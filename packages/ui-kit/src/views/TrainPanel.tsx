@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { LineRemediation, TrainLineProjection } from "@bridge/contracts";
+import { recoveryCauseLabel } from "@bridge/contracts";
 import { kbApi, type KbTrainLane } from "../server/kb";
 import { Chip, type ChipTone } from "./index-kit";
 
@@ -76,10 +77,26 @@ export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now
     <span className="train-banner-line">{line.reason}</span>
     {line.evidence.length > 0 && <span className="train-banner-line train-banner-checks">Checks: {line.evidence.map((e, i) =>
       <span key={`${e.name}-${i}`}>{i > 0 ? " · " : ""}{e.url
-         ? <a href={e.url} target="_blank" rel="noreferrer">{e.name}</a> : e.name}</span>)}</span>}
+        ? <a href={e.url} target="_blank" rel="noreferrer">{e.name}</a> : e.name}</span>)}</span>}
     {line.observed_at > 0 && <span className="train-banner-line train-banner-dim">Main last checked {age(line.observed_at, now)} ago</span>}
     </div>
-    {line.remediation && <div className="train-banner-recovery"><Recovery action={line.remediation} now={now} openTask={openTask} /></div>}
+    {(line.remediation || !!line.recoveries?.length) && <div className="train-banner-recovery">
+    {line.remediation && <Recovery action={line.remediation} now={now} openTask={openTask} />}
+    {line.recoveries?.filter((r) => r.episode.stage.phase !== "superseded").map(({ episode, task }) => (
+      <div key={episode.id} className="train-banner-line">
+        <strong>{recoveryCauseLabel(episode.cause)}</strong> — {episode.stage.phase}
+        {task && <> · <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.id}</TaskLink>{task.owner ? ` · ${task.owner}` : ""}</>}
+        <div>Next: {episode.stage.next}</div>
+        {episode.attempts.map((attempt) => <div key={attempt.id}>
+          Action: {attempt.action} — {attempt.status === "running" ? "execution in progress; no result yet" : `${attempt.outcome}: ${attempt.summary}`}
+          {attempt.status === "finished" && attempt.receipts.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer"> · receipt</a>)}
+        </div>)}
+        <details><summary>Recovery history · {episode.sources.length} observed run attempt(s)</summary>
+          {episode.history.map((event) => <div key={event.event_id}>{age(event.at, now)} ago · {event.kind}: {event.summary}</div>)}
+        </details>
+      </div>
+    ))}
+    </div>}
   </div>;
 }
 

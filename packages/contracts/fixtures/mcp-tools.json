@@ -182,6 +182,10 @@
       "required": ["repo", "observation"]
     },
     {
+      "name": "train_recovery_event",
+      "required": ["repo", "base", "head_sha", "cause", "event_id", "event"]
+    },
+    {
       "name": "transition",
       "required": [
         "id",

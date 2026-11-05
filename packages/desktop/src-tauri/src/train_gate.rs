@@ -1270,9 +1270,22 @@ pub fn merge_sweep_human_leg_title(repo: &str, reasons: &[String]) -> String {
 /// `workflow_dispatch` and fast-page escalation (BR#6179). Mirrored in `core.ts`.
 pub const DEPLOY_RECONCILE_GRACE_SECS: u64 = 300;
 
+/// Wire mirror of @bridge/contracts RecoveryCauseSchema. Only an unknown
+/// check failure is eligible for a generic retry; identified test/capability
+/// defects belong to their repair executors.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoveryCause {
+    TestFailure { check: String, suite: String, test: String },
+    CapabilityUnavailable { check: String, scenario: String, capability: String, scope: String },
+    CheckFailure { check: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeployWorkflowRun {
     pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_attempt: Option<i64>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -1899,7 +1912,7 @@ mod tests {
         let runs: Vec<MainCheckRun> = required.iter().enumerate().map(|(i, name)| run(i as i64, name, Some("success"))).collect();
         let scoped = classify_base_check_runs(&runs, &required);
         assert_eq!(scoped.verdict, MainVerdict::Green);
-        let workflow = |id, sha: &str, conclusion: &str| DeployWorkflowRun { id, name: "Deploy Dev".into(),
+        let workflow = |id, sha: &str, conclusion: &str| DeployWorkflowRun { id, run_attempt: Some(1), name: "Deploy Dev".into(),
             path: Some(".github/workflows/deploy-dev.yml".into()), head_sha: sha.into(), event: Some("push".into()),
             status: Some("completed".into()), conclusion: Some(conclusion.into()), html_url: Some(format!("https://github.com/actions/runs/{id}")) };
         let workflows = vec![workflow(41926939169, "78760d10", "failure"), workflow(41924676992, "e99f74f8", "success")];
@@ -3233,6 +3246,7 @@ mod tests {
         let wf_runs_with_dhr = vec![
             DeployWorkflowRun {
                 id: 41791923312,
+                run_attempt: Some(1),
                 name: "Deploy Health Record".into(),
                 path: Some(".github/workflows/deploy-health.yml".into()),
                 head_sha: dark_tip.into(),
@@ -3243,6 +3257,7 @@ mod tests {
             },
             DeployWorkflowRun {
                 id: 41780000001,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3321,6 +3336,7 @@ mod tests {
         let wf_runs_redundant = vec![
             DeployWorkflowRun {
                 id: 41798951196,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3331,6 +3347,7 @@ mod tests {
             },
             DeployWorkflowRun {
                 id: 41798949143,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3391,6 +3408,7 @@ mod tests {
             &required,
             &[DeployWorkflowRun {
                 id: 41911085476,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),
@@ -3421,6 +3439,7 @@ mod tests {
             &required,
             &[DeployWorkflowRun {
                 id: 41911085476,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),

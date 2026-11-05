@@ -1723,6 +1723,39 @@ other law owns them.
 
 ### One line-health and recovery state (BR#6389)
 
+#### Cause-specific closed-loop recovery (BR#6522)
+
+Each failed commit has durable recovery episodes keyed by a typed cause:
+`test_failure`, `capability_unavailable`, or an undiagnosed `check_failure`.
+Different workflow attempts do not create different incidents. A specific
+diagnosis supersedes a broad job-name placeholder without erasing other causes.
+Existing repair tasks own the work; the journal does not create duplicate fixes.
+Binding an observed current-main failure sponsors its existing repair task as
+priority-zero root-fix work, so a released cause repair cannot silently sit
+behind ordinary implementation while the entire line is held.
+
+`train_recovery_event {repo, base, head_sha, cause, event_id, event}` records
+observed evidence, diagnosis, action starts, action outcomes, and progress.
+Repeated event IDs are idempotent. The updated executor obtains durable
+authorization before a generic main retry (one retry per cause/commit); known
+test/capability defects go to repair instead of a blind rerun. Record the actual
+result after dispatch. A heartbeat is liveness, not an action outcome.
+
+Episodes move through `diagnosing`, `repairing`, `verifying`, `exhausted`, and
+`recovered`; broad placeholders may be `superseded`. Code submission and task
+completion only start verification. Clients cannot emit a recovered event.
+The hub requires a successful decisive deployment receipt matching current main
+and a green effective check verdict. Set `successful_deployments_required` on
+an observed event when a stability bar needs several distinct successful runs;
+polls never count as additional successes and requirements cannot be weakened
+by later observations. New failures reset consecutive evidence.
+
+The stop-line banner shows every cause, bound repair owner, stage, explicit
+next step, attempts/results/receipts, and an expandable history. Structured
+`log_progress` and task-submission events update the journal automatically.
+Deployment observations publish actual run attempts and are refreshed by the
+updated train executor, independently of merge-control decisions.
+
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery
 message uses an explicit agent progress/next-action report, or states honestly

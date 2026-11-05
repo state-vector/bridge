@@ -19,6 +19,7 @@ import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
+import { RecoveryCommandSchema } from "./train-recovery.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
@@ -53,6 +54,7 @@ export const TOOL_NAMES = [
   "train_lease",
   "train_status",
   "train_observe_deploy",
+  "train_recovery_event",
   "transition",
   "update_artefact",
 ] as const;
@@ -66,6 +68,7 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  */
 export const TOOL_ARG_SCHEMAS = {
   train_observe_deploy: z.looseObject({ repo: z.string(), base: z.string().optional(), observation: DeployObservationSchema }),
+  train_recovery_event: RecoveryCommandSchema,
   orient: z.looseObject({
     session: z
       .string()

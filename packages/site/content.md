@@ -108,6 +108,14 @@ Backlog distinguishes a passive **PR dependency** (the PR owner delivers it; the
 
 ### One authoritative line-health state
 
+Recovery is tracked per typed failure cause and commit, not merely per failing
+job. Each cause retains its repair task, stage, next action, bounded retry
+budget, actual action outcomes, evidence and history across workflow retries
+and executor restarts. Code delivery is not recovery: the hub closes an episode
+only after matched successful deployment evidence meets its verification bar.
+The banner exposes these cause-specific records so independent defects cannot
+silently replace each other under one smoke-job label.
+
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action
 reports. Missing next actions are shown explicitly rather than invented.

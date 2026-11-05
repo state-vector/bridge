@@ -6,6 +6,7 @@
  * the UI (`kb.ts`/`TrainPanel.tsx`), and the Rust executor (`train.rs`/`train_gate.rs`).
  */
 import { z } from "zod";
+import { RecoveryCauseSchema } from "./train-recovery.ts";
 
 export const TrainEntryClassSchema = z.enum([
   "ready",
@@ -129,9 +130,12 @@ export type DeployCoveragePhase = DeployCoverageState["phase"];
 export const DeployObservationSchema = z.object({
   tip_sha: z.string().regex(/^[0-9a-f]{40}$/),
   observed_at: z.number().int().positive(),
-  failures: z.array(z.object({ run_id: z.number().int().positive(), name: z.string().min(1), url: z.string().url() })).max(100).optional(),
+  failures: z.array(z.object({ run_id: z.number().int().positive(), name: z.string().min(1), url: z.string().url(),
+    cause: RecoveryCauseSchema.optional(), repair_task_id: z.string().regex(/^BR#\d+$/).optional(),
+  })).max(100).optional(),
   runs: z.array(z.object({
     id: z.number().int().positive(), name: z.string(), path: z.string().optional(),
+    run_attempt: z.number().int().positive().optional(),
     head_sha: z.string().regex(/^[0-9a-f]{40}$/),
     status: z.enum(["queued", "waiting", "pending", "requested", "in_progress", "completed"]),
     conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullable(),

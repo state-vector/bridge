@@ -325,6 +325,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_observe_deploy,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.observe_deploy", args), null, 1)),
   },
+  train_recovery_event: {
+    description: "Record cause-specific recovery diagnosis, action attempt, outcome and next step. Repeated event IDs are idempotent; retry budgets survive executor restarts. Code submission never marks live recovery. Only a matched successful decisive deployment closes an episode.",
+    schema: TOOL_ARG_SCHEMAS.train_recovery_event,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.recovery_event", args), null, 1)),
+  },
   reconcile_schedule: {
     description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",
     schema: TOOL_ARG_SCHEMAS.reconcile_schedule,

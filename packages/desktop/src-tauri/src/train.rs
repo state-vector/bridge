@@ -50,6 +50,7 @@ use crate::train_gate::{
     TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
@@ -914,6 +915,7 @@ fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
         }
         out.push(DeployWorkflowRun {
             id,
+            run_attempt: r.get("run_attempt").and_then(|v| v.as_i64()),
             name,
             path: r.get("path").and_then(|v| v.as_str()).map(String::from),
             head_sha,
@@ -1652,6 +1654,19 @@ fn reconcile_base_deploy(
         return build_base_state(base_class, required, pass_merged);
     }
     let wf_runs = ctx.workflow_runs(repo, base, tip_sha);
+    // Observation is not a merger action. Keep the hub's durable recovery
+    // proof current on every normal base probe, including matching reruns.
+    if pass_merged == 0 && tip_sha.len() == 40 {
+        let reportable: Vec<&DeployWorkflowRun> = wf_runs.iter().filter(|r|
+            crate::train_gate::is_deploy_workflow_run(r, required) && r.head_sha.len() == 40 && r.html_url.is_some()
+        ).collect();
+        if reportable.iter().any(|r| r.head_sha == tip_sha) {
+            if let Err(e) = ctx.mcp("train_observe_deploy", json!({ "repo": repo, "base": base,
+                "observation": { "tip_sha": tip_sha, "observed_at": now_ms(), "runs": reportable } })) {
+                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 200)));
+            }
+        }
+    }
     let auto_key = format!("{key}:{tip_sha}");
     let manual_redispatch = lane.get("dispatch_deploy").filter(|v| !v.is_null()).is_some();
     let hub_dispatched_at = if manual_redispatch {
@@ -1727,6 +1742,31 @@ fn reconcile_base_deploy(
     }
     *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
     build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
+}
+
+fn request_main_recovery_retry(ctx: &mut Ctx, lane: &Value, repo: &str, base: &str, head: &str) -> Option<Value> {
+    let episodes = lane.pointer("/line/recoveries").and_then(Value::as_array)?;
+    for view in episodes {
+        let episode = view.get("episode")?;
+        if vstr(episode, "head_sha") != Some(head) { continue; }
+        let cause: crate::train_gate::RecoveryCause = serde_json::from_value(episode.get("cause")?.clone()).ok()?;
+        if !matches!(cause, crate::train_gate::RecoveryCause::CheckFailure { .. }) { continue; }
+        let stage = episode.get("stage")?;
+        if !matches!(vstr(stage, "phase"), Some("diagnosing" | "repairing")) { continue; }
+        let task = vstr(stage, "task_id")?;
+        let attempt_id = format!("auto-main-retry:{head}");
+        let command = json!({ "repo": repo, "base": base, "head_sha": head, "cause": cause,
+            "event_id": format!("retry-request:{head}:{}", vstr(episode, "id").unwrap_or("")),
+            "event": { "kind": "attempt_started", "task_id": task, "attempt_id": attempt_id,
+                "attempt_kind": "retry", "action": "Re-run failed required workflows on main once",
+                "next": "Read the actual rerun result; repeated failure requires diagnosis and repair" } });
+        match ctx.mcp("train_recovery_event", command.clone()) {
+            Ok(result) if result.get("authorized").and_then(Value::as_bool) == Some(true) => return Some(command),
+            Ok(_) => log(None, "main retry not authorized: durable recovery budget or replay guard owns the next action"),
+            Err(e) => log(None, &format!("main retry withheld: no durable authorization ({})", trunc(&e, 160))),
+        }
+    }
+    None
 }
 
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
@@ -1975,13 +2015,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             let auto_key = format!("{key}:{base_sha}");
             if v.verdict == MainVerdict::Red && !has_bisect && !rerun_requested && !base_sha.is_empty() && !ctx.auto_rerun_shas.contains(&auto_key) {
                 ctx.auto_rerun_shas.insert(auto_key);
+                let retry = request_main_recovery_retry(ctx, lane, repo, base, &base_sha);
                 let mut auto_rerun_ok = 0usize;
+                let mut seen_run_ids = HashSet::new();
                 for r in &v.red {
+                    if retry.is_none() { break; }
                     if let Some(run_id) = extract_actions_run_id(&r.url) {
+                        if !seen_run_ids.insert(run_id.clone()) { continue; }
                         if ctx.sh("gh", &["run", "rerun", &run_id.to_string(), "--repo", repo]).is_ok() {
                             auto_rerun_ok += 1;
                         }
                     }
+                }
+                if let Some(mut command) = retry {
+                    let attempt_id = command.pointer("/event/attempt_id").cloned().unwrap_or(Value::Null);
+                    let task_id = command.pointer("/event/task_id").cloned().unwrap_or(Value::Null);
+                    command["event_id"] = json!(format!("auto-retry-result:{base_sha}"));
+                    command["event"] = json!({ "kind": "attempt_finished", "task_id": task_id, "attempt_id": attempt_id,
+                        "outcome": if auto_rerun_ok > 0 { "delivered" } else { "failed" },
+                        "summary": format!("Dispatched {auto_rerun_ok} required-workflow rerun(s); recovery not yet verified"),
+                        "receipts": [], "next": "Observe the actual workflow result; diagnose and repair if the same cause remains" });
+                    if let Err(e) = ctx.mcp("train_recovery_event", command) { log(Some(key), &format!("recovery outcome recording failed: {}", trunc(&e, 200))); }
                 }
                 if auto_rerun_ok > 0 {
                     log(Some(key), &format!("self-heal: auto-dispatched rerun for {auto_rerun_ok} failing required workflow(s) on stopped tip {}", &base_sha[..base_sha.len().min(9)]));
@@ -5953,6 +6007,26 @@ mod tests {
     }
 
     #[test]
+    fn recovery_retry_needs_durable_authorization_and_never_retries_known_capability_defects() {
+        let head = "7".repeat(40);
+        let lane = json!({ "line": { "recoveries": [{ "episode": { "id": "cause", "head_sha": head,
+            "cause": { "kind": "check_failure", "check": "Deploy smoke" },
+            "stage": { "phase": "diagnosing", "task_id": "BR#1" } } }] } });
+        let (hub, calls) = mock_hub(vec![ok(json!({ "authorized": true }))]);
+        let mut ctx = test_ctx(&hub);
+        assert!(request_main_recovery_retry(&mut ctx, &lane, "o/r", "main", &head).is_some());
+        assert_eq!(call_name(&calls.lock().unwrap()[0]), "train_recovery_event");
+        let (refused, _) = mock_hub(vec![ok(json!({ "authorized": false }))]);
+        assert!(request_main_recovery_retry(&mut test_ctx(&refused), &lane, "o/r", "main", &head).is_none());
+        let known = json!({ "line": { "recoveries": [{ "episode": { "id": "cause", "head_sha": head,
+            "cause": { "kind": "capability_unavailable", "check": "Deploy smoke", "scenario": "php-sql-injection", "capability": "callers", "scope": "User.php" },
+            "stage": { "phase": "repairing", "task_id": "BR#1" } } }] } });
+        let (untouched, calls) = mock_hub(vec![]);
+        assert!(request_main_recovery_retry(&mut test_ctx(&untouched), &known, "o/r", "main", &head).is_none());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn synthetic_dark_tip_drill_dispatches_once_cancels_redundant_and_merges_when_green_br6179() {
         // Synthetic dark-tip drill (BR#6179 Done-When):
         // - Tick 1 (dark tip 7f5efec2, 17m old, zero required check runs, only DHR ran):
@@ -6003,12 +6077,14 @@ mod tests {
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // train_queue_facts
             ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
             ok(json!({ "ok": true })),                   // train_queue_facts (ready)

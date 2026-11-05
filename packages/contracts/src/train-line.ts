@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { BaseRedResolutionSchema, DeployCoverageStateSchema, TrainFixCardSchema } from "./train.ts";
 import type { TrainFixCard } from "./train.ts";
+import { RecoveryEpisodeSchema, recoveryIsOpen } from "./train-recovery.ts";
 
 /** Runner stream messages prove liveness, not a structured progress report.
  * Keep their raw output available in details, without advertising fragments
@@ -29,6 +30,7 @@ const LineFields = z.object({
   evidence: z.array(EvidenceSchema),
   held: z.number().int().nonnegative(),
   observed_at: z.number(),
+  recoveries: z.array(z.object({ episode: RecoveryEpisodeSchema, task: TrainFixCardSchema.nullable() })).optional(),
 });
 /** Closed state machine: healthy/retired cannot carry a blocker, while an
  * interrupted line cannot exist without its cause and recovery disposition. */
@@ -41,6 +43,16 @@ export const TrainLineProjectionSchema = z.discriminatedUnion("phase", [
   LineFields.extend({ phase: z.literal("unknown"), blocker: z.literal("stale_observation"), remediation: LineRemediationSchema }),
 ]);
 export type TrainLineProjection = z.infer<typeof TrainLineProjectionSchema>;
+
+export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonNullable<TrainLineProjection["recoveries"]>): TrainLineProjection {
+  const open = recoveries.filter((r) => recoveryIsOpen(r.episode));
+  if (open.length && line.phase === "ready") return TrainLineProjectionSchema.parse({ ...line, recoveries,
+    phase: "waiting", label: "Verifying recovery", blocker: "checks_running",
+    reason: "Repair work is not yet proven recovered by a matching successful deployment.",
+    remediation: { kind: "machine", text: "Waiting for the current tip's successful decisive deployment receipt, not just task completion.", url: null },
+  });
+  return TrainLineProjectionSchema.parse({ ...line, recoveries });
+}
 
 /** One boundary adapter for legacy executor facts. The UI consumes only the
  * projection; it never arbitrates between these independent observations. */

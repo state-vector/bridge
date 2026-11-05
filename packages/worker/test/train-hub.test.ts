@@ -103,6 +103,45 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
 }
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("recovery records survive retries and task delivery; only matched successful deployment proves recovery", async () => {
+    const repo = "state-vector/recovery-loop-6522", head = "7".repeat(40);
+    const repair = await kbJson("/create", { type: "task", title: "Repair callers availability", qualified: true, roles: ["impl"] });
+    const task = String(repair.body.id);
+    await acquire(repo, "merger-6522", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [] } });
+    const cause = { kind: "capability_unavailable", check: "Cortex Quality Smoke", scenario: "php-sql-injection", capability: "callers", scope: "includes/User/User.php:2416" };
+    const observe = (id: number, conclusion: string, attempt = 1) => kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: head, observed_at: Date.now(), runs: [{ id, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml", head_sha: head, run_attempt: attempt,
+        status: "completed", conclusion, html_url: `https://github.com/${repo}/actions/runs/${id}` }],
+      failures: conclusion === "failure" ? [{ run_id: id, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/${id}/job/456`, cause, repair_task_id: task }] : [],
+    } });
+    expect((await observe(123, "failure", 5)).body.error ?? "").toBe("");
+    const sponsored = (await kbJson("/get", { id: task })).body;
+    expect(sponsored.tags).toContain("root_blocker");
+    expect(sponsored.meta.root_fix).toMatchObject({ repo, head_sha: head });
+    const command = (event_id: string, event: Record<string, unknown>) => kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id, event, actor: "repairer" });
+    const diagnosed = await command("diagnosis", { kind: "diagnosed", task_id: task, diagnosis: "Adjacency read exceeds callers deadline", next: "Implement pruning" });
+    expect(diagnosed.body.episode.stage.phase).toBe("repairing");
+    const started = { kind: "attempt_started", task_id: task, attempt_id: "repair-1", attempt_kind: "repair", action: "Implement pruning and regression", next: "Publish repair" };
+    expect((await command("start", started)).body.authorized).toBe(true);
+    expect((await command("start", started)).body.authorized).toBe(false);
+    await command("delivered", { kind: "attempt_finished", task_id: task, attempt_id: "repair-1", outcome: "delivered", summary: "Repair published", receipts: [`https://github.com/${repo}/commit/123`], next: "Verify deployment" });
+    let snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("verifying");
+    expect((await observe(123, "failure", 6)).body.error ?? "").toBe("");
+    snap = await laneSnap(repo);
+    expect(snap.line.recoveries).toHaveLength(1);
+    expect(snap.line.recoveries[0].episode.sources).toHaveLength(2);
+    expect(snap.line.recoveries[0].episode.stage.phase).not.toBe("recovered");
+    await observe(124, "success");
+    await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [],
+      deploy_coverage: { phase: "covered", tip_sha: head, tip_age_secs: 60, covered_by_sha: head, covered_by_run_id: 124 } } });
+    snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("recovered");
+    expect(snap.line.recoveries[0].episode.stage.receipt.run_id).toBe(124);
+    const fake = await command("fake-recovery", { kind: "recovered", task_id: task });
+    expect(fake.status).toBe(400);
+  });
   it("deployment observations stop a failed line independently of the merge lease and survive stale green gateway snapshots", async () => {
     const repo = "state-vector/observe-deploy-6389";
     const tip = "7".repeat(40);

@@ -225,6 +225,7 @@ import {
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { RecoveryCommandSchema, RecoveryLedgerSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, type RecoveryEpisode, type RecoveryEvent } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -3548,6 +3549,7 @@ export class KnowledgeHub {
         case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
         case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
         case "train.observe_deploy": return this.json(await this.trainObserveDeploy(body, actor));
+        case "train.recovery_event": return this.json(await this.trainRecoveryEvent(body, actor));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
         case "reconcile.schedule": return this.json(await this.reconcileSchedule(body, actor));
@@ -5385,6 +5387,9 @@ export class KnowledgeHub {
       ...(body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
+    if (row.type === "task" && (verdict.status === "in_review" || verdict.status === "done")) {
+      this.recordTaskRecovery(id, { kind: "delivery_submitted", task_id: id }, actor);
+    }
     if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(ts);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
@@ -6130,6 +6135,7 @@ export class KnowledgeHub {
     );
     this.audit(actor, "progress", id, { note, sentiment, will: will || undefined });
     this.version(id, actor, "progress", note, { note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct });
+    if (will && !note.startsWith("runner:")) this.recordTaskRecovery(id, { kind: "progress", task_id: id, did: note.slice(0, 2000), next: will.slice(0, 2000) }, actor);
     return {
       id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct,
       grace_until: graceUntil, instructions,
@@ -8767,6 +8773,107 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   /** Observation plane, deliberately independent of the merge-control lease.
    * Authenticated executors report GitHub facts; the hub owns every decision.
    * This never merges, clears stops, or grants a bypass. */
+  private async trainRecoveryEvent(body: unknown, actor: string): Promise<unknown> {
+    const cmd = RecoveryCommandSchema.parse(body);
+    if (!isValidGitHubRepo(cmd.repo)) throw new Error("recovery requires a valid repository");
+    const row = this.laneRow(laneKey(cmd.repo, cmd.base));
+    if (!row || row.status === "done" || row.status === "superseded") throw new Error("recovery requires an active registered lane");
+    const meta = JSON.parse(row.meta ?? "{}");
+    const ledger = RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {});
+    const key = recoveryEpisodeKey(cmd.head_sha, cmd.cause);
+    const previous = ledger[key];
+    const task = this.one(`SELECT type, status, status_ts, meta, tags FROM artefacts WHERE id = ?`, cmd.event.task_id);
+    if (!task || task.type !== "task") throw new Error("recovery must bind an existing repair task");
+    if (cmd.event.kind === "observed") {
+      const source = cmd.event.source;
+      const runUrl = `https://github.com/${cmd.repo}/actions/runs/${source.run_id}`;
+      if (source.head_sha !== cmd.head_sha || !(source.url === runUrl || source.url.startsWith(`${runUrl}/job/`))) throw new Error("failure receipt must match episode repository, commit and run");
+      const observed = DeployObservationSchema.safeParse(meta.lane?.deploy_observation);
+      if (!observed.success || !observed.data.runs.some((r) => r.id === source.run_id && r.head_sha === cmd.head_sha &&
+          r.status === "completed" && r.conclusion !== "success" && r.conclusion !== "cancelled" && r.conclusion !== "skipped" &&
+          source.run_attempt <= (r.run_attempt ?? 1))) throw new Error("failure source requires an observed failed deployment receipt");
+      if (Object.keys(ledger).length >= 64 && !previous) throw new Error("recovery episode budget exhausted; reconcile existing incidents");
+    }
+    const replayed = previous?.history.some((h) => h.event_id === cmd.event_id) ?? false;
+    let episode = reduceRecoveryEpisode(previous, { head_sha: cmd.head_sha, cause: cmd.cause, event_id: cmd.event_id, event: cmd.event, actor, now: Date.now() });
+    const accepted = !replayed && episode.history.some((h) => h.event_id === cmd.event_id);
+    if (cmd.event.kind === "observed" && accepted) {
+      const repairMeta = JSON.parse(task.meta ?? "{}");
+      if (repairMeta.root_fix?.repo && repairMeta.root_fix.repo !== cmd.repo) throw new Error("repair task belongs to another repository's red episode");
+      repairMeta.root_fix = { ...(repairMeta.root_fix ?? {}), repo: cmd.repo, base: cmd.base, head_sha: cmd.head_sha,
+        why: `Cause-specific recovery: ${cmd.cause.kind}`, bound_at: Date.now(), lane: laneKey(cmd.repo, cmd.base) };
+      repairMeta.boosted = Date.now();
+      const tags = [...new Set([...parseTags(task.tags), "root_blocker", "main-red", "merge-train", "p0"])];
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, tags = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(repairMeta), JSON.stringify(tags), Date.now(), cmd.event.task_id);
+      if (task.status === "in_review" || task.status === "done") episode = reduceRecoveryEpisode(episode, {
+        head_sha: cmd.head_sha, cause: cmd.cause, event_id: `existing-delivery:${cmd.event.task_id}:${task.status_ts}`,
+        event: { kind: "delivery_submitted", task_id: cmd.event.task_id }, actor: "system:recovery", now: Date.now() });
+    }
+    ledger[key] = episode;
+    // A more specific diagnosis replaces a job-name placeholder. It does not
+    // erase other specific causes, reset attempts, or pretend they recovered.
+    if (cmd.cause.kind !== "check_failure") {
+      for (const other of Object.values(ledger)) if (other.head_sha === cmd.head_sha && other.cause.kind === "check_failure" &&
+          other.cause.check === cmd.cause.check && recoveryIsOpen(other)) {
+        other.stage = { phase: "superseded", task_id: other.stage.task_id, reason: "Specific failure cause identified", next: "Follow the cause-specific recovery episodes" };
+      }
+    }
+    meta.lane = { ...meta.lane, recovery_episodes: ledger };
+    this.saveLaneState(row.id, meta, Date.now());
+    if (accepted) this.version(row.id, actor, "recovery_event", `${cmd.event.kind}: ${episode.history.at(-1)?.summary ?? ""}`, { episode_id: key, event: cmd.event });
+    return { episode, replayed, accepted, authorized: accepted && cmd.event.kind === "attempt_started" && episode.stage.phase !== "exhausted" };
+  }
+
+  /** Existing task events add facts to the journal. A code handoff or done
+   * verdict only moves to verification; it never certifies live recovery. */
+  private recordTaskRecovery(taskId: string, event: RecoveryEvent, actor: string): void {
+    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
+    const now = Date.now();
+    for (const row of rows) {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      const ledger = RecoveryLedgerSchema.parse(meta.lane.recovery_episodes);
+      let changed = false;
+      for (const [key, episode] of Object.entries(ledger)) {
+        if (!recoveryIsOpen(episode) || episode.stage.task_id !== taskId) continue;
+        ledger[key] = reduceRecoveryEpisode(episode, { head_sha: episode.head_sha, cause: episode.cause,
+          event_id: `task:${taskId}:${event.kind}:${now}`, event, actor, now });
+        changed = true;
+      }
+      if (changed) { meta.lane.recovery_episodes = ledger; this.saveLaneState(String(row.id), meta, now); }
+    }
+  }
+
+  private recoveryEpisodesForLine(meta: Record<string, unknown>, now: number): RecoveryEpisode[] {
+    const lane = (meta.lane ?? {}) as Record<string, unknown>;
+    const ledger = RecoveryLedgerSchema.parse(lane.recovery_episodes ?? {});
+    const facts = lane.queue_facts as { base_state?: { verdict?: string; gate_blocked?: boolean; deploy_coverage?: unknown } } | undefined;
+    const coverage = DeployCoverageStateSchema.safeParse(facts?.base_state?.deploy_coverage);
+    const observed = DeployObservationSchema.safeParse(lane.deploy_observation);
+    if (facts?.base_state?.verdict === "red" && observed.success) {
+      const failed = [...observed.data.runs].filter((r) => r.head_sha === observed.data.tip_sha && r.status === "completed" && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
+      if (failed && failed.conclusion !== "success") for (const episode of Object.values(ledger)) {
+        if (!recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
+        const newer = episode.verified_receipts.every((r) => failed.id > r.run_id || (failed.id === r.run_id && (failed.run_attempt ?? 1) > r.run_attempt));
+        if (!newer) continue;
+        episode.verified_receipts = [];
+        episode.stage = { phase: "verifying", task_id: episode.stage.task_id, next: `Verify ${episode.successful_deployments_required} consecutive successful decisive deployment(s)` };
+        episode.history.push({ event_id: `deployment-failed:${failed.id}:${failed.run_attempt ?? 1}`, at: now, actor: "system:deployment", kind: "verification_failed", summary: "Decisive deployment failed; consecutive verification evidence reset, recovery remains open" });
+        episode.updated_at = now;
+      }
+    }
+    if (facts?.base_state?.verdict === "green" && !facts.base_state.gate_blocked && coverage.success && coverage.data.phase === "covered" && observed.success) {
+      const cov = coverage.data;
+      const run = observed.data.runs.find((r) => r.id === cov.covered_by_run_id && r.head_sha === cov.tip_sha && r.status === "completed" && r.conclusion === "success");
+      if (run) for (const [key, episode] of Object.entries(ledger)) {
+        const newestFailure = episode.sources.reduce((a, b) => b.run_id > a.run_id || (b.run_id === a.run_id && b.run_attempt > a.run_attempt) ? b : a);
+        if (run.id < newestFailure.run_id || (run.id === newestFailure.run_id && (run.run_attempt ?? 1) < newestFailure.run_attempt)) continue;
+        ledger[key] = verifyRecoveryEpisode(episode, { head_sha: cov.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: run.html_url }, now);
+      }
+    }
+    lane.recovery_episodes = ledger;
+    return Object.values(ledger);
+  }
+
   private async trainObserveDeploy(body: unknown, actor: string): Promise<unknown> {
     const input = body as { repo?: string; base?: string; observation?: unknown };
     const repo = String(input.repo ?? "");
@@ -8797,8 +8904,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     this.version(row.id, actor, "deploy_observed", `Observed deployment health at ${observation.tip_sha.slice(0, 9)}: ${effective?.verdict}`, { observation });
     if (effective?.verdict === "red") {
       const failing = Array.isArray(effective.red) ? effective.red : [];
-      await this.ensureRootFixCard({ repo, base, sha: observation.tip_sha, failing,
+      const repairId = await this.ensureRootFixCard({ repo, base, sha: observation.tip_sha, failing,
         why: `Decisive deployment failed at ${observation.tip_sha.slice(0, 9)}`, actor, now, laneId: row.id, culpritId: null, pr: null });
+      const receiptMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, row.id)?.meta ?? "{}");
+      const knownEpisodes = RecoveryLedgerSchema.parse(receiptMeta.lane?.recovery_episodes ?? {});
+      const specificRepair = Object.values(knownEpisodes).some((e) => e.head_sha === observation.tip_sha && e.cause.kind !== "check_failure" && recoveryIsOpen(e));
+      const latestTipRun = [...observation.runs].filter((r) => r.head_sha === observation.tip_sha && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
+      const failureRows: NonNullable<typeof observation.failures> = observation.failures?.length ? observation.failures
+        : !specificRepair && latestTipRun?.status === "completed" && latestTipRun.conclusion !== "success"
+          ? [{ run_id: latestTipRun.id, name: latestTipRun.name, url: latestTipRun.html_url }] : [];
+      for (const failure of failureRows) {
+        const run = observation.runs.find((r) => r.id === failure.run_id);
+        if (!run || !repairId) continue;
+        const cause = failure.cause ?? { kind: "check_failure" as const, check: failure.name };
+        const current = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, row.id)?.meta ?? "{}");
+        const existing = RecoveryLedgerSchema.parse(current.lane?.recovery_episodes ?? {});
+        if (cause.kind === "check_failure" && Object.values(existing).some((e) => e.head_sha === observation.tip_sha && e.cause.check === cause.check && e.cause.kind !== "check_failure" && recoveryIsOpen(e))) continue;
+        await this.trainRecoveryEvent({ repo, base, head_sha: observation.tip_sha, cause,
+          event_id: `observed:${run.id}:${run.run_attempt ?? 1}:${recoveryEpisodeKey(observation.tip_sha, cause)}`,
+          event: { kind: "observed", task_id: failure.repair_task_id ?? repairId,
+            source: { head_sha: observation.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: failure.url },
+            next: "Diagnose the exact failed test or unavailable capability, then record the repair action and outcome" } }, actor);
+      }
     }
     return this.trainStatus({ repo });
   }
@@ -13570,8 +13697,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         blocker: "stale_observation", evidence: [], held: queue.length, observed_at: Number(brQf?.at ?? 0),
         remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
       };
-      const line = await this.ensureLineRecovery(l.id, projectedLine, now0);
+      let line = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, l.id)?.meta ?? "{}");
+      const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
+      line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })));
       latestMeta.lane = { ...latestMeta.lane, line };
       this.saveLaneState(l.id, latestMeta, now0);
       out.push({
