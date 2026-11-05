@@ -170,7 +170,13 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id }),
+      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id,
+        execution_scope: request.headers.get("x-bridge-task") ? {
+          id: request.headers.get("x-bridge-task"),
+          generation: Number(request.headers.get("x-bridge-generation")),
+          attempt_id: request.headers.get("x-bridge-attempt"),
+        } : null,
+      }),
     });
     const out = await r.json();
     if (!r.ok) throw kbError(op, r.status, out);

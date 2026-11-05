@@ -55,6 +55,80 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 ## 3 · Run a runner (the gateway)
 
+### Durable execution (protocol v1)
+
+New runners acquire a hub-persisted execution generation before spawning an
+agent. The SQLite state and command replay receipt commit atomically. Worker
+MCP writes carry their generation/attempt scope in runner-injected headers;
+removing or changing the scope does not restore legacy write access.
+
+- **Portable work:** every five minutes and when a process stops, an isolated
+  Git worktree is snapshotted through a private index (tracked and non-ignored
+  untracked files). A signed preservation commit is pushed to a unique
+  `bridge-checkpoints/…` ref and read back. Snapshotting leaves HEAD, the real
+  index and local WIP intact. Checkpoints record base, commit, tree, environment,
+  next action and content-bound test evidence. Ignored inputs/secrets are not
+  uploaded: required external environments must be provisioned separately.
+- **Safe transfer:** lease expiry and missing stdout never prove a writer has
+  stopped. Another attempt waits for the original runner's empty-process-group
+  acknowledgement; cross-host execution additionally requires a published
+  checkpoint and verified commit/tree restoration. Newer local WIP is retained,
+  not reset to an older checkpoint. Dirty or unpublished worktrees are retained
+  by cleanup if the preservation barrier cannot be proved.
+- **Independent clocks:** a two-minute execution lease is renewed by control
+  polls; the configured task action budget (at most one hour) is independent of
+  narration. Three exhausted action budgets stop automatic restarts and require
+  diagnosis. Quiet ACP actions can run within their action budget. Unproven
+  process-tree isolation retains host affinity; agents must not detach writers
+  from the runner's process group.
+- **Active coordination:** safe-point polls reconcile task-addressed asks into a
+  durable mailbox (`queued → delivered → acknowledged → acted`). For CLIs that
+  cannot accept hot input, the runner stops/checkpoints and resumes with the
+  message. Interruptions gate conflicting hub writes immediately. Delivery is
+  not a claim that the requested repair succeeded.
+- **Bounded external operations:** the `execution` MCP tool supports
+  `prepare`/`result` with stable operation IDs, exact input revisions, budgets
+  and receipts. A timed-out effect becomes `outcome_unknown`; inspect GitHub/AWS
+  before reporting its result. Pending unknown effects prevent transfer or
+  another attempt, rather than authorising a duplicate push/deployment.
+- **Explicit capability escalation:** set each backend's `reasoning_tier` to
+  `small`, `medium` or `large` in runner config (omitted means `small`; model
+  names are never guessed into tiers). Task `meta.execution_requirements`
+  persists minimum tier, tools, environment and optional host constraints.
+  Gateways advertise expiring scoped facts; begin/claim gates check them and
+  execution records retain the actual backend/model/config observation.
+  `execution` command `availability` distinguishes no observed supporting
+  configuration, expired gateways and capacity waits. Explicit `escalate`
+  strengthens the requirement; the runner yields only after publication and
+  quiescence. An unavailable larger model is not a human approval request.
+- **Recovery continuity:** a still-open cause carries its attempt history and
+  consumed retry budget across revisions. The new revision receives no inherited
+  green verification credit. Code delivery, accepted review and live deployment
+  evidence remain separate facts.
+- **Critical-path capacity:** repair, review and deployment-verification work
+  sorts ahead of diagnostics. Diagnostics cannot take the last slot on a
+  multi-slot gateway; single-slot gateways still execute serially.
+
+The hub and runner must both be updated for these guarantees; deploy the hub,
+then install the matching dev runner. Existing processes cannot acquire process
+isolation retroactively. A sudden host loss can lose work since the last
+published checkpoint and leaves transfer held until writer quiescence is proved.
+`execution` command `inspect` exposes the exact durable attempt, mailbox and
+operation state. Protocol v1 uses the existing bound-human-decision lifecycle;
+the separately specified local-handoff UI/authorised acceptance contract is not
+implemented by treating an ask answer as autonomous requeue.
+
+Paired operators can inspect the same facts without claiming or resuming work:
+
+```sh
+bridge execution inspect 'BR#123'
+bridge execution availability 'BR#123'
+```
+
+Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
+and independent receipt review; other repositories retain PR/merge-train
+delivery. The generated prompt uses the actual `dispatch-<task>` claim session.
+
 The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board. Worktree teardown is eventual (BR#3633): a `done` task's tree goes immediately (uncommitted work preserved onto a `wip/<task>-<date>` branch first); any tree no running session holds is swept by the periodic hygiene pass — at once when the task reads `done`/`superseded`/`todo`, otherwise after 7 days regardless of status — so a hub outage, an unresolvable task id, or a parked card can never pin disk forever; trees drain oldest-first, capped per tick. The sweep also enumerates the runner's own `<workdir>/worktrees` root and — via `git worktree list` — every REGISTERED worktree of the clones under `<workdir>/repos`. And the **worktree registry** (`~/.bridge/worktree-registry.jsonl`, 2026-11-02) closes the loop mechanically, no discovery: the runner registers every provisioned tree at creation and deregisters at teardown, the takeover prompts direct local sessions to register theirs with an exact one-liner (an unregistered tree is never swept — registration IS the contract), and the sweep enumerates registered paths wherever they live, pruning dead lines on read. Rooted in that contract, the 2026-11-02 incident (185 strays / 471 GB on one checkout, trees registered to a repo the dir-only scans never consulted) cannot recur: the system that directs the worktree's creation records its path, and the sweep joins registry × disk × board status. `sweep_repos` (env `BRIDGE_SWEEP_REPOS`) stays as an explicit extra-roots escape hatch. Claim races are noise, not failures: before claiming, the runner re-reads the card and skips silently when another dispatcher won; a card still `in_progress` whose dispatched session died (no fresh session stamp or hub heartbeat for 10 minutes — the same bar the watchdog uses) has its stale claim released and is re-claimed fresh; and the dispatch circuit breaker counts only genuine agent-CLI failures (spawn, auth, guardrails, provisioning) — lifecycle rejections from races never count toward it.
 
 ```bash

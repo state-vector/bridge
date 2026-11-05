@@ -46,6 +46,8 @@ export type RecoveryReducerEvent = RecoveryEvent | { kind: "executor_assigned"; 
   | { kind: "repair_merged"; task_id: string; pr: number; merge_sha: string; url: string };
 export const RecoveryEpisodeSchema = z.object({
   id: z.string(), head_sha: z.string(), cause: RecoveryCauseSchema,
+  /** Stable incident ancestry; exact-revision episode ids remain proof scopes. */
+  lineage_id: z.string().optional(),
   stage: RecoveryStageSchema, retry_limit: z.number().int().nonnegative(),
   successful_deployments_required: z.number().int().min(1).max(10), verified_receipts: z.array(RecoveryReceiptSchema),
   delivery: z.discriminatedUnion("kind", [
@@ -74,6 +76,26 @@ export function recoveryEpisodeKey(head: string, cause: RecoveryCause): string {
     case "capability_unavailable": return JSON.stringify([head, cause.kind, cause.check, cause.scenario, cause.capability]);
     case "check_failure": return JSON.stringify([head, cause.kind, cause.check]);
   }
+}
+
+export function recoveryCauseKey(cause: RecoveryCause): string {
+  return recoveryEpisodeKey("", cause);
+}
+
+/** Continue an OPEN fault at a new revision without resetting its attempts or
+ * history. Evidence coverage never carries: the new exact revision must pass
+ * its own verification bar. A recovered fault recurring is a new incident. */
+export function continueRecoveryLineage(previous: RecoveryEpisode, head_sha: string, task_id: string, now: number): RecoveryEpisode {
+  if (!recoveryIsOpen(previous)) throw new Error("only an open fault can continue across revisions");
+  if (head_sha === previous.head_sha) return previous;
+  return RecoveryEpisodeSchema.parse({ ...structuredClone(previous),
+    id: recoveryEpisodeKey(head_sha, previous.cause), head_sha,
+    lineage_id: previous.lineage_id ?? previous.id,
+    verified_receipts: [],
+    stage: { phase: "diagnosing", task_id, next: "Continue the existing fault diagnosis; verify the new exact revision independently" },
+    updated_at: now,
+    history: [...previous.history, { event_id: `continued:${head_sha}`, at: now, actor: "system:recovery", kind: "lineage_continued", summary: `Same unresolved cause continued from ${previous.head_sha}; retry budget and prior attempts preserved, verification coverage reset` }],
+  });
 }
 export function recoveryCauseLabel(cause: RecoveryCause): string {
   switch (cause.kind) {

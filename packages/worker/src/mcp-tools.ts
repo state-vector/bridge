@@ -81,6 +81,11 @@ async function seeAlso(a: any, rel: any, identity: ToolCtx["identity"], call: To
  * this row are what tools/list ADVERTISES and what the fixture test pins.
  */
 export const TOOL_TABLE: ToolTable = defineToolTable({
+  execution: {
+    description: "Durable executor protocol v1: inspect/advertise, fenced begin/poll, published checkpoint/verified restore/quiesce, active mailbox, persistent tier escalation, and idempotent external-operation receipts. Lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
+    schema: TOOL_ARG_SCHEMAS.execution,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("execution", { ...args, session: args.session ?? ctx.sessionName }))),
+  },
   orient: {
     description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags. Every artefact row carries url — its stable deep link (/card/BR-NNNN), pasteable in a browser.",
     schema: TOOL_ARG_SCHEMAS.orient,

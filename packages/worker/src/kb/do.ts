@@ -226,6 +226,8 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
+import { ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState } from "@bridge/contracts";
+import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -2849,6 +2851,19 @@ export class KnowledgeHub {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS execution_state (
+        task_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        worker_token_id TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS execution_commands (
+        task_id TEXT NOT NULL, command_id TEXT NOT NULL,
+        request TEXT NOT NULL, result TEXT NOT NULL,
+        PRIMARY KEY (task_id, command_id)
+      );
+      CREATE TABLE IF NOT EXISTS execution_hosts (
+        token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS workspaces (
         slug TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -3521,7 +3536,9 @@ export class KnowledgeHub {
     const actor = String(body.actor ?? "mcp");
 
     try {
+      this.executionMutationGuard(op, body);
       switch (op) {
+        case "execution": return this.json(this.executionCommand(body, actor));
         case "create": return this.json(await this.create(body, actor));
         case "boost": return this.json(await this.boost(body, actor));
         case "get": return this.json(await this.get(String(body.id)));
@@ -4431,6 +4448,146 @@ export class KnowledgeHub {
   /** Every rejected transition is audited (transition_rejected: actor, from, to,
    *  reason) — gaming the gates is visible in the Log and costs behaviour score.
    *  The rejection then goes through the breach door: storms raise ONE card. */
+  private executionState(id: string): ExecutionState | null {
+    const row = this.one(`SELECT state FROM execution_state WHERE task_id = ?`, id);
+    return row ? ExecutionStateSchema.parse(JSON.parse(row.state)) : null;
+  }
+
+  /** The bearer and scope headers are stamped by mcp.ts, never argument fields.
+   * A worker cannot remove its headers to fall back to a legacy unfenced write. */
+  private executionMutationGuard(op: string, body: Record<string, unknown>): void {
+    const writes = new Set(["create", "update", "transition", "claim.takeover", "link", "ask.create", "ask.answer", "train.event", "train.ci", "train.lease", "train.recovery_event"]);
+    if (!writes.has(op)) return;
+    const bound = this.one(`SELECT task_id FROM execution_state WHERE worker_token_id = ? LIMIT 1`, String(body.token_id ?? ""));
+    if (bound) {
+      const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | null;
+      const state = scope?.id ? this.executionState(scope.id) : null;
+      const binding = scope?.id ? this.one(`SELECT worker_token_id FROM execution_state WHERE task_id = ?`, scope.id) : null;
+      const a = state?.attempt;
+      const claim = scope?.id ? this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, scope.id) : null;
+      const claimSession = claim ? JSON.parse(claim.meta ?? "{}").session : null;
+      const interrupted = state?.messages.some(m => m.priority === "interrupt" && m.state !== "acted") && op !== "ask.answer";
+      if (!a || interrupted || claim?.status !== "in_progress" || claimSession !== a.session || binding?.worker_token_id !== body.token_id || scope?.generation !== a.generation || scope?.attempt_id !== a.attempt_id || a.phase !== "running" || a.lease_until <= Date.now() || a.action_deadline <= Date.now()) {
+        throw new Error("gate: execution mutation fenced — stop and checkpoint; runner must verify restore/quiescence before resuming");
+      }
+    }
+    if (op === "transition" && body.to === "in_progress") {
+      const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, String(body.id ?? ""));
+      const a = this.executionState(String(body.id ?? ""))?.attempt;
+      if (row?.status === "todo" && a && a.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — preserve host affinity");
+      const requirements = row ? JSON.parse(row.meta ?? "{}").execution_requirements : null;
+      if (row?.status === "todo" && requirements) {
+        const token = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
+        if (token && tagsSayGateway(parseTags(token.tags))) {
+          const host = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, String(body.token_id));
+          if (!host || Date.now() - host.observed_ts > 120_000) throw new Error("gate: claim requires a live executor capability observation");
+          const blockers = capabilityBlockers(ExecutionRequirementsSchema.parse(requirements), ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities)), token.label);
+          if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
+        }
+      }
+    }
+  }
+
+  /** No awaits between read/decide/write. State and replay receipt share one
+   * SQLite transaction; replay after a lost response never authorises a second
+   * Git/AWS effect. Those effects still require inspect-and-reconcile. */
+  private executionCommand(raw: unknown, actor: string) {
+    const req = ExecutionRequestSchema.parse(raw);
+    const body = raw as Record<string, unknown>;
+    const tokenId = String(body.token_id ?? "");
+    const token = this.one(`SELECT label, principal, tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, tokenId);
+    if (!token) throw new Error("gate: durable execution requires a live authenticated credential");
+    const gateway = tagsSayGateway(parseTags(token.tags));
+    const command = req.command;
+    const now = Date.now();
+    if (command.kind === "advertise") {
+      if (!gateway) throw new Error("gate: only authenticated gateways advertise executor capabilities");
+      this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(command.capabilities), now);
+      return { ok: true, observed_ts: now, expires_ts: now + 120_000 };
+    }
+    const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
+    if (!row) throw new Error("gate: durable execution requires a task");
+    const meta = JSON.parse(row.meta ?? "{}");
+    let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
+    if (command.kind === "inspect") return current;
+    if (command.kind === "availability") {
+      const hosts = this.state.storage.sql.exec(`SELECT t.label, h.capabilities, h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(h => {
+        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(h.capabilities)));
+        const blockers = capabilityBlockers(current.requirements, capabilities, String(h.label));
+        const active = this.one(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state, '$.attempt.host') = ? AND json_extract(state, '$.attempt.phase') IN ('running','restoring') AND json_extract(state, '$.attempt.lease_until') > ?`, h.label, now);
+        return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
+      });
+      const eligible = hosts.filter(h => !h.blockers.length);
+      const live = eligible.filter(h => h.expires_ts > now);
+      return { requirements: current.requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : live.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
+    }
+    const owner = token.principal ?? (gateway ? String(body.agent ?? "") : actor);
+    const binding = this.one(`SELECT worker_token_id FROM execution_state WHERE task_id = ?`, req.id);
+    const worker = binding?.worker_token_id === tokenId;
+    const attemptHost = current.attempt?.host;
+    if (command.kind !== "message" && !(owner === row.owner || worker || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
+    const session = req.session ?? "";
+    if (!session) throw new Error("gate: durable execution requires an explicit session");
+    const encoded = JSON.stringify({ command, session, actor });
+    const old = this.one(`SELECT request, result FROM execution_commands WHERE task_id = ? AND command_id = ?`, req.id, req.command_id);
+    if (old) {
+      if (old.request !== encoded) throw new Error("gate: command_id reused with different input");
+      return JSON.parse(old.result);
+    }
+    if (command.kind === "poll") {
+      if (current.attempt && (row.status !== "in_progress" || meta.session !== current.attempt.session)) current.attempt.phase = "stopping";
+      // Reconcile the durable ask inbox on every safe-point poll. This repairs
+      // a crash between ask creation and notification without a second writer
+      // or a bootstrap-only inbox. The question remains the source of truth.
+      const asks = this.state.storage.sql.exec(`SELECT id, title, body_md, meta FROM artefacts WHERE type = 'question' AND status IN ('todo','in_progress','blocked') AND json_extract(meta, '$.ask.route.kind') = 'executor_coordination' AND json_extract(meta, '$.ask.route.task_id') = ? LIMIT 100`, req.id).toArray();
+      for (const ask of asks) {
+        const askMeta = JSON.parse(String(ask.meta ?? "{}"));
+        const messageId = `ask:${ask.id}`;
+        if (!current.messages.some(m => m.id === messageId)) current = reduceExecution(current, {
+          kind: "message", message_id: messageId, text: `${ask.id}: ${ask.title}\n${ask.body_md}`.slice(0, 4000),
+          priority: askMeta.ask?.urgency === "time-sensitive" ? "interrupt" : "normal",
+        }, "system:coordination", "system:coordination", now);
+      }
+    }
+    let workerTokenId = String(binding?.worker_token_id ?? "");
+    if (command.kind === "begin") {
+      if (row.status !== "in_progress" || meta.session !== session) throw new Error("gate: begin requires the current task claim/session");
+      const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
+      if (!advertised || now - advertised.observed_ts > 120_000) throw new Error("gate: executor capabilities missing/stale — advertise live facts before begin");
+      const blockers = capabilityBlockers(current.requirements, ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities)), actor);
+      if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
+      if (!gateway || !command.worker.startsWith(`${actor}/`)) throw new Error("gate: runner worker must belong to its authenticated gateway");
+      const child = this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, command.worker);
+      if (!child) throw new Error("gate: worker credential must be provisioned before begin");
+      workerTokenId = child.id;
+    } else if (["poll", "restore", "checkpoint", "quiesce"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
+      throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
+    }
+    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
+    if (command.kind === "begin" && next.attempt) {
+      const advertised = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id = ?`, tokenId);
+      next.attempt.executor = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+    }
+    if (command.kind === "yield" && (row.status !== "in_progress" || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
+      this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(next));
+      // Control polls do not authorise external effects. Keep a bounded replay
+      // window for their transport retries; mutation/effect receipts persist.
+      if (command.kind === "poll") this.state.storage.sql.exec(`DELETE FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' AND rowid NOT IN (SELECT rowid FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' ORDER BY rowid DESC LIMIT 32)`, req.id, req.id);
+      // Requirements are persistent infrastructure, never a prompt-only hint.
+      meta.execution_requirements = next.requirements;
+      if (command.kind === "yield") {
+        delete meta.session;
+        this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), req.id);
+      } else {
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), req.id);
+      }
+    });
+    if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
+    return next;
+  }
+
   private async transition(body: any, actor: string) {
     try {
       return await this.doTransition(body, actor);
@@ -8832,7 +8989,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(row.meta ?? "{}");
     const ledger = RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {});
     const key = recoveryEpisodeKey(cmd.head_sha, cmd.cause);
-    const previous = ledger[key];
+    const ancestor = cmd.event.kind === "observed" && !ledger[key]
+      ? Object.values(ledger).filter(e => recoveryIsOpen(e) && recoveryCauseKey(e.cause) === recoveryCauseKey(cmd.cause)).sort((a, b) => b.updated_at - a.updated_at)[0]
+      : undefined;
+    if (ancestor) {
+      const activeRepair = this.one(`SELECT status FROM artefacts WHERE id = ?`, ancestor.stage.task_id);
+      if (activeRepair && !["done", "superseded"].includes(activeRepair.status)) cmd.event.task_id = ancestor.stage.task_id;
+    }
+    const previous = ledger[key] ?? (ancestor ? continueRecoveryLineage(ancestor, cmd.head_sha, cmd.event.task_id, Date.now()) : undefined);
     const task = this.one(`SELECT type, status, status_ts, owner, meta, tags FROM artefacts WHERE id = ?`, cmd.event.task_id);
     if (!task || task.type !== "task") throw new Error("recovery must bind an existing repair task");
     if (cmd.event.kind !== "observed" && cmd.event.kind !== "delivery_submitted" && cmd.event.kind !== "repair_delivery_observed") {
@@ -8897,6 +9061,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     }
     ledger[key] = episode;
+    if (ancestor && accepted) ledger[ancestor.id] = { ...ancestor,
+      stage: { phase: "superseded", task_id: ancestor.stage.task_id, reason: "Unresolved fault continued at a new exact revision", next: `Follow incident ${episode.lineage_id ?? episode.id} at ${cmd.head_sha}` } };
     // A more specific diagnosis replaces a job-name placeholder. It does not
     // erase other specific causes, reset attempts, or pretend they recovered.
     if (cmd.cause.kind !== "check_failure") {

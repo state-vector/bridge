@@ -24,6 +24,8 @@
 #[path = "../../desktop/src-tauri/src/dispatch.rs"]
 #[allow(dead_code)]
 mod dispatch;
+#[path = "../../desktop/src-tauri/src/checkpoint.rs"]
+mod checkpoint;
 #[path = "../../desktop/src-tauri/src/keychain.rs"]
 #[allow(dead_code)]
 mod keychain;
@@ -115,6 +117,19 @@ fn main() {
                     eprintln!("no runner state — is a runner running?");
                     std::process::exit(1);
                 }
+            }
+        }
+        "execution" => {
+            let kind = match args.get(2).map(String::as_str) {
+                Some("inspect") => dispatch::ExecutionRead::Inspect,
+                Some("availability") => dispatch::ExecutionRead::Availability,
+                _ => { eprintln!("usage: bridge execution inspect|availability <task-id>"); std::process::exit(2); }
+            };
+            let task_id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("execution requires a BR# task id"); std::process::exit(2); });
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
+            match dispatch::execution_read(&cfg, task_id, kind) {
+                Ok(state) => println!("{}", serde_json::to_string_pretty(&state).unwrap_or_default()),
+                Err(error) => { eprintln!("bridge execution: {error}"); std::process::exit(1); }
             }
         }
         "reset-principal" => {

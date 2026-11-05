@@ -37,6 +37,41 @@ Every push to `main` also publishes a rolling **dev** pre-release of the binarie
 
 ## How work flows
 
+### Durable execution and preserved work
+
+Execution protocol v1 connects the hub's SQLite journal to the native runner.
+Before spawning, the runner obtains a fenced attempt generation. It publishes
+signed private-index Git checkpoints every five minutes and at process exit,
+including tracked/untracked non-ignored work, and verifies the remote ref. A
+replacement writer requires proven process-group quiescence; cross-machine
+continuation also verifies the checkpoint's commit and content tree. Failed
+publication, newer local WIP or unproven writer isolation retains the work and
+host affinity. A dead host cannot guarantee preservation of changes since its
+last published checkpoint.
+
+Action budgets are independent of stdout activity. Task-addressed coordination
+is delivered through a durable queued/delivered/acknowledged/acted mailbox;
+non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
+operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution
+MCP tool exposes exact state and availability, including expired supporting
+gateways versus busy capacity. Backend `reasoning_tier` declarations and task
+minimum requirements are explicit, persistent and checked by the hub—there is
+no model-name guessing or silent downgrade. Explicit model escalation yields
+only after work is portable and the old writer is quiescent; it does not ask a
+human to staff another agent.
+
+Unresolved recovery causes retain their history and retry budget across new
+commits, while each new exact revision must earn its own deployment verification.
+Repair/review/deployment-verification tasks sort first; diagnostics leave the
+last slot available on multi-slot gateways.
+Both hub and runner need the matching protocol version. Bound human decisions
+remain separate from the specified local-handoff flow; protocol v1 does not
+implement local acceptance by auto-resuming an answered ask. Bridge's own
+repository uses signed direct-main delivery and independent receipt review;
+other repositories retain their PR/merge-train policy.
+Paired CLI operators can read the same facts with `bridge execution inspect 'BR#123'`
+and `bridge execution availability 'BR#123'`; neither command claims work.
+
 ```
 you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►  RUNNER (gateway/CLI)
                                       ▲                            │
