@@ -213,6 +213,12 @@ reports. Missing next actions are shown explicitly rather than invented.
 
 The train status, message and recovery banner consume the hub's shared typed
 `line` projection. A failed decisive deployment overrides green job subsets;
+when a ready cure needs a human bypass merge, the line says **Fix ready — your
+merge is needed** and links directly to the fix PR and its confirmation request.
+Historical recovery episodes and agent logs are expandable details. A current
+merge refusal gets its own repair ownership, not yesterday's starvation report.
+The executor selects a merge method allowed by both repository settings and the
+effective branch rules, including linear history; unreadable policy holds merges.
 an older successful deployment cannot cover a different commit. Stopped lines
 show the failed run and recovery task with live executor progress and next
 action, including when no PRs remain queued. Unknown or stale observations are

@@ -12985,7 +12985,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const meta = JSON.parse(lane?.meta ?? "{}");
     const cfg = laneOfMeta(meta);
     if (!cfg) return line;
-    const current = this.trainOpenRootFix(cfg.repo).card;
+    const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo).card;
+    const episode = `${line.blocker}:${line.blocker === "merge_failed"
+      ? meta.lane?.queue_facts?.stalled?.since ?? "current"
+      : meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`;
     const bound = current ? this.enrichFixCardRow(current.id, now) : null;
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
       ...line, remediation: { kind: bound.active_agent ? "agent" : "queued", task: bound,
@@ -12995,8 +12998,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
        AND json_extract(meta, '$.machine_duty.subject') = ?
        AND json_extract(meta, '$.machine_duty.kind') IN ('line_recovery','task-recovery','diagnostic')
-       AND ((json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded')) OR json_extract(meta, '$.machine_duty.episode') = ?) ORDER BY created_ts DESC`, laneId,
-      `${line.blocker}:${meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`,
+       AND ((? != 'merge_failed' AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
+         OR (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
+         OR json_extract(meta, '$.machine_duty.episode') = ?) ORDER BY created_ts DESC`, laneId,
+      line.blocker, episode,
     ).toArray();
     const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
     const task = open ? this.enrichFixCardRow(open.id, now) : null;
@@ -13012,10 +13017,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     if (!exhausted) {
       const created = await this.create({
         type: "task", title: `Restore work flow on ${cfg.repo}@${cfg.base}: ${line.label}`,
-        body_md: `The line cannot advance: ${line.reason}\n\nRead live GitHub runs and gateway status. Recover the missing executor/deploy/check or resolve the named mechanical failure automatically. Do not report success while the line remains stuck. Publish did/next progress at least every 10 minutes. Ask for human action only when a concrete permission, unavailable credential, or authored decision prevents recovery.\n\nEvidence: ${line.evidence.map((e) => `${e.name} ${e.url ?? ""}`).join("; ")}`,
+        body_md: `The line cannot advance: ${line.reason}\n\nRead live GitHub runs and gateway status. Recover the missing executor/deploy/check or resolve the named mechanical failure automatically. Do not report success while the line remains stuck. Publish did/next progress at least every 10 minutes. Ask for human action only when a concrete permission, unavailable credential, or authored decision prevents recovery.\n\nEvidence: ${line.evidence.map((e) => `${e.name} ${e.url ?? ""}`).join("; ")}\n\nMerge rejection: ${meta.lane?.queue_facts?.stalled?.last_error ?? "none"}`,
         qualified: true, roles: ["impl"], tags: ["merge-train", "diagnostic", "p0"], session: "",
         meta: { machine_duty: { by: "system:train", kind: "line_recovery", subject: laneId,
-          episode: `${line.blocker}:${meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}` }, boosted: now },
+          episode }, boosted: now },
       }, "system:train");
       this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, created.id, laneId, now);
       const assigned = this.enrichFixCardRow(String(created.id), now)!;
@@ -14134,9 +14139,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         fixCard: base_red_resolution?.fix_card ?? null,
         now: now0,
       });
-      const diagnosticId = meta.lane?.gate_blocked?.duty_id ?? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id;
+      const diagnosticId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.duty_id
+        : starved ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
       const diagnostic = diagnosticId ? this.enrichFixCardRow(String(diagnosticId), now0) : null;
-      const diagnosticAskId = meta.lane?.gate_blocked?.ask_id ?? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id;
+      const diagnosticAskId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.ask_id
+        : starved ? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id : null;
       const diagnosticAskRow = diagnosticAskId ? this.one(`SELECT id, title, meta FROM artefacts WHERE id = ? AND status = 'todo'`, String(diagnosticAskId)) : null;
       const diagnosticAskMeta = diagnosticAskRow ? JSON.parse(diagnosticAskRow.meta ?? "{}") : null;
       const lineFacts = TrainLineFactsSchema.safeParse({

@@ -3024,6 +3024,9 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await acquire(repo, "gw-stall", { merge_capable: true, required_workflows: ["Test"] });
     const c1 = await queueViaAccept({ repo, pr: 53761, head: "e".repeat(40), title: "IMPL: stall drill 1" });
     const c2 = await queueViaAccept({ repo, pr: 53762, head: "f".repeat(40), title: "IMPL: stall drill 2" });
+    const initialLane = await laneSnap(repo);
+    const staleDiagnostic = await kbJson("/create", { type: "task", title: "Yesterday's starvation diagnosis", qualified: true,
+      meta: { machine_duty: { kind: "diagnostic", subject: initialLane.card } } });
 
     const stamp = (stalled: unknown) =>
       kbJson("/train.queue_facts", {
@@ -3050,8 +3053,13 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`));
     expect(ask).toBeUndefined();
     expect(sr.ask ?? null).toBeNull();
-    const repair = (await kbJson("/get", { id: lane.card })).body.meta.recovery.task_id;
-    expect((await kbJson("/get", { id: repair })).body.meta.machine_duty.kind).toBe("task-recovery");
+    expect(lane.line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge" });
+    expect(lane.line.remediation.task.id).not.toBe(staleDiagnostic.body.id);
+    const repair = lane.line.remediation.task.id;
+    expect((await kbJson("/get", { id: repair })).body.meta.machine_duty).toMatchObject({
+      kind: "line_recovery", subject: lane.card,
+    });
+    expect((await laneSnap(repo)).line.remediation.task.id).toBe(repair);
 
     // ONE ask per episode — the per-tick stamp repeats dedupe on the
     // numberless title (no tick counts, no ages)
