@@ -1220,7 +1220,10 @@ main landed nothing. Two laws close the class:
   owns the lane, and gone the moment anything lands. A tick that never attempts
   (empty batch, no merge leg) is idle, not stalled; any landing resets the episode.
 - **Merge-method fallback**: a merge-method refusal (`…not allowed on this
-  repository`) is a REPO POLICY mismatch, never a PR defect — the executor retries
+  repository` — or the ruleset-era answer `the base branch policy prohibits the
+  merge`, BR#6673: a branch ruleset pinning `allowed_merge_methods` to
+  squash+rebase refuses every `gh pr merge --merge` attempt with that text) is a
+  REPO POLICY mismatch, never a PR defect — the executor retries
   the refused member with an allowed method, SQUASH first (the standing
   superpositional landing shape — sp main's history is all squash), then rebase,
   then merge, and remembers the working method per repo for the process lifetime
