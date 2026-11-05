@@ -404,7 +404,7 @@ export const RULES: Rule[] = [
       !!i.meta?.session &&
       String(i.meta.session) !== String(i.body.session),
     guard: (i) =>
-      `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (owner/web-directed, BR#6135) — you are the superseded holder. ` +
+      `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. ` +
       "STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish.",
   },
   {

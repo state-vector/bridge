@@ -11,14 +11,23 @@
  *
  * Authority is SERVER-VERIFIED, never self-declared (BR#2673: human
  * authority exists only in an interactive authenticated session; a bare
- * agent flag is not one). The three accepted anchors, all derived from
+ * agent flag is not one). The accepted anchors, all derived from
  * token/auth state by the caller (do.ts):
  *   1. human plane — actor matches web:/human: (OWNER_RELEASE_EXEMPT family)
  *   2. owner label — the acting token's agent label IS the card owner
  *   3. owner principal — the acting token's principal IS the card owner
  *      (labels are display; principals are the anchor, do.ts claim path)
- * plus the gateway-attribution pair (body.gateway + body.agent === owner),
- * the same pair the release-ownership rule trusts (BR#3611).
+ *   4. gateway attribution pair (body.gateway + body.agent === owner), the
+ *      same pair the release-ownership rule trusts (BR#3611)
+ *   5. FULL-AGENT credential (BR#6436, Ray ruling 2026-11-05 — supersedes
+ *      the owner-only portion of BR#6159): the acting token's LIVE
+ *      auth_tokens.tags classify as a full authenticated agent — no
+ *      `gateway` tag (the attribution plane), no `cadence:cron` tag (an
+ *      unattended schedule). This anchor is deliberately CROSS-OWNER: a
+ *      full agent may pull rank over a dispatched runner claim it does not
+ *      own. It still reads the credential, never the body — a session
+ *      cannot declare itself a full agent any more than it could declare
+ *      itself the owner.
  *
  * Refusals are terminal semantic gates — each carries a [rule: takeover-*]
  * tag that machine.ts RULE_BREACH_CLASSES folds into the never-a-breach
@@ -55,6 +64,10 @@ export interface TakeoverAuthority {
    *  agent token cannot forge it (mcp.ts only forwards agent with the
    *  gateway tag). */
   attributedAgent?: string | null;
+  /** The acting token's LIVE auth_tokens.tags, parsed by the caller — the
+   *  full-agent anchor's ONLY source (BR#6436). null/undefined = no token
+   *  row resolved for the caller: fail-closed, no credential no authority. */
+  actingTags?: string[] | null;
   /** The acting session name (resolveSession). */
   session?: string | null;
 }
@@ -73,7 +86,26 @@ export type TakeoverRuleTag =
   | "takeover-held"
   | "takeover-authority";
 
-/** Does the acting identity hold owner-or-human authority over the card?
+/** BR#6436 — does this LIVE credential tag set classify as a full agent?
+ *  The closed law: `gateway` (the attribution plane — infrastructure) and
+ *  `cadence:cron` (an unattended schedule — no agent behind it) NEVER pull
+ *  rank; every other authenticated agent token does, untagged worker tokens
+ *  included (BR#2455: class is a tag and the default class is full agent).
+ *  Null/undefined input means no live token row resolved for the caller —
+ *  fail-closed false. Pure string law; the caller (do.ts) owns the token
+ *  read. */
+export function isFullAgentCredential(tags: readonly string[] | null | undefined): boolean {
+  if (!Array.isArray(tags)) return false; // no credential resolved — fail closed
+  // Tag comparisons are case-insensitive like tagsSayGateway: tags are
+  // user-malleable and mint does not sanitize them.
+  return !tags.some((t) => {
+    const k = String(t).toLowerCase();
+    return k === "gateway" || k === "cadence:cron";
+  });
+}
+
+/** Does the acting identity hold owner-or-human authority over the card —
+ *  or, since BR#6436, full-agent credential authority (cross-owner)?
  *  The named anchors in precedence order; used by the decision and by
  *  tests. Pure string law — no token reads here. */
 export function takeoverAuthority(target: TakeoverTarget, a: TakeoverAuthority): boolean {
@@ -81,6 +113,7 @@ export function takeoverAuthority(target: TakeoverTarget, a: TakeoverAuthority):
   if (target.owner && a.actor === target.owner) return true; // owner label
   if (target.owner && a.actingPrincipal && a.actingPrincipal === target.owner) return true; // owner principal
   if (target.owner && a.attributedAgent && a.attributedAgent === target.owner) return true; // gateway pair
+  if (isFullAgentCredential(a.actingTags)) return true; // full-agent credential (BR#6436, cross-owner)
   return false;
 }
 
@@ -125,7 +158,7 @@ export function decideTakeover(target: TakeoverTarget, a: TakeoverAuthority): Ta
       ok: false,
       rule: "takeover-authority",
       message:
-        `claim takeover of ${target.id} is owner/web/human-anchored (BR#2673: authority is server-verified, never self-declared) — ` +
+        `claim takeover of ${target.id} is owner/web/human-anchored or full-agent-credentialed (BR#2673: authority is server-verified, never self-declared; BR#6436: a full authenticated agent token — not gateway, not cron — may pull rank across owners) — ` +
         `you are ${a.actor || "anonymous"} and the card is held by ${target.owner || "nobody"}. ` +
         "If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane).",
     };

@@ -77,7 +77,7 @@ export const TOOL_ARG_SCHEMAS = {
     note: z.string().optional(),
     session: z.string().optional(),
   }).describe(
-    "Interactive claim takeover (BR#2997/BR#6135): the card's OWNER agent (or a human via web) atomically re-takes an in_progress task claim held by a dispatched runner session — no release→pool→re-claim race. Status stays in_progress; meta.session flips to you; the ex-holder's next state-change is gate-rejected with a stand-down order (checkpoint last_will, exit). Refused on verify/unblock duty cards and cards holding a typed wait (train slot / await_event / bound ask). Non-owner agents: ask the human or coordinate via ask_agent.",
+    "Interactive claim takeover (BR#2997/BR#6135, amended BR#6436): the card's OWNER agent, a human via web, or an authenticated FULL-AGENT credential (your token's LIVE tags say full agent — gateway/cron credentials excluded; never body-declared) atomically re-takes an in_progress task claim held by a dispatched runner session — across owners. No release→pool→re-claim race. Status stays in_progress; meta.session flips to you; the ex-holder's next state-change is gate-rejected with a stand-down order (checkpoint last_will, exit). Refused on verify/unblock duty cards and cards holding a typed wait (train slot / await_event / bound ask). Credentials with no authority anchor: ask the human or coordinate via ask_agent.",
   ),
   create_artefact: z.looseObject({
     type: z.string(),
@@ -120,9 +120,10 @@ export const TOOL_ARG_SCHEMAS = {
     budget_minutes: z.number().int().max(1440).optional(),
     replacement_id: z.string().optional(),
     session: z.string().optional(),
-    /** BR#6135 interactive claim takeover: with to:"in_progress" and
-     *  takeover:true the transition becomes an owner/web-anchored claim
-     *  re-take (same op as claim_takeover) instead of the (illegal)
+    /** BR#6135 interactive claim takeover, amended BR#6436: with
+     *  to:"in_progress" and takeover:true the transition becomes a claim
+     *  re-take (owner/web-anchored, or a full-agent credential across
+     *  owners — same op as claim_takeover) instead of the (illegal)
      *  in_progress→in_progress edge. */
     takeover: z.boolean().optional(),
     /** BR#6432 executor-applied batch SUPERSEDE authorization: with
