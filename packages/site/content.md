@@ -136,6 +136,8 @@ other repositories retain their PR/merge-train policy.
 Managed updates can pause only that gateway's new claims for five minutes,
 checkpoint active tasks through their durable mailbox, and resume after a
 writer-free replacement. Neither the pause nor expiry weakens transfer fences.
+Quiescent same-host claims resume from their durable state rather than waiting
+for a stale conversation timestamp; changed holders/local handoffs stay fenced.
 Paired CLI operators can read the same facts with `bridge execution inspect 'BR#123'`
 and `bridge execution availability 'BR#123'`; neither command claims work.
 
