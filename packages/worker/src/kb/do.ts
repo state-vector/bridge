@@ -224,7 +224,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -12412,7 +12412,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const bound = current ? this.enrichFixCardRow(current.id, now) : null;
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
       ...line, remediation: { kind: bound.active_agent ? "agent" : "queued", task: bound,
-        text: bound.last_progress?.note ?? "Repair work is queued for an available agent." },
+        text: bound.active_agent ? repairProgressText(bound) : "Repair work is queued for an available agent." },
     };
     const duties = this.state.storage.sql.exec(
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
@@ -12425,7 +12425,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const task = open ? this.enrichFixCardRow(open.id, now) : null;
     if (task && !this.rootFixExhausted(JSON.parse(String(open!.meta ?? "{}")), task.status)) return {
       ...line, remediation: task.active_agent
-        ? { kind: "agent", task, text: task.last_progress?.note ?? "An agent is investigating why work cannot move." }
+        ? { kind: "agent", task, text: repairProgressText(task) }
         : { kind: "queued", task, text: task.status === "blocked"
             ? `The repair is waiting: ${task.blocked_reason ?? "see the repair task for its next step"}`
             : task.status === "in_progress" ? "The repair has no recent heartbeat; the watchdog will reassign it if the session remains silent."
@@ -12473,7 +12473,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       m = {};
     }
     const status = String(r.status ?? "");
-    const owner = String(r.owner ?? "").trim() || undefined;
+    const owner = r.owner ? this.displayOwner(String(r.owner)).trim() || undefined : undefined;
     const executorSession =
       status === "in_progress" && typeof m?.session === "string" && m.session.trim()
         ? m.session.trim()

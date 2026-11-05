@@ -48,10 +48,16 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
           {task.id} — {task.title}
         </TaskLink>{task.owner ? ` · ${task.owner}` : ""}</span>
         <span className="train-banner-line">{action.text}</span>
+        {task.last_progress?.note && task.last_progress.note !== action.text && (
+          <details className="train-banner-line">
+            <summary>Latest agent output</summary>
+            <div>{task.last_progress.note}</div>
+          </details>
+        )}
         {task.last_progress && <span className="train-banner-line">
           Last update {age(task.last_progress.ts, now)} ago
           {task.last_progress.completion_pct != null ? ` · ${task.last_progress.completion_pct}%` : ""}
-          {task.last_progress.will ? ` · NEXT: ${task.last_progress.will}` : ""}
+          {task.last_progress.will ? ` · NEXT: ${task.last_progress.will}` : action.kind === "agent" ? " · Next action not yet reported" : ""}
         </span>}
       </>;
     }

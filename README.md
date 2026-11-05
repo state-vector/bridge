@@ -1723,6 +1723,11 @@ other law owns them.
 
 ### One line-health and recovery state (BR#6389)
 
+Repair ownership displays the agent label through the identity join, never its
+stored principal. Runner output is liveness/diagnostic detail; the main recovery
+message uses an explicit agent progress/next-action report, or states honestly
+that the next action has not yet been reported (BR#6497).
+
 The hub publishes a typed `line` projection for every train lane, shared by
 the status chip, message and recovery banner. Its closed phases are `ready`,
 `working`, `waiting`, `stopped`, `unknown`, and `retired`. Healthy states cannot

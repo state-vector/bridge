@@ -1,5 +1,16 @@
 import { z } from "zod";
 import { BaseRedResolutionSchema, DeployCoverageStateSchema, TrainFixCardSchema } from "./train.ts";
+import type { TrainFixCard } from "./train.ts";
+
+/** Runner stream messages prove liveness, not a structured progress report.
+ * Keep their raw output available in details, without advertising fragments
+ * of internal reasoning as the operator's next action. */
+export function repairProgressText(task: TrainFixCard): string {
+  const note = task.last_progress?.note?.trim();
+  if (note && !note.startsWith("runner:")) return note;
+  if (task.last_progress?.will) return `Next: ${task.last_progress.will}`;
+  return "Agent session is active; next action has not yet been reported.";
+}
 
 const EvidenceSchema = z.object({ name: z.string(), url: z.string().optional() });
 const ActionSchema = z.object({ id: z.string(), url: z.string(), question: z.string(), options: z.array(z.string()) });
@@ -80,7 +91,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     if (ask) return { kind: "human", text: task?.pr && !task.merged
       ? `Merge repair PR #${task.pr}, then choose DONE in the request. Main's failing checks prevent the automatic merge.`
       : `Automatic repair is stuck${task?.blocked_reason ? `: ${task.blocked_reason}` : "."} Provide the missing access or repair instructions in the request.`, action: ask };
-    if (task?.active_agent) return { kind: "agent", text: task.last_progress?.note ?? "An agent is investigating the failure.", task };
+    if (task?.active_agent) return { kind: "agent", text: repairProgressText(task), task };
     if (task && (task.status === "todo" || task.status === "in_review")) return {
       kind: "queued", text: task.status === "todo" ? "Repair is queued at top priority; waiting for an available agent." : "The repair is awaiting independent verification.", task,
     };

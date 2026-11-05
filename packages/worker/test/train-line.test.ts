@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine } from "@bridge/contracts";
+import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText } from "@bridge/contracts";
 import { applyDeployObservation, normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
 
 const now = 2_000_000;
@@ -8,6 +8,12 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("runner transcripts remain diagnostic output, never an invented next action", () => {
+    const runner = { ...task, last_progress: { note: "runner: agent output — timing suggests classifier...", ts: now } };
+    expect(repairProgressText(runner)).toBe("Agent session is active; next action has not yet been reported.");
+    expect(repairProgressText({ ...runner, last_progress: { ...runner.last_progress, will: "Run the classifier regression fixture" } })).toBe("Next: Run the classifier regression fixture");
+    expect(repairProgressText(task)).toBe("Reading the failed deployment log");
+  });
   const required = ["deploy / Deploy to dev", "post-deploy / Post-Deploy Smoke", "post-deploy / DNS chain (front doors)", "post-deploy / Lodestar Operational Health"];
   const scopedGreen: MainCheckVerdict = { verdict: "green", red: [], unsettled: [], green: 4 };
   const workflow = (id: number, head_sha: string, conclusion: string): DeployWorkflowRun => ({

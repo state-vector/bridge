@@ -107,6 +107,10 @@ Backlog distinguishes a passive **PR dependency** (the PR owner delivers it; the
 
 ### One authoritative line-health state
 
+Recovery names the agent by its display label. Raw runner transcripts are
+expandable diagnostic details; they are not presented as structured next-action
+reports. Missing next actions are shown explicitly rather than invented.
+
 The train status, message and recovery banner consume the hub's shared typed
 `line` projection. A failed decisive deployment overrides green job subsets;
 an older successful deployment cannot cover a different commit. Stopped lines
