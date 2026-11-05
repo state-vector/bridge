@@ -225,7 +225,7 @@ import {
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
-import { RecoveryCommandSchema, RecoveryLedgerSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, type RecoveryEpisode, type RecoveryEvent } from "@bridge/contracts";
+import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, type RecoveryEpisode, type RecoveryEvent } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -8803,6 +8803,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       repairMeta.root_fix = { ...(repairMeta.root_fix ?? {}), repo: cmd.repo, base: cmd.base, head_sha: cmd.head_sha,
         why: `Cause-specific recovery: ${cmd.cause.kind}`, bound_at: Date.now(), lane: laneKey(cmd.repo, cmd.base) };
       repairMeta.boosted = Date.now();
+      const links = RecoveryLinksSchema.parse(repairMeta.recovery_links ?? []);
+      if (!links.some((l) => l.repo === cmd.repo && l.base === cmd.base && recoveryEpisodeKey(l.head_sha, l.cause) === key)) links.push({ repo: cmd.repo, base: cmd.base, head_sha: cmd.head_sha, cause: cmd.cause });
+      repairMeta.recovery_links = links;
       const tags = [...new Set([...parseTags(task.tags), "root_blocker", "main-red", "merge-train", "p0"])];
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, tags = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(repairMeta), JSON.stringify(tags), Date.now(), cmd.event.task_id);
       if (task.status === "in_review" || task.status === "done") episode = reduceRecoveryEpisode(episode, {

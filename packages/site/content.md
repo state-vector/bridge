@@ -117,6 +117,8 @@ Code repairs also require independent delivery acceptance; a passing rerun alone
 cannot accept a fix that remains unmerged or unreviewed.
 The banner exposes these cause-specific records so independent defects cannot
 silently replace each other under one smoke-job label.
+Bound repair tasks carry typed recovery links and receive the action/result
+reporting protocol in their agent instructions.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

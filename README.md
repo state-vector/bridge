@@ -1758,6 +1758,9 @@ next step, attempts/results/receipts, and an expandable history. Structured
 `log_progress` and task-submission events update the journal automatically.
 Deployment observations publish actual run attempts and are refreshed by the
 updated train executor, independently of merge-control decisions.
+Bound tasks expose typed `meta.recovery_links`; the agent operating instructions
+name the journal protocol so repair executors can publish action/result facts
+without relying on an operator to transcribe runner output.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery

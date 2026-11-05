@@ -55,6 +55,7 @@ export const RecoveryCommandSchema = z.object({
   cause: RecoveryCauseSchema, event_id: Text, event: RecoveryEventSchema,
 });
 export type RecoveryCommand = z.infer<typeof RecoveryCommandSchema>;
+export const RecoveryLinksSchema = z.array(z.object({ repo: z.string(), base: z.string(), head_sha: z.string(), cause: RecoveryCauseSchema }));
 
 /** Scope/line samples are evidence, not new incidents on every timed-out
  * entity. Workflow attempt numbers never participate in cause identity. */
