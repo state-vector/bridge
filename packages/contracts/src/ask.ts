@@ -20,11 +20,11 @@ export const HumanDecisionSchema = z.object({
     label: z.string().min(1).max(200),
     executor: z.enum(["bridge", "human"]),
     consequence: z.string().min(1).max(500),
-    action: z.enum(["resume", "hold", "release"]),
+    action: z.enum(["resume", "hold", "release", "local_handoff"]),
   })).min(2).max(8),
 }).superRefine((d, ctx) => {
   if (new Set(d.choices.map((c) => c.label)).size !== d.choices.length) ctx.addIssue({ code: "custom", message: "decision choice labels must be unique" });
-  for (const c of d.choices) if (c.executor === "human" && c.action !== "hold") ctx.addIssue({ code: "custom", message: "a human execution step must hold the task until completion is confirmed" });
+  for (const c of d.choices) if (c.executor === "human" && c.action !== "hold" && c.action !== "local_handoff") ctx.addIssue({ code: "custom", message: "a human execution step must hold the task or enter explicit local handoff until completion is confirmed" });
 });
 export type HumanDecision = z.infer<typeof HumanDecisionSchema>;
 

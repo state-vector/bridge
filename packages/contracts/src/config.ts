@@ -23,6 +23,8 @@ import { ReasoningTierSchema } from "./execution.ts";
 export const CONFIG_FORBIDDEN_KEYS = ["token", "principal"] as const;
 
 export const BackendConfigSchema = z.looseObject({
+  enabled: z.boolean().optional(),
+  projects: z.array(z.string()).optional(),
   reasoning_tier: ReasoningTierSchema.optional(),
   bin: z.string().optional(),
   agent: z.string().optional(),

@@ -94,9 +94,17 @@ mod tests {
     struct Sandbox(PathBuf);
     impl Sandbox {
         fn new() -> Self {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let p = std::env::temp_dir().join(format!("bridge-checkpoint-test-{}-{nonce}", std::process::id()));
-            std::fs::create_dir_all(&p).unwrap(); Self(p)
+            loop {
+                let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let p = std::env::temp_dir().join(format!("bridge-checkpoint-test-{}-{nonce}-{sequence}", std::process::id()));
+                match std::fs::create_dir(&p) {
+                    Ok(()) => return Self(p),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("checkpoint sandbox: {error}"),
+                }
+            }
         }
     }
     impl Drop for Sandbox { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }

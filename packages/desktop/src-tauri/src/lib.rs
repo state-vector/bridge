@@ -37,6 +37,14 @@ struct NotifyAskArgs {
     options: Vec<mac_notify::AskOptionDto>,
     urgent: bool,
 }
+#[derive(Deserialize)]
+struct NotifyExecutionArgs { id: String, title: String, body: String }
+#[tauri::command]
+fn notify_execution_attention(app: tauri::AppHandle, args: NotifyExecutionArgs) {
+    let id = args.id.clone(); let title = args.title.clone(); let body = args.body.clone();
+    let _ = app.run_on_main_thread(move || { mac_notify::send_ask_main_thread(&id, &title, &body, &[]); });
+    if !mac_notify::bundled() { let _ = app.notification().builder().title(&args.title).body(&args.body).show(); }
+}
 
 /// Dispatch a decision to the OS notification surface.
 /// Native buttons when bundled (.app); plain notification otherwise.
@@ -213,8 +221,17 @@ fn dispatch_start(
 }
 
 #[tauri::command]
-fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) {
+async fn dispatch_stop(state: tauri::State<'_, dispatch::DispatchState>) -> Result<(), String> {
     dispatch::stop(&state);
+    let running = state.running.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while running.load(std::sync::atomic::Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline { return Err("Gateway is still draining checkpoints; no replacement runner was started. Inspect runtime state before retrying.".into()); }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(())
+    }).await.map_err(|error| error.to_string())?
 }
 
 /// Settings "Reconnect gateway": re-vend the gateway token via the human
@@ -299,6 +316,7 @@ pub fn run() {
         .manage(dispatch::DispatchState::new())
         .invoke_handler(tauri::generate_handler![
             notify_ask,
+            notify_execution_attention,
             dispatch_status,
             dispatch_config,
             dispatch_snapshot,

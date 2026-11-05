@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig, setKbAuthEscalator } from "@bridge/ui-kit";
+import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig, setKbAuthEscalator, kbApi, notifyExecutionAttention, type ExecutionNotice } from "@bridge/ui-kit";
+import { ExecutionAttentionSchema, type ReasoningTier } from "@bridge/contracts";
 import { openDetailWindow } from "./detailWindow";
 import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
@@ -43,6 +44,7 @@ interface Snapshot {
   needs_attention_ts?: number | null;
 }
 /** Mirrors dispatch.rs DispatchConfig (serde). */
+interface BackendSection { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null; enabled?: boolean; reasoning_tier?: ReasoningTier; projects?: string[] }
 interface Cfg {
   url: string;
   token: string;
@@ -57,7 +59,7 @@ interface Cfg {
   isolate: boolean;
   model: string | null;
   backend: string | null;
-  backends?: Record<string, { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null }> | string[] | null;
+  backends?: Record<string, BackendSection> | string[] | null;
   models?: Record<string, string> | null;
   agents?: Record<string, string> | null;
   report_minutes?: number | null;
@@ -121,6 +123,8 @@ export function App() {
   const [backends, setBackends] = useState<string[]>(["opencode"]);
   const [backendModels, setBackendModels] = useState<Record<string, string>>({});
   const [backendAgents, setBackendAgents] = useState<Record<string, string>>({});
+  const [backendTiers, setBackendTiers] = useState<Record<string, ReasoningTier>>({});
+  const [backendProjects, setBackendProjects] = useState<Record<string, string>>({});
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
   const [logoutMsg, setLogoutMsg] = useState("");
@@ -132,6 +136,19 @@ export function App() {
 
   // signed in = the human session exists and is live (probe clears dead sessions)
   const paired = !!session?.signed_in;
+  useEffect(() => {
+    if (!paired) return;
+    const notify = (event: Event) => {
+      const notice = (event as CustomEvent<ExecutionNotice>).detail;
+      void invoke("notify_execution_attention", { args: { id: notice.id, title: notice.title, body: `${notice.body}\n${notice.url}` } })
+        .catch(error => useKb.getState().reportError("execution notification", error));
+    };
+    window.addEventListener("bridge-execution-attention", notify);
+    const poll = () => kbApi.executionAttention().then(value => notifyExecutionAttention(ExecutionAttentionSchema.parse(value)))
+      .catch(error => useKb.getState().reportError("execution attention notification poll", error));
+    void poll(); const timer = setInterval(() => void poll(), 30_000);
+    return () => { clearInterval(timer); window.removeEventListener("bridge-execution-attention", notify); };
+  }, [paired]);
   // BR#2532: the 2s poll compares keychain-token presence against this ref —
   // config reloads only when the token flips under us (re-reading on every
   // tick would clobber in-flight settings edits). The sign-in screen then
@@ -215,7 +232,7 @@ export function App() {
         pairedRef.current = !!c.token;
         setMaxSessions(c.max_sessions);
         // backends dict (new) or legacy array + flat maps
-        const sections: Record<string, { model?: string; agent?: string }> = {};
+        const sections: Record<string, BackendSection> = {};
         if (Array.isArray(c.backends)) {
           for (const name of c.backends) sections[name] = {};
           const legacyModels = c.models ?? {};
@@ -226,15 +243,17 @@ export function App() {
           }
         } else if (c.backends && typeof c.backends === "object") {
           for (const [name, sec] of Object.entries(c.backends)) {
-            sections[name] = { model: sec?.model ?? undefined, agent: sec?.agent ?? undefined };
+            sections[name] = { ...sec };
           }
         } else if (c.backend) {
           sections[c.backend] = {};
         }
-        const enabled = Object.keys(sections).length ? Object.keys(sections) : ["opencode"];
+        const enabled = Object.keys(sections).length ? Object.keys(sections).filter(b => sections[b]?.enabled !== false) : ["opencode"];
         setBackends(enabled);
         setBackendModels(Object.fromEntries(enabled.map((b) => [b, sections[b]?.model ?? ""])));
         setBackendAgents(Object.fromEntries(enabled.map((b) => [b, sections[b]?.agent ?? ""])));
+        setBackendTiers(Object.fromEntries(enabled.map(b => [b, sections[b]?.reasoning_tier ?? "small"])));
+        setBackendProjects(Object.fromEntries(enabled.map(b => [b, (sections[b]?.projects ?? ["*"]).join(", ")])));
         setHubUrl(c.url);
       }
     } catch { /* no shell */ }
@@ -384,10 +403,13 @@ export function App() {
     // over the existing file config — Apply only owns what the form shows
     // (model, agent); fields it does not know about (mode, bin) must
     // survive, or saving settings silently switches the transport.
-    const prevBackends = (cfg?.backends && !Array.isArray(cfg.backends) ? cfg.backends : {}) as Record<string, { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null }>;
+    const prevBackends = cfg?.backends && !Array.isArray(cfg.backends) ? cfg.backends : {};
     const backendsOut = Object.fromEntries(
       ordered.map((b) => [b, {
         ...(prevBackends[b] ?? {}),
+        enabled: true,
+        reasoning_tier: backendTiers[b] ?? "small",
+        projects: (backendProjects[b] ?? "*").split(",").map(p => p.trim()).filter(Boolean),
         model: (backendModels[b] ?? "").trim() || null,
         agent: (backendAgents[b] ?? "").trim() || null,
       }]),
@@ -566,6 +588,14 @@ export function App() {
                       onChange={(e) => setBackendAgents((m) => ({ ...m, [b]: e.target.value }))} />
                   </div>
                   <span className="gw-note">{meta.note}</span>
+                  <div className="gw-row">
+                    <label>Actual model reasoning tier <select value={backendTiers[b] ?? "small"} onChange={e => {
+                      const tier = e.target.value;
+                      if (tier === "small" || tier === "medium" || tier === "large") setBackendTiers(m => ({ ...m, [b]: tier }));
+                    }}><option>small</option><option>medium</option><option>large</option></select></label>
+                    <label>Project scope <TextInput value={backendProjects[b] ?? "*"} placeholder="* or comma-separated projects" onChange={e => setBackendProjects(m => ({ ...m, [b]: e.target.value }))} /></label>
+                  </div>
+                  <span className="gw-note">Declare the configured model's actual capability; tiers are never guessed from its name. Missing capacity remains blocked without a lower-tier fallback.</span>
                 </div>
               );
             })}

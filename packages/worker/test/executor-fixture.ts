@@ -13,7 +13,7 @@ export async function readyGateway(call: Call, tokenId: string, label: string): 
   expect((await call("/agent.provision", { label: worker, actor: label })).status).toBe(200);
   const ready = await call("/execution", { id: "gateway", actor: label, token_id: tokenId, session: "fixture-readiness",
     command_id: `fixture:${label}`, command: { kind: "advertise", capabilities: {
-      tier: "large", tools: ["git"], environment: ["test"], worker: { kind: "provisioned", label: worker },
+      tier: "large", model: "test/fixture", tools: ["git"], environment: ["test"], worker: { kind: "provisioned", label: worker },
     } } });
   expect(ready.body).toMatchObject({ ok: true });
 }

@@ -120,6 +120,16 @@ fn main() {
             }
         }
         "execution" => {
+            if matches!(args.get(2).map(String::as_str), Some("pause" | "resume" | "coordinate")) {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                let result = if args[2] == "coordinate" {
+                    let id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("usage: bridge execution coordinate <BR#id> <message>"); std::process::exit(2); });
+                    let message = args.get(4).filter(|text| !text.is_empty()).unwrap_or_else(|| { eprintln!("coordination message required"); std::process::exit(2); });
+                    dispatch::execution_coordinate(&cfg, id, message)
+                } else { dispatch::execution_claims(&cfg, args[2] == "pause") };
+                match result { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()), Err(error) => { eprintln!("{error}"); std::process::exit(1); } }
+                return;
+            }
             if args.get(2).map(String::as_str) == Some("ready") {
                 let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
                 match dispatch::execution_ready(&cfg) {

@@ -83,6 +83,21 @@ async function seeAlso(a: any, rel: any, identity: ToolCtx["identity"], call: To
  * this row are what tools/list ADVERTISES and what the fixture test pins.
  */
 export const TOOL_TABLE: ToolTable = defineToolTable({
+  handoffs: {
+    description: "Read pending local handoffs without claiming, acknowledging or resuming work. Paginated, project/recipient scoped. Includes continuation prompt, all current blockers, can_accept/prerequisites and explicit acceptance reference.",
+    schema: TOOL_ARG_SCHEMAS.handoffs,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.read", { ...args, session: ctx.sessionName }))),
+  },
+  handoff_accept: {
+    description: "Explicit episode/version-bound local acceptance. Requires a live full interactive credential (never a provisioned worker/gateway/cron) and a matching human-web authorised session/capability grant. Returns accepted/already_accepted/stale_episode/unauthorized/unmet_prerequisites. Copying a prompt or answering an ask is not acceptance.",
+    schema: TOOL_ARG_SCHEMAS.handoff_accept,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.accept", args))),
+  },
+  handoff_checkpoint: {
+    description: "Record the winning local session's newly published checkpoint before explicit human-authorised return to autonomous execution. Increments the handoff version; never requeues work by itself.",
+    schema: TOOL_ARG_SCHEMAS.handoff_checkpoint,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
+  },
   execution: {
     description: "Durable executor protocol v1: inspect/advertise, fenced begin/poll, published checkpoint/verified restore/quiesce, active mailbox, persistent tier escalation, and idempotent external-operation receipts. Lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
     schema: TOOL_ARG_SCHEMAS.execution,
@@ -94,7 +109,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
       const session = await ctx.call("session.touch", { token_id: ctx.identity.token_id, session: args.session ?? ctx.sessionName });
-      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags });
+      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags, session: args.session ?? ctx.sessionName });
       const named = args.session ?? ctx.sessionName;
       const required: string[] = Array.isArray(o.action_required) ? o.action_required : [];
       return text(JSON.stringify(

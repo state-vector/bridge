@@ -176,7 +176,7 @@ function atomKey(a: Omit<ProxyAtom, "raw">): string {
  *  evaluates those first-class, board-locally); the prose parser still needs
  *  their atom shape so `typed await_event ask/time` conditions parse
  *  (BR#4062). */
-function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
+function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> | null {
   switch (e.event) {
     case "pr_merged": return { kind: "pr_merged", repo: e.repo, number: e.n };
     case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id };
@@ -188,6 +188,7 @@ function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
     case "ask": return { kind: "ask", repo: null, askId: e.ask_id };
     case "time": return { kind: "time", repo: null, untilTs: e.until_ts };
+    case "local_handoff": case "executor_capability": return null;
   }
 }
 
@@ -324,7 +325,7 @@ export function parseProxyCondition(text: string): ParsedCondition {
         } else cand[k] = v;
       }
       const ev = validateAwaitEvent(cand);
-      if (ev) pushAtom(atomOfAwait(ev));
+      if (ev) { const atom = atomOfAwait(ev); if (atom) pushAtom(atom); else unparseable = true; }
       // else: the line names the grammar but nothing valid parsed —
       // LOOKS_MACHINE (which knows the marker) stamps it unparseable.
     }
@@ -560,6 +561,8 @@ export function legLabel(leg: CloseLeg): string {
 // human-friendly annotation, DERIVED from the structured event when absent.
 
 export type AwaitEvent =
+  | { event: "local_handoff"; handoff_id: string; version: number }
+  | { event: "executor_capability"; id: string }
   | { event: "pr_merged"; repo: string; n: number }
   | { event: "br_pr_merged"; id: string }
   | { event: "issue_closed"; repo: string; n: number }
@@ -572,6 +575,7 @@ export type AwaitEvent =
   | { event: "time"; until_ts: number };
 
 export const AWAIT_EVENT_KINDS = [
+  "local_handoff", "executor_capability",
   "pr_merged", "br_pr_merged", "issue_closed", "br_done",
   "br_answered", "run_success", "pr_checks_green", "deployed", "ask", "time",
 ] as const;
@@ -599,6 +603,8 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
   const num = (x: unknown) => typeof x === "number" && Number.isInteger(x) && x > 0;
   const id = (x: unknown) => typeof x === "string" && /^BR#\d+$/.test(x) ? x : null;
   switch (kind) {
+    case "local_handoff": return typeof e.handoff_id === "string" && e.handoff_id.length > 0 && num(e.version) ? { event: "local_handoff", handoff_id: e.handoff_id, version: Number(e.version) } : null;
+    case "executor_capability": return id(e.id) ? { event: "executor_capability", id: String(e.id) } : null;
     case "pr_merged":
     case "issue_closed":
     case "pr_checks_green":
@@ -647,7 +653,7 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id, newerThan: e.newer_than, head: e.head, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
-    case "ask": case "time": return null;
+    case "ask": case "time": case "local_handoff": case "executor_capability": return null;
   }
 }
 
@@ -667,6 +673,8 @@ export function describeAwaitEvent(e: AwaitEvent): string {
     case "deployed": return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
     case "ask": return `ask ${e.ask_id} answered`;
     case "time": return `timer elapsed (until_ts ${e.until_ts})`;
+    case "local_handoff": return `Explicit authorised local acceptance of ${e.handoff_id} version ${e.version}`;
+    case "executor_capability": return `A live eligible capability becomes usable for ${e.id}, with all other blockers resolved`;
   }
 }
 

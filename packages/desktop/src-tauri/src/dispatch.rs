@@ -112,8 +112,12 @@ pub struct DispatchConfig {
 
 /// Per-provider settings. Everything optional — a provider section can be
 /// empty ({}) and the runner just uses that CLI's own defaults.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
+    #[serde(default = "default_isolate")]
+    pub enabled: bool,
+    #[serde(default = "default_projects")]
+    pub projects: Vec<String>,
     /// Explicit capability declaration; never inferred from a model-name regex.
     #[serde(default)]
     pub reasoning_tier: ReasoningTier,
@@ -126,6 +130,10 @@ pub struct BackendConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>, // transport: "acp" (default for opencode) | "stdio"
 }
+fn default_projects() -> Vec<String> { vec!["*".into()] }
+impl Default for BackendConfig {
+    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, bin: None, agent: None, model: None, mode: None } }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,7 +142,7 @@ pub enum ReasoningTier { #[default] Small, Medium, Large }
 fn backend_satisfies(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> bool {
     let required = meta.pointer("/execution_requirements/tier").and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
     let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-    cfg.backends.get(name).map(|b| b.reasoning_tier).unwrap_or_default() >= required
+    cfg.backends.get(name).map(|b| b.enabled && b.reasoning_tier >= required && b.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str())).unwrap_or(false)
 }
 
 /// Structured scheduling facts only. Diagnostics cannot consume the final
@@ -172,13 +180,12 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
         cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
     }).ok_or("no configured backend is available")?;
     let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-    let bc = cfg.backends.get(name).cloned().unwrap_or_default();
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
-    let mut capabilities = executor_capabilities(bc.reasoning_tier, &worker);
-    capabilities["backend"] = json!(name);
-    capabilities["model"] = json!(bc.model.or_else(|| cfg.model.clone()));
-    capabilities["config_revision"] = json!(worker_config_revision(cfg));
-    capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
+    let mut capabilities = backend_capabilities(cfg, name, true, Some(&worker));
+    capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| other.as_str() != name).map(|other| {
+        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(other)) == *b);
+        backend_capabilities(cfg, other, runnable, Some(&worker))
+    }).collect::<Vec<_>>());
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
         return Err(format!("executor readiness held: {}", reply["readiness"]));
@@ -241,6 +248,24 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
     }
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ModelAvailability { Usable, Unavailable { reason: String }, Disabled }
+fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker: Option<&WorkerCredential>) -> serde_json::Value {
+    let bc = cfg.backends.get(name).cloned().unwrap_or_default();
+    let model = bc.model.clone().or_else(|| cfg.model.clone());
+    let mut facts = worker.map(|worker| executor_capabilities(bc.reasoning_tier, worker))
+        .unwrap_or_else(|| json!({ "tier": bc.reasoning_tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
+    let availability = if !bc.enabled { ModelAvailability::Disabled }
+        else if !runnable { ModelAvailability::Unavailable { reason: "Configured agent CLI is unavailable or its circuit breaker is open".into() } }
+        else if model.as_deref().unwrap_or("").is_empty() { ModelAvailability::Unavailable { reason: "Actual configured model identity is unreported; configure it explicitly".into() } }
+        else { ModelAvailability::Usable };
+    facts["backend"] = json!(name); facts["model"] = json!(model); facts["projects"] = json!(bc.projects);
+    facts["availability"] = json!(availability); facts["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
+    facts["config_revision"] = json!(worker_config_revision(cfg));
+    facts
+}
+
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
 
 fn execution_call(cfg: &DispatchConfig, tid: &str, command: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -262,6 +287,12 @@ pub enum ExecutionRead { Inspect, Availability }
 pub fn execution_read(cfg: &DispatchConfig, task_id: &str, kind: ExecutionRead) -> Result<serde_json::Value, String> {
     let command = match kind { ExecutionRead::Inspect => "inspect", ExecutionRead::Availability => "availability" };
     execution_call(cfg, task_id, json!({ "kind": command }))
+}
+pub fn execution_claims(cfg: &DispatchConfig, pause: bool) -> Result<serde_json::Value, String> {
+    execution_call(cfg, "gateway", if pause { json!({ "kind": "pause_claims", "reason": "Operator runtime update: preserve active writers while draining", "budget_ms": 300_000 }) } else { json!({ "kind": "resume_claims" }) })
+}
+pub fn execution_coordinate(cfg: &DispatchConfig, task_id: &str, message: &str) -> Result<serde_json::Value, String> {
+    execution_call(cfg, task_id, json!({ "kind": "message", "message_id": format!("operator-{}-{}", std::process::id(), now_ms()), "text": message, "priority": "interrupt" }))
 }
 
 #[derive(Clone)]
@@ -298,7 +329,12 @@ struct RemoteExecution {
     policy_version: u32,
     attempt: Option<RemoteAttempt>,
     messages: Vec<RemoteMessage>,
+    #[serde(default)]
+    handoff: RemoteHandoff,
 }
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
 impl RemoteExecution {
     fn parse(value: serde_json::Value) -> Result<Self, String> {
         let state: Self = serde_json::from_value(value).map_err(|e| format!("durable execution contract drift: {e}"))?;
@@ -1816,6 +1852,7 @@ fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
     cfg.backends
         .iter()
         .filter(|(name, bc)| {
+            if !bc.enabled { return false; }
             let bin = bc.bin.clone().unwrap_or_else(|| match opencode::Backend::parse(Some(name)) {
                 opencode::Backend::Kiro => "kiro".to_string(),
                 _ => cfg.opencode_bin.clone(),
@@ -3418,18 +3455,14 @@ fn spawn_opencode(
     let agent_token = &worker.secret;
     // Durable lease BEFORE spawning; no legacy fallback when this gate fails.
     match execution_call(cfg, tid, json!({ "kind": "inspect" })).and_then(RemoteExecution::parse) {
-        Ok(s) if s.attempt.as_ref().map(|a| !matches!(a.state, RemoteAttemptState::Quiesced)).unwrap_or(false) => {
+        Ok(s) if !matches!(s.handoff, RemoteHandoff::None | RemoteHandoff::Returned) || s.attempt.as_ref().map(|a| !matches!(a.state, RemoteAttemptState::Quiesced)).unwrap_or(false) => {
             dlog(tid, "execution held: prior writer/restoration still requires quiescence reconciliation; not retrying begin");
             return;
         }
         Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
         _ => {}
     }
-    let mut capabilities = executor_capabilities(bc.reasoning_tier, worker);
-    capabilities["backend"] = json!(backend_name);
-    capabilities["model"] = json!(model);
-    capabilities["config_revision"] = json!(worker_config_revision(cfg));
-    capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
+    let capabilities = backend_capabilities(cfg, backend_name, true, Some(worker));
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
     let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|ready| {
         if ready["ok"] != true { return Err(format!("executor readiness held: {}", ready["readiness"])); }
@@ -3617,6 +3650,7 @@ fn tick(
     breaker: &mut CircuitBreaker,
     live_notes: &mut HashMap<String, (String, Instant, Instant)>,
     gated_announced: &mut HashSet<String>,
+    stop: &AtomicBool,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
 
@@ -3631,6 +3665,11 @@ fn tick(
     *avail = available_backends(cfg);
     let avail_ok = !avail.is_empty();
     if !avail_ok {
+        if let Some(name) = cfg.backends.keys().next() {
+            let mut capabilities = backend_capabilities(cfg, name, false, None);
+            capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| *other != name).map(|other| backend_capabilities(cfg, other, false, None)).collect::<Vec<_>>());
+            let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
+        }
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
         dlog("", msg);
         snap_activity(snap, "error", msg);
@@ -4258,7 +4297,7 @@ fn tick(
     }
 
     // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok {
+    if !avail_ok || stop.load(Ordering::SeqCst) {
         return Ok(msgs);
     }
     let Some(worker_credential) = prepared_worker.as_ref() else { return Ok(msgs); };
@@ -4342,7 +4381,8 @@ fn tick(
         // (session_alive_ts / last_progress.ts).
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        task_meta["execution_project"] = art["project"].clone();
         if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) {
             if gated_announced.insert(format!("{tid}:reasoning")) { dlog(tid, "SKIP: persistent minimum reasoning tier unavailable on this host"); }
             continue;
@@ -4580,7 +4620,8 @@ fn tick(
             }
         }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        task_meta["execution_project"] = art["project"].clone();
         // BR#3845 self-heal: a reference this runner already refused (fatal
         // clone failure) is skipped WITHOUT claiming — the recorded refusal
         // stands until the card's repo URL changes, so a ghost reference can't
@@ -4824,7 +4865,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut cfg = cfg;
     loop {
         if stop.load(Ordering::Relaxed) {
-            break;
+            if in_flight.is_empty() { break; }
+            // Stop is a bounded checkpoint/quiesce drain, not dropping the
+            // result receivers while detached writer threads keep running.
+            for inf in &in_flight { inf.execution.control.stop.store(true, Ordering::SeqCst); }
         }
         // BR#3787 — negotiated catch-up at the tick boundary: the hub's epoch
         // header moved past the epoch we vended (another login/repair rotated
@@ -4882,6 +4926,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 &mut breaker,
                 &mut live_notes,
                 &mut gated_announced,
+                &stop,
             ) {
             Ok(msgs) => {
                 for msg in msgs {
@@ -5081,6 +5126,11 @@ pub fn reconnect(state: &DispatchState) -> Result<serde_json::Value, String> {
 ///    token at startup — the local copy is provably useless; delete it and
 ///    await the next login to re-vend.
 fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot, clear_credential: bool) {
+    if !clear_credential {
+        write_runner_state(snap);
+        dlog("", "human session ended; gateway and its writer leases keep running");
+        return;
+    }
     stop.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
     if clear_credential {
@@ -5116,7 +5166,7 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     );
 }
 
-/// Log out (Settings): stop the runner and end the human session — but the
+/// Log out (Settings): end the human session — the runner continues and the
 /// gateway token STAYS in the keychain (credential-class ADR: the gateway
 /// survives UI logout, dispatched agents keep running, admin revoke is the
 /// kill switch). The next login re-vends, replacing in place.
