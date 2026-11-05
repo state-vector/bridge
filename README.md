@@ -62,6 +62,32 @@ execution begins. Revoked/wrong-class cache entries are re-provisioned; the
 runner binds the hub's canonical worker label rather than an old cache key.
 Transient/deployment errors retain the cache and never trigger credential
 rotation. Gateway and interactive credentials are never worker fallbacks.
+Provisioning and canonical-identity proof happen **before claiming any card**.
+Readiness advertises a closed `worker` state; the hub verifies a live worker in
+that gateway's namespace at advertisement, claim and begin. Tool availability
+alone is not launch readiness. Older runners can keep existing writers alive,
+but cannot consume new work with an unprovisioned readiness advertisement.
+
+If startup fails before a child launches, the runner reconciles the exact begin
+attempt, proves quiescence where needed, and records `start_failed`. The hub
+releases the unstarted claim atomically without a watchdog abandonment. Dirty
+or unpublished work stays host-affine and is never cleaned up by this path.
+The failing host cools down after transport failures; three require repair.
+A named prerequisite rejection holds immediately rather than retrying it.
+A changed credential/configuration can
+restore readiness, and other ready hosts can pick up the released work. Unknown
+writers and unresolved external effects remain held. Startup preparation is
+not displayed as a successfully dispatched worker.
+
+Paired operators can run `bridge execution ready` to prove the live hub/worker
+handshake without claiming work. `bridge execution recover-unstarted 'BR#N'`
+recovers recorded legacy pre-begin credential failures only after a fresh
+same-host zero-worker report and an empty runner child list. The hub also
+requires no execution attempt; a real writer, review verdict, human hold or
+unknown external effect cannot be erased. Retained work stays host-affine and
+superseded startup-churn counters are archived. Legacy GUI advertisements do not
+overwrite a corrected runner's live readiness, and old clients cannot borrow
+that proof to claim or begin new work.
 Namespaced worker labels such as `gateway/opencode` (and `label@session`)
 are valid coordination recipients, matching the identities Connect exposes.
 

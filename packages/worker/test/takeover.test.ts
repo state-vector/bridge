@@ -15,6 +15,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readyGateway, executorRequest } from "./executor-fixture";
 import { breachClass } from "../src/kb/machine.ts";
 import { decideTakeover, isFullAgentCredential, takeoverAuthority, type TakeoverAuthority, type TakeoverTarget } from "../src/kb/takeover.ts";
 
@@ -240,7 +241,7 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   const r = await kb(path, {
     method: "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(executorRequest(body)),
   });
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
@@ -332,6 +333,7 @@ describe("claim takeover — full-agent credentials across owners (BR#6436, real
   it("a full-agent token from ANOTHER owner takes a dispatched runner claim atomically; the ex-runner stands down", async () => {
     // the dispatched runner: a gateway credential claiming for its agent
     const gw = await kbJson("/admin.mint", { label: "br6436-gw", tags: ["gateway"], principal: "p_br6436_gwbox" });
+    await readyGateway(kbJson, gw.body.id, "br6436-gw");
     // the cross-owner full agent: a DIFFERENT machine's full credential —
     // not the owner label, not the owner principal, not the web plane
     const full = await kbJson("/admin.mint", { label: "br6436-full", tags: ["role:impl", "local-work"] });

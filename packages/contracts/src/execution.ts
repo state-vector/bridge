@@ -2,6 +2,7 @@
 import { z } from "zod";
 
 export const EXECUTION_POLICY_VERSION = 1;
+export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
 export const EXECUTION_LEASE_MS = 120_000;
 const text = z.string().min(1).max(4000);
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/);
@@ -14,6 +15,21 @@ export const ExecutionRequirementsSchema = z.object({
   host: text.optional(),
 });
 export type ExecutionRequirements = z.infer<typeof ExecutionRequirementsSchema>;
+export const WorkerReadinessSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("unprovisioned") }),
+  z.object({ kind: z.literal("provisioned"), label: text }),
+]);
+export const ExecutorStartBarrierSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cooldown"), fingerprint: text, failures: z.number().int().min(1).max(2), until_ts: z.number().int(), reason: text }),
+  z.object({ kind: z.literal("repair_required"), fingerprint: text, failures: z.number().int().positive(), reason: text }),
+]);
+export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
+export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" = "transport"): ExecutorStartBarrier {
+  const failures = previous?.fingerprint === fingerprint ? previous.failures + 1 : 1;
+  return ExecutorStartBarrierSchema.parse(failureClass === "prerequisite" || failures >= 3
+    ? { kind: "repair_required", fingerprint, failures, reason }
+    : { kind: "cooldown", fingerprint, failures, until_ts: now + 60_000 * failures, reason });
+}
 export const ExecutorCapabilitiesSchema = z.object({
   tier: ReasoningTierSchema,
   tools: z.array(text),
@@ -22,6 +38,7 @@ export const ExecutorCapabilitiesSchema = z.object({
   model: z.string().nullable().default(null),
   config_revision: text.default("legacy"),
   capacity: z.number().int().min(1).max(64).default(1),
+  worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }),
 });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
@@ -90,6 +107,8 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("availability") }),
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
   z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000) }),
+  z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite"]).default("prerequisite") }),
+  z.object({ kind: z.literal("recover_unstarted"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
   z.object({ kind: z.literal("poll"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
   z.object({ kind: z.literal("checkpoint"), ...FenceSchema.shape, checkpoint: CheckpointSchema }),
@@ -124,6 +143,14 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
   };
   switch (command.kind) {
     case "inspect": case "availability": case "advertise": return s;
+    case "start_failed": {
+      if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
+      return s; // the authenticated coordinator owns the atomic task release
+    }
+    case "recover_unstarted": {
+      if (a) throw new Error("gate: legacy unstarted recovery cannot erase an execution attempt");
+      return s;
+    }
     case "begin": {
       if (s.budget_exhaustions >= 3) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");

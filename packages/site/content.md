@@ -43,6 +43,19 @@ The runner proves cached worker credentials against the live hub and binds the
 canonical provisioned identity before starting work. Stale labels or cached
 gateway credentials cannot masquerade as workers; transient errors never cause
 blind credential rotation.
+The hub verifies provisioned worker readiness before a gateway can claim work.
+An advertised toolchain without a usable canonical worker is unavailable, not
+an executing agent. A never-launched startup failure releases its claim through
+an atomic, replay-safe handshake; the host backs off while another ready host
+can recover the task. Dirty/unpublished work remains on its originating host.
+Named prerequisite failures hold immediately; three transport startup failures
+also hold that host for repair. Unknown writers or
+external effects never authorise a release.
+Paired operators can verify readiness and recover only recorded, never-launched
+legacy credential failures through bounded CLI commands. Local zero-worker and
+child-process checks plus the hub's no-attempt gate preserve actual writers and
+human holds. Existing old clients may drain work but cannot claim new tasks or
+overwrite a corrected runner's readiness.
 Namespaced worker identities such as `gateway/opencode` can receive coordination
 directly, including session-qualified addresses.
 

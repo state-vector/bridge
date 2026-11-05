@@ -227,7 +227,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import {
   parseProxyCondition,
@@ -2865,6 +2865,12 @@ export class KnowledgeHub {
       CREATE TABLE IF NOT EXISTS execution_hosts (
         token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS executor_start_barriers (
+        token_id TEXT PRIMARY KEY, state TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS executor_start_claims (
+        task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS workspaces (
         slug TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -4470,6 +4476,25 @@ export class KnowledgeHub {
     return row ? ExecutionStateSchema.parse(JSON.parse(row.state)) : null;
   }
 
+  private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number):
+    | { kind: "ready"; worker_id: string; fingerprint: string }
+    | { kind: "unprovisioned"; reason: string }
+    | { kind: "cooldown"; reason: string; until_ts: number }
+    | { kind: "repair_required"; reason: string } {
+    const worker = capabilities.worker;
+    if (worker.kind !== "provisioned" || !worker.label.startsWith(`${host}/`)) return { kind: "unprovisioned", reason: "Provision the gateway's canonical worker credential before claiming work" };
+    const child = this.one(`SELECT id, tags FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, worker.label);
+    if (!child || tagsSayGateway(parseTags(child.tags))) return { kind: "unprovisioned", reason: "Worker credential is missing, revoked or the wrong class" };
+    const fingerprint = JSON.stringify([String(child.id), capabilities.config_revision]);
+    const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
+    const barrier = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
+    if (barrier?.fingerprint === fingerprint) {
+      if (barrier.kind === "repair_required") return { kind: "repair_required", reason: barrier.reason };
+      if (barrier.until_ts > now) return { kind: "cooldown", until_ts: barrier.until_ts, reason: barrier.reason };
+    }
+    return { kind: "ready", worker_id: String(child.id), fingerprint };
+  }
+
   /** The bearer and scope headers are stamped by mcp.ts, never argument fields.
    * A worker cannot remove its headers to fall back to a legacy unfenced write. */
   private executionMutationGuard(op: string, body: Record<string, unknown>): void {
@@ -4493,12 +4518,16 @@ export class KnowledgeHub {
       const a = this.executionState(String(body.id ?? ""))?.attempt;
       if (row?.status === "todo" && a && a.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — preserve host affinity");
       const requirements = row ? JSON.parse(row.meta ?? "{}").execution_requirements : null;
-      if (row?.status === "todo" && requirements) {
+      if (row?.status === "todo") {
         const token = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
         if (token && tagsSayGateway(parseTags(token.tags))) {
+          if (body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL) throw new Error("gate: claim requires the worker-ready runner protocol");
           const host = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, String(body.token_id));
           if (!host || Date.now() - host.observed_ts > 120_000) throw new Error("gate: claim requires a live executor capability observation");
-          const blockers = capabilityBlockers(ExecutionRequirementsSchema.parse(requirements), ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities)), token.label);
+          const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
+          const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
+          if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
+          const blockers = capabilityBlockers(ExecutionRequirementsSchema.parse(requirements ?? {}), capabilities, token.label);
           if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
         }
       }
@@ -4519,8 +4548,17 @@ export class KnowledgeHub {
     const now = Date.now();
     if (command.kind === "advertise") {
       if (!gateway) throw new Error("gate: only authenticated gateways advertise executor capabilities");
-      this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(command.capabilities), now);
-      return { ok: true, observed_ts: now, expires_ts: now + 120_000 };
+      const readiness = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
+        ? this.executorReadiness(tokenId, actor, command.capabilities, now)
+        : { kind: "unprovisioned" as const, reason: "Upgrade to the worker-ready runner protocol before claiming work" };
+      const existing = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
+      const keepReady = readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
+        && this.executorReadiness(tokenId, actor, ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)), now).kind === "ready";
+      // An obsolete GUI can drain existing work, but cannot overwrite the live
+      // readiness of a corrected runner or borrow its proof to claim a card.
+      const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
+      if (!keepReady) this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(observedCapabilities), now);
+      return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
     if (!row) throw new Error("gate: durable execution requires a task");
@@ -4528,21 +4566,34 @@ export class KnowledgeHub {
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     if (command.kind === "inspect") return current;
     if (command.kind === "availability") {
-      const hosts = this.state.storage.sql.exec(`SELECT t.label, h.capabilities, h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(h => {
+      const hosts = this.state.storage.sql.exec(`SELECT t.label, h.token_id, h.capabilities, h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(h => {
         const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(h.capabilities)));
         const blockers = capabilityBlockers(current.requirements, capabilities, String(h.label));
         const active = this.one(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state, '$.attempt.host') = ? AND json_extract(state, '$.attempt.phase') IN ('running','restoring') AND json_extract(state, '$.attempt.lease_until') > ?`, h.label, now);
-        return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
+        const readiness = this.executorReadiness(String(h.token_id), String(h.label), capabilities, now);
+        return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, readiness, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
       });
       const eligible = hosts.filter(h => !h.blockers.length);
       const live = eligible.filter(h => h.expires_ts > now);
-      return { requirements: current.requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : live.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
+      const runnable = live.filter(h => h.readiness.kind === "ready");
+      return { requirements: current.requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : !runnable.length ? "unavailable" : runnable.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
+    }
+    // A released failed-start acknowledgement never authorises a writer or an
+    // external operation. Its exact authenticated replay survives owner clear.
+    if ((command.kind === "start_failed" || command.kind === "recover_unstarted") && gateway && req.session) {
+      const replay = this.one(`SELECT request, result FROM execution_commands WHERE task_id = ? AND command_id = ?`, req.id, req.command_id);
+      if (replay) {
+        if (replay.request !== JSON.stringify({ command, session: req.session, actor })) throw new Error("gate: command_id reused with different input");
+        return JSON.parse(replay.result);
+      }
     }
     const owner = token.principal ?? (gateway ? String(body.agent ?? "") : actor);
     const binding = this.one(`SELECT worker_token_id FROM execution_state WHERE task_id = ?`, req.id);
     const worker = binding?.worker_token_id === tokenId;
     const attemptHost = current.attempt?.host;
-    if (command.kind !== "message" && !(owner === row.owner || worker || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
+    const startClaim = this.one(`SELECT token_id, session FROM executor_start_claims WHERE task_id = ?`, req.id);
+    const ownsUnstartedClaim = gateway && (command.kind === "start_failed" || command.kind === "recover_unstarted") && startClaim?.token_id === tokenId && startClaim.session === req.session;
+    if (command.kind !== "message" && !(owner === row.owner || worker || ownsUnstartedClaim || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
     const session = req.session ?? "";
     if (!session) throw new Error("gate: durable execution requires an explicit session");
     const encoded = JSON.stringify({ command, session, actor });
@@ -4550,6 +4601,49 @@ export class KnowledgeHub {
     if (old) {
       if (old.request !== encoded) throw new Error("gate: command_id reused with different input");
       return JSON.parse(old.result);
+    }
+    if (command.kind === "start_failed" || command.kind === "recover_unstarted") {
+      const recovering = command.kind === "recover_unstarted";
+      const legacyChurn = recovering && row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      if (!gateway || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (!ownsUnstartedClaim && !(token.principal && token.principal === row.owner)) || (row.status !== "in_progress" && !legacyChurn) || meta.session !== session) throw new Error("gate: failed start requires the authenticated runner's current claim/session");
+      if (recovering && (current.attempt || !String(meta.last_progress?.note ?? "").startsWith("runner: durable execution held:") || !String(meta.last_progress?.note ?? "").includes("worker credential must be provisioned before begin"))) throw new Error("gate: legacy recovery needs the recorded pre-begin credential rejection and no execution attempt");
+      if (current.attempt && current.attempt.phase !== "quiesced") return { kind: "held", reason: "Reconcile and quiesce the existing writer before releasing its claim" };
+      if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return { kind: "held", reason: "Reconcile unknown external operations before releasing the claim" };
+      const observed = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id = ?`, tokenId);
+      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(observed?.capabilities ?? "{}"));
+      const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
+      if (recovering && readiness.kind !== "ready") throw new Error("gate: repair worker readiness before recovering old startup claims");
+      // Even while cooling down, derive the same prerequisite identity without
+      // granting a launch or discarding any work retained on this host.
+      const child = capabilities.worker.kind === "provisioned" ? this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, capabilities.worker.label) : null;
+      const fingerprint = readiness.kind === "ready" ? readiness.fingerprint : JSON.stringify([String(child?.id ?? "missing"), capabilities.config_revision]);
+      const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
+      const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
+      const reason = command.kind === "start_failed" ? command.reason : "Canonical worker readiness restored after a legacy pre-begin credential rejection";
+      const stage = command.kind === "start_failed" ? command.stage : "begin";
+      const barrier = command.kind === "start_failed" ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
+      const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;
+      const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
+      meta.execution_requirements = requirements;
+      current = { ...current, requirements };
+      meta.execution_start_failure = { stage, reason, host: actor, at: now };
+      if (recovering) {
+        meta.startup_recovery = { at: now, host: actor, previous_attempts: meta.attempt ?? null };
+        delete meta.attempt;
+        delete meta.blocked;
+      }
+      delete meta.session;
+      const result = { kind: "released", task_id: req.id, barrier };
+      this.state.storage.transactionSync(() => {
+        if (barrier) this.state.storage.sql.exec(`INSERT INTO executor_start_barriers (token_id, state) VALUES (?, ?) ON CONFLICT(token_id) DO UPDATE SET state=excluded.state`, tokenId, JSON.stringify(barrier));
+        this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), req.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, req.id, JSON.stringify(current), String(binding?.worker_token_id ?? ""));
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, req.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(result));
+      });
+      this.version(req.id, actor, "transition", `${row.status} → todo — worker never launched (${stage}); released without watchdog abandonment`, { from: row.status, to: "todo", note: reason });
+      this.audit(actor, "execution_start_failed", req.id, { stage, reason, barrier });
+      return result;
     }
     if (command.kind === "poll") {
       if (current.attempt && (row.status !== "in_progress" || meta.session !== current.attempt.session)) current.attempt.phase = "stopping";
@@ -4568,15 +4662,20 @@ export class KnowledgeHub {
     }
     let workerTokenId = String(binding?.worker_token_id ?? "");
     if (command.kind === "begin") {
+      if (body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL) throw new Error("gate: begin requires the worker-ready runner protocol");
       if (row.status !== "in_progress" || meta.session !== session) throw new Error("gate: begin requires the current task claim/session");
       const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
       if (!advertised || now - advertised.observed_ts > 120_000) throw new Error("gate: executor capabilities missing/stale — advertise live facts before begin");
-      const blockers = capabilityBlockers(current.requirements, ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities)), actor);
+      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+      const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
+      if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
+      const blockers = capabilityBlockers(current.requirements, capabilities, actor);
       if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
       if (!gateway || !command.worker.startsWith(`${actor}/`)) throw new Error("gate: runner worker must belong to its authenticated gateway");
       const child = this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, command.worker);
       if (!child) throw new Error("gate: worker credential must be provisioned before begin");
       workerTokenId = child.id;
+      this.state.storage.sql.exec(`DELETE FROM executor_start_barriers WHERE token_id = ?`, tokenId);
     } else if (["poll", "restore", "checkpoint", "quiesce"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
@@ -5545,10 +5644,20 @@ export class KnowledgeHub {
     const nextBodyMd = typeof body.body_md === "string" && body.body_md.trim()
       ? body.body_md
       : String(row.body_md ?? "");
-    this.state.storage.sql.exec(
-      `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
-      verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
-    );
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
+        verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
+      );
+      if (row.type === "task") {
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, id);
+        if (row.status === "todo" && verdict.status === "in_progress" && typeof body.token_id === "string") {
+          const credential = this.one(`SELECT tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, body.token_id);
+          if (credential && tagsSayGateway(parseTags(credential.tags))) this.state.storage.sql.exec(
+            `INSERT INTO executor_start_claims (task_id, token_id, session) VALUES (?, ?, ?)`, id, body.token_id, String(meta.session ?? ""));
+        }
+      }
+    });
     // post-conditions on the single write path: violations are breaches (a
     // loud audited trail), never silent repairs.
     const violations = checkInvariants({ type: row.type, status: verdict.status, roles: tRoles, tags: tTags, meta });
