@@ -14,15 +14,22 @@ export const ExecutionRequirementsSchema = z.object({
   host: text.optional(),
 });
 export type ExecutionRequirements = z.infer<typeof ExecutionRequirementsSchema>;
-export const ExecutorCapabilitiesSchema = z.object({
+export const ModelCapabilitySchema = z.object({
   tier: ReasoningTierSchema,
   tools: z.array(text),
   environment: z.array(text),
-  backend: z.enum(["opencode", "kiro"]).default("opencode"),
+  backend: z.enum(["opencode", "kiro", "interactive"]).default("opencode"),
   model: z.string().nullable().default(null),
   config_revision: text.default("legacy"),
   capacity: z.number().int().min(1).max(64).default(1),
+  projects: z.array(text).default(["*"]),
+  availability: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("usable") }),
+    z.object({ kind: z.literal("unavailable"), reason: text }),
+    z.object({ kind: z.literal("disabled") }),
+  ]).default({ kind: "usable" }),
 });
+export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]) });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
   const tiers: ReasoningTier[] = ["small", "medium", "large"];
@@ -46,6 +53,48 @@ export const CheckpointSchema = z.object({
   tests: z.array(z.object({ tree: sha, command: text, outcome: z.enum(["passed", "failed", "inconclusive"]), receipt: text })),
 });
 export type Checkpoint = z.infer<typeof CheckpointSchema>;
+const HandoffDetails = {
+  id: text, version: z.number().int().positive(), requested_at: z.number(),
+  reason: text, action: text, findings: text, tried: text, next: text,
+  evidence: z.array(text), approvals: z.array(text), recipient: text.nullable(),
+};
+const QuiescenceProofSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("runner"), host: text, generation: z.number() }),
+  z.object({ kind: z.literal("human_attested"), by: text, evidence: text }),
+]);
+export const LocalHandoffSchema = z.discriminatedUnion("phase", [
+  z.object({ phase: z.literal("none") }),
+  z.object({ phase: z.literal("preparing"), ...HandoffDetails, quiescence: z.object({ kind: z.literal("pending") }) }),
+  z.object({ phase: z.literal("waiting"), ...HandoffDetails, checkpoint: CheckpointSchema, quiescence: QuiescenceProofSchema }),
+  z.object({ phase: z.literal("accepted"), ...HandoffDetails, checkpoint: CheckpointSchema,
+    token_id: text, session: text, host: text, accepted_at: z.number(), grant_id: text, capabilities: ExecutorCapabilitiesSchema, quiescence: QuiescenceProofSchema }),
+  z.object({ phase: z.literal("returned"), ...HandoffDetails, checkpoint: CheckpointSchema, returned_at: z.number(), by: text, quiescence: QuiescenceProofSchema }),
+]);
+export type LocalHandoff = z.infer<typeof LocalHandoffSchema>;
+export const LocalGrantSchema = z.object({
+  id: text, task_id: text, handoff_id: text, version: z.number().int().positive(),
+  token_id: text, session: text, host: text, by: text, expires_at: z.number(),
+  source: z.literal("human_attested"), evidence: text, capabilities: ExecutorCapabilitiesSchema,
+});
+export type LocalGrant = z.infer<typeof LocalGrantSchema>;
+export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),
+  z.object({ kind: z.literal("capacity_wait"), episode_id: text, text }),
+  z.object({ kind: z.literal("human_answer_required"), episode_id: text, ask_id: text, text }),
+  z.object({ kind: z.literal("local_pickup_required"), episode_id: text, handoff_id: text, version: z.number(), text }),
+  z.object({ kind: z.literal("writer_quiescence_required"), episode_id: text, text }),
+]);
+export type ExecutionBlocker = z.infer<typeof ExecutionBlockerSchema>;
+export const HandoffReadSchema = z.looseObject({ project: text.optional(), recipient: text.optional(), cursor: z.string().optional(), limit: z.number().int().min(1).max(100).optional() });
+export const HandoffAcceptSchema = z.looseObject({ id: text, handoff_id: text, version: z.number().int().positive(), session: text });
+export const HandoffControlSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("request_local"), id: text, reason: text, action: text }),
+  z.object({ kind: z.literal("confirm_preparation"), id: text, handoff_id: text, version: z.number().int().positive(), checkpoint: CheckpointSchema, evidence: text, writers: z.literal("human_confirmed_quiescent") }),
+  z.object({ kind: z.literal("authorize"), id: text, handoff_id: text, version: z.number().int().positive(), label: text, session: text, host: text, evidence: text, capabilities: ExecutorCapabilitiesSchema }),
+  z.object({ kind: z.literal("return_autonomous"), id: text, handoff_id: text, version: z.number().int().positive(), writers: z.literal("human_confirmed_quiescent") }),
+]);
+export type HandoffControl = z.infer<typeof HandoffControlSchema>;
+export const HandoffCheckpointSchema = HandoffAcceptSchema.extend({ checkpoint: CheckpointSchema });
 const FenceSchema = z.object({ generation: z.number().int().positive(), attempt_id: text });
 const MessageSchema = z.object({
   id: text, text, priority: z.enum(["normal", "interrupt"]),
@@ -79,10 +128,11 @@ export const ExecutionStateSchema = z.object({
   messages: z.array(MessageSchema),
   operations: z.array(OperationSchema),
   budget_exhaustions: z.number().int().nonnegative().default(0),
+  handoff: LocalHandoffSchema.default({ phase: "none" }),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0 };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, handoff: { phase: "none" } };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -98,6 +148,8 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]) }),
   z.object({ kind: z.literal("ack"), ...FenceSchema.shape, message_id: text, state: z.enum(["acknowledged", "acted"]) }),
   z.object({ kind: z.literal("escalate"), ...FenceSchema.shape, tier: ReasoningTierSchema, reason: text }),
+  z.object({ kind: z.literal("local_handoff"), ...FenceSchema.shape, reason: text, action: text, findings: text, tried: text, next: text,
+    evidence: z.array(text), approvals: z.array(text), recipient: text.nullable().default(null) }),
   z.object({ kind: z.literal("prepare"), ...FenceSchema.shape, operation_id: text, action: text, input_revision: text, budget_ms: z.number().int().min(1000).max(3_600_000) }),
   z.object({ kind: z.literal("result"), ...FenceSchema.shape, operation_id: text, outcome: z.enum(["succeeded", "failed", "outcome_unknown"]), receipts: z.array(text) }),
 ]);
@@ -125,6 +177,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
   switch (command.kind) {
     case "inspect": case "availability": case "advertise": return s;
     case "begin": {
+      if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
       if (s.budget_exhaustions >= 3) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
@@ -136,8 +189,9 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         action_deadline: now + command.action_budget_ms,
         executor: null,
       };
-      s.attempt = a?.checkpoint
-        ? { ...common, phase: "restoring", checkpoint: a.checkpoint, restored_tree: null }
+      const checkpoint = a?.checkpoint ?? (s.handoff.phase === "returned" ? s.handoff.checkpoint : null);
+      s.attempt = checkpoint
+        ? { ...common, phase: "restoring", checkpoint, restored_tree: null }
         : { ...common, phase: "running", checkpoint: null, restored_tree: null };
       break;
     }
@@ -172,6 +226,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const current = requireAttempt(true);
       if (current.phase !== "quiesced" || !current.checkpoint) throw new Error("gate: yield requires a published checkpoint and quiescent writer");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile pending external operations before yielding");
+      if (s.handoff.phase === "preparing") s.handoff = { ...s.handoff, phase: "waiting", checkpoint: current.checkpoint, quiescence: { kind: "runner", host, generation: current.generation } };
       break;
     }
     case "message": {
@@ -195,6 +250,15 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const tiers: ReasoningTier[] = ["small", "medium", "large"];
       if (tiers.indexOf(command.tier) <= tiers.indexOf(s.requirements.tier)) throw new Error("gate: escalation must increase the persistent minimum reasoning tier");
       s.requirements.tier = command.tier;
+      current.phase = "stopping";
+      break;
+    }
+    case "local_handoff": {
+      const current = requireAttempt();
+      if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: a local handoff already owns this episode");
+      s.handoff = { phase: "preparing", id: `local:${s.generation}:${s.revision + 1}`, version: 1, requested_at: now,
+        reason: command.reason, action: command.action, findings: command.findings, tried: command.tried, next: command.next,
+        evidence: command.evidence, approvals: command.approvals, recipient: command.recipient, quiescence: { kind: "pending" } };
       current.phase = "stopping";
       break;
     }

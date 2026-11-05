@@ -2,6 +2,9 @@
   "recorded": "2026-10-26",
   "note": "the MCP tool registry contract \u2014 name + required args per tool. The dispatch must implement every name here and vice versa (the ask_answer/answer_ask incident). CI compares a generated table against this.",
   "tools": [
+    { "name": "handoffs", "required": [] },
+    { "name": "handoff_accept", "required": ["id", "handoff_id", "version", "session"] },
+    { "name": "handoff_checkpoint", "required": ["id", "handoff_id", "version", "session", "checkpoint"] },
     { "name": "execution", "required": ["id", "command_id", "command"] },
     {
       "name": "answer_ask",

@@ -64,11 +64,33 @@ Unresolved recovery causes retain their history and retry budget across new
 commits, while each new exact revision must earn its own deployment verification.
 Repair/review/deployment-verification tasks sort first; diagnostics leave the
 last slot available on multi-slot gateways.
+**Local pickup is explicit.** A forced handoff stops/checkpoints the old writer,
+then parks on a typed local-only wait. Execution attention shows the exact action,
+all capability/decision blockers and a copyable continuation. A human authorises
+the chosen interactive credential/session and attests its actual host/model/
+tools/access and checkpoint restoration; only that session's `handoff_accept`
+resumes the task. Competing acceptance is atomic. Copying, answering an ask,
+notification dismissal and expiry never accept it. Updated checkpoints and an
+explicit human-authorised stopped-writer return are required to rejoin automation.
+Manual-origin preparation has a separately labelled human-attestation path that
+cannot override a managed native writer. Human decision choices may explicitly
+select `local_handoff` rather than automatic resume.
+Humans may explicitly request local pickup for unserved work; it goes through
+the same preparation and authorisation barriers. Episode-deduplicated browser/
+desktop notifications link to the task; dismissal never changes execution state.
+
+**Capability waits are composable.** Inventories declare configured model IDs,
+enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
+unavailable and merely busy hosts produce different facts. Queued unsupported
+work waits on capability restoration without generating a human approval request;
+restoration clears only its matching blocker. Task requirements survive releases
+and cannot silently weaken. Use backend `enabled`, `projects`, `model` and
+`reasoning_tier` settings to declare actual capacity.
+
 Both hub and runner need the matching protocol version. Gateways wait for the
 live execution advertisement endpoint before claiming work during rollout;
 a version stamp alone does not prove endpoint readiness. Bound human decisions
-remain separate from the specified local-handoff flow; protocol v1 does not
-implement local acceptance by auto-resuming an answered ask. Bridge's own
+remain separate from authorised local acceptance. Bridge's own
 repository uses signed direct-main delivery and independent receipt review;
 other repositories retain their PR/merge-train policy.
 Paired CLI operators can read the same facts with `bridge execution inspect 'BR#123'`

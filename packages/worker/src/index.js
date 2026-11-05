@@ -252,6 +252,19 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
       }
+      if (sub === "execution_attention" && request.method === "GET") {
+        return kbCors(await kbGuard("kb.execution.attention", env.KB.get(kbId).fetch("https://kb/execution.attention", {
+          method: "POST", headers: { "content-type": "application/json", ...(auth.bearer ? {} : { "x-kb-admin": "1" }) },
+          body: JSON.stringify({ limit: 100, project: url.searchParams.get("project") || undefined, actor: auth.bearer ? "gateway" : `web:${auth.login}` }),
+        })));
+      }
+      if (sub === "handoff_control" && request.method === "POST") {
+        if (auth.bearer) return kbCors(json({ error: "local authorisation/return requires a human session" }, 403));
+        const body = await request.json().catch(() => ({}));
+        return kbCors(await kbGuard("kb.handoff.control", env.KB.get(kbId).fetch("https://kb/handoff.control", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify({ ...body, actor: `web:${auth.login}` }),
+        })));
+      }
       if (sub === "supersede" && request.method === "POST") {
         // BR#3910: one-click human supersede (the action next to Reframe /
         // Claim locally). Web/human-only per BR#2480 — a gateway bearer is an

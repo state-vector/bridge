@@ -109,6 +109,8 @@
       "additionalProperties": {
         "type": "object",
         "properties": {
+          "enabled": { "type": "boolean" },
+          "projects": { "type": "array", "items": { "type": "string" } },
           "reasoning_tier": {
             "type": "string",
             "enum": ["small", "medium", "large"]

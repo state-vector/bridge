@@ -446,6 +446,8 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const kbApi = {
+  executionAttention: () => j<unknown>("/api/kb/execution_attention"),
+  handoffControl: (body: import("@bridge/contracts").HandoffControl) => j<{ kind: string; prerequisites?: unknown[] }>("/api/kb/handoff_control", { method: "POST", body: JSON.stringify(body) }),
   board: () => j<KbBoard>("/api/kb/board"),
   throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));

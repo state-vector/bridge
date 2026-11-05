@@ -98,6 +98,8 @@ export async function copyText(text: string): Promise<boolean> {
  *  new window so the agent-prompt is never lost. */
 export function ClaimLocallyBtn({ task, ask, size = "sm" }: ClaimLocallyInput & { size?: "sm" | "md" }) {
   const [copied, setCopied] = useState(false);
+  const wait = task.meta?.blocked?.await_event?.event;
+  if (wait === "local_handoff" || wait === "executor_capability" || task.meta?.local_execution) return <span>Use Execution attention for explicit authorised pickup.</span>;
   const prompt = buildClaimLocallyPrompt({ task, ask });
   const onClick = async () => {
     const ok = await copyText(prompt);

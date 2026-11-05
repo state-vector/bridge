@@ -116,9 +116,63 @@ stamp alone is not proof the execution endpoint has propagated. Existing process
 isolation retroactively. A sudden host loss can lose work since the last
 published checkpoint and leaves transfer held until writer quiescence is proved.
 `execution` command `inspect` exposes the exact durable attempt, mailbox and
-operation state. Protocol v1 uses the existing bound-human-decision lifecycle;
-the separately specified local-handoff UI/authorised acceptance contract is not
-implemented by treating an ask answer as autonomous requeue.
+operation state. Local pickup and human decisions have separate typed exits;
+an answered or dismissed request never implicitly accepts local execution.
+
+### Local handoffs and capability blockers
+
+`execution` command `local_handoff` records the exact local action, reason,
+findings, attempts, evidence, approvals and next step. It first stops the writer;
+only a published checkpoint plus quiescence allows `yield` to move the task to a
+typed `local_handoff` wait. It disappears from every autonomous claim/retry/
+unblock path. The Top view's **Execution attention** shows all simultaneous
+blockers and offers **Copy continuation prompt** without changing task state.
+
+1. Start the chosen local agent with a unique local session name. `handoffs`
+   provides side-effect-free, project/recipient-filtered paginated discovery,
+   current prerequisites and the continuation prompt.
+2. In the human web session, choose **Authorise a local session**. Select its
+   actual credential label/session/host, model ID/tier and capability evidence;
+   explicitly attest the required tools/access and exact checkpoint restoration.
+   This creates a 15-minute, episode/version-bound grant. It does not resume work.
+3. That interactive agent explicitly calls `handoff_accept`. Acceptance is atomic
+   and race-safe; a winning repeat is idempotent, stale/unauthorised attempts are
+   typed failures. Gateway, cron and provisioned worker credentials cannot pose
+   as local agents. Being interactive never bypasses capability prerequisites.
+4. Record updated published work with `handoff_checkpoint` before returning.
+   Only **Return to automation**, explicitly authorised by the human after local
+   writers stop, removes local-only execution. Other asks/capability blockers
+   still apply. Ordinary ask answers, dismissal and expiry do not do this.
+
+A human decision can explicitly use choice action `local_handoff` instead of
+`resume`, `hold` or `release`. Native-origin work still needs its originating
+runner's quiescence proof. For manual-origin work without a managed runner,
+**Confirm manual preparation** records a separately labelled human attestation
+of the published checkpoint and stopped writers; it cannot override a native
+writer. Continuation prompts identify what is portable and require a fresh
+registered worktree, not reuse of another executor's working directory.
+The human may also choose **Request local pickup** for queued/unserved work.
+That prepares the same guarded lifecycle; it does not create an execution claim.
+Notifications are deduplicated by workspace and blocker/handoff episode;
+clicking or dismissing one never resolves a wait.
+
+Task `meta.execution_requirements` is monotonic: ordinary edits cannot silently
+remove a tool/access/host requirement or reduce a tier. Configured gateways
+advertise enabled, project-scoped model inventories, including unavailable and
+disabled entries. An installed CLI or an unreported model ID is not usable model
+capacity. Queued unsupported work is visibly blocked on a typed capability wait;
+restoration clears only that blocker. Busy hosts produce a capacity wait rather
+than an unavailable-model warning. Healthy running attempts are not aborted by
+changes in future dispatch capacity. Evidence includes config revision, model
+identity and expiring host observations; no human staffing/approval ask is made
+just because a model is missing.
+
+Backend configuration adds `enabled` (default true) and `projects` (default
+`["*"]`) alongside explicit `reasoning_tier` and `model`. For example:
+
+```json
+{"opencode":{"enabled":true,"model":"provider/actual-model-id","reasoning_tier":"large","projects":["bridge"]}}
+```
 
 Paired operators can inspect the same facts without claiming or resuming work:
 
@@ -131,7 +185,7 @@ Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
 and independent receipt review; other repositories retain PR/merge-train
 delivery. The generated prompt uses the actual `dispatch-<task>` claim session.
 
-The runner claims `todo` tasks from the board and dispatches each to an agent CLI (opencode) in an isolated git worktree — one PR per task, progress reported back to the board. Worktree teardown is eventual (BR#3633): a `done` task's tree goes immediately (uncommitted work preserved onto a `wip/<task>-<date>` branch first); any tree no running session holds is swept by the periodic hygiene pass — at once when the task reads `done`/`superseded`/`todo`, otherwise after 7 days regardless of status — so a hub outage, an unresolvable task id, or a parked card can never pin disk forever; trees drain oldest-first, capped per tick. The sweep also enumerates the runner's own `<workdir>/worktrees` root and — via `git worktree list` — every REGISTERED worktree of the clones under `<workdir>/repos`. And the **worktree registry** (`~/.bridge/worktree-registry.jsonl`, 2026-11-02) closes the loop mechanically, no discovery: the runner registers every provisioned tree at creation and deregisters at teardown, the takeover prompts direct local sessions to register theirs with an exact one-liner (an unregistered tree is never swept — registration IS the contract), and the sweep enumerates registered paths wherever they live, pruning dead lines on read. Rooted in that contract, the 2026-11-02 incident (185 strays / 471 GB on one checkout, trees registered to a repo the dir-only scans never consulted) cannot recur: the system that directs the worktree's creation records its path, and the sweep joins registry × disk × board status. `sweep_repos` (env `BRIDGE_SWEEP_REPOS`) stays as an explicit extra-roots escape hatch. Claim races are noise, not failures: before claiming, the runner re-reads the card and skips silently when another dispatcher won; a card still `in_progress` whose dispatched session died (no fresh session stamp or hub heartbeat for 10 minutes — the same bar the watchdog uses) has its stale claim released and is re-claimed fresh; and the dispatch circuit breaker counts only genuine agent-CLI failures (spawn, auth, guardrails, provisioning) — lifecycle rejections from races never count toward it.
+The runner claims eligible `todo` work and dispatches an agent CLI in a registered isolated worktree. Delivery follows the repository's policy (signed direct-main for Bridge; PR/train elsewhere). The hygiene sweep joins the worktree registry, disk and board state; it does not delete dirty or unpublished work on a best-effort preservation promise. Clean remotely reachable trees are swept when released/terminal, or after the stale horizon when no process holds them. `sweep_repos` (`BRIDGE_SWEEP_REPOS`) adds registered roots. Claim races do not count as agent-CLI failures. Expired claims do not override the durable writer-quiescence or checkpoint-restoration barriers above.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash

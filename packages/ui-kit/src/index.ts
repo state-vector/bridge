@@ -40,3 +40,4 @@ export { BacklogView, CompletedView } from "./views/BacklogView";
 export { StatusLights } from "./views/StatusLights";
 export { ForMeView } from "./views/ForMeView";
 export { DecisionPopover, decisionFrame } from "./views/decide";
+export { notifyExecutionAttention, type ExecutionNotice } from "./server/executionNotifications";

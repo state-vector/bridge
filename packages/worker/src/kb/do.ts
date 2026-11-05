@@ -229,6 +229,9 @@ import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchem
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
+import { HandoffCheckpointSchema } from "@bridge/contracts";
+import { usableFor, strengthensRequirements } from "@bridge/contracts";
+import { ExecutionWork, isExecutionWait } from "./execution-work.ts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -630,6 +633,7 @@ export class KnowledgeHub {
 
   private async alarmSweep() {
     await this.ensureSchema();
+    this.executionWork().sweep();
     const now0 = Date.now();
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
     // but an ask to an agent that never answers would pause its task FOREVER
@@ -869,6 +873,7 @@ export class KnowledgeHub {
     for (const r of parkRows as any[]) {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
+        if (this.protectedExecution(String(r.id), meta)) continue;
         parkCensus.total++;
         if (meta.awaiting_ask) continue; // ask-gated: the ask TTL + hourly aging annotation govern these (rule 6)
         // BR#4067 — a park on a live machine wait is not drainable age. The
@@ -951,6 +956,7 @@ export class KnowledgeHub {
     for (const r of ownedRows as any[]) {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
+        if (this.protectedExecution(String(r.id), meta)) continue;
         if (meta.awaiting_ask) continue; // an open ask runs its own TTL; the asker auto-resumes
         if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
         if (meta.subprocess && typeof meta.subprocess.deadline_ts === "number" && meta.subprocess.deadline_ts > now) continue;
@@ -1232,6 +1238,7 @@ export class KnowledgeHub {
     for (const r of rows as any[]) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
+      if (this.protectedExecution(String(r.id), meta)) continue;
       if (meta.awaiting_ask) {
         // aging escalation: a task parked on a human answer must show its
         // age, or the wait is invisible and unbounded. Annotate hourly;
@@ -1754,6 +1761,7 @@ export class KnowledgeHub {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
         const bmeta = meta.blocked ?? {};
+        if (this.protectedExecution(String(r.id), meta)) continue;
         // BR#3578: the typed await (validated at the door) is trusted and
         // evaluated FIRST; the free text is annotation + legacy fallback.
         const aw = validateAwaitEvent(bmeta.await_event) ?? null;
@@ -2303,6 +2311,7 @@ export class KnowledgeHub {
   private async spawnProxyDuty(
     r: any, meta: any, now: number, prev: any, cond: string, receiptLines: string[],
   ): Promise<void> {
+    if (this.protectedExecution(String(r.id), meta)) return;
     const openChild = this.one(
       `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
@@ -2864,6 +2873,10 @@ export class KnowledgeHub {
       );
       CREATE TABLE IF NOT EXISTS execution_hosts (
         token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS local_execution_grants (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, token_id TEXT NOT NULL,
+        session TEXT NOT NULL, grant TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS workspaces (
         slug TEXT PRIMARY KEY,
@@ -3540,6 +3553,19 @@ export class KnowledgeHub {
       this.executionMutationGuard(op, body);
       switch (op) {
         case "execution": return this.json(this.executionCommand(body, actor));
+        case "handoff.read": return this.json(this.executionWork().read(body, String(body.token_id ?? ""), String(body.session ?? "")));
+        case "handoff.accept": return this.json(this.executionWork().accept(body, String(body.token_id ?? "")));
+        case "handoff.checkpoint": return this.json(this.executionWork().checkpoint(HandoffCheckpointSchema.parse(body), String(body.token_id ?? "")));
+        case "execution.attention": return this.json(this.executionWork().read(body, "", "", isAdmin, true));
+        case "handoff.control": {
+          if (!isAdmin) throw new Error("gate: local handoff control is human-web-only");
+          return this.json(this.executionWork().control(body, actor));
+        }
+        case "admin.execution_sweep": {
+          if (!isAdmin) throw new Error("admin only");
+          this.executionWork().sweep(Number(body.now) || Date.now());
+          return this.json({ ok: true });
+        }
         case "create": return this.json(await this.create(body, actor));
         case "boost": return this.json(await this.boost(body, actor));
         case "get": return this.json(await this.get(String(body.id)));
@@ -4015,7 +4041,8 @@ export class KnowledgeHub {
         this.version(id, "system:verifier", "note", `machine auto-apply failed — the verdict stays proposed for the panel: ${String((e as Error).message ?? e).slice(0, 200)}`, {});
       }
     }
-    return { id, type, status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}), ...(machineApplied ? { machine_applied: true } : {}) };
+    if (type === "task") this.executionWork().sweep();
+    return { id, type, status: this.one(`SELECT status FROM artefacts WHERE id=?`, id)?.status ?? status, ...(feedbackRoundId ? { feedback_round: feedbackRoundId } : {}), ...(machineApplied ? { machine_applied: true } : {}) };
   }
 
   /** BR#3457 — ONE ACTIONABLE VERDICT PER TARGET, EVER. A verify-verdict
@@ -4346,6 +4373,7 @@ export class KnowledgeHub {
       : "";
     this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}${metaDetail}`, { title, body_md: bodyMd });
     await this.embedArtefact(id, title, bodyMd);
+    this.executionWork().sweep();
     return { id };
   }
 
@@ -4450,8 +4478,18 @@ export class KnowledgeHub {
    *  reason) — gaming the gates is visible in the Log and costs behaviour score.
    *  The rejection then goes through the breach door: storms raise ONE card. */
   private executionState(id: string): ExecutionState | null {
-    const row = this.one(`SELECT state FROM execution_state WHERE task_id = ?`, id);
-    return row ? ExecutionStateSchema.parse(JSON.parse(row.state)) : null;
+    const row = this.one(`SELECT e.state,a.meta FROM execution_state e JOIN artefacts a ON a.id=e.task_id WHERE e.task_id = ?`, id);
+    if (!row) return null;
+    const state = ExecutionStateSchema.parse(JSON.parse(row.state));
+    state.requirements = ExecutionRequirementsSchema.parse(JSON.parse(row.meta ?? "{}").execution_requirements ?? state.requirements);
+    return state;
+  }
+  private executionWork(): ExecutionWork {
+    return new ExecutionWork(this.state.storage, (actor, op, id, data) => this.audit(actor, op, id, data), this.wsSlug() ?? DEFAULT_WS_SLUG);
+  }
+  private protectedExecution(id: string, meta: Record<string, unknown>): boolean {
+    const h = this.executionState(id)?.handoff;
+    return isExecutionWait(meta) || (h && h.phase !== "none" && h.phase !== "returned");
   }
 
   /** The bearer and scope headers are stamped by mcp.ts, never argument fields.
@@ -4459,6 +4497,27 @@ export class KnowledgeHub {
   private executionMutationGuard(op: string, body: Record<string, unknown>): void {
     const writes = new Set(["create", "update", "transition", "claim.takeover", "link", "ask.create", "ask.answer", "train.event", "train.ci", "train.lease", "train.recovery_event"]);
     if (!writes.has(op)) return;
+    const patch = body.meta as { execution_requirements?: unknown } | undefined;
+    if (op === "update") {
+      const task = this.one(`SELECT meta FROM artefacts WHERE id=?`, String(body.id ?? ""));
+      const stored = JSON.parse(task?.meta ?? "{}");
+      const deletions = Array.isArray(body.meta_delete) ? body.meta_delete : [];
+      if (deletions.includes("execution_requirements") && stored.execution_requirements) throw new Error("gate: execution requirements cannot be deleted to bypass capability eligibility");
+      if (this.protectedExecution(String(body.id ?? ""), stored)) {
+        for (const key of ["blocked", "execution_wait", "local_execution"]) {
+          if (deletions.includes(key) || (body.meta && key in Object(body.meta) && JSON.stringify((body.meta as Record<string, unknown>)[key]) !== JSON.stringify(stored[key]))) throw new Error("gate: execution lifecycle infrastructure changes only through its explicit typed controls");
+        }
+      }
+    }
+    if (op === "update" && patch?.execution_requirements !== undefined) {
+      const task = this.one(`SELECT meta FROM artefacts WHERE id=?`, String(body.id ?? ""));
+      const before = ExecutionRequirementsSchema.parse(JSON.parse(task?.meta ?? "{}").execution_requirements ?? {});
+      if (!strengthensRequirements(before, ExecutionRequirementsSchema.parse(patch.execution_requirements))) throw new Error("gate: execution requirements cannot silently weaken; cancel/re-scope explicitly");
+    }
+    const local = this.executionState(String(body.id ?? ""))?.handoff;
+    if (local?.phase === "accepted" && body.token_id && (local.token_id !== body.token_id || local.session !== body.session)) {
+      throw new Error("gate: local execution belongs to the explicitly accepted credential/session");
+    }
     const bound = this.one(`SELECT task_id FROM execution_state WHERE worker_token_id = ? LIMIT 1`, String(body.token_id ?? ""));
     if (bound) {
       const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | null;
@@ -4477,13 +4536,16 @@ export class KnowledgeHub {
       const a = this.executionState(String(body.id ?? ""))?.attempt;
       if (row?.status === "todo" && a && a.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — preserve host affinity");
       const requirements = row ? JSON.parse(row.meta ?? "{}").execution_requirements : null;
-      if (row?.status === "todo" && requirements) {
+      if (["todo", "blocked"].includes(row?.status) && requirements && this.executionState(String(body.id ?? ""))?.handoff.phase !== "accepted") {
         const token = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
         if (token && tagsSayGateway(parseTags(token.tags))) {
           const host = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, String(body.token_id));
           if (!host || Date.now() - host.observed_ts > 120_000) throw new Error("gate: claim requires a live executor capability observation");
-          const blockers = capabilityBlockers(ExecutionRequirementsSchema.parse(requirements), ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities)), token.label);
-          if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
+          const capability = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
+          const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(body.id)).project ?? "");
+          if (![capability, ...capability.alternatives].some(c => usableFor(ExecutionRequirementsSchema.parse(requirements), c, token.label, project))) throw new Error("gate: claim requires a live usable configured model in the task's capability scope");
+        } else if (token) {
+          throw new Error("gate: capability-constrained local execution requires explicit authorised handoff acceptance; interactive credentials are not an implicit bypass");
         }
       }
     }
@@ -4503,7 +4565,9 @@ export class KnowledgeHub {
     const now = Date.now();
     if (command.kind === "advertise") {
       if (!gateway) throw new Error("gate: only authenticated gateways advertise executor capabilities");
+      if ([command.capabilities, ...command.capabilities.alternatives].some(c => c.backend === "interactive")) throw new Error("gate: interactive capability attestations belong to human-scoped grants, not gateway inventory");
       this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(command.capabilities), now);
+      this.executionWork().sweep();
       return { ok: true, observed_ts: now, expires_ts: now + 120_000 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
@@ -4511,17 +4575,7 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     if (command.kind === "inspect") return current;
-    if (command.kind === "availability") {
-      const hosts = this.state.storage.sql.exec(`SELECT t.label, h.capabilities, h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(h => {
-        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(h.capabilities)));
-        const blockers = capabilityBlockers(current.requirements, capabilities, String(h.label));
-        const active = this.one(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state, '$.attempt.host') = ? AND json_extract(state, '$.attempt.phase') IN ('running','restoring') AND json_extract(state, '$.attempt.lease_until') > ?`, h.label, now);
-        return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
-      });
-      const eligible = hosts.filter(h => !h.blockers.length);
-      const live = eligible.filter(h => h.expires_ts > now);
-      return { requirements: current.requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : live.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
-    }
+    if (command.kind === "availability") return this.executionWork().availability(req.id);
     const owner = token.principal ?? (gateway ? String(body.agent ?? "") : actor);
     const binding = this.one(`SELECT worker_token_id FROM execution_state WHERE task_id = ?`, req.id);
     const worker = binding?.worker_token_id === tokenId;
@@ -4529,6 +4583,8 @@ export class KnowledgeHub {
     if (command.kind !== "message" && !(owner === row.owner || worker || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
     const session = req.session ?? "";
     if (!session) throw new Error("gate: durable execution requires an explicit session");
+    const localYield = command.kind === "yield" && current.handoff.phase === "preparing" && row.status === "blocked";
+    if (["prepare", "escalate", "local_handoff", "yield"].includes(command.kind) && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: execution action no longer owns the task claim/session");
     const encoded = JSON.stringify({ command, session, actor });
     const old = this.one(`SELECT request, result FROM execution_commands WHERE task_id = ? AND command_id = ?`, req.id, req.command_id);
     if (old) {
@@ -4555,8 +4611,9 @@ export class KnowledgeHub {
       if (row.status !== "in_progress" || meta.session !== session) throw new Error("gate: begin requires the current task claim/session");
       const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
       if (!advertised || now - advertised.observed_ts > 120_000) throw new Error("gate: executor capabilities missing/stale — advertise live facts before begin");
-      const blockers = capabilityBlockers(current.requirements, ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities)), actor);
-      if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
+      const capability = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+      const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, req.id).project ?? "");
+      if (!usableFor(current.requirements, capability, actor, project)) throw new Error("gate: begin requires the selected usable configured model in the task's scope");
       if (!gateway || !command.worker.startsWith(`${actor}/`)) throw new Error("gate: runner worker must belong to its authenticated gateway");
       const child = this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, command.worker);
       if (!child) throw new Error("gate: worker credential must be provisioned before begin");
@@ -4569,7 +4626,7 @@ export class KnowledgeHub {
       const advertised = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id = ?`, tokenId);
       next.attempt.executor = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
     }
-    if (command.kind === "yield" && (row.status !== "in_progress" || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
+    if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(next));
@@ -4580,12 +4637,16 @@ export class KnowledgeHub {
       meta.execution_requirements = next.requirements;
       if (command.kind === "yield") {
         delete meta.session;
-        this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), req.id);
+        const local = next.handoff.phase === "waiting" ? next.handoff : null;
+        if (local) meta.blocked = { reason: `Pick up locally: ${local.action}`, unblock_condition: "Explicit human-authorised local acceptance of this handoff episode; answers/dismissals do not resume it", ts: now,
+          await_event: { event: "local_handoff", handoff_id: local.id, version: local.version } };
+        this.state.storage.sql.exec(`UPDATE artefacts SET status = ?, owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, local ? "blocked" : "todo", now, now, JSON.stringify(meta), req.id);
       } else {
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), req.id);
       }
     });
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
+    if (command.kind === "yield") this.executionWork().sweep();
     return next;
   }
 
@@ -5202,6 +5263,13 @@ export class KnowledgeHub {
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
+    const executionMeta = JSON.parse(row.meta ?? "{}");
+    const localMode = this.executionState(id)?.handoff;
+    if ((isExecutionWait(executionMeta) || localMode?.phase === "preparing" || localMode?.phase === "waiting") && !(to === "superseded" && actor.startsWith("web:"))) {
+      throw new Error("gate: typed local/capability wait owns this exit; ordinary transitions/asks/timeout cannot release it");
+    }
+    if (localMode?.phase === "accepted" && to === "todo") throw new Error("gate: local execution returns only through explicit human-authorised return with quiescence confirmation");
+    if (["local_handoff", "executor_capability"].includes(body.await_event?.event)) throw new Error("gate: execution-owned waits can only be emitted by their authoritative lifecycle");
     // BR#6135: takeover:true on an in_progress card routes to the atomic
     // claim-takeover op BEFORE the lifecycle table — in_progress →
     // in_progress is otherwise the illegal edge this flag exists to replace
@@ -5235,6 +5303,12 @@ export class KnowledgeHub {
       { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
       this.ruleCtx(row, body, id, tTags),
     );
+    const freshClaim = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+    if (freshClaim.status !== row.status || freshClaim.owner !== row.owner || JSON.parse(freshClaim.meta ?? "{}").session !== JSON.parse(row.meta ?? "{}").session
+      || (this.protectedExecution(id, JSON.parse(freshClaim.meta ?? "{}")) && !(isExecutionWait(executionMeta) || (localMode && localMode.phase !== "none" && localMode.phase !== "returned")))) {
+      throw new Error("gate: execution ownership/wait changed during transition; the fresh lifecycle owns the next action");
+    }
+    row.meta = freshClaim.meta;
     if (verdict.ok === false) {
       // BR#4390: a machine refusal (illegal edge or guard) rides TYPED —
       // result_class "gate_rejected" survives the op catch-all below into the
@@ -5821,6 +5895,7 @@ export class KnowledgeHub {
           break;
         }
         case "spawn_unblock": {
+          if (this.protectedExecution(id, meta)) break;
           // every blocked task gets an unblock child — the executor already
           // ran the cap (≤1 open per parent) and the flood guard; this is the
           // only spawn site and it only executes.
@@ -6248,6 +6323,15 @@ export class KnowledgeHub {
       ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
       : "";
     const instructions = composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine;
+    const execution = this.executionState(id);
+    const localAccepted = execution?.handoff.phase === "accepted" && execution.handoff.token_id === body.token_id && execution.handoff.session === body.session;
+    const scope = body.execution_scope as { generation?: number; attempt_id?: string } | undefined;
+    const staleScope = scope && execution?.attempt && (scope.generation !== execution.attempt.generation || scope.attempt_id !== execution.attempt.attempt_id);
+    if (isExecutionWait(meta) || (!localAccepted && (execution?.attempt?.phase === "quiesced" || staleScope))) {
+      this.audit(actor, "progress_comment", id, { note, will });
+      this.version(id, actor, "comment", note, { note, will, kind: "commentary" });
+      return { id, kind: "commentary", note, instructions, note_postscript: "Execution wait unchanged; explicit authorised lifecycle exit is required." };
+    }
     if (Array.isArray(meta.recovery_links) && meta.recovery_links.length) {
       const principal = body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, String(body.token_id))?.principal : null;
       const owns = row.owner === actor || (principal && row.owner === principal);
@@ -7338,6 +7422,7 @@ export class KnowledgeHub {
       // Free-text steering is recorded, but cannot silently authorise release
       // or resume. Only an explicit choice can invoke its declared effect.
       const decisionAction = decision ? choice?.action ?? "hold" : undefined;
+      if (decisionAction === "local_handoff" && !actor.startsWith("web:")) throw new Error("gate: a human-web answer must authorise conversion to local handoff");
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
       // BR#3911: an answer resolves a live human-claim hold — the timer is
       // cancelled by the very act the hold was waiting for.
@@ -7360,6 +7445,7 @@ export class KnowledgeHub {
       );
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
+        const answeredLocalExit = sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id;
         // BR#5902: the standing alarm sink (train_alarm_sink_id) is exempt
         // from ask-answer dispatch entirely — every dispatch leg ends in a
         // transition and every transition on the sink is refused by its
@@ -7388,7 +7474,13 @@ export class KnowledgeHub {
         if (cleared) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), subject.id);
         }
-        if (subject.status === "blocked" && !sinkAnchored) {
+        const localMode = this.executionState(String(subject.id))?.handoff;
+        if (decisionAction === "local_handoff") {
+          this.executionWork().fromHumanDecision(String(subject.id), String(node.title), decision?.why_human ?? "Human requested local execution", actor);
+          taskStatus = "blocked";
+        }
+        if (answeredLocalExit && (localMode?.phase === "accepted" || localMode?.phase === "returned")) this.executionWork().resumeAfterAnswer(String(subject.id));
+        if (subject.status === "blocked" && !sinkAnchored && !isExecutionWait(sm) && localMode?.phase !== "accepted" && decisionAction !== "local_handoff") {
           // BR#3578 answer dispatch: when the ask IS the exit path (a
           // migration ask, or an option that names the action), the ANSWER
           // actions the card — SUPERSEDE drops it, RELEASE/CANCEL releases
@@ -7808,6 +7900,7 @@ export class KnowledgeHub {
     const unclaimedWork = dispatchPool.filter((t: any) => {
       const need: string[] = t.roles ?? [];
       const m = JSON.parse(t.meta ?? "{}");
+      if (this.protectedExecution(String(t.id), m)) return false;
       const declared = m.qualification?.state ?? (m.qualified === true ? "qualified" : undefined);
       const qualified = declared === "qualified" || analysisEv.has(t.id) || parentQualified.has(t.id);
       const bars: string[] = m.qualification?.bars ?? [];
@@ -7981,6 +8074,7 @@ export class KnowledgeHub {
       steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,
+      pending_local_handoffs: this.executionWork().read({ limit: 10 }, String(body.token_id ?? ""), String(body.session ?? "")).items,
       decisions_awaiting_consensus: decisionsAwaiting.length ? decisionsAwaiting : undefined,
       action_required: actionRequired.length || verificationNotices.length
         ? [...actionRequired, ...verificationNotices]
