@@ -1,7 +1,7 @@
 /** Local execution is a human-authorised mode, never an autonomous queue tier.
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema,
-  initialExecution, projectExecutionBlockers, continuationPrompt, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation } from "@bridge/contracts";
+  initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
@@ -17,7 +17,8 @@ export function interactiveCredential(token: Credential | null): boolean {
 }
 
 export class ExecutionWork {
-  constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace = "state-vector") {}
+  constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace: string,
+    private readiness: (token: string, host: string, capabilities: ExecutorCapabilities, now: number) => ExecutorReadiness) {}
   private get sql() { return this.storage.sql; }
   private one<T>(query: string, ...args: (string | number | null)[]): T | null { return (this.sql.exec(query, ...args).toArray()[0] as unknown as T) ?? null; }
   private task(id: string): TaskRow {
@@ -35,16 +36,24 @@ export class ExecutionWork {
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
   private credential(tokenId: string): Credential | null { return this.one<Credential>(`SELECT id,label,principal,tags,revoked_ts FROM auth_tokens WHERE id=?`, tokenId); }
   private hosts(): CapabilityObservation[] {
-    return this.sql.exec(`SELECT t.label,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
+    return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
       host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
       active: Number(this.one<{ n: number }>(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state,'$.attempt.host')=? AND json_extract(state,'$.attempt.phase') IN ('running','restoring') AND json_extract(state,'$.attempt.lease_until')>?`, String(row.label), Date.now())?.n ?? 0),
+      readiness: this.readiness(String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), Date.now()),
     }));
   }
   availability(id: string) {
     const task = this.task(id); const blockers = this.blockers(task, Date.now());
     const capability = blockers.find(b => b.kind === "capability_unavailable");
-    return { requirements: this.state(task).requirements, blockers, phase: capability?.kind === "capability_unavailable" ? capability.reason
-      : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts: this.hosts() };
+    const state = this.state(task);
+    const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
+    const hosts = this.hosts().map(host => {
+      const missing = capabilityBlockers(requirements, host.capabilities, host.host);
+      if (!missing.length && ![host.capabilities, ...host.capabilities.alternatives].some(c => usableFor(requirements, c, host.host, task.project))) missing.push("model_or_project_scope");
+      return { ...host, observed_ts: host.observed_at, expires_ts: host.observed_at + 120_000, blockers: missing, busy: host.active >= host.capabilities.capacity };
+    });
+    return { requirements, blockers, phase: capability?.kind === "capability_unavailable" ? capability.reason
+      : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts };
   }
   private asks(id: string) {
     return this.sql.exec(`SELECT q.id,q.title FROM relations r JOIN artefacts q ON q.id=r.src_id WHERE r.dst_id=? AND r.relation='child_of' AND q.type='question' AND q.status NOT IN ('done','superseded') AND json_extract(q.meta,'$.ask.route.kind')='human_decision'`, id).toArray().map(q => ({ id: String(q.id), question: String(q.title) }));
@@ -60,7 +69,8 @@ export class ExecutionWork {
     const state = this.state(task);
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
-    return projectExecutionBlockers({ id: task.id, project: task.project, requirements: state.requirements, handoff: state.handoff, hosts: this.hosts(), asks: this.asks(task.id), now, local });
+    const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
+    return projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(), asks: this.asks(task.id), now, local });
   }
   /** Reads compute fresh availability without persisting, claiming or granting. */
   read(raw: unknown, tokenId = "", session = "", human = false, attention = false) {
@@ -121,7 +131,7 @@ export class ExecutionWork {
       if (h.recipient && h.recipient !== token!.label && h.recipient !== token!.principal) return { kind: "unauthorized" as const };
       if (/^(dispatch-|bridge-task-)/.test(cmd.session)) throw new Error("gate: local acceptance requires a separately named interactive session");
       const grant: LocalGrant = { id: crypto.randomUUID(), task_id: task.id, handoff_id: h.id, version: h.version,
-        token_id: token!.id, session: cmd.session, host: cmd.host, by: actor, source: "human_attested", evidence: cmd.evidence, capabilities: cmd.capabilities, expires_at: Date.now() + 15 * 60_000 };
+        token_id: token!.id, session: cmd.session, host: cmd.host, by: actor, source: "human_attested", evidence: cmd.evidence, capabilities: cmd.capabilities, expires_at: Date.now() + (cmd.ttl_ms ?? 900_000) };
       const blockers = this.blockers(task, Date.now(), grant).filter(b => b.kind !== "local_pickup_required" && b.kind !== "capacity_wait");
       if (blockers.length) return { kind: "unmet_prerequisites" as const, prerequisites: blockers };
       this.sql.exec(`INSERT INTO local_execution_grants (id,task_id,token_id,session,grant) VALUES (?,?,?,?,?)`, grant.id, task.id, token!.id, cmd.session, JSON.stringify(grant));

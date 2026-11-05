@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityBlockers, initialExecution, reduceExecution, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -9,6 +9,17 @@ const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", s
 const started = () => step(initialExecution(), begin);
 
 describe("durable execution failure boundaries", () => {
+  it("bounds unstarted failures across restarts; only changed prerequisites reset their budget", () => {
+    const one = nextExecutorStartBarrier(null, "worker/config-one", "begin refused", 100);
+    expect(one).toMatchObject({ kind: "cooldown", failures: 1, until_ts: 60_100 });
+    const two = nextExecutorStartBarrier(JSON.parse(JSON.stringify(one)), "worker/config-one", "still refused", 70_000);
+    expect(two).toMatchObject({ kind: "cooldown", failures: 2, until_ts: 190_000 });
+    const three = nextExecutorStartBarrier(two, "worker/config-one", "still refused", 200_000);
+    expect(three).toMatchObject({ kind: "repair_required", failures: 3 });
+    expect(nextExecutorStartBarrier(null, "worker/config-one", "gate: prerequisite missing", 100, "prerequisite")).toMatchObject({ kind: "repair_required", failures: 1 });
+    expect(nextExecutorStartBarrier(three, "worker/config-repaired", "new prerequisite failure", 300_000)).toMatchObject({ kind: "cooldown", failures: 1 });
+    expect(() => step(started(), { kind: "start_failed", stage: "begin", reason: "unknown start outcome", retained_work: false, failure_class: "transport" })).toThrow(/unquiesced/);
+  });
   it("keeps a fault's retry budget/history across unrelated commits without carrying verification coverage", () => {
     const cause: RecoveryCause = { kind: "check_failure", check: "Smoke" };
     let episode = reduceRecoveryEpisode(undefined, { head_sha: cp.base, cause, event_id: "failed", actor: "runner", now: 1,

@@ -120,10 +120,37 @@ fn main() {
             }
         }
         "execution" => {
+            if matches!(args.get(2).map(String::as_str), Some("pause" | "resume" | "coordinate")) {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                let result = if args[2] == "coordinate" {
+                    let id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("usage: bridge execution coordinate <BR#id> <message>"); std::process::exit(2); });
+                    let message = args.get(4).filter(|text| !text.is_empty()).unwrap_or_else(|| { eprintln!("coordination message required"); std::process::exit(2); });
+                    dispatch::execution_coordinate(&cfg, id, message)
+                } else { dispatch::execution_claims(&cfg, args[2] == "pause") };
+                match result { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()), Err(error) => { eprintln!("{error}"); std::process::exit(1); } }
+                return;
+            }
+            if args.get(2).map(String::as_str) == Some("ready") {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
+                match dispatch::execution_ready(&cfg) {
+                    Ok(reply) => println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default()),
+                    Err(error) => { eprintln!("bridge readiness: {error}"); std::process::exit(1); }
+                }
+                return;
+            }
+            if args.get(2).map(String::as_str) == Some("recover-unstarted") {
+                let tid = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("execution recover-unstarted requires a BR# task id"); std::process::exit(2); });
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                match dispatch::recover_unstarted(&cfg, tid) {
+                    Ok(reply) => println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default()),
+                    Err(error) => { eprintln!("bridge startup recovery: {error}"); std::process::exit(1); }
+                }
+                return;
+            }
             let kind = match args.get(2).map(String::as_str) {
                 Some("inspect") => dispatch::ExecutionRead::Inspect,
                 Some("availability") => dispatch::ExecutionRead::Availability,
-                _ => { eprintln!("usage: bridge execution inspect|availability <task-id>"); std::process::exit(2); }
+                _ => { eprintln!("usage: bridge execution ready | recover-unstarted <task-id> | inspect|availability <task-id>"); std::process::exit(2); }
             };
             let task_id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("execution requires a BR# task id"); std::process::exit(2); });
             let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });

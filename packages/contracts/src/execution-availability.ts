@@ -11,7 +11,8 @@ export const ExecutionAttentionSchema = z.object({
 export type ExecutionAttention = z.infer<typeof ExecutionAttentionSchema>;
 export type ExecutionAttentionItem = ExecutionAttention["items"][number];
 
-export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number }
+export type ExecutorReadiness = { kind: "ready"; worker_id: string; fingerprint: string } | { kind: "unprovisioned" | "repair_required"; reason: string } | { kind: "cooldown"; reason: string; until_ts: number };
+export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number; readiness?: ExecutorReadiness }
 export function usableFor(required: ExecutionRequirements, capability: ExecutorCapabilities | ExecutorCapabilities["alternatives"][number], host: string, project: string): boolean {
   return capability.availability.kind === "usable" && capability.model !== null && capability.projects.some(p => p === "*" || p === project)
     && capabilityBlockers(required, capability, host).length === 0;
@@ -32,7 +33,7 @@ export function projectExecutionBlockers(input: {
     .filter(h => h.capabilities.availability.kind !== "disabled" && h.capabilities.projects.some(p => p === "*" || p === project)
       && capabilityBlockers(requirements, h.capabilities, h.host).length === 0);
   const live = configured.filter(h => now - h.observed_at < 120_000);
-  const usable = live.filter(h => h.capabilities.availability.kind === "usable" && h.capabilities.model !== null);
+  const usable = live.filter(h => h.capabilities.availability.kind === "usable" && h.capabilities.model !== null && (!h.readiness || h.readiness.kind === "ready"));
   const localReady = input.local && !capabilityBlockers(requirements, input.local.capabilities, input.local.host).length
     && input.local.capabilities.model !== null && input.local.capabilities.availability.kind === "usable"
     && input.local.capabilities.projects.some(p => p === "*" || p === project);

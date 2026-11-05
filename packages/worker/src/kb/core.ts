@@ -458,7 +458,7 @@ export function isValidAskTarget(to: string): boolean {
   if (!to || to.length > 120) return false;
   if (to === "any") return true;
   if (to.startsWith("tag:")) return /^[a-z0-9:_-]{1,100}$/.test(to.slice(4));
-  return /^[a-zA-Z0-9._@-]{1,100}$/.test(to);
+  return /^[a-zA-Z0-9._-]+(?:\/[a-zA-Z0-9._-]+)*(?:@[a-zA-Z0-9._-]+)?$/.test(to);
 }
 
 export const ASK_OPEN = "open";

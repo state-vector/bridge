@@ -8,6 +8,31 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("a bound, non-conflicting cure is an explicit PR merge action, even before the request is published", () => {
+    const fix = { ...task, pr: 2916, pr_url: "https://github.com/o/r/pull/2916", merged: false, conflict: false };
+    const f = facts({ stop: { reason: "Deployment failed" }, base_red_resolution: {
+      verdict: "red", phase: "cure_pr_awaiting_force_merge", held: 12, whats_broken: [], ask: null, fix_card: fix,
+    } });
+    const line = projectTrainLine(f, now);
+    expect(line).toMatchObject({ label: "Fix ready — your merge is needed", remediation: {
+      kind: "merge", pr: 2916, url: fix.pr_url, request: null,
+    } });
+    f.base_red_resolution!.ask = { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Merge cure", options: ["DONE", "HOLD"] };
+    expect(projectTrainLine(f, now).remediation).toMatchObject({ kind: "merge", request: { id: "BR#2" } });
+    f.base_red_resolution!.fix_card!.conflict = true;
+    expect(projectTrainLine(f, now).remediation?.kind).not.toBe("merge");
+    f.base_red_resolution!.fix_card!.conflict = false;
+    f.base_red_resolution!.fix_card!.merged = true;
+    expect(projectTrainLine(f, now).remediation?.kind).not.toBe("merge");
+  });
+  it("a current merge refusal cannot advertise yesterday's starvation diagnosis as its repair", () => {
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#3974" }], diagnostic: { ...task, id: "BR#6442" },
+      queue_facts: { at: now, base_state: { verdict: "green" }, stalled: { last_error: "gh pr merge 2513 --merge: base branch policy prohibits the merge" } },
+    }), now);
+    expect(line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge", remediation: { kind: "attention" } });
+    expect(JSON.stringify(line)).not.toContain("BR#6442");
+    expect(line.reason).not.toContain("gh pr merge");
+  });
   it("a scoped-green base waiting only for the drift check is pending, not a failing main", () => {
     const q = { at: now, base_state: { verdict: "green", red: [], unsettled: [], gate_blocked: true, gate_red: [], gate_unsettled: ["Deploy drift alarm"] } };
     expect(projectTrainLine(facts({ queue_facts: q }), now)).toMatchObject({ phase: "waiting", blocker: "checks_running", label: "Waiting for required checks", remediation: { kind: "machine" } });

@@ -33,6 +33,7 @@ function LocalActions({ item, agents, changed }: { item: ExecutionAttentionItem;
         ? { ...base, kind: "return_autonomous", writers: "human_confirmed_quiescent" }
         : { ...base, kind: "authorize", label, session, host, evidence,
           capabilities: { tier: ReasoningTierSchema.parse(tier), model, backend: "interactive", tools: item.requirements.tools,
+            worker: { kind: "unprovisioned" },
             environment: item.requirements.environment, config_revision: `human-session:${session}`, capacity: 1,
             projects: [item.project], alternatives: [], availability: { kind: "usable" } } });
       if (!["authorized", "returned_autonomous", "preparation_confirmed"].includes(result.kind)) throw new Error(`${result.kind}: ${JSON.stringify(result.prerequisites ?? [])}`);

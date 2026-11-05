@@ -2,6 +2,7 @@
 import { z } from "zod";
 
 export const EXECUTION_POLICY_VERSION = 1;
+export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
 export const EXECUTION_LEASE_MS = 120_000;
 const text = z.string().min(1).max(4000);
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/);
@@ -14,6 +15,21 @@ export const ExecutionRequirementsSchema = z.object({
   host: text.optional(),
 });
 export type ExecutionRequirements = z.infer<typeof ExecutionRequirementsSchema>;
+export const WorkerReadinessSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("unprovisioned") }),
+  z.object({ kind: z.literal("provisioned"), label: text }),
+]);
+export const ExecutorStartBarrierSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cooldown"), fingerprint: text, failures: z.number().int().min(1).max(2), until_ts: z.number().int(), reason: text }),
+  z.object({ kind: z.literal("repair_required"), fingerprint: text, failures: z.number().int().positive(), reason: text }),
+]);
+export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
+export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" = "transport"): ExecutorStartBarrier {
+  const failures = previous?.fingerprint === fingerprint ? previous.failures + 1 : 1;
+  return ExecutorStartBarrierSchema.parse(failureClass === "prerequisite" || failures >= 3
+    ? { kind: "repair_required", fingerprint, failures, reason }
+    : { kind: "cooldown", fingerprint, failures, until_ts: now + 60_000 * failures, reason });
+}
 export const ModelCapabilitySchema = z.object({
   tier: ReasoningTierSchema,
   tools: z.array(text),
@@ -29,7 +45,7 @@ export const ModelCapabilitySchema = z.object({
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
 });
-export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]) });
+export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }) });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
   const tiers: ReasoningTier[] = ["small", "medium", "large"];
@@ -90,7 +106,7 @@ export const HandoffAcceptSchema = z.looseObject({ id: text, handoff_id: text, v
 export const HandoffControlSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("request_local"), id: text, reason: text, action: text }),
   z.object({ kind: z.literal("confirm_preparation"), id: text, handoff_id: text, version: z.number().int().positive(), checkpoint: CheckpointSchema, evidence: text, writers: z.literal("human_confirmed_quiescent") }),
-  z.object({ kind: z.literal("authorize"), id: text, handoff_id: text, version: z.number().int().positive(), label: text, session: text, host: text, evidence: text, capabilities: ExecutorCapabilitiesSchema }),
+  z.object({ kind: z.literal("authorize"), id: text, handoff_id: text, version: z.number().int().positive(), label: text, session: text, host: text, evidence: text, capabilities: ExecutorCapabilitiesSchema, ttl_ms: z.number().int().min(1).max(900_000).optional() }),
   z.object({ kind: z.literal("return_autonomous"), id: text, handoff_id: text, version: z.number().int().positive(), writers: z.literal("human_confirmed_quiescent") }),
 ]);
 export type HandoffControl = z.infer<typeof HandoffControlSchema>;
@@ -136,10 +152,14 @@ export function initialExecution(requirements: ExecutionRequirements = Execution
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("pause_claims"), reason: text, budget_ms: z.number().int().min(10_000).max(300_000) }),
+  z.object({ kind: z.literal("resume_claims") }),
   z.object({ kind: z.literal("inspect") }),
   z.object({ kind: z.literal("availability") }),
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
   z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000) }),
+  z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite"]).default("prerequisite") }),
+  z.object({ kind: z.literal("recover_unstarted"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
   z.object({ kind: z.literal("poll"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
   z.object({ kind: z.literal("checkpoint"), ...FenceSchema.shape, checkpoint: CheckpointSchema }),
@@ -175,7 +195,15 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     return a;
   };
   switch (command.kind) {
-    case "inspect": case "availability": case "advertise": return s;
+    case "inspect": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "start_failed": {
+      if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
+      return s; // the authenticated coordinator owns the atomic task release
+    }
+    case "recover_unstarted": {
+      if (a) throw new Error("gate: legacy unstarted recovery cannot erase an execution attempt");
+      return s;
+    }
     case "begin": {
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
       if (s.budget_exhaustions >= 3) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");

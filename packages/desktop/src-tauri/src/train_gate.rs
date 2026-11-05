@@ -107,7 +107,11 @@ fn settled_green(c: &str) -> bool {
     c == "success" || c == "skipped" || c == "neutral"
 }
 
-fn is_exempt_check_name(name: &str) -> bool {
+/// BR#2267 exempt-external names (BR#6001 list). BR#6568: now also consumed
+/// by the probe path (train.rs classify_rollup, the observation behind the
+/// typed pr_checks_green await) — an exempt external failing must not park a
+/// typed await, exactly as it must not bounce a merge (BR#3177 law).
+pub fn is_exempt_check_name(name: &str) -> bool {
     let n = name.to_lowercase();
     MERGE_EXEMPT_CHECK_PATTERNS.iter().any(|p| n.contains(p))
 }

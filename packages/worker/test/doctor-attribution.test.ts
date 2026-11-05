@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readyGateway, executorRequest } from "./executor-fixture";
 
 /**
  * Executor-attribution laws (2026-11-03 "doctor" incident):
@@ -58,7 +59,7 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   const r = await kb(path, {
     method: "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(executorRequest(body)),
   });
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
@@ -69,6 +70,7 @@ async function mintToken(label: string, tags: string[]): Promise<{ id: string; s
   expect(body.error).toBeUndefined();
   expect(body.id).toBeTruthy();
   expect(body.secret).toBeTruthy();
+  if (tags.includes("gateway")) await readyGateway(kbJson, body.id, label);
   return { id: body.id as string, secret: body.secret as string };
 }
 

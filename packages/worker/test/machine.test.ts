@@ -8,6 +8,7 @@ import {
   invariants,
   detectBreaches,
   breachClass,
+  BREACH_THRESHOLDS,
   silentCycles,
   replayStatus,
   CHURN_COOLDOWN_MS,
@@ -1897,7 +1898,30 @@ describe("breachClass: release_held (BR#4562)", () => {
       op: "transition_rejected", task: "TASK-001", ts: 1000 + i * 60_000, reason,
     }));
     const out = detectBreaches(events as any, new Set());
-    expect(out.map((b) => b.klass)).not.toContain("release_held");
+    // BR#6654 hardening: the tag classifies this shape as release:held-typed-await,
+    // NOT release_held — the old assertion (not.toContain("release_held")) passed
+    // vacuously while the named class raised at the default threshold 3. The law
+    // is: NO breach at all, under either spelling.
+    expect(out).toEqual([]);
+  });
+
+  it("BR#6654 specimen: a tagged train-queue refusal storm (one per alarm tick, BR#4687 2026-11-05 14:09–14:11Z) raises nothing", () => {
+    const reason = "card is merge-train awaiting-ci (typed await pr_merged state-vector/bridge#322) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool. [rule: release-holds-train-queue]";
+    expect(reason.length).toBeLessThanOrEqual(300); // short repo name — the tag survives the audit slice
+    expect(breachClass(reason)).toBe("release:held-train-queue");
+    const events = Array.from({ length: 12 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#4687", ts: 1000 + i * 60_000, reason,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("the named release:held-* classes share release_held's never-a-breach pricing (BREACH_THRESHOLDS pin)", () => {
+    expect(BREACH_THRESHOLDS["release_held"]).toBe(Number.POSITIVE_INFINITY);
+    expect(BREACH_THRESHOLDS["release:held-typed-await"]).toBe(Number.POSITIVE_INFINITY);
+    expect(BREACH_THRESHOLDS["release:held-train-queue"]).toBe(Number.POSITIVE_INFINITY);
+    // the honest names survive: classification is observability, pricing is the law
+    expect(breachClass("x [rule: release-holds-typed-await]")).toBe("release:held-typed-await");
+    expect(breachClass("x [rule: release-holds-train-queue]")).toBe("release:held-train-queue");
   });
 
   it("the contrast holds: an equally persistent unknown refusal still folds unclassified and raises at the threshold", () => {

@@ -42,7 +42,7 @@ struct NotifyExecutionArgs { id: String, title: String, body: String }
 #[tauri::command]
 fn notify_execution_attention(app: tauri::AppHandle, args: NotifyExecutionArgs) {
     let id = args.id.clone(); let title = args.title.clone(); let body = args.body.clone();
-    let _ = app.run_on_main_thread(move || mac_notify::send_ask_main_thread(&id, &title, &body, &[]));
+    let _ = app.run_on_main_thread(move || { mac_notify::send_ask_main_thread(&id, &title, &body, &[]); });
     if !mac_notify::bundled() { let _ = app.notification().builder().title(&args.title).body(&args.body).show(); }
 }
 

@@ -52,6 +52,10 @@ describe("ask targets", () => {
     expect(isValidAskTarget("any")).toBe(true);
     expect(isValidAskTarget("opencode-ray")).toBe(true);
     expect(isValidAskTarget("opencode-ray@fix-auth-2")).toBe(true);
+    expect(isValidAskTarget("ip-172-31-1-230/opencode")).toBe(true);
+    expect(isValidAskTarget("gateway/agent@review-1")).toBe(true);
+    expect(isValidAskTarget("https://example.test/agent")).toBe(false);
+    expect(isValidAskTarget("agent@@session")).toBe(false);
     expect(isValidAskTarget("tag:datadog-access")).toBe(true);
     expect(isValidAskTarget("has spaces")).toBe(false);
     expect(isValidAskTarget("tag:BAD TAG")).toBe(false);

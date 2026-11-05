@@ -20,6 +20,7 @@ export const LineRemediationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("agent"), text: z.string(), task: TrainFixCardSchema }),
   z.object({ kind: z.literal("queued"), text: z.string(), task: TrainFixCardSchema }),
   z.object({ kind: z.literal("human"), text: z.string(), action: ActionSchema }),
+  z.object({ kind: z.literal("merge"), text: z.string(), pr: z.number().int().positive(), url: z.string().url(), request: ActionSchema.nullable() }),
   z.object({ kind: z.literal("attention"), text: z.string() }),
 ]);
 export type LineRemediation = z.infer<typeof LineRemediationSchema>;
@@ -48,7 +49,7 @@ export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonN
   const open = recoveries.filter((r) => recoveryIsOpen(r.episode));
   // The cause-bound repair is authoritative over historical starvation or
   // generic diagnostic duties. Keep actual human requirements intact.
-  if (line.phase === "stopped" && line.blocker === "main_failed" && line.remediation.kind !== "human") {
+  if (line.phase === "stopped" && line.blocker === "main_failed" && line.remediation.kind !== "human" && line.remediation.kind !== "merge") {
     const ranked = open.filter((r) => r.task && r.task.status !== "done" && r.task.status !== "superseded")
       .sort((a, b) => Number(!!b.task?.active_agent) - Number(!!a.task?.active_agent)
         || Number(a.episode.cause.kind === "check_failure") - Number(b.episode.cause.kind === "check_failure")
@@ -117,9 +118,13 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     ...TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: q?.at ?? 0, remediation }),
   });
   const repair = (): LineRemediation => {
+    if (f.base_red_resolution?.phase === "cure_pr_awaiting_force_merge" && task?.pr && task.pr_url && !task.merged && !task.conflict) return {
+      kind: "merge", text: `Bypass-merge fix PR #${task.pr} to unblock this line. Main's failing deployment check prevents the automatic merge.`,
+      pr: task.pr, url: task.pr_url, request: ask ?? null,
+    };
     if (ask) return { kind: "human", text: task?.pr && !task.merged
       ? `Merge repair PR #${task.pr}, then choose DONE in the request. Main's failing checks prevent the automatic merge.`
-      : `Automatic repair is stuck${task?.blocked_reason ? `: ${task.blocked_reason}` : "."} Provide the missing access or repair instructions in the request.`, action: ask };
+      : ask.question, action: ask };
     if (task?.active_agent) return { kind: "agent", text: repairProgressText(task), task };
     if (task && (task.status === "todo" || task.status === "in_review")) return {
       kind: "queued", text: task.status === "todo" ? "Repair is queued at top priority; waiting for an available agent." : "The repair is awaiting independent verification.", task,
@@ -133,7 +138,8 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     const failure = cov?.phase === "failed" ? [{ name: `Deploy Dev${cov.failing_run_id ? ` run #${cov.failing_run_id}` : ""}`, ...(cov.failing_run_url ? { url: cov.failing_run_url } : {}) }] : [];
     const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];
     const names = evidence.map((e) => e.name).join(", ");
-    return make("stopped", "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, repair());
+    const action = repair();
+    return make("stopped", action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
   }
   if (q && !fresh && (f.queue.length || f.currently || bs?.verdict !== "green" || bs?.gate_blocked)) return make(
     "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());
@@ -152,8 +158,10 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     "Main has no covering deployment. Changes are held while the executor attempts recovery.", "deploy_missing", [], repair());
   if (f.bypass_wait) return make("stopped", "Your action is needed",
     `PR #${f.bypass_wait.pr} cannot be merged automatically.`, "human_action", [], repair());
-  if (fresh && q?.stalled) return make("stopped", "Merges are failing",
-    q.stalled.last_error ?? "Merge attempts are not landing.", "merge_failed", [], repair());
+  if (fresh && q?.stalled) return make("stopped", "Queued PRs cannot merge",
+    "GitHub rejected the selected PR merges. The executor must reconcile branch policy and required checks before retrying.", "merge_failed", [],
+    ask ? { kind: "human", text: ask.question, action: ask }
+      : { kind: "attention", text: "Bridge must repair the rejected merge. No bypass-merge request has been issued for this failure." });
   if (f.starved) return make("stopped", "Work is not moving",
     "Changes have waited over an hour without a merge.", "no_progress", [], repair());
   if (f.currently) return make(f.currently.phase === "bursting" ? "working" : "waiting",

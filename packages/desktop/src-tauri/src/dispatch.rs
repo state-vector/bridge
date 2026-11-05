@@ -154,28 +154,115 @@ fn execution_rank(task: &serde_json::Value) -> u8 {
     else { 1 }
 }
 
-fn executor_capabilities(tier: ReasoningTier) -> serde_json::Value {
+fn executor_capabilities(tier: ReasoningTier, worker: &WorkerCredential) -> serde_json::Value {
     let tools: Vec<&str> = ["git", "gh", "cargo", "npm", "aws"].into_iter().filter(|bin| {
         Command::new(bin).arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
     }).collect();
     // Scope facts only: an installed AWS CLI is NOT proof of cloud authority.
-    json!({ "tier": tier, "tools": tools, "environment": [std::env::consts::OS, std::env::consts::ARCH] })
+    json!({ "tier": tier, "tools": tools, "environment": [std::env::consts::OS, std::env::consts::ARCH],
+        "worker": { "kind": "provisioned", "label": worker.label } })
+}
+
+fn requested_worker_label(cfg: &DispatchConfig) -> String {
+    match &cfg.label {
+        Some(label) if !label.is_empty() => format!("{label}/{}", agent_segment(cfg)),
+        _ => agent_identity(cfg),
+    }
+}
+
+fn worker_config_revision(cfg: &DispatchConfig) -> String {
+    format!("worker-ready-v2:task-affinity-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default())
+}
+
+fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(WorkerCredential, serde_json::Value), String> {
+    let backend = avail.iter().max_by_key(|b| {
+        let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+        cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
+    }).ok_or("no configured backend is available")?;
+    let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+    let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
+    let mut capabilities = backend_capabilities(cfg, name, true, Some(&worker));
+    capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| other.as_str() != name).map(|other| {
+        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(other)) == *b);
+        backend_capabilities(cfg, other, runnable, Some(&worker))
+    }).collect::<Vec<_>>());
+    let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
+    if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
+        return Err(format!("executor readiness held: {}", reply["readiness"]));
+    }
+    Ok((worker, reply))
+}
+
+/// A bounded paired-operator preflight; never claims or launches a task.
+pub fn execution_ready(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
+    prepare_worker(cfg, &available_backends(cfg)).map(|(_, reply)| reply)
+}
+
+/// Recover only recorded legacy pre-begin failures, under this host's genuine
+/// credential, after fresh local proof that its old runner launched no workers.
+pub fn recover_unstarted(cfg: &DispatchConfig, tid: &str) -> Result<serde_json::Value, String> {
+    let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dispatch_dir().ok_or("no dispatch directory")?.join("runner.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if report["label"].as_str() != cfg.label.as_deref() || report["in_flight"].as_array().map(|a| !a.is_empty()).unwrap_or(true)
+        || now_ms().saturating_sub(report["updated_ts"].as_u64().unwrap_or(0)) > 90_000 {
+        return Err("legacy recovery requires a fresh same-host runner report with zero workers".into());
+    }
+    let pid = report["pid"].as_u64().filter(|p| *p > 1).ok_or("runner report has no process")?;
+    let children = Command::new("pgrep").args(["-P", &pid.to_string()]).output().map_err(|e| e.to_string())?;
+    if children.status.code() != Some(1) { return Err("runner children exist or cannot be proved absent; preserve all claims and work".into()); }
+    execution_ready(cfg)?;
+    execution_call(cfg, tid, json!({ "kind": "recover_unstarted", "writers": "not_launched", "retained_work": true }))
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StartStage { Inspect, Begin }
+
+/// These paths have launched no child. Reconcile a committed-but-lost begin
+/// by its exact attempt; never release another writer or discard local work.
+fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str, expected_attempt: Option<&str>, path: Option<&Path>) {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let state = execution_call(cfg, tid, json!({ "kind": "inspect" }))?;
+        if let Some(a) = state.get("attempt").filter(|a| !a.is_null()) {
+            if a["phase"] != "quiesced" {
+                let session = format!("dispatch-{}", slugify(tid));
+                let ours = expected_attempt.is_some() && expected_attempt == a["attempt_id"].as_str()
+                    && a["host"].as_str() == cfg.label.as_deref() && a["session"].as_str() == Some(session.as_str());
+                if !ours { return Err("prior writer is not this never-launched attempt; retain claim/WIP".into()); }
+                execution_call(cfg, tid, json!({ "kind": "quiesce", "generation": a["generation"], "attempt_id": a["attempt_id"], "writers": "process_group_empty" }))?;
+            }
+        }
+        let retained_work = path.map(|p| {
+            let clean = Command::new("git").current_dir(p).args(["status", "--porcelain"]).output();
+            let published = Command::new("git").current_dir(p).args(["branch", "-r", "--contains", "HEAD"]).output();
+            !matches!(clean, Ok(o) if o.status.success() && o.stdout.is_empty())
+                || !matches!(published, Ok(o) if o.status.success() && !o.stdout.is_empty())
+        }).unwrap_or(false);
+        let failure_class = if reason.contains("gate:") { "prerequisite" } else { "transport" };
+        execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
+    })();
+    // Progress after release would re-claim todo through the legacy API.
+    match result {
+        Ok(value) if value["kind"] == "released" => dlog(tid, &format!("startup failed before worker launch: {reason}; claim released; {}", if value["barrier"].is_null() { "task prerequisite retained; gateway remains ready" } else { "gateway readiness held; inspect the startup cause" })),
+        Ok(value) => dlog(tid, &format!("startup reconciliation held: {value}")),
+        Err(error) => dlog(tid, &format!("startup reconciliation unavailable: {error}; preserve claim and work")),
+    }
 }
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ModelAvailability { Usable, Unavailable { reason: String }, Disabled }
-fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool) -> serde_json::Value {
+fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker: Option<&WorkerCredential>) -> serde_json::Value {
     let bc = cfg.backends.get(name).cloned().unwrap_or_default();
     let model = bc.model.clone().or_else(|| cfg.model.clone());
-    let mut facts = executor_capabilities(bc.reasoning_tier);
+    let mut facts = worker.map(|worker| executor_capabilities(bc.reasoning_tier, worker))
+        .unwrap_or_else(|| json!({ "tier": bc.reasoning_tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
     let availability = if !bc.enabled { ModelAvailability::Disabled }
         else if !runnable { ModelAvailability::Unavailable { reason: "Configured agent CLI is unavailable or its circuit breaker is open".into() } }
         else if model.as_deref().unwrap_or("").is_empty() { ModelAvailability::Unavailable { reason: "Actual configured model identity is unreported; configure it explicitly".into() } }
         else { ModelAvailability::Usable };
     facts["backend"] = json!(name); facts["model"] = json!(model); facts["projects"] = json!(bc.projects);
     facts["availability"] = json!(availability); facts["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
-    facts["config_revision"] = json!(serde_json::to_string(&cfg.backends).unwrap_or_default());
+    facts["config_revision"] = json!(worker_config_revision(cfg));
     facts
 }
 
@@ -200,6 +287,12 @@ pub enum ExecutionRead { Inspect, Availability }
 pub fn execution_read(cfg: &DispatchConfig, task_id: &str, kind: ExecutionRead) -> Result<serde_json::Value, String> {
     let command = match kind { ExecutionRead::Inspect => "inspect", ExecutionRead::Availability => "availability" };
     execution_call(cfg, task_id, json!({ "kind": command }))
+}
+pub fn execution_claims(cfg: &DispatchConfig, pause: bool) -> Result<serde_json::Value, String> {
+    execution_call(cfg, "gateway", if pause { json!({ "kind": "pause_claims", "reason": "Operator runtime update: preserve active writers while draining", "budget_ms": 300_000 }) } else { json!({ "kind": "resume_claims" }) })
+}
+pub fn execution_coordinate(cfg: &DispatchConfig, task_id: &str, message: &str) -> Result<serde_json::Value, String> {
+    execution_call(cfg, task_id, json!({ "kind": "message", "message_id": format!("operator-{}-{}", std::process::id(), now_ms()), "text": message, "priority": "interrupt" }))
 }
 
 #[derive(Clone)]
@@ -1310,6 +1403,7 @@ fn mcp_call_task(
 ) -> Result<serde_json::Value, String> {
     if let Some(obj) = args.as_object_mut() {
         obj.insert("agent".into(), json!(agent_identity(cfg)));
+        obj.insert("runner_protocol".into(), json!("worker-ready-v2"));
     }
     mcp_call_session(cfg, id, tool, args, Some(&format!("dispatch-{}", slugify(task_id))))
 }
@@ -1519,8 +1613,10 @@ pub fn overlay_needs_attention(snap: &SharedSnapshot, v: &mut serde_json::Value)
 // without a PR); failed tasks keep their file until the retry succeeds.
 
 fn dispatch_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(&home).join(".bridge").join("dispatch");
+    let dir = match std::env::var_os("BRIDGE_DISPATCH_DIR").filter(|v| !v.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(std::env::var("HOME").ok()?).join(".bridge").join("dispatch"),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -3024,6 +3120,7 @@ fn spawn_opencode(
     _role_type: &str,
     avail: &[opencode::Backend],
     in_flight: &mut Vec<InFlight>,
+    worker: &WorkerCredential,
 ) {
     let eligible: Vec<_> = avail.iter().copied().filter(|b| backend_satisfies(cfg, *b, task_meta)).collect();
     if eligible.is_empty() { dlog(tid, "capability blocked: no available backend meets the persistent reasoning tier"); return; }
@@ -3290,7 +3387,7 @@ fn spawn_opencode(
     dlog(
         tid,
         &format!(
-            "dispatched — {} opencode session bridge-{tid}{}",
+            "preparing — {} opencode session bridge-{tid}{}",
             if resume {
                 format!(
                     "resuming session {}",
@@ -3310,9 +3407,9 @@ fn spawn_opencode(
     );
     snap_activity(
         snap,
-        "dispatch",
+        "startup",
         &format!(
-            "{tid} dispatched — {}",
+            "{tid} preparing launch — {}",
             if resume { "resumed session" } else { "new session" }
         ),
     );
@@ -3331,10 +3428,6 @@ fn spawn_opencode(
     // (<gateway>.<agent>) — ownership filtering is then a prefix glob
     // (machinename/*), and the namespace survives re-pairings because the
     // gateway label is the stable root.
-    let agent_label = match &cfg.label {
-        Some(l) if !l.is_empty() => format!("{l}/{}", agent_segment(cfg)),
-        _ => agent_identity(cfg),
-    };
     // Provision the worker's per-agent token. There is NO second class check
     // here: the token secret is opaque (bkw_*), so a prefix test can never
     // work, and the class gate is run_loop's (config gateway flag). If
@@ -3342,39 +3435,32 @@ fn spawn_opencode(
     // gateway's own token would mis-attribute every board action. Release
     // the claim instead; transient hub failures self-heal next tick (the
     // runner may release its own claims, BR#2419).
-    let agent_token = match provision_agent_token(cfg, &agent_label) {
-        Ok(t) => t,
-        Err(e) => {
-            dlog(&agent_label, &format!("error: agent token provisioning failed: {e} — no fallback (gateway token would mis-attribute); releasing claim"));
-            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
-            release_claim(
-                cfg,
-                tid,
-                &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
-            );
-            return;
-        }
-    };
+    // Bind the credential actually proved/minted by the hub, not the cache key
+    // requested before rename/canonicalisation. Labels are not credential IDs.
+    let agent_label = &worker.label;
+    let agent_token = &worker.secret;
     // Durable lease BEFORE spawning; no legacy fallback when this gate fails.
     match execution_call(cfg, tid, json!({ "kind": "inspect" })).and_then(RemoteExecution::parse) {
         Ok(s) if !matches!(s.handoff, RemoteHandoff::None | RemoteHandoff::Returned) || s.attempt.as_ref().map(|a| !matches!(a.state, RemoteAttemptState::Quiesced)).unwrap_or(false) => {
             dlog(tid, "execution held: prior writer/restoration still requires quiescence reconciliation; not retrying begin");
             return;
         }
-        Err(e) => { dlog(tid, &e); return; }
+        Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
         _ => {}
     }
-    let capabilities = backend_capabilities(cfg, backend_name, true);
-    let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|_| {
-        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": format!("{}-{}", std::process::id(), now_ms()), "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000) }))
+    let capabilities = backend_capabilities(cfg, backend_name, true, Some(worker));
+    let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
+    let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|ready| {
+        if ready["ok"] != true { return Err(format!("executor readiness held: {}", ready["readiness"])); }
+        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000) }))
     });
     let state = match begin {
         Ok(s) => s,
-        Err(e) => { dlog(tid, &format!("durable execution gate: {e} — no agent spawned; local WIP retained")); note_task(cfg, tid, &format!("runner: durable execution held: {e}")); return; }
+        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&expected_attempt), worktree.as_deref()); return; }
     };
     let remote = match RemoteExecution::parse(state.clone()).and_then(|s| s.attempt.ok_or("execution begin returned no attempt".into())) {
         Ok(a) if a.generation > 0 && !a.attempt_id.is_empty() => a,
-        _ => { dlog(tid, "durable execution response malformed; no agent spawned"); return; }
+        _ => { failed_start(cfg, tid, StartStage::Begin, "durable execution response malformed", Some(&expected_attempt), worktree.as_deref()); return; }
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
@@ -3401,7 +3487,7 @@ fn spawn_opencode(
     }
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
-        Err(e) => { dlog(tid, &format!("execution renewal failed before spawn: {e}; no agent launched")); return; }
+        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
     };
     prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", safe_point["messages"]));
     for message in safe_point["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
@@ -3566,8 +3652,8 @@ fn tick(
     let avail_ok = !avail.is_empty();
     if !avail_ok {
         if let Some(name) = cfg.backends.keys().next() {
-            let mut capabilities = backend_capabilities(cfg, name, false);
-            capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| *other != name).map(|other| backend_capabilities(cfg, other, false)).collect::<Vec<_>>());
+            let mut capabilities = backend_capabilities(cfg, name, false, None);
+            capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| *other != name).map(|other| backend_capabilities(cfg, other, false, None)).collect::<Vec<_>>());
             let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
         }
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
@@ -3581,20 +3667,11 @@ fn tick(
         snap_activity(snap, "info", "agents available — resuming claims");
     }
     *last_avail_ok = avail_ok;
-    let mut execution_ready = false;
-    if let Some(backend) = avail.iter().max_by_key(|b| {
-        let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-        cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
-    }) {
-        let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-        let mut capabilities = backend_capabilities(cfg, name, !breaker.tripped());
-        capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| other.as_str() != name).map(|other| {
-            let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(other)) == *b) && !breaker.tripped();
-            backend_capabilities(cfg, other, runnable)
-        }).collect::<Vec<_>>());
-        match execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities })) {
-            Ok(reply) if reply["ok"] == true => execution_ready = true,
-            result => dlog("", &format!("execution protocol not ready: {result:?}; no new claims until capability advertisement succeeds")),
+    let mut prepared_worker = None;
+    if !avail.is_empty() {
+        match prepare_worker(cfg, avail) {
+            Ok((worker, _)) => prepared_worker = Some(worker),
+            Err(error) => dlog("", &format!("execution protocol not ready: {error}; no new claims until worker readiness succeeds")),
         }
     }
 
@@ -4206,9 +4283,10 @@ fn tick(
     }
 
     // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok || !execution_ready || stop.load(Ordering::SeqCst) {
+    if !avail_ok || stop.load(Ordering::SeqCst) {
         return Ok(msgs);
     }
+    let Some(worker_credential) = prepared_worker.as_ref() else { return Ok(msgs); };
 
     // 3c. circuit breaker: agent CLI is failing deterministically — stop
     // claiming. In-flight sessions keep finishing; the breaker clears on the
@@ -4408,7 +4486,7 @@ fn tick(
                     let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
                     (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
                 }).unwrap_or((false, "task".to_string()));
-                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight);
+                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight, worker_credential);
                 attempts.insert(tid.to_string(), Instant::now());
                 snap_activity(snap, "dispatch", &msg);
                 msgs.push(msg);
@@ -4536,6 +4614,22 @@ fn tick(
         // re-enter the claim → clone-fail → watchdog-stall loop forever. A
         // changed URL drops the record and dispatch resumes.
         if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) { continue; }
+        // The task's persisted writer/checkpoint affinity is authoritative;
+        // metadata alone can predate the last execution. Never claim first.
+        match execution_call(cfg, tid, json!({ "kind": "availability" })) {
+            Ok(state) => {
+                let host = state["hosts"].as_array().and_then(|hosts| hosts.iter().find(|h| h["host"].as_str() == cfg.label.as_deref()));
+                let eligible = host.map(|h| h["blockers"].as_array().map(|b| b.is_empty()).unwrap_or(false)
+                    && h.pointer("/readiness/kind").and_then(|k| k.as_str()) == Some("ready")).unwrap_or(false);
+                if !eligible {
+                    if gated_announced.insert(format!("{tid}:execution-availability")) {
+                        dlog(tid, &format!("SKIP: execution prerequisites on this host: {}", host.map(|h| h["blockers"].to_string()).unwrap_or_else(|| "no live host observation".into())));
+                    }
+                    continue;
+                }
+            }
+            Err(error) => { dlog(tid, &format!("execution preflight unavailable: {error}; no claim attempted")); continue; }
+        }
         let candidate_url = source_repo(&body_md, &task_meta);
         let mut refused = refused_cache_load();
         if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
@@ -4588,21 +4682,27 @@ fn tick(
             cfg,
             id,
             "log_progress",
-            json!({ "id": tid, "note": format!("runner: claimed — dispatching to opencode"), "sentiment": "going_well" }),
+            json!({ "id": tid, "note": "runner: claimed — preparing verified worker launch", "sentiment": "going_well" }),
             &tid,
         );
         let msg = match &resume_sess {
             Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
-            None => format!("claimed {tid} — dispatched to opencode"),
+            None => format!("claimed {tid} — worker launch requested"),
         };
         let (role_work, role_type) = task.get("tags").and_then(|v| v.as_array()).map(|a| {
             let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
             (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
         }).unwrap_or((false, "task".to_string()));
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight);
+        let before_launch = in_flight.len();
+        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight, worker_credential);
         attempts.insert(tid.to_string(), Instant::now());
-        snap_activity(snap, "dispatch", &msg);
-        msgs.push(msg);
+        if in_flight.len() > before_launch {
+            snap_activity(snap, "dispatch", &msg);
+            msgs.push(msg);
+        } else {
+            snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
+            break; // re-prove gateway readiness next tick before another claim
+        }
     }
     if malformed_candidates > 0 {
         msgs.push(format!(
@@ -6172,26 +6272,37 @@ mod tests {
 /// with rotate (old token revoked, fresh secret issued, cached). Without
 /// this the runner dead-ends forever — the 2026-10-24 churn engine (38
 /// fake in-flight cards, 38–58 watchdog releases each).
-fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<String, String> {
-    if !cfg.token.is_empty() && agent_label == "gateway" {
-        return Ok(cfg.token.clone());
-    }
-    let cache_dir = dispatch_dir().ok_or("no dispatch dir")?;
+struct WorkerCredential { label: String, secret: String }
+fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<WorkerCredential, String> {
+    // Credentials belong to the gateway, not an individual runner's ephemeral
+    // report directory. Side-by-side processes must reuse the same credential;
+    // separate caches would revoke each other's active workers on every tick.
+    let cache_dir = PathBuf::from(std::env::var("HOME").map_err(|_| "no home directory")?).join(".bridge").join("dispatch");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let cache_path = cache_dir.join("agent-tokens.json");
     let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    if let Some(secret) = cache.get(agent_label) {
-        if !secret.is_empty() {
-            return Ok(secret.clone());
-        }
-    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let hub = cfg.url.trim_end_matches('/').to_string();
+    if let Some(secret) = cache.get(agent_label).filter(|s| !s.is_empty()).cloned() {
+        let response = client.post(format!("{hub}/api/kb-machine/provision"))
+            .header("Authorization", format!("Bearer {}", cfg.token)).json(&json!({ "label": agent_label, "cached_secret": secret })).send().map_err(|e| e.to_string())?;
+        let status = response.status();
+        let proof: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+        if status.is_success() && proof["cached"] == true {
+            return Ok(WorkerCredential { label: proof["label"].as_str().filter(|s| !s.is_empty()).ok_or("worker proof missing canonical label")?.into(), secret });
+        }
+        if status.as_u16() != 401 && status.as_u16() != 403 {
+            return Err(format!("worker credential proof not ready ({status}); keep cache and wait — never rotate on infrastructure/deploy errors"));
+        }
+        cache.remove(agent_label); // explicit revoked/wrong-class prerequisite
+        dlog(agent_label, "cached worker credential invalid/wrong class; re-provisioning under the gateway's own namespace");
+    }
     // attempt 1: plain provision; attempt 2 (only when the hub has no secret
     // to re-show): rotate re-vend. Revoking-then-minting is safe here — the
     // old secret is provably not in our cache, and by label-namespace rules
@@ -6227,7 +6338,8 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
                 "agent token re-vended by rotate (cache was empty)",
             );
         }
-        return Ok(secret.to_string());
+        let label = body.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("worker provision response missing canonical label")?;
+        return Ok(WorkerCredential { label: label.into(), secret: secret.into() });
     }
     Err(format!(
         "agent token provisioning for '{agent_label}' failed after rotate retry — {last_err}"

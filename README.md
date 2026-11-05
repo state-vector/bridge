@@ -57,6 +57,50 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 ### Durable execution (protocol v1)
 
+Worker provisioning validates cached credentials against the live hub before
+execution begins. Revoked/wrong-class cache entries are re-provisioned; the
+runner binds the hub's canonical worker label rather than an old cache key.
+Transient/deployment errors retain the cache and never trigger credential
+rotation. Gateway and interactive credentials are never worker fallbacks.
+Provisioning and canonical-identity proof happen **before claiming any card**.
+Readiness advertises a closed `worker` state; the hub verifies a live worker in
+that gateway's namespace at advertisement, claim and begin. Tool availability
+alone is not launch readiness. Older runners can keep existing writers alive,
+but cannot consume new work with an unprovisioned readiness advertisement.
+
+If startup fails before a child launches, the runner reconciles the exact begin
+attempt, proves quiescence where needed, and records `start_failed`. The hub
+releases the unstarted claim atomically without a watchdog abandonment. Dirty
+or unpublished work stays host-affine and is never cleaned up by this path.
+The failing host cools down after transport failures; three require repair.
+A named prerequisite rejection holds immediately rather than retrying it.
+A changed credential/configuration can
+restore readiness, and other ready hosts can pick up the released work. Unknown
+writers and unresolved external effects remain held. Startup preparation is
+not displayed as a successfully dispatched worker.
+Task-specific begin prerequisites do not hold unrelated work on the gateway.
+Scheduling checks persisted execution/checkpoint host affinity before claiming;
+a failed launch stops that claim sweep until readiness is re-proved next tick.
+Startup failure logs include the actual reason and whether the task or gateway
+is held, rather than reporting every rejection as a credential failure.
+
+Paired operators can run `bridge execution ready` to prove the live hub/worker
+handshake without claiming work. `bridge execution recover-unstarted 'BR#N'`
+recovers recorded legacy pre-begin credential failures only after a fresh
+same-host zero-worker report and an empty runner child list. The hub also
+requires no execution attempt; a real writer, review verdict, human hold or
+unknown external effect cannot be erased. Retained work stays host-affine and
+superseded startup-churn counters are archived. Legacy GUI advertisements do not
+overwrite a corrected runner's live readiness, and old clients cannot borrow
+that proof to claim or begin new work.
+For a side-by-side rollout, set `BRIDGE_DISPATCH_DIR` to a separate directory for
+the corrected runner's ephemeral process/status files. Pairing and credentials
+remain in the normal store; the human GUI's status report remains intact.
+The canonical worker-token cache is shared across runner report directories,
+so adopting a side-by-side runner does not rotate another process's worker.
+Namespaced worker labels such as `gateway/opencode` (and `label@session`)
+are valid coordination recipients, matching the identities Connect exposes.
+
 New runners acquire a hub-persisted execution generation before spawning an
 agent. The SQLite state and command replay receipt commit atomically. Worker
 MCP writes carry their generation/attempt scope in runner-injected headers;
@@ -180,6 +224,14 @@ Paired operators can inspect the same facts without claiming or resuming work:
 bridge execution inspect 'BR#123'
 bridge execution availability 'BR#123'
 ```
+
+For a managed runtime update, `bridge execution pause` temporarily stops new
+claims for that gateway (five-minute, self-expiring lease) without aborting
+healthy active work. `bridge execution coordinate 'BR#123' '<message>'` requests
+a bounded checkpoint/stop through its durable mailbox. Wait for quiescent
+checkpoints and a writer-free runner before replacing it, then run
+`bridge execution resume`. The gateway's own credential is required; a pause
+is not a credential failure or a waiver of task/transfer fences.
 
 Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
 and independent receipt review; other repositories retain PR/merge-train
@@ -973,7 +1025,14 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   infrastructure problem, never a reason to stop the bridge's merges; the head gate
   routes it into the exempt `external` bucket like every other external) — a required
   check would deadlock against it — and the BR#2267 externals (Workers builds / deploy
-  previews never gate). The
+  previews never gate). BR#6568 extends the SAME exemption to the typed
+  `pr_checks_green` probe (the executor's first-hand `statusCheckRollup` observation
+  behind the await, `classify_rollup` in train.rs): exempt-external failures no longer
+  stamp the probe conclusively negative — the probe SATISFIES with the exempt external
+  named in the verdict — so a degraded SP flow runner cannot park a typed await
+  indefinitely (the BR#4694 canary / PR bridge#323 class), while a REQUIRED check
+  failing still stamps negative and anything pending stays transient (fail-closed).
+  The
   bypass actor is unchanged — rayh alone keeps `bypass_mode=always`: the human retains the
   loud escape hatch; machines do not. Proven end-to-end by probe PRs #216 and #217.
 - **The stop (executor-fed, BR#3516)**: the hub holds no VCS credentials and no longer
@@ -1962,14 +2021,25 @@ carry a failure; interrupted states require a cause and a recovery disposition.
 The UI renders this contract instead of reconstructing health from lease,
 starvation, check-subset and latest-log heuristics.
 
+**Action-first recovery (BR#6667):** a ready, non-conflicting cure blocked by
+main's deployment gate says **Fix ready — your merge is needed**, links directly
+to the fix PR for a bypass merge, and links its confirmation request when one
+exists. Repair logs, old next-action reports and resolved episodes are collapsed
+under details. A new merge-refusal episode cannot reuse an unrelated starvation
+diagnostic as its repair. Raw GitHub refusals remain available in merge details.
+Before merging, the executor intersects repository merge flags with the effective
+base-branch rules (including allowed methods and linear history), choosing an
+allowed method instead of repeatedly attempting a forbidden merge commit. It
+holds on unreadable policy; method selection never bypasses required checks.
+
 A decisive deployment failure on the current tip outranks a successful subset
 of required jobs. Deployment receipts keep their actual commit/run identity:
 an older green run cannot certify a newer tip. The same effective verdict
 controls queue admission, stale-gate reruns and stop clearance. A failed line
 stays visible even with an empty queue. Recovery names the failing evidence,
 the repair task, its executor and heartbeat, progress and next action. Missing
-or stale observations fail closed. A human action is shown only with a concrete
-linked request; an exhausted machine retry budget alone is not a human task.
+or stale observations fail closed. A human action identifies a concrete cure PR
+or linked request; an exhausted machine retry budget alone is not a human task.
 Explicit `train.lane` configuration updates refresh an existing lane atomically
 and return the updated required-check set, rather than silently retaining it.
 The authenticated `train_observe_deploy` observation plane accepts first-hand
@@ -2437,7 +2507,7 @@ double-binding single spawn) and `test/machine.test.ts` (the refusal names child
 - **Blocked parks get a clock too** (BR#2893): churn-guard parks (retry instructions stamped as blocks) and parks whose unblock condition references only closed asks drain back to the pool automatically; an honest park with no external gate ages out past `blocked_stale_hours` (a setting, default 48). True external gates — dated checkpoints, GitHub issue/PR lanes, red-main — are exempt, and so is any park on a live machine wait (BR#4067): a typed `await_event`, a merge-train queue slot, or a bound ask owns its own exit, and the drain never attempts one (attempting it only re-bred a refused release — and a breach card — every sweep tick). A card whose owner has had no live session for `owner_stale_hours` (default 4) loses the claim regardless of status. And a parent that has burned `UNBLOCK_SPAWN_CAP` (3) unblock rounds stops spawning them and escalates to a human once — do-not-claim anchors excepted: the alarm sink and other `infra_anchor` cards skip the spawner entirely (an audit line only), never burning the shared round budget and never escalating, because their own machine exits re-arm instead (BR#5916). On the board, Top is the actionable fleet only; every parked card files in Backlog under its EXIT CONDITION — one group per typed await class (awaiting you · PR verification · PR merge (train) · CI · deploy · another task · GitHub issue · a date · green main · other), with churn parks under Timeout — each row has a **Release** button and the section head a **Release all** (human early-exit; protected parks — typed awaits, train-queue slots — refuse server-side and are listed, never routed around) — and a live unblock duty shown as a chip on the row.
 - Anything needing a human lands in **For Me** (genuine decisions only — a merge-train coverage bounce parks the card Awaiting only for genuine human legs (BR#5226): a machine-verdict-covered head re-queues itself, a plain lapse re-verifies, BR#4960)
 - **For Me never jumps (BR#3457)**: acting on a proposed decision (accept, or reject — which routes to supersede-with-reason, the decision lifecycle's only exit for a verdict that doesn't hold) pins the card to the bottom of its section with an `actioning…` chip and dead buttons; the card leaves the list only when a refetch confirms the server flipped it, and an error returns it to its slot with the reason inline. Server-side, one actionable verdict per target, ever: a newer verify-verdict for a target supersedes still-proposed older rounds at create, and the acting party's accept/reject (human or the machine apply, BR#5377) sweeps any leftover proposed sibling (legacy stacked rounds included). Machine verdicts rarely sit proposed at all — they accept on filing — so the panel holds only failed-apply stragglers and the deploy-time backlog, which both the create-time sweep and the adoption sweep (below) clean up: a stacked group collapses to one card that can never regrow.
-- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738), and the verdict-done receipts gate classifies as `gate:verdict-receipts` — a rejection carrying the audited ` [rule: <name>]` tag classifies by its rule name FIRST (the gate's own message embeds "PR link", which the older message-stem ladder mis-folded as `gate:review-needs-pr`, leaving the receipts class unreachable for its own gate; specimens BR#3735, BR#4291), with the stems kept as the fallback for suffix-less legacy reasons (BR#4295). The BR#4067 release-hold backstop classifies its refusals too: a machine silence- or owner-death release correctly held by a typed wait or a train queue slot is benign by design — the proxy watch / the answer / the train owns the exit — so its rejections classify as `release:held-typed-await` / `release:held-train-queue` instead of piling into `unclassified` (specimens TASK-016/BR#4563, BR#3727/BR#4573). And the blocked-park drain's ask-ref scan is word-bounded, so an unblock condition naming a task id (`TASK-016`) no longer yields the phantom ref `ASK-016` that made the drain re-attempt a refused release every sweep tick (BR#4563). The receipts gate's rejection and every unblock-duty spawn template now teach the accepted note shape — any URL, or one of the verdict tokens (`PR` / `merged` / `passed` / `unblocked` / `still blocked`) — so a duty holder closing with honest findings prose passes on the first try instead of burning rejections (each rejection is a breach event) reverse-engineering the matcher from source (BR#4295). And the bootstrap teaches every dispatched session the retry law that keeps the loops from forming at all (rule 4c + a mirrored PROTOCOL CARD clause, BR#4474): a 5xx / `infra_storage_fault` is retryable — same transition, backoff, heartbeat — while a SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child", "malformed") is TERMINAL for that attempt — stop, read what it names, resolve the named precondition or take a lifecycle-legal edge; retrying a gate-rejected transition cannot succeed and every retry is an audited breach event (the 2026-10-28/29 storage-fault era uncorked four `gate:open-children` cards in 18 minutes from exactly these loops — BR#4403, BR#4473). And the BR#4067 release-hold backstop classifies as `release_held`, priced as noise like `claim_race`: a machine sweep's release attempt on a card parked on a typed wait or a merge-train queue slot being refused IS the system working (zero state destroyed — the proxy watch / the answer owns the exit), so no pile-up of refusals ever raises a breach card (BR#4562, specimen TASK-001). The park-drain sweep that kept re-attempting those refusals every tick now checks the same hold its sibling sweeps check before releasing — a held park is waited out, not re-refused — and the full alarm sweep gained an `admin.alarm_sweep` drill, since the drain was previously reachable by no test path at all.
+- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738), and the verdict-done receipts gate classifies as `gate:verdict-receipts` — a rejection carrying the audited ` [rule: <name>]` tag classifies by its rule name FIRST (the gate's own message embeds "PR link", which the older message-stem ladder mis-folded as `gate:review-needs-pr`, leaving the receipts class unreachable for its own gate; specimens BR#3735, BR#4291), with the stems kept as the fallback for suffix-less legacy reasons (BR#4295). The BR#4067 release-hold backstop classifies its refusals too: a machine silence- or owner-death release correctly held by a typed wait or a train queue slot is benign by design — the proxy watch / the answer / the train owns the exit — so its rejections classify as `release:held-typed-await` / `release:held-train-queue` instead of piling into `unclassified` (specimens TASK-016/BR#4563, BR#3727/BR#4573). And the blocked-park drain's ask-ref scan is word-bounded, so an unblock condition naming a task id (`TASK-016`) no longer yields the phantom ref `ASK-016` that made the drain re-attempt a refused release every sweep tick (BR#4563). The receipts gate's rejection and every unblock-duty spawn template now teach the accepted note shape — any URL, or one of the verdict tokens (`PR` / `merged` / `passed` / `unblocked` / `still blocked`) — so a duty holder closing with honest findings prose passes on the first try instead of burning rejections (each rejection is a breach event) reverse-engineering the matcher from source (BR#4295). And the bootstrap teaches every dispatched session the retry law that keeps the loops from forming at all (rule 4c + a mirrored PROTOCOL CARD clause, BR#4474): a 5xx / `infra_storage_fault` is retryable — same transition, backoff, heartbeat — while a SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child", "malformed") is TERMINAL for that attempt — stop, read what it names, resolve the named precondition or take a lifecycle-legal edge; retrying a gate-rejected transition cannot succeed and every retry is an audited breach event (the 2026-10-28/29 storage-fault era uncorked four `gate:open-children` cards in 18 minutes from exactly these loops — BR#4403, BR#4473). And the BR#4067 release-hold backstop classifies as `release_held`, priced as noise like `claim_race`: a machine sweep's release attempt on a card parked on a typed wait or a merge-train queue slot being refused IS the system working (zero state destroyed — the proxy watch / the answer owns the exit), so no pile-up of refusals ever raises a breach card (BR#4562, specimen TASK-001) — and the pricing covers the NAMED held spellings too (`release:held-typed-await` / `release:held-train-queue`, the tagged-refusal classes above): they exist so the Log says WHAT held, not so the same benign refusals can re-arm breach cards under a different name (BR#6654: three tagged refusals on an awaiting-ci car raised exactly such a card, 2026-11-05). The park-drain sweep that kept re-attempting those refusals every tick now checks the same hold its sibling sweeps check before releasing — a held park is waited out, not re-refused — and the owner-death release leg joins that hold-check family (it was the last release path attempting bare, re-manufacturing a refused release once per alarm tick until the owner's next live session), and the full alarm sweep gained an `admin.alarm_sweep` drill, since the drain was previously reachable by no test path at all.
 - **Decisions collect consensus (BR#903)**: proposing a decision auto-spawns a `Feedback:` round (a question node) — agents contribute agree/disagree with reasons via `log_progress`; orient surfaces the open rounds (`decisions_awaiting_consensus`) and For Me shows the tally next to your accept/reject buttons. The round informs you; it never gates you. **Verify-verdicts spawn no round** (BR#5377): a machine verdict is not a consensus-seeking proposal — it applies on filing, so there is nothing to collect; supersede is the one human leg left.
 
 

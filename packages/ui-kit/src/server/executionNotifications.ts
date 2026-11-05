@@ -6,7 +6,7 @@ export interface ExecutionNotice { id: string; title: string; body: string; url:
 export function notifyExecutionAttention(data: ExecutionAttention): void {
   const key = `bridge.execution.notified:${getKbHubConfig().url}:${data.workspace}`;
   let seen: string[];
-  try { seen = JSON.parse(localStorage.getItem(key) ?? "[]"); } catch { seen = []; }
+  try { const stored: unknown = JSON.parse(localStorage.getItem(key) ?? "[]"); seen = Array.isArray(stored) ? stored.filter((v): v is string => typeof v === "string") : []; } catch { seen = []; }
   for (const item of data.items) for (const blocker of item.blockers) {
     if (blocker.kind !== "local_pickup_required" && blocker.kind !== "capability_unavailable") continue;
     const id = `${item.id}:${blocker.episode_id}`;

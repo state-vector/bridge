@@ -126,6 +126,10 @@ export default {
       // the label is free-form, so class is read from the tag
       const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
       if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
+      if (typeof body.cached_secret === "string") return kbGuard("kb.worker.resolve", kbId.fetch("https://kb/worker.resolve", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret: body.cached_secret, token_id: ident.token_id, actor: ident.label }),
+      }));
       return kbGuard("kb.agent.provision", kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
