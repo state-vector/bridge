@@ -125,6 +125,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(diagnosed.body.episode.stage.phase).toBe("repairing");
     await kbJson("/progress.log", { id: task, actor: "observer", did: "Independent diagnostic comment", will: "Await impl claim" });
     expect((await laneSnap(repo)).line.recoveries[0].episode.stage.next).toBe("Implement pruning");
+    expect((await kbJson("/get", { id: task })).body.meta.last_progress?.actor).not.toBe("observer");
     const wrongExecutor = await kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id: "not-owner",
       event: { kind: "diagnosed", task_id: task, diagnosis: "Different diagnosis", next: "Replace next step" }, actor: "observer" });
     expect(wrongExecutor.status).toBe(400);

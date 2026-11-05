@@ -122,6 +122,7 @@ reporting protocol in their agent instructions.
 Only the bound repair owner can publish its execution/next-step updates; external
 comments remain commentary. Executor assignment is visible without being
 misreported as an action result.
+Recovery comments do not claim work or refresh another executor's heartbeat.
 Repair-merge receipts appear in the recovery history without claiming that the
 deployment has passed.
 

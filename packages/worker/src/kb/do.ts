@@ -6062,6 +6062,18 @@ export class KnowledgeHub {
       ? `\n\nYour behaviour score: ${myScore.score}/100 (${myScore.grade}).` + (myScore.hints.length ? ` ${myScore.hints.join(" ")}` : "")
       : "";
     const instructions = composeBootstrap(m.project_name || "Superpositional", m.board ?? DEFAULT_BOARD) + (m.bootstrap_md ? `\n${m.bootstrap_md}` : "") + scoreLine;
+    if (Array.isArray(meta.recovery_links) && meta.recovery_links.length) {
+      const principal = body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, String(body.token_id))?.principal : null;
+      const owns = row.owner === actor || (principal && row.owner === principal);
+      if (!owns || row.status === "todo") {
+        // Recovery comments must not implicitly claim released work, refresh
+        // executor liveness, or overwrite its authoritative progress/next.
+        this.audit(actor, "progress_comment", id, { note, will: will || undefined });
+        this.version(id, actor, "comment", note, { note, will: will || undefined, kind: "commentary" });
+        return { id, kind: "commentary", note, will: will || undefined, instructions,
+          note_postscript: "Comment recorded without changing repair ownership or progress. Claim recovery work explicitly with transition before reporting execution." };
+      }
+    }
     // Re-claim: logging progress on a watchdog-abandoned task flips it back to
     // in_progress (the unblock condition the watchdog promised). Subprocess
     // blocks re-claim the same way — the agent is back, the subprocess resolved.

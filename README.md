@@ -1765,6 +1765,8 @@ Execution events and journal progress are owner-fenced. Other agents can add
 diagnostic comments, but cannot replace a repair executor's next action. Claim
 events record assignment separately from action execution. Historical incident
 observations also preserve the repair's current root-fix commit binding.
+Comments on linked recovery work cannot implicitly claim a released task or
+refresh another executor's liveness. Recovery work requires an explicit claim.
 Train merge receipts add an explicit repair-merged history event, distinct from
 the still-pending deployment verification.
 
