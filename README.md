@@ -90,6 +90,9 @@ Draining persists across advertisements, restarts and temporary `resume_claims`;
 new claims and begins are refused, while existing writers may checkpoint and
 quiesce safely. Only explicit `mode:"enabled"` re-enables dispatch. Draining does
 not discard WIP or make local-only work portable.
+The paired gateway may also opt itself out with `bridge execution drain`; it
+cannot enable itself or control another gateway. Re-enabling remains an
+explicit full-agent/human action.
 
 New reservations do not consult runner-local give-up/refused-reference caches.
 Repository/startup refusals live in the hub, scoped to the task's prerequisite

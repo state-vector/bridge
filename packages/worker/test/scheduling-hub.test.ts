@@ -91,7 +91,9 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const admin = await post("admin.mint", { label: "scheduler-operator", tags: [] });
     const identity = await post("auth.identify", { bearer: admin.secret });
     const control = { id: "gateway", command_id: "drain", command: { kind: "gateway_control", host: g.host, mode: "draining", reason: "Human laptop retired from autonomous work" } };
-    expect((await post("execution", { ...g.auth, ...control })).error).toMatch(/full-agent/);
+    expect((await post("execution", { ...other.auth, ...control })).error).toMatch(/full-agent/);
+    expect((await post("execution", { ...g.auth, ...control, command_id: "self-drain" })).kind).toBe("gateway_controlled");
+    expect((await post("execution", { ...g.auth, ...control, command_id: "self-enable", command: { ...control.command, mode: "enabled" } })).error).toMatch(/full-agent/);
     expect((await post("execution", { ...control, actor: "scheduler-operator", token_id: identity.token_id })).kind).toBe("gateway_controlled");
     const replay = await post("execution", { ...control, actor: "scheduler-operator", token_id: identity.token_id });
     expect(replay.kind).toBe("gateway_controlled");

@@ -4977,9 +4977,10 @@ export class KnowledgeHub {
     if (command.kind === "schedule_status") return { hosts: this.schedulingStatus(command.host) };
     if (command.kind === "gateway_control") {
       const tags = parseTags(token.tags).map(t => t.toLowerCase());
-      if (!actor.startsWith("web:") && (gateway || tags.some(t => t === "provisioned" || t.startsWith("by:") || t.startsWith("cadence:")))) throw new Error("gate: gateway drain control requires a full-agent or human credential");
       const target = this.one(`SELECT id,tags FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, command.host);
       if (!target || !tagsSayGateway(parseTags(target.tags))) throw new Error("gate: unknown gateway host");
+      const selfDrain = gateway && target.id === tokenId && command.mode === "draining";
+      if (!selfDrain && !actor.startsWith("web:") && (gateway || tags.some(t => t === "provisioned" || t.startsWith("by:") || t.startsWith("cadence:")))) throw new Error("gate: gateway control requires full-agent/human authority; gateways may only drain themselves");
       const result = { ...command, kind: "gateway_controlled", observed_at: now };
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`INSERT INTO gateway_dispatch_control(token_id,mode,reason,actor,updated_ts) VALUES(?,?,?,?,?) ON CONFLICT(token_id) DO UPDATE SET mode=excluded.mode,reason=excluded.reason,actor=excluded.actor,updated_ts=excluded.updated_ts`, target.id, command.mode, command.reason, actor, now);

@@ -318,6 +318,10 @@ pub fn scheduling_status(cfg: &DispatchConfig, host: Option<&str>) -> Result<ser
     let command = match host { Some(host) => json!({ "kind": "schedule_status", "host": host }), None => json!({ "kind": "schedule_status" }) };
     execution_call(cfg, "gateway", command)
 }
+pub fn drain_gateway(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
+    let host = cfg.label.as_deref().ok_or("gateway label missing")?;
+    execution_call(cfg, "gateway", json!({ "kind": "gateway_control", "host": host, "mode": "draining", "reason": "Operator retired this gateway from autonomous dispatch" }))
+}
 pub fn execution_coordinate(cfg: &DispatchConfig, task_id: &str, message: &str) -> Result<serde_json::Value, String> {
     execution_call(cfg, task_id, json!({ "kind": "message", "message_id": format!("operator-{}-{}", std::process::id(), now_ms()), "text": message, "priority": "interrupt" }))
 }
