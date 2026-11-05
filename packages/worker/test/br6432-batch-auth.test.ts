@@ -147,6 +147,11 @@ describe("batch_auth supersede (BR#6432)", () => {
     await kbJson("/update", { id: outside, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } });
     await kbJson("/admin.alarm_sweep");
     expect((await kbJson("/get", { id: target })).body.status).toBe("superseded");
+    await kbJson("/update", { id: target, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } });
+    await kbJson("/admin.alarm_sweep");
+    const replayed = (await kbJson("/get", { id: target })).body;
+    expect(replayed.meta.disposition_request).toBeUndefined();
+    expect(replayed.meta.disposition_result).toBeUndefined();
     const rejected = (await kbJson("/get", { id: outside })).body;
     expect(rejected.meta.disposition_result.kind).toBe("refused");
     expect(rejected.meta.disposition_request).toBeUndefined();

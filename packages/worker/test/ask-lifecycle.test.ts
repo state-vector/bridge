@@ -216,4 +216,14 @@ describe("request audience and lifecycle", () => {
     const invalid = await call("ask.create", { route: { kind: "human_decision" }, artefact_id: "BR#3124", question: "Should Bridge continue?", decision });
     expect(invalid.status).toBe(400);
   });
+
+  it("retires a stored diagnostic episode even after the lane stops taking its old starvation branch", async () => {
+    const lane = await call("train.lane", { repo: "state-vector/retired-diagnostic" });
+    const laneId = lane.body.card ?? lane.body.id;
+    const snapshot = (await call("get", { id: laneId })).body;
+    const ask = await call("ask.create", { to: "human", question: "Should someone investigate this queue?", reason: "Legacy diagnostic", details: "An old queue monitor asked for investigation.", options: ["Investigate", "Wait"] });
+    await call("update", { id: laneId, meta: { lane: { ...snapshot.meta.lane, starvation: { ask_id: ask.body.id, since: Date.now(), fired_at: Date.now() } } } });
+    await call("admin.alarm_sweep");
+    expect((await call("get", { id: ask.body.id })).body.meta.ask.resolution.kind).toBe("cancelled");
+  });
 });

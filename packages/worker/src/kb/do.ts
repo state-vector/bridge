@@ -12146,8 +12146,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    * existing gate is the only writer of a drop; semantic refusals terminate
    * this command and are never retried on the next alarm. */
   private async applyPendingDispositions(): Promise<void> {
-    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.disposition_request') IS NOT NULL`).toArray();
+    const rows = this.state.storage.sql.exec(`SELECT id, status, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.disposition_request') IS NOT NULL`).toArray();
     for (const row of rows) {
+      const previous = JSON.parse(String(row.meta ?? "{}"));
+      if (row.status === "superseded" && previous.batch_auth?.ask === previous.disposition_request?.ask) {
+        delete previous.disposition_request;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(previous), row.id);
+        this.version(String(row.id), "system:disposition", "disposition_replay_ack", "This authorised disposition was already applied; duplicate command acknowledged without repeating the action.", { ask: previous.batch_auth.ask });
+        continue;
+      }
       try {
         await this.transition({ id: String(row.id), to: "superseded", session: "", note: "Apply persisted human-authorised disposition" }, "system:disposition");
       } catch (e) {
@@ -12173,6 +12180,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    * Join the recorded alarm episode to its exact old template, not a general
    * title classifier. No user-authored decision is cancelled by this migration. */
   private retireLegacyRecoveryRequests(): void {
+    const lanes = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`).toArray();
+    for (const lane of lanes) {
+      const meta = JSON.parse(String(lane.meta ?? "{}"));
+      let changed = false;
+      for (const episode of [meta.lane?.starvation, meta.starvation, meta.lane?.gate_blocked, meta.lane?.dark_tip]) {
+        if (!episode?.ask_id) continue;
+        this.cancelRequest(String(episode.ask_id), "Bridge owns this recovery investigation; no human decision has been identified.", "system:recovery");
+        episode.ask_id = null;
+        changed = true;
+      }
+      if (changed) this.saveLaneState(String(lane.id), meta, Date.now());
+    }
     const subjects = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND (json_extract(meta, '$.strand_alarm') IS NOT NULL OR json_extract(meta, '$.merge_train.conflicting_alarm') IS NOT NULL)`).toArray();
     const requests = this.state.storage.sql.exec(`SELECT id, title, meta FROM artefacts WHERE type = 'question' AND status = 'todo' AND created_by = 'system:train' AND json_extract(meta, '$.ask.from') = 'system:train' AND json_extract(meta, '$.ask.artefact_id') = ?`, this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID)).toArray();
     for (const subject of subjects) {
