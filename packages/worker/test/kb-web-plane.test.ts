@@ -224,25 +224,20 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(topViewSrc.indexOf("<TrainPanel")).toBeLessThan(topViewSrc.indexOf("<DashboardSummary"));
   });
 
-  it("renders the BR#5349 blocked-lane resolution banner PINNED ABOVE the lane table — plain words, zero jargon (Ray directive 2026-11-01: 'THIS IS WHAT FIXES IT, HERE IS WHAT WE NEED TO DO')", () => {
+  it("keeps the stop-line cause, checks and recovery next to its affected lane", () => {
     // the banner keys off the hub-served resolution block and speaks Ray's
     // plain words: what's broken, what fixes it, what we need from you
     expect(trainPanelSrc).toContain("lane.line ?? unavailable");
-    expect(trainPanelSrc).toContain("FAILING CHECKS:");
-    expect(trainPanelSrc).toContain("WHY:");
-    expect(trainPanelSrc).toContain("WHAT WE ARE DOING:");
+    expect(trainPanelSrc).toContain("Checks:");
+    expect(trainPanelSrc).toContain("{line.reason}");
+    expect(trainPanelSrc).toContain("Recovery:");
     // BR#6390: the banner names the human gate, not a bypass suggestion —
     // "merge the fix PR yourself, then click DONE in the ask"
-    expect(trainPanelSrc).toContain("YOUR ACTION IS NEEDED:");
+    expect(trainPanelSrc).toContain("Your action:");
     expect(trainPanelSrc).toContain("Open the action request");
     expect(trainPanelSrc).not.toContain("function laneStatus(");
     expect(trainPanelSrc).not.toContain("function StalledBanner(");
-    // pinned at the very top: the banner renders BEFORE the lane table head
-    const banner = trainPanelSrc.indexOf("train-blocked-banner");
-    const tableHead = trainPanelSrc.indexOf("ktable-head train-head-cols");
-    expect(banner).toBeGreaterThan(-1);
-    expect(tableHead).toBeGreaterThan(-1);
-    expect(banner).toBeLessThan(tableHead);
+    expect(trainPanelSrc.indexOf("<LineStopBanner lane={l}")).toBeGreaterThan(trainPanelSrc.indexOf('className="ktable-row train-row"'));
   });
 
   it("shows the CAS lock holder machine with a live heartbeat age per lane", () => {

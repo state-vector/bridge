@@ -4,7 +4,7 @@ import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { TrainPanel } from "./TrainPanel";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
-import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
+import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
 
@@ -246,11 +246,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       <TrainPanel openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
-      <div className="view-head">
-        <h2>Top</h2>
-        <span className="muted-note">fleet processes — status dot · agent · gauges · ages. actionable work only; every parked card files in Backlog under its exit condition (awaiting you · PR verification · PR merge · CI · …).</span>
-      </div>
-      <TagThemeBar theme={tagTheme} />
+      <TopSectionHeader theme={tagTheme} />
 
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
@@ -396,4 +392,12 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
     </div>
   );
+}
+
+export function TopSectionHeader({ theme }: { theme: TagTheme }) {
+  return <div className="view-head top-section-head">
+    <div className="top-section-title"><h2>Top</h2>
+      <span className="muted-note">Active work across your fleet. Parked tasks are in Backlog.</span></div>
+    <TagThemeBar theme={theme} />
+  </div>;
 }

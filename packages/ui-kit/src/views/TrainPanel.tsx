@@ -32,19 +32,19 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
   switch (action.kind) {
     case "human":
       return <>
-        <span className="train-banner-line"><strong>YOUR ACTION IS NEEDED: </strong>{action.text}</span>
+        <span className="train-banner-line"><strong>Your action: </strong>{action.text}</span>
         <span className="train-banner-line"><TaskLink id={action.action.id} url={action.action.url} openTask={openTask}>
           Open the action request — choose an answer
         </TaskLink></span>
       </>;
     case "machine":
-      return <span className="train-banner-line">WHAT WE ARE DOING: {action.url
+      return <span className="train-banner-line">Recovery: {action.url
         ? <a href={action.url} target="_blank" rel="noreferrer">{action.text}</a> : action.text}</span>;
     case "agent":
     case "queued": {
       const task = action.task;
       return <>
-        <span className="train-banner-line">WHAT WE ARE DOING: <TaskLink id={task.id} url={task.url} openTask={openTask}>
+        <span className="train-banner-line">Recovery: <TaskLink id={task.id} url={task.url} openTask={openTask}>
           {task.id} — {task.title}
         </TaskLink>{task.owner ? ` · ${task.owner}` : ""}</span>
         <span className="train-banner-line">{action.text}</span>
@@ -62,7 +62,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
       </>;
     }
     case "attention":
-      return <span className="train-banner-line"><strong>RECOVERY NEEDS ATTENTION: </strong>{action.text}</span>;
+      return <span className="train-banner-line"><strong>Recovery needs attention: </strong>{action.text}</span>;
   }
 }
 
@@ -71,13 +71,15 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
   return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
-    <span className="train-banner-line"><strong>{line.label}</strong> — {lane.lane} · {line.held} changes held</span>
-    <span className="train-banner-line">WHY: {line.reason}</span>
-    {line.evidence.length > 0 && <span className="train-banner-line">FAILING CHECKS: {line.evidence.map((e, i) =>
+    <div className="train-banner-cause">
+    <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
+    <span className="train-banner-line">{line.reason}</span>
+    {line.evidence.length > 0 && <span className="train-banner-line train-banner-checks">Checks: {line.evidence.map((e, i) =>
       <span key={`${e.name}-${i}`}>{i > 0 ? " · " : ""}{e.url
-        ? <a href={e.url} target="_blank" rel="noreferrer">{e.name}</a> : e.name}</span>)}</span>}
-    {line.remediation && <Recovery action={line.remediation} now={now} openTask={openTask} />}
+         ? <a href={e.url} target="_blank" rel="noreferrer">{e.name}</a> : e.name}</span>)}</span>}
     {line.observed_at > 0 && <span className="train-banner-line train-banner-dim">Main last checked {age(line.observed_at, now)} ago</span>}
+    </div>
+    {line.remediation && <div className="train-banner-recovery"><Recovery action={line.remediation} now={now} openTask={openTask} /></div>}
   </div>;
 }
 
@@ -99,14 +101,18 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
     const clock = setInterval(() => setNow(Date.now()), 1000);
     return () => { dead = true; clearInterval(poll); clearInterval(clock); };
   }, []);
+  return <TrainPanelView lanes={lanes} error={error} now={now} openTask={openTask} />;
+}
+
+export function TrainPanelView({ lanes, error, now, openTask }: {
+  lanes: KbTrainLane[] | null; error: string | null; now: number; openTask?: (id: string) => void;
+}) {
   return <div className="train-panel">
-    <div className="train-head"><h2>merge trains</h2><span className="muted-note">Live recovery status · refreshed every 30 seconds</span></div>
+    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
-    {(lanes ?? []).filter((l) => (l.line ?? unavailable).blocker).map((l) =>
-      <LineStopBanner key={l.lane} lane={l} now={now} openTask={openTask} />)}
     {lanes?.length === 0 && <div className="muted-note">No merge lines configured.</div>}
     {!!lanes?.length && <div className="ktable-head train-head-cols">
-      <span>machine</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
+      <span title="Executor heartbeat" aria-label="Executor heartbeat">●</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
     </div>}
     {(lanes ?? []).map((l) => {
       const line = l.line ?? unavailable;
@@ -117,7 +123,8 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
       const progress = l.currently?.phase === "bursting"
         ? `${l.currently.burst_merged ?? 0} merged this batch`
         : l.currently ? "Merged — checking deployment" : `${line.held} changes queued`;
-      return <div key={l.lane} className="ktable-row train-row">
+      return <section key={l.lane} className={`train-lane-group${line.blocker ? " train-lane-interrupted" : ""}`} aria-label={l.lane}>
+      <div className="ktable-row train-row">
         <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
         <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
@@ -134,7 +141,9 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}`}
             title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
-      </div>;
+      </div>
+      {line.blocker && <LineStopBanner lane={l} now={now} openTask={openTask} />}
+      </section>;
     })}
   </div>;
 }
