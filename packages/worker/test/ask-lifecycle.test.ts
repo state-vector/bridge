@@ -174,8 +174,11 @@ describe("request audience and lifecycle", () => {
 
   it("a prerequisite merge resumes execution instead of closing it, despite a copied delivery PR stamp", async () => {
     const repo = "state-vector/prereq-test";
-    await call("train.lane", { repo, spec: { required_workflows: [] } });
-    await call("train.lease", { repo, action: "acquire", actor: "prereq-gateway" });
+    // BR#4691: the deliberately unconfigured lane is born through the typed,
+    // risk-acknowledged override (stamped on the card) — and the lease carries
+    // the same acknowledgement.
+    await call("train.lane", { repo, spec: { required_workflows: [] }, allow_empty_workflows: true });
+    await call("train.lease", { repo, action: "acquire", actor: "prereq-gateway", allow_empty_workflows: true });
     const execution = (await call("create", { type: "task", title: "Apply authorised cleanup after support code deploys", qualified: true, meta: { depends_on: "PR403 deployed", completion: { kind: "execution", outcome: "Each target has a disposition receipt" }, pr: { repo, number: 403 }, merge_train: { state: "queued", repo, pr: 403 } } })).body.id;
     await call("transition", { id: execution, to: "in_progress", actor: "cleanup", session: "cleanup" });
     const park = await call("transition", { id: execution, to: "blocked", actor: "cleanup", session: "cleanup", note: "Wait for prerequisite support code", await_event: { event: "pr_merged", repo, n: 403 } });
@@ -218,7 +221,7 @@ describe("request audience and lifecycle", () => {
   });
 
   it("retires a stored diagnostic episode even after the lane stops taking its old starvation branch", async () => {
-    const lane = await call("train.lane", { repo: "state-vector/retired-diagnostic" });
+    const lane = await call("train.lane", { repo: "state-vector/retired-diagnostic", allow_empty_workflows: true });
     const laneId = lane.body.card ?? lane.body.id;
     const snapshot = (await call("get", { id: laneId })).body;
     const ask = await call("ask.create", { to: "human", question: "Should someone investigate this queue?", reason: "Legacy diagnostic", details: "An old queue monitor asked for investigation.", options: ["Investigate", "Wait"] });

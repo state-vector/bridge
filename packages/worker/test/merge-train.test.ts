@@ -35,6 +35,7 @@ import {
   partitionMergeBatches,
   isValidGitHubRepo,
   parseDirectCommitReceipt,
+  requiredWorkflowsGuard,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -2072,5 +2073,23 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     // 7. ISO-8601 parser parity with Rust
     expect(parseIso8601EpochMs("2026-11-04T08:01:57Z")).toBe(1_793_779_317_000);
     expect(parseIso8601EpochMs("invalid")).toBeNull();
+  });
+});
+
+describe("requiredWorkflowsGuard (BR#4691 — an empty lane config is a hole, not a choice)", () => {
+  const refusal = (required: string[], allowEmpty: boolean) => requiredWorkflowsGuard(required, allowEmpty);
+
+  it("a configured lane is always legal; the override only matters for the empty set", () => {
+    expect(refusal(["Test", "CLI build (packages/cli)", "main-green gate"], false)).toBeNull();
+    expect(refusal(["Test"], true)).toBeNull();
+    expect(refusal([], true)).toBeNull();
+  });
+
+  it("the empty set refuses and the reason names BOTH fixes (configure / explicit override)", () => {
+    const r = refusal([], false)!;
+    expect(r).toContain("lane config refused");
+    expect(r).toContain("required_workflows is empty");
+    expect(r).toContain("allow_empty_workflows=true");
+    expect(r).toContain("BR#4691");
   });
 });

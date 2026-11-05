@@ -67,7 +67,7 @@ const task = async (title: string) => {
 /** Lane + lease so /train.event is legal, and a merged event so the lane is
  *  healthy (the strand sweep's healthy-lane gate never hijacks this car). */
 async function healthyLane(repo: string, gw: string): Promise<void> {
-  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
   expect(lane.body.error ?? "").toBe("");
   const a = await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: gw });
   expect(a.body.error ?? "", `lease failed: ${JSON.stringify(a.body)}`).toBe("");

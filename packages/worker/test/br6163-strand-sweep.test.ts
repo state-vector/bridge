@@ -49,7 +49,7 @@ const acquire = (repo: string, actor: string, extra: Record<string, unknown> = {
 /** A lane card for the repo + a LIVE lease + one merged event NOW — the
  *  healthy-lane proof (the train moved after any 3h-ago park). */
 async function healthyLane(repo: string, gw: string): Promise<void> {
-  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
   expect(lane.body.error ?? "").toBe("");
   const a = await acquire(repo, gw);
   expect(a.body.error ?? "").toBe("");
