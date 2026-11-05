@@ -43,6 +43,8 @@ The runner proves cached worker credentials against the live hub and binds the
 canonical provisioned identity before starting work. Stale labels or cached
 gateway credentials cannot masquerade as workers; transient errors never cause
 blind credential rotation.
+Namespaced worker identities such as `gateway/opencode` can receive coordination
+directly, including session-qualified addresses.
 
 Execution protocol v1 connects the hub's SQLite journal to the native runner.
 Before spawning, the runner obtains a fenced attempt generation. It publishes

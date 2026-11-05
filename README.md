@@ -62,6 +62,8 @@ execution begins. Revoked/wrong-class cache entries are re-provisioned; the
 runner binds the hub's canonical worker label rather than an old cache key.
 Transient/deployment errors retain the cache and never trigger credential
 rotation. Gateway and interactive credentials are never worker fallbacks.
+Namespaced worker labels such as `gateway/opencode` (and `label@session`)
+are valid coordination recipients, matching the identities Connect exposes.
 
 New runners acquire a hub-persisted execution generation before spawning an
 agent. The SQLite state and command replay receipt commit atomically. Worker
