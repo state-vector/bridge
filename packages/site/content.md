@@ -172,6 +172,9 @@ can distinguish the live state engine from the edge version marker.
 Worker-authored behind branches carry their verdict across repeated clean
 updates. Carry receipts must match the queued PR/lane and append contiguously;
 protected human branches and root-fix admission retain their existing gates.
+Intermediate merge commits with no CI can settle against a proven containing
+live tip's checks. Unknown ancestry and actual running or failed merge checks
+remain fail-closed.
 Pending merge-gate checks display as waiting, with their names, rather than
 claiming main failed. Actual red checks and active stop episodes still block.
 

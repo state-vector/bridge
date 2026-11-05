@@ -1886,6 +1886,10 @@ Machine update receipts append only to the queued PR leg on the matching lane
 and to the current contiguous verdict-chain end. Repeated clean updates preserve
 the accepted verdict; gap or unrelated-task receipts are rejected. Rust and hub
 gates retain the root-fix fast lane alongside worker-branch provenance checks.
+When GitHub reports an intermediate merge SHA that never triggered main CI,
+the executor settles it from the current live tip only after proving Git
+ancestry. Empty check lists cannot pin that merge forever; unrelated commits,
+running checks, and real failures cannot use this fallback.
 A merge gate waiting only on unsettled checks displays "Waiting for required
 checks". It never calls a pending check a failed main; actual failures and
 persisted stop-the-line episodes retain precedence.

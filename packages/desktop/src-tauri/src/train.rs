@@ -100,6 +100,22 @@ fn branch_is_worker_authored(commit_logins: &[String], worker_identities: &[Stri
             .all(|l| matches!(classify_login(l, worker_identities), IdentityClass::Worker(_)))
 }
 
+/// A merge recorded from GitHub may be an intermediate topic merge with no
+/// main-push CI of its own. Only a proven containing live tip can settle it.
+fn settle_from_descendant_ci(proven_descendant: bool, runs: &[MainCheckRun], required: &[String]) -> bool {
+    if !proven_descendant || required.is_empty() || !runs.iter().all(|r| r.status.as_deref() == Some("completed")) {
+        return false;
+    }
+    let required_run = |r: &MainCheckRun| required.iter().any(|n| n == &r.name);
+    if runs.iter().any(|r| required_run(r) && matches!(r.conclusion.as_deref(), Some("failure" | "timed_out" | "action_required"))) {
+        return false;
+    }
+    runs.is_empty()
+        || runs.iter().any(|r| required_run(r) && r.conclusion.as_deref() == Some("cancelled"))
+        || !runs.iter().any(required_run)
+        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure"))
+}
+
 /// "detached-cody, rayh" → ["detached-cody", "rayh"] — trimmed, lowercased.
 fn parse_identities(raw: &str) -> Vec<String> {
     raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
@@ -2161,12 +2177,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // or missing/startup_failure required runs (superseded because a hotfix
                 // live_base_sha was pushed on top of merge_sha), judge the settle from
                 // live_base_sha's runs instead of hanging on merge_sha.
-                let merge_all_done = !runs.is_empty() && runs.iter().all(|r| r.status.as_deref() == Some("completed"));
-                let merge_req_cancelled = runs.iter().any(|r| required.iter().any(|n| n == &r.name) && r.conclusion.as_deref() == Some("cancelled"));
-                let merge_req_missing_or_startup_fail = !required.is_empty()
-                    && (!runs.iter().any(|r| required.iter().any(|n| n == &r.name))
-                        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure")));
-                if live_base_sha != merge_sha && merge_all_done && (merge_req_cancelled || merge_req_missing_or_startup_fail) {
+                let proven_descendant = live_base_sha != merge_sha && ctx.is_ancestor(&merge_sha, &live_base_sha).unwrap_or(false);
+                if settle_from_descendant_ci(proven_descendant, &runs, &required) {
                     runs = live_runs;
                 }
             }
@@ -5009,6 +5021,21 @@ mod tests {
         // blank/unknown login → not worker class → not owned
         assert!(!branch_is_worker_authored(&["".into()], &workers));
         assert!(!branch_is_worker_authored(&["ghost-login".into()], &workers));
+    }
+
+    #[test]
+    fn intermediate_merge_without_ci_settles_only_from_proven_descendant() {
+        let required = vec!["Test".to_string()];
+        let run = |status: &str, conclusion: &str| MainCheckRun { id: 1, name: "Test".into(), status: Some(status.into()),
+            conclusion: Some(conclusion.into()), html_url: None };
+        assert!(settle_from_descendant_ci(true, &[], &required));
+        assert!(!settle_from_descendant_ci(false, &[], &required));
+        assert!(!settle_from_descendant_ci(true, &[], &[]));
+        assert!(!settle_from_descendant_ci(true, &[run("in_progress", "")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "failure")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "failure"), run("completed", "cancelled")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "success")], &required));
+        assert!(settle_from_descendant_ci(true, &[run("completed", "cancelled")], &required));
     }
 
     #[test]
