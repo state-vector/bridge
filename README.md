@@ -96,6 +96,8 @@ that proof to claim or begin new work.
 For a side-by-side rollout, set `BRIDGE_DISPATCH_DIR` to a separate directory for
 the corrected runner's ephemeral process/status files. Pairing and credentials
 remain in the normal store; the human GUI's status report remains intact.
+The canonical worker-token cache is shared across runner report directories,
+so adopting a side-by-side runner does not rotate another process's worker.
 Namespaced worker labels such as `gateway/opencode` (and `label@session`)
 are valid coordination recipients, matching the identities Connect exposes.
 

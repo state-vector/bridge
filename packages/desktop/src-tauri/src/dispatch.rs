@@ -6220,7 +6220,11 @@ mod tests {
 /// fake in-flight cards, 38–58 watchdog releases each).
 struct WorkerCredential { label: String, secret: String }
 fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<WorkerCredential, String> {
-    let cache_dir = dispatch_dir().ok_or("no dispatch dir")?;
+    // Credentials belong to the gateway, not an individual runner's ephemeral
+    // report directory. Side-by-side processes must reuse the same credential;
+    // separate caches would revoke each other's active workers on every tick.
+    let cache_dir = PathBuf::from(std::env::var("HOME").map_err(|_| "no home directory")?).join(".bridge").join("dispatch");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let cache_path = cache_dir.join("agent-tokens.json");
     let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
         .ok()

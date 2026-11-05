@@ -61,6 +61,8 @@ holding unrelated gateway work; runners check that affinity before claiming.
 Startup failure logs show the actual cause and stop the current claim sweep.
 Side-by-side runner rollouts can set `BRIDGE_DISPATCH_DIR` to isolate ephemeral
 process/status files while preserving the GUI's report and normal credential store.
+Worker credentials remain shared across those directories to avoid revoking
+another runner's active workers during adoption.
 Namespaced worker identities such as `gateway/opencode` can receive coordination
 directly, including session-qualified addresses.
 
