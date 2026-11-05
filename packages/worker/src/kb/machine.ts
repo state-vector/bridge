@@ -1144,6 +1144,17 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   "spawn-while-open": 1,
   claim_race: Number.POSITIVE_INFINITY,
   release_held: Number.POSITIVE_INFINITY,
+  // BR#6654 — the BR#4563 NAMED held classes classify the very same benign
+  // BR#4067 refusals (the tagged shape: "… [rule: release-holds-train-queue]"),
+  // but only the umbrella `release_held` was priced never-a-breach — the
+  // named spellings fell through to the default threshold of 3, so three
+  // hold refusals in a 30-min window re-armed breach cards on exactly the
+  // events BR#4562 ruled benign (specimen BR#4687: 3 owner-death attempts on
+  // an awaiting-ci car, 2026-11-05 14:09–14:11Z, one per alarm tick). The
+  // names exist so the Log says WHAT held — the pricing law is unchanged:
+  // the guard refusing is the system working, never a breach.
+  "release:held-typed-await": Number.POSITIVE_INFINITY,
+  "release:held-train-queue": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 

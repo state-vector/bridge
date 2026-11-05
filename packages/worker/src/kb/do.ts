@@ -962,6 +962,19 @@ export class KnowledgeHub {
         if (now - cardTs <= ownerStaleMs) continue; // the card itself moved — attribution lag, not death
         const silentH = Math.max(1, Math.round((now - ownerTs) / 3_600_000));
         if (r.status === "in_progress") {
+          // BR#6654 — the owner-death release is a machine release like any
+          // other: a card holding a train queue slot / typed wait / bound ask
+          // keeps its exit's owner (the train, the proxy watch, the answer).
+          // Every sibling release path holds BEFORE attempting (stall sweep,
+          // review sweep, park drain, ask-answer dispatch); this leg was the
+          // one path that slipped past its own backstop — each tick it
+          // attempted the release, the BR#4067 guard refused, and the
+          // refusals re-manufactured an audited transition_rejected every
+          // minute (specimen BR#4687: 3 ticks → breach card, 2026-11-05
+          // 14:09–14:11Z; the storm ran until the owner's next live session).
+          // A held card is waited out, not re-refused — same law as the park
+          // drain (BR#4562).
+          if (releaseHold(meta)) continue;
           await this.transition({
             id: r.id, to: "todo",
             note: `watchdog: owner-death release — ${r.owner} has had no live session for ~${silentH}h; claim released to the pool`,
