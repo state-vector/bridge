@@ -68,7 +68,7 @@ const parkQueuedCar = async (id: string, repo: string, n: number, actor: string,
 
 /** A provenance merge receipt for (repo, n) via a train merged event. */
 const stampProvenance = async (repo: string, n: number, mergeSha: string, headSha: string, gw: string) => {
-  await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+  await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
   const a = await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: gw });
   expect(a.body.error ?? "", `lease failed: ${JSON.stringify(a.body)}`).toBe("");
   const ev = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: gw, pr: n, merge_sha: mergeSha, head_sha: headSha });

@@ -76,6 +76,18 @@ async function laneSnap(repo: string): Promise<any> {
  *  drill stamps the legacy Awaiting park with the SAME verdict id the park
  *  era's awaiting.verdict_id carried. Zero GitHub anywhere. */
 async function queueViaAcceptBoth(opts: { repo: string; pr: number; head?: string | null; title?: string; session?: string }): Promise<{ implId: string; verifyId: string }> {
+  // BR#4691: the lane exists and is configured before anything queues on it —
+  // the operator's train_lane call (find-or-create, idempotent). The accept
+  // hook tolerates an unconfigured repo (the card queues on its stamps), but
+  // these drills assert lane state, so seed the gate set — ONLY when the lane
+  // is still MISSING: a drill that configured the lane first (a richer gate
+  // set, or the typed empty-config override) owns that config and must not
+  // be clobbered back to ["Test"].
+  const st = await kbJson("/train.status", { repo: opts.repo });
+  const existingLane = (st.body.lanes ?? []).find((l: any) => l.lane === `${opts.repo}@main`);
+  if (!existingLane) {
+    await kbJson("/train.lane", { repo: opts.repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
+  }
   // session: "" = explicitly anonymous (resolveSession's contract) — the impl
   // card must NOT inherit the token's last-seen session, or the separation
   // guard would see the drill verify session as the impl session
@@ -219,14 +231,68 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(meta.lane.key).toBe("state-vector/lane-config@main");
   });
 
+  it("BR#4691 — an EMPTY required_workflows refuses to exist: creation, config-clear, and lease all refuse with the reason named; the typed override is the only way through and it stamps the card", async () => {
+    // creation without any config (no setting, no spec) → refused, fix named
+    const noCfg = await kbJson("/train.lane", { repo: "state-vector/lane-empty", base: "main", actor: "drill" });
+    expect(noCfg.status).toBeGreaterThanOrEqual(400);
+    expect(String(noCfg.body.error)).toContain("lane config refused");
+    expect(String(noCfg.body.error)).toContain("allow_empty_workflows=true");
+
+    // the override creates the lane — and the acknowledgement is ON the card
+    const override = await kbJson("/train.lane", { repo: "state-vector/lane-empty", base: "main", actor: "drill", allow_empty_workflows: true });
+    expect(override.body.error ?? "").toBe("");
+    const oMeta = JSON.parse(override.body.meta ?? "{}");
+    expect(oMeta.lane.required_workflows).toEqual([]);
+    expect(oMeta.lane.empty_workflows_override.by).toBe("drill");
+    expect(typeof oMeta.lane.empty_workflows_override.at).toBe("number");
+    expect(String(override.body.body_md)).toContain("EMPTY-CONFIG OVERRIDE");
+
+    // leasing an unconfigured lane refuses too — the executor cannot work a hole
+    const repo = "state-vector/lane-empty-lease";
+    await kbJson("/train.lane", { repo, base: "main", actor: "drill", allow_empty_workflows: true });
+    const refused = await acquire(repo, "gw-x");
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    expect(String(refused.body.error)).toContain("lane config refused");
+    const acked = await acquire(repo, "gw-x", { allow_empty_workflows: true });
+    expect(acked.body.error ?? "").toBe("");
+    expect(acked.body.lease.holder).toBe("gw-x");
+    const ackMeta = (await kbJson("/get", { id: (await laneSnap(repo)).card })).body.meta ?? {};
+    // first acknowledgement wins the card stamp — later override leases ride
+    // the audit log instead of rewriting the original ack
+    expect(ackMeta.lane.empty_workflows_override.by).toBe("drill");
+
+    // configuring the lane lands the real gate set and clears the override stamp
+    const gates = ["Test", "CLI build (packages/cli)", "main-green gate"];
+    const cfg = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: gates, ci_typical_minutes: 10 } });
+    expect(cfg.body.error ?? "").toBe("");
+    const cfgGet = (await kbJson("/get", { id: (await laneSnap(repo)).card })).body;
+    expect((cfgGet.meta ?? {}).lane?.required_workflows).toEqual(gates);
+    expect((cfgGet.meta ?? {}).lane?.empty_workflows_override).toBeUndefined();
+    expect(String(cfgGet.body_md)).toContain("main-green gate");
+
+    // an explicit CLEAR of a configured lane needs the override too
+    const clear = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: [] } });
+    expect(clear.status).toBeGreaterThanOrEqual(400);
+    expect(String(clear.body.error)).toContain("lane config refused");
+    expect(String(clear.body.error)).toContain("config refresh");
+
+    // a stale executor carrying an empty list on acquire must NOT wipe the live config
+    // (release the acked lease first — gw-x still holds it)
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-x" });
+    const stale = await acquire(repo, "gw-y", { required_workflows: [] });
+    expect(stale.body.error ?? "").toBe("");
+    const after = (await kbJson("/get", { id: (await laneSnap(repo)).card })).body.meta ?? {};
+    expect(after.lane.required_workflows).toEqual(gates);
+  });
+
   it("the lease is a CAS: a live holder rejects a second gateway; only the holder renews/releases; a freed lane re-grants", async () => {
     const repo = "state-vector/lane-cas";
-    const a = await acquire(repo, "gw-1");
+    const a = await acquire(repo, "gw-1", { required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     expect(a.body.lease.holder).toBe("gw-1");
     expect(String(a.body.note)).toContain("lane was free");
 
-    const b = await acquire(repo, "gw-2");
+    const b = await acquire(repo, "gw-2", { required_workflows: ["Test"] });
     expect(b.status).toBe(400);
     expect(String(b.body.error)).toContain("held live by gw-1");
     expect(String(b.body.error)).toContain("stand down this tick");
@@ -243,7 +309,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(rel.body.error ?? "").toBe("");
     expect(rel.body.lease).toBeNull();
 
-    const again = await acquire(repo, "gw-2");
+    const again = await acquire(repo, "gw-2", { required_workflows: ["Test"] });
     expect(again.body.error ?? "").toBe("");
     expect(again.body.lease.holder).toBe("gw-2");
   });
@@ -251,12 +317,12 @@ describe("merge train DO drill (real bundled worker)", () => {
   it("idle ≠ gateway-less: a recent merge-capable tick marks the lane READY with the machine named (Ray 2026-10-29 — readiness visible with no work queued)", async () => {
     const repo = "state-vector/lane-ready";
     // fresh lane: no capable tick ever — the honest awaiting reason
-    await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     const fresh = await laneSnap(repo);
     expect(fresh.reason).toBe("merge-train: awaiting an available gateway");
     expect(fresh.capable).toBeNull();
     // a merge-capable acquire+release (the gateway's idle-tick shape) → READY
-    const a = await acquire(repo, "gw-ready", { merge_capable: true });
+    const a = await acquire(repo, "gw-ready", { merge_capable: true, required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     const rel = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ready" });
     expect(rel.body.error ?? "").toBe("");
@@ -572,8 +638,9 @@ describe("merge train DO drill (real bundled worker)", () => {
     // never pass — the card was NOT queued (still in its pre-hook status)
     expect(c.meta?.pr?.head_sha_at_acceptance).toBeUndefined();
     expect(c.status).not.toBe("blocked");
-    // and no lane was even created for this repo — nothing was leased
-    expect((await kbJson("/train.status", { repo })).body.lanes.length).toBe(0);
+    // and nothing queued onto the lane — the unbound close never enters the
+    // train (the lane itself exists: the operator seeded it, BR#4691 law)
+    expect((await laneSnap(repo)).queue).toEqual([]);
   });
 
   it("BR#3659 defect 1: a two-leg card closes only when the LAST leg lands — after leg 1 it stays queued naming the leg still out", async () => {
@@ -812,7 +879,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect((await laneSnap(repo)).queue.map((x: any) => x.id)).toContain(cardId);
 
     // the zombie acquires, then renews carrying its FROZEN action note (hours old)
-    const a = await acquire(repo, "gw-zombie");
+    const a = await acquire(repo, "gw-zombie", { required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     const denied = await kbJson("/train.lease", {
       repo, base: "main", action: "renew", actor: "gw-zombie",
@@ -834,7 +901,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(notes).toContain("train:lease_evicted");
 
     // takeover: the next gateway's acquire WINS the now-free lane
-    const takeover = await acquire(repo, "gw-2");
+    const takeover = await acquire(repo, "gw-2", { required_workflows: ["Test"] });
     expect(takeover.body.error ?? "").toBe("");
     expect(takeover.body.lease.holder).toBe("gw-2");
 
@@ -852,7 +919,7 @@ describe("merge train DO drill (real bundled worker)", () => {
 
     // empty queue ⇒ even a frozen note renews — idle holding is harmless
     const idleRepo = "state-vector/lane-zombie-idle";
-    expect((await acquire(idleRepo, "gw-idle")).body.error ?? "").toBe("");
+    expect((await acquire(idleRepo, "gw-idle", { required_workflows: ["Test"] })).body.error ?? "").toBe("");
     const idleRenew = await kbJson("/train.lease", {
       repo: idleRepo, base: "main", action: "renew", actor: "gw-idle",
       progress: { progress: "merged PR #1", progress_age_ms: 3 * 60 * 60_000, holder: "gw-idle" },
@@ -1422,7 +1489,7 @@ describe("merge train DO drill (real bundled worker)", () => {
 describe("BR#4489 starvation — capability-aware lane health", () => {
   it("merge_capable leases stamp the capable clock; a non-capable lease does not", async () => {
     const repo = "state-vector/starve-capable";
-    const a = await acquire(repo, "gw-cody", { merge_capable: true });
+    const a = await acquire(repo, "gw-cody", { merge_capable: true, required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     const lane0 = await laneSnap(repo);
     expect(lane0.last_capable_lease_ts).toBeGreaterThan(0);
@@ -1431,7 +1498,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
 
     // the stand-down class: a lease op WITHOUT merge_capable must leave the
     // capable clock alone (it proves liveness, not capability)
-    const b = await acquire(repo, "gw-personal", {});
+    const b = await acquire(repo, "gw-personal", { required_workflows: ["Test"] });
     expect(b.body.error ?? "").toBe("");
     const lane1 = await laneSnap(repo);
     expect(lane1.last_capable_lease_ts).toBe(stamped);
@@ -1442,7 +1509,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
     const repo = "state-vector/starve-lane";
     const sink = (await kbJson("/create", { type: "task", title: "Starvation alarm sink", meta: { infra_anchor: true } })).body.id;
     await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: sink } });
-    const a = await acquire(repo, "gw-cody", { merge_capable: true });
+    const a = await acquire(repo, "gw-cody", { merge_capable: true, required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     const seeded = await laneSnap(repo);
     const laneCard: string = seeded.card;
@@ -1496,7 +1563,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
     expect(asks2.body.artefacts.filter((x: any) => x.type === "question" && x.meta?.ask?.decision?.task_id === laneCard).length).toBe(1);
 
     // recovery: a capable lease clears the episode (state + payload)
-    await acquire(repo, "gw-cody", { merge_capable: true });
+    await acquire(repo, "gw-cody", { merge_capable: true, required_workflows: ["Test"] });
     const lane3 = await laneSnap(repo);
     expect(lane3.starved).toBeNull();
     expect((await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since ?? null).toBeNull();
@@ -1576,8 +1643,11 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
   it("required=[] + ZERO checks + merge far past the settle dwell still RESOLVES (landed) — the vacuous-green lane can close, never wedge", async () => {
     const repo = "state-vector/lane-zeroruns";
     const HEAD = "b".repeat(40);
+    // BR#4691: the vacuous-green shape needs the typed override — the lane is
+    // born EMPTY through the risk-acknowledged flag (stamped on the card),
+    // configured before the accept chain queues onto it.
+    await acquire(repo, "gw-z", { allow_empty_workflows: true });
     const card = await queueViaAccept({ repo, pr: 4754, head: HEAD, title: "IMPL: zero-run settle drill" });
-    await acquire(repo, "gw-z", {}); // NO lane config — the unconfigured lane
     const M = "d".repeat(40);
     const merged = await kbJson("/train.event", {
       repo, base: "main", kind: "merged", actor: "gw-z",
@@ -1890,7 +1960,7 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
 
   it("BR#4934 settle-window rebase: train.carry appends the verdict-carry chain (contiguity enforced, gaps fail loud)", async () => {
     const repo = "state-vector/lane-carry";
-    await acquire(repo, "gw-carry", {});
+    await acquire(repo, "gw-carry", { required_workflows: ["Test"] });
     const H = "5".repeat(40);
     const card = await queueViaAccept({ repo, pr: 5401, head: H, title: "IMPL: settle-window carry drill" });
     const H2 = "6".repeat(40);
@@ -1919,7 +1989,7 @@ describe("BR#4977 lane lifecycle + queue base scoping", () => {
   it("a retired (done) lane card is frozen — the tick refuses it, its meta never moves, train_status shows it retired with an empty queue", async () => {
     const repo = "state-vector/retire-lane";
     // create + exercise the lane normally first (the card exists, blocked)
-    const a = await acquire(repo, "gw-retire", { merge_capable: true });
+    const a = await acquire(repo, "gw-retire", { merge_capable: true, required_workflows: ["Test"] });
     expect(a.body.error ?? "").toBe("");
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-retire" });
     const laneCard: string = (await laneSnap(repo)).card;
@@ -1968,7 +2038,7 @@ describe("BR#4977 lane lifecycle + queue base scoping", () => {
     expect((await kbJson("/update", { id: releaseCard, meta: m })).status).toBeLessThan(400);
 
     // a lane for the release base exists (created on demand like any lane)
-    const rl = await kbJson("/train.lane", { repo, base: "release/1", actor: "drill" });
+    const rl = await kbJson("/train.lane", { repo, base: "release/1", actor: "drill", spec: { required_workflows: ["Test"] } });
     expect(rl.body.error ?? "").toBe("");
 
     const st = await kbJson("/train.status", { repo });
@@ -2077,7 +2147,7 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
 
   it("close-protection: an agent/duty cannot done or supersede a lane/infra card — NAMED rejection; web retires it fine", async () => {
     const repo = "state-vector/lane-guard";
-    await acquire(repo, "gw-gd", {});
+    await acquire(repo, "gw-gd", { required_workflows: ["Test"] });
     const lane = await laneSnap(repo);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-gd" });
 
@@ -2162,7 +2232,7 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
 
   it("the SAME stop re-reported by a tick loop is ONE ledger episode (no stopped-storm)", async () => {
     const repo = "state-vector/lane-storm";
-    await acquire(repo, "gw-sm", {});
+    await acquire(repo, "gw-sm", { required_workflows: ["Test"] });
     const HEAD = "7".repeat(40);
     await queueViaAccept({ repo, pr: 50614, head: HEAD, title: "IMPL: storm drill" });
     const M = "8".repeat(40);
@@ -2998,7 +3068,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
 
   it("a legacy renewal with NO progress payload stamps nothing — the deprecation window stays silent", async () => {
     const repo = "state-vector/lane-legacy-renew";
-    await acquire(repo, "gw-leg", { merge_capable: true });
+    await acquire(repo, "gw-leg", { merge_capable: true, required_workflows: ["Test"] });
     const ren = await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-leg", merge_capable: true });
     expect(ren.body.error ?? "").toBe("");
     const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
@@ -3052,7 +3122,7 @@ describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {
 
   it("a merged event naming the standing LANE card is a named reject — nothing stamped, nothing settled", async () => {
     const repo = "state-vector/dedupe-lane-drill";
-    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     expect(lane.body.error ?? "").toBe("");
     const laneId = String(lane.body.id);
     await acquire(repo, "gw-lane", { required_workflows: ["Test"] });
@@ -3278,7 +3348,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
 
   it("BR#5658 v2: trainStatus serves 3-bucket pr_stats (in_progress, verifying, ready) across all card states + sequential batches, direct-to-main Verify ACCEPT auto-closes parent done, and unbound handoff asks mint a tracked task on answer", async () => {
     const repo = "state-vector/nextgen-lane";
-    await kbJson("/train.lane", { repo, base: "main", actor: "gw-ng" });
+    await kbJson("/train.lane", { repo, base: "main", actor: "gw-ng", spec: { required_workflows: ["Test"] } });
 
     // 1. Direct-to-main card: in_review with commit URL receipt -> Verify closes done -> parent auto-closes done (never queued on a ghost lane)
     const directCard = (await kbJson("/create", {

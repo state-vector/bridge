@@ -167,7 +167,7 @@ describe("BR#5751: the direct 'merge-train: queued' parent park rides trainQueue
 
 describe("BR#5751: the awaiting lane is base-scoped (BR#4977 law on the awaiting leg)", () => {
   it("fix 3 — another base's awaiting card never lists on this lane; pr_stats excludes it too", async () => {
-    const lane = await post("/train.lane", { repo: "o/r", base: "main" });
+    const lane = await post("/train.lane", { repo: "o/r", base: "main", spec: { required_workflows: ["Test"] } });
     expect(lane.status).toBe(200);
 
     // awaiting card on THIS lane's base
