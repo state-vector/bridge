@@ -1219,11 +1219,20 @@ fn stall_next(
 }
 
 /// BR#5376: does this gh refusal name a MERGE METHOD the repo disallows?
-/// GitHub's mergePullRequest answers "Merge commits are not allowed on this
-/// repository." (squash/rebase variants exist) — that phrase is specific to
-/// the merge-method policy; every other refusal is NOT a method mismatch.
+/// Two eras of the same repo-policy refusal, both method mismatches:
+/// - the classic repo-settings GraphQL answer "Merge commits are not allowed
+///   on this repository." (squash/rebase variants exist), and
+/// - the ruleset-era REST/gh answer "the base branch policy prohibits the
+///   merge." (BR#6442/BR#6673: ruleset 24656303 "main: signed commits and
+///   PRs" pins allowed_merge_methods to squash+rebase with no bypass, so
+///   every `gh pr merge --merge` attempt is refused with that text — the
+///   sp@main lane read fake-busy 22h+ while the queue starved because the
+///   fallback never fired on this string).
+/// Every other refusal is NOT a method mismatch.
 fn is_merge_method_refusal(err: &str) -> bool {
-    err.to_lowercase().contains("not allowed on this repository")
+    let low = err.to_lowercase();
+    low.contains("not allowed on this repository")
+        || low.contains("base branch policy prohibits the merge")
 }
 
 /// Which merge method did the refusal name? (Drives the fallback's skip.)
@@ -4908,6 +4917,12 @@ mod tests {
         assert!(is_merge_method_refusal("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"));
         assert!(is_merge_method_refusal("Squash merges are not allowed on this repository."));
         assert!(is_merge_method_refusal("Rebase merges are not allowed on this repository."));
+        // BR#6673: the ruleset-era REST/gh refusal — ruleset 24656303 pins
+        // allowed_merge_methods to squash+rebase (no bypass), so every
+        // `gh pr merge --merge` attempt is refused with exactly this text
+        assert!(is_merge_method_refusal(
+            "Pull request state-vector/superpositional#2513 is not mergeable: the base branch policy prohibits the merge."
+        ));
         // a PR defect or a permission refusal is NOT a method mismatch
         assert!(!is_merge_method_refusal("gh: permission denied"));
         assert!(!is_merge_method_refusal("Pull request is not up to date"));
@@ -4919,9 +4934,23 @@ mod tests {
         assert_eq!(refused_merge_method("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"), Some("merge"));
         assert_eq!(refused_merge_method("Squash merges are not allowed on this repository."), Some("squash"));
         assert_eq!(refused_merge_method("gh: something else"), None);
+        // BR#6673: the ruleset-era text names NO method — None is correct
+        assert_eq!(
+            refused_merge_method(
+                "Pull request state-vector/superpositional#2513 is not mergeable: the base branch policy prohibits the merge."
+            ),
+            None
+        );
         // sp class: configured merge refused → squash first (Ray's law), then rebase
         assert_eq!(
             merge_fallback_candidates("merge", Some("merge"), true),
+            vec!["squash".to_string(), "rebase".to_string()]
+        );
+        // BR#6673 ruleset-era shape: the refusal names no method (None) but
+        // the PRIMARY attempt was refused, so the configured method is still
+        // skipped — squash first, then rebase (the standing sp landing shape)
+        assert_eq!(
+            merge_fallback_candidates("merge", None, true),
             vec!["squash".to_string(), "rebase".to_string()]
         );
         // a squash-configured lane refused squash → rebase, then merge
