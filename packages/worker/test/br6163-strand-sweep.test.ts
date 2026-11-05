@@ -145,7 +145,7 @@ describe("BR#6163: bounce-release strand — evidence, re-board, alarm, exclusio
     expect(cur.meta?.bounce_released?.train_only_await).toEqual({ event: "pr_merged", repo: REPO, n: 2734 });
   });
 
-  it("leg 2 — the sweep RE-BOARDS an out-of-queue train-only-await car once: legal blocked transition, queue membership, strand_reboard pin", async () => {
+  it("leg 2 — released queue records get one owned inspection, never automatic requeue or a human diagnostic", async () => {
     const REPO = "state-vector/strand-reboard";
     await healthyLane(REPO, "gw-strand-2");
     const id = await task("BR#6163 reboard specimen");
@@ -168,26 +168,19 @@ describe("BR#6163: bounce-release strand — evidence, re-board, alarm, exclusio
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
     let cur = (await kbJson("/get", { id })).body;
-    expect(cur.status).toBe("blocked");
-    expect(String(cur.meta?.blocked?.reason ?? "")).toContain("strand re-board (BR#6163)");
-    expect(String(cur.meta?.blocked?.reason ?? "")).toMatch(/^merge-train: queued/);
-    // the typed train wait is PRESERVED by the re-board
-    expect(cur.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: REPO, n: 2735 });
-    expect(cur.meta?.merge_train?.state).toBe("queued");
-    // the one-attempt pin
-    expect(cur.meta?.strand_reboard?.class).toBe("out_of_queue_await");
-    const pinAt = cur.meta.strand_reboard.at;
-    // the car is back IN the lane's derived queue — the train can gate it again
-    const snap = (await kbJson("/train.status", { repo: REPO })).body.lanes[0];
-    expect((snap.queue ?? []).map((x: any) => x.id)).toContain(id);
-    // second sweep: the pin holds — no second re-board (at unchanged)
+    // A released card needs actual PR inspection before any queue admission.
+    expect(cur.status).toBe("todo");
+    const recoveryId = cur.meta.recovery.task_id;
+    const recovery = (await kbJson("/get", { id: recoveryId })).body;
+    expect(recovery.meta.machine_duty).toMatchObject({ kind: "task-recovery", subject: id });
+    expect(recovery.meta.completion.kind).toBe("execution");
+    expect(await sinkQuestions(id)).toHaveLength(0);
     await kbJson("/admin.alarm_sweep");
     cur = (await kbJson("/get", { id })).body;
-    expect(cur.meta?.strand_reboard?.at).toBe(pinAt);
-    expect((cur.meta?.blocked?.reason ?? "").match(/strand re-board \(BR#6163\)/g)?.length).toBe(1);
+    expect(cur.meta.recovery.task_id).toBe(recoveryId);
   });
 
-  it("leg 3 — an unbound-in-queue car is ALARM-only (no machine re-board) and the alarm dedupes", async () => {
+  it("leg 3 — missing binding schedules one deduplicated repair duty and no human ask", async () => {
     const REPO = "state-vector/strand-unbound";
     await healthyLane(REPO, "gw-strand-3");
     const id = await task("BR#6163 unbound strand specimen");
@@ -217,18 +210,17 @@ describe("BR#6163: bounce-release strand — evidence, re-board, alarm, exclusio
     expect(cur.status).toBe("blocked");
     expect(cur.meta?.strand_reboard).toBeUndefined();
     expect(cur.meta?.merge_train?.state).toBe("unbound");
-    // the alarm fired ONCE to the sink
+    const recoveryId = cur.meta.recovery.task_id;
+    expect((await kbJson("/get", { id: recoveryId })).body.meta.machine_duty.subject).toBe(id);
     let asks = await sinkQuestions(id);
-    expect(asks.length).toBe(1);
-    expect(String(asks[0].title)).toContain(id);
-    expect(String(asks[0].title)).toMatch(/\?$/);
-    expect(asks[0].meta?.ask?.to).toBe("human");
+    expect(asks.length).toBe(0);
     // second sweep: deduped — no second re-board, no second ask
     await kbJson("/admin.alarm_sweep");
     cur = (await kbJson("/get", { id })).body;
     expect(cur.meta?.strand_reboard).toBeUndefined();
     asks = await sinkQuestions(id);
-    expect(asks.length).toBe(1);
+    expect(asks.length).toBe(0);
+    expect(cur.meta.recovery.task_id).toBe(recoveryId);
   });
 
   it("leg 4 — a HEALTHY awaiting park is excluded: the strand sweep never touches BR#5633's class", async () => {

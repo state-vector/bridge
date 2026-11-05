@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { isHumanDecisionAsk } from "@bridge/contracts";
+import { AskContext } from "./AskContext";
 import { useKb } from "../server/kbStore";
 import { kbApi, type KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
@@ -19,7 +21,7 @@ import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
  *  Server-side, one actionable verdict per target: the group cannot regrow.
  */
 
-import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions, ConsensusLine, md } from "./decide";
+import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions, ConsensusLine } from "./decide";
 import {
   beginHold,
   groupBusy,
@@ -199,7 +201,7 @@ function QuestionNodeRow({ node, onDone, answered }: { node: any; onDone: (id: s
         <span className="why-line">
           {ask.from ?? "agent"} → {ask.to ?? "any"} · {rel(node.created_ts)}
           {/* BR#3942 — presence: is the addressee even alive? */}
-          {node.ask_target && !node.ask_target.online && (
+          {!isHumanDecisionAsk(ask) && node.ask_target && !node.ask_target.online && (
             <span className="ab-offline">
               {" · "}offline{node.ask_target.last_seen_ts ? ` · last seen ${rel(node.ask_target.last_seen_ts)}` : " · never seen"}
             </span>
@@ -207,18 +209,13 @@ function QuestionNodeRow({ node, onDone, answered }: { node: any; onDone: (id: s
         </span>
       </div>
       <h3 className="ask-question">{node.title}</h3>
-      <p className="ask-reason">Choose how Bridge should proceed. An option will say explicitly if it needs you to do something.</p>
-      {ask.reason && <p className="ask-reason"><b>Why Bridge needs you:</b> {ask.reason}</p>}
-      {ask.escalated?.reason && <p className="ask-reason"><b>escalation:</b> {ask.escalated.reason}</p>}
+      <AskContext body={node.body_md} ask={ask} />
       {/* BR#6390 (Ray: "the question/body needs to be clear in the UI, not
           buried ... not small truncated text"): the ask's full body_md — the
           human gates (merge command, PR links, why) — renders inline on the
           card, markdown + linkified, never behind a Details click. */}
-      {String(node.body_md ?? "").trim() && (
-        <div className="forme-body md-body" dangerouslySetInnerHTML={{ __html: md(String(node.body_md)) }} />
-      )}
       {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} busy={busy || answered} onPick={(o) => void answer(o)} />
+        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box">
         <TextInput
@@ -391,4 +388,3 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
     </div>
   );
 }
-import { isHumanDecisionAsk } from "@bridge/contracts";

@@ -251,7 +251,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
     schema: TOOL_ARG_SCHEMAS.ask_agent,
     handler: async (args, ctx) => {
-      const a = await ctx.call("ask.create", { route: args.route, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
+      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
       return text(JSON.stringify({
         ...a,
         note: a.kind === "independent_review" ? a.message : a.task_status === "blocked"

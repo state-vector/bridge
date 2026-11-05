@@ -1,7 +1,7 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { askLifecycle, askRoute, isHumanDecisionAsk } from "@bridge/contracts";
+import { askLifecycle, askRoute, isHumanDecisionAsk, planTaskRecovery, mergeCompletesTask } from "@bridge/contracts";
 import { exitClassOf } from "../../ui-kit/src/server/views";
 
 let mf: Miniflare;
@@ -141,5 +141,79 @@ describe("request audience and lifecycle", () => {
     expect(results.map((r) => r.status).sort()).toEqual([200, 400]);
     const node = (await call("get", { id: ask.body.id })).body;
     expect(askLifecycle(node).state).toBe("answered");
+  });
+
+  it("the recovery decision table has no human outcome, and current execution/dependencies outrank old queue state", () => {
+    const facts = { status: "in_progress", phase: "queued", live_executor: true, queue_admitted: false, is_delivery: true, has_other_wait: false };
+    expect(planTaskRecovery(facts).kind).toBe("owned");
+    expect(planTaskRecovery({ ...facts, status: "in_review" }).kind).toBe("none");
+    expect(planTaskRecovery({ ...facts, status: "blocked", has_other_wait: true }).kind).toBe("none");
+    expect(planTaskRecovery({ ...facts, status: "blocked", is_delivery: false }).kind).toBe("none");
+    expect(planTaskRecovery({ ...facts, status: "blocked", phase: "unbound" })).toEqual({ kind: "dispatch", reason: "queue_binding" });
+    expect(mergeCompletesTask({ depends_on: "PR403 deployed" })).toBe(false);
+  });
+
+  it("a claimed repair does not get requeued or create a human strand request; its obsolete diagnostic is cancelled", async () => {
+    const old = Date.now() - 3 * 3_600_000;
+    const mint = await call("admin.mint", { label: "repair-owner", tags: [] });
+    await call("auth.identify", { bearer: mint.body.secret });
+    await call("orient", { actor: "repair-owner", token_id: mint.body.id, session: "repair-session" });
+    const task = (await call("create", { type: "task", title: "Backlog recovery repair", qualified: true, meta: { merge_train: { state: "queued", repo: "state-vector/bridge", pr: 402, at: old }, strand_alarm: { at: old, class: "queued_out_of_queue" } } })).body.id;
+    expect((await call("transition", { id: task, to: "in_progress", actor: "repair-owner", session: "repair-session" })).status).toBe(200);
+    await call("progress.log", { id: task, actor: "repair-owner", session: "repair-session", note: "Repairing failing tests" });
+    const sink = (await call("create", { type: "task", title: "Alarm sink", meta: { infra_anchor: true } })).body.id;
+    await call("admin.settings_set", { settings: { train_alarm_sink_id: sink } });
+    const obsolete = await call("ask.create", { to: "human", actor: "system:train", question: `${task} sits out of the merge queue on a train-only wait (pr_merged) while state-vector/bridge kept merging — need a human leg?`, reason: "Old diagnostic", details: "Old queue diagnostic", options: ["Investigate", "Release"], artefact_id: sink });
+    expect(obsolete.status, JSON.stringify(obsolete.body)).toBe(200);
+    await call("admin.alarm_sweep");
+    const parent = (await call("get", { id: task })).body;
+    expect(parent.status).toBe("in_progress");
+    expect(parent.meta.recovery).toBeUndefined();
+    expect((await call("get", { id: obsolete.body.id })).body.meta.ask.resolution.kind).toBe("cancelled");
+  });
+
+  it("a prerequisite merge resumes execution instead of closing it, despite a copied delivery PR stamp", async () => {
+    const repo = "state-vector/prereq-test";
+    await call("train.lane", { repo, spec: { required_workflows: [] } });
+    await call("train.lease", { repo, action: "acquire", actor: "prereq-gateway" });
+    const execution = (await call("create", { type: "task", title: "Apply authorised cleanup after support code deploys", qualified: true, meta: { depends_on: "PR403 deployed", completion: { kind: "execution", outcome: "Each target has a disposition receipt" }, pr: { repo, number: 403 }, merge_train: { state: "queued", repo, pr: 403 } } })).body.id;
+    await call("transition", { id: execution, to: "in_progress", actor: "cleanup", session: "cleanup" });
+    const park = await call("transition", { id: execution, to: "blocked", actor: "cleanup", session: "cleanup", note: "Wait for prerequisite support code", await_event: { event: "pr_merged", repo, n: 403 } });
+    expect(park.status, JSON.stringify(park.body)).toBe(200);
+    expect((await call("train.status", { repo })).body.lanes[0].queue).not.toContainEqual(expect.objectContaining({ id: execution }));
+    await call("train.event", { repo, kind: "merged", actor: "prereq-gateway", pr: 403, merge_sha: "e".repeat(40), head_sha: "f".repeat(40) });
+    await call("admin.alarm_sweep");
+    const after = (await call("get", { id: execution })).body;
+    expect(after.status).toBe("todo");
+    expect(after.meta.prerequisite_receipt.pr).toBe(403);
+    expect(after.meta.merge_train).toBeUndefined();
+    await call("transition", { id: execution, to: "in_progress", actor: "cleanup2", session: "cleanup2" });
+    const falseDone = await call("transition", { id: execution, to: "done", actor: "cleanup2", session: "cleanup2", note: `Prerequisite merged ${ci}` });
+    expect(falseDone.status).toBe(400);
+    expect(falseDone.body.error).toContain("execution_result");
+    const completed = await call("transition", { id: execution, to: "in_review", actor: "cleanup2", session: "cleanup2", note: "All actions executed; inspect the outcome receipts.", execution_result: { outcome: "Each target has a disposition receipt", receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] } });
+    expect(completed.status, JSON.stringify(completed.body)).toBe(200);
+    const verify = completed.body.verify_task;
+    const duty = (await call("get", { id: verify })).body;
+    expect(duty.body_md).toContain("actual execution_result");
+    expect(duty.body_md).not.toContain("gh pr view");
+    await call("transition", { id: verify, to: "in_progress", actor: "outcome-reviewer", session: "outcome-reviewer" });
+    const accepted = await call("transition", { id: verify, to: "done", actor: "outcome-reviewer", session: "outcome-reviewer", review_result: { kind: "accepted_execution", task_id: execution, receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] }, note: "Verified every applied target; passed execution outcome checks." });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await call("get", { id: execution })).body.status).toBe("done");
+  });
+
+  it("human choices require an actual subject and execute typed consequences rather than verbs in labels", async () => {
+    expect((await call("ask.create", { route: { kind: "human_decision" }, question: "Investigate the queue?", reason: "Machine uncertainty", details: "diagnostic", options: ["Investigate", "Release"] })).status).toBe(400);
+    const task = (await call("create", { type: "task", title: "Retention policy choice", qualified: true })).body.id;
+    await call("transition", { id: task, to: "in_progress", actor: "choice-owner", session: "choice-owner" });
+    const decision = { kind: "preference", task_id: task, context: "Choose whether records are kept.", why_human: "This is your retention policy.", choices: [{ label: "Release old records", executor: "bridge", consequence: "Bridge continues implementing deletion.", action: "resume" }, { label: "Keep all records", executor: "bridge", consequence: "Bridge waits for a revised policy.", action: "hold" }] };
+    const ask = await call("ask.create", { route: { kind: "human_decision" }, question: "Should Bridge delete old records?", decision });
+    expect(ask.status, JSON.stringify(ask.body)).toBe(200);
+    const answer = await call("ask.answer", { id: ask.body.id, answer: "Release old records", actor: "web:rayh" });
+    expect(answer.status, JSON.stringify(answer.body)).toBe(200);
+    expect((await call("get", { id: task })).body.status).toBe("in_progress");
+    const invalid = await call("ask.create", { route: { kind: "human_decision" }, artefact_id: "BR#3124", question: "Should Bridge continue?", decision });
+    expect(invalid.status).toBe(400);
   });
 });

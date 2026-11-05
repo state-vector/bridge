@@ -3,10 +3,11 @@ import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, md } from "./decide";
+import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
 import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { isHumanDecisionAsk } from "@bridge/contracts";
+import { AskContext } from "./AskContext";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -221,19 +222,12 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
             commands, PR links, why) live in body_md and must never hide
             behind Details. */}
         <span className="ab-title">{nodeAsk.title}</span>
-        <span className="ab-reason">Choose how Bridge should proceed. An option will say explicitly if it needs you to do something.</span>
-        {m.ask?.reason && <span className="ab-reason">Why Bridge needs you: {m.ask.reason}</span>}
-        {String(nodeAsk.body_md ?? "").trim() && (
-          <div
-            className="ask-band-body md-body"
-            dangerouslySetInnerHTML={{ __html: md(String(nodeAsk.body_md)) }}
-          />
-        )}
+        <AskContext body={nodeAsk.body_md} ask={ask} />
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
           {/* BR#3942 — addressee presence: a stalled card shows WHO the ask is
               waiting on and whether that identity is even alive */}
-          {nodeAsk.ask_target && !nodeAsk.ask_target.online && (
+          {!isHumanDecisionAsk(ask) && nodeAsk.ask_target && !nodeAsk.ask_target.online && (
             <span className="ab-offline" title={`addressee presence (10-min window, source: ${nodeAsk.ask_target.source})`}>
               {" · "}offline{nodeAsk.ask_target.last_seen_ts ? ` · last seen ${rel(nodeAsk.ask_target.last_seen_ts)}` : " · never seen"}
             </span>
@@ -242,7 +236,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
           {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}
         </span>
         {(ask.options ?? []).length > 0 && (
-          <AskOptions options={ask.options as string[]} busy={busy || answered} onPick={(o) => void answer(o)} />
+          <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} onPick={(o) => void answer(o)} />
         )}
         {customOpen ? (
           <div className="ask-opt-row">

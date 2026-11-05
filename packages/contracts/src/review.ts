@@ -3,6 +3,7 @@ import { z } from "zod";
 /** A review completion is not necessarily an acceptance. Typed receipts keep
  * a findings/cannot-proceed close from being mistaken for delivered work. */
 export const ReviewResultSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("accepted_execution"), task_id: z.string().regex(/^BR#\d+$/), receipts: z.array(z.string().min(1)).min(1) }),
   z.object({
     kind: z.literal("accepted_direct_main"),
     repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),

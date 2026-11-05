@@ -135,6 +135,39 @@ describe("parseCardIdRefs (BR#6432 batch-authorization scope)", () => {
 // ---------- B + C. the hub-applied batch authorization ----------
 
 describe("batch_auth supersede (BR#6432)", () => {
+  it("the alarm executes a persisted authorised command after a crash and consumes a rejected command once", async () => {
+    const drain = await task("Durable cleanup executor");
+    const target = await task("Durable disposition target");
+    await park(target, "state-vector/bridge", 311, "durable-owner");
+    const askId = await authAsk(drain, [target], ["SUPERSEDE all 1", "KEEP"]);
+    await kbJson("/ask.answer", { id: askId, answer: "SUPERSEDE all 1", actor: "web:rayh" });
+    await kbJson("/update", { id: target, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } });
+    const outside = await task("Unapproved durable target");
+    await park(outside, "state-vector/bridge", 312, "durable-outside");
+    await kbJson("/update", { id: outside, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } });
+    await kbJson("/admin.alarm_sweep");
+    expect((await kbJson("/get", { id: target })).body.status).toBe("superseded");
+    const rejected = (await kbJson("/get", { id: outside })).body;
+    expect(rejected.meta.disposition_result.kind).toBe("refused");
+    expect(rejected.meta.disposition_request).toBeUndefined();
+    await kbJson("/admin.alarm_sweep");
+    expect((await kbJson("/get", { id: outside })).body.meta.disposition_result.at).toBe(rejected.meta.disposition_result.at);
+  });
+  it("a persisted disposition request consumes the same human-authority gate, with no prose parsing or repeated ask", async () => {
+    const drain = await task("Receipt-scoped cleanup executor");
+    const target = await task("Persisted disposition target");
+    await park(target, "state-vector/bridge", 311, "receipt-owner");
+    const askId = await authAsk(drain, [target], ["SUPERSEDE all 1", "KEEP"]);
+    await kbJson("/ask.answer", { id: askId, answer: "SUPERSEDE all 1", actor: "web:rayh" });
+    expect((await kbJson("/update", { id: target, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } })).status).toBe(200);
+    const applied = await kbJson("/transition", { id: target, to: "superseded", actor: "cleanup-executor", session: "cleanup-executor" });
+    expect(applied.status, JSON.stringify(applied.body)).toBe(200);
+    expect((await kbJson("/get", { id: target })).body.meta.batch_auth.ask).toBe(askId);
+    const outside = await task("Out-of-scope target");
+    await park(outside, "state-vector/bridge", 312, "outside-owner");
+    await kbJson("/update", { id: outside, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: askId } } });
+    expect((await kbJson("/transition", { id: outside, to: "superseded", actor: "cleanup-executor" })).status).toBe(400);
+  });
   it("happy path: one answered ask drops both named parks; the bound task survives; provenance stamped", async () => {
     const drain = await task("EXECUTE: drain the strand backlog (drill)");
     const dead = await task("dead park drill (awaited PR closed unmerged)");

@@ -8,6 +8,26 @@
  */
 import { z } from "zod";
 
+/** The choice and its effect are separate from display prose. A location used
+ * for notifications is never the action target. Diagnostic uncertainty has no
+ * human-decision category: Bridge must investigate it first. */
+export const HumanDecisionSchema = z.object({
+  kind: z.enum(["authority", "information", "preference"]),
+  task_id: z.string().regex(/^BR#\d+$/),
+  context: z.string().min(1).max(2000),
+  why_human: z.string().min(1).max(1200),
+  choices: z.array(z.object({
+    label: z.string().min(1).max(200),
+    executor: z.enum(["bridge", "human"]),
+    consequence: z.string().min(1).max(500),
+    action: z.enum(["resume", "hold", "release"]),
+  })).min(2).max(8),
+}).superRefine((d, ctx) => {
+  if (new Set(d.choices.map((c) => c.label)).size !== d.choices.length) ctx.addIssue({ code: "custom", message: "decision choice labels must be unique" });
+  for (const c of d.choices) if (c.executor === "human" && c.action !== "hold") ctx.addIssue({ code: "custom", message: "a human execution step must hold the task until completion is confirmed" });
+});
+export type HumanDecision = z.infer<typeof HumanDecisionSchema>;
+
 /** Audience and lifecycle are explicit. Review is executable work, never a
  * human decision disguised as an ask. Missing routes are legacy input only. */
 export const AskRouteSchema = z.discriminatedUnion("kind", [
@@ -45,10 +65,11 @@ export function isHumanDecisionAsk(ask: { route?: unknown; to?: unknown }): bool
 
 export const AskCreatePayloadSchema = z.looseObject({
   route: AskRouteSchema.optional(),
+  decision: HumanDecisionSchema.optional(),
   /** Agent label, label@session, tag:<capability>, "human", or "any". */
   to: z.string().optional(),
   /** THE ask itself — one answerable sentence, ≤240 chars. */
-   question: z.string().min(1).max(240).optional(),
+  question: z.string().min(1).max(240).optional(),
   /** WHY this is escalated instead of automatic (required for humans). */
   reason: z.string().optional(),
   /**

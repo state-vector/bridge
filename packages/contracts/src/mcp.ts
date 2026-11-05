@@ -15,7 +15,8 @@
  * generated surface against `fixtures/mcp-tools.json`.
  */
 import { z } from "zod";
-import { AskRouteSchema } from "./ask.ts";
+import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
+import { ExecutionResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
 
@@ -113,6 +114,7 @@ export const TOOL_ARG_SCHEMAS = {
     roles: z.array(z.string()).optional(),
   }),
   transition: z.looseObject({
+    execution_result: ExecutionResultSchema.optional().describe("Execution tasks complete only after their actual outcome is achieved. Supply an outcome and per-action receipts; a prerequisite PR merge is not completion."),
     review_result: ReviewResultSchema.optional().describe("For a review duty closing done: accepted_direct_main carries verified commit and green CI receipts; findings is not acceptance. Prefer this typed result over prose."),
     id: z.string(),
     to: z.string(),
@@ -174,6 +176,7 @@ export const TOOL_ARG_SCHEMAS = {
     limit: z.number().int().max(200).optional(),
   }),
   ask_agent: z.looseObject({
+    decision: HumanDecisionSchema.optional().describe("For a human decision: the affected task, concise context, the actual missing authority/information/preference, and choices with named executor, consequence and typed action. Machine investigation is not a human decision."),
     route: AskRouteSchema.optional().describe("human_decision: a choice only the human can make; agent_coordination: peer assistance; independent_review with task_id: Bridge schedules/reuses a fresh review automatically, without asking the human"),
     to: z.string().optional(),
     question: z.string().max(240).optional().describe("Required for decisions and coordination; plain English, one complete question. Omit for independent_review work."),

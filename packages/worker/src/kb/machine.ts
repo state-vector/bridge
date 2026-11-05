@@ -14,6 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
+import { mergeCompletesTask, ExecutionResultSchema } from "@bridge/contracts";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -559,7 +560,7 @@ export const RULES: Rule[] = [
     name: "review-needs-pr",
     when: (i) => isTask(i) && i.to === "in_review",
     guard: (i) =>
-      hasEvidenceLink(noteOf(i))
+      hasEvidenceLink(noteOf(i)) || (!mergeCompletesTask(i.meta ?? {}) && ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success)
         ? null
         : `moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call)`,
   },

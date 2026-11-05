@@ -8,7 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
-import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -503,6 +503,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
     `6c. ASK QUALITY BAR — an ask must be answerable on plain reading. (a) If you recommend an option, put it FIRST in options and prefix it "(Recommended)" — the first button IS the recommendation. (b) Human-directed asks REQUIRE details: a self-contained brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected by the hub. (c) Split the fields: question ≤240 chars, details carries the full story, reason is the one-line WHY escalated. Never cram the narrative into reason or reference cards the reader hasn't read.`,
     `6d. REQUEST ROUTING: use route {kind:"executor_coordination",task_id:"BR#N"} to ask the current executor of work — the recipient follows claim changes. Use route {kind:"independent_review",task_id:"BR#N"} for review: Bridge schedules/reuses a fresh review agent, no human staffing question. Agent delivery failures return to the agent pool, never become human decisions merely because a recipient is offline. Human decisions use route {kind:"human_decision"}, to:"human", only for a specific choice/authority Bridge lacks. Write the complete question in plain English: explain the user-visible issue before task/commit evidence; each option names who acts and what happens. Answer coordination via answer_ask (even "No overlap"), never log_progress: progress is commentary, not an answer.`,
+    `6e. EXPLICIT EFFECTS: human_decision requests require decision {kind:authority|information|preference,task_id,context,why_human,choices:[{label,executor:bridge|human,consequence,action:resume|hold|release}]}. Diagnostics are machine recovery work, not a human choice. Operational/post-deploy tasks declare meta.completion {kind:"execution",outcome}; prerequisite delivery only resumes them. Record actual execution_result {outcome,receipts}, submit to independent outcome review, and accept with review_result {kind:"accepted_execution",task_id,receipts}. Never mark prerequisite arrival as completed execution.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch — the docs are the interface, stale docs are a defect.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
@@ -2228,7 +2229,7 @@ export function rootFixCardBody(repo: string, sha: string, failing: { name: stri
  *  `WHERE id = laneKey(repo, base)`, and a lane key is never an
  *  artefacts.id, so the filter never fired once.) */
 export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
-  const queued = cards.filter((c) =>
+  const queued = cards.filter((c) => mergeCompletesTask(c.meta ?? {}) && (
     [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX))
     // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
     // the silence-release parked unprefixed must not stay invisible to the
@@ -2245,7 +2246,7 @@ export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority
     // the exit), but it must never silently leave the derived queue — the
     // Phase A empty-queue starvation happened precisely because a conflicting
     // car was invisible to every alarm.
-    || mergePhaseOf(c.meta) === "conflicting",
+    || mergePhaseOf(c.meta) === "conflicting"),
   );
   const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
   return [...queued]

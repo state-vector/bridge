@@ -68,9 +68,13 @@ export function askOptionVariant(o: string): "accept" | "reject" {
  *      [ A ] - Provision x
  *      [ B ] - Reword y
  *  Never letter-keys alone — an option without its text is not an option. */
-export function AskOptions({ options: raw, onPick, busy }: {
-  options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean;
+export function AskOptions({ options: raw, onPick, busy, choices }: {
+  options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean; choices?: import("@bridge/contracts").HumanDecision["choices"];
 }) {
+  if (choices) return <div className="ask-opt-list">{choices.map((choice) => <div key={choice.label} className="ask-choice">
+    <Btn disabled={busy} onClick={() => onPick(choice.label)}>{choice.label}</Btn>
+    <p className="ask-opt-text"><b>{choice.executor === "human" ? "You" : "Bridge"}:</b> {choice.consequence}</p>
+  </div>)}</div>;
   const options = raw
     .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))
     .filter((o) => o && !/\[object\s*object\]/i.test(o));
@@ -86,10 +90,9 @@ export function AskOptions({ options: raw, onPick, busy }: {
   }
   return (
     <div className="ask-opt-list">
-      {options.map((o, i) => (
+      {options.map((o) => (
         <div key={o} className={`ask-opt-row ${busy ? "disabled" : ""}`} onClick={() => !busy && onPick(o)}>
-          <Btn size="sm" disabled={busy}>{String.fromCharCode(65 + i)}</Btn>
-          <span className="ask-opt-text">{o}</span>
+          <Btn size="sm" disabled={busy}>{o}</Btn>
         </div>
       ))}
     </div>

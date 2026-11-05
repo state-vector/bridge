@@ -3,6 +3,7 @@ import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
 import { md, AskOptions, askOptionVariant } from "./decide";
+import { AskContext } from "./AskContext";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -527,7 +528,7 @@ function QuestionHoldBand({ task, onChanged }: { task: KbArtefact & { meta?: any
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
-function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
+function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const ask = task.meta?.ask ?? {};
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -556,12 +557,9 @@ function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: 
         <span className="gw-mono ab-id">{task.id}</span>
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
-      {ask.reason && (
-        <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
-      )}
-      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={onOpen} repo={task.meta?.provenance?.repo} /></div>
+      <AskContext body={task.body_md} ask={ask} />
       {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
+        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />

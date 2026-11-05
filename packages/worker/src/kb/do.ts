@@ -223,6 +223,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
+import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import {
   parseProxyCondition,
@@ -344,6 +345,10 @@ Use answer_ask for any coordination question you answer; progress notes do not r
     ? `\n\nDIRECT-TO-MAIN LANDING (AGENTS.md Rule 7 — commit receipt ${prLink}, no PR): verify the commit is an ancestor of main, signed (isValid=true), with green CI and substance matching the task. On ACCEPT: close yourself done citing \`commit <full-40-hex>\` and the green CI run URL — the hub automatically closes ${parentId} done (do NOT transition ${parentId} to blocked with \`merge-train: queued\` when there is no PR).`
     : "";
   return `Verification duty for ${parentId} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${parentId} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.${fastLane}${directMain}\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls).\n2. Transition the parent ${parentId} to blocked with note \`merge-train: queued\` AND the ONE typed machine leg on the same call — pass await_event ${leg ? `{event:"pr_merged", repo:"${leg.repo}", n:${leg.n}}` : `{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}`}. One typed leg per park (BR#3986): conjunction prose ("…merges (mergeCommit non-null) AND main CI green after") parses to 2 machine atoms and is refused loud at the door (breach class gate:multi-atom-condition — specimens BR#4425, BR#4303); carry the conjunction as plain prose in unblock_condition — the typed leg is the gate the train flips. The train gates it, merges it, waits out main CI, and closes it citing the mergeCommit.\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`;
+}
+
+function executionDutyBody(id: string, title: string): string {
+  return `Independent outcome review for ${id}: ${title}.\n\nVerify the actual execution_result and every action receipt on the parent, not whether a prerequisite PR merged. Acceptance requires that the stated outcome was executed. Close this duty done with review_result {kind:"accepted_execution",task_id:"${id}",receipts:["<verified outcome evidence>"]}. Missing actions or unverifiable receipts are findings: bounce the parent and close with review_result {kind:"findings",summary:"<specific missing outcome>"}. A prerequisite arriving is not acceptance.`;
 }
 
 /** Body for a reconcile-spawned binding card (BR#4170): the card's whole job
@@ -2408,6 +2413,14 @@ export class KnowledgeHub {
     const byId = new Map(tasks.map((t) => [t.id, t]));
     const parentOf = new Map(links.map((l: any) => [l.src_id, l.dst_id]));
     for (const t of tasks) {
+      const recoveryId = t.meta?.recovery?.task_id;
+      if (recoveryId) {
+        const duty = this.one(`SELECT id, status, owner, meta FROM artefacts WHERE id = ?`, recoveryId);
+        const dm = JSON.parse(String(duty?.meta ?? "{}"));
+        t.meta.repair_status = duty?.status === "in_progress" && this.strandOwnerLive(duty.owner, dm, 10)
+          ? { kind: "working", task_id: recoveryId, owner: this.displayOwner(String(duty.owner)) }
+          : duty && !["done", "superseded"].includes(String(duty.status)) ? { kind: "scheduled", task_id: recoveryId } : { kind: "not_scheduled" };
+      }
       const parent = parentOf.get(t.id);
       if (parent) t.part_of = parent;
       t.children_open = 0;
@@ -2487,7 +2500,7 @@ export class KnowledgeHub {
       if (pendingAsk) t.meta.awaiting_ask = { ask_id: pending.id, route: askRoute(pendingAsk), to: this.askRecipient(pendingAsk) };
       if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
         t.meta.ask.route = askRoute(t.meta.ask);
-        t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
+        if (!isHumanDecisionAsk(t.meta.ask)) t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
       }
     }
     return { tasks, sessions, progress, series, agents: this.agentScores() };
@@ -3744,6 +3757,8 @@ export class KnowledgeHub {
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
+    if (createMeta.disposition_request !== undefined) createMeta.disposition_request = DispositionRequestSchema.parse(createMeta.disposition_request);
+    if (createMeta.completion !== undefined || createMeta.depends_on) createMeta.completion = completionContract(createMeta);
     // an ask node REQUIRES options (the human answers by clicking) — enforced
     // here, not just in ask.create, so every door is covered
     if (createMeta.ask && (type === "task" || type === "question")) {
@@ -4249,6 +4264,9 @@ export class KnowledgeHub {
     const postRow = reclaimed ? this.one(`SELECT meta FROM artefacts WHERE id = ?`, id) : null;
     const metaObj: any = { ...(postRow ? JSON.parse(postRow.meta ?? "{}") : preMeta) };
     if (body.meta !== undefined) Object.assign(metaObj, JSON.parse(JSON.stringify(body.meta)));
+    if (metaObj.completion !== undefined) metaObj.completion = CompletionContractSchema.parse(metaObj.completion);
+    if (metaObj.disposition_request !== undefined) metaObj.disposition_request = DispositionRequestSchema.parse(metaObj.disposition_request);
+    if (metaObj.execution_result !== undefined) metaObj.execution_result = ExecutionResultSchema.parse(metaObj.execution_result);
     if (body.meta?.ask) {
       for (const key of ["answer", "answered_by", "answered_ts", "resolution"]) {
         if (JSON.stringify(body.meta.ask[key]) !== JSON.stringify(JSON.parse(String(row.meta ?? "{}")).ask?.[key])) throw new Error("ask lifecycle fields are owned by answer_ask and machine cancellation, not metadata updates");
@@ -4992,6 +5010,7 @@ export class KnowledgeHub {
     // carried it. get_history keeps the act row; this keeps it machine-readable.
     const cur = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
     const cm = JSON.parse(cur?.meta ?? "{}");
+    delete cm.disposition_request;
     cm.batch_auth = {
       ask: askId,
       answered_by: answeredBy,
@@ -5028,6 +5047,8 @@ export class KnowledgeHub {
     // (system:question(<answered_by>)), receipt-scoped to the card ids the
     // authorization body names, with the target's current state rechecked
     // first. Refusals are typed gate_rejected (BR#4390).
+    const savedDisposition = JSON.parse(String(row.meta ?? "{}")).disposition_request;
+    if (to === "superseded" && savedDisposition && body.batch_auth == null && !body.human_verdict) body = { ...body, batch_auth: { ask: DispositionRequestSchema.parse(savedDisposition).ask } };
     if (body?.batch_auth != null && to === "superseded" && row.type === "task") {
       return await this.applyBatchAuthorization(body, actor, row);
     }
@@ -5067,6 +5088,8 @@ export class KnowledgeHub {
     const ts = ts0;
     const meta = JSON.parse(row.meta ?? "{}");
     const reviewResult = body.review_result === undefined ? undefined : ReviewResultSchema.parse(body.review_result);
+    if (body.execution_result !== undefined) meta.execution_result = ExecutionResultSchema.parse(body.execution_result);
+    if (row.type === "task" && body.to === "done" && !mergeCompletesTask(meta) && !ExecutionResultSchema.safeParse(meta.execution_result).success) throw new Error("execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion");
     if (row.type === "question" && meta.ask && body.to === "done") throw new Error("answer an ask with ask.answer / answer_ask; a transition or progress note is not an answer");
     if (reviewResult) {
       if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
@@ -5572,7 +5595,7 @@ export class KnowledgeHub {
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: verifyDutyBody(
+              body_md: !mergeCompletesTask(meta) ? executionDutyBody(id, rootTitle) : verifyDutyBody(
                 id,
                 rootTitle,
                 prLink,
@@ -6670,6 +6693,9 @@ export class KnowledgeHub {
   private async askCreate(body: any, actor: string) {
     let to = String(body.to ?? (body.route?.kind === "human_decision" ? "human" : "any"));
     const route = askRoute({ route: body.route, to });
+    const decision = body.decision === undefined ? undefined : HumanDecisionSchema.parse(body.decision);
+    if (body.route?.kind === "human_decision" && !decision) throw new Error("human_decision requires decision: affected task, context, why_human, and explicit choices naming executor, consequence and action; diagnostics belong to agent recovery");
+    if (decision && route.kind !== "human_decision") throw new Error("decision is only valid for human_decision requests");
     if (route.kind === "independent_review") {
       return this.ensureIndependentReview(route.task_id, actor);
     }
@@ -6688,14 +6714,14 @@ export class KnowledgeHub {
     // Reports, receipts and narrative belong in details (body_md).
     if (question.length > 240) throw new Error("question must be the ask itself, one sentence ≤240 chars — put reports/receipts in details");
     if (!question.endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?' (you sent a status report, not a question)");
-    const details = String(body.details ?? "").trim();
+    const details = String(body.details ?? decision?.context ?? "").trim();
     // WHY IT'S ESCALATED is not optional for human-directed asks: "merge PR
     // #84?" is unanswerable without "review is red but rebuttable per guidance".
     // (Was .slice(0, 400): the cap chopped human asks mid-sentence — BR#3997
     // and BR#3983 both ended mid-clause ("includes Name; " / "sits gate-bl"),
     // which is exactly the unreadable-ask failure Ray bounced back. 1200 with
     // the narrative living in details below.)
-    const reason = String(body.reason ?? "").trim().slice(0, 1200);
+    const reason = String(decision?.why_human ?? body.reason ?? "").trim().slice(0, 1200);
     if (!reason && route.kind === "human_decision") throw new Error("asks to a human must state the specific decision or authority Bridge lacks (reason: '…'); assigning another agent is Bridge's responsibility");
     // PLAIN-READING BAR (2026-10-28, Ray directive): a human-directed ask must
     // be answerable on its own — what is this about, current state, why it
@@ -6706,14 +6732,15 @@ export class KnowledgeHub {
       throw new Error("human-directed asks require details: a self-contained brief (what this is about, current state, why it needs a human) — gloss every BR#/PR# reference in one clause instead of bare references");
     }
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
-    const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
+    const artefactId = decision?.task_id ?? (body.artefact_id ? String(body.artefact_id).trim() : "");
+    if (decision && body.artefact_id && body.artefact_id !== decision.task_id) throw new Error("the decision's affected task must match artefact_id; notification sinks are not action targets");
     if (artefactId && !this.one(`SELECT id FROM artefacts WHERE id = ?`, artefactId)) throw new Error(`no such artefact: ${artefactId}`);
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
     // (free-text refinement lives in the detail view). No options = rejected
     // at the contract, not a button-less ask the UI can't surface.
     // options are strings the human clicks — objects are flattened to their
     // label-ish field and [object Object] garbage never stores
-    const options = [...new Set((Array.isArray(body.options) ? body.options : [])
+    const options = [...new Set((decision?.choices.map((c) => c.label) ?? (Array.isArray(body.options) ? body.options : []))
       .map((o: any) => typeof o === "string" ? o
         : String(o?.label ?? o?.text ?? o?.value ?? o?.title ?? ""))
       .map((x: string) => x.trim())
@@ -6747,7 +6774,7 @@ export class KnowledgeHub {
         // the why, never just the bare question.
         body_md: details || (reason ? `${question}\n\nWHY ESCALATED: ${reason}` : question),
         owner: "",
-        meta: { ask: { route, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
+        meta: { ask: { route, decision, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
       },
       actor,
     );
@@ -6846,7 +6873,7 @@ export class KnowledgeHub {
     const meta = JSON.parse(parent.meta ?? "{}");
     const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
     const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
-    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: verifyDutyBody(taskId, parent.title, link), roles: ["review"], session: "" }, actor);
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], session: "" }, actor);
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
@@ -7091,6 +7118,11 @@ export class KnowledgeHub {
       const m = JSON.parse(node.meta ?? "{}");
       if (!m.ask) throw new Error(`${id} is not an ask`);
       if (askLifecycle({ status: String(node.status), meta: m }).state !== "open") throw new Error(`ask ${id} is already resolved`);
+      const decision = m.ask.decision ? HumanDecisionSchema.parse(m.ask.decision) : undefined;
+      const choice = decision?.choices.find((c) => c.label === answer);
+      // Free-text steering is recorded, but cannot silently authorise release
+      // or resume. Only an explicit choice can invoke its declared effect.
+      const decisionAction = decision ? choice?.action ?? "hold" : undefined;
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
       // BR#3911: an answer resolves a live human-claim hold — the timer is
       // cancelled by the very act the hold was waiting for.
@@ -7168,26 +7200,27 @@ export class KnowledgeHub {
           // deliberate-park semantics.
           const stripRecommended = (s: string): string =>
             s.trim().replace(/^\(recommended\)\s*/i, "").trim();
-          const strippedAnswer = stripRecommended(answer);
+          const strippedAnswer = decisionAction ? ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]) : stripRecommended(answer);
           // BR#6395: a batch-authorization answer ("SUPERSEDE all 29 — ...",
           // "SUPERSEDE only the 6 dead parks") authorizes the bound disposition
           // task to supersede target cards — it must resume the bound task,
           // NEVER drop the bound task itself (the BR#6383/BR#6387 misfire).
           const isBatchSupersedeAuth =
             !isMigrationAsk && /^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(strippedAnswer);
-          const optHit = !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
+          const optHit = decisionAction ? decisionAction !== "resume" : !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
             .map((o) => stripRecommended(String(o ?? "")).split(/\s+/)[0] ?? "")
             .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
             .some((verb) => strippedAnswer.toLowerCase().startsWith(verb.toLowerCase()));
           const asActor = `system:question(${actor})`;
+          const dispatchText = decisionAction ? strippedAnswer : answer;
           if (isMigrationAsk || optHit) {
-            if (/\bSUPERSEDE\b/i.test(answer)) {
+            if (/\bSUPERSEDE\b/i.test(dispatchText)) {
               // human_verdict: the human's answered-ask decision — the system
               // actor is only the pen. The release-holds guards (BR#4067)
               // exempt it: a human may release what a machine wait holds.
               await this.transition({ id: subject.id, to: "superseded", human_verdict: true, note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "superseded";
-            } else if (/\b(?:RELEASE|CANCEL)\b/i.test(answer)) {
+            } else if (/\b(?:RELEASE|CANCEL)\b/i.test(dispatchText)) {
               await this.transition({ id: subject.id, to: "todo", human_verdict: true, note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "todo";
             } else {
@@ -10113,23 +10146,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the same one) collapse to one ask per episode.
       const askTitle = trainStallAskTitle({ repo, base });
       try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed since ${new Date(since).toISOString()} — likely executor breakage, not a PR defect`,
-            details: [
-              `Lane ${laneKey(repo, base)} is STALLED: batch ${members.length ? members.map((p) => "#" + p).join(", ") : "(none)"} was selected to merge, merges were attempted every tick, and 0 landed across ${ticks} tick(s) (since ${new Date(since).toISOString()}).`,
-              lastError ? `The last merge attempt ended: ${lastError}` : "The executor's last merge error text was not supplied.",
-              `This is the BR#5376 class: executor breakage that logs only to the executor's local log while the lane reads fake-busy "checking review, signatures and CI". The fix is operational, not a code change.`,
-              `Unblock: restart the merge-train gateway/executor onto the current build (the executor's method fallback lands via squash per the sp landing law). Any landing clears the episode by itself.`,
-            ].join("\n\n"),
-            options: ["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
+        this.retireLaneDiagnosticAsk(askTitle);
+        await this.ensureTaskRecovery(lane.id, "execution_environment");
       } catch (e) {
         // an identical ask is already open for this episode — that IS one per class
         this.audit(actor, "train:stalled_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
@@ -10177,6 +10195,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (row.id === cur.task_id) continue; // the final card — landedFlow owns it
       try {
         const cm = JSON.parse(row.meta ?? "{}");
+        if (!mergeCompletesTask(cm)) continue;
         const legs = trainLegs(cm);
         const leg = legs.find((l) => (l.repo === laneSpec.repo || !l.repo) && String(cm.merge_train?.legs?.[String(l.number)]?.state ?? "") === "awaiting-ci");
         if (!leg) continue;
@@ -10216,6 +10235,33 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return closed;
   }
 
+  private async resumeMergedPrerequisites(): Promise<void> {
+    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event.event') = 'pr_merged'`).toArray();
+    for (const row of rows) {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      if (mergeCompletesTask(meta)) continue;
+      const event = meta.blocked.await_event;
+      const receipt = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, event.repo, event.n);
+      if (receipt?.merge_sha) await this.resumePrerequisite(String(row.id), event.repo, event.n, String(receipt.merge_sha));
+    }
+  }
+
+  private async resumePrerequisite(id: string, repo: string, pr: number, sha: string): Promise<void> {
+    const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, id);
+    if (!row || row.status !== "blocked") return;
+    const meta = JSON.parse(String(row.meta ?? "{}"));
+    const event = meta.blocked?.await_event;
+    if (mergeCompletesTask(meta) || event?.event !== "pr_merged" || event.repo !== repo || event.n !== pr) return;
+    delete meta.merge_train;
+    delete meta.review_pr;
+    delete meta.pr;
+    delete meta.prs;
+    delete meta.blocked.await_event;
+    meta.prerequisite_receipt = { repo, pr, merge_sha: sha, at: Date.now() };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+    await this.transition({ id, to: "todo", session: "", note: `Prerequisite ${repo}#${pr} merged (${sha}). The task still needs execution; returned to the agent pool.` }, "system:completion");
+  }
+
   /** BR#6330/BR#6332 — merged-park heal, the structural leg of the one-
    *  classification law. A blocked card whose typed merge phase is queued|
    *  awaiting-ci while its PR leg carries a PROVENANCE merge receipt is a
@@ -10229,6 +10275,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  instead of closing. Runs on the alarm cadence (the strand-sweep
    *  family); one bad card audits and skips, never throws. */
   private async sweepMergedParks(now0: number): Promise<number> {
+    await this.resumeMergedPrerequisites();
     const rows = this.state.storage.sql.exec(
       `SELECT id, meta FROM artefacts
        WHERE type = 'task' AND status = 'blocked'
@@ -10246,6 +10293,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     for (const r of rows) {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
+        if (!mergeCompletesTask(meta)) continue;
         const legs = trainLegs(meta);
         const repoDefault = String((meta as any).merge_train?.repo ?? (meta as any).pr?.repo ?? "");
         const mergedLeg = legs.find((l) => {
@@ -10308,6 +10356,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const card = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, taskId);
       if (card && card.status !== "done" && card.status !== "superseded") {
         const cm = JSON.parse(card.meta ?? "{}");
+        if (!mergeCompletesTask(cm)) {
+          await this.resumePrerequisite(taskId, laneSpec.repo, p.pr, p.mergeSha);
+          meta.currently = null;
+          const reason = this.laneSyncReason(lane.id, meta, now);
+          return { ok: true, kind: "landed", task: taskId, resumed: true, reason };
+        }
         // stamp THIS leg landed — multi-PR map; single-PR cards ride the same
         // shape (the legacy card-level landed state is only set on final close)
         const legsMap = { ...(cm.merge_train?.legs ?? {}), [String(p.pr)]: { state: "landed", merge_sha: p.mergeSha, landed_at: now } };
@@ -11119,25 +11173,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const lastError = String(stalled.last_error ?? "").slice(0, 300);
       const askTitle = trainStallAskTitle({ repo, base });
       try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: sinceMs
-              ? `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed since ${new Date(sinceMs).toISOString()} — likely executor breakage, not a PR defect`
-              : `the ${repo}@${base} lane keeps selecting PRs and attempting merges but NOTHING has landed across ${ticks} tick(s) — likely executor breakage, not a PR defect`,
-            details: [
-              `Lane ${laneKey(repo, base)} is STALLED: batch ${members.length ? members.map((p) => "#" + p).join(", ") : "(none)"} was selected to merge, merges were attempted every tick, and 0 landed across ${ticks} tick(s)${sinceMs ? ` (since ${new Date(sinceMs).toISOString()})` : ""}.`,
-              lastError ? `The last merge attempt ended: ${lastError}` : "The executor's last merge error text was not supplied.",
-              `This is the BR#5376 class: executor breakage that logs only to the executor's local log while the lane reads fake-busy "checking review, signatures and CI". The fix is operational, not a code change.`,
-              `Unblock: restart the merge-train gateway/executor onto the current build (the executor's method fallback lands via squash per the sp landing law). Any landing clears the episode by itself.`,
-            ].join("\n\n"),
-            options: ["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
+        this.retireLaneDiagnosticAsk(askTitle);
+        await this.ensureTaskRecovery(lane.id, "execution_environment");
       } catch (e) {
         // an identical ask is already open for this episode — that IS one per episode
         this.audit(actor, "train:stalled_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
@@ -11208,6 +11245,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
     const meta = JSON.parse(parent.meta ?? "{}");
+    if (!mergeCompletesTask(meta)) {
+      if (parent.status === "in_review" && src.review_result?.kind === "accepted_execution" && src.review_result.task_id === parentId && ExecutionResultSchema.safeParse(meta.execution_result).success) {
+        await this.transition({ id: parentId, to: "done", session: "", note: `Independent execution acceptance: ${src.review_result.receipts.join("; ")}` }, actor);
+        return;
+      }
+      this.audit("system:completion", "prerequisite_not_delivery", parentId, { completion: completionContract(meta) });
+      return;
+    }
     const blockedReason = () => [String(meta.blocked?.reason ?? ""), String(meta.blocked_reason ?? "")].find((r) => r) ?? "";
     const note = String(src.note ?? "");
     if (src.review_result?.kind === "findings") return;
@@ -11617,7 +11662,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const held = entriesArr.length;
     const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const askTitle = trainGateBlockedAskTitle({ repo, base }, gateReds.map((r: { name: string }) => r.name));
-    const brief = trainGateBlockedAskBrief({ repo, base }, gateReds, gateUnsettled, held);
     let meta: any = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     let ep = meta.lane?.gate_blocked ?? null;
     if (!ep) {
@@ -11692,34 +11736,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit("system:train", "gate_blocked_duty_error", lane.id, { note: String((de as Error).message ?? de).slice(0, 160) });
       }
     }
-    // (2) ONE human ask per episode (deduped via askCreate's identical-open-ask guard)
-    try {
-      await this.askCreate(
-        {
-          to: "human",
-          question: askTitle,
-          reason: `${repo}@${base} passes its required workflows but the repo merge gate judges main's tip non-green — ${held} queued change(s) cannot merge and the lane reads green-idle (BR#5883 class: the 2026-11-03 3.5h silent starve)`,
-          details: brief.details,
-          options: brief.options,
-          artefact_id: sinkId,
-          urgency: "time-sensitive",
-        },
-        actor,
-      );
-    } catch (e) {
-      this.audit(actor, "train:gate_blocked_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
-    }
+    const oldAsk = ep.ask_id ?? this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status = 'todo' AND c.title = ? LIMIT 1`, sinkId, askTitle)?.id;
+    if (oldAsk) this.cancelRequest(String(oldAsk), "Bridge has assigned investigation of the merge checks. No human choice has been identified.", "system:recovery");
+    ep.ask_id = null;
     // persist the episode's ask/duty ids (re-read meta first — the ask/duty
     // writes above may have bumped the row)
     meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     if (meta.lane?.gate_blocked && (meta.lane.gate_blocked.ask_id !== ep.ask_id || meta.lane.gate_blocked.duty_id !== ep.duty_id)) {
       // ask/duty ids change only when re-derived; write once when they differ
-      const freshAsk = this.one(
-        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
-        sinkId, askTitle,
-      ) as any;
-      meta.lane.gate_blocked.ask_id = freshAsk?.id ? String(freshAsk.id) : meta.lane.gate_blocked.ask_id ?? null;
+      meta.lane.gate_blocked.ask_id = null;
       meta.lane.gate_blocked.duty_id = ep.duty_id ?? meta.lane.gate_blocked.duty_id ?? null;
       this.saveLaneState(lane.id, meta, Date.now());
     }
@@ -11770,46 +11795,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       sinkId,
       askTitle,
     ) as any;
-    if (existing) {
-      const em = JSON.parse(existing.meta ?? "{}");
-      const prevOptions = Array.isArray(em?.ask?.options) ? em.ask.options.map(String) : [];
-      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(prevOptions) !== JSON.stringify(brief.options)) {
-        em.ask = { ...(em.ask ?? {}), to: String(em.ask?.to ?? "human"), options: brief.options };
-        this.state.storage.sql.exec(
-          `UPDATE artefacts SET body_md = ?, meta = ?, updated_ts = ? WHERE id = ?`,
-          brief.details,
-          JSON.stringify(em),
-          Date.now(),
-          existing.id,
-        );
-        this.version(existing.id, actor, "update", `dark-tip ask refreshed (${coverage.phase})`, {});
-      }
-      ep.ask_id = String(existing.id);
-    } else {
-      try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: `base ${repo}@${base} tip ${coverage.tip_sha.slice(0, 8)} is not covered by any deploy workflow run (age ${Math.max(1, Math.floor(coverage.tip_age_secs / 60))}m) — ${held} car(s) held`,
-            details: brief.details,
-            options: brief.options,
-            artefact_id: sinkId,
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
-      } catch (e) {
-        this.audit(actor, "train:dark_tip_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
-      }
-      const freshAsk = this.one(
-        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
-        sinkId,
-        askTitle,
-      ) as any;
-      if (freshAsk?.id) ep.ask_id = String(freshAsk.id);
-    }
+    if (existing) this.cancelRequest(String(existing.id), "Bridge owns deployment investigation. No human decision has been identified.", "system:recovery");
+    ep.ask_id = null;
+    ep.duty_id = await this.ensureTaskRecovery(lane.id, "execution_environment");
     meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     meta.lane = {
       ...(meta.lane ?? {}),
@@ -11998,44 +11986,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         ep.duty_id = dutyId;
         diagInput.dutyId = dutyId;
 
-        // (2) Fire ONE human ask per episode (deduped via askCreate's identical-open-ask guard)
-        const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
-        const askTitle = trainStarvationAskTitle(lane);
-        let askId: string | null = null;
-        try {
-          const createdAsk = await this.askCreate(
-            {
-              to: "human",
-              question: askTitle,
-              reason: `lane ${lane.repo}@${lane.base} has held ${queue.length} queued + ${awaiting.length} awaiting car(s) for ${mins}m (>1h) with 0 merges and no active stop-the-line (BR#5674 P4)`,
-              details: trainStarvationAskDetails(diagInput),
-              options: [
-                "(Recommended) Let diagnostic duty investigate",
-                "Transient — re-run the failing check",
-                "Restart the train gateway/executor",
-                "Hold — investigating manually",
-              ],
-              artefact_id: sinkId,
-              urgency: "time-sensitive",
-            },
-            "system:train",
-          );
-          askId = createdAsk?.id ? String(createdAsk.id) : null;
-        } catch (e) {
-          this.audit("system:train", "starved_ask_suppressed", l.id, { note: String((e as Error).message ?? e).slice(0, 160) });
-          const openAsk = this.one(
-            `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question'
-               AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
-            sinkId, askTitle,
-          ) as any;
-          if (openAsk?.id) askId = String(openAsk.id);
-        }
-        ep.ask_id = askId;
+        ep.ask_id = null; // the diagnostic duty owns investigation; no human decision
         meta.lane = { ...(meta.lane ?? {}), starvation: ep, starved_since: meta.lane?.starved_since ?? since };
         meta.starvation = ep;
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
         return { ...ep, mins, kind: "merge_starved" };
+      }
+      if (existingEp.ask_id) {
+        this.cancelRequest(String(existingEp.ask_id), "Bridge's diagnostic duty owns recovery. No human decision is needed.", "system:recovery");
+        existingEp.ask_id = null;
+        meta.lane.starvation = existingEp;
+        meta.starvation = existingEp;
+        this.saveLaneState(l.id, meta, now0);
       }
       const curMins = Math.max(60, Math.round((now0 - Number(existingEp.since ?? mergeRefTs)) / 60_000));
       return {
@@ -12071,7 +12033,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         await this.askCreate(
           {
             to: "human",
-            question: `Merge train starved ${Math.max(1, starved.mins)}m: ${lane.repo}@${lane.base} — restart a merge-capable gateway?`,
+            route: { kind: "human_decision" },
+            question: `Can you start Bridge on a computer that can merge changes for ${lane.repo}?`,
+            decision: { kind: "authority", task_id: String(l.id), context: `${queue.length} change(s) are waiting, but no merge-capable computer has connected recently.`, why_human: "Bridge has no available execution host to start or restart the disconnected computer.", choices: [
+              { label: "I'll start Bridge on a computer", executor: "human", consequence: "Start the Bridge gateway; work resumes automatically when it reconnects.", action: "hold" },
+              { label: "Wait for a computer to reconnect", executor: "bridge", consequence: "Bridge keeps the changes queued and resumes when an execution host becomes available.", action: "hold" },
+            ] },
             reason: "the merge train cannot advance — queued heads wait on a worker-class executor; gateways present are standing down (BR#3181) or dead (the 2026-10-29 outage class, BR#4489)",
             details: [
               `Lane ${lane.repo}@${lane.base} starved since ${new Date(starved.since).toISOString()} (${starved.mins}m starved).`,
@@ -12080,7 +12047,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               `Recovers automatically: the starved state clears on the first capable lease.`,
             ].join("\n\n"),
             options: ["Ack — restarting a merge-capable gateway", "Merge the head by hand", "Waive — not urgent"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+            artefact_id: String(l.id),
             urgency: "time-sensitive",
           },
           "system:train",
@@ -12124,28 +12091,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
   }
 
-  /** BR#6163 — the strand sweep. A card that left the merge queue while
-   *  carrying a train-only wait (pr_merged / pr_checks_green) can never have
-   *  that wait satisfied by anything a pool executor does: the wait fires
-   *  from lane train_events, and the card is no longer in any lane's queue.
-   *  Shapes: the ghost bounce-release (owner dead → released to pool with the
-   *  wait still stamped, BR#5522 — 38h stranded under a healthy train), the
-   *  unprefixed park (silently dropped from mergeTrainQueue, the BR#4995
-   *  class), and the fail-closed unbound park (admitted, legless).
-   *  Healthy-lane gate: the strand only matters when the lane it cites
-   *  MOVED since the card parked (a merged event newer than the park) — a
-   *  stalled train is sweepLaneStarvation's problem, not stranded cars.
-   *  Reaction: ONE machine re-board per episode (in-place prefix repair for
-   *  blocked parks — blocked→blocked is an illegal edge — or a legal blocked
-   *  transition for released cards; the machine-managed park flag keeps the
-   *  agent queue hook off so the re-board never re-stamps through
-   *  trainQueueOnAccept), pinned by meta.strand_reboard; then ONE alarm per
-   *  episode (24h dedupe via meta.strand_alarm + askCreate's identical-open-
-   *  ask guard) to the train alarm sink. unbound_in_queue cars are alarm-only:
-   *  a machine re-queue would fail-closed re-stamp unbound (no heads exist).
-   *  in_progress cars re-board only on a dead owner signal — a live claim is
-   *  never hijacked (the BR#3659 defect-2 law). */
+  /** Current-state recovery, not a historical queue census. The pure plan
+   * preserves live execution/review/dependencies, repairs a blocked queue
+   * admission, or schedules one inspection duty. No human decision exists. */
   private async sweepStrandedTrainCards(now0: number): Promise<void> {
+    await this.applyPendingDispositions();
+    this.retireLegacyRecoveryRequests();
     const strandHours = (() => {
       const s = this.one(`SELECT value FROM settings WHERE key = 'train.strand_hours'`);
       return s ? Math.max(1, Math.min(168, parseInt(s.value, 10) || 2)) : 2;
@@ -12154,19 +12105,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
       return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
     })();
-    const lanes = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM artefacts
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
-    ).toArray() as any[];
-    const liveRepos = new Set<string>();
-    for (const l of lanes) {
-      try {
-        const lm = JSON.parse(l.meta ?? "{}");
-        const lane = laneOfMeta(lm);
-        if (!lane || l.status === "done" || l.status === "superseded") continue;
-        liveRepos.add(lane.repo);
-      } catch { /* skip malformed lane cards */ }
-    }
     const rows = this.state.storage.sql.exec(
       `SELECT id, status, owner, title, meta, status_ts, updated_ts FROM artefacts
        WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
@@ -12184,71 +12122,103 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             (rn) => rn.startsWith(MERGE_TRAIN_REASON_PREFIX),
           ) || mergeTrainHoldPrefix(meta) !== null);
         const cls = trainStrandClass(meta, admitted);
-        if (!cls) continue;
-        // lane linkage, widened beyond the legs: an unbound (legless) card
-        // matches on its train stamp or its await evidence instead
+        if (!cls && !["unbound", "bounced"].includes(String(meta.merge_train?.state ?? ""))) continue;
         const awaitEv = trainOnlyAwait(meta);
-        const repo = [
-          trainLegsRemaining(meta)[0]?.repo,
-          meta.merge_train?.repo,
-          awaitEv?.repo,
-          meta.pr?.repo,
-        ].map((x) => String(x ?? "")).find((x) => x.includes("/")) ?? "";
-        if (!repo || !liveRepos.has(repo)) continue; // no live lane to judge aliveness against
         const parkTs = Number(meta.blocked?.ts ?? meta.merge_train?.at ?? r.status_ts ?? 0);
         if (!parkTs) continue;
         const ageMs = now0 - parkTs;
         if (ageMs < strandHours * 3_600_000) continue;
-        // healthy-lane proof: the repo merged SOMETHING after this card parked
-        const moved = this.one(
-          `SELECT seq FROM train_events WHERE repo = ? AND kind = 'merged' AND ts > ? LIMIT 1`,
-          repo, parkTs,
-        );
-        if (!moved) continue; // the train itself is stalled — starvation law owns that
-        const ageH = Math.max(1, Math.round(ageMs / 3_600_000));
-        // machine re-board: once per episode, and never for unbound cars or a
-        // live in_progress claim
-        let did = "";
-        if (cls !== "unbound_in_queue" && !meta.strand_reboard) {
-          if (String(r.status) === "in_progress" && this.strandOwnerLive(r.owner, meta, staleMin)) {
-            did = "none — live claim, not hijacked";
-          } else {
-            did = await this.strandAct(String(r.id), String(r.status), cls, awaitEv) || "re-boarded";
-          }
-        }
-        // alarm leg: once per card-episode (24h dedupe) + askCreate's
-        // identical-open-ask guard
-        const alarmedAt = Number(meta.strand_alarm?.at ?? 0);
-        if (now0 - alarmedAt < 24 * 3_600_000) continue;
-        const prN = Number(meta.merge_train?.pr ?? awaitEv?.n ?? meta.pr?.number ?? 0);
-        try {
-          await this.askCreate(
-            {
-              to: "human",
-              question: `${r.id} sits out of the merge queue on a train-only wait (${cls === "unbound_in_queue" ? "unbound legs" : String(awaitEv?.event ?? "pr_merged")}) while ${repo} kept merging — need a human leg?`,
-              reason: `stranded ${ageH}h under a healthy lane — machine re-board this episode: ${did || "none (unbound car: a re-queue would fail-closed re-stamp unbound)"}`,
-              details: `BR#6163 strand sweep (bounce-release strands train-parked cards): card ${r.id} "${String(r.title ?? "").slice(0, 60)}" left the merge-train queue while carrying a typed wait only the train can satisfy (PR merge / green checks${prN ? ` on ${repo}#${prN}` : ` on ${repo}`}). The lane merged another PR after this card parked ${ageH}h ago, so the train is healthy and this car was left behind. Status ${String(r.status)}; strand class ${cls}; machine action this episode: ${did || "none"}.`,
-              options: [
-                "(Recommended) Investigating the strand — will re-queue or release the car",
-                "False positive — the card's wait is still satisfiable",
-                "Release the car — clear the train wait and let the pool own it",
-              ],
-              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            },
-            "system:train",
-          );
-          const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, r.id);
-          const m2 = JSON.parse(after?.meta ?? "{}");
-          m2.strand_alarm = { at: now0, class: cls };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m2), r.id);
-        } catch (e) {
-          // an identical alarm is already open for this episode — that IS once
-          this.audit("system:train", "strand_alarm_deduped", r.id, { detail: String((e as Error).message ?? e).slice(0, 200) });
+        const event = meta.blocked?.await_event;
+        const plan = planTaskRecovery({ status: String(r.status), phase: String(meta.merge_train?.state ?? ""), live_executor: this.strandOwnerLive(r.owner, meta, staleMin), queue_admitted: admitted, is_delivery: mergeCompletesTask(meta), has_other_wait: !!event && !["pr_merged", "pr_checks_green"].includes(event.event) });
+        switch (plan.kind) {
+          case "none": case "owned": break;
+          case "restore_queue": if (cls) await this.strandAct(String(r.id), String(r.status), cls, awaitEv); break;
+          case "dispatch": await this.ensureTaskRecovery(String(r.id), plan.reason); break;
         }
       } catch (e) {
         this.audit("system:train", "strand_sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
       }
     }
+  }
+
+  private readonly taskRecoveries = new Map<string, Promise<string>>();
+  /** A persisted, already-authorised command survives an executor crash. The
+   * existing gate is the only writer of a drop; semantic refusals terminate
+   * this command and are never retried on the next alarm. */
+  private async applyPendingDispositions(): Promise<void> {
+    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.disposition_request') IS NOT NULL`).toArray();
+    for (const row of rows) {
+      try {
+        await this.transition({ id: String(row.id), to: "superseded", session: "", note: "Apply persisted human-authorised disposition" }, "system:disposition");
+      } catch (e) {
+        if (!(e && typeof e === "object" && "result_class" in e && e.result_class === "gate_rejected")) {
+          this.audit("system:disposition", "disposition_command_retryable", String(row.id), { reason: String(e) });
+          continue;
+        }
+        const fresh = this.one(`SELECT meta FROM artefacts WHERE id = ?`, row.id);
+        const meta = JSON.parse(String(fresh?.meta ?? "{}"));
+        delete meta.disposition_request;
+        meta.disposition_result = { kind: "refused", reason: String(e), at: Date.now() };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), row.id);
+        this.version(String(row.id), "system:disposition", "disposition_refused", `Disposition not applied: ${String(e)}`, { result: meta.disposition_result });
+        this.audit("system:disposition", "disposition_command_refused", String(row.id), { reason: String(e) });
+      }
+    }
+  }
+  private retireLaneDiagnosticAsk(title: string): void {
+    const rows = this.state.storage.sql.exec(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status = 'todo' AND c.title = ?`, this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID), title).toArray();
+    for (const row of rows) this.cancelRequest(String(row.id), "Bridge owns this investigation. No human decision has been identified.", "system:recovery");
+  }
+  /** Narrow compatibility migration for the two retired built-in emitters.
+   * Join the recorded alarm episode to its exact old template, not a general
+   * title classifier. No user-authored decision is cancelled by this migration. */
+  private retireLegacyRecoveryRequests(): void {
+    const subjects = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND (json_extract(meta, '$.strand_alarm') IS NOT NULL OR json_extract(meta, '$.merge_train.conflicting_alarm') IS NOT NULL)`).toArray();
+    const requests = this.state.storage.sql.exec(`SELECT id, title, meta FROM artefacts WHERE type = 'question' AND status = 'todo' AND created_by = 'system:train' AND json_extract(meta, '$.ask.from') = 'system:train' AND json_extract(meta, '$.ask.artefact_id') = ?`, this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID)).toArray();
+    for (const subject of subjects) {
+      const meta = JSON.parse(String(subject.meta ?? "{}"));
+      const event = trainOnlyAwait(meta);
+      const repo = trainLegsRemaining(meta)[0]?.repo ?? meta.merge_train?.repo ?? event?.repo ?? meta.pr?.repo;
+      const cls = meta.strand_alarm?.class;
+      const exactTitle = `${subject.id} sits out of the merge queue on a train-only wait (${cls === "unbound_in_queue" ? "unbound legs" : event?.event ?? "pr_merged"}) while ${repo} kept merging — need a human leg?`;
+      for (const request of requests) {
+        const strandMatch = !!cls && request.title === exactTitle;
+        const conflictMatch = !!meta.merge_train?.conflicting_alarm && String(request.title).startsWith(`CONFLICTING train car ${subject.id} (PR ${repo}#${meta.merge_train.pr}) past the `);
+        if (!strandMatch && !conflictMatch) continue;
+        this.cancelRequest(String(request.id), `Bridge owns repair of ${subject.id}. A queue diagnostic does not require a human decision.`, "system:recovery");
+      }
+    }
+  }
+
+  private async ensureTaskRecovery(taskId: string, reason: RecoveryReason): Promise<string> {
+    const pending = this.taskRecoveries.get(taskId);
+    if (pending) return pending;
+    const run = this.createTaskRecovery(taskId, reason);
+    this.taskRecoveries.set(taskId, run);
+    try { return await run; } finally { this.taskRecoveries.delete(taskId); }
+  }
+
+  private async createTaskRecovery(taskId: string, reason: RecoveryReason): Promise<string> {
+    const active = this.one(`SELECT id FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' OR (? = 'execution_environment' AND json_extract(meta, '$.machine_duty.kind') IN ('diagnostic','line_recovery'))) AND json_extract(meta, '$.machine_duty.subject') = ? ORDER BY created_ts DESC LIMIT 1`, reason, taskId);
+    if (active) return String(active.id);
+    const parent = this.one(`SELECT title, meta FROM artefacts WHERE id = ?`, taskId);
+    if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
+    const description = reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : "Restore delivery tracking";
+    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
+
+This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
+
+Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Otherwise inspect the actual PR on GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+
+Keep changes and disposition receipts on the affected task. Finish this recovery task with execution_result {outcome:"<actual result>",receipts:["<per-action evidence>"]}. If no repair is needed, cite the current executor or delivered outcome as the receipt. Escalate only a concrete missing human authority, information or product choice, with its affected task and explicit consequences.` }, "system:recovery");
+    this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, duty.id, taskId, Date.now());
+    const fresh = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+    const meta = JSON.parse(String(fresh?.meta ?? "{}"));
+    meta.recovery = { kind: "duty", task_id: duty.id, reason };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), taskId);
+    this.version(taskId, "system:recovery", "recovery_scheduled", `${description}. Bridge scheduled ${duty.id}; no human action is needed.`, { duty: duty.id, reason });
+    this.audit("system:recovery", "recovery_scheduled", taskId, { duty: duty.id, reason });
+    return duty.id;
   }
 
   /** Liveness for a stranded card's owner — the same two real signals the
@@ -12262,11 +12232,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const token = this.one(`SELECT id FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, label, label);
     if (!token) return false; // dead by construction — can never heartbeat
     const sess = this.one(
-      `SELECT last_seen_ts FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
-      token.id,
+      `SELECT last_seen_ts FROM sessions WHERE token_id = ? AND name = ? LIMIT 1`,
+      token.id, String(meta.session ?? ""),
     );
     const lastProgressTs = Number(meta?.last_progress?.ts ?? 0);
-    const lastSignal = Math.max(Number(sess?.last_seen_ts ?? 0), lastProgressTs);
+    const lastSignal = Math.max(Number(sess?.last_seen_ts ?? 0), lastProgressTs, Number(meta.session_alive_ts ?? 0));
     return !!lastSignal && Date.now() - lastSignal <= staleMin * 60_000;
   }
 
@@ -12372,24 +12342,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const ageH = Math.max(1, Math.round(ageMs / 3_600_000));
         const budgetH = Math.round(budgetMin / 60 * 10) / 10;
         try {
-          await this.askCreate(
-            {
-              to: "human",
-              question: `CONFLICTING train car ${r.id} (PR ${repo ? `${repo}#` : "#"}${prN}) past the ${budgetMin}m budget (${ageH}h) — dispatch the mechanical rebase leg?`,
-              reason: `conflicting car loud alarm (BR#6348) — queue-visible the whole time, but the exit is machine work nobody has claimed`,
-              details: `BR#6348 conflicting-budget alarm: card ${r.id} "${String(r.title ?? "").slice(0, 60)}" is parked TYPED conflicting on ${repo ? `${repo}#` : "#"}${prN} — CONFLICTING against its base (${files.length} file(s): ${files.slice(0, 5).join(", ") || "trial-merge failed to enumerate"}). The typed park keeps the car in the derived queue (starvation accounting sees it) and releaseHold keeps the watchdog from stranding it, but the EXIT is the mechanical rebase leg — rebase onto origin/main, resolve the conflicts, signed force-with-lease push, fresh verify, re-queue at the BACK — and no session has claimed it for ${ageH}h (budget ${budgetH}h, knob train.conflicting_budget_min). Repo steering §8: this is 100% machine work — never a human leg.`,
-              options: [
-                "(Recommended) Dispatching the mechanical rebase leg — claim the card, rebase, resolve, signed force-with-lease push, fresh verify",
-                "The conflict needs an authored decision (not mechanical) — say which and why",
-                "False park — the PR is not actually conflicting (re-verify will clear it)",
-              ],
-              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            },
-            "system:train",
-          );
+          const duty = await this.ensureTaskRecovery(String(r.id), "conflict");
           const after = this.one(`SELECT meta FROM artefacts WHERE id = ?`, r.id);
           const m2 = JSON.parse(after?.meta ?? "{}");
-          m2.merge_train = { ...(m2.merge_train ?? {}), conflicting_alarm: { at: now0, budget_min: budgetMin } };
+          m2.merge_train = { ...(m2.merge_train ?? {}), conflicting_alarm: { at: now0, budget_min: budgetMin, duty_id: duty } };
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m2), r.id);
           this.audit("system:train", "train:conflicting_budget_expired", r.id, { lane_pr: prN, repo, age_h: ageH, budget_min: budgetMin, files: files.length });
           this.version(r.id, "system:train", "update", `conflicting budget expired (BR#6348) — ${ageH}h parked conflicting past the ${budgetMin}m budget; loud alarm filed naming the mechanical rebase leg`, {});
@@ -12442,8 +12398,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const duties = this.state.storage.sql.exec(
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
        AND json_extract(meta, '$.machine_duty.subject') = ?
-       AND json_extract(meta, '$.machine_duty.kind') = 'line_recovery'
-       AND json_extract(meta, '$.machine_duty.episode') = ? ORDER BY created_ts DESC`, laneId,
+       AND json_extract(meta, '$.machine_duty.kind') IN ('line_recovery','task-recovery','diagnostic')
+       AND ((json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded')) OR json_extract(meta, '$.machine_duty.episode') = ?) ORDER BY created_ts DESC`, laneId,
       `${line.blocker}:${meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`,
     ).toArray();
     const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
@@ -14108,6 +14064,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           // lane. The join already lane-exempts; this guard covers a stale
           // projection racing a lane re-creation.
           const target = this.one(`SELECT id, meta, tags FROM artefacts WHERE id = ?`, a.card) as any;
+          if (target && !mergeCompletesTask(JSON.parse(target.meta ?? "{}"))) {
+            await this.resumePrerequisite(String(a.card), repo, j.pr, a.merge_sha);
+            break;
+          }
           if (target && isStandingCard(JSON.parse(target.meta ?? "{}"), parseTags(target.tags))) {
             this.audit(actor, "reconcile_reverse_close_skipped_lane", a.card, { pr: `${repo}#${j.pr}`, merge_sha: a.merge_sha.slice(0, 9), note: "standing lane card — provenance on it never closes it (BR#5151)" });
             break;

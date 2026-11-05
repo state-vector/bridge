@@ -265,7 +265,7 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     expect(String(cur.meta.blocked?.reason ?? "").match(/BR#6348/g)?.length).toBe(1);
   });
 
-  it("leg 4 — past the budget the loud alarm fires ONCE per episode to the sink", async () => {
+  it("leg 4 — past the budget Bridge schedules one conflict repair duty and no human ask", async () => {
     const REPO = "state-vector/conflict-budget";
     await healthyLane(REPO, "gw-conflict-4");
     const id = await task("BR#6348 conflicting budget specimen");
@@ -297,16 +297,16 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
     let asks = await sinkQuestions(id);
-    expect(asks.length).toBe(1);
-    expect(String(asks[0].title)).toContain(id);
-    expect(String(asks[0].title)).toMatch(/\?$/);
-    expect(String(asks[0].title)).toContain("mechanical rebase");
-    expect(asks[0].meta?.ask?.to).toBe("human");
+    expect(asks.length).toBe(0);
+    const recoveryId = (await kbJson("/get", { id })).body.meta.recovery.task_id;
+    const recovery = (await kbJson("/get", { id: recoveryId })).body;
+    expect(recovery.meta.machine_duty).toMatchObject({ kind: "task-recovery", reason: "conflict", subject: id });
     expect((await kbJson("/get", { id })).body.meta?.merge_train?.conflicting_alarm?.at).toBeGreaterThan(0);
 
     // second sweep: deduped (24h) — still exactly one ask
     await kbJson("/admin.alarm_sweep");
-    expect(await sinkQuestions(id)).toHaveLength(1);
+    expect(await sinkQuestions(id)).toHaveLength(0);
+    expect((await kbJson("/get", { id })).body.meta.recovery.task_id).toBe(recoveryId);
   });
 
   it("leg 5 — claiming the rebase leg (blocked → in_progress) ends the park: conflicting → bounced, keys cleared", async () => {

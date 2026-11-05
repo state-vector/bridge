@@ -32,3 +32,15 @@ it("a question's continuation prompt names the participants and cannot issue imp
   expect(prompt).not.toContain("TAKEOVER PROTOCOL");
   expect(prompt).not.toContain("git worktree add");
 });
+
+it("human decisions render essential context, named executors and consequences without diagnostic filler or human presence warnings", () => {
+  const decision = { kind: "preference", task_id: "BR#1", context: "Choose how long customer records are retained.", why_human: "Only you can set the product retention policy.", choices: [{ label: "Keep records", executor: "bridge", consequence: "Bridge implements permanent retention.", action: "resume" }, { label: "Review policy first", executor: "human", consequence: "You supply a retention period; Bridge waits.", action: "hold" }] };
+  useKb.setState({ tasks: [{ id: "BR#1", type: "question", status: "todo", title: "Should Bridge keep customer records?", body_md: "Commit details and check URLs are supporting evidence.", created_ts: 1, updated_ts: 1, ask_target: { online: false, source: "unknown", last_seen_ts: null }, meta: { ask: { route: { kind: "human_decision" }, to: "human", decision, options: decision.choices.map((c) => c.label) } } }] });
+  const html = renderToStaticMarkup(createElement(ForMeView, {}));
+  expect(html).toContain(decision.context);
+  expect(html).toContain("<b>Bridge:</b>");
+  expect(html).toContain("<b>You:</b>");
+  expect(html).toContain("Evidence and technical details</summary>");
+  expect(html).not.toContain("never seen");
+  expect(html).not.toContain("Choose how Bridge should proceed");
+});

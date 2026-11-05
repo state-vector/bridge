@@ -148,7 +148,7 @@ describe("BR#6330 leg 2 — exitClassOf: one classification, no prose path (sour
     // Unbound PR park -> pr class (not "other")
     const unboundCar = { status: "blocked", meta: { merge_train: { state: "unbound", pr: 2575 }, blocked: { await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2575 } } } };
     expect(exitClassOf(unboundCar)).toBe(EXIT_CLASSES.repair);
-    expect(blockedSummaryOf(unboundCar).whatUnblocks).toContain("bind superpositional#2575");
+    expect(blockedSummaryOf(unboundCar).whatUnblocks).toContain("Repair not scheduled");
 
     // Upstream PR dependency is NOT a stranded train car (BR#6395)
     expect(trainStrandClass(upstreamWait.meta, false)).toBeNull();

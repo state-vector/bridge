@@ -1,4 +1,5 @@
 import type { Decision, EventView, Presence } from "@bridge/specs";
+import { mergeCompletesTask } from "@bridge/contracts";
 import { relTime } from "../relTime";
 
 /** The API doc says EventView.ts is ms epoch; tolerate seconds-valued ts from early adapters. */
@@ -186,9 +187,9 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
   },
   repair: {
     key: "repair",
-    title: "Awaiting agent — PR repair or queue binding",
+    title: "PR repair — Bridge owns recovery",
     icon: "↻",
-    unblockedBy: "Agent (repair and fresh verification)",
+    unblockedBy: "Bridge (schedule repair and verification)",
     unblockedTone: "warn",
     note: "the PR is unbound or bounced; an agent must resolve the recorded defect and obtain a fresh verify accept before it can enter the train.",
   },
@@ -286,6 +287,9 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   // force-review owns the exit, not the proxy
   if (AWAITING_RX.test(reason)) return EXIT_CLASSES.awaiting;
   if (ev === "ask" || m.awaiting_ask?.ask_id) return ["agent_coordination", "executor_coordination"].includes(m.awaiting_ask?.route?.kind) ? EXIT_CLASSES.coordination : EXIT_CLASSES.ask;
+  // Current dependencies outrank the historical bounce that led to this park.
+  if (ev === "br_done" || ev === "br_answered") return EXIT_CLASSES.task;
+  if (!mergeCompletesTask(m) && (ev === "pr_merged" || ev === "br_pr_merged")) return EXIT_CLASSES.pr;
   // BR#6330 / BR#6395 — ONE classification: ONLY the typed merge_train phase
   // (queued|awaiting-ci) enters EXIT_CLASSES.merge ("Awaiting PR merge — train").
   // Non-train pr_merged / br_pr_merged waits (upstream PR dependencies with
@@ -355,12 +359,15 @@ export function blockedSummaryOf(t: { status?: string; meta?: any }): {
     whatUnblocks = `Agent: rebase ${prShort} onto main`;
     unblockedTone = "warn";
   } else if (cls.key === "repair") {
-    whatUnblocks = phase === "unbound"
-      ? `Agent: bind ${prShort} and obtain fresh verification`
-      : `Agent: repair ${prShort} and re-verify`;
+    whatUnblocks = m.repair_status?.kind === "working"
+      ? `Repair in progress — ${m.repair_status.owner}`
+      : m.repair_status?.kind === "scheduled" ? `Repair scheduled — ${m.repair_status.task_id}` : "Repair not scheduled — Bridge must assign an agent";
     unblockedTone = "warn";
   } else if (cls.key === "pr") {
-    if (phase === "unbound") {
+    if (!mergeCompletesTask(m)) {
+      whatUnblocks = `Prerequisite: ${prShort} must merge; Bridge then schedules the remaining work`;
+      unblockedTone = "scope";
+    } else if (phase === "unbound") {
       whatUnblocks = `Agent / System: re-verify ${prShort} to queue (or closes on merge)`;
       unblockedTone = "warn";
     } else if (phase === "bounced") {

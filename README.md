@@ -608,6 +608,46 @@ transition). Window: `question_claim_minutes` setting (default 10).
 
 ## The ask contract: asks are question nodes
 
+**Recovery and completion are explicit (BR#6483).** Queue diagnostics and aged
+conflicts create deduplicated repair tasks owned by Bridge, never a question asking
+the human to investigate or find another agent. A live executor or current review
+outranks historical queue metadata. An earlier unrelated merge is not proof that a
+line is healthy now. The Backlog reports repair **working**, **scheduled**, or
+**not scheduled** from the real recovery duty and executor heartbeat; current task
+dependencies outrank old bounce labels. Obsolete built-in strand/conflict requests
+are cancelled without fabricating a human answer.
+
+New explicit `human_decision` requests require `decision`: `kind` is authority,
+information or preference; `task_id` is the affected task (not an alarm sink);
+`context` and `why_human` explain the actual choice. Each choice carries `label`,
+`executor` (bridge/human), `consequence`, and `action` (resume/hold/release). The
+effect comes from that action, never a verb in the label. Human execution steps
+hold the task until confirmed; free-text steering cannot silently release/resume
+it. All three ask views share the essential context/why renderer, show named
+executors and consequences, and put supporting evidence under Details. They show
+no offline/never-seen diagnostics for human recipients. Legacy requests retain
+their full brief; their compatibility adapter does not rewrite their meaning.
+
+Task `meta.completion` is `{kind:"delivery"}` or `{kind:"execution",outcome}`.
+Only delivery work completes on a merge receipt. Execution work waits for its
+prerequisite, then returns to the agent pool with the receipt; its actual actions
+must finish with `execution_result {outcome,receipts}`. Legacy `depends_on` markers
+adapt to execution. Review acceptance, queue admission, merged-park healing,
+burst settling and reverse reconciliation all preserve this distinction.
+Execution review accepts with `review_result {kind:"accepted_execution",task_id,receipts}`
+after checking the actual outcomes; it needs no fictitious implementation PR.
+An already-authorised disposition can be applied via transition `batch_auth`, or
+persisted `meta.disposition_request {kind:"apply_authorized_supersede",ask:"BR#N"}`
+followed by transition to superseded. Both consume the same receipt-scoped human
+authorisation gate and recheck the target; neither grants an agent human authority.
+The alarm also consumes persisted disposition requests, so a crash between request
+and application cannot skip the cleanup. Semantic refusals become terminal receipts;
+storage faults leave the command pending for retry.
+The same machine-ownership rule covers stalled batches, mismatched merge checks,
+missing deployment evidence and no-progress diagnostics. A genuinely unavailable
+execution host instead produces a concrete request to start Bridge on a computer,
+with named human/Bridge steps—not a request to diagnose the queue.
+
 **Bridge coordinates agents; humans make decisions (BR#6455).** Requests have a
 closed `route` in `@bridge/contracts`, shared by the MCP door, hub and human UI:
 

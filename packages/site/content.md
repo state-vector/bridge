@@ -195,6 +195,19 @@ Verify verdicts are **machine verdicts** (BR#5377): a verify-verdict decision **
 
 ### The ask contract: asks are question nodes
 
+**Bridge owns recovery; you own genuine choices (BR#6483).** Missing queue links
+and conflicts schedule agent repair work, not diagnostic questions for you. Live
+execution and current dependencies outrank historical queue metadata. Backlog says
+whether repair is working, scheduled or not scheduled, backed by the actual duty.
+Obsolete built-in diagnostic asks retire automatically. Human requests name the
+affected task, the actual missing authority/information/preference, and each
+choice's executor, consequence and typed effect. Essential context is concise;
+supporting evidence is expandable. Human recipients never display offline/never-seen
+agent diagnostics. A prerequisite merge resumes execution: it cannot complete
+post-deploy work. Execution completes only with outcome receipts. Existing human
+batch authorisations remain applicable without another round of approval, through
+the same receipt-scoped gate.
+
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following
 its current claim holder), and `independent_review` (Bridge schedules/reuses a review duty,

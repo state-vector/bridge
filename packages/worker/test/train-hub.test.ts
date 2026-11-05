@@ -1430,7 +1430,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
     expect(stamped1).toBeGreaterThan(0);
     const asks1 = await kbJson("/search?q=starved&type=question&limit=50");
     // NB: /search's semantic branch ignores the type filter — re-apply it here
-    const mine1 = asks1.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`));
+    const mine1 = asks1.body.artefacts.filter((x: any) => x.type === "question" && x.meta?.ask?.decision?.task_id === laneCard);
     expect(mine1.length).toBe(1);
 
     // a second read (and the alarm sweep riding the alarm tick) must NOT
@@ -1440,7 +1440,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
     expect(after2.length).toBe(after1.length);
     expect((await kbJson("/get", { id: laneCard })).body.meta.lane.starved_since).toBe(stamped1);
     const asks2 = await kbJson("/search?q=starved&type=question&limit=50");
-    expect(asks2.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`)).length).toBe(1);
+    expect(asks2.body.artefacts.filter((x: any) => x.type === "question" && x.meta?.ask?.decision?.task_id === laneCard).length).toBe(1);
 
     // recovery: a capable lease clears the episode (state + payload)
     await acquire(repo, "gw-cody", { merge_capable: true });
@@ -2390,16 +2390,15 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       const all = (await kbJson("/search", { q: "lane-gate-blocked", type: "task", limit: 50 })).body.artefacts;
       return all.filter((x: any) => x.type === "task" && String(x.title).includes("GATE-BLOCKED on ") && String(x.title).includes(`${repo}@main`));
     };
-    expect(await askHits()).toHaveLength(1);
+    expect(await askHits()).toHaveLength(0);
     expect((await dutyHits()).length).toBe(1);
-    const ask = (await askHits())[0];
-    expect(String(ask.body_md)).toContain("main-green gate");
-    expect(String(ask.body_md)).toContain("Deploy drift alarm");
-    expect(String(ask.body_md)).toContain("3.5h");
+    const duty = (await dutyHits())[0];
+    expect(String(duty.body_md)).toContain("main-green gate");
+    expect(String(duty.body_md)).toContain("Deploy drift alarm");
 
     // per-tick repeats dedupe — ONE ask, ONE duty
     expect((await stamp()).body.error ?? "").toBe("");
-    expect(await askHits()).toHaveLength(1);
+    expect(await askHits()).toHaveLength(0);
     expect((await dutyHits()).length).toBe(1);
 
     // fresh stamp WITHOUT the qualifier: episode clears, ask auto-closes,
@@ -2412,8 +2411,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
     expect(lane2.reason).not.toContain("GATE-BLOCKED");
     const asksAfter = await askHits();
-    expect(asksAfter.length).toBe(1);
-    expect(asksAfter[0].status).toBe("done");
+    expect(asksAfter.length).toBe(0);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-gb" });
   });
 
@@ -2869,9 +2867,10 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // the episode's OPEN alarm ask rides verbatim (one click to answer)
     const ask = (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`));
-    expect(ask).toBeTruthy();
-    expect(sr.ask.id).toBe(ask.id);
-    expect(sr.ask.options).toEqual(["(Recommended) Restarting the train gateway/executor now", "Investigating — hold the alarm"]);
+    expect(ask).toBeUndefined();
+    expect(sr.ask ?? null).toBeNull();
+    const repair = (await kbJson("/get", { id: lane.card })).body.meta.recovery.task_id;
+    expect((await kbJson("/get", { id: repair })).body.meta.machine_duty.kind).toBe("task-recovery");
 
     // ONE ask per episode — the per-tick stamp repeats dedupe on the
     // numberless title (no tick counts, no ages)
@@ -2880,7 +2879,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts.filter(
         (x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`),
       ).length;
-    expect(await askCount()).toBe(1);
+    expect(await askCount()).toBe(0);
 
     // base-red owns the story when BOTH ride the same stamp — the STALLED
     // banner is suppressed while the lane reads BLOCKED
@@ -2901,7 +2900,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const lane2 = await laneSnap(repo);
     expect(lane2.reason).not.toContain("STALLED");
     expect(lane2.stalled_resolution ?? null).toBeNull();
-    expect(await askCount()).toBe(1);
+    expect(await askCount()).toBe(0);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-stall" });
   });
 
@@ -2937,7 +2936,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     const asks = (await kbJson("/search", { q: "MERGE TRAIN STALLED", type: "question", limit: 50 })).body.artefacts.filter(
       (x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`),
     );
-    expect(asks.length).toBe(1);
+    expect(asks.length).toBe(0);
     // a non-holder cannot fire the alarm (the lane lease is required)
     const no = await kbJson("/train.event", { repo, base: "main", actor: "gw-other", kind: "stalled", pr: 0, batch_members: [1], ticks: 3, since: T0 + 60_000 });
     expect(no.status).toBeGreaterThanOrEqual(400);
@@ -3126,7 +3125,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     const snap1 = await laneSnap(repo);
     expect(snap1.starved).toBeTruthy();
     expect(snap1.starved.mins).toBeGreaterThanOrEqual(60);
-    expect(snap1.starved.ask_id).toBeTruthy();
+    expect(snap1.starved.ask_id).toBeNull();
     expect(snap1.starved.duty_id).toBeTruthy();
 
     const laneCardObj = (await kbJson("/get", { id: snap1.card })).body;
@@ -3136,17 +3135,6 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(starv.fired_at).toBeGreaterThan(0);
     expect(starv.ask_id).toBe(snap1.starved.ask_id);
     expect(starv.duty_id).toBe(snap1.starved.duty_id);
-
-    // Check the starvation ask details carry full diagnosis + P1 alarm
-    const askArt = (await kbJson("/get", { id: starv.ask_id })).body;
-    expect(askArt.type).toBe("question");
-    expect(askArt.status).toBe("todo");
-    expect(String(askArt.title)).toContain(`MERGE TRAIN STARVED: ${repo}@main`);
-    expect(String(askArt.body_md)).toContain("49 runs read, none matched required set — check names/pagination");
-    expect(String(askArt.body_md)).toContain("1 queued");
-    expect(String(askArt.body_md)).toContain("1 awaiting");
-    expect(String(askArt.body_md)).toContain(String(twoHoursAgo));
-    expect(String(askArt.body_md)).toContain(starv.duty_id);
 
     // Check the diagnostic duty card (tags merge-train + diagnostic, checklist items)
     const dutyArt = (await kbJson("/get", { id: starv.duty_id })).body;
@@ -3174,7 +3162,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(snap2.starved?.duty_id).toBe(starv.duty_id);
     const allStarveAsks = (await kbJson("/search", { q: "lane-p4-starve", type: "question", limit: 50 })).body.artefacts
       .filter((x: any) => x.type === "question" && String(x.title).startsWith(`MERGE TRAIN STARVED: ${repo}@main`));
-    expect(allStarveAsks.length).toBe(1);
+    expect(allStarveAsks.length).toBe(0);
 
     // ANY merge on the lane clears starvation (meta.lane.starvation = null, lane.starved = null)
     const M1 = "6".repeat(40);
@@ -3230,7 +3218,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(snapCleared.queue.length).toBe(0);
     expect(snapCleared.awaiting.length).toBe(1);
     expect(snapCleared.starved).toBeTruthy();
-    expect(snapCleared.starved.ask_id).toBeTruthy();
+    expect(snapCleared.starved.ask_id).toBeNull();
     expect(snapCleared.starved.duty_id).toBeTruthy();
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p4a" });
   });
