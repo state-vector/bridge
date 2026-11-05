@@ -17,11 +17,13 @@
  *   on LOAD and folded in; the WRITTEN shape is the dict form below.
  */
 import { z } from "zod";
+import { ReasoningTierSchema } from "./execution.ts";
 
 /** Keys that must never appear in a serialized config file. */
 export const CONFIG_FORBIDDEN_KEYS = ["token", "principal"] as const;
 
 export const BackendConfigSchema = z.looseObject({
+  reasoning_tier: ReasoningTierSchema.optional(),
   bin: z.string().optional(),
   agent: z.string().optional(),
   model: z.string().optional(),

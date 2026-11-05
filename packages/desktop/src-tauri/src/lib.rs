@@ -1,5 +1,6 @@
 mod console;
 mod dispatch;
+mod checkpoint;
 mod keychain;
 mod mac_notify;
 mod menubar;

@@ -109,6 +109,10 @@
       "additionalProperties": {
         "type": "object",
         "properties": {
+          "reasoning_tier": {
+            "type": "string",
+            "enum": ["small", "medium", "large"]
+          },
           "bin": {
             "type": "string"
           },

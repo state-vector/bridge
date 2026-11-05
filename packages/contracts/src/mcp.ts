@@ -20,9 +20,11 @@ import { ExecutionResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
 import { RecoveryCommandSchema } from "./train-recovery.ts";
+import { ExecutionRequestSchema } from "./execution.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
+  "execution",
   "answer_ask",
   "ask_agent",
   "asks",
@@ -67,6 +69,7 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * Schema is what the fixture pins.
  */
 export const TOOL_ARG_SCHEMAS = {
+  execution: ExecutionRequestSchema,
   train_observe_deploy: z.looseObject({ repo: z.string(), base: z.string().optional(), observation: DeployObservationSchema }),
   train_recovery_event: RecoveryCommandSchema,
   orient: z.looseObject({
