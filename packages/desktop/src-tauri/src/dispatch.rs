@@ -269,6 +269,7 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
         else { ModelAvailability::Usable };
     facts["backend"] = json!(name); facts["model"] = json!(model); facts["projects"] = json!(bc.projects);
     facts["availability"] = json!(availability); facts["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
+    facts["inventory_revision"] = json!(2);
     facts["config_revision"] = json!(worker_config_revision(cfg));
     facts
 }
@@ -1333,6 +1334,7 @@ fn mcp_call_session(
     if let Some(obj) = args.as_object_mut() {
         let name = session.map(String::from).unwrap_or_else(|| cfg.session_name());
         obj.entry("session").or_insert_with(|| json!(name));
+        obj.insert("inventory_protocol".into(), json!(2));
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))

@@ -64,6 +64,22 @@ async function interactive(label: string) {
 }
 
 describe("local handoff authority and lifecycle", () => {
+  it("prevents an old GUI sharing the gateway token from overwriting or borrowing a scoped inventory", async () => {
+    const r = await runtimeTask();
+    const capability = { ...localCapabilities, backend: "opencode", inventory_revision: 2, worker: { kind: "provisioned", label: `${r.auth.actor}/worker` } };
+    expect((await r.command("scoped-inventory", { kind: "advertise", capabilities: capability })).data.ok).toBe(true);
+    expect((await r.command("old-gui", { kind: "advertise", capabilities: { ...capability, inventory_revision: undefined, projects: ["*"] } })).data.ok).toBe(false);
+    const availability = await r.command("inventory-after-old-gui", { kind: "availability" });
+    expect(availability.data.hosts).toEqual(expect.arrayContaining([expect.objectContaining({ host: r.auth.actor, capabilities: expect.objectContaining({ inventory_revision: 2, projects: ["bridge"] }) })]));
+    const task = (await post<{ id: string }>("create", { actor: r.auth.actor, type: "task", title: "Scoped inventory claim", project: "bridge", qualified: true })).data;
+    expect((await post("transition", { ...r.auth, id: task.id, to: "in_progress", inventory_protocol: undefined })).data.error).toMatch(/scoped-inventory/);
+    expect((await post("transition", { ...r.auth, id: task.id, to: "in_progress" })).data.error).toBeUndefined();
+    const begin = { ...r.auth, id: task.id, command_id: "scoped-begin", command: { kind: "begin", attempt_id: "scoped", worker: r.auth.agent, action_budget_ms: 60_000 } };
+    expect((await post("execution", { ...begin, inventory_protocol: undefined })).data.error).toMatch(/scoped-inventory/);
+    expect((await post("execution", begin)).data.error).toBeUndefined();
+    // The upgrade fence must not prevent an older writer from stopping safely.
+    expect((await post("execution", { ...r.auth, id: task.id, inventory_protocol: undefined, command_id: "old-drain", command: { kind: "quiesce", generation: 1, attempt_id: "scoped", writers: "process_group_empty" } })).data.error).toBeUndefined();
+  });
   it("pauses only new gateway claims without turning an operator drain into a credential repair barrier", async () => {
     const r = await runtimeTask();
     const task = (await post<{ id: string }>("create", { actor: r.auth.actor, type: "task", title: "Pending update claim", project: "bridge", qualified: true })).data;

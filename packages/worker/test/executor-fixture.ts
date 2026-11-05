@@ -2,7 +2,7 @@ import { expect } from "vitest";
 import { EXECUTOR_READINESS_PROTOCOL } from "@bridge/contracts";
 
 export function executorRequest(body: unknown): unknown {
-  return body && typeof body === "object" && !Array.isArray(body) ? { runner_protocol: EXECUTOR_READINESS_PROTOCOL, ...body } : body;
+  return body && typeof body === "object" && !Array.isArray(body) ? { runner_protocol: EXECUTOR_READINESS_PROTOCOL, inventory_protocol: 2, ...body } : body;
 }
 
 type Call = (path: string, body: unknown) => Promise<{ status: number; body: unknown }>;

@@ -211,6 +211,10 @@ changes in future dispatch capacity. Evidence includes config revision, model
 identity and expiring host observations; no human staffing/approval ask is made
 just because a model is missing.
 
+Once a gateway adopts scoped inventory revision 2, an older GUI sharing its
+credential may drain existing work but cannot overwrite that inventory or borrow
+it to make new claims. Other gateways can roll forward independently.
+
 Backend configuration adds `enabled` (default true) and `projects` (default
 `["*"]`) alongside explicit `reasoning_tier` and `model`. For example:
 

@@ -45,7 +45,7 @@ export const ModelCapabilitySchema = z.object({
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
 });
-export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }) });
+export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional() });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
   const tiers: ReasoningTier[] = ["small", "medium", "large"];

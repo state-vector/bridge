@@ -113,6 +113,8 @@ work waits on capability restoration without generating a human approval request
 restoration clears only its matching blocker. Task requirements survive releases
 and cannot silently weaken. Use backend `enabled`, `projects`, `model` and
 `reasoning_tier` settings to declare actual capacity.
+After scoped-inventory adoption, obsolete producers sharing that gateway's
+credential can finish active work but cannot overwrite or borrow newer readiness.
 
 Both hub and runner need the matching protocol version. Gateways wait for the
 live execution advertisement endpoint before claiming work during rollout;

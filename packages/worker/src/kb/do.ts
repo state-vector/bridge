@@ -4614,6 +4614,7 @@ export class KnowledgeHub {
           const host = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, String(body.token_id));
           if (!host || Date.now() - host.observed_ts > 120_000) throw new Error("gate: claim requires a live executor capability observation");
           const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
+          if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: claim requires the scoped-inventory runner protocol; obsolete GUI may drain but not borrow newer readiness");
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
           const scheduling = this.executionSchedulingRequirements(String(body.id), requirements);
@@ -4659,12 +4660,14 @@ export class KnowledgeHub {
     if (command.kind === "advertise") {
       if (!gateway) throw new Error("gate: only authenticated gateways advertise executor capabilities");
       if ([command.capabilities, ...command.capabilities.alternatives].some(c => c.backend === "interactive")) throw new Error("gate: interactive capability attestations belong to human-scoped grants, not gateway inventory");
-      const readiness = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
+      const existing = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
+      const previousCapabilities = existing ? ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)) : null;
+      const obsoleteInventory = previousCapabilities?.inventory_revision === 2 && command.capabilities.inventory_revision !== 2;
+      const readiness = obsoleteInventory ? { kind: "repair_required" as const, reason: "A scoped-inventory runner has adopted this gateway; upgrade this obsolete producer before new claims" } : body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
         ? this.executorReadiness(tokenId, actor, command.capabilities, now)
         : { kind: "unprovisioned" as const, reason: "Upgrade to the worker-ready runner protocol before claiming work" };
-      const existing = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
-      const keepReady = readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
-        && this.executorReadiness(tokenId, actor, ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)), now).kind === "ready";
+      const keepReady = obsoleteInventory || (readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
+        && this.executorReadiness(tokenId, actor, ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)), now).kind === "ready");
       // An obsolete GUI can drain existing work, but cannot overwrite the live
       // readiness of a corrected runner or borrow its proof to claim a card.
       const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
@@ -4773,6 +4776,7 @@ export class KnowledgeHub {
       const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
       if (!advertised || now - advertised.observed_ts > 120_000) throw new Error("gate: executor capabilities missing/stale — advertise live facts before begin");
       const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+      if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: begin requires the scoped-inventory runner protocol; obsolete producers may only drain existing attempts");
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
       const blockers = capabilityBlockers(current.requirements, capabilities, actor);
