@@ -140,7 +140,7 @@ is delivered through a durable queued/delivered/acknowledged/acted mailbox;
 non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
 operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution
 MCP tool exposes exact state and availability, including expired supporting
-gateways versus busy capacity. Backend `reasoning_tier` declarations and task
+gateways versus busy capacity. Backend `models` tier maps and task
 minimum requirements are explicit, persistent and checked by the hub—there is
 no model-name guessing or silent downgrade. Explicit model escalation yields
 only after work is portable and the old writer is quiescent; it does not ask a
@@ -170,8 +170,32 @@ enabled state, project scope and explicit reasoning tiers. Unconfigured, expired
 unavailable and merely busy hosts produce different facts. Queued unsupported
 work waits on capability restoration without generating a human approval request;
 restoration clears only its matching blocker. Task requirements survive releases
-and cannot silently weaken. Use backend `enabled`, `projects`, `model` and
-`reasoning_tier` settings to declare actual capacity.
+and cannot silently weaken. Use backend `enabled`, `projects` and
+`models: {"medium":"provider/glm-5.3","large":"provider/solver"}` settings to
+declare actual capacity (example IDs; use your CLI's exact IDs). Legacy single
+`model` + `reasoning_tier` configuration remains supported. Desktop Providers
+exposes all three tier slots, and doctor reports the configured supply.
+
+**Model policy is global, not per gateway.** Built-in defaults run analysis on
+the largest live usable model tier, implementation on the smallest, and
+verification on the smallest at least as large as the implementation delivery.
+Busy gateways count as supply, so policy does not change just because a slot is
+occupied. Workspace `model_policy` settings can override lane selection with
+`smallest_available`, `largest_available`, or an explicit `minimum` tier; these
+preferences never override a task's persistent minimum or the verification floor.
+Execution receipts record the selected model rather than the gateway's strongest
+model. All tiers remain advertised while a smaller model runs.
+
+Agents explicitly self-escalate through the fenced execution protocol; availability
+reports the next actually available larger tier. Normal review findings do not
+bump implementation. A typed `stronger_implementation_required` review outcome
+raises the idle parent to the next available tier and requeues it atomically with
+the verdict. Missing large capability blocks explicit large requirements; restored
+capability clears only its own blocker. A changed backend/model/tier starts a fresh
+session with the preserved checkpoint. Confidence/risk gauges prompt judgement,
+not automatic bumps or human asks. Human blocking is reserved for precise missing
+decisions/authority/information or concrete local-only actions, not mechanical
+repairs or ordinary review iteration.
 After scoped-inventory adoption, obsolete producers sharing that gateway's
 credential can finish active work but cannot overwrite or borrow newer readiness.
 

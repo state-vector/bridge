@@ -1016,6 +1016,12 @@ fn doctor() -> bool {
     // as configuration, it does NOT validate it against anything hub-side.
     let backends = &cfg.backends;
     for (b, section) in backends {
+        if !section.models.is_empty() {
+            for (tier, model) in &section.models {
+                println!("  \x1b[32mok\x1b[0m   model[{b}][{}] = {model} (CLI-resolved supply; lane policy is global)", serde_json::to_string(tier).unwrap_or_default());
+            }
+            continue;
+        }
         match &section.model {
             Some(m) if !m.trim().is_empty() => {
                 println!("  \x1b[32mok\x1b[0m   model[{b}] = {m} (resolved by the agent CLI against its own provider config)");

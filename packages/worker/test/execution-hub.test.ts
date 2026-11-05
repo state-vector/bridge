@@ -189,7 +189,7 @@ describe("durable executor on real SQLite", () => {
     expect((await cmd("legacy", { kind: "advertise", capabilities })).data.ok).toBe(false);
     expect((await cmd("unavailable", { kind: "availability" })).data.phase).toBe("unavailable");
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/worker|readiness/);
-    expect((await post("get", { id: task.id })).data.status).toBe("todo");
+    expect((await post("get", { id: task.id })).data.status).toBe("blocked"); // global policy exposes unavailable worker capacity
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     expect((await cmd("ready", { kind: "advertise", capabilities: ready })).data.ok).toBe(true);

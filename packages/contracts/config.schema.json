@@ -115,6 +115,11 @@
             "type": "string",
             "enum": ["small", "medium", "large"]
           },
+          "models": {
+            "type": "object",
+            "propertyNames": { "type": "string", "enum": ["small", "medium", "large"] },
+            "additionalProperties": { "type": "string", "minLength": 1 }
+          },
           "bin": {
             "type": "string"
           },

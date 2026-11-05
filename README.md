@@ -265,9 +265,9 @@ removing or changing the scope does not restore legacy write access.
   and receipts. A timed-out effect becomes `outcome_unknown`; inspect GitHub/AWS
   before reporting its result. Pending unknown effects prevent transfer or
   another attempt, rather than authorising a duplicate push/deployment.
-- **Explicit capability escalation:** set each backend's `reasoning_tier` to
-  `small`, `medium` or `large` in runner config (omitted means `small`; model
-  names are never guessed into tiers). Task `meta.execution_requirements`
+- **Explicit capability escalation:** configure each backend's `models` supply
+  by `small`, `medium` or `large` (legacy `model` + `reasoning_tier` is still
+  accepted; names are never guessed into tiers). Task `meta.execution_requirements`
   persists minimum tier, tools, environment and optional host constraints.
   Gateways advertise expiring scoped facts; begin/claim gates check them and
   execution records retain the actual backend/model/config observation.
@@ -345,12 +345,78 @@ Once a gateway adopts scoped inventory revision 2, an older GUI sharing its
 credential may drain existing work but cannot overwrite that inventory or borrow
 it to make new claims. Other gateways can roll forward independently.
 
-Backend configuration adds `enabled` (default true) and `projects` (default
-`["*"]`) alongside explicit `reasoning_tier` and `model`. For example:
+### Global model policy and gateway supply
+
+Gateways describe **supply**, not lane policy. In `~/.bridge/config.json`:
 
 ```json
-{"opencode":{"enabled":true,"model":"provider/actual-model-id","reasoning_tier":"large","projects":["bridge"]}}
+{
+  "backends": {
+    "opencode": {
+      "enabled": true,
+      "projects": ["bridge"],
+      "models": {
+        "medium": "provider/glm-5.3",
+        "large": "provider/your-solver-model"
+      }
+    }
+  }
+}
 ```
+
+Use exact IDs accepted by your agent CLI; the IDs above are examples. Omit tiers
+this gateway cannot supply. A nonempty `models` map replaces the backend's legacy
+single-model pin; the desktop Providers form exposes the same three fields and
+`bridge doctor` reports them. All configured tiers remain advertised while a
+smaller model is running. The hub verifies the selected backend/model/tier against
+that live inventory at begin and retains the actual selection in the attempt and
+delivery receipt.
+
+**Workspace-wide defaults:** analysis chooses the largest live usable tier;
+implementation chooses the smallest; verification chooses the smallest at least
+as large as the implementation delivery. Busy gateways still count as available
+supply. With medium GLM and large Sol, implementation starts medium, analysis
+large, and a large implementation must be reviewed at large. Defaults apply to
+managed workspaces once gateway inventory exists; legacy manual-only workspaces
+retain their manual workflow. Explicit minimum requirements always apply.
+
+Operators may override the workspace `model_policy` through the existing
+authenticated settings API (`admin.settings_set`, settings key `model_policy`):
+
+```json
+{
+  "analysis": { "kind": "largest_available" },
+  "impl": { "kind": "smallest_available" },
+  "verify": { "kind": "smallest_available" }
+}
+```
+
+A lane can instead use `{ "kind": "minimum", "tier": "medium" }`. Overrides
+never weaken an explicit task minimum or the verification floor. The settings
+read returns validated effective defaults; invalid policy changes are rejected.
+Task reads expose computed `meta.execution_scheduling_requirements` separately
+from persistent `meta.execution_requirements`; the former is a read-only projection,
+not another configuration knob.
+
+**Escalation:** an executor inspects `execution` command `availability`, which
+reports `next_available_tier` (or null). It explicitly calls `escalate` with its
+generation/attempt, concrete limitation, and a stronger tier. It stops working;
+the runner checkpoints, quiesces and yields. The next session is fresh when
+backend/model/tier changes. Explicit unavailable minima block rather than fall
+back, and capability restoration clears only that blocker.
+
+**Verification:** ordinary `review_result: {kind:"findings",summary:"..."}` does
+not bump implementation. For a genuine model limitation, the review duty can close
+with `{kind:"stronger_implementation_required",task_id:"BR#123",summary:"..."}`.
+The hub validates the subject and idle writer, chooses the next actually available
+larger tier, and atomically commits the verdict and parent requeue. If none is
+available, it rejects that optional bump with a precise error rather than inventing
+a capability or asking a human to staff an agent. The implementation may still
+explicitly declare a hard unmet requirement and wait for capability restoration.
+Low confidence/risk gauges are evidence, not automatic tier or human escalations.
+Human asks must name a concrete missing decision/authority/information; local
+handoffs must name the precise local-only action. Use them sparingly, not for CI
+waits, review iteration or routine mechanical repairs.
 
 Paired operators can inspect the same facts without claiming or resuming work:
 

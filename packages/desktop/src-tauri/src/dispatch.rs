@@ -177,6 +177,9 @@ pub struct BackendConfig {
     /// Explicit capability declaration; never inferred from a model-name regex.
     #[serde(default)]
     pub reasoning_tier: ReasoningTier,
+    /// Explicit tier supply. Lane policy is global in Bridge, never per host.
+    #[serde(default, deserialize_with = "tier_models_de", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<ReasoningTier, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,   // CLI binary override (default: "opencode" / "kiro")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,17 +191,39 @@ pub struct BackendConfig {
 }
 fn default_projects() -> Vec<String> { vec!["*".into()] }
 impl Default for BackendConfig {
-    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, bin: None, agent: None, model: None, mode: None } }
+    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, models: Default::default(), bin: None, agent: None, model: None, mode: None } }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningTier { #[default] Small, Medium, Large }
 
+fn tier_models_de<'de, D: serde::Deserializer<'de>>(de: D) -> Result<std::collections::BTreeMap<ReasoningTier, String>, D::Error> {
+    let models = std::collections::BTreeMap::<ReasoningTier, String>::deserialize(de)?;
+    if models.values().any(|m| m.trim().is_empty()) { return Err(serde::de::Error::custom("tier models must contain non-empty CLI model IDs")); }
+    Ok(models.into_iter().map(|(tier, model)| (tier, model.trim().to_string())).collect())
+}
+
 fn backend_satisfies(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> bool {
-    let required = meta.pointer("/execution_requirements/tier").and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
+    selected_model(cfg, backend, meta).is_some()
+}
+
+fn configured_models(cfg: &DispatchConfig, bc: &BackendConfig) -> Vec<(ReasoningTier, String)> {
+    if !bc.models.is_empty() {
+        return bc.models.iter().filter(|(_, model)| !model.trim().is_empty()).map(|(tier, model)| (*tier, model.clone())).collect();
+    }
+    bc.model.clone().or_else(|| cfg.model.clone()).filter(|model| !model.trim().is_empty())
+        .map(|model| vec![(bc.reasoning_tier, model)]).unwrap_or_default()
+}
+
+fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> Option<(ReasoningTier, String)> {
+    let required = meta.pointer("/execution_scheduling_requirements/tier").or_else(|| meta.pointer("/execution_requirements/tier"))
+        .and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
     let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-    cfg.backends.get(name).map(|b| b.enabled && b.reasoning_tier >= required && b.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str())).unwrap_or(false)
+    let bc = cfg.backends.get(name)?;
+    if !bc.enabled || !bc.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str()) { return None; }
+    let initial_selection = meta.get("execution_scheduling_requirements").is_some() && meta.get("execution_last_model").is_none();
+    configured_models(cfg, bc).into_iter().filter(|(tier, _)| if initial_selection { *tier == required } else { *tier >= required }).min_by_key(|(tier, _)| *tier)
 }
 
 fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
@@ -236,11 +261,7 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
     }).ok_or("no configured backend is available")?;
     let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
-    let mut capabilities = backend_capabilities(cfg, name, true, Some(&worker));
-    capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| other.as_str() != name).map(|other| {
-        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(other)) == *b);
-        backend_capabilities(cfg, other, runnable, Some(&worker))
-    }).collect::<Vec<_>>());
+    let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
         return Err(format!("executor readiness held: {}", reply["readiness"]));
@@ -308,9 +329,10 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
 enum ModelAvailability { Usable, Unavailable { reason: String }, Disabled }
 fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker: Option<&WorkerCredential>) -> serde_json::Value {
     let bc = cfg.backends.get(name).cloned().unwrap_or_default();
-    let model = bc.model.clone().or_else(|| cfg.model.clone());
-    let mut facts = worker.map(|worker| executor_capabilities(bc.reasoning_tier, worker))
-        .unwrap_or_else(|| json!({ "tier": bc.reasoning_tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
+    let (tier, model) = configured_models(cfg, &bc).into_iter().max_by_key(|(tier, _)| *tier)
+        .map(|(tier, model)| (tier, Some(model))).unwrap_or((bc.reasoning_tier, None));
+    let mut facts = worker.map(|worker| executor_capabilities(tier, worker))
+        .unwrap_or_else(|| json!({ "tier": tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
     let availability = if !bc.enabled { ModelAvailability::Disabled }
         else if !runnable { ModelAvailability::Unavailable { reason: "Configured agent CLI is unavailable or its circuit breaker is open".into() } }
         else if model.as_deref().unwrap_or("").is_empty() { ModelAvailability::Unavailable { reason: "Actual configured model identity is unreported; configure it explicitly".into() } }
@@ -320,6 +342,25 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
     facts["inventory_revision"] = json!(2);
     facts["config_revision"] = json!(worker_config_revision(cfg));
     facts
+}
+
+/// Advertise the complete supply even when a task selects a smaller model.
+/// Otherwise running medium temporarily erases this host's large capability.
+fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
+    let mut inventory = Vec::new();
+    for (name, bc) in &cfg.backends {
+        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(name)) == *b);
+        let base = backend_capabilities(cfg, name, runnable, worker);
+        let models = configured_models(cfg, bc);
+        if models.is_empty() { inventory.push(base); }
+        else { for (tier, model) in models {
+            let mut facts = base.clone(); facts["tier"] = json!(tier); facts["model"] = json!(model);
+            inventory.push(facts);
+        } }
+    }
+    let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
+    if inventory.is_empty() { return backend_capabilities(cfg, primary, false, worker); }
+    let mut main = inventory.remove(index); main["alternatives"] = json!(inventory); main
 }
 
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
@@ -3157,7 +3198,8 @@ fn spawn_opencode(
         failed_start(cfg, tid, StartStage::Begin, "gate: selected capability no longer available on this host", None, None);
         return;
     }
-    let backend = pick_backend(&eligible);
+    let backend = *eligible.iter().min_by_key(|b| selected_model(cfg, **b, task_meta).map(|(tier, _)| tier)).unwrap();
+    let (model_tier, model_id) = selected_model(cfg, backend, task_meta).expect("eligible backend has a configured model");
 
     // BR#2460: provisioning is a best-effort optimization; capability belongs
     // to the agent. A resolvable repo reference (meta.repo or the task body)
@@ -3182,9 +3224,14 @@ fn spawn_opencode(
     let bc = cfg.backends.get(backend_name).cloned().unwrap_or_default();
     let bc_mode = bc.mode.clone();
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
-    let model = bc.model.or_else(|| cfg.model.clone());
+    let model = Some(model_id);
     let model_str = model.clone().unwrap_or_default();
-    let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
+    // A different model gets a fresh session, preserving the checkpoint/WIP.
+    let previous = task_meta.get("execution_last_model");
+    let model_changed = previous.and_then(|p| p["model"].as_str()) != model.as_deref()
+        || previous.and_then(|p| serde_json::from_value::<ReasoningTier>(p["tier"].clone()).ok()) != Some(model_tier)
+        || previous.and_then(|p| p["backend"].as_str()) != Some(backend_name);
+    let resume_session = if model_changed { None } else if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
         resume_session
@@ -3446,11 +3493,12 @@ fn spawn_opencode(
         Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
         _ => {}
     }
-    let capabilities = backend_capabilities(cfg, backend_name, true, Some(worker));
+    let capabilities = capability_inventory(cfg, avail, Some(worker), backend_name);
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
     let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|ready| {
         if ready["ok"] != true { return Err(format!("executor readiness held: {}", ready["readiness"])); }
-        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000) }))
+        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000),
+            "selection": { "backend": backend_name, "model": model_str, "tier": model_tier } }))
     });
     let state = match begin {
         Ok(s) => s,
@@ -3465,6 +3513,7 @@ fn spawn_opencode(
     let execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), last_poll: Instant::now(), last_checkpoint: Instant::now() };
     execution.control.grant_lease();
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
+    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
     if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
         let restored = (|| -> Result<(), String> {
@@ -3650,8 +3699,7 @@ fn tick(
     let avail_ok = !avail.is_empty();
     if !avail_ok {
         if let Some(name) = cfg.backends.keys().next() {
-            let mut capabilities = backend_capabilities(cfg, name, false, None);
-            capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| *other != name).map(|other| backend_capabilities(cfg, other, false, None)).collect::<Vec<_>>());
+            let capabilities = capability_inventory(cfg, &[], None, name);
             let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
         }
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
@@ -5058,6 +5106,32 @@ mod tests {
         assert!(!quiesced_claim_can_resume(&state, &json!({ "status": "in_progress", "meta": { "session": "local-owner" } }), Some("host")));
         state["handoff"]["phase"] = json!("waiting");
         assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+    }
+
+    #[test]
+    fn multi_model_selection_respects_global_requirement_and_scope() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "backends": { "opencode": {
+            "projects": ["bridge"], "models": { "medium": "glm-5.3", "large": "provider/sol" }
+        } } })).unwrap();
+        let task = json!({ "execution_project": "bridge", "execution_scheduling_requirements": { "tier": "medium" } });
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &task), Some((ReasoningTier::Medium, "glm-5.3".into())));
+        let mut large = task.clone(); large["execution_scheduling_requirements"]["tier"] = json!("large");
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &large), Some((ReasoningTier::Large, "provider/sol".into())));
+        large["execution_project"] = json!("other");
+        assert!(!backend_satisfies(&cfg, opencode::Backend::OpenCode, &large));
+        let inventory = capability_inventory(&cfg, &[opencode::Backend::OpenCode], None, "opencode");
+        assert_eq!(inventory["model"], "provider/sol");
+        assert_eq!(inventory["alternatives"][0]["model"], "glm-5.3");
+        assert_eq!(inventory["availability"]["kind"], "usable");
+    }
+
+    #[test]
+    fn explicit_models_replace_legacy_pin_and_never_fall_back_below_minimum() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "model": "legacy-large", "backends": { "opencode": {
+            "reasoning_tier": "large", "models": { "medium": "glm-5.3" }
+        } } })).unwrap();
+        assert!(selected_model(&cfg, opencode::Backend::OpenCode, &json!({ "execution_requirements": { "tier": "large" } })).is_none());
+        assert!(serde_json::from_value::<BackendConfig>(json!({"models": {"huge": "not-a-tier"}})).is_err());
     }
 
     #[test]

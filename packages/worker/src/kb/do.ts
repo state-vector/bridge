@@ -227,7 +227,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -4213,7 +4213,9 @@ export class KnowledgeHub {
   private async get(id: string) {
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
-    return this.shape(row);
+    const shaped = this.shape(row);
+    if (row.type === "task") shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
+    return shaped;
   }
 
   private async list(body: any) {
@@ -4547,7 +4549,8 @@ export class KnowledgeHub {
   }
   private executionWork(): ExecutionWork {
     return new ExecutionWork(this.state.storage, (actor, op, id, data) => this.audit(actor, op, id, data), this.wsSlug() ?? DEFAULT_WS_SLUG,
-      (token, host, capabilities, now) => this.executorReadiness(token, host, capabilities, now));
+      (token, host, capabilities, now) => this.executorReadiness(token, host, capabilities, now),
+      () => ModelPolicySchema.parse(this.settingsMap().model_policy ?? {}));
   }
   private protectedExecution(id: string, meta: Record<string, unknown>, ignoreStartup = false): boolean {
     const h = this.executionState(id)?.handoff;
@@ -4556,7 +4559,7 @@ export class KnowledgeHub {
 
   private executionSchedulingRequirements(id: string, fallback: unknown) {
     const state = this.executionState(id);
-    const requirements = state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {});
+    const requirements = this.executionWork().schedulingRequirements(id, state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {}), state ?? undefined);
     // A quiescent writer can still own unpublished work. Check this before
     // claiming, using the same durable affinity that begin will enforce.
     return state?.attempt && !state.attempt.checkpoint
@@ -4937,7 +4940,7 @@ export class KnowledgeHub {
           const blockers = capabilityBlockers(scheduling, capabilities, token.label);
           if (blockers.length && !capabilities.alternatives.some(c => capabilityBlockers(scheduling, c, token.label).length === 0)) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
           const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(body.id)).project ?? "");
-          if (![capabilities, ...capabilities.alternatives].some(c => usableFor(scheduling, c, token.label, project))) throw new Error("gate: claim requires a live usable configured model in the task's capability scope");
+          if (![capabilities, ...capabilities.alternatives].some(c => usableFor(scheduling, c, token.label, project) && (!!a || c.tier === scheduling.tier))) throw new Error("gate: claim requires the globally selected live usable model tier in the task's capability scope");
         } else if (token && requirements) {
           throw new Error("gate: capability-constrained local execution requires explicit authorised handoff acceptance; interactive credentials are not an implicit bypass");
         }
@@ -5039,6 +5042,7 @@ export class KnowledgeHub {
     if (!row) throw new Error("gate: durable execution requires a task");
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
+    current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
     if (command.kind === "inspect") return current;
     if (command.kind === "availability") return this.executionWork().availability(req.id);
     // A released failed-start acknowledgement never authorises a writer or an
@@ -5141,13 +5145,18 @@ export class KnowledgeHub {
       }
     }
     let workerTokenId = String(binding?.worker_token_id ?? "");
+    let begunExecutor: ExecutorCapabilities | null = null;
     if (command.kind === "begin") {
       if (body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL) throw new Error("gate: begin requires the worker-ready runner protocol");
       if (row.status !== "in_progress" || meta.session !== session) throw new Error("gate: begin requires the current task claim/session");
       const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
       if (!advertised || now - advertised.observed_ts > 120_000) throw new Error("gate: executor capabilities missing/stale — advertise live facts before begin");
-      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
-      if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: begin requires the scoped-inventory runner protocol; obsolete producers may only drain existing attempts");
+      const inventory = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+      if (inventory.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: begin requires the scoped-inventory runner protocol; obsolete producers may only drain existing attempts");
+      const selection = command.selection;
+      const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
+      if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
+      const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
       if (this.startupWait(req.id) || this.startupRejected(req.id, actor, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before begin");
@@ -5155,18 +5164,21 @@ export class KnowledgeHub {
       if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
       const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, req.id).project ?? "");
       if (!usableFor(current.requirements, capabilities, actor, project)) throw new Error("gate: begin requires the selected usable configured model in the task's scope");
+      if (!current.attempt && capabilities.tier !== current.requirements.tier) throw new Error("gate: initial execution must use the globally selected tier, not a more expensive model");
       if (!gateway || !command.worker.startsWith(`${actor}/`)) throw new Error("gate: runner worker must belong to its authenticated gateway");
       const child = this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, command.worker);
       if (!child) throw new Error("gate: worker credential must be provisioned before begin");
       workerTokenId = child.id;
+      begunExecutor = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: [], inventory_revision: inventory.inventory_revision });
       this.state.storage.sql.exec(`DELETE FROM executor_start_barriers WHERE token_id = ?`, tokenId);
     } else if (["poll", "restore", "checkpoint", "quiesce"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
-    if (command.kind === "begin" && next.attempt) {
-      const advertised = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id = ?`, tokenId);
-      next.attempt.executor = ExecutorCapabilitiesSchema.parse(JSON.parse(advertised.capabilities));
+    if (begunExecutor && next.attempt) {
+      next.attempt.executor = begunExecutor;
+      next.requirements.tier = maxTier(next.requirements.tier, begunExecutor.tier);
+      meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     this.state.storage.transactionSync(() => {
@@ -5890,6 +5902,12 @@ export class KnowledgeHub {
       if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
       if (reviewResult.kind === "accepted_direct_main" && !reviewResult.ci_run_url.startsWith(`https://github.com/${reviewResult.repo}/actions/runs/`)) throw new Error("review CI receipt must belong to the delivered repository");
       meta.review_result = reviewResult;
+      if (reviewResult.kind === "stronger_implementation_required") {
+        const subject = meta.execution_review_of;
+        const parent = this.one(`SELECT dst_id FROM relations WHERE src_id=? AND relation='child_of' AND dst_id=?`, id, reviewResult.task_id);
+        if (subject !== reviewResult.task_id && !parent) throw new Error("gate: stronger implementation verdict must name this review's subject");
+        this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, false);
+      }
     }
     if (isSubprocess && row.type === "task" && row.status === "in_progress") {
       const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
@@ -6169,6 +6187,14 @@ export class KnowledgeHub {
           if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
         }
       }
+      if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor);
+      if (row.type === "task" && verdict.status === "in_review") {
+        const execution = this.executionState(id);
+        if (execution) {
+          execution.delivery = execution.handoff.phase === "accepted" ? execution.handoff.capabilities : execution.attempt?.executor ?? execution.delivery;
+          this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(execution)), id);
+        }
+      }
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
         verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
@@ -6225,7 +6251,8 @@ export class KnowledgeHub {
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
     // onto the train (the train owns delivery; the verifier never merges).
     // The hub parses the PR + head from BOARD data only (no hub GitHub calls).
-    if (row.type === "task" && verdict.status === "done" && parseTags(row.roles ?? "").includes("review")) {
+    if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().sweep();
+    if (row.type === "task" && verdict.status === "done" && parseTags(row.roles ?? "").includes("review") && reviewResult?.kind !== "stronger_implementation_required") {
       try {
         const parent = this.one(
           `SELECT p.id AS id, p.status AS status, p.meta AS meta FROM relations r JOIN artefacts p ON p.id = r.dst_id WHERE r.relation = 'child_of' AND r.src_id = ? LIMIT 1`,
@@ -6440,6 +6467,8 @@ export class KnowledgeHub {
                 parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
               ),
               roles: ["review"],
+              meta: { execution_review_of: id },
+              project: row.project,
             },
             actor,
           );
@@ -7759,7 +7788,7 @@ export class KnowledgeHub {
     const meta = JSON.parse(parent.meta ?? "{}");
     const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
     const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
-    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], session: "" }, actor);
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], project: parent.project, meta: { execution_review_of: taskId }, session: "" }, actor);
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
@@ -9639,10 +9668,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   }
 
   private async settingsGet() {
-    return { settings: this.settingsMap() };
+    const settings = this.settingsMap();
+    return { settings: { ...settings, model_policy: ModelPolicySchema.parse(settings.model_policy ?? {}) } };
   }
 
   private async settingsSet(body: any) {
+    if (body.settings?.model_policy !== undefined) ModelPolicySchema.parse(body.settings.model_policy);
     const entries = Object.entries(body.settings ?? {}).filter(([k]) => /^[a-z0-9_]{1,40}$/.test(k));
     if (entries.length === 0) throw new Error("no valid settings keys (lowercase [a-z0-9_])");
     for (const [k, v] of entries) {
@@ -9652,7 +9683,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       );
       this.audit("admin", "settings", k, {});
     }
-    return { settings: this.settingsMap() };
+    this.executionWork().sweep();
+    return this.settingsGet();
   }
 
   // ---------- serialized merge train (BR#3516) ----------
@@ -12384,7 +12416,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     const blockedReason = () => [String(meta.blocked?.reason ?? ""), String(meta.blocked_reason ?? "")].find((r) => r) ?? "";
     const note = String(src.note ?? "");
-    if (src.review_result?.kind === "findings") return;
+    if (src.review_result?.kind === "findings" || src.review_result?.kind === "stronger_implementation_required") return;
     // A verifier's explicit accepted main-commit receipt supersedes historical
     // PR metadata. Never infer acceptance from the implementer's receipts:
     // cannot-proceed/findings closes must not silently deliver the parent.
