@@ -166,15 +166,18 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
 
 /** Called only after the hub matches a successful decisive deployment to
  * the current tip and requires its effective required-check verdict green. */
-export function verifyRecoveryEpisode(episode: RecoveryEpisode, receipt: RecoveryReceipt, now: number): RecoveryEpisode {
+export function verifyRecoveryEpisode(episode: RecoveryEpisode, receipt: RecoveryReceipt, now: number, repairAccepted = true): RecoveryEpisode {
   if (!recoveryIsOpen(episode)) return episode;
-  if (episode.verified_receipts.some((r) => r.run_id === receipt.run_id && r.run_attempt === receipt.run_attempt)) return episode;
-  const verified_receipts = [...episode.verified_receipts, receipt];
-  const verified = verified_receipts.length >= episode.successful_deployments_required;
+  const repeated = episode.verified_receipts.some((r) => r.run_id === receipt.run_id && r.run_attempt === receipt.run_attempt);
+  const verified_receipts = repeated ? episode.verified_receipts : [...episode.verified_receipts, receipt];
+  const verified = verified_receipts.length >= episode.successful_deployments_required && repairAccepted;
+  if (repeated && !verified) return episode;
   return RecoveryEpisodeSchema.parse({ ...episode,
     verified_receipts,
     stage: verified ? { phase: "recovered", task_id: episode.stage.task_id, next: "No action required", receipt }
-      : { phase: "verifying", task_id: episode.stage.task_id, next: `Verify ${episode.successful_deployments_required - verified_receipts.length} more successful decisive deployment(s)` }, updated_at: now,
-    history: [...episode.history, { event_id: `deployment:${receipt.run_id}:${receipt.run_attempt}`, at: now, actor: "system:deployment", kind: verified ? "verified" : "verification_passed", summary: `Successful deployment evidence: ${verified_receipts.length}/${episode.successful_deployments_required} required` }],
+      : { phase: "verifying", task_id: episode.stage.task_id, next: verified_receipts.length >= episode.successful_deployments_required
+          ? "Deployment evidence meets the bar; independent repair acceptance is still required"
+          : `Verify ${episode.successful_deployments_required - verified_receipts.length} more successful decisive deployment(s)` }, updated_at: now,
+    history: [...episode.history, { event_id: `${verified ? "verified" : "deployment"}:${receipt.run_id}:${receipt.run_attempt}`, at: now, actor: "system:deployment", kind: verified ? "verified" : "verification_passed", summary: `Successful deployment evidence: ${verified_receipts.length}/${episode.successful_deployments_required} required${repairAccepted ? "" : "; repair acceptance pending"}` }],
   });
 }

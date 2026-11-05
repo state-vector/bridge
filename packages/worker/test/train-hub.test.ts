@@ -137,6 +137,20 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [],
       deploy_coverage: { phase: "covered", tip_sha: head, tip_age_secs: 60, covered_by_sha: head, covered_by_run_id: 124 } } });
     snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("verifying");
+    expect(snap.line.recoveries[0].episode.verified_receipts).toHaveLength(1);
+    // A passing live run does not accept a still-unreviewed code repair.
+    await kbJson("/transition", { id: task, to: "in_progress", actor: "repairer-6522", session: "impl-6522", note: "implement repair" });
+    const handoff = await kbJson("/transition", { id: task, to: "in_review", actor: "repairer-6522", session: "impl-6522", note: `Direct main https://github.com/${repo}/commit/${head}` });
+    expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
+    const verifyId = handoff.body.verify_task;
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "verifier-6522", session: "verify-6522", note: "checking repair" });
+    const accepted = await kbJson("/transition", { id: verifyId, to: "done", actor: "verifier-6522", session: "verify-6522",
+      note: `VERIFY ACCEPT commit ${head} https://github.com/${repo}/actions/runs/124`,
+      review_result: { kind: "accepted_direct_main", repo, commit: head, ci_run_url: `https://github.com/${repo}/actions/runs/124` } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await kbJson("/get", { id: task })).body.status).toBe("done");
+    snap = await laneSnap(repo);
     expect(snap.line.recoveries[0].episode.stage.phase).toBe("recovered");
     expect(snap.line.recoveries[0].episode.stage.receipt.run_id).toBe(124);
     const fake = await command("fake-recovery", { kind: "recovered", task_id: task });

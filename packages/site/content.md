@@ -113,6 +113,8 @@ job. Each cause retains its repair task, stage, next action, bounded retry
 budget, actual action outcomes, evidence and history across workflow retries
 and executor restarts. Code delivery is not recovery: the hub closes an episode
 only after matched successful deployment evidence meets its verification bar.
+Code repairs also require independent delivery acceptance; a passing rerun alone
+cannot accept a fix that remains unmerged or unreviewed.
 The banner exposes these cause-specific records so independent defects cannot
 silently replace each other under one smoke-job label.
 

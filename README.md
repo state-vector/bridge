@@ -1745,7 +1745,10 @@ Episodes move through `diagnosing`, `repairing`, `verifying`, `exhausted`, and
 `recovered`; broad placeholders may be `superseded`. Code submission and task
 completion only start verification. Clients cannot emit a recovered event.
 The hub requires a successful decisive deployment receipt matching current main
-and a green effective check verdict. Set `successful_deployments_required` on
+and a green effective check verdict, plus accepted repair delivery (or the
+actual delivered bounded retry for a generic check failure). Passing deployment
+evidence can accrue while review is pending, but cannot accept an unmerged or
+unreviewed code repair. Set `successful_deployments_required` on
 an observed event when a stability bar needs several distinct successful runs;
 polls never count as additional successes and requirements cannot be weakened
 by later observations. New failures reset consecutive evidence.

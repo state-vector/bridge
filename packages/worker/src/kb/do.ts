@@ -8867,7 +8867,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (run) for (const [key, episode] of Object.entries(ledger)) {
         const newestFailure = episode.sources.reduce((a, b) => b.run_id > a.run_id || (b.run_id === a.run_id && b.run_attempt > a.run_attempt) ? b : a);
         if (run.id < newestFailure.run_id || (run.id === newestFailure.run_id && (run.run_attempt ?? 1) < newestFailure.run_attempt)) continue;
-        ledger[key] = verifyRecoveryEpisode(episode, { head_sha: cov.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: run.html_url }, now);
+        const repair = this.one(`SELECT status FROM artefacts WHERE id = ?`, episode.stage.task_id);
+        const repairAccepted = repair?.status === "done" || (episode.cause.kind === "check_failure" && episode.attempts.some((a) => a.kind === "retry" && a.status === "finished" && a.outcome === "delivered"));
+        ledger[key] = verifyRecoveryEpisode(episode, { head_sha: cov.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: run.html_url }, now, repairAccepted);
       }
     }
     lane.recovery_episodes = ledger;
