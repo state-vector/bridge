@@ -8,6 +8,13 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("a scoped-green base waiting only for the drift check is pending, not a failing main", () => {
+    const q = { at: now, base_state: { verdict: "green", red: [], unsettled: [], gate_blocked: true, gate_red: [], gate_unsettled: ["Deploy drift alarm"] } };
+    expect(projectTrainLine(facts({ queue_facts: q }), now)).toMatchObject({ phase: "waiting", blocker: "checks_running", label: "Waiting for required checks", remediation: { kind: "machine" } });
+    expect(projectTrainLine(facts({ queue_facts: q }), now + 16 * 60_000).phase).toBe("unknown");
+    expect(projectTrainLine(facts({ queue_facts: { ...q, base_state: { ...q.base_state, gate_red: [{ name: "Deploy drift alarm" }] } } }), now).phase).toBe("stopped");
+    expect(projectTrainLine(facts({ queue_facts: q, stop: { reason: "Actual stop", failing: [{ name: "Test" }] } }), now).phase).toBe("stopped");
+  });
   it("cause-bound repairs replace stale diagnostic selection without concealing a concrete human requirement", () => {
     const line = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [], unsettled: [] } },
       diagnostic: { ...task, id: "BR#6442", active_agent: false } }), now);
