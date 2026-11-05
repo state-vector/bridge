@@ -2574,6 +2574,18 @@ export type TrainLeg = {
   carry?: CarryRecord[];
 };
 
+/** The only valid append point for a machine-clean carry. */
+export function trainCarryChainEnd(leg: Pick<TrainLeg, "head_sha_at_acceptance" | "carry">): string {
+  let end = String(leg.head_sha_at_acceptance ?? "").toLowerCase();
+  for (const link of Array.isArray(leg.carry) ? leg.carry : []) {
+    const from = String(link.from_head ?? "").toLowerCase();
+    const to = String(link.to_head ?? "").toLowerCase();
+    if (from !== end || !/^[0-9a-f]{7,40}$/.test(to)) break;
+    end = to;
+  }
+  return end;
+}
+
 /** The card's legs: meta.prs when stamped (multi-PR), else the legacy
  *  meta.pr single leg. Empty when neither exists. */
 export function trainLegs(meta: any): TrainLeg[] {
@@ -2759,6 +2771,11 @@ export type TrainGateInput = {
   mergeStateStatus: string | null;
   /** commits of the PR: REST verification (verified=true = signed+valid) */
   commits: { sha: string; verified: boolean }[];
+  /** BR#4687 (L1.2): the branch is worker-authored — every commit's GitHub
+   *  author login sits on the worker allowlist. The behind pre-clear below
+   *  is provenance-gated on this: the train machine-updates its OWN
+   *  branches; a protected human branch still bounces to its owner. */
+  trainOwnedBranch?: boolean;
   headChecks: MainCheckRun[];
   /** BR#3659: which leg of the card's PR list this gate drives (1-based
    *  position in meta.prs) — the gate checks THAT leg's stamp, and the
@@ -3003,10 +3020,24 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
           ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
           : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
       }
-      // (5) Mechanically sound + base green + head green -> Merge
+      // (5) Mechanically sound + base green + head green -> Merge.
+      // BR#4687 (L1.2): the behind pre-clear is PROVENANCE-GATED. The train
+      // machine-updates branches its own fleet authored (every commit's
+      // GitHub author on the worker allowlist); a protected human branch is
+      // not the train's to move — it still bounces to its owner with the
+      // named state. Fail-closed: an input that does not say
+      // worker-authored is human-treated.
+      const behindPrecleared = behind && i.trainOwnedBranch === true;
+      if (behind && !behindPrecleared) {
+        return {
+          kind: "bounce",
+          defect: `PR #${i.prNumber} mergeStateStatus=behind against base on a protected (non-worker-authored) branch — the train does not move human branches. Rebase, re-sign, re-push and re-enter the queue`,
+          bounceKind: "gate",
+        };
+      }
       return {
         kind: "merge",
-        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
+        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behindPrecleared ? "behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
       };
     }
   }

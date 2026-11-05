@@ -1453,6 +1453,98 @@ describe("merge train DO drill (real bundled worker)", () => {
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-vocab", line_green: true });
   });
+
+  // BR#4687 (L1.2): the executor machine-updated a behind worker-authored
+  // branch — `updated` stamps the carry chain the moment the update lands,
+  // and the card re-enters the queue SILENTLY: no bounce, no status change,
+  // no review ask, no boost. The merge at the carried head must NOT
+  // double-append the chain leg.
+  it("BR#4687: train:updated carries the verdict across a machine update-branch — card re-enters silently, merged dedupes the chain", async () => {
+    const repo = "state-vector/lane-updated";
+    const A = "e".repeat(40), B = "f".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4687, head: A, title: "IMPL: behind carry drill" });
+    await acquire(repo, "gw-upd", { required_workflows: ["Test"] });
+
+    const upd = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd",
+      pr: 4687, task_id: card, from_head: A, head_sha: B,
+    });
+    expect(upd.body.error ?? "", `train:updated failed: ${JSON.stringify(upd.body)}`).toBe("");
+    expect(upd.body.task).toBe(card);
+
+    // the carry chain holds stamp→new head, and the card is EXACTLY where
+    // it was — queued (blocked) with the queue's own stamp untouched (the
+    // handler never writes meta.merge_train), unbounced, unboosted, no ask
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    const legCarry = c.meta?.prs?.find((l: any) => l.number === 4687)?.carry;
+    const legacyCarry = c.meta?.pr?.number === 4687 ? c.meta?.pr?.carry : undefined;
+    const carry = legCarry ?? legacyCarry;
+    expect(Array.isArray(carry)).toBe(true);
+    expect(carry).toHaveLength(1);
+    expect(String(carry[0].from_head).toLowerCase()).toBe(A);
+    expect(String(carry[0].to_head).toLowerCase()).toBe(B);
+    expect(carry[0].via).toBe("update-branch");
+    expect(c.meta?.merge_train?.state).toBe("queued");
+    expect(c.meta?.boosted).toBeUndefined();
+    expect(await reviewAsks(card)).toHaveLength(0);
+    const hist = (await kbJson("/train.history", { repo })).body.events;
+    expect(hist.filter((e: any) => e.kind === "updated")).toHaveLength(1);
+    expect(hist.filter((e: any) => e.kind === "bounced")).toHaveLength(0);
+
+    // A second clean update extends the chain's current end, not its stamp.
+    const C = "8".repeat(40);
+    const secondArgs = { repo, base: "main", kind: "updated", actor: "gw-upd", pr: 4687, task_id: card, from_head: B, head_sha: C };
+    expect((await kbJson("/train.event", secondArgs)).status).toBe(200);
+    expect((await kbJson("/train.event", secondArgs)).status).toBe(200); // replay is not another append
+    const gap = await kbJson("/train.event", { ...secondArgs, from_head: A, head_sha: "7".repeat(40) });
+    expect(gap.status).toBe(400);
+    // The merge lands at the carried head without appending a duplicate.
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-upd",
+      pr: 4687, merge_sha: "9".repeat(40), head_sha: C, task_id: card,
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const c2 = (await kbJson("/get", { id: card })).body;
+    const carry2 = c2.meta?.prs?.find((l: any) => l.number === 4687)?.carry ?? (c2.meta?.pr?.number === 4687 ? c2.meta?.pr?.carry : undefined);
+    expect(carry2).toHaveLength(2);
+    expect(carry2[1]).toMatchObject({ from_head: B, to_head: C });
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-upd" });
+  });
+
+  // BR#4687: the carry is only as good as its contiguity — a from_head that
+  // is not THIS leg's stamp is refused loud (a broken chain can never be
+  // extended), and garbage sha shapes never reach the meta write.
+  it("BR#4687: train:updated fails loud off-contiguity — from_head must be the leg's stamp, heads must be 40-hex", async () => {
+    const repo = "state-vector/lane-updated-guard";
+    const A = "1".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4688, head: A, title: "IMPL: behind carry guard" });
+    await acquire(repo, "gw-upd2", { required_workflows: ["Test"] });
+    const wrongBinding = await kbJson("/train.event", { repo, kind: "updated", actor: "gw-upd2", task_id: card,
+      pr: 9999, from_head: A, head_sha: "4".repeat(40) });
+    expect(wrongBinding.status).toBe(400);
+
+    const offChain = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd2",
+      pr: 4688, task_id: card, from_head: "2".repeat(40), head_sha: "3".repeat(40),
+    });
+    expect(String(offChain.body.error)).toContain("stamp");
+
+    const badShape = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd2",
+      pr: 4688, task_id: card, from_head: "not-a-sha", head_sha: "4".repeat(40),
+    });
+    expect(String(badShape.body.error)).toContain("40-hex");
+
+    // nothing was written: the chain is untouched, the card still queued
+    const c = (await kbJson("/get", { id: card })).body;
+    const carry = c.meta?.prs?.find((l: any) => l.number === 4688)?.carry ?? (c.meta?.pr?.number === 4688 ? c.meta?.pr?.carry : undefined);
+    expect(carry ?? []).toHaveLength(0);
+    expect(c.status).toBe("blocked");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-upd2" });
+  });
 });
 
 describe("BR#4489 starvation — capability-aware lane health", () => {
