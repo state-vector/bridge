@@ -1106,6 +1106,56 @@ describe("BR#4702 — capped re-attempts under a standing escalation are observa
   });
 });
 
+// ---------- (h) BR#6518 — a depth-capped card entering in_review gets a DETACHED verify duty, not a stranded review leg ----------
+
+describe("BR#6518 — the depth guard reroutes the verify round instead of dropping it", () => {
+  it("a 3-deep card entering in_review spawns a DETACHED verify duty (no depth-4 child_of edge), stamps the round, folds NO breach card, and a bounce re-entry REUSES the same round", async () => {
+    // 1. build a depth-3 chain: A → B → C → D (D carries 3 child_of ancestors,
+    //    the exact BR#6500 shape: recovery card under a fix under an umbrella)
+    const a = await kbJson("/create", { type: "task", title: "ROOT: br6518 chain A", qualified: true, session: "drill-a" });
+    expect(a.status).toBe(200);
+    const b = await kbJson("/create", { type: "task", title: "IMPL: br6518 chain B", qualified: true, session: "drill-b" });
+    const c3 = await kbJson("/create", { type: "task", title: "IMPL: br6518 chain C", qualified: true, session: "drill-c" });
+    const d = await kbJson("/create", { type: "task", title: "IMPL: br6518 depth-capped D", qualified: true, session: "drill-d" });
+    for (const [src, dst] of [[b.body.id, a.body.id], [c3.body.id, b.body.id], [d.body.id, c3.body.id]]) {
+      const l = await kbJson("/link", { src, relation: "child_of", dst });
+      expect(l.status, `link ${src} → ${dst} failed: ${JSON.stringify(l.body)}`).toBe(200);
+    }
+    // the BR#532 cap holds at the relation layer: a 5th node under D is refused
+    const e = await kbJson("/create", { type: "task", title: "IMPL: br6518 would-be depth-4", qualified: true, session: "drill-e" });
+    expect((await kbJson("/link", { src: e.body.id, relation: "child_of", dst: d.body.id })).status).toBeGreaterThanOrEqual(400);
+
+    // 2. D enters review — pre-BR#6518 this spawned NOTHING (no review leg,
+    //    card stranded believing a verifier existed) and folded a
+    //    spawn-while-open breach card on the guard's own suppression
+    expect((await kbJson("/transition", { id: d.body.id, to: "in_progress", actor: "drill-d", session: "drill-d" })).status).toBe(200);
+    const rv = await kbJson("/transition", { id: d.body.id, to: "in_review", actor: "drill-d", session: "drill-d", note: "execution receipts: https://example.com/br6518-run" });
+    expect(rv.status, `in_review failed: ${JSON.stringify(rv.body)}`).toBe(200);
+
+    // 3. the duty exists, DETACHED: no child_of edge anywhere, the SUBJECT
+    //    binding rides the duty body, the round is stamped on D
+    const verifyDuties = async () => ((await kbJson("/list", { type: "task", limit: 500 })).body?.artefacts ?? [])
+      .filter((x: any) => x.title.startsWith("Verify: IMPL: br6518 depth-capped D"));
+    const duties = await verifyDuties();
+    expect(duties.length, `expected 1 detached duty, got ${JSON.stringify(duties.map((x: any) => x.id))}`).toBe(1);
+    expect(duties[0].roles).toContain("review");
+    expect(String(duties[0].body_md)).toContain(String(d.body.id));
+    const rels = (await kbJson("/relations", { id: duties[0].id })).body?.relations ?? [];
+    expect(rels.filter((r: any) => r.relation === "child_of")).toHaveLength(0);
+    expect((await taskById(d.body.id)).meta?.verify_round?.duty).toBe(duties[0].id);
+
+    // 4. the fold over the audit stream raises NO spawn-while-open card for D
+    const breaches = ((await kbJson("/list", { type: "task", tag: "breach", limit: 200 })).body?.artefacts ?? [])
+      .filter((x: any) => String(x.meta?.breach_task ?? "") === String(d.body.id));
+    expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((x: any) => [x.id, x.meta?.breach_key]))}`).toHaveLength(0);
+
+    // 5. bounce → re-enter review: the SAME round is reused, no duplicate duty
+    expect((await kbJson("/transition", { id: d.body.id, to: "in_progress", actor: "verifier-6518", session: "verifier-6518", note: "bounced — findings: receipt chain incomplete" })).status).toBe(200);
+    const rv2 = await kbJson("/transition", { id: d.body.id, to: "in_review", actor: "drill-d", session: "drill-d", note: "execution receipts re-recorded: https://example.com/br6518-run-2" });
+    expect(rv2.status, `re-entry failed: ${JSON.stringify(rv2.body)}`).toBe(200);
+    expect((await verifyDuties()).length, "bounce re-entry must reuse the stamped round, never stack a second duty").toBe(1);  });
+});
+
 // ---------- (i) BR#5916 — the zombie-park re-arm: unclaimable infra anchors ----------
 
 describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (machine, no breach)", () => {

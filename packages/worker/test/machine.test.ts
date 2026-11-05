@@ -48,6 +48,7 @@ const baseCtx = (): RuleCtx => ({
   openChildDetails: () => [],
   spawnGuard: () => null,
   openVerifyChild: () => null,
+  openVerifyRound: () => null,
   openUnblockChild: () => null,
   cardBody: () => "",
   closeLegChildClosed: () => false,
@@ -831,11 +832,27 @@ describe("effects decided executor-side (F4)", () => {
     expect(v.effects).toEqual([{ kind: "reuse_verify", parent: "BR#1", verify: "BR#99" }]);
   });
 
-  it("verify-of-verify / nesting guards SKIP the spawn — and the skip becomes a breach event", async () => {
+  it("verify-of-verify / nesting guards DETACH the verify round instead of dropping the review leg (BR#6518)", async () => {
     const c = baseCtx();
     c.spawnGuard = () => "ancestor BR#5 is a review task — verify-of-verify is blocked";
-    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "PR https://x/pull/1" } }), c));
-    expect(v.effects).toEqual([{ kind: "skip_verify_spawn", parent: "BR#1", reason: "ancestor BR#5 is a review task — verify-of-verify is blocked" }]);
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "PR https://github.com/x/y/pull/1" } }), c));
+    expect(v.effects).toEqual([
+      {
+        kind: "spawn_verify",
+        parent: "BR#1",
+        detached: true,
+        reroute: "ancestor BR#5 is a review task — verify-of-verify is blocked",
+        pr: "https://github.com/x/y/pull/1",
+      },
+    ]);
+  });
+
+  it("a depth-capped subject with a stamped round REUSES it — no duplicate detached duty per bounce cycle (BR#6518)", async () => {
+    const c = baseCtx();
+    c.spawnGuard = () => "nesting depth 3 would exceed the child_of cap of 3";
+    c.openVerifyRound = () => ({ id: "BR#77" });
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "receipts: https://github.com/x/y/pull/1" } }), c));
+    expect(v.effects).toEqual([{ kind: "reuse_verify", parent: "BR#1", verify: "BR#77" }]);
   });
 
   it("blocked spawns an unblock child with the exit condition; cap and flood guard skip it", async () => {

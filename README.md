@@ -452,7 +452,8 @@ checks are green. There is no separate human merge gate for a verified PR. The c
 impl works → rebases → pushes a mergeable PR → `in_review`; verify reviews substance
 (mergeability confirmed first — rule 5c); findings → bounce back to impl
 (`in_review → in_progress`, one round, N bounces — the same verify round re-enters, it
-never stacks); loop until the train merges and closes. The one-round rule is
+never stacks; a depth-capped card's round rides detached and re-enters the same way —
+BR#6518); loop until the train merges and closes. The one-round rule is
 **target-scoped** (BR#5874): a second verify duty linked under the same parent supersedes
 an older open round only when both cover the SAME PR — resolved from the card's `meta.pr`/
 `meta.prs` binding, its body's GitHub pull URL, or its title ("slug PR #N"). A disposition
@@ -492,7 +493,15 @@ audited without folding a breach card, and a resume consumes the unblock round s
 silence issues one fresh round instead of flooding for an hour. The spawner cap re-suppresses
 the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
-card, carries the recurring block to the human ledger.
+card, carries the recurring block to the human ledger. The verify spawn's nesting guard
+plays the same law (BR#6518): the BR#532 depth cap (`child_of` chains ≤ 3) used to make a
+depth-capped card entering `in_review` skip the verify spawn outright — no review leg ever
+existed, the card sat in review believing a verifier was coming, and the skip folded a
+spawn-while-open breach card on the guard's own working. The guard now reroutes: the duty
+spawns DETACHED (no `child_of` edge — the cap holds by the letter; a verify duty cannot
+recurse anyway, review cards never spawn one), the round is stamped on the subject
+(`meta.verify_round`) so a bounce re-entry reuses it instead of stacking a duplicate, and
+the (now unreachable) skip path audits `spawn_verify_skipped` without folding.
 The trains panel is honest about capability and activity (BR#4981): a held lock names
 its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
 shows the pill `train ready` (the tooltip names the machine and its last tick age);
