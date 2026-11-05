@@ -46,6 +46,22 @@ export type TrainLineProjection = z.infer<typeof TrainLineProjectionSchema>;
 
 export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonNullable<TrainLineProjection["recoveries"]>): TrainLineProjection {
   const open = recoveries.filter((r) => recoveryIsOpen(r.episode));
+  // The cause-bound repair is authoritative over historical starvation or
+  // generic diagnostic duties. Keep actual human requirements intact.
+  if (line.phase === "stopped" && line.blocker === "main_failed" && line.remediation.kind !== "human") {
+    const ranked = open.filter((r) => r.task && r.task.status !== "done" && r.task.status !== "superseded")
+      .sort((a, b) => Number(!!b.task?.active_agent) - Number(!!a.task?.active_agent)
+        || Number(a.episode.cause.kind === "check_failure") - Number(b.episode.cause.kind === "check_failure")
+        || b.episode.updated_at - a.episode.updated_at);
+    const repair = ranked[0];
+    if (repair?.task) return TrainLineProjectionSchema.parse({ ...line, recoveries, remediation: {
+      kind: repair.task.active_agent ? "agent" : "queued", task: repair.task,
+      text: repair.task.active_agent ? repairProgressText(repair.task)
+        : repair.task.blocked_reason ? `The repair is waiting: ${repair.task.blocked_reason}`
+        : repair.task.status === "in_progress" ? "The cause-bound repair has no recent heartbeat; executor recovery is pending."
+        : "The cause-bound repair is queued for execution or independent verification.",
+    } });
+  }
   if (open.length && line.phase === "ready") return TrainLineProjectionSchema.parse({ ...line, recoveries,
     phase: "waiting", label: "Verifying recovery", blocker: "checks_running",
     reason: "Repair work is not yet proven recovered by a matching successful deployment.",

@@ -127,6 +127,8 @@ Repair-merge receipts appear in the recovery history without claiming that the
 deployment has passed.
 Out-of-band merge observations must match the independently accepted repair
 head and still require live deployment verification.
+Cause-bound repairs take precedence over stale generic diagnostic tasks in the
+main-failure banner, while explicit human requirements remain visible.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

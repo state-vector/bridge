@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText } from "@bridge/contracts";
+import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText, withRecoveryEpisodes, reduceRecoveryEpisode } from "@bridge/contracts";
 import { applyDeployObservation, normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
 
 const now = 2_000_000;
@@ -8,6 +8,19 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("cause-bound repairs replace stale diagnostic selection without concealing a concrete human requirement", () => {
+    const line = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [], unsettled: [] } },
+      diagnostic: { ...task, id: "BR#6442", active_agent: false } }), now);
+    const episode = reduceRecoveryEpisode(undefined, { head_sha: "7".repeat(40),
+      cause: { kind: "capability_unavailable", check: "Smoke", scenario: "php", capability: "callers", scope: "User.php:2416" }, event_id: "cause", actor: "observer", now,
+      event: { kind: "observed", task_id: "BR#6494", next: "Publish callers repair", source: { head_sha: "7".repeat(40), run_id: 100, run_attempt: 1, url: "https://github.com/o/r/actions/runs/100" } } });
+    const recoveries = [{ episode, task: { ...task, id: "BR#6494" } }];
+    expect(withRecoveryEpisodes(line, recoveries)).toMatchObject({ remediation: { kind: "agent", task: { id: "BR#6494" } } });
+    expect(withRecoveryEpisodes(line, [{ episode, task: { ...task, id: "BR#6494", active_agent: false } }])).toMatchObject({ remediation: { kind: "queued", task: { id: "BR#6494" } } });
+    if (line.phase !== "stopped") throw new Error("expected stopped fixture");
+    const human = { ...line, remediation: { kind: "human" as const, text: "Missing credential", action: { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Grant access?", options: ["Grant"] } } };
+    expect(withRecoveryEpisodes(human, recoveries).remediation).toEqual(human.remediation);
+  });
   it("runner transcripts remain diagnostic output, never an invented next action", () => {
     const runner = { ...task, last_progress: { note: "runner: agent output — timing suggests classifier...", ts: now } };
     expect(repairProgressText(runner)).toBe("Agent session is active; next action has not yet been reported.");

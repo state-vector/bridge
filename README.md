@@ -1774,6 +1774,8 @@ An executor can also report a first-hand out-of-band repair merge through
 accepted binding. That only advances verification; it cannot certify recovery.
 Before the accepted repair lifecycle closes, merge-observed verification requires
 deployment of that exact merge SHA; workflow ordering alone is not ancestry proof.
+The live main-failure banner selects an open cause-bound repair ahead of stale
+starvation diagnostics, preserving concrete human-action requests when present.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery
