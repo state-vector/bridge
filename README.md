@@ -232,6 +232,9 @@ a bounded checkpoint/stop through its durable mailbox. Wait for quiescent
 checkpoints and a writer-free runner before replacing it, then run
 `bridge execution resume`. The gateway's own credential is required; a pause
 is not a credential failure or a waiver of task/transfer fences.
+After restart, an unchanged same-host claim with authoritative writer quiescence
+can resume immediately; an old conversation timestamp is not evidence that a
+quiesced process is still running. Local handoffs and changed holders remain fenced.
 
 Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
 and independent receipt review; other repositories retain PR/merge-train

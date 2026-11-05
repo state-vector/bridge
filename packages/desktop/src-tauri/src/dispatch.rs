@@ -153,6 +153,13 @@ fn execution_rank(task: &serde_json::Value) -> u8 {
     else if has("tags", "diagnostic") { 2 }
     else { 1 }
 }
+fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
+    task["status"] == "in_progress" && state["attempt"]["phase"] == "quiesced"
+        && state["attempt"]["host"].as_str() == host && host.is_some()
+        && state["attempt"]["session"].as_str().is_some()
+        && state["attempt"]["session"] == task["meta"]["session"]
+        && matches!(state.pointer("/handoff/phase").and_then(|v| v.as_str()), None | Some("none" | "returned"))
+}
 
 fn executor_capabilities(tier: ReasoningTier, worker: &WorkerCredential) -> serde_json::Value {
     let tools: Vec<&str> = ["git", "gh", "cargo", "npm", "aws"].into_iter().filter(|bin| {
@@ -4389,6 +4396,14 @@ fn tick(
         }
         let meta_obj = task_meta.as_object();
         let sess = find_session(&sessions, tid);
+        if execution_call(cfg, tid, json!({ "kind": "inspect" })).map(|state| quiesced_claim_can_resume(&state, &art, cfg.label.as_deref())).unwrap_or(false) {
+            let role_work = art["roles"].as_array().map(|roles| roles.iter().any(|role| matches!(role.as_str(), Some("analysis" | "review" | "unblock")))).unwrap_or(false);
+            // Authoritative quiescence beats an old conversation's recent
+            // timestamp. Keep the claim/session; begin restores/fences anew.
+            spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess.map(|s| s.id.clone()), role_work, "task", avail, in_flight, worker_credential);
+            attempts.insert(tid.to_string(), Instant::now());
+            continue;
+        }
         let disposition = claim_liveness(
             sess.and_then(|s| s.updated_ms),
             meta_obj.and_then(|m| m.get("session_alive_ts")).and_then(|v| v.as_u64()),
@@ -5184,6 +5199,18 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quiescence_can_resume_only_the_same_hosts_unchanged_claim_without_a_local_handoff() {
+        let task = json!({ "status": "in_progress", "meta": { "session": "dispatch-BR-1" } });
+        let mut state = json!({ "attempt": { "phase": "running", "host": "host", "session": "dispatch-BR-1" }, "handoff": { "phase": "none" } });
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+        state["attempt"]["phase"] = json!("quiesced");
+        assert!(quiesced_claim_can_resume(&state, &task, Some("host")));
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("other")));
+        assert!(!quiesced_claim_can_resume(&state, &json!({ "status": "in_progress", "meta": { "session": "local-owner" } }), Some("host")));
+        state["handoff"]["phase"] = json!("waiting");
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+    }
 
     #[test]
     fn orient_gate_matches_the_checked_in_production_fixture() {
