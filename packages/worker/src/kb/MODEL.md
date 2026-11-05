@@ -47,13 +47,16 @@ Post-write invariants run on the single write path. Every
 `replay_mismatch` event folds through `foldBreaches()` — one OPEN breach
 card per `(task, class)` key (classes: same-gate rejection storms at 3
 events; spawn-while-open, invariant violation and replay mismatch on the
-first event). `replayStatus()` folds the version log's transition chain
+first event). The verify spawn's own guard suppression is exempt: a
+depth-capped subject gets a DETACHED verify round instead of a skip
+(BR#6518), and the skip's residual handler audits `spawn_verify_skipped`
+without folding — the BR#532 cap working is never a breach. `replayStatus()` folds the version log's transition chain
 forward and compares with stored state; a disagreement (or a broken chain)
 is itself a breach. Breach cards are tasks tagged `breach:<class>`.
 
 ## Verification duty
 
-`in_review` is a blocked-until-verdict state. The implementer holds the claim and polls; a fresh `role:review` agent picks the verify child, checks receipts, then closes the parent (`done`) or bounces it (`in_progress` with findings). A bounce or done supersedes any open verify children — the next `in_review` spawns a fresh round. Unclaimed verify children stall their parents: they outrank everything in the unclaimed pool, surface a `verification_stalled` signal to both owner and reviewers, and score-penalize idle reviewers.
+`in_review` is a blocked-until-verdict state. The implementer holds the claim and polls; a fresh `role:review` agent picks the verify child, checks receipts, then closes the parent (`done`) or bounces it (`in_progress` with findings). A bounce or done supersedes any open verify children — the next `in_review` spawns a fresh round. A card already 3 deep in a `child_of` chain (the BR#532 nesting cap) spawns its round DETACHED (BR#6518): no `child_of` edge — the cap holds by the letter — with the round stamped on the subject (`meta.verify_round`) so a bounce re-entry reuses it; a verify duty cannot recurse (review cards never spawn one), so detached costs nothing structurally. The old skip-dropped-the-leg behavior stranded such cards in `in_review` forever and folded a spawn-while-open breach on the guard's own working. Unclaimed verify children stall their parents: they outrank everything in the unclaimed pool, surface a `verification_stalled` signal to both owner and reviewers, and score-penalize idle reviewers.
 
 ## Knowledge artefacts
 

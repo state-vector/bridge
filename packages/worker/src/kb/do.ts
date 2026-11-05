@@ -4877,6 +4877,18 @@ export class KnowledgeHub {
            WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
              AND c.roles LIKE '%"review"%' AND r.src_id != r.dst_id ORDER BY c.updated_ts DESC LIMIT 1`, id,
         ),
+      // BR#6518: the subject's stamped DETACHED verify round (meta.verify_round.duty)
+      // while that duty is still an open role:review task — a detached duty has no
+      // child_of edge, so openVerifyChild cannot see it
+      openVerifyRound: () => {
+        const m = JSON.parse(String(row.meta ?? "{}")) as Record<string, any>;
+        const dutyId = m.verify_round?.duty;
+        if (typeof dutyId !== "string" || !dutyId) return null;
+        const d = this.one(`SELECT id, status, roles FROM artefacts WHERE id = ?`, dutyId);
+        if (!d || !["todo", "in_progress", "blocked"].includes(String(d.status))) return null;
+        if (!parseTags(d.roles).includes("review")) return null;
+        return { id: String(d.id) };
+      },
       // at most ONE live unblock child per parent, ever (cap ≤1 open)
       openUnblockChild: () =>
         this.one(
@@ -5614,11 +5626,22 @@ export class KnowledgeHub {
             actor,
           );
           verifyTaskId = created.id;
-          this.state.storage.sql.exec(
-            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
-            created.id, id, ts,
-          );
-          this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
+          if (fx.detached) {
+            // BR#6518: depth-capped subject — the duty rides DETACHED: no
+            // child_of edge (this insert would otherwise be the BR#532 cap's
+            // 4th level), the subject binding lives in the duty body/title
+            // and the round stamp. meta.verify_round lets a bounce re-entry
+            // REUSE this round (openVerifyChild cannot see a detached duty).
+            meta.verify_round = { duty: created.id, at: ts };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+            this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id, detached: true, reroute: fx.reroute ?? null });
+          } else {
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+              created.id, id, ts,
+            );
+            this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
+          }
           break;
         }
         case "reuse_verify": {
@@ -5627,8 +5650,13 @@ export class KnowledgeHub {
           break;
         }
         case "skip_verify_spawn": {
-          this.audit("system:guard", "spawn_skipped", id, { auto: "verification", reason: fx.reason });
-          try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
+          // BR#6518: decide() no longer emits this — a depth-capped subject
+          // gets a DETACHED verify round instead of a bare skip. The handler
+          // stays as defense-in-depth, and its audit op no longer folds a
+          // breach card: the BR#532 cap suppressing a verify spawn is the cap
+          // WORKING — the same observable-never-folded law as the unblock
+          // spawner's flood (BR#4282) and cap (BR#4702) skips.
+          this.audit("system:guard", "spawn_verify_skipped", id, { auto: "verification", reason: fx.reason });
           break;
         }
         case "spawn_unblock": {

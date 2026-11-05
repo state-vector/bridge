@@ -77,6 +77,10 @@ export interface RuleCtx {
   spawnGuard(): string | null | Promise<string | null>;
   /** newest OPEN role:review child (reuse candidate), or null */
   openVerifyChild(): { id: string } | null | Promise<{ id: string } | null>;
+  /** BR#6518: the subject's stamped DETACHED verify round (meta.verify_round)
+   *  while that duty is still an OPEN role:review task, or null — a detached
+   *  duty has no child_of edge, so openVerifyChild cannot see it */
+  openVerifyRound(): { id: string } | null | Promise<{ id: string } | null>;
   /** newest OPEN role:unblock child (cap ≤1 per parent), or null */
   openUnblockChild(): { id: string } | null | Promise<{ id: string } | null>;
   /** the task's own body_md (the Done-when section lives there) */
@@ -253,7 +257,7 @@ export function prTargetMatch(a: { repo?: string; number: number } | null | unde
 }
 
 export type Effect =
-  | { kind: "spawn_verify"; parent: string; pr: string | null }
+  | { kind: "spawn_verify"; parent: string; pr: string | null; detached?: boolean; reroute?: string }
   | { kind: "reuse_verify"; parent: string; verify: string }
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
@@ -866,18 +870,37 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
 
   // entering review: the verification duty. Recursion-guarded; reuse over spawn.
   if (i.to === "in_review" && r !== "review") {
-    const guard = await c.spawnGuard();
-    if (guard) {
-      effects.push({ kind: "skip_verify_spawn", parent: i.id, reason: guard });
+    const open = (await c.openVerifyChild()) ?? (await c.openVerifyRound());
+    if (open) {
+      effects.push({ kind: "reuse_verify", parent: i.id, verify: open.id });
     } else {
-      const open = await c.openVerifyChild();
-      if (open) effects.push({ kind: "reuse_verify", parent: i.id, verify: open.id });
-      else
+      const guard = await c.spawnGuard();
+      // BR#6518: the guard used to SKIP the spawn outright — a depth-capped
+      // subject (≥3 child_of ancestors, the BR#532 cap) got NO review leg at
+      // all: the card sat in in_review believing a verifier existed, and the
+      // skip folded a spawn-while-open breach on the guard's own working (the
+      // same detection-noise class BR#4282 flood and BR#4702 spawn-cap fixed
+      // for the unblock spawner). The depth leg can no longer cost the review
+      // leg: a verify duty cannot recurse (review cards never spawn one — the
+      // r !== "review" gate above), so when the cap fires the duty rides
+      // DETACHED — no child_of edge, the BR#532 nesting cap holds by the
+      // letter — stamped on the subject (meta.verify_round) so a bounce
+      // re-entry reuses the round instead of stacking a duplicate.
+      if (guard) {
+        effects.push({
+          kind: "spawn_verify",
+          parent: i.id,
+          detached: true,
+          reroute: guard,
+          pr: prFromNote(String(i.body?.note ?? "")),
+        });
+      } else {
         effects.push({
           kind: "spawn_verify",
           parent: i.id,
           pr: prFromNote(String(i.body?.note ?? "")),
         });
+      }
     }
   }
 
