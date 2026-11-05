@@ -26,11 +26,24 @@ export const BaseRedPhaseSchema = z.enum([
 ]);
 export type BaseRedPhase = z.infer<typeof BaseRedPhaseSchema>;
 
+export const TrainFixCardProgressSchema = z.object({
+  note: z.string(),
+  will: z.string().optional(),
+  completion_pct: z.number().int().min(0).max(100).optional(),
+  ts: z.number(),
+});
+export type TrainFixCardProgress = z.infer<typeof TrainFixCardProgressSchema>;
+
 export const TrainFixCardSchema = z.object({
   id: z.string(),
   url: z.string(),
   title: z.string(),
   status: z.string(),
+  owner: z.string().optional(),
+  executor_session: z.string().optional(),
+  active_agent: z.boolean().optional(),
+  blocked_reason: z.string().optional(),
+  last_progress: TrainFixCardProgressSchema.nullable().optional(),
   pr: z.number().int().positive().optional(),
   pr_url: z.string().optional(),
   conflict: z.boolean().optional(),
@@ -103,6 +116,7 @@ export const DeployCoverageStateSchema = z.discriminatedUnion("phase", [
     tip_sha: z.string(),
     tip_age_secs: z.number().int().nonnegative(),
     failing_run_id: z.number().int().positive().nullable().optional(),
+    failing_run_url: z.string().nullable().optional(),
     last_green_sha: z.string().nullable().optional(),
     last_green_run_id: z.number().int().positive().nullable().optional(),
   }),

@@ -1355,6 +1355,8 @@ pub enum DeployCoverageState {
         #[serde(skip_serializing_if = "Option::is_none")]
         failing_run_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        failing_run_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         last_green_sha: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_green_run_id: Option<i64>,
@@ -1619,14 +1621,24 @@ pub fn reconcile_deploy_coverage(
             && r.conclusion.as_deref().map(|c| c != "cancelled" && is_red_conclusion(c)).unwrap_or(false)
     });
 
-    if base_verdict.verdict == MainVerdict::Green {
+    // Workflow evidence outranks a green SUBSET of job checks. Never attach an
+    // older SHA's green run to this tip (the false-green incident, BR#6458).
+    let newest_tip = tip_runs.iter().copied().find(|r| !matches!(
+        r.conclusion.as_deref(), Some("cancelled" | "skipped")
+    ));
+    let decisive_failure = newest_tip.filter(|r| r.status.as_deref() == Some("completed")
+        && r.conclusion.as_deref().map(is_red_conclusion).unwrap_or(false));
+    if base_verdict.verdict == MainVerdict::Green && decisive_failure.is_none()
+        && tip_active.is_none()
+        && (tip_green.is_some() || infer_deploy_workflow(required, workflow_runs).is_none())
+    {
         return DeployReconcilePlan {
             coverage: DeployCoverageState::Covered {
                 tip_sha: tip_sha.clone(),
                 tip_age_secs,
                 covered_by_sha: tip_sha.clone(),
-                covered_by_run_id: tip_green.map(|r| r.id).or(last_green_run_id),
-                covered_by_url: tip_green.and_then(|r| r.html_url.clone()).or_else(|| newest_green.and_then(|r| r.html_url.clone())),
+                covered_by_run_id: tip_green.map(|r| r.id),
+                covered_by_url: tip_green.and_then(|r| r.html_url.clone()),
             },
             dispatch_workflow: None,
             cancel_run_ids,
@@ -1635,12 +1647,15 @@ pub fn reconcile_deploy_coverage(
         };
     }
 
-    if base_verdict.verdict == MainVerdict::Red {
+    if base_verdict.verdict == MainVerdict::Red
+        || decisive_failure.is_some()
+    {
         return DeployReconcilePlan {
             coverage: DeployCoverageState::Failed {
                 tip_sha,
                 tip_age_secs,
                 failing_run_id: tip_red.map(|r| r.id),
+                failing_run_url: tip_red.and_then(|r| r.html_url.clone()),
                 last_green_sha: last_green_sha.clone(),
                 last_green_run_id,
             },
@@ -1786,6 +1801,86 @@ pub fn format_deploy_coverage_summary(cov: &DeployCoverageState) -> String {
     }
 }
 
+/// Reconciles `CheckVerdict` (computed from commit check-runs) with
+/// `DeployCoverageState` (computed from deploy workflow runs) into a single
+/// cohesive base verdict (BR#6389):
+/// - When `base_verdict.verdict == MainVerdict::Empty` because a multi-stage
+///   deploy workflow (e.g. `Deploy Dev` in `Prepare deploy to dev (build on spot)`)
+///   has not created downstream `required_workflows` check-runs yet, but
+///   `coverage` is `DeployCoverageState::Settling`, the effective verdict is
+///   `MainVerdict::Unsettled` (with `alarm: None`), NEVER `Empty` ("dark tip").
+/// - When `base_verdict.verdict == MainVerdict::Empty` and `coverage` is
+///   `DeployCoverageState::Failed` (the deploy workflow failed in build/setup
+///   before creating downstream check-runs), the effective verdict is
+///   `MainVerdict::Red` naming `Deploy Dev`.
+/// - When `base_verdict.verdict == MainVerdict::Empty` and `coverage` is
+///   `DeployCoverageState::Covered`, keep waiting for required check evidence.
+/// Mirrored in `core.ts` `reconcileBaseVerdictWithDeployCoverage`.
+pub fn reconcile_base_verdict_with_deploy_coverage(
+    base_verdict: &CheckVerdict,
+    coverage: &DeployCoverageState,
+) -> CheckVerdict {
+    // This is the effective line-health reducer, not an empty-checks cosmetic
+    // adapter. Deployment failure must override scoped job-subset GREEN.
+    if base_verdict.verdict == MainVerdict::Red {
+        return base_verdict.clone();
+    }
+    match coverage {
+        DeployCoverageState::Settling { active_run_id, .. } => {
+            let mut v = base_verdict.clone();
+            v.verdict = MainVerdict::Unsettled;
+            v.alarm = None;
+            if v.unsettled.is_empty() {
+                let label = match active_run_id {
+                    Some(id) => format!("Deploy Dev (run #{id} in flight)"),
+                    None => "Deploy Dev (in flight)".to_string(),
+                };
+                v.unsettled.push(label);
+            }
+            v
+        }
+        DeployCoverageState::Failed { failing_run_id, failing_run_url, .. } => {
+            let mut v = base_verdict.clone();
+            v.verdict = MainVerdict::Red;
+            v.alarm = None;
+            if v.red.is_empty() {
+                let name = match failing_run_id {
+                    Some(id) => format!("Deploy Dev (run #{id})"),
+                    None => "Deploy Dev".to_string(),
+                };
+                v.red.push(MainRedCheck {
+                    name,
+                    conclusion: "failure".to_string(),
+                    url: failing_run_url.clone().unwrap_or_default(),
+                });
+            }
+            v
+        }
+        DeployCoverageState::Covered { .. } => {
+            if base_verdict.verdict != MainVerdict::Empty {
+                return base_verdict.clone();
+            }
+            let mut v = base_verdict.clone();
+            v.verdict = MainVerdict::Unsettled;
+            v.unsettled.push("Deployment finished; waiting for required checks".to_string());
+            v.alarm = None;
+            v
+        }
+        DeployCoverageState::UncoveredGrace { .. } | DeployCoverageState::UncoveredDispatched { .. } => {
+            let mut v = base_verdict.clone();
+            v.verdict = MainVerdict::Unsettled;
+            v.unsettled.push("Waiting for a covering deployment to start".to_string());
+            v
+        }
+        DeployCoverageState::UncoveredDark { reason, .. } => {
+            let mut v = base_verdict.clone();
+            v.verdict = MainVerdict::Empty;
+            v.alarm = Some(reason.clone());
+            v
+        }
+    }
+}
+
 // ---------- fixtures mirrored from packages/worker/test/merge-train.test.ts ----------
 
 #[cfg(test)]
@@ -1796,6 +1891,30 @@ fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decisive_failed_deploy_overrules_scoped_green_and_never_borrows_old_receipt() {
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into(), "post-deploy / Post-Deploy Smoke".into(),
+            "post-deploy / DNS chain (front doors)".into(), "post-deploy / Lodestar Operational Health".into()];
+        let runs: Vec<MainCheckRun> = required.iter().enumerate().map(|(i, name)| run(i as i64, name, Some("success"))).collect();
+        let scoped = classify_base_check_runs(&runs, &required);
+        assert_eq!(scoped.verdict, MainVerdict::Green);
+        let workflow = |id, sha: &str, conclusion: &str| DeployWorkflowRun { id, name: "Deploy Dev".into(),
+            path: Some(".github/workflows/deploy-dev.yml".into()), head_sha: sha.into(), event: Some("push".into()),
+            status: Some("completed".into()), conclusion: Some(conclusion.into()), html_url: Some(format!("https://github.com/actions/runs/{id}")) };
+        let workflows = vec![workflow(41926939169, "78760d10", "failure"), workflow(41924676992, "e99f74f8", "success")];
+        let plan = reconcile_deploy_coverage("78760d10", 7800, 300, &scoped, &required, &workflows, None);
+        assert!(matches!(plan.coverage, DeployCoverageState::Failed { failing_run_id: Some(41926939169), .. }));
+        assert_eq!(plan.covered_by_sha.as_deref(), Some("e99f74f8"));
+        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage);
+        assert_eq!(effective.verdict, MainVerdict::Red);
+        assert!(effective.red[0].url.ends_with("41926939169"));
+        // Effective red cannot dispatch stale-gate recovery or clear a stop.
+        assert_ne!(effective.verdict, MainVerdict::Green);
+        let newer_failure = vec![workflow(3, "tip", "failure"), workflow(2, "tip", "success")];
+        assert!(matches!(reconcile_deploy_coverage("tip", 900, 300, &scoped, &required, &newer_failure, None).coverage,
+            DeployCoverageState::Failed { .. }));
+    }
 
     #[test]
     fn latest_red_deploy_health_ignores_superseded_red_when_latest_green_br5880() {
@@ -3246,6 +3365,81 @@ mod tests {
             plan_settling.coverage,
             DeployCoverageState::Settling { active_run_id: Some(41798951196), .. }
         ));
+
+        // 5b. Stage-1 Spot build (exact 20b508b328 PR #2899 incident, BR#6389):
+        //     `check_runs` has only `deploy / Prepare deploy to dev (build on spot)` (0 of 4 required runs),
+        //     so `classify_base_check_runs` returns `Empty` with alarm, while `Deploy Dev` workflow run
+        //     41911085476 is `in_progress`. `reconcile_base_verdict_with_deploy_coverage` MUST promote
+        //     the base verdict from `Empty` to `Unsettled` and clear the spurious alarm so the UI/hub
+        //     never misclassifies an active deploy as a dark tip.
+        let spot_build_verdict = classify_base_check_runs(
+            &[MainCheckRun {
+                id: 126859440408,
+                name: "deploy / Prepare deploy to dev (build on spot)".into(),
+                status: Some("in_progress".into()),
+                conclusion: None,
+                html_url: None,
+            }],
+            &required,
+        );
+        assert_eq!(spot_build_verdict.verdict, MainVerdict::Empty);
+        let plan_spot = reconcile_deploy_coverage(
+            "20b508b3281abf77e7cfec680d920df0e27a7ef2",
+            147,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &spot_build_verdict,
+            &required,
+            &[DeployWorkflowRun {
+                id: 41911085476,
+                name: "Deploy Dev".into(),
+                path: Some(".github/workflows/deploy-dev.yml".into()),
+                head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),
+                event: Some("push".into()),
+                status: Some("in_progress".into()),
+                conclusion: None,
+                html_url: Some("https://github.com/state-vector/superpositional/actions/runs/41911085476".into()),
+            }],
+            None,
+        );
+        assert!(matches!(
+            plan_spot.coverage,
+            DeployCoverageState::Settling { active_run_id: Some(41911085476), .. }
+        ));
+        let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage);
+        assert_eq!(reconciled_spot.verdict, MainVerdict::Unsettled);
+        assert!(reconciled_spot.alarm.is_none());
+        assert_eq!(reconciled_spot.unsettled, vec!["Deploy Dev (run #41911085476 in flight)"]);
+
+        // 5c. Stage-1 failed build (0 required check-runs created because Spot build failed):
+        //     `reconcile_deploy_coverage` classifies `Failed` (not `UncoveredDark`) and
+        //     `reconcile_base_verdict_with_deploy_coverage` promotes `Empty` -> `Red`.
+        let plan_failed_spot = reconcile_deploy_coverage(
+            "20b508b3281abf77e7cfec680d920df0e27a7ef2",
+            600,
+            DEPLOY_RECONCILE_GRACE_SECS,
+            &spot_build_verdict,
+            &required,
+            &[DeployWorkflowRun {
+                id: 41911085476,
+                name: "Deploy Dev".into(),
+                path: Some(".github/workflows/deploy-dev.yml".into()),
+                head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),
+                event: Some("push".into()),
+                status: Some("completed".into()),
+                conclusion: Some("failure".into()),
+                html_url: Some("https://github.com/state-vector/superpositional/actions/runs/41911085476".into()),
+            }],
+            None,
+        );
+        assert_eq!(plan_failed_spot.dispatch_workflow, None);
+        assert!(matches!(
+            plan_failed_spot.coverage,
+            DeployCoverageState::Failed { failing_run_id: Some(41911085476), .. }
+        ));
+        let reconciled_failed = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_failed_spot.coverage);
+        assert_eq!(reconciled_failed.verdict, MainVerdict::Red);
+        assert_eq!(reconciled_failed.red.len(), 1);
+        assert_eq!(reconciled_failed.red[0].name, "Deploy Dev (run #41911085476)");
 
         // 6. ISO-8601 parser accuracy
         assert_eq!(parse_iso8601_epoch_ms("2026-11-04T08:01:57Z"), Some(1_793_779_317_000));

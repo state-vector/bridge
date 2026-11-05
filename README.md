@@ -1660,6 +1660,24 @@ and what the machine already did. Awaiting parks (BR#5633's sweep), bounced
 re-entry (BR#4494's demote), and cards holding a bound ask are excluded —
 other law owns them.
 
+### One line-health and recovery state (BR#6389)
+
+The hub publishes a typed `line` projection for every train lane, shared by
+the status chip, message and recovery banner. Its closed phases are `ready`,
+`working`, `waiting`, `stopped`, `unknown`, and `retired`. Healthy states cannot
+carry a failure; interrupted states require a cause and a recovery disposition.
+The UI renders this contract instead of reconstructing health from lease,
+starvation, check-subset and latest-log heuristics.
+
+A decisive deployment failure on the current tip outranks a successful subset
+of required jobs. Deployment receipts keep their actual commit/run identity:
+an older green run cannot certify a newer tip. The same effective verdict
+controls queue admission, stale-gate reruns and stop clearance. A failed line
+stays visible even with an empty queue. Recovery names the failing evidence,
+the repair task, its executor and heartbeat, progress and next action. Missing
+or stale observations fail closed. A human action is shown only with a concrete
+linked request; an exhausted machine retry budget alone is not a human task.
+
 ### One merge classification (BR#6330)
 
 There is exactly ONE answer to "is this card awaiting merge?", and it is the

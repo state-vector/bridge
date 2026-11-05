@@ -188,11 +188,23 @@ export type KbBaseRedPhase =
   | "cure_pr_awaiting_force_merge"
   | "fix_exhausted";
 
+export interface KbTrainFixCardProgress {
+  note: string;
+  will?: string;
+  completion_pct?: number;
+  ts: number;
+}
+
 export interface KbTrainFixCard {
   id: string;
   url: string;
   title: string;
   status: string;
+  owner?: string;
+  executor_session?: string;
+  active_agent?: boolean;
+  blocked_reason?: string;
+  last_progress?: KbTrainFixCardProgress | null;
   pr?: number;
   pr_url?: string;
   conflict?: boolean;
@@ -252,6 +264,7 @@ export type KbDeployCoverageState =
       tip_sha: string;
       tip_age_secs: number;
       failing_run_id?: number | null;
+      failing_run_url?: string | null;
       last_green_sha?: string | null;
       last_green_run_id?: number | null;
     };
@@ -267,6 +280,7 @@ export interface KbBaseRedResolution {
 }
 
 export interface KbTrainLane {
+  line?: import("@bridge/contracts").TrainLineProjection;
   lane: string;
   card: string;
   lease: KbTrainLease | null;

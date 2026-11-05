@@ -144,6 +144,8 @@ import {
   type TrainFixCard,
   DEPLOY_RECONCILE_GRACE_SECS,
   formatDeployCoverageSummary,
+  reconcileBaseVerdictWithDeployCoverage,
+  normalizeBaseStateWithCoverage,
   trainDarkTipAskTitle,
   trainDarkTipAskBrief,
   trainGateBlockedAskTitle,
@@ -220,7 +222,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { DeployCoverageStateSchema } from "@bridge/contracts";
+import { DeployCoverageStateSchema, TrainLineFactsSchema, projectTrainLine, type TrainLineProjection } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -8840,8 +8842,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // fresh (<15m; the executor refreshes every tick) so a dead daemon's
     // stale stamp can never pin a false BLOCKED.
     const bsQf: any = lane ? meta.lane?.queue_facts ?? null : null;
-    const baseBlock: any = bsQf?.base_state && String(bsQf.base_state?.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
-      ? bsQf.base_state
+    const normBs: any = bsQf?.base_state ? normalizeBaseStateWithCoverage(bsQf.base_state) : null;
+    const baseBlock: any = normBs && String(normBs.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
+      ? normBs
       : null;
     // BR#5883: the gate-blocked qualifier — the scoped verdict IS green (the
     // base-red row above reads none) but the repo's own merge gate judges
@@ -8857,11 +8860,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       lane.required_workflows.some((w: string) => String(w).toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) ||
       !lane.required_workflows.some((w: string) => String(w).toLowerCase().startsWith("deploy /"));
     const gateBlocked: any = laneUsesMainGreenGate
-      && bsQf?.base_state
-      && String(bsQf.base_state?.verdict ?? "") === "green"
-      && bsQf.base_state?.gate_blocked === true
+      && normBs
+      && String(normBs.verdict ?? "") === "green"
+      && normBs.gate_blocked === true
       && now - Number(bsQf.at ?? 0) < 15 * 60_000
-      ? bsQf.base_state
+      ? normBs
       : null;
     // BR#5376: the walk's batch-stall episode stamp (executor-fed via
     // train.queue_facts) — truthy only when fresh (<15m; the executor
@@ -9009,6 +9012,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const lane = laneOfMeta(meta);
     if (!lane) return null;
     const opState = resolveLaneOperationalState({
+      baseState: meta.lane?.queue_facts?.base_state ?? null,
       stop: meta.stop ?? null,
       currently: meta.currently ?? null,
       now,
@@ -9067,6 +9071,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit("system:merge-train", "watch_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
       }
     }
+    // Recovery is a hub responsibility even with zero open browser clients.
+    // Reuse the same typed reduction/persistence path as the status endpoint.
+    try { await this.trainStatus({}); }
+    catch (e) { this.audit("system:train", "line_recovery_monitor_error", null, { error: String(e).slice(0, 200) }); }
   }
 
   /** train.lease — the CAS op. The DO is single-threaded, so the
@@ -9270,9 +9278,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
       const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
       if (o.status === "blocked" && !sameSha) continue;
+      if (!sameSha && this.rootFixExhausted(om, String(o.status ?? ""))) continue;
+      const nextFailing = a.failing.map((f) => f.name);
+      const prevFailing = Array.isArray(om.root_fix?.failing) ? om.root_fix.failing.map(String) : [];
+      const changed = !sameSha || JSON.stringify(prevFailing) !== JSON.stringify(nextFailing);
       om.boosted = om.boosted ?? a.now;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(om)), o.id);
-      this.version(o.id, a.actor, "update", `root-fix card rebound to the live failing run ${a.sha.slice(0, 9)} (stop-the-line, BR#5190)`, {});
+      if (changed) {
+        this.version(o.id, a.actor, "update", `root-fix card rebound to the live failing run ${a.sha.slice(0, 9)} (stop-the-line, BR#5190)`, {});
+      }
       return o.id;
     }
     // (3) spawn fresh — absolute p0 (boosted + qualified so any gateway/agent claims immediately)
@@ -10375,6 +10389,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const clearedSha = String(meta.stop.sha ?? sha);
         meta.stop = null;
         if (meta.currently?.phase === "stopped") meta.currently = null;
+        if (meta.lane?.queue_facts?.base_state?.tip_sha === clearedSha) {
+          // This evidence covers only the stopped SHA, never a newer tip.
+          delete meta.lane.queue_facts.base_state;
+        }
         const reason = this.laneSyncReason(lane.id, meta, now);
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
         this.audit(actor, "train:line_green_ci", lane.id, { lane: laneKey(repo, base), sha: clearedSha.slice(0, 9), reason });
@@ -10674,7 +10692,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // (bound to the standing alarm sink; askCreate's identical-open-ask
     // guard dedupes the per-tick repeats — same shape as the stopped
     // flow's stop ask).
-    const baseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
+    const rawBaseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
+    const baseState = normalizeBaseStateWithCoverage(rawBaseState);
     // BR#5376: the ACTIVE batch-stall episode rides the stamp (executor-fed;
     // the next stamp after a landing omits it, which clears the state by
     // itself). The lane renders a loud STALLED reason/banner off it and the
@@ -10794,10 +10813,33 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
       if (changed) this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneM), Date.now(), lane.id);
     }
-    if (baseState && String(baseState.verdict ?? "") === "red" && (entriesArr.length > 0 || !!meta.stop || !!this.trainOpenRootFix(repo, entriesArr).curePr)) {
+    const tipShaForRed = typeof baseState?.tip_sha === "string" ? baseState.tip_sha.trim() : "";
+    if (
+      baseState &&
+      String(baseState.verdict ?? "") === "red" &&
+      (entriesArr.length > 0 || !!meta.stop || !!tipShaForRed || !!this.trainOpenRootFix(repo, entriesArr).curePr)
+    ) {
       const reds = (Array.isArray(baseState.red) ? baseState.red : [])
         .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
         .filter((r: { name: string }) => r.name);
+      if (tipShaForRed) {
+        try {
+          await this.ensureRootFixCard({
+            repo,
+            base,
+            sha: tipShaForRed,
+            failing: reds,
+            why: reds.length ? `required workflows RED: ${reds.map((f: { name: string }) => f.name).join(", ")}` : "base main RED",
+            actor,
+            now: Date.now(),
+            laneId: lane.id,
+            culpritId: meta.stop?.culprit_task ? String(meta.stop.culprit_task) : null,
+            pr: Number(meta.stop?.pr ?? 0) || null,
+          });
+        } catch (e) {
+          this.audit(actor, "root_fix_spawn_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
+        }
+      }
       await this.syncBaseRedAlarmAsk(lane, repo, base, entriesArr, reds, actor);
     }
     // BR#5883: the GATE-BLOCKED escalation at P1 — the scoped verdict reads
@@ -12232,14 +12274,144 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return path ? emitOrigin(this.env?.CANONICAL_ORIGIN) + path : "";
   }
 
+  /** One backstop for every interrupted line: never claim recovery is running
+   * without a live task. Existing cause-specific self-healing runs first;
+   * this repairs missing ownership and escalates only after bounded attempts. */
+  private async ensureLineRecovery(laneId: string, line: TrainLineProjection, now: number): Promise<TrainLineProjection> {
+    if (!line.blocker) {
+      const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneId);
+      const m = JSON.parse(row?.meta ?? "{}");
+      const askId = m.lane?.line_recovery_ask_id;
+      if (askId) {
+        const ask = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(askId));
+        if (ask?.status === "todo") await this.transition({ id: String(askId), to: "done", session: "", note: "Work flow has recovered; no human action remains." }, "system:train");
+        delete m.lane.line_recovery_ask_id;
+        this.saveLaneState(laneId, m, now);
+      }
+      return line;
+    }
+    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working" || line.remediation?.kind !== "attention") return line;
+    const lane = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneId);
+    const meta = JSON.parse(lane?.meta ?? "{}");
+    const cfg = laneOfMeta(meta);
+    if (!cfg) return line;
+    const current = this.trainOpenRootFix(cfg.repo).card;
+    const bound = current ? this.enrichFixCardRow(current.id, now) : null;
+    if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
+      ...line, remediation: { kind: bound.active_agent ? "agent" : "queued", task: bound,
+        text: bound.last_progress?.note ?? "Repair work is queued for an available agent." },
+    };
+    const duties = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts WHERE type = 'task'
+       AND json_extract(meta, '$.machine_duty.subject') = ?
+       AND json_extract(meta, '$.machine_duty.kind') = 'line_recovery'
+       AND json_extract(meta, '$.machine_duty.episode') = ? ORDER BY created_ts DESC`, laneId,
+      `${line.blocker}:${meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`,
+    ).toArray();
+    const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
+    const task = open ? this.enrichFixCardRow(open.id, now) : null;
+    if (task && !this.rootFixExhausted(JSON.parse(String(open!.meta ?? "{}")), task.status)) return {
+      ...line, remediation: task.active_agent
+        ? { kind: "agent", task, text: task.last_progress?.note ?? "An agent is investigating why work cannot move." }
+        : { kind: "queued", task, text: task.status === "blocked"
+            ? `The repair is waiting: ${task.blocked_reason ?? "see the repair task for its next step"}`
+            : task.status === "in_progress" ? "The repair has no recent heartbeat; the watchdog will reassign it if the session remains silent."
+            : "Recovery is queued; waiting for an available agent." },
+    };
+    const exhausted = !!current?.exhausted || duties.length >= 3 || !!(open && this.rootFixExhausted(JSON.parse(String(open.meta ?? "{}")), String(open.status)));
+    if (!exhausted) {
+      const created = await this.create({
+        type: "task", title: `Restore work flow on ${cfg.repo}@${cfg.base}: ${line.label}`,
+        body_md: `The line cannot advance: ${line.reason}\n\nRead live GitHub runs and gateway status. Recover the missing executor/deploy/check or resolve the named mechanical failure automatically. Do not report success while the line remains stuck. Publish did/next progress at least every 10 minutes. Ask for human action only when a concrete permission, unavailable credential, or authored decision prevents recovery.\n\nEvidence: ${line.evidence.map((e) => `${e.name} ${e.url ?? ""}`).join("; ")}`,
+        qualified: true, roles: ["impl"], tags: ["merge-train", "diagnostic", "p0"], session: "",
+        meta: { machine_duty: { by: "system:train", kind: "line_recovery", subject: laneId,
+          episode: `${line.blocker}:${meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}` }, boosted: now },
+      }, "system:train");
+      this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, created.id, laneId, now);
+      const assigned = this.enrichFixCardRow(String(created.id), now)!;
+      return { ...line, remediation: { kind: "queued", task: assigned, text: "Recovery assigned at top priority; waiting for an available agent." } };
+    }
+    // An exhausted machine retry budget is NOT evidence that a human must
+    // act. Only a concrete ask bound to the repair can warrant that claim.
+    // Keep the failure loud and retain its repair ownership without inventing
+    // a generic "provide access or instructions" request.
+    return { ...line, remediation: { kind: "attention", text:
+      `Automatic recovery has exhausted its bounded attempts. ${current ? `Repair ${current.id}` : task ? `Repair ${task.id}` : "The recovery duty"} requires agent investigation; no human action has been identified. ${bound?.blocked_reason ?? task?.blocked_reason ?? ""}`.trim() } };
+  }
+
+  private enrichFixCardRow(
+    rowOrId: any,
+    now: number = Date.now(),
+    prExtra?: { pr?: number; pr_url?: string; conflict?: boolean; merged?: boolean; merge_sha?: string },
+  ): TrainFixCard | null {
+    const r =
+      typeof rowOrId === "string"
+        ? (this.one(`SELECT id, title, status, owner, updated_ts, meta FROM artefacts WHERE id = ?`, rowOrId) as any)
+        : rowOrId && typeof rowOrId === "object" && rowOrId.id
+          ? (rowOrId.meta !== undefined && rowOrId.owner !== undefined && rowOrId.updated_ts !== undefined
+              ? rowOrId
+              : (this.one(`SELECT id, title, status, owner, updated_ts, meta FROM artefacts WHERE id = ?`, String(rowOrId.id)) as any) ?? rowOrId)
+          : null;
+    if (!r || !r.id) return null;
+    let m: any = {};
+    try {
+      m = typeof r.meta === "string" ? JSON.parse(r.meta || "{}") : (r.meta ?? {});
+    } catch {
+      m = {};
+    }
+    const status = String(r.status ?? "");
+    const owner = String(r.owner ?? "").trim() || undefined;
+    const executorSession =
+      status === "in_progress" && typeof m?.session === "string" && m.session.trim()
+        ? m.session.trim()
+        : undefined;
+    const lastSig = Math.max(
+      Number(m?.session_alive_ts ?? 0),
+      Number(m?.last_progress?.ts ?? 0),
+    );
+    const activeAgent = status === "in_progress" && !!executorSession && lastSig > 0 && now - lastSig < 10 * 60_000;
+    const blockedReason =
+      status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
+        ? m.blocked.reason.trim()
+        : undefined;
+    const lp = m?.last_progress;
+    const lastProgress =
+      lp && typeof lp === "object" && typeof lp.note === "string" && lp.note.trim() && Number.isFinite(Number(lp.ts))
+        ? {
+            note: String(lp.note).trim(),
+            ...(typeof lp.will === "string" && lp.will.trim() ? { will: String(lp.will).trim() } : {}),
+            ...(Number.isFinite(Number(lp.completion_pct))
+              ? { completion_pct: Math.max(0, Math.min(100, Math.floor(Number(lp.completion_pct)))) }
+              : {}),
+            ts: Number(lp.ts),
+          }
+        : undefined;
+    return {
+      id: String(r.id),
+      url: this.cardUrl(String(r.id)),
+      title: String(r.title ?? ""),
+      status,
+      ...(owner ? { owner } : {}),
+      ...(executorSession ? { executor_session: executorSession } : {}),
+      active_agent: activeAgent,
+      ...(blockedReason ? { blocked_reason: blockedReason } : {}),
+      ...(lastProgress ? { last_progress: lastProgress } : {}),
+      ...(prExtra?.pr ? { pr: prExtra.pr } : {}),
+      ...(prExtra?.pr_url ? { pr_url: prExtra.pr_url } : {}),
+      ...(prExtra?.conflict ? { conflict: true } : {}),
+      ...(prExtra?.merged ? { merged: true } : {}),
+      ...(prExtra?.merge_sha ? { merge_sha: prExtra.merge_sha } : {}),
+    };
+  }
+
   /** BR#5349: the lane's active fix-forward card — an OPEN task tagged
    *  hotfix+main-red in the LANE CARD's project (the lane card's project
    *  column is the repo→project join; BR#5346 is the live superpositional
    *  example). Newest-touched first. */
-  private trainFixCard(project: string, repo?: string, redNames?: string[]): { id: string; url: string; title: string; status: string } | null {
+  private trainFixCard(project: string, repo?: string, redNames?: string[], now: number = Date.now()): TrainFixCard | null {
     if (!project) return null;
     const rows = this.state.storage.sql.exec(
-      `SELECT id, title, status, tags, meta FROM artefacts
+      `SELECT id, title, status, owner, updated_ts, tags, meta FROM artefacts
        WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
          AND project = ? AND tags LIKE '%"main-red"%'
        ORDER BY updated_ts DESC LIMIT 20`,
@@ -12261,11 +12433,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         });
       });
       if (matched) {
-        return { id: String(matched.id), url: this.cardUrl(String(matched.id)), title: String(matched.title), status: String(matched.status) };
+        return this.enrichFixCardRow(matched, now);
       }
     }
     const row = candidates[0];
-    return { id: String(row.id), url: this.cardUrl(String(row.id)), title: String(row.title), status: String(row.status) };
+    return this.enrichFixCardRow(row, now);
   }
 
   /** 2026-11-02: the episode's OPEN root-fix card (BR#5190) for a repo, with
@@ -12286,19 +12458,25 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *      a plausibly-curing PR is queued, not only when a root-fix card
    *      binds. Walk order (the executor's queue_facts order, or the derived
    *      queue's rank on the status side) decides precedence. */
-  /** 2026-11-03 (BR#5631): the machine proxy for "the agent fix path is
-   *  EXHAUSTED" — the fix card churned out of watchdog attempts (>= 3, the
-   *  unblock spawner's own cap class) or carries an escalation stamp. Only
-   *  then does a red episode become human-actionable without a cure PR. */
-  private rootFixExhausted(m: any): boolean {
+  /** 2026-11-03 (BR#5631) + BR#6389: the machine proxy for "the agent fix path
+   *  is EXHAUSTED" — the fix card churned out of watchdog attempts (>= 3, the
+   *  unblock spawner's own cap class), carries an escalation stamp, or is
+   *  parked `blocked` under the watchdog `churn guard`. Only then does a red
+   *  episode become human-actionable without a cure PR. */
+  private rootFixExhausted(m: any, status?: string): boolean {
     if (!m || typeof m !== "object") return false;
     if (m.escalate || m.unblock_escalated) return true;
     const attempts = Number(m?.attempt?.attempts ?? 0);
-    return Number.isFinite(attempts) && attempts >= 3;
+    if (Number.isFinite(attempts) && attempts >= 3) return true;
+    if (status === "blocked") {
+      const reason = String(m?.blocked?.reason ?? "").trim().toLowerCase();
+      if (reason.startsWith("churn guard")) return true;
+    }
+    return false;
   }
 
   private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[], redNames?: string[]): {
-    card: { id: string; title: string; status: string; exhausted?: boolean } | null;
+    card: { id: string; title: string; status: string; exhausted?: boolean; blocked_reason?: string } | null;
     curePr: { repo: string; number: number } | null;
     conflictPr?: { repo: string; number: number } | null;
     mergedPr?: { repo: string; number: number; merge_sha: string } | null;
@@ -12381,7 +12559,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           continue;
         }
         const candidate = {
-          card: { id: String(r.id), title: String(r.title ?? ""), status: String(r.status ?? ""), exhausted: this.rootFixExhausted(m) },
+          card: {
+            id: String(r.id),
+            title: String(r.title ?? ""),
+            status: String(r.status ?? ""),
+            exhausted: this.rootFixExhausted(m, String(r.status ?? "")),
+            ...(r.status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
+              ? { blocked_reason: m.blocked.reason.trim() }
+              : {}),
+          },
           curePr,
           conflictPr,
           mergedPr,
@@ -12448,7 +12634,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
         if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
         const resolved = {
-          card: { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
+          card: {
+            id: String(row.id),
+            title: String(row.title ?? ""),
+            status: String(row.status ?? ""),
+            exhausted: this.rootFixExhausted(m, String(row.status ?? "")),
+            ...(row.status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
+              ? { blocked_reason: m.blocked.reason.trim() }
+              : {}),
+          },
           curePr: { repo: legRepo, number: pr },
           conflictPr: null,
           mergedPr: null,
@@ -12540,7 +12734,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // authority is stamped; instead the decline suppresses re-asks for this
     // episode title + cure PR (24h) so the answered gate stays answered.
     const decline = !!baseRed && !bypassPr && !rerun && /\bdecline\b|\bhold\b/i.test(ans);
-    if (!bypassPr && !rerun && !decline) return;
+    const rearm = !!baseRed && !bypassPr && !rerun && /\bre-?arm\b|\bre-?issue\b/i.test(ans);
+    if (!bypassPr && !rerun && !decline && !rearm) return;
     const repo = fast ? fast[1] : baseRed ? baseRed[1] : "";
     const base = baseRed ? baseRed[2] : "main";
     if (!repo) return;
@@ -12556,6 +12751,36 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     const laneMeta = JSON.parse(laneRow.meta ?? "{}");
     const now = Date.now();
+    if (rearm) {
+      const rf = this.trainOpenRootFix(repo);
+      const targetId = rf.card?.id ?? null;
+      if (targetId) {
+        const cardRow = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, targetId) as any;
+        if (cardRow && cardRow.status === "blocked" && this.rootFixExhausted(JSON.parse(cardRow.meta ?? "{}"), cardRow.status)) {
+          if (releaseHold(JSON.parse(cardRow.meta ?? "{}"))) return;
+          await this.transition({ id: targetId, to: "todo", session: "", note: `Human requested a fresh repair attempt through ${askId}` }, actor);
+          const cm = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, targetId)?.meta ?? "{}");
+          delete cm.attempt;
+          delete cm.escalate;
+          delete cm.unblock_escalated;
+          cm.boosted = now;
+          this.state.storage.sql.exec(
+            `UPDATE artefacts SET meta = ? WHERE id = ?`,
+            JSON.stringify(cm),
+            targetId,
+          );
+          this.version(
+            targetId,
+            actor,
+            "transition",
+            `re-armed by ask ${askId} (answer: "${ans.slice(0, 120)}") — cleared attempt/churn-guard exhaustion and returned to todo at p0 for a fresh agent session`,
+            { from: cardRow.status, to: "todo" },
+          );
+          this.audit(actor, "train:root_fix_rearmed", targetId, { repo, base, ask_id: askId });
+        }
+      }
+      return;
+    }
     if (bypassPr && Number.isInteger(bypassPr) && bypassPr > 0) {
       // a DONE supersedes an earlier DECLINE for the same PR — the gate is
       // being answered affirmatively now; the decline must not suppress it
@@ -12628,6 +12853,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           lane: `${lane.repo}@${lane.base}`,
           card: l.id,
           retired: true,
+          line: projectTrainLine(TrainLineFactsSchema.parse({ retired: true, queue: [] }), now0),
           lease: null,
           currently: null,
           stop: null,
@@ -12966,41 +13192,70 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           batches: partitionMergeBatches(batchCandidates, conflictPairs, lane.burst_max),
         };
       })();
-      const brQf: any = meta.lane?.queue_facts ?? null;
+      const brQf: any = meta.lane?.queue_facts
+        ? {
+            ...meta.lane.queue_facts,
+            ...(meta.lane.queue_facts.base_state
+              ? { base_state: normalizeBaseStateWithCoverage(meta.lane.queue_facts.base_state) }
+              : {}),
+          }
+        : null;
       const inNormalSettle = !meta.stop && (meta.currently?.phase === "awaiting-ci" || meta.currently?.phase === "bursting");
-      const brBase: any = brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
-        && (!inNormalSettle || String(brQf.base_state?.verdict ?? "") === "red")
-        && now0 - Number(brQf.at ?? 0) < 15 * 60_000 && queue.length > 0
+      const qfFresh = Boolean(brQf && now0 - Number(brQf.at ?? 0) < 15 * 60_000);
+      const isBaseRedNow = qfFresh && String(brQf?.base_state?.verdict ?? "") === "red";
+      const brBase: any = qfFresh && brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
+        && (!inNormalSettle || isBaseRedNow)
+        && (isBaseRedNow || queue.length > 0)
+        ? brQf.base_state : null;
+      const laneUsesMainGreenGate =
+        !Array.isArray(lane.required_workflows) ||
+        lane.required_workflows.length === 0 ||
+        lane.required_workflows.some((w: string) => String(w).toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) ||
+        !lane.required_workflows.some((w: string) => String(w).toLowerCase().startsWith("deploy /"));
+      const brGateBlocked: any = !brBase && !meta.stop && laneUsesMainGreenGate && qfFresh
+        && String(brQf?.base_state?.verdict ?? "") === "green"
+        && brQf?.base_state?.gate_blocked === true
+        && queue.length > 0
         ? brQf.base_state : null;
       const stopActive: any = meta.stop ?? null;
       let base_red_resolution: any = null;
-      if (brBase || stopActive) {
+      if (brBase || stopActive || brGateBlocked) {
         const nowActionObj: any = meta.lane?.now_action ?? null;
         const nowActionFresh = nowActionObj && now0 - Number(nowActionObj.at ?? 0) < 15 * 60_000;
         const mNowRed = nowActionFresh ? /^main still red \(red: ([^)]+)\)/.exec(String(nowActionObj.note ?? "")) : null;
         const mNowUnsettled = nowActionFresh && /^main still unsettled\b/.test(String(nowActionObj.note ?? ""));
-        const reds = brBase
-          ? (Array.isArray(brBase.red) ? brBase.red : [])
-              .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
-              .filter((r: any) => r.name)
-          : mNowRed
-            ? mNowRed[1]
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean)
-                .map((name) => {
-                  const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : []).find((r: any) => String(r?.name ?? "") === name);
-                  const fromQf = (Array.isArray(brQf?.base_state?.red) ? brQf.base_state.red : []).find((r: any) => String(r?.name ?? "") === name);
-                  return { name, url: String(fromQf?.url ?? fromStop?.url ?? fromStop?.html_url ?? "") };
-                })
-            : (() => {
-                const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : [])
-                  .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? r?.html_url ?? "") }))
-                  .filter((r: any) => r.name);
-                if (fromStop.length) return fromStop;
-                const why = String(stopActive?.reason ?? "").trim();
-                return why ? [{ name: why, url: "" }] : [];
-              })();
+        const reds = brGateBlocked
+          ? (() => {
+              const gReds = (Array.isArray(brGateBlocked.gate_red) ? brGateBlocked.gate_red : [])
+                .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+                .filter((r: any) => r.name);
+              if (gReds.length) return gReds;
+              return (Array.isArray(brGateBlocked.gate_unsettled) ? brGateBlocked.gate_unsettled : [])
+                .map((n: any) => ({ name: String(n ?? "").trim(), url: "" }))
+                .filter((r: any) => r.name);
+            })()
+          : brBase
+            ? (Array.isArray(brBase.red) ? brBase.red : [])
+                .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? "") }))
+                .filter((r: any) => r.name)
+            : mNowRed
+              ? mNowRed[1]
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+                  .map((name) => {
+                    const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : []).find((r: any) => String(r?.name ?? "") === name);
+                    const fromQf = (Array.isArray(brQf?.base_state?.red) ? brQf.base_state.red : []).find((r: any) => String(r?.name ?? "") === name);
+                    return { name, url: String(fromQf?.url ?? fromStop?.url ?? fromStop?.html_url ?? "") };
+                  })
+              : (() => {
+                  const fromStop = (Array.isArray(stopActive?.failing) ? stopActive.failing : [])
+                    .map((r: any) => ({ name: String(r?.name ?? ""), url: String(r?.url ?? r?.html_url ?? "") }))
+                    .filter((r: any) => r.name);
+                  if (fromStop.length) return fromStop;
+                  const why = String(stopActive?.reason ?? "").trim();
+                  return why ? [{ name: why, url: "" }] : [];
+                })();
         // the OPEN alarm ask for this episode — filed per red episode under
         // the deterministic trainBaseRedAskTitle prefix. Newest open questions
         // first, prefix-matched in JS: parameterized LIKE+ESCAPE trips
@@ -13010,6 +13265,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const askPrefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base}`;
         const stopAskPrefix = `MERGE TRAIN STOPPED: ${lane.repo}@${lane.base}`;
         const darkTipAskPrefix = `MERGE TRAIN DARK TIP: ${lane.repo}@${lane.base}`;
+        const gateBlockedAskPrefix = `MERGE TRAIN GATE-BLOCKED: ${lane.repo}@${lane.base}`;
         const askRow = ((this.state.storage.sql.exec(
           `SELECT id, title, meta FROM artefacts
            WHERE type = 'question' AND status = 'todo' AND created_ts > ?
@@ -13017,18 +13273,20 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           now0 - 7 * 86_400_000,
         ).toArray() as any[]).find((r) => {
           const t = String(r.title ?? "");
-          return t.startsWith(askPrefix) || t.startsWith(stopAskPrefix) || t.startsWith(darkTipAskPrefix);
+          return t.startsWith(askPrefix) || t.startsWith(stopAskPrefix) || t.startsWith(darkTipAskPrefix) || t.startsWith(gateBlockedAskPrefix);
         })) ?? null;
         const askMeta = askRow ? JSON.parse(String(askRow.meta ?? "{}") || "{}") : null;
         const covParsed = brBase?.deploy_coverage ? DeployCoverageStateSchema.safeParse(brBase.deploy_coverage) : null;
         const deployCov: DeployCoverageState | null = covParsed?.success ? covParsed.data : null;
         const isDarkTipAsk = askRow && String(askRow.title ?? "").startsWith(darkTipAskPrefix);
+        const isGateBlockedAsk = askRow && String(askRow.title ?? "").startsWith(gateBlockedAskPrefix);
         const darkTipWarrantAsk = Boolean(
           isDarkTipAsk &&
           brBase &&
           String(brBase.verdict ?? "") === "empty" &&
           (deployCov?.phase === "uncovered_dark" || deployCov?.phase === "uncovered_dispatched"),
         );
+        const gateBlockedWarrantAsk = Boolean(isGateBlockedAsk && brGateBlocked);
         const qfEntries = Array.isArray(brQf?.entries) ? brQf.entries : [];
         const seenIds = new Set<string>(queue.map((q: any) => String(q.id)));
         const mergedQueue = [
@@ -13039,7 +13297,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
         const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
-        if (!rf.state.warrantAsk && !darkTipWarrantAsk && askRow) {
+        if (!rf.state.warrantAsk && !darkTipWarrantAsk && !gateBlockedWarrantAsk && askRow) {
           this.state.storage.sql.exec(
             `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
             now0,
@@ -13079,12 +13337,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
         }
         base_red_resolution = {
-          verdict: brBase ? String(brBase.verdict ?? "red") : mNowUnsettled ? "unsettled" : "red",
+          verdict: brGateBlocked
+            ? (String(brGateBlocked.gate_verdict ?? "") === "unsettled" ? "unsettled" : "red")
+            : brBase
+              ? String(brBase.verdict ?? "red")
+              : mNowUnsettled
+                ? "unsettled"
+                : "red",
           phase: rf.state.phase,
           whats_broken: reds,
           held: queue.length,
           ...(deployCov ? { deploy_coverage: deployCov } : {}),
-          ask: (rf.state.warrantAsk || darkTipWarrantAsk) && askRow
+          ask: (rf.state.warrantAsk || darkTipWarrantAsk || gateBlockedWarrantAsk) && askRow
             ? {
                 id: String(askRow.id),
                 url: this.cardUrl(String(askRow.id)),
@@ -13092,37 +13356,41 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          // 2026-11-02 + BR#5679 + BR#6012: the fix card prefers the episode's
-          // ROOT-FIX card (matching the live failing check names when multiple
-          // root-fix cards exist), then the project's open blocker/hotfix+main-red
-          // task (also matched against live red check names), and falls back to
-          // stop.culprit_task ONLY when no root-fix or project main-red card exists.
+          // 2026-11-02 + BR#5679 + BR#6012 + BR#6389: the fix card prefers the
+          // episode's ROOT-FIX card (matching the live failing check names when
+          // multiple root-fix cards exist), then the gate-blocked diagnostic duty
+          // (when gate_blocked), then the project's open blocker/hotfix+main-red
+          // task, and falls back to stop.culprit_task ONLY when no fix card exists.
+          // Every returned card is enriched with live agent telemetry (owner,
+          // executor_session, active_agent, blocked_reason, last_progress).
           fix_card: (() => {
             if (rf.card) {
               const shownPr = rf.curePr ?? rf.conflictPr ?? rf.mergedPr ?? null;
-              return {
-                id: rf.card.id,
-                url: this.cardUrl(rf.card.id),
-                title: rf.card.title,
-                status: rf.card.status,
-                ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
-                ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
-                ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
-              };
+              return (
+                this.enrichFixCardRow(rf.card.id, now0, {
+                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
+                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
+                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
+                }) ?? {
+                  id: rf.card.id,
+                  url: this.cardUrl(rf.card.id),
+                  title: rf.card.title,
+                  status: rf.card.status,
+                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
+                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
+                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
+                }
+              );
             }
-            const projFix = this.trainFixCard(String((l as any).project ?? ""), lane.repo, reds.map((r: any) => r.name));
+            if (brGateBlocked && meta.lane?.gate_blocked?.duty_id) {
+              const gbDuty = this.enrichFixCardRow(String(meta.lane.gate_blocked.duty_id), now0);
+              if (gbDuty && gbDuty.status !== "done" && gbDuty.status !== "superseded") return gbDuty;
+            }
+            const projFix = this.trainFixCard(String((l as any).project ?? ""), lane.repo, reds.map((r: any) => r.name), now0);
             if (projFix) return projFix;
             const culpritId = String(stopActive?.culprit_task ?? "").trim();
             if (culpritId) {
-              const cr = this.one(`SELECT id, title, status FROM artefacts WHERE id = ?`, culpritId) as any;
-              if (cr) {
-                return {
-                  id: String(cr.id),
-                  url: this.cardUrl(String(cr.id)),
-                  title: String(cr.title ?? ""),
-                  status: String(cr.status ?? ""),
-                };
-              }
+              return this.enrichFixCardRow(culpritId, now0);
             }
             return null;
           })(),
@@ -13165,15 +13433,39 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         };
       }
       const lane_state = resolveLaneOperationalState({
+        baseState: brQf?.base_state ?? null,
         stop: meta.stop ?? null,
         currently: meta.currently ?? null,
         fixCard: base_red_resolution?.fix_card ?? null,
         now: now0,
       });
+      const diagnosticId = meta.lane?.gate_blocked?.duty_id ?? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id;
+      const diagnostic = diagnosticId ? this.enrichFixCardRow(String(diagnosticId), now0) : null;
+      const diagnosticAskId = meta.lane?.gate_blocked?.ask_id ?? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id;
+      const diagnosticAskRow = diagnosticAskId ? this.one(`SELECT id, title, meta FROM artefacts WHERE id = ? AND status = 'todo'`, String(diagnosticAskId)) : null;
+      const diagnosticAskMeta = diagnosticAskRow ? JSON.parse(diagnosticAskRow.meta ?? "{}") : null;
+      const lineFacts = TrainLineFactsSchema.safeParse({
+        queue, currently: meta.currently ?? null, stop: meta.stop ?? null,
+        lease: meta.lease ?? null, capable, queue_facts: brQf,
+        base_red_resolution, diagnostic,
+        diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,
+        starved, bypass_wait: meta.bypass_wait ?? null,
+        attempt: headHold ? { note: headHold.note, hold: headHold.class } : null,
+      });
+      const projectedLine: TrainLineProjection = lineFacts.success ? projectTrainLine(lineFacts.data, now0) : {
+        phase: "unknown", label: "Status needs investigation", reason: "The executor supplied inconsistent line facts; work has not been confirmed healthy.",
+        blocker: "stale_observation", evidence: [], held: queue.length, observed_at: Number(brQf?.at ?? 0),
+        remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
+      };
+      const line = await this.ensureLineRecovery(l.id, projectedLine, now0);
+      const latestMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, l.id)?.meta ?? "{}");
+      latestMeta.lane = { ...latestMeta.lane, line };
+      this.saveLaneState(l.id, latestMeta, now0);
       out.push({
         lane: `${lane.repo}@${lane.base}`,
         card: l.id,
         lane_state,
+        line,
         lease: meta.lease ?? null,
         currently: meta.currently ?? null,
         stop: meta.stop ?? null,
@@ -13200,7 +13492,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         queue_awaiting_review: awaitingReview,
         // BR#5114: per-entry executor gate verdicts in walk order (panel
         // blocks) — null until the first executor tick stamps them
-        queue_facts: meta.lane?.queue_facts ?? null,
+        queue_facts: brQf,
         // BR#5633: the awaiting sweep's per-task rate-limit stamps — the
         // executor reads these to skip re-asserting a settled human-leg
         // park at an unchanged head

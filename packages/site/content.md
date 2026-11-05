@@ -105,6 +105,16 @@ The pool ranks work in this order: verify duty and unblock tasks first (release-
 
 Backlog distinguishes a passive **PR dependency** (the PR owner delivers it; the hub needs a merge receipt) from **agent repair or queue binding** (`unbound`/`bounced`) and **train-owned delivery** (`queued`/`awaiting-ci`). A review-PR reference alone does not prove train admission. The unblocker label names the next actor or observed event; a machine event can schedule continuation rather than immediately complete the task.
 
+### One authoritative line-health state
+
+The train status, message and recovery banner consume the hub's shared typed
+`line` projection. A failed decisive deployment overrides green job subsets;
+an older successful deployment cannot cover a different commit. Stopped lines
+show the failed run and recovery task with live executor progress and next
+action, including when no PRs remain queued. Unknown or stale observations are
+never presented as healthy. A retry dispatch is activity, not proof of recovery;
+only observed line recovery permits stale-gate healing and stop clearance.
+
 ### Blocker rollup: many parked cards, one root
 
 Blocked work usually doesn't fail N ways — it fails once and N cards queue behind it. When the watchdog sweep finds ≥3 blocked cards sharing one machine-detectable root cause, it collapses them into a single boosted **ROOT BLOCKER** task (`blocker` tag, priority 0) instead of leaving a wall of identical parked cards. Every queued card gets `meta.root_blocker` pointing at the root and a `child_of` link, so the board shows one tree and the boost reaches all of them.

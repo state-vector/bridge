@@ -42,11 +42,12 @@
 
 use crate::train_gate::{
     classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
-     is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_deploy_coverage,
-    root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
-    CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision, MainCheckRun,
-    MainVerdict, MergeAction, DEPLOY_RECONCILE_GRACE_SECS, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
+    is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
+    reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
+    verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun,
+    DrainDecision, MainCheckRun, MainVerdict, MergeAction, DEPLOY_RECONCILE_GRACE_SECS, TRAIN_CI_BOUND_MULTIPLIER,
+    TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -1593,7 +1594,11 @@ fn build_base_state_with_coverage(
     plan: Option<&DeployReconcilePlan>,
     cancelled_runs: &[i64],
 ) -> Value {
-    let mut base_state = build_base_state(base_class, required, pass_merged);
+    let reconciled_class = match plan {
+        Some(p) => reconcile_base_verdict_with_deploy_coverage(base_class, &p.coverage),
+        None => base_class.clone(),
+    };
+    let mut base_state = build_base_state(&reconciled_class, required, pass_merged);
     if pass_merged == 0 {
         if let Some(p) = plan {
             let obj = base_state.as_object_mut().unwrap();
@@ -1639,7 +1644,7 @@ fn reconcile_base_deploy(
     base: &str,
     tip_sha: &str,
     tip_age_secs: u64,
-    base_class: &CheckVerdict,
+    base_class: &mut CheckVerdict,
     required: &[String],
     pass_merged: u32,
 ) -> Value {
@@ -1720,6 +1725,7 @@ fn reconcile_base_deploy(
             }
         }
     }
+    *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
     build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
 }
 
@@ -1934,7 +1940,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
         let (base_sha, base_age_secs) = ctx.base_tip_facts(repo, base)?;
         let base_runs = ctx.check_runs(repo, &base_sha);
-        let v = classify_base_check_runs(&base_runs, &required);
+        let mut v = classify_base_check_runs(&base_runs, &required);
+        let observed = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut v, &required, 0);
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": observed }));
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
@@ -1993,14 +2001,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             //     alarm at expiry; the mechanical rebase leg owns the exit) instead
             //     of churning it through the pool.
             if ctx.base_probe {
-                let effective_v = if v.verdict == MainVerdict::Empty && !stop_sha.is_empty() && stop_sha != base_sha {
+                let mut effective_v = if v.verdict == MainVerdict::Empty && !stop_sha.is_empty() && stop_sha != base_sha {
                     let stop_runs = ctx.check_runs(repo, stop_sha);
                     let sv = classify_base_check_runs(&stop_runs, &required);
                     if sv.verdict != MainVerdict::Empty { sv } else { v.clone() }
                 } else {
                     v.clone()
                 };
-                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &effective_v, &required, 0);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut effective_v, &required, 0);
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 let _ = settle_window_rebase(ctx, key, repo, base, lane);
             }
@@ -2062,8 +2070,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 } else {
                     ctx.check_runs(repo, &live_base_sha)
                 };
-                let live_base_class = classify_base_check_runs(&live_runs, &required);
-                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &live_base_class, &required, 0);
+                let mut live_base_class = classify_base_check_runs(&live_runs, &required);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &mut live_base_class, &required, 0);
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 // If merge_sha's own runs are all completed with a cancelled required run
                 // or missing/startup_failure required runs (superseded because a hotfix
@@ -2199,7 +2207,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let (probed_base_sha, probed_base_age_secs, base_class) = if !ctx.base_probe {
+    let (probed_base_sha, probed_base_age_secs, mut base_class) = if !ctx.base_probe {
         // BR#5265 fix-up (verify bounce, CI run 41261611797 — the PR's own
         // drills failed in CI): the hoisted read is HERMETIC — the drills
         // (base_probe=false) never shell out to gh; the Unsettled stamp
@@ -2228,9 +2236,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             ),
         }
     };
-    if let Some(ref alarm) = base_class.alarm {
-        log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
-    }
     let base_state = reconcile_base_deploy(
         ctx,
         lane,
@@ -2239,10 +2244,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         base,
         &probed_base_sha,
         probed_base_age_secs,
-        &base_class,
+        &mut base_class,
         &required,
         if from_awaiting_ci { 0 } else { pass_merged },
     );
+    if let Some(ref alarm) = base_class.alarm {
+        log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
+    }
     if from_awaiting_ci && base_class.verdict == MainVerdict::Red {
         let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": base_state }));
         log(Some(key), "awaiting-ci: base tip is RED — holding batch continuation until base is green");
@@ -6160,7 +6168,7 @@ mod tests {
 
         // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
         let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
-        assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
         assert_eq!(bs1.get("covered_by").and_then(|v| v.as_str()), Some(prev_green));
         assert_eq!(bs1.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("uncovered_dispatched"));
         assert_eq!(bs1.pointer("/deploy_coverage/workflow").and_then(|v| v.as_str()), Some("deploy-dev.yml"));

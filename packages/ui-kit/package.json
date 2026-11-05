@@ -11,6 +11,7 @@
     "./views.css": "./src/views/views.css"
   },
   "dependencies": {
+    "@bridge/contracts": "*",
     "react": "^19.1.0",
     "@bridge/specs": "*",
     "zustand": "^5.0.8",

@@ -14,3 +14,4 @@ export * from "./provision.ts";
 export * from "./ask.ts";
 export * from "./config.ts";
 export * from "./train.ts";
+export * from "./train-line.ts";

@@ -8,7 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
-import { isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -3300,7 +3300,7 @@ export function trainBaseRedAskBrief(
   reds: { name: string; url?: string }[],
   held: number,
   fix: {
-    card: { id: string; title?: string; status?: string; exhausted?: boolean } | null;
+    card: { id: string; title?: string; status?: string; exhausted?: boolean; blocked_reason?: string } | null;
     curePr: { repo: string; number: number } | null;
     culpritPr: number | null;
   },
@@ -3361,7 +3361,14 @@ export function trainBaseRedAskBrief(
           ``,
           `If you **DECLINE**: the line holds — nothing merges until main is green again, and agent sessions keep fixing on ${fix.card ? fix.card.id : "the fix card"}. The queue drains by itself the moment main recovers.`,
         ]
-      : []),
+      : fix.card?.exhausted
+        ? [
+            ``,
+            `**Why this needs you (automatic fix work is stuck):**`,
+            `- Fix card **${fix.card.id}** stopped progressing after repeated attempts${fix.card.blocked_reason ? ` (${fix.card.blocked_reason})` : ""} without producing a mergeable fix PR, and no agent is currently working on it.`,
+            `- Choose **Re-arm** to reset and re-queue ${fix.card.id} at top priority for a fresh agent session, **Transient** to re-run the failing check on GitHub, or **Other** to describe manual steps.`,
+          ]
+        : []),
     ``,
     fix.curePr
       ? `**Other ways this clears:** the fix lands through the line itself once main recovers (no action from you), a transient check clears on re-run, or you answer in your own words with manual steps.`
@@ -3589,6 +3596,7 @@ export function trainBaseRedAskWarranted(fix: {
  *  SQLite table so the hub and UI never reconstruct state from contradictory
  *  fragments. */
 export function resolveLaneOperationalState(input: {
+  baseState?: { verdict?: string; tip_sha?: string; red?: { name: string; url?: string }[] } | null;
   stop?: {
     sha?: string;
     reason?: string;
@@ -3608,7 +3616,10 @@ export function resolveLaneOperationalState(input: {
   fixCard?: TrainFixCard | null;
   now: number;
 }): LaneOperationalState {
-  const { stop, currently, episodeState, fixCard, now } = input;
+  const { currently, episodeState, fixCard, now } = input;
+  const stop = input.baseState?.verdict === "red" && input.baseState.tip_sha
+    ? { sha: input.baseState.tip_sha, failing: input.baseState.red ?? [], culprit_task: input.stop?.culprit_task }
+    : input.stop;
   if (stop && stop.sha) {
     const failingChecks = Array.isArray(stop.failing)
       ? stop.failing.map((f) => ({ name: String(f.name ?? ""), ...(f.url ? { url: String(f.url) } : {}) })).filter((f) => f.name)
@@ -3964,15 +3975,18 @@ export function reconcileDeployCoverage(input: {
       MAIN_RED_CONCLUSIONS.has(r.conclusion),
   );
 
-  if (input.baseVerdict.verdict === "green") {
+  const newestTip = tipRuns.find((r) => !["cancelled", "skipped"].includes(r.conclusion ?? ""));
+  const decisiveFailure = newestTip?.status === "completed" && MAIN_RED_CONCLUSIONS.has(newestTip.conclusion ?? "");
+  if (input.baseVerdict.verdict === "green" && !decisiveFailure && !tipActive &&
+      (tipGreen || !inferDeployWorkflow(input.required, input.workflowRuns))) {
     return {
       coverage: {
         phase: "covered",
         tip_sha: tipSha,
         tip_age_secs: tipAgeSecs,
         covered_by_sha: tipSha,
-        covered_by_run_id: tipGreen?.id ?? lastGreenRunId,
-        covered_by_url: tipGreen?.html_url ?? newestGreen?.html_url ?? null,
+        covered_by_run_id: tipGreen?.id ?? null,
+        covered_by_url: tipGreen?.html_url ?? null,
       },
       dispatch_workflow: null,
       cancel_run_ids: cancelRunIds,
@@ -3981,13 +3995,14 @@ export function reconcileDeployCoverage(input: {
     };
   }
 
-  if (input.baseVerdict.verdict === "red") {
+  if (input.baseVerdict.verdict === "red" || decisiveFailure) {
     return {
       coverage: {
         phase: "failed",
         tip_sha: tipSha,
         tip_age_secs: tipAgeSecs,
         failing_run_id: tipRed?.id ?? null,
+        failing_run_url: tipRed?.html_url ?? null,
         last_green_sha: lastGreenSha,
         last_green_run_id: lastGreenRunId,
       },
@@ -4109,6 +4124,95 @@ export function formatDeployCoverageSummary(cov: DeployCoverageState): string {
     case "failed":
       return `tip ${shortTip} deploy failed (age ${ageStr})`;
   }
+}
+
+/** Reconciles `MainCheckVerdict` (computed from commit check-runs) with
+ *  `DeployCoverageState` (computed from deploy workflow runs) into a single
+ *  cohesive base verdict (BR#6389):
+ *  - When `baseVerdict.verdict === "empty"` because a multi-stage deploy
+ *    workflow (e.g. `Deploy Dev` in `Prepare deploy to dev (build on spot)`)
+ *    has not created downstream `required_workflows` check-runs yet, but
+ *    `coverage.phase === "settling"`, the effective verdict is `"unsettled"`
+ *    (with `alarm` cleared), NEVER `"empty"` ("dark tip").
+ *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "failed"`,
+ *    the effective verdict is `"red"` naming `Deploy Dev`.
+ *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "covered"`,
+ *    keep waiting for required check evidence; coverage alone cannot prove green.
+ *  Mirrored in `train_gate.rs` `reconcile_base_verdict_with_deploy_coverage`. */
+export function reconcileBaseVerdictWithDeployCoverage(
+  baseVerdict: MainCheckVerdict,
+  coverage: DeployCoverageState,
+): MainCheckVerdict {
+  if (baseVerdict.verdict === "red") return baseVerdict;
+  if (coverage.phase === "settling") {
+    const label = coverage.active_run_id
+      ? `Deploy Dev (run #${coverage.active_run_id} in flight)`
+      : "Deploy Dev (in flight)";
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "unsettled",
+      unsettled: baseVerdict.unsettled.length > 0 ? baseVerdict.unsettled : [label],
+    };
+  }
+  if (coverage.phase === "failed") {
+    const name = coverage.failing_run_id
+      ? `Deploy Dev (run #${coverage.failing_run_id})`
+      : "Deploy Dev";
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "red",
+      red:
+        baseVerdict.red.length > 0
+          ? baseVerdict.red
+          : [
+              {
+                name,
+                conclusion: "failure",
+                url: coverage.failing_run_url ?? "",
+              },
+            ],
+    };
+  }
+  if (coverage.phase === "covered") {
+    if (baseVerdict.verdict !== "empty") return baseVerdict;
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "unsettled",
+      unsettled: ["Deployment finished; waiting for required checks"],
+    };
+  }
+  if (coverage.phase === "uncovered_grace" || coverage.phase === "uncovered_dispatched") {
+    return { ...baseVerdict, verdict: "unsettled", unsettled: ["Waiting for a covering deployment to start"] };
+  }
+  if (coverage.phase === "uncovered_dark") {
+    return { ...baseVerdict, verdict: "empty", alarm: coverage.reason };
+  }
+  return baseVerdict;
+}
+
+/** Normalizes a raw `queue_facts.base_state` object on the hub (BR#6389) so
+ *  even if a gateway binary stamps `verdict: "empty"` alongside
+ *  `deploy_coverage: { phase: "settling" | "covered" | "failed" }`, the hub
+ *  immediately reconciles `verdict`, `red`, `unsettled`, and `alarm` into one
+ *  consistent state. */
+export function normalizeBaseStateWithCoverage(baseState: Record<string, unknown> | null | undefined): Record<string, unknown> | null | undefined {
+  if (!baseState || typeof baseState !== "object") return baseState;
+  if (!baseState.deploy_coverage) return baseState;
+  const parsed = DeployCoverageStateSchema.safeParse(baseState.deploy_coverage);
+  if (!parsed.success) return baseState;
+  const effective = reconcileBaseVerdictWithDeployCoverage({
+    verdict: baseState.verdict === "green" ? "green" : baseState.verdict === "red" ? "red" : baseState.verdict === "unsettled" ? "unsettled" : "empty",
+    red: Array.isArray(baseState.red) ? baseState.red : [], green: Number(baseState.green ?? 0),
+    unsettled: Array.isArray(baseState.unsettled) ? baseState.unsettled.map(String) : [],
+  }, parsed.data);
+  if (effective.verdict === "empty") return baseState;
+  const next: Record<string, unknown> = { ...baseState, verdict: effective.verdict, unsettled: effective.unsettled,
+    ...(effective.red.length ? { red: effective.red } : {}) };
+  delete next.alarm;
+  return next;
 }
 
 /** BR#6179 (C) Fast-page deterministic ask title for a dark/uncovered tip past

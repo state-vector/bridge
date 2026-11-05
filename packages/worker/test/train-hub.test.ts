@@ -3129,7 +3129,12 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
 
     // Train-health priority: the diagnostic duty ranks at the top of orient's unclaimed_work
     const oriented = (await kbJson("/orient", { session: "p4-diag-probe" })).body;
-    expect((oriented.unclaimed_work ?? []).map((w: any) => w.id)).toContain(starv.duty_id);
+    // The pool is limited to ten rows; automatic recovery of other blocked
+    // lines may fill that page. Every returned task must still be train-health
+    // priority rather than unrelated feature work.
+    const top = oriented.unclaimed_work ?? [];
+    expect(top.length).toBeGreaterThan(0);
+    expect(top.every((w: any) => (w.tags ?? []).includes("diagnostic") || (w.tags ?? []).includes("root_blocker"))).toBe(true);
 
     // Second read + merge_capable lease renewal: does NOT duplicate the ask or duty, and does NOT clear starvation before a merge
     await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-p4", merge_capable: true });
@@ -3518,23 +3523,18 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
 
     const snap1 = await laneSnap(repo);
     // (B) Lane reason + base_red_resolution expose the deploy-coverage summary
-    expect(snap1.reason).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+    expect(snap1.reason).toContain("unsettled");
+    expect(snap1.line).toMatchObject({ phase: "waiting", label: "Deployment requested", remediation: { kind: "machine" } });
     expect(snap1.deploy_dispatched?.sha).toBe(darkTip);
     expect(snap1.deploy_dispatched?.workflow).toBe("deploy-dev.yml");
     expect(snap1.base_red_resolution).toBeTruthy();
-    expect(snap1.base_red_resolution.verdict).toBe("empty");
+    expect(snap1.base_red_resolution.verdict).toBe("unsettled");
     expect(snap1.base_red_resolution.deploy_coverage?.phase).toBe("uncovered_dispatched");
     expect(snap1.base_red_resolution.deploy_coverage?.tip_sha).toBe(darkTip);
 
-    // (C) Fast page: ONE dark-tip ask filed immediately (no 63m starvation wait)
-    expect(snap1.base_red_resolution.ask).toBeTruthy();
-    expect(snap1.base_red_resolution.ask.question).toBe(
-      `MERGE TRAIN DARK TIP: ${repo}@main — tip 7f5efec2 not covered by any deploy run. Remedy?`,
-    );
-    const askId = snap1.base_red_resolution.ask.id;
-    const askArt = (await kbJson("/get", { id: askId })).body;
-    expect(askArt.status).toBe("todo");
-    expect(String(askArt.body_md)).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+    // A dispatched recovery is machine work, not a request for another
+    // human decision. The typed line carries the actual next operation.
+    expect(snap1.base_red_resolution.ask).toBeNull();
 
     // (2) Tick 2: Dispatched deploy settles GREEN on 7f5efec2 -> dark-tip episode clears & ask auto-closes!
     const qf2 = await kbJson("/train.queue_facts", {
@@ -3564,9 +3564,48 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
 
     const snap2 = await laneSnap(repo);
     expect(snap2.base_red_resolution).toBeUndefined();
-    const askArtAfter = (await kbJson("/get", { id: askId })).body;
-    expect(askArtAfter.status).toBe("done");
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6179" });
+  });
+
+  it("BR#6389: a red tip with an empty queue gets one repair, live progress, then a clear human escalation when exhausted", async () => {
+    const repo = "state-vector/line-recovery-6389";
+    const sink = await kbJson("/create", { type: "task", title: "Line recovery alarm sink" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: sink.body.id } });
+    await acquire(repo, "gw-6389", { required_workflows: ["Deploy Dev"] });
+    const stamp = () => kbJson("/train.queue_facts", {
+      repo, actor: "gw-6389", entries: [], base_state: { verdict: "red", tip_sha: "6".repeat(40), red: [{ name: "Deploy Dev", url: "https://github.com/run/6389" }], unsettled: [] },
+    });
+    expect((await stamp()).body.error ?? "").toBe("");
+    const first = await laneSnap(repo);
+    expect(first.line).toMatchObject({ phase: "stopped", held: 0, remediation: { kind: "queued" } });
+    const repair = first.base_red_resolution.fix_card.id;
+    await stamp();
+    expect((await laneSnap(repo)).base_red_resolution.fix_card.id).toBe(repair);
+    const claim = await kbJson("/transition", { id: repair, to: "in_progress", actor: "repair-agent", session: "repair-6389" });
+    expect(claim.body.error ?? "").toBe("");
+    await kbJson("/progress.log", { id: repair, actor: "repair-agent", session: "repair-6389", did: "Found the missing deploy permission", will: "Restore deployment permission", completion_pct: 40 });
+    expect((await laneSnap(repo)).line).toMatchObject({ remediation: { kind: "agent", task: { last_progress: { note: "Found the missing deploy permission", completion_pct: 40 } } } });
+    await kbJson("/update", { id: repair, meta: { attempt: { attempts: 3 }, escalate: { reason: "No permission to restore deploy role" } } });
+    await stamp();
+    const exhausted = await laneSnap(repo);
+    expect(exhausted.line.remediation.kind).toBe("human");
+    expect(exhausted.line.remediation.action.url).toContain("/card/");
+    await kbJson("/train.queue_facts", { repo, actor: "gw-6389", entries: [], base_state: { verdict: "green", red: [], unsettled: [] } });
+    expect((await laneSnap(repo)).line.blocker).toBeNull();
+    await kbJson("/train.lease", { repo, action: "release", actor: "gw-6389" });
+  });
+
+  it("BR#6389: old gateways' empty plus settling is normalized without a false missing-deployment alarm", async () => {
+    const repo = "state-vector/line-settling-6389";
+    await acquire(repo, "gw-settling6389", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "gw-settling6389", entries: [], base_state: {
+      verdict: "empty", tip_sha: "a".repeat(40), tip_age_secs: 1000, red: [], unsettled: [],
+      deploy_coverage: { phase: "settling", tip_sha: "a".repeat(40), tip_age_secs: 1000, active_run_id: 123, active_run_url: "https://github.com/run/123" },
+    } });
+    const lane = await laneSnap(repo);
+    expect(lane.queue_facts.base_state.verdict).toBe("unsettled");
+    expect(lane.line).toMatchObject({ phase: "waiting", remediation: { kind: "machine", url: "https://github.com/run/123" } });
+    await kbJson("/train.lease", { repo, action: "release", actor: "gw-settling6389" });
   });
 });
