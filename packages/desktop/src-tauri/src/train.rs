@@ -88,6 +88,18 @@ fn classify_login(login: &str, worker_identities: &[String]) -> IdentityClass {
     }
 }
 
+/// BR#4687 (L1.2) branch provenance — pure, unit-pinned. The branch is the
+/// train's own (machine-updatable) iff it is non-empty and EVERY commit was
+/// authored by a worker-class identity. An empty commit list (API hiccup)
+/// fails closed to human-owned: a bounce is the safe direction, a machine
+/// rewrite of an unknown branch is not.
+fn branch_is_worker_authored(commit_logins: &[String], worker_identities: &[String]) -> bool {
+    !commit_logins.is_empty()
+        && commit_logins
+            .iter()
+            .all(|l| matches!(classify_login(l, worker_identities), IdentityClass::Worker(_)))
+}
+
 /// "detached-cody, rayh" → ["detached-cody", "rayh"] — trimmed, lowercased.
 fn parse_identities(raw: &str) -> Vec<String> {
     raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
@@ -710,6 +722,24 @@ impl Ctx {
                         c.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
                     )
                 })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
+    /// commit on the PR head. The pulls API resolves the commit email to the
+    /// owning account (`author.login`; null when the email maps to no
+    /// account). Worker-authored = every commit's login on the worker
+    /// allowlist; anything else (a human's login, an unlinked email) fails
+    /// closed to human-owned — the train never machine-updates a branch it
+    /// cannot prove is its own fleet's.
+    fn pr_commit_logins(&self, repo: &str, n: i64) -> Vec<String> {
+        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {login: (.author.login // \"\")}]"]);
+        match out {
+            Ok(Value::Array(a)) => a
+                .iter()
+                .map(|c| c.get("login").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
                 .collect(),
             _ => vec![],
         }
@@ -2543,6 +2573,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // the mid-drain forced green (a stale gate re-run must rest on the
         // gate's own predicate, not on the burst's pass-green fiction).
         let base_gate_green = base_class.verdict == MainVerdict::Green && base_class.gate.is_none();
+        // BR#4687 (L1.2): branch provenance for the behind pre-clear — the
+        // PR's commit author logins against the worker allowlist. One extra
+        // read-only gh call, fetched only when the state could be behind
+        // (the only provenance-sensitive state) to keep the common tick's
+        // gh budget unchanged.
+        let merge_state = vstr(&facts, "mergeStateStatus").unwrap_or("").to_lowercase();
+        let train_owned_branch = if merge_state == "behind" {
+            let logins = ctx.pr_commit_logins(repo, pr);
+            let owned = branch_is_worker_authored(&logins, &ctx.worker_identities);
+            if !owned {
+                log(
+                    Some(key),
+                    &format!(
+                        "PR #{pr} is behind but NOT worker-authored ({} commit author(s)) — the bounce goes to its owner; the train does not move human branches",
+                        logins.len()
+                    ),
+                );
+            }
+            owned
+        } else {
+            false
+        };
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -2557,6 +2609,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             root_fix,
             base_red_names: &base_red_names,
             base_gate_green,
+            train_owned_branch,
         });
         // BR#6348: a car ALREADY parked TYPED conflicting is a clock, not a
         // bounce. The hub's conflict bounce parks it (merge_train.state =
@@ -2607,6 +2660,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     // BR#5883 field encodes (RerunGate ≠ Merge, so the
                     // ready_on_own_head predicate reads identically either way)
                     base_gate_green: true,
+                    train_owned_branch,
                 }),
                 MergeAction::Merge { .. }
             )
@@ -4936,6 +4990,25 @@ mod tests {
         // be bypassed by unsetting the env (BR#3181: merge as worker or not).
         let workers: Vec<String> = vec![];
         assert!(matches!(classify_login("detached-cody", &workers), IdentityClass::Personal(_)));
+    }
+
+    #[test]
+    fn branch_provenance_worker_authored_fail_closed() {
+        // BR#4687 (L1.2): the branch is machine-updatable iff EVERY commit was
+        // authored by a worker-class identity — and every missing/blank/unknown
+        // case fails closed to human-owned.
+        let workers = vec!["detached-cody".to_string()];
+        // all-worker authorship → the train owns the branch (case-insensitive)
+        assert!(branch_is_worker_authored(&["detached-cody".into(), "Detached-Cody".into()], &workers));
+        // ONE personal author → a protected human branch, never machine-moved
+        assert!(!branch_is_worker_authored(&["detached-cody".into(), "rayh".into()], &workers));
+        // empty logins (API hiccup) → fail-closed human-owned
+        assert!(!branch_is_worker_authored(&[], &workers));
+        // empty allowlist → every login personal → never owned
+        assert!(!branch_is_worker_authored(&["detached-cody".into()], &vec![]));
+        // blank/unknown login → not worker class → not owned
+        assert!(!branch_is_worker_authored(&["".into()], &workers));
+        assert!(!branch_is_worker_authored(&["ghost-login".into()], &workers));
     }
 
     #[test]

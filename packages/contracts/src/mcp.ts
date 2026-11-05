@@ -227,10 +227,14 @@ export const TOOL_ARG_SCHEMAS = {
     // STALL_ALARM_TICKS consecutive ticks (default 3, env
     // MERGE_TRAIN_STALL_TICKS). The hub renders the STALLED lane/banner and
     // files the one-per-episode alarm ask.
-    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled"]),
+    // BR#4687 "updated": the executor's silent machine-rebase carry — the
+    // train updates its OWN behind worker-authored branch and stamps the
+    // carry the moment the update lands (no bounce, no status change).
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
+    from_head: z.string().optional(),
     merge_sha: z.string().optional(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
