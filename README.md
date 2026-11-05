@@ -57,6 +57,47 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 ### Durable execution (protocol v1)
 
+#### Eligibility-first scheduling and gateway retirement
+
+The hub selects work for the requesting gateway **before** applying a candidate
+limit. Host-affine or unavailable work cannot hide runnable work behind a global
+top-ten queue. `execution {id:"gateway", command:{kind:"schedule",mode:"reserve"},
+command_id:"<unique request>"}` reserves one eligible task and its gateway slot
+through the normal lifecycle gates. Replaying a request returns its original
+reservation; a reservation still requires fenced `begin` before any worker starts.
+Each reservation has a fresh executor session, which the runner propagates to
+the worker and all callbacks; re-dispatch does not reuse a tainted verifier identity.
+
+Capacity counts pre-launch reservations and **all unquiesced writers**, including
+stopping writers and expired leases. An expired lease is never proof of a free
+slot. Pre-launch reservations expire after five minutes: only an unchanged,
+never-launched claim with no live writer, unknown effect or independent wait is
+released, without spending execution/churn retries. Potential retained local
+files remain host-affine. A delayed old launch is refused by the claim/session gate.
+
+`bridge execution schedule-status [hostname]` (or the read-only `execution`
+command `schedule_status`) reports running/uncertain writers, reservations,
+capacity, eligible work, exclusion counts, readiness, last scheduling result and
+work-conservation health. A ready gateway with free slots and eligible work but
+no new reservations for two minutes raises one `dispatch_starved` audit incident
+per episode. Reservations clear the episode; this is machine diagnosis, not a
+human approval queue.
+
+To retire a laptop from autonomous execution, an authenticated full agent or
+human uses `execution` with `id:"gateway"` and command
+`{kind:"gateway_control",host:"<hostname>",mode:"draining",reason:"<reason>"}`.
+Draining persists across advertisements, restarts and temporary `resume_claims`;
+new claims and begins are refused, while existing writers may checkpoint and
+quiesce safely. Only explicit `mode:"enabled"` re-enables dispatch. Draining does
+not discard WIP or make local-only work portable.
+
+New reservations do not consult runner-local give-up/refused-reference caches.
+Repository/startup refusals live in the hub, scoped to the task's prerequisite
+inputs and executor proof: correcting the repository or configuration re-arms
+that task, while progress or a priority boost does not. Repeated runtime failures
+produce a visible five-minute gateway cooldown, followed by readiness re-proof,
+rather than a permanent local circuit breaker requiring restart.
+
 Worker provisioning validates cached credentials against the live hub before
 execution begins. Revoked/wrong-class cache entries are re-provisioned; the
 runner binds the hub's canonical worker label rather than an old cache key.

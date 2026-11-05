@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,29 @@ use crate::scm;
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
     logging::emit("dispatch", scope, msg);
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SchedulingOutcome {
+    Reserved { task_id: String, session: String },
+    Ready { candidates: Vec<String> },
+    NoEligibleWork { eligible: usize, reasons: HashMap<String, usize> },
+    AtCapacity { active: usize, reserved: usize, capacity: usize },
+    GatewayNotReady { reason: String },
+    ReservationPending {},
+    ReservationLapsed { task_id: String },
+}
+
+static CLAIM_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+fn remember_claim_session(cfg: &DispatchConfig, tid: &str, session: &str) {
+    CLAIM_SESSIONS.get_or_init(Default::default).lock().expect("claim session map poisoned")
+        .insert(format!("{}:{tid}", cfg.label.as_deref().unwrap_or("runner")), session.to_string());
+}
+fn claim_session(cfg: &DispatchConfig, tid: &str) -> String {
+    CLAIM_SESSIONS.get_or_init(Default::default).lock().expect("claim session map poisoned")
+        .get(&format!("{}:{tid}", cfg.label.as_deref().unwrap_or("runner"))).cloned()
+        .unwrap_or_else(|| format!("dispatch-{}", slugify(tid))) // legacy claims retain their original identity
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,14 +168,6 @@ fn backend_satisfies(cfg: &DispatchConfig, backend: opencode::Backend, meta: &se
     cfg.backends.get(name).map(|b| b.enabled && b.reasoning_tier >= required && b.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str())).unwrap_or(false)
 }
 
-/// Structured scheduling facts only. Diagnostics cannot consume the final
-/// slot on a multi-slot gateway; repair/review/deployment work sorts first.
-fn execution_rank(task: &serde_json::Value) -> u8 {
-    let has = |key: &str, value: &str| task[key].as_array().map(|a| a.iter().any(|v| v.as_str() == Some(value))).unwrap_or(false);
-    if has("tags", "root_blocker") || has("tags", "main-red") || has("roles", "review") || has("tags", "deployment-verification") { 0 }
-    else if has("tags", "diagnostic") { 2 }
-    else { 1 }
-}
 fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
     task["status"] == "in_progress" && state["attempt"]["phase"] == "quiesced"
         && state["attempt"]["host"].as_str() == host && host.is_some()
@@ -178,7 +193,7 @@ fn requested_worker_label(cfg: &DispatchConfig) -> String {
 }
 
 fn worker_config_revision(cfg: &DispatchConfig) -> String {
-    format!("worker-ready-v2:task-affinity-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default())
+    format!("worker-ready-v2:task-affinity-v1:eligibility-first-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default())
 }
 
 fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(WorkerCredential, serde_json::Value), String> {
@@ -231,7 +246,7 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
         let state = execution_call(cfg, tid, json!({ "kind": "inspect" }))?;
         if let Some(a) = state.get("attempt").filter(|a| !a.is_null()) {
             if a["phase"] != "quiesced" {
-                let session = format!("dispatch-{}", slugify(tid));
+                let session = claim_session(cfg, tid);
                 let ours = expected_attempt.is_some() && expected_attempt == a["attempt_id"].as_str()
                     && a["host"].as_str() == cfg.label.as_deref() && a["session"].as_str() == Some(session.as_str());
                 if !ours { return Err("prior writer is not this never-launched attempt; retain claim/WIP".into()); }
@@ -298,6 +313,10 @@ pub fn execution_read(cfg: &DispatchConfig, task_id: &str, kind: ExecutionRead) 
 }
 pub fn execution_claims(cfg: &DispatchConfig, pause: bool) -> Result<serde_json::Value, String> {
     execution_call(cfg, "gateway", if pause { json!({ "kind": "pause_claims", "reason": "Operator runtime update: preserve active writers while draining", "budget_ms": 300_000 }) } else { json!({ "kind": "resume_claims" }) })
+}
+pub fn scheduling_status(cfg: &DispatchConfig, host: Option<&str>) -> Result<serde_json::Value, String> {
+    let command = match host { Some(host) => json!({ "kind": "schedule_status", "host": host }), None => json!({ "kind": "schedule_status" }) };
+    execution_call(cfg, "gateway", command)
 }
 pub fn execution_coordinate(cfg: &DispatchConfig, task_id: &str, message: &str) -> Result<serde_json::Value, String> {
     execution_call(cfg, task_id, json!({ "kind": "message", "message_id": format!("operator-{}-{}", std::process::id(), now_ms()), "text": message, "priority": "interrupt" }))
@@ -1414,7 +1433,7 @@ fn mcp_call_task(
         obj.insert("agent".into(), json!(agent_identity(cfg)));
         obj.insert("runner_protocol".into(), json!("worker-ready-v2"));
     }
-    mcp_call_session(cfg, id, tool, args, Some(&format!("dispatch-{}", slugify(task_id))))
+    mcp_call_session(cfg, id, tool, args, Some(&claim_session(cfg, task_id)))
 }
 
 /// The agent name dispatched tasks are attributed to: config override
@@ -2036,57 +2055,6 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
         Ok(path)
     } else {
         Err(classify_clone_failure(&String::from_utf8_lossy(&out.stderr)))
-    }
-}
-
-/// ---- refused-reference cache (BR#3845 self-heal) ----
-/// A card whose repo reference is fatally unclonable (ghost repo, no access)
-/// must not re-enter the claim→clone-fail→watchdog-release loop forever. The
-/// runner records (task → reference + reason) locally and skips the reference
-/// until it CHANGES on the card — the author fixes the URL, the record no
-/// longer matches, dispatch resumes. Local to this runner host: the hub
-/// machine stays the verdict authority; this is provisioning self-defense.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RefusedRef {
-    pub url: String,
-    pub reason: String,
-    pub ts: u64,
-}
-
-fn refused_cache_path() -> Option<PathBuf> {
-    dispatch_dir().map(|d| d.join("refused-repos.json"))
-}
-
-fn refused_cache_load() -> HashMap<String, RefusedRef> {
-    let Some(p) = refused_cache_path() else {
-        return HashMap::new();
-    };
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn refused_cache_store(cache: &HashMap<String, RefusedRef>) {
-    if let Some(p) = refused_cache_path() {
-        let _ = std::fs::write(&p, serde_json::to_string_pretty(cache).unwrap_or_default());
-    }
-}
-
-/// Whether this task's CURRENT reference is the one we already refused:
-/// true = skip dispatch (the defect stands); false = proceed (fresh task, or
-/// the author fixed the URL — the stale record is dropped so it can't pin the
-/// card forever).
-fn refused_reference(cache: &mut HashMap<String, RefusedRef>, tid: &str, url: Option<&str>) -> bool {
-    match (cache.get(tid), url) {
-        (Some(r), Some(u)) if r.url == u => true,
-        (Some(_), _) => {
-            // reference changed (or removed) since the refusal — re-arm
-            cache.remove(tid);
-            refused_cache_store(cache);
-            false
-        }
-        (None, _) => false,
     }
 }
 
@@ -3146,7 +3114,10 @@ fn spawn_opencode(
     worker: &WorkerCredential,
 ) {
     let eligible: Vec<_> = avail.iter().copied().filter(|b| backend_satisfies(cfg, *b, task_meta)).collect();
-    if eligible.is_empty() { dlog(tid, "capability blocked: no available backend meets the persistent reasoning tier"); return; }
+    if eligible.is_empty() {
+        failed_start(cfg, tid, StartStage::Begin, "gate: selected capability no longer available on this host", None, None);
+        return;
+    }
     let backend = pick_backend(&eligible);
 
     // BR#2460: provisioning is a best-effort optimization; capability belongs
@@ -3235,45 +3206,8 @@ fn spawn_opencode(
                     "error",
                     &format!("{tid}: clone failed ({url}): {}", e.detail()),
                 );
-                let mut refused = refused_cache_load();
-                if e.fatal() {
-                    // BR#3845 self-heal: record the refusal so the claim →
-                    // clone-fail → 10-min-watchdog-stall → release loop stops
-                    // after ONE cycle; the candidate skip re-arms the moment
-                    // the card's reference changes.
-                    refused.insert(
-                        tid.to_string(),
-                        RefusedRef {
-                            url: url.clone(),
-                            reason: match &e {
-                                CloneFailure::NotFound(_) => "repository not found (authoring defect in the card's repo reference)".into(),
-                                CloneFailure::Auth(_) => "access denied (runner lacks credentials for this repo)".into(),
-                                CloneFailure::Transient(_) => unreachable!("fatal arm"),
-                            },
-                            ts: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0),
-                        },
-                    );
-                    refused_cache_store(&refused);
-                    release_claim(
-                        cfg,
-                        tid,
-                        &format!(
-                            "runner: clone of {url} is fatally refused ({}) — recorded; dispatch skipped until the card's repo reference changes (fix meta.repo/body URL, or grant the runner access)",
-                            e.detail()
-                        ),
-                    );
-                } else {
-                    // transient: release the claim so the retry starts NOW —
-                    // holding it only bought a 10-minute watchdog stall
-                    release_claim(
-                        cfg,
-                        tid,
-                        &format!("runner: transient clone failure for {url} ({}) — claim released, will retry next cycle", e.detail()),
-                    );
-                }
+                let reason = format!("{}clone of {url} failed: {}", if e.fatal() { "gate: " } else { "" }, e.detail());
+                failed_start(cfg, tid, StartStage::Begin, &reason, None, None);
                 return;
             }
         };
@@ -3293,6 +3227,7 @@ fn spawn_opencode(
                 "worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)";
             dlog(tid, &format!("error: {detail}"));
             snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
+            failed_start(cfg, tid, StartStage::Begin, &format!("gate: {detail}"), None, Some(&repo_path));
             return;
         }
         // Identity leg (BR#3185): write the profile's repo-local git config and
@@ -3318,6 +3253,7 @@ fn spawn_opencode(
                         e
                     ),
                 );
+                failed_start(cfg, tid, StartStage::Inspect, &format!("gate: {detail}"), None, Some(wt));
                 return;
             }
         }
@@ -3397,7 +3333,7 @@ fn spawn_opencode(
             "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
         )
     };
-    let bridge_session = format!("dispatch-{}", slugify(tid));
+    let bridge_session = claim_session(cfg, tid);
     let env_block = format!(
         "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
     );
@@ -4067,7 +4003,7 @@ fn tick(
             let receipt_note = if pr_url.is_some() {
                 note.clone()
             } else {
-                format!("{note}\nverified against: task artefact + history receipts (exit 0, session dispatch-{})", slugify(&inf.task_id))
+                format!("{note}\nverified against: task artefact + history receipts (exit 0, session {})", claim_session(cfg, &inf.task_id))
             };
             // worker-lane signal: a session that ended with BR-BLOCKED: hit a
             // blocker mid-run. The gateway files the block (and the ask the
@@ -4312,13 +4248,13 @@ fn tick(
     let Some(worker_credential) = prepared_worker.as_ref() else { return Ok(msgs); };
 
     // 3c. circuit breaker: agent CLI is failing deterministically — stop
-    // claiming. In-flight sessions keep finishing; the breaker clears on the
-    // first success or a runner restart after the environment is fixed.
+    // claiming. Persist a bounded cooldown at the hub so operators see the
+    // cause and recovery does not require a process restart.
     if breaker.tripped() {
-        msgs.push(format!(
-            "CIRCUIT BREAKER — {} consecutive dispatch failures ({}). Not claiming new work: fix the agent CLI/auth, then restart the runner.",
-            breaker.consecutive_failures, breaker.last_signature
-        ));
+        let reason = format!("{} consecutive dispatch failures ({})", breaker.consecutive_failures, breaker.last_signature);
+        execution_call(cfg, "gateway", json!({ "kind": "gateway_failure", "reason": reason, "cooldown_ms": 300_000 }))?;
+        msgs.push(format!("CIRCUIT BREAKER — {reason}; hub cooldown for 5m, then readiness is re-proved"));
+        *breaker = CircuitBreaker::default();
         return Ok(msgs);
     }
 
@@ -4389,6 +4325,7 @@ fn tick(
         // seconds stale) and carries the hub heartbeat in meta
         // (session_alive_ts / last_progress.ts).
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+        if let Some(session) = art.pointer("/meta/session").and_then(|v| v.as_str()) { remember_claim_session(cfg, tid, session); }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
         let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
         task_meta["execution_project"] = art["project"].clone();
@@ -4530,185 +4467,37 @@ fn tick(
         ));
     }
 
-    // 6. claim new claimable tasks until the WIP limit is reached.
-    // BR#2419: blocked tasks are NOT candidates — resuming them is an unblock
-    // duty's verdict, never a client transition. The runner only claims todo
-    // work. RESUME preference: a candidate we hold an opencode session AND
-    // worktree for sorts first — resuming that session restores full context
-    // cheaply, which is how a task that yielded earlier routes back to "the
-    // same agent".
-    let candidates = orient
-        .get("unclaimed_work")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut candidates: Vec<(serde_json::Value, Option<String>)> = candidates
-        .into_iter()
-        .map(|t| {
-            let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sess = find_session(&sessions, &tid).map(|s| s.id.clone());
-            (t, sess)
-        })
-        .collect();
-    candidates.sort_by(|a, b| {
-        let priority = execution_rank(&a.0).cmp(&execution_rank(&b.0));
-        if priority != std::cmp::Ordering::Equal { return priority; }
-        let ra = if a.1.is_some() { 0 } else { 1 };
-        let rb = if b.1.is_some() { 0 } else { 1 };
-        ra.cmp(&rb)
-    });
-    // BR#2844: same law as my_tasks — one malformed candidate never zeroes
-    // the dispatch surface, and it is never silent.
-    let mut malformed_candidates = 0usize;
-    for (task, resume_sess) in candidates {
-        if in_flight.len() >= cfg.max_sessions {
-            break;
-        }
-        if execution_rank(&task) == 2 && cfg.max_sessions > 1 && in_flight.len() >= cfg.max_sessions - 1 {
-            continue; // preserve one slot for repair + independent verification
-        }
-        let (Some(tid), Some(title)) = (
-            task.get("id").and_then(|v| v.as_str()),
-            task.get("title").and_then(|v| v.as_str()),
-        ) else {
-            malformed_candidates += 1;
-            continue;
+    // New work is selected AND reserved by the hub. Local history is not a
+    // second scheduling authority: a human release re-enters this path even
+    // when this process previously gave up or cached a refused reference.
+    while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) {
+        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
+        let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
+            Ok(SchedulingOutcome::Reserved { task_id, session, .. }) => (task_id, session),
+            Ok(other) => {
+                let message = format!("hub scheduling: {other:?}");
+                dlog("", &message);
+                snap_activity(snap, "schedule", &message);
+                break;
+            }
+            Err(error) => return Err(format!("hub scheduling contract drift: {error}")),
         };
-        if in_flight.iter().any(|inf| inf.task_id == tid)
-            || attempts
-                .get(tid)
-                .map(|a| a.elapsed() < Duration::from_secs(300))
-                .unwrap_or(false)
-        {
-            continue;
+        let (tid, session) = (&reservation.0, &reservation.1);
+        remember_claim_session(cfg, tid, session);
+        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))?;
+        if art["status"].as_str() != Some("in_progress") || art.pointer("/meta/session").and_then(|v| v.as_str()) != Some(session.as_str()) {
+            return Err(format!("{tid}: reservation changed before launch; preserving current holder"));
         }
-        // not dispatchable at all: question tasks (answered, not claimed),
-        // operator gates, bar-gated work — the claim gate would reject or the
-        // claim is wrong by definition. Respect the verdict; no churn.
-        if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false)
-            || task.get("is_claimable").and_then(|q| q.as_bool()) == Some(false)
-        {
-            // silence here reads as a dead runner: the queue looks full and
-            // nothing moves, with no errors anywhere. Say why — once per app
-            // run per task (an operator clearing the gate re-arms the note).
-            if gated_announced.insert(tid.to_string()) {
-                msgs.push(format!("SKIP: {tid} not claimable (qualification bars unmet) — meet the declared bars or re-issue"));
-            }
-            continue;
+        if in_flight.iter().any(|inf| inf.task_id == *tid) {
+            return Err(format!("{tid}: hub reserved a task with a local writer; refusing duplicate launch"));
         }
-        if gave_up.contains(tid) {
-            continue; // escalated or handed off — the watchdog/humans own it now
-        }
-        // BR#2419: blocked work is not runner work. Leaving blocked is a
-        // verdict delivered by a role:unblock duty or a human — never a client
-        // transition. The unblock CHILD (a todo task) is what the runner
-        // dispatches; it shows up here as its own candidate.
-        if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
-            // blocked is a verdict, and claiming it needs a resolution the
-            // runner cannot invent — that is role:unblock duty. Skipping
-            // silently here starved the runner in front of a full backlog:
-            // ten blocked tasks filled the orient slice, every claim was
-            // refused, and nothing announced why. Announce + pace.
-            if gated_announced.insert(format!("{tid}:blocked")) {
-                msgs.push(format!("SKIP: {tid} blocked — needs its unblock condition resolved (unblock duty or human)"));
-            }
-            continue;
-        }
-        // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
-        // dir with the board delivery contract. Provisioning is the runner's
-        // best-effort job; capability is the agent's. Nothing is declined for
-        // missing metadata.
-        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-        // BR#3337: re-read the card's status at claim time — the orient slice
-        // can be seconds stale, and a card another dispatcher claimed in
-        // between must skip silently (race lost), never claim-and-fail.
-        if let Some(st) = art.get("status").and_then(|s| s.as_str()) {
-            if st != "todo" {
-                dlog(
-                    tid,
-                    &format!("claim race lost (status now {st}) — skipping"),
-                );
-                snap_activity(
-                    snap,
-                    "info",
-                    &format!("{tid} claim race lost (now {st}) — skipped"),
-                );
-                continue;
-            }
-        }
-        let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        gave_up.remove(tid);
+        finished_no_pr.remove(tid);
+        let title = art["title"].as_str().ok_or("reserved task is missing title")?;
+        let body_md = art["body_md"].as_str().unwrap_or("");
+        let mut task_meta = art["meta"].clone();
         task_meta["execution_project"] = art["project"].clone();
-        // BR#3845 self-heal: a reference this runner already refused (fatal
-        // clone failure) is skipped WITHOUT claiming — the recorded refusal
-        // stands until the card's repo URL changes, so a ghost reference can't
-        // re-enter the claim → clone-fail → watchdog-stall loop forever. A
-        // changed URL drops the record and dispatch resumes.
-        if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) { continue; }
-        // The task's persisted writer/checkpoint affinity is authoritative;
-        // metadata alone can predate the last execution. Never claim first.
-        match execution_call(cfg, tid, json!({ "kind": "availability" })) {
-            Ok(state) => {
-                let host = state["hosts"].as_array().and_then(|hosts| hosts.iter().find(|h| h["host"].as_str() == cfg.label.as_deref()));
-                let eligible = host.map(|h| h["blockers"].as_array().map(|b| b.is_empty()).unwrap_or(false)
-                    && h.pointer("/readiness/kind").and_then(|k| k.as_str()) == Some("ready")).unwrap_or(false);
-                if !eligible {
-                    if gated_announced.insert(format!("{tid}:execution-availability")) {
-                        dlog(tid, &format!("SKIP: execution prerequisites on this host: {}", host.map(|h| h["blockers"].to_string()).unwrap_or_else(|| "no live host observation".into())));
-                    }
-                    continue;
-                }
-            }
-            Err(error) => { dlog(tid, &format!("execution preflight unavailable: {error}; no claim attempted")); continue; }
-        }
-        let candidate_url = source_repo(&body_md, &task_meta);
-        let mut refused = refused_cache_load();
-        if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
-            let reason = refused.get(tid).map(|r| r.reason.clone()).unwrap_or_default();
-            if gated_announced.insert(format!("{tid}:refused")) {
-                dlog(
-                    tid,
-                    &format!(
-                        "skip: refused repo reference {} ({}) — fix the reference on the card to re-arm",
-                        candidate_url.unwrap_or_default(),
-                        reason
-                    ),
-                );
-                snap_activity(snap, "info", &format!("{tid} refused repo reference ({reason}) — skipped until it changes"));
-            }
-            continue;
-        }
-        if let Err(e) = mcp_call_task(
-            cfg,
-            id,
-            "transition",
-            json!({ "id": tid, "to": "in_progress" }),
-            &tid,
-        ) {
-            if is_claim_race_error(&e) {
-                // BR#3337: the lifecycle/ownership gate refused the claim —
-                // another gateway or session owns the card. That is a claim
-                // race: retryable next tick, never a dispatch failure (no
-                // error bookkeeping, no backoff, breaker untouched).
-                dlog(
-                    tid,
-                    &format!("claim raced (rejected: {}) — skipping", truncate(&e, 100)),
-                );
-                snap_activity(
-                    snap,
-                    "info",
-                    &format!("{tid} claim raced — skipped (retryable)"),
-                );
-                continue;
-            }
-            // claim failed for a real reason — don't kill the tick or the whole
-            // claim loop; surface it on stderr too (snap-only failures read as
-            // silence) and back off this candidate
-            dlog(tid, &format!("error: claim failed: {e}"));
-            attempts.insert(tid.to_string(), Instant::now());
-            snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
-            continue;
-        }
+        let resume_sess = None; // a new reservation is a fresh executor session; WIP remains in the registered worktree
         let _ = mcp_call_task(
             cfg,
             id,
@@ -4720,12 +4509,12 @@ fn tick(
             Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
             None => format!("claimed {tid} — worker launch requested"),
         };
-        let (role_work, role_type) = task.get("tags").and_then(|v| v.as_array()).map(|a| {
-            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
+        let (role_work, role_type) = art.get("roles").and_then(|v| v.as_array()).map(|a| {
+            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| matches!(*s, "review" | "analysis" | "unblock")).map(str::to_string);
             (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
         }).unwrap_or((false, "task".to_string()));
         let before_launch = in_flight.len();
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight, worker_credential);
+        spawn_opencode(cfg, snap, tid, title, body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight, worker_credential);
         attempts.insert(tid.to_string(), Instant::now());
         if in_flight.len() > before_launch {
             snap_activity(snap, "dispatch", &msg);
@@ -4734,11 +4523,6 @@ fn tick(
             snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
             break; // re-prove gateway readiness next tick before another claim
         }
-    }
-    if malformed_candidates > 0 {
-        msgs.push(format!(
-            "WARN: {malformed_candidates} unclaimed_work item(s) missing id/title — hub contract drift (BR#2844, packages/contracts)"
-        ));
     }
 
     Ok(msgs)
@@ -5589,24 +5373,15 @@ mod tests {
     }
 
     #[test]
-    fn refused_reference_skips_until_the_reference_changes() {
-        let mut cache = HashMap::new();
-        // fresh task: not refused
-        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/o/r")));
-        // record a refusal (as the clone-failure path does), then the SAME
-        // reference is skipped...
-        cache.insert(
-            "BR#1".into(),
-            RefusedRef { url: "https://github.com/state-vector/super".into(), reason: "repository not found".into(), ts: 0 },
-        );
-        assert!(refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/super")));
-        // ...but a FIXED reference re-arms dispatch and drops the record
-        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/superpositional")));
-        assert!(!cache.contains_key("BR#1"), "stale refusal must not pin the card forever");
-        // repo-less after a refusal (reference removed) also re-arms
-        cache.insert("BR#2".into(), RefusedRef { url: "https://github.com/o/r".into(), reason: "x".into(), ts: 0 });
-        assert!(!refused_reference(&mut cache, "BR#2", None));
-        assert!(!cache.contains_key("BR#2"));
+    fn scheduling_requires_a_complete_reservation_and_preserves_hub_session_identity() {
+        assert!(serde_json::from_value::<SchedulingOutcome>(json!({"kind":"reserved","task_id":"BR#1"})).is_err());
+        assert!(serde_json::from_value::<SchedulingOutcome>(json!({"kind":"unknown"})).is_err());
+        let result = serde_json::from_value::<SchedulingOutcome>(json!({"kind":"reserved","task_id":"BR#1","session":"dispatch-BR-1-fresh"})).unwrap();
+        let SchedulingOutcome::Reserved { task_id, session } = result else { panic!("not reserved") };
+        let mut cfg = default_config();
+        cfg.label = Some("scheduling-test".into());
+        remember_claim_session(&cfg, &task_id, &session);
+        assert_eq!(claim_session(&cfg, &task_id), session);
     }
 
     #[test]

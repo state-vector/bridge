@@ -27,3 +27,11 @@ export function startupProofChanged(wait: StartupWait, host: string, fingerprint
   if (wait.retained_work && host !== wait.host) return false;
   return wait.phase === "waiting_executor" || host !== wait.host || fingerprint !== wait.fingerprint;
 }
+
+/** Stable prerequisite identity excludes progress, priority and retry counters.
+ * Fixing repository/task inputs re-arms only that task, not the whole host. */
+export function startupPrerequisiteFingerprint(proof: string, task: { body_md: string; project: string; meta: Record<string, unknown> }): string {
+  const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, canonical(child)])) : value;
+  return JSON.stringify([proof, task.body_md, task.project, canonical({ repo: task.meta.repo, execution_requirements: task.meta.execution_requirements, qualification: task.meta.qualification })]);
+}

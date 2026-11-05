@@ -120,6 +120,14 @@ fn main() {
             }
         }
         "execution" => {
+            if args.get(2).map(String::as_str) == Some("schedule-status") {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                match dispatch::scheduling_status(&cfg, args.get(3).map(String::as_str)) {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()),
+                    Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+                }
+                return;
+            }
             if matches!(args.get(2).map(String::as_str), Some("pause" | "resume" | "coordinate")) {
                 let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
                 let result = if args[2] == "coordinate" {

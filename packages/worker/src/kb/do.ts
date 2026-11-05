@@ -229,10 +229,12 @@ import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchem
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
-import { StartupWaitSchema, startupWaitReason, startupProofChanged, type StartupWait } from "@bridge/contracts";
+import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait } from "./execution-work.ts";
+import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
+import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -636,6 +638,8 @@ export class KnowledgeHub {
     await this.ensureSchema();
     this.executionWork().sweep();
     const now0 = Date.now();
+    this.reconcileDispatchReservations(now0);
+    this.reconcileSchedulingHealth(now0);
     // Readiness owns startup waits, not the task churn/timer machinery.
     this.reconcileStartupWaits(now0);
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
@@ -2903,6 +2907,19 @@ export class KnowledgeHub {
       CREATE TABLE IF NOT EXISTS executor_start_claims (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS dispatch_reservations (
+        task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL,
+        generation INTEGER NOT NULL, expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS gateway_dispatch_control (
+        token_id TEXT PRIMARY KEY, mode TEXT NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL, updated_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS dispatch_observations (
+        token_id TEXT PRIMARY KEY, outcome TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS dispatch_health (
+        token_id TEXT PRIMARY KEY, since INTEGER NOT NULL, attention_at INTEGER
+      );
       CREATE TABLE IF NOT EXISTS executor_start_waits (
         task_id TEXT PRIMARY KEY, state TEXT NOT NULL
       );
@@ -3584,7 +3601,7 @@ export class KnowledgeHub {
     try {
       this.executionMutationGuard(op, body);
       switch (op) {
-        case "execution": return this.json(this.executionCommand(body, actor));
+        case "execution": return this.json(await this.executionCommand(body, actor));
         case "handoff.read": return this.json(this.executionWork().read(body, String(body.token_id ?? ""), String(body.session ?? "")));
         case "handoff.accept": return this.json(this.executionWork().accept(body, String(body.token_id ?? "")));
         case "handoff.checkpoint": return this.json(this.executionWork().checkpoint(HandoffCheckpointSchema.parse(body), String(body.token_id ?? "")));
@@ -3595,6 +3612,7 @@ export class KnowledgeHub {
         }
         case "admin.execution_sweep": {
           if (!isAdmin) throw new Error("admin only");
+          this.reconcileDispatchReservations(Number(body.now) || Date.now());
           this.executionWork().sweep(Number(body.now) || Date.now());
           return this.json({ ok: true });
         }
@@ -4427,6 +4445,7 @@ export class KnowledgeHub {
       : "";
     this.version(id, actor, "update", `updated ${changed.join(", ") || "fields"}${metaDetail}`, { title, body_md: bodyMd });
     await this.embedArtefact(id, title, bodyMd);
+    if (body.body_md !== undefined || body.meta?.repo !== undefined || body.meta?.execution_requirements !== undefined || body.meta?.qualification !== undefined) this.reconcileStartupWaits(Date.now());
     this.executionWork().sweep();
     return { id };
   }
@@ -4561,6 +4580,15 @@ export class KnowledgeHub {
     const row = this.one(`SELECT state FROM executor_start_waits WHERE task_id = ?`, id);
     return row ? StartupWaitSchema.parse(JSON.parse(row.state)) : null;
   }
+  private taskStartupProof(id: string, proof: string, override?: Record<string, unknown>): string {
+    const row = this.one(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id);
+    const meta = override ?? JSON.parse(row?.meta ?? "{}");
+    return startupPrerequisiteFingerprint(proof, { body_md: String(row?.body_md ?? ""), project: String(row?.project ?? ""), meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } });
+  }
+  private startupRejected(id: string, host: string, proof: string): boolean {
+    // Keep old unscoped rejection fences until their executor proof changes.
+    return !!this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint IN (?,?)`, id, host, proof, this.taskStartupProof(id, proof));
+  }
 
   /** Never use an owner/session expiry as evidence that a writer stopped.
    * This migration admits only the old, exact pre-begin credential rejection,
@@ -4625,8 +4653,8 @@ export class KnowledgeHub {
         if (capabilityBlockers(requirements, capabilities, String(host.label)).length) return false;
         if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, String(host.label), String(row.project)))) return false;
         const proof = this.executorReadiness(String(host.token_id), String(host.label), capabilities, now);
-        return proof.kind === "ready" && startupProofChanged(wait, String(host.label), proof.fingerprint)
-          && !this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, id, host.label, proof.fingerprint);
+        return proof.kind === "ready" && startupProofChanged(wait, String(host.label), wait.phase === "recovery_required" ? this.taskStartupProof(id, proof.fingerprint) : proof.fingerprint)
+          && !this.startupRejected(id, String(host.label), proof.fingerprint);
       });
       if (!ready) {
         // One incident on the original card per wait episode; no approval or
@@ -4677,11 +4705,174 @@ export class KnowledgeHub {
       || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL`, id);
   }
 
+  /** One eligibility predicate for discovery and reservations. No global top-N
+   * window: incompatible tasks cannot hide compatible work further down. */
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities) {
+    const reasons: Partial<Record<SchedulingReason, number>> = {};
+    const rows = this.state.storage.sql.exec(`SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''`).toArray();
+    const eligible = rows.filter(row => {
+      const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
+      const state = this.executionState(id);
+      let reason: SchedulingReason | null = null;
+      if (meta.operator_gated) reason = "operator_gate";
+      else if (isQuestionTask(meta)) reason = "question";
+      else if (this.unmetBars(row).length) reason = "qualification";
+      else if (this.protectedExecution(id, meta) || releaseHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
+      else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
+      else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
+      else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";
+      else {
+        const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
+        if (requirements.host && requirements.host !== host) reason = "host_affinity";
+        else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
+        else {
+          const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
+          if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
+        }
+      }
+      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; return false; }
+      return true;
+    });
+    const rank = (row: (typeof rows)[number]) => {
+      const meta = JSON.parse(String(row.meta ?? "{}")), tags = parseTags(row.tags), roles = parseTags(row.roles);
+      if (isRootFixCard({ tags, meta }) || (tags.includes("merge-train") && tags.includes("diagnostic"))) return -2;
+      if (meta.boosted) return -1;
+      return roles.includes("review") || roles.includes("unblock") ? 0 : 4;
+    };
+    eligible.sort((a, b) => rank(a) - rank(b) || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
+    return { eligible, reasons };
+  }
+
+  private reconcileDispatchReservations(now = Date.now()) {
+    for (const reservation of this.state.storage.sql.exec(`SELECT r.*,t.label FROM dispatch_reservations r JOIN auth_tokens t ON t.id=r.token_id WHERE r.expires_at<=?`, now).toArray()) {
+      const id = String(reservation.task_id), row = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, id);
+      const state = this.executionState(id), meta = JSON.parse(row?.meta ?? "{}");
+      // Expiration only proves a reservation elapsed, never writer quiescence.
+      if (state?.attempt && state.attempt.phase !== "quiesced") continue;
+      if ((state?.generation ?? 0) !== Number(reservation.generation) || state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) continue;
+      if (row?.status !== "in_progress" || meta.session !== reservation.session) {
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, id); continue;
+      }
+      if (this.protectedExecution(id, meta) || releaseHold(meta) || this.startupHasAsk(id)) continue;
+      // Provisioning may have retained local files. Keep conservative affinity;
+      // the scheduler must not equate a missing begin with portable work.
+      meta.execution_requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), host: String(reservation.label) };
+      meta.dispatch_recovery = { kind: "reservation_expired", at: now, host: reservation.label };
+      delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, id);
+        this.version(id, "system:scheduler", "transition", "in_progress → todo — pre-launch reservation expired; retained host preserved, no execution retry consumed", {});
+      });
+    }
+  }
+
+  private schedulingStatus(host?: string, now = Date.now()) {
+    return this.state.storage.sql.exec(`SELECT h.token_id,t.label,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray()
+      .filter(row => !host || row.label === host).map(row => {
+        const tokenId = String(row.token_id), label = String(row.label), capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+        const readiness = this.executorReadiness(tokenId, label, capabilities, now);
+        const selection = this.dispatchCandidates(tokenId, label, capabilities);
+        const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, tokenId);
+        const health: SchedulingHealth = !pending ? { kind: "clear" } : now - Number(pending.since) < 120_000 ? { kind: "waiting", since: Number(pending.since) }
+          : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
+        const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
+        return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), eligible: selection.eligible.length,
+          reasons: selection.reasons, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
+          live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
+      });
+  }
+  private reconcileSchedulingHealth(now: number) {
+    for (const status of this.schedulingStatus(undefined, now)) {
+      if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
+        this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
+      }
+      this.state.storage.sql.exec(`INSERT OR IGNORE INTO dispatch_health(token_id,since) VALUES(?,?)`, status.token_id, now);
+      const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, status.token_id);
+      if (now - Number(pending.since) >= 120_000 && !pending.attention_at) {
+        this.state.storage.transactionSync(() => {
+          this.state.storage.sql.exec(`UPDATE dispatch_health SET attention_at=? WHERE token_id=?`, now, status.token_id);
+          this.audit("system:scheduler", "dispatch_starved", null, { host: status.host, eligible: status.eligible, active: status.active, reserved: status.reserved, capacity: status.capacity, since: pending.since });
+        });
+      }
+    }
+  }
+
+  private async scheduleGateway(body: Record<string, unknown>, tokenId: string, host: string, mode: "inspect" | "reserve", commandId: string): Promise<SchedulingOutcome> {
+    this.reconcileDispatchReservations();
+    const key = `schedule:${tokenId}`, encoded = JSON.stringify({ mode, host, session: body.session });
+    const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, key, commandId);
+    if (replay) {
+      if (replay.request !== encoded) throw new Error("gate: command_id reused with different scheduling input");
+      let result = SchedulingOutcomeSchema.parse(JSON.parse(replay.result));
+      if (result.kind === "reservation_pending") {
+        const reservation = this.one(`SELECT r.expires_at FROM dispatch_reservations r JOIN artefacts a ON a.id=r.task_id WHERE r.task_id=? AND r.token_id=? AND r.session=? AND a.status='in_progress' AND json_extract(a.meta,'$.session')=r.session`, result.task_id, tokenId, result.session);
+        if (reservation) result = { ...result, kind: "reserved", expires_at: Number(reservation.expires_at) };
+        else if (Date.now() - result.observed_at >= DISPATCH_RESERVATION_MS) result = { ...result, kind: "reservation_lapsed" };
+        if (result.kind !== "reservation_pending") this.state.storage.sql.exec(`UPDATE execution_commands SET result=? WHERE task_id=? AND command_id=?`, JSON.stringify(result), key, commandId);
+      }
+      return result;
+    }
+    const observation = this.one(`SELECT capabilities,observed_ts FROM execution_hosts WHERE token_id=?`, tokenId);
+    const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
+    const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
+    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} };
+    const facts = { host, ...occupancy, capacity: capabilities ? gatewayCapacity(capabilities) : 0, eligible: selection.eligible.length, reasons: selection.reasons, observed_at: Date.now() };
+    const record = (outcome: SchedulingOutcome) => {
+      const result = SchedulingOutcomeSchema.parse(outcome);
+      this.state.storage.sql.exec(`INSERT INTO dispatch_observations(token_id,outcome) VALUES(?,?) ON CONFLICT(token_id) DO UPDATE SET outcome=excluded.outcome`, tokenId, JSON.stringify(result));
+      return result;
+    };
+    if (!capabilities || Date.now() - Number(observation?.observed_ts) >= 120_000) return record({ kind: "gateway_not_ready", ...facts, reason: "Executor capability observation missing or stale" });
+    const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
+    if (readiness.kind !== "ready" || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2)) return record({ kind: "gateway_not_ready", ...facts, reason: readiness.kind === "ready" ? "Runner protocol upgrade required" : readiness.reason });
+    if (occupancy.active + occupancy.reserved >= facts.capacity) return record({ kind: "at_capacity", ...facts });
+    if (!selection.eligible.length) return record({ kind: "no_eligible_work", ...facts });
+    if (mode === "inspect") return record({ kind: "ready", ...facts, candidates: selection.eligible.map(t => String(t.id)) });
+    // Persist a pending command before the lifecycle's async evidence checks.
+    // Concurrent replay cannot reserve twice; the final claim transaction also
+    // rechecks capacity, ownership, readiness and every execution fence.
+    const firstId = String(selection.eligible[0].id);
+    const dispatchSession = (id: string) => `dispatch-${id.replace('#', '-')}-${crypto.randomUUID().slice(0, 8)}`;
+    this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, key, commandId, encoded, JSON.stringify({ kind: "reservation_pending", ...facts, task_id: firstId, session: dispatchSession(firstId) }));
+    let result: SchedulingOutcome = { kind: "no_eligible_work", ...facts };
+    try {
+      for (const task of selection.eligible) {
+        const id = String(task.id), session = dispatchSession(id);
+        this.state.storage.sql.exec(`UPDATE execution_commands SET result=? WHERE task_id=? AND command_id=?`, JSON.stringify({ kind: "reservation_pending", ...facts, task_id: id, session }), key, commandId);
+        try {
+          await this.transition({ ...body, id, to: "in_progress", session, gateway: true, agent: capabilities.worker.kind === "provisioned" ? capabilities.worker.label : "", note: "Hub scheduler reserved eligible work" }, host);
+          const reservation = this.one(`SELECT expires_at FROM dispatch_reservations WHERE task_id=? AND token_id=? AND session=?`, id, tokenId, session);
+          if (!reservation) throw new Error("gate: reservation no longer held after claim");
+          result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at) };
+          break;
+        } catch (error) {
+          const message = String(error);
+          if (!message.includes("gate:") && !message.includes("[rule:")) throw error;
+          facts.reasons.lifecycle_gate = (facts.reasons.lifecycle_gate ?? 0) + 1;
+          this.audit(host, "dispatch_candidate_rejected", id, { reason: message.slice(0, 500) });
+          const n = gatewayOccupancy(this.state.storage.sql, tokenId, host);
+          if (n.active + n.reserved >= facts.capacity) { result = { kind: "at_capacity", ...facts, ...n }; break; }
+        }
+      }
+      this.state.storage.sql.exec(`UPDATE execution_commands SET result=? WHERE task_id=? AND command_id=?`, JSON.stringify(result), key, commandId);
+      return record(result);
+    } catch (error) {
+      // An infrastructure failure is not a NO-work verdict. Keep an explicit
+      // pending receipt for reconciliation, never re-run an unknown claim.
+      this.audit(host, "dispatch_reservation_unknown", null, { command_id: commandId, error: String(error).slice(0, 500) });
+      throw error;
+    }
+  }
+
   private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number):
     | { kind: "ready"; worker_id: string; fingerprint: string }
     | { kind: "unprovisioned"; reason: string }
     | { kind: "cooldown"; reason: string; until_ts: number }
-    | { kind: "repair_required"; reason: string } {
+    | { kind: "repair_required" | "draining"; reason: string } {
+    const control = this.one(`SELECT mode,reason FROM gateway_dispatch_control WHERE token_id=?`, tokenId);
+    if (control?.mode === "draining") return { kind: "draining", reason: String(control.reason) };
     const worker = capabilities.worker;
     if (worker.kind !== "provisioned" || !worker.label.startsWith(`${host}/`)) return { kind: "unprovisioned", reason: "Provision the gateway's canonical worker credential before claiming work" };
     const child = this.one(`SELECT id, tags FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, worker.label);
@@ -4753,10 +4944,10 @@ export class KnowledgeHub {
           if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: claim requires the scoped-inventory runner protocol; obsolete GUI may drain but not borrow newer readiness");
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
-          if (this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, String(body.id), token.label, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before retrying this task");
+          if (this.startupRejected(String(body.id), String(token.label), readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before retrying this task");
           const scheduling = this.executionSchedulingRequirements(String(body.id), requirements);
           const blockers = capabilityBlockers(scheduling, capabilities, token.label);
-          if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
+          if (blockers.length && !capabilities.alternatives.some(c => capabilityBlockers(scheduling, c, token.label).length === 0)) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
           const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(body.id)).project ?? "");
           if (![capabilities, ...capabilities.alternatives].some(c => usableFor(scheduling, c, token.label, project))) throw new Error("gate: claim requires a live usable configured model in the task's capability scope");
         } else if (token && requirements) {
@@ -4769,7 +4960,7 @@ export class KnowledgeHub {
   /** No awaits between read/decide/write. State and replay receipt share one
    * SQLite transaction; replay after a lost response never authorises a second
    * Git/AWS effect. Those effects still require inspect-and-reconcile. */
-  private executionCommand(raw: unknown, actor: string) {
+  private async executionCommand(raw: unknown, actor: string) {
     const req = ExecutionRequestSchema.parse(raw);
     const body = raw as Record<string, unknown>;
     const tokenId = String(body.token_id ?? "");
@@ -4778,6 +4969,45 @@ export class KnowledgeHub {
     const gateway = tagsSayGateway(parseTags(token.tags));
     const command = req.command;
     const now = Date.now();
+    const effectKey = `gateway:${tokenId}`, effectRequest = JSON.stringify({ command, actor });
+    if (command.kind === "gateway_control" || command.kind === "gateway_failure") {
+      const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, effectKey, req.command_id);
+      if (replay) { if (replay.request !== effectRequest) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+    }
+    if (command.kind === "schedule_status") return { hosts: this.schedulingStatus(command.host) };
+    if (command.kind === "gateway_control") {
+      const tags = parseTags(token.tags).map(t => t.toLowerCase());
+      if (!actor.startsWith("web:") && (gateway || tags.some(t => t === "provisioned" || t.startsWith("by:") || t.startsWith("cadence:")))) throw new Error("gate: gateway drain control requires a full-agent or human credential");
+      const target = this.one(`SELECT id,tags FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, command.host);
+      if (!target || !tagsSayGateway(parseTags(target.tags))) throw new Error("gate: unknown gateway host");
+      const result = { ...command, kind: "gateway_controlled", observed_at: now };
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`INSERT INTO gateway_dispatch_control(token_id,mode,reason,actor,updated_ts) VALUES(?,?,?,?,?) ON CONFLICT(token_id) DO UPDATE SET mode=excluded.mode,reason=excluded.reason,actor=excluded.actor,updated_ts=excluded.updated_ts`, target.id, command.mode, command.reason, actor, now);
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, effectKey, req.command_id, effectRequest, JSON.stringify(result));
+        this.audit(actor, "gateway_dispatch_control", null, command);
+      });
+      this.executionWork().sweep();
+      this.reconcileSchedulingHealth(now);
+      return result;
+    }
+    if (command.kind === "schedule") {
+      if (!gateway) throw new Error("gate: scheduling requires an authenticated gateway");
+      return this.scheduleGateway(body, tokenId, String(token.label), command.mode, req.command_id);
+    }
+    if (command.kind === "gateway_failure") {
+      if (!gateway) throw new Error("gate: only an authenticated gateway reports its executor failure");
+      const observation = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id=?`, tokenId);
+      if (!observation) throw new Error("gate: advertise executor facts before reporting failure");
+      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities));
+      const child = capabilities.worker.kind === "provisioned" ? this.one(`SELECT id FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, capabilities.worker.label) : null;
+      const barrier = ExecutorStartBarrierSchema.parse({ kind: "cooldown", fingerprint: JSON.stringify([String(child?.id ?? "missing"), capabilities.config_revision]), failures: 2, until_ts: now + command.cooldown_ms, reason: command.reason });
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`INSERT INTO executor_start_barriers(token_id,state) VALUES(?,?) ON CONFLICT(token_id) DO UPDATE SET state=excluded.state`, tokenId, JSON.stringify(barrier));
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, effectKey, req.command_id, effectRequest, JSON.stringify(barrier));
+        this.audit(actor, "executor_failure_cooldown", null, barrier);
+      });
+      return barrier;
+    }
     if (command.kind === "pause_claims" || command.kind === "resume_claims") {
       if (!gateway) throw new Error("gate: only an authenticated gateway can pause/resume its own claims");
       const key = `gateway:${tokenId}`;
@@ -4810,8 +5040,10 @@ export class KnowledgeHub {
       // readiness of a corrected runner or borrow its proof to claim a card.
       const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
       if (!keepReady) this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(observedCapabilities), now);
+      this.reconcileDispatchReservations(now);
       this.reconcileStartupWaits(now);
       this.executionWork().sweep();
+      this.reconcileSchedulingHealth(now);
       return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
@@ -4871,12 +5103,13 @@ export class KnowledgeHub {
       const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && readiness.kind === "ready";
       const paused = Number(this.one(`SELECT until_ts FROM executor_claim_pauses WHERE token_id=?`, tokenId)?.until_ts ?? 0) > now;
       const barrier = command.kind === "start_failed" && !taskPrerequisite && !paused ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
-      const startupWait = !recovering && !current.attempt && current.generation === 0 && !current.operations.length
-        ? StartupWaitSchema.parse({ phase: taskPrerequisite ? "recovery_required" : "waiting_executor", source: "start_failed",
-          host: actor, fingerprint, reason, since: now, retained_work: command.retained_work }) : null;
       const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;
       const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
       meta.execution_requirements = requirements;
+      const taskFingerprint = taskPrerequisite ? this.taskStartupProof(req.id, fingerprint, meta) : fingerprint;
+      const startupWait = !recovering && !current.attempt && current.generation === 0 && !current.operations.length
+        ? StartupWaitSchema.parse({ phase: taskPrerequisite ? "recovery_required" : "waiting_executor", source: "start_failed",
+          host: actor, fingerprint: taskFingerprint, reason, since: now, retained_work: command.retained_work }) : null;
       current = { ...current, requirements };
       meta.execution_start_failure = { stage, reason, host: actor, at: now };
       if (startupWait) meta.startup_wait = startupWait;
@@ -4891,11 +5124,12 @@ export class KnowledgeHub {
       this.state.storage.transactionSync(() => {
         if (barrier) this.state.storage.sql.exec(`INSERT INTO executor_start_barriers (token_id, state) VALUES (?, ?) ON CONFLICT(token_id) DO UPDATE SET state=excluded.state`, tokenId, JSON.stringify(barrier));
         if (startupWait) this.state.storage.sql.exec(`INSERT INTO executor_start_waits (task_id, state) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, req.id, JSON.stringify(startupWait));
-        if (startupWait?.phase === "recovery_required") this.state.storage.sql.exec(`INSERT OR IGNORE INTO executor_start_rejections (task_id, host, fingerprint) VALUES (?, ?, ?)`, req.id, actor, fingerprint);
+        if (startupWait?.phase === "recovery_required") this.state.storage.sql.exec(`INSERT OR IGNORE INTO executor_start_rejections (task_id, host, fingerprint) VALUES (?, ?, ?)`, req.id, actor, taskFingerprint);
         if (recovering) this.state.storage.sql.exec(`DELETE FROM executor_start_waits WHERE task_id = ?`, req.id);
         this.state.storage.sql.exec(`UPDATE artefacts SET status = 'todo', owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), req.id);
         this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, req.id, JSON.stringify(current), String(binding?.worker_token_id ?? ""));
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, req.id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id = ?`, req.id);
         this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(result));
       });
       this.version(req.id, actor, "transition", `${row.status} → todo — worker never launched (${stage}); released without watchdog abandonment`, { from: row.status, to: "todo", note: reason });
@@ -4927,7 +5161,7 @@ export class KnowledgeHub {
       if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: begin requires the scoped-inventory runner protocol; obsolete producers may only drain existing attempts");
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
-      if (this.startupWait(req.id) || this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id = ? AND host = ? AND fingerprint = ?`, req.id, actor, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before begin");
+      if (this.startupWait(req.id) || this.startupRejected(req.id, actor, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before begin");
       const blockers = capabilityBlockers(current.requirements, capabilities, actor);
       if (blockers.length) throw new Error(`gate: executor capability blockers: ${blockers.join(", ")}`);
       const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, req.id).project ?? "");
@@ -4947,6 +5181,7 @@ export class KnowledgeHub {
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     this.state.storage.transactionSync(() => {
+      if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(next));
       // Control polls do not authorise external effects. Keep a bounded replay
@@ -5931,6 +6166,20 @@ export class KnowledgeHub {
     const terminalStartup = ["done", "superseded"].includes(verdict.status);
     if (terminalStartup) delete meta.startup_wait;
     this.state.storage.transactionSync(() => {
+      if (row.type === "task" && row.status === "todo" && verdict.status === "in_progress") {
+        const current = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+        if (current.status !== row.status || current.owner !== row.owner || current.meta !== row.meta) throw new Error("gate: claim changed during scheduling; preserve the current executor");
+        // The lifecycle awaits evidence/session lookups. Re-evaluate execution
+        // prerequisites at the write boundary, not just at HTTP ingress.
+        this.executionMutationGuard("transition", body);
+        const credential = this.one(`SELECT label,tags FROM auth_tokens WHERE id=? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
+        if (credential && tagsSayGateway(parseTags(credential.tags))) {
+          const observation = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id=?`, String(body.token_id));
+          const capacity = gatewayCapacity(ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)));
+          const n = gatewayOccupancy(this.state.storage.sql, String(body.token_id), String(credential.label));
+          if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
+        }
+      }
       this.state.storage.sql.exec(
         `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
         verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
@@ -5941,10 +6190,14 @@ export class KnowledgeHub {
           this.state.storage.sql.exec(`DELETE FROM executor_start_rejections WHERE task_id = ?`, id);
         }
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id = ?`, id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id = ?`, id);
         if (row.status === "todo" && verdict.status === "in_progress" && typeof body.token_id === "string") {
           const credential = this.one(`SELECT tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, body.token_id);
-          if (credential && tagsSayGateway(parseTags(credential.tags))) this.state.storage.sql.exec(
-            `INSERT INTO executor_start_claims (task_id, token_id, session) VALUES (?, ?, ?)`, id, body.token_id, String(meta.session ?? ""));
+          if (credential && tagsSayGateway(parseTags(credential.tags))) {
+            this.state.storage.sql.exec(`INSERT INTO executor_start_claims (task_id, token_id, session) VALUES (?, ?, ?)`, id, body.token_id, String(meta.session ?? ""));
+            this.state.storage.sql.exec(`INSERT INTO dispatch_reservations(task_id,token_id,session,generation,expires_at) VALUES(?,?,?,?,?)`, id, body.token_id, String(meta.session ?? ""), this.executionState(id)?.generation ?? 0, Date.now() + DISPATCH_RESERVATION_MS);
+            this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, body.token_id);
+          }
         }
       }
     });
@@ -8216,7 +8469,7 @@ export class KnowledgeHub {
     const pool = this.state.storage.sql.exec(
       `SELECT id, type, title, tags, roles, meta, project, updated_ts, status FROM artefacts
        WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
-       ORDER BY updated_ts DESC LIMIT 400`,
+        ORDER BY updated_ts DESC`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // gateway callers dispatch sessions and never claim blocked work —
     // resolving an unblock condition is role:unblock duty. Ten blocked cards
@@ -8224,7 +8477,12 @@ export class KnowledgeHub {
     // runner (every claim refused for a missing resolution). Gateways get
     // the claimable surface; agents still see blocked work to reason about.
     const callerIsGateway = tags.some((t) => t.toLowerCase() === "gateway");
-    const dispatchPool = callerIsGateway ? pool.filter((t: any) => t.status !== "blocked") : pool;
+    const dispatchHost = callerIsGateway ? this.one(`SELECT h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=? AND t.revoked_ts IS NULL`, label) : null;
+    const dispatchCapabilities = dispatchHost ? ExecutorCapabilitiesSchema.parse(JSON.parse(dispatchHost.capabilities)) : null;
+    const dispatchReady = dispatchHost && dispatchCapabilities && Date.now() - Number(dispatchHost.observed_ts) < 120_000
+      && this.executorReadiness(String(dispatchHost.token_id), label, dispatchCapabilities, Date.now()).kind === "ready";
+    const eligibleIds = dispatchReady ? new Set(this.dispatchCandidates(String(dispatchHost.token_id), label, dispatchCapabilities).eligible.map(t => String(t.id))) : new Set<string>();
+    const dispatchPool = callerIsGateway ? pool.filter((t: any) => t.status === "todo" && eligibleIds.has(String(t.id))) : pool;
     const { analysisEv, reviewEv } = this.qualificationEvidence();
     const qualIds = new Set(
       (this.state.storage.sql.exec(
@@ -8420,6 +8678,7 @@ export class KnowledgeHub {
       open_artefacts: open,
       my_tasks: myTasks,
       unclaimed_work: unclaimedWork,
+      scheduling: this.schedulingStatus(callerIsGateway ? label : undefined),
       steering,
       my_roles: tags.filter((t) => t.startsWith("role:")),
       pending_asks: pendingAsks,

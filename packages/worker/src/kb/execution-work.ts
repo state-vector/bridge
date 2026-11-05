@@ -2,7 +2,8 @@
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema,
   initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
-import { StartupWaitSchema, startupWaitReason } from "@bridge/contracts";
+import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
+import { gatewayOccupancy } from "./scheduling.ts";
 
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
@@ -39,13 +40,16 @@ export class ExecutionWork {
   private hosts(taskId?: string): CapabilityObservation[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
       host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
-      active: Number(this.one<{ n: number }>(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state,'$.attempt.host')=? AND json_extract(state,'$.attempt.phase') IN ('running','restoring') AND json_extract(state,'$.attempt.lease_until')>?`, String(row.label), Date.now())?.n ?? 0),
+      active: (() => { const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label)); return n.active + n.reserved; })(),
       readiness: this.taskReadiness(taskId, String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)))),
     }));
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
     const proof = this.readiness(token, host, capabilities, Date.now());
-    return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint=?`, id, host, proof.fingerprint)
+    const task = id ? this.one<{ body_md: string; project: string; meta: string }>(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id) : null;
+    const meta = JSON.parse(task?.meta ?? "{}");
+    const fingerprint = task && proof.kind === "ready" ? startupPrerequisiteFingerprint(proof.fingerprint, { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } }) : "";
+    return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint IN (?,?)`, id, host, proof.fingerprint, fingerprint)
       ? { kind: "repair_required", reason: "This task's startup prerequisite requires changed executor/configuration proof" } : proof;
   }
   private startupWait(id: string) {
@@ -58,7 +62,8 @@ export class ExecutionWork {
     const state = this.state(task);
     const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
     const hosts = this.hosts(id).map(host => {
-      const missing = capabilityBlockers(requirements, host.capabilities, host.host);
+      const compatible = [host.capabilities, ...host.capabilities.alternatives].some(c => capabilityBlockers(requirements, c, host.host).length === 0);
+      const missing = compatible ? [] : capabilityBlockers(requirements, host.capabilities, host.host);
       if (!missing.length && ![host.capabilities, ...host.capabilities.alternatives].some(c => usableFor(requirements, c, host.host, task.project))) missing.push("model_or_project_scope");
       return { ...host, observed_ts: host.observed_at, expires_ts: host.observed_at + 120_000, blockers: missing, busy: host.active >= host.capabilities.capacity };
     });

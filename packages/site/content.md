@@ -31,6 +31,32 @@ Every push to `main` also publishes a rolling **dev** pre-release of the binarie
 
 ## Three surfaces, one hub
 
+### Work goes to an eligible machine
+
+The hub filters for each gateway's actual host affinity, model, tools, project
+scope and readiness before ranking or limiting its dispatch queue. Work pinned
+to a full laptop cannot hide work an EC2 gateway can run. Selection reserves the
+task and a gateway slot atomically, through the normal lifecycle gates; a fresh
+claim session and fenced begin are required before launching the worker.
+Capacity includes pre-launch reservations and every unquiesced writer—even one
+whose lease expired. A never-launched reservation can recover after five minutes
+without spending task retries, while unpublished work stays on its original host.
+
+Use `bridge execution schedule-status [hostname]` to see occupied slots,
+reservations, capacity, eligible work, exclusion reasons and the last scheduling
+outcome. Idle capacity with eligible work for two minutes produces one
+`dispatch_starved` incident per episode. Repository refusals are task-scoped hub
+state, re-evaluated when prerequisite inputs change; a stale local give-up cache
+cannot override a released task. Repeated runtime failures use a visible bounded
+cooldown rather than requiring the operator to restart a silent runner.
+
+A full agent or human can persistently drain a gateway with the `execution`
+command `{kind:"gateway_control",host:"<hostname>",mode:"draining",reason:"<reason>"}`
+(`id:"gateway"`, a unique `command_id`). This prevents new claims and launches
+across restarts and advertisements, while allowing current writers to checkpoint
+and stop safely. Explicit `mode:"enabled"` is required to resume; draining never
+discards local work or silently transfers it to another host.
+
 - **Gateway**: desktop app and the headless `bridge` CLI: auth, a live dispatch log, agent configuration, WIP limits. The gateway turns todo tasks into running agent sessions; `bridge doctor` verifies the setup end to end — config, token, hub reachability, agent CLIs, and that every pinned model id actually resolves via the hub's `/v1/models` proxy. Gateways are infrastructure with their own gateway-class identity (the class is a tag on the token) — the board shows each gateway with the agents it dispatched, never conflated with your interactive agents. The desktop shell renders the same board views as the web (one shared rendering path), live over the paired token. Credentials are owned by a single store: the token lives in the OS keychain (never in config.json, which is written atomically with a schema version), and the device principal is a write-once file a rejected token can never corrupt. If a desktop's saved token falls out of the gateway class (say, a pre-gateway token surviving an upgrade), the run gate signs the desktop out — one self-repair attempt first — and the sign-in screen explains why (the identity law) and walks the one-click sign-back-in: hub URL and settings are kept, and the fresh gateway-class token re-associates with the same device. **A token the hub rejects mid-run is never a sign-out** (BR#4113): auth failures (401/403) classify separately from network faults and run a bounded self-heal ladder — keychain reload, principal re-vend, desktop self-provision — on exponential backoff (5s→300s cap); the gateway stays connected, parks with a loud `needs attention` banner if the ladder stays blocked, keeps polling, and resumes dispatch on its own within one poll interval the moment the hub accepts the device again (rotation grace, rollback, row restore) — zero human action, by design: a hub-side credential rotation must be survivable without touching a single gateway. The 👥 panel invites teammates by GitHub username or removes them: invited logins sign in with GitHub immediately, everyone holds the same rights, and the workspace creator cannot be removed.
 - **Decision inbox**: the desktop app notifies you when a decision needs a human, and answers questions about the board in a console chat — retrieval over the hub, summarised by Apple's on-device model (falls back to your configured agent CLI). Read-only: the console never does the work.
 - **Mobile** (coming soon): what your fleet is doing right now, and what needs you, from anywhere.

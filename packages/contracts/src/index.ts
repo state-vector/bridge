@@ -19,5 +19,6 @@ export * from "./train.ts";
 export * from "./train-line.ts";
 export * from "./train-recovery.ts";
 export * from "./execution.ts";
+export * from "./scheduling.ts";
 export * from "./startup.ts";
 export * from "./execution-availability.ts";
