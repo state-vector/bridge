@@ -1585,6 +1585,20 @@ fn dispatch_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Canonical worker-token cache file: $HOME/.bridge/dispatch/agent-tokens.json.
+/// Deliberately NOT dispatch_dir(): the credential belongs to the gateway, not
+/// an individual runner's ephemeral report directory (562f394) — side-by-side
+/// runners (BRIDGE_DISPATCH_DIR set) must share one cache, so every read,
+/// write AND clear (BR#6682) resolves this same fixed path.
+fn agent_token_cache_path() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".bridge")
+            .join("dispatch")
+            .join("agent-tokens.json"),
+    )
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5073,9 +5087,13 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
         if let Err(e) = crate::store::TokenStore::open().clear_token() {
             dlog("", &format!("warning: credential clear failed: {e}"));
         }
-        if let Some(dir) = dispatch_dir() {
-            // vendored per-agent credentials — re-provisioned after the next login
-            let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+        // vendored per-agent credentials — re-provisioned after the next login.
+        // BR#6682: clear the CANONICAL cache — the fixed path provision_agent_token
+        // writes. The dispatch-dir resolution honors BRIDGE_DISPATCH_DIR, which
+        // would delete an isolated rollout runner's report-dir copy while the
+        // real shared cache survives the credential clear.
+        if let Some(cache_path) = agent_token_cache_path() {
+            let _ = std::fs::remove_file(&cache_path);
         }
     }
     if let Ok(mut s) = snap.lock() {
@@ -5639,6 +5657,41 @@ mod tests {
         ] {
             assert!(src.contains(needle), "BR#4113 machinery missing: {needle}");
         }
+    }
+
+    #[test]
+    fn credential_clear_targets_the_canonical_token_cache_not_dispatch_dir() {
+        // BR#6682 (BR#6663 audit F1): provision_agent_token caches the worker
+        // credential at the FIXED path $HOME/.bridge/dispatch/agent-tokens.json
+        // (562f394 — side-by-side runners share one credential). logout_core's
+        // credential clear must hit that same file: resolving via
+        // dispatch_dir() honors BRIDGE_DISPATCH_DIR, so a rollout runner would
+        // delete only its isolated report-dir copy while the real shared cache
+        // survives logout. One shared helper is the single resolution for both
+        // sites — separate resolutions are exactly how this drifted.
+        let src = include_str!("dispatch.rs");
+        let helper = format!("agent_{}_{}_path()", "token", "cache");
+        // one definition + exactly two callers (provision + credential clear)
+        assert_eq!(
+            src.matches(&helper).count(),
+            3,
+            "the canonical cache-path helper must be defined once and used by provision_agent_token AND logout_core"
+        );
+        let start = src
+            .find(&format!("fn {}_core", "logout"))
+            .expect("logout_core present");
+        let body = &src[start..src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .unwrap_or(src.len())];
+        assert!(
+            !body.contains(&format!("{}_dir()", "dispatch")),
+            "logout_core's credential clear must not resolve via dispatch_dir() — under BRIDGE_DISPATCH_DIR it deletes the isolated copy while the shared cache survives"
+        );
+        assert!(
+            body.contains(&helper),
+            "the credential clear must go through the canonical cache-path helper"
+        );
     }
 
     #[test]
@@ -6215,9 +6268,10 @@ mod tests {
 }
 
 /// Provision (or reuse) the per-agent hub token for `agent_label` via the
-/// gateway's own credentials. Secret cached in ~/.bridge/agent-tokens.json
-/// (0600 dir); hub dedupes by label. When our local cache is empty but the
-/// hub token already exists, the hub cannot re-show the secret (vended
+/// gateway's own credentials. Secret cached in ~/.bridge/dispatch/
+/// agent-tokens.json — the FIXED canonical path shared with logout_core's
+/// credential clear (562f394, BR#6682); hub dedupes by label. When our local cache
+/// is empty but the hub token already exists, the hub cannot re-show the secret (vended
 /// once) — the only recovery is a rotate re-vend, so we retry exactly once
 /// with rotate (old token revoked, fresh secret issued, cached). Without
 /// this the runner dead-ends forever — the 2026-10-24 churn engine (38
@@ -6227,9 +6281,8 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Work
     // Credentials belong to the gateway, not an individual runner's ephemeral
     // report directory. Side-by-side processes must reuse the same credential;
     // separate caches would revoke each other's active workers on every tick.
-    let cache_dir = PathBuf::from(std::env::var("HOME").map_err(|_| "no home directory")?).join(".bridge").join("dispatch");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    let cache_path = cache_dir.join("agent-tokens.json");
+    let cache_path = agent_token_cache_path().ok_or("no home directory")?;
+    std::fs::create_dir_all(cache_path.parent().ok_or("no cache directory")?).map_err(|e| e.to_string())?;
     let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
