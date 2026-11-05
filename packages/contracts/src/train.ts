@@ -138,7 +138,13 @@ export const DeployObservationSchema = z.object({
     run_attempt: z.number().int().positive().optional(),
     head_sha: z.string().regex(/^[0-9a-f]{40}$/),
     status: z.enum(["queued", "waiting", "pending", "requested", "in_progress", "completed"]),
-    conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullable(),
+    // GitHub reports conclusion: null while a run is queued/in_progress, and the
+    // Rust runner's `skip_serializing_if` OMITS the key for None — so the key may
+    // legitimately be absent (in-flight run). `.default(null)` accepts the missing
+    // key and normalizes to null, keeping the parsed type `string | null` exactly
+    // as before (2026-11-05 incident: whole observations rejected with a misleading
+    // invalid_value whenever a deploy run was in flight).
+    conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullish().default(null),
     html_url: z.string().url(),
   })).min(1).max(100),
 });

@@ -133,6 +133,33 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect((await prove(baseline, 101)).verified_receipts).toHaveLength(0);
     expect((await prove("8".repeat(40), 102)).stage.phase).toBe("recovered");
   });
+  it("observations carrying an IN-FLIGHT deploy run (conclusion key absent) are accepted, not rejected wholesale (2026-11-05 incident)", async () => {
+    const repo = "state-vector/observe-inflight-run", tip = "7".repeat(40);
+    await acquire(repo, "observe-merger", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "observe-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [] } });
+    // The exact incident shape: the Rust runner's skip_serializing_if OMITS
+    // conclusion for runs GitHub still reports as in_progress. Before the fix
+    // the whole observation (settled runs included) died on a missing-key
+    // invalid_value that read like an enum violation.
+    const mixed = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 200, name: "Deploy Dev", head_sha: tip, status: "in_progress", html_url: `https://github.com/${repo}/actions/runs/200` },
+        { id: 199, name: "Deploy Dev", head_sha: tip, status: "completed", conclusion: "success", html_url: `https://github.com/${repo}/actions/runs/199` },
+      ] } });
+    expect(mixed.status, JSON.stringify(mixed.body)).toBe(200);
+    // Explicit null (the hardened runner's shape) is accepted too.
+    const explicitNull = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 201, name: "Deploy Dev", head_sha: tip, status: "queued", conclusion: null, html_url: `https://github.com/${repo}/actions/runs/201` },
+      ] } });
+    expect(explicitNull.status, JSON.stringify(explicitNull.body)).toBe(200);
+    // The enum itself stays closed.
+    const bad = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 202, name: "Deploy Dev", head_sha: tip, status: "completed", conclusion: "nope", html_url: `https://github.com/${repo}/actions/runs/202` },
+      ] } });
+    expect(bad.status).toBe(400);
+  });
   it("recovery records survive retries and task delivery; only matched successful deployment proves recovery", async () => {
     const repo = "state-vector/recovery-loop-6522", head = "7".repeat(40);
     const repair = await kbJson("/create", { type: "task", title: "Repair callers availability", qualified: true, roles: ["impl"] });

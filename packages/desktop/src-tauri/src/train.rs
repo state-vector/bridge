@@ -1773,7 +1773,10 @@ fn reconcile_base_deploy(
         if reportable.iter().any(|r| r.head_sha == tip_sha) {
             if let Err(e) = ctx.mcp("train_observe_deploy", json!({ "repo": repo, "base": base,
                 "observation": { "tip_sha": tip_sha, "observed_at": now_ms(), "runs": reportable } })) {
-                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 200)));
+                // 600 chars keeps the zod issue's `path` + `message` visible —
+                // 200 cut the error inside the enum values list and hid the
+                // failing field entirely during the 2026-11-05 incident.
+                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 600)));
             }
         }
     }
