@@ -3548,6 +3548,7 @@ fn tick(
         snap_activity(snap, "info", "agents available — resuming claims");
     }
     *last_avail_ok = avail_ok;
+    let mut execution_ready = false;
     if let Some(backend) = avail.iter().max_by_key(|b| {
         let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
         cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
@@ -3559,8 +3560,9 @@ fn tick(
         capabilities["model"] = json!(bc.model.or_else(|| cfg.model.clone()));
         capabilities["config_revision"] = json!(serde_json::to_string(&cfg.backends).unwrap_or_default());
         capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
-        if let Err(e) = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities })) {
-            dlog("", &format!("capability observation unavailable: {e}; execution begin remains fail-closed"));
+        match execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities })) {
+            Ok(reply) if reply["ok"] == true => execution_ready = true,
+            result => dlog("", &format!("execution protocol not ready: {result:?}; no new claims until capability advertisement succeeds")),
         }
     }
 
@@ -4172,7 +4174,7 @@ fn tick(
     }
 
     // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok {
+    if !avail_ok || !execution_ready {
         return Ok(msgs);
     }
 

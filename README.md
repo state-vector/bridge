@@ -110,7 +110,9 @@ removing or changing the scope does not restore legacy write access.
   multi-slot gateway; single-slot gateways still execute serially.
 
 The hub and runner must both be updated for these guarantees; deploy the hub,
-then install the matching dev runner. Existing processes cannot acquire process
+then install the matching dev runner. A gateway waits for a successful live
+protocol capability advertisement before claiming anything; a new `/__version`
+stamp alone is not proof the execution endpoint has propagated. Existing processes cannot acquire process
 isolation retroactively. A sudden host loss can lose work since the last
 published checkpoint and leaves transfer held until writer quiescence is proved.
 `execution` command `inspect` exposes the exact durable attempt, mailbox and

@@ -64,7 +64,9 @@ Unresolved recovery causes retain their history and retry budget across new
 commits, while each new exact revision must earn its own deployment verification.
 Repair/review/deployment-verification tasks sort first; diagnostics leave the
 last slot available on multi-slot gateways.
-Both hub and runner need the matching protocol version. Bound human decisions
+Both hub and runner need the matching protocol version. Gateways wait for the
+live execution advertisement endpoint before claiming work during rollout;
+a version stamp alone does not prove endpoint readiness. Bound human decisions
 remain separate from the specified local-handoff flow; protocol v1 does not
 implement local acceptance by auto-resuming an answered ask. Bridge's own
 repository uses signed direct-main delivery and independent receipt review;
