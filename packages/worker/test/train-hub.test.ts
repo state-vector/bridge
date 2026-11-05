@@ -103,6 +103,27 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
 }
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("deployment observations stop a failed line independently of the merge lease and survive stale green gateway snapshots", async () => {
+    const repo = "state-vector/observe-deploy-6389";
+    const tip = "7".repeat(40);
+    await acquire(repo, "merger", { required_workflows: ["deploy / Deploy to dev"] });
+    const green = { verdict: "green", tip_sha: tip, red: [], unsettled: [], green: 1 };
+    await kbJson("/train.queue_facts", { repo, actor: "merger", entries: [], base_state: green });
+    const observation = { tip_sha: tip, observed_at: Date.now(), runs: [{ id: 123, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml",
+      head_sha: tip, status: "completed", conclusion: "failure", html_url: `https://github.com/${repo}/actions/runs/123` }],
+      failures: [{ run_id: 123, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/123/job/456` }] };
+    const result = await kbJson("/train.observe_deploy", { repo, actor: "independent-observer", observation });
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect(result.body.lanes[0].line).toMatchObject({ phase: "stopped", blocker: "main_failed" });
+    expect(result.body.lanes[0].line.evidence.some((e: { name: string }) => e.name === "Cortex Quality Smoke")).toBe(true);
+    await kbJson("/train.queue_facts", { repo, actor: "merger", entries: [], base_state: green });
+    const after = await laneSnap(repo);
+    expect(after.queue_facts.base_state.verdict).toBe("red");
+    expect(after.lane_state.phase).toBe("stopped_red");
+    expect(after.base_red_resolution.fix_card).toBeTruthy();
+    const bad = await kbJson("/train.observe_deploy", { repo, actor: "independent-observer", observation: { ...observation, tip_sha: "8".repeat(40) } });
+    expect(bad.status).toBe(400);
+  });
   it("an existing lane accepts explicit required-check configuration atomically and returns the refreshed row", async () => {
     const repo = "state-vector/lane-reconfigure-6389";
     const first = await kbJson("/train.lane", { repo, spec: { required_workflows: ["Deploy"] } });

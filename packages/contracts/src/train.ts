@@ -124,6 +124,22 @@ export const DeployCoverageStateSchema = z.discriminatedUnion("phase", [
 export type DeployCoverageState = z.infer<typeof DeployCoverageStateSchema>;
 export type DeployCoveragePhase = DeployCoverageState["phase"];
 
+/** Read-only GitHub observation, independent of the merge executor's lease.
+ * The hub alone reduces observations into line health and recovery work. */
+export const DeployObservationSchema = z.object({
+  tip_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  observed_at: z.number().int().positive(),
+  failures: z.array(z.object({ run_id: z.number().int().positive(), name: z.string().min(1), url: z.string().url() })).max(100).optional(),
+  runs: z.array(z.object({
+    id: z.number().int().positive(), name: z.string(), path: z.string().optional(),
+    head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+    status: z.enum(["queued", "waiting", "pending", "requested", "in_progress", "completed"]),
+    conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullable(),
+    html_url: z.string().url(),
+  })).min(1).max(100),
+});
+export type DeployObservation = z.infer<typeof DeployObservationSchema>;
+
 export const BaseRedResolutionSchema = z.object({
   verdict: z.enum(["red", "unsettled", "empty"]),
   phase: BaseRedPhaseSchema,

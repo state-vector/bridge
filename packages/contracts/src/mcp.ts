@@ -17,6 +17,7 @@
 import { z } from "zod";
 import { AskRouteSchema } from "./ask.ts";
 import { ReviewResultSchema } from "./review.ts";
+import { DeployObservationSchema } from "./train.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
@@ -50,6 +51,7 @@ export const TOOL_NAMES = [
   "train_queue_facts",
   "train_lease",
   "train_status",
+  "train_observe_deploy",
   "transition",
   "update_artefact",
 ] as const;
@@ -62,6 +64,7 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * Schema is what the fixture pins.
  */
 export const TOOL_ARG_SCHEMAS = {
+  train_observe_deploy: z.looseObject({ repo: z.string(), base: z.string().optional(), observation: DeployObservationSchema }),
   orient: z.looseObject({
     session: z
       .string()

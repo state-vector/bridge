@@ -320,6 +320,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
   },
+  train_observe_deploy: {
+    description: "Report first-hand read-only GitHub deployment observations independently of the merger lease. The hub validates commit/run receipts and decides line health and recovery. Does not authorize merges or bypass checks.",
+    schema: TOOL_ARG_SCHEMAS.train_observe_deploy,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.observe_deploy", args), null, 1)),
+  },
   reconcile_schedule: {
     description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",
     schema: TOOL_ARG_SCHEMAS.reconcile_schedule,

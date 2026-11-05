@@ -146,6 +146,7 @@ import {
   formatDeployCoverageSummary,
   reconcileBaseVerdictWithDeployCoverage,
   normalizeBaseStateWithCoverage,
+  applyDeployObservation,
   trainDarkTipAskTitle,
   trainDarkTipAskBrief,
   trainGateBlockedAskTitle,
@@ -222,7 +223,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { DeployCoverageStateSchema, TrainLineFactsSchema, projectTrainLine, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -3533,6 +3534,7 @@ export class KnowledgeHub {
         case "train.carry": return this.json(await this.trainCarry(body, actor));
         case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
         case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        case "train.observe_deploy": return this.json(await this.trainObserveDeploy(body, actor));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
         // decides and mutates — the board↔GitHub invariant ----
         case "reconcile.schedule": return this.json(await this.reconcileSchedule(body, actor));
@@ -8729,6 +8731,45 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  (done/superseded ⇒ retired, BR#4977) cards bind nothing ever again.
    *  The 2026-10-29 outage: LIMIT 1 returned the retired original every
    *  tick and the lane could not self-heal onto its reseed. */
+  /** Observation plane, deliberately independent of the merge-control lease.
+   * Authenticated executors report GitHub facts; the hub owns every decision.
+   * This never merges, clears stops, or grants a bypass. */
+  private async trainObserveDeploy(body: unknown, actor: string): Promise<unknown> {
+    const input = body as { repo?: string; base?: string; observation?: unknown };
+    const repo = String(input.repo ?? "");
+    if (!isValidGitHubRepo(repo)) throw new Error("deployment observation requires a valid repository");
+    const base = String(input.base ?? "main");
+    const observation = DeployObservationSchema.parse(input.observation);
+    const now = Date.now();
+    if (observation.observed_at > now + 30_000 || now - observation.observed_at > 5 * 60_000) throw new Error("deployment observation must be first-hand and within five minutes");
+    const row = this.laneRow(laneKey(repo, base));
+    if (!row || row.status === "done" || row.status === "superseded") throw new Error("deployment observation requires an active registered lane");
+    const meta = JSON.parse(row.meta ?? "{}");
+    const tip = meta.lane?.queue_facts?.base_state?.tip_sha;
+    if (tip && tip !== observation.tip_sha) throw new Error("deployment observation does not match the lane's current tip");
+    if (!observation.runs.some((r) => r.head_sha === observation.tip_sha)) throw new Error("deployment observation lacks a run on the observed tip");
+    for (const run of observation.runs) {
+      if (run.html_url !== `https://github.com/${repo}/actions/runs/${run.id}`) throw new Error("deployment run receipt must match repository and run id");
+    }
+    for (const failure of observation.failures ?? []) {
+      if (!observation.runs.some((r) => r.id === failure.run_id && r.head_sha === observation.tip_sha && r.conclusion !== "success") ||
+          !failure.url.startsWith(`https://github.com/${repo}/actions/runs/${failure.run_id}/job/`)) throw new Error("failed-job receipt must belong to a failed observed deployment on the current tip");
+    }
+    if (Number(meta.lane?.deploy_observation?.observed_at ?? 0) > observation.observed_at) throw new Error("deployment observation superseded by a newer observation");
+    const cfg = laneOfMeta(meta);
+    const effective = applyDeployObservation(meta.lane?.queue_facts?.base_state, observation, cfg?.required_workflows ?? []);
+    meta.lane = { ...meta.lane, deploy_observation: observation,
+      queue_facts: { ...(meta.lane?.queue_facts ?? {}), at: now, base_state: effective } };
+    this.laneSyncReason(row.id, meta, now);
+    this.version(row.id, actor, "deploy_observed", `Observed deployment health at ${observation.tip_sha.slice(0, 9)}: ${effective?.verdict}`, { observation });
+    if (effective?.verdict === "red") {
+      const failing = Array.isArray(effective.red) ? effective.red : [];
+      await this.ensureRootFixCard({ repo, base, sha: observation.tip_sha, failing,
+        why: `Decisive deployment failed at ${observation.tip_sha.slice(0, 9)}`, actor, now, laneId: row.id, culpritId: null, pr: null });
+    }
+    return this.trainStatus({ repo });
+  }
+
   private laneRow(laneKeyValue: string): any {
     return this.one(
       `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts
@@ -8965,7 +9006,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // fresh (<15m; the executor refreshes every tick) so a dead daemon's
     // stale stamp can never pin a false BLOCKED.
     const bsQf: any = lane ? meta.lane?.queue_facts ?? null : null;
-    const normBs: any = bsQf?.base_state ? normalizeBaseStateWithCoverage(bsQf.base_state) : null;
+    const normBs: any = bsQf?.base_state ? applyDeployObservation(bsQf.base_state, meta.lane?.deploy_observation, lane.required_workflows) : null;
     const baseBlock: any = normBs && String(normBs.verdict ?? "") !== "green" && now - Number(bsQf.at ?? 0) < 15 * 60_000
       ? normBs
       : null;
@@ -10816,7 +10857,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // guard dedupes the per-tick repeats — same shape as the stopped
     // flow's stop ask).
     const rawBaseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
-    const baseState = normalizeBaseStateWithCoverage(rawBaseState);
+    const baseState = applyDeployObservation(rawBaseState, meta.lane?.deploy_observation, laneOfMeta(meta)?.required_workflows ?? []);
     // BR#5376: the ACTIVE batch-stall episode rides the stamp (executor-fed;
     // the next stamp after a landing omits it, which clears the state by
     // itself). The lane renders a loud STALLED reason/banner off it and the
@@ -13293,7 +13334,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         ? {
             ...meta.lane.queue_facts,
             ...(meta.lane.queue_facts.base_state
-              ? { base_state: normalizeBaseStateWithCoverage(meta.lane.queue_facts.base_state) }
+              ? { base_state: applyDeployObservation(meta.lane.queue_facts.base_state, meta.lane?.deploy_observation, lane.required_workflows) }
               : {}),
           }
         : null;

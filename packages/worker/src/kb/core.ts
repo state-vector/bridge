@@ -14,6 +14,7 @@ import type {
   BaseRedResolution,
   DeployCoveragePhase,
   DeployCoverageState,
+  DeployObservation,
   LaneOperationalState,
   TrainEntryClass,
   TrainFixCard,
@@ -4213,6 +4214,33 @@ export function normalizeBaseStateWithCoverage(baseState: Record<string, unknown
     ...(effective.red.length ? { red: effective.red } : {}) };
   delete next.alarm;
   return next;
+}
+
+/** Durable deployment observations are folded on EVERY ingress/read. A
+ * lease-holder's older scoped-green snapshot cannot overwrite known failed
+ * deployment evidence. Facts for another commit never apply to this tip. */
+export function applyDeployObservation(
+  baseState: Record<string, unknown> | null | undefined,
+  observation: DeployObservation | undefined,
+  required: string[],
+): Record<string, unknown> | null | undefined {
+  if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
+  const raw = baseState ?? { verdict: "empty", red: [], unsettled: [] };
+  const verdict: MainCheckVerdict = {
+    verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",
+    red: Array.isArray(raw.red) ? raw.red : [], unsettled: Array.isArray(raw.unsettled) ? raw.unsettled.map(String) : [], green: Number(raw.green ?? 0),
+  };
+  const plan = reconcileDeployCoverage({ tipSha: observation.tip_sha, tipAgeSecs: Number(raw.tip_age_secs ?? 0),
+    baseVerdict: verdict, required, workflowRuns: observation.runs });
+  const normalized = normalizeBaseStateWithCoverage({ ...raw, tip_sha: observation.tip_sha,
+    deploy_coverage: plan.coverage, covered_by: plan.covered_by_sha, coverage_age_secs: plan.coverage_age_secs });
+  if (plan.coverage.phase === "failed") {
+    const failedRunId = plan.coverage.failing_run_id;
+    const failures = (observation.failures ?? []).filter((f) => f.run_id === failedRunId)
+      .map((f) => ({ name: f.name, url: f.url, conclusion: "failure" }));
+    if (failures.length) return { ...normalized, red: failures };
+  }
+  return normalized;
 }
 
 /** BR#6179 (C) Fast-page deterministic ask title for a dark/uncovered tip past

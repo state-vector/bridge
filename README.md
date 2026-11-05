@@ -1700,6 +1700,12 @@ or stale observations fail closed. A human action is shown only with a concrete
 linked request; an exhausted machine retry budget alone is not a human task.
 Explicit `train.lane` configuration updates refresh an existing lane atomically
 and return the updated required-check set, rather than silently retaining it.
+The authenticated `train_observe_deploy` observation plane accepts first-hand
+GitHub commit/run/job receipts independently of the merge lease. It cannot
+merge or bypass checks. The hub persists those facts and folds them into every
+subsequent gateway snapshot, so an outdated merger cannot erase a known failed
+deployment with a scoped-green report. Other-commit, stale, or mismatched
+receipt observations are rejected.
 
 ### One merge classification (BR#6330)
 

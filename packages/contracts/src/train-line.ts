@@ -91,8 +91,9 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
   if (f.retired) return make("retired", "retired", "This line is retired.");
   if ((fresh && (bs?.verdict === "red" || bs?.gate_blocked || cov?.phase === "failed")) || f.stop) {
     const failure = cov?.phase === "failed" ? [{ name: `Deploy Dev${cov.failing_run_id ? ` run #${cov.failing_run_id}` : ""}`, ...(cov.failing_run_url ? { url: cov.failing_run_url } : {}) }] : [];
-    return make("stopped", "STOP THE LINE — main is failing", "New changes are held until main passes its required checks.", "main_failed",
-      fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [], repair());
+    const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];
+    const names = evidence.map((e) => e.name).join(", ");
+    return make("stopped", "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, repair());
   }
   if (q && !fresh && (f.queue.length || f.currently || bs?.verdict !== "green")) return make(
     "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());

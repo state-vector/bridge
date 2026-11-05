@@ -178,6 +178,10 @@
       "required": []
     },
     {
+      "name": "train_observe_deploy",
+      "required": ["repo", "observation"]
+    },
+    {
       "name": "transition",
       "required": [
         "id",

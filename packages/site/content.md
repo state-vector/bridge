@@ -116,6 +116,10 @@ never presented as healthy. A retry dispatch is activity, not proof of recovery;
 only observed line recovery permits stale-gate healing and stop clearance.
 Lane required-check updates apply to existing lanes and are returned immediately
 so operators can verify that a configuration correction actually took effect.
+First-hand deployment observations can also be reported independently of the
+merge-control lease through `train_observe_deploy`. The hub validates the
+commit/run/job receipts and preserves them across older gateway snapshots;
+reporting evidence grants no merge or bypass authority.
 
 ### Blocker rollup: many parked cards, one root
 
