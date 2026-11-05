@@ -56,6 +56,8 @@ legacy credential failures through bounded CLI commands. Local zero-worker and
 child-process checks plus the hub's no-attempt gate preserve actual writers and
 human holds. Existing old clients may drain work but cannot claim new tasks or
 overwrite a corrected runner's readiness.
+Side-by-side runner rollouts can set `BRIDGE_DISPATCH_DIR` to isolate ephemeral
+process/status files while preserving the GUI's report and normal credential store.
 Namespaced worker identities such as `gateway/opencode` can receive coordination
 directly, including session-qualified addresses.
 

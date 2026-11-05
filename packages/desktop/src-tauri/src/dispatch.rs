@@ -1573,8 +1573,10 @@ pub fn overlay_needs_attention(snap: &SharedSnapshot, v: &mut serde_json::Value)
 // without a PR); failed tasks keep their file until the retry succeeds.
 
 fn dispatch_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(&home).join(".bridge").join("dispatch");
+    let dir = match std::env::var_os("BRIDGE_DISPATCH_DIR").filter(|v| !v.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(std::env::var("HOME").ok()?).join(".bridge").join("dispatch"),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
