@@ -4476,6 +4476,16 @@ export class KnowledgeHub {
     return row ? ExecutionStateSchema.parse(JSON.parse(row.state)) : null;
   }
 
+  private executionSchedulingRequirements(id: string, fallback: unknown) {
+    const state = this.executionState(id);
+    const requirements = state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {});
+    // A quiescent writer can still own unpublished work. Check this before
+    // claiming, using the same durable affinity that begin will enforce.
+    return state?.attempt && !state.attempt.checkpoint
+      ? { ...requirements, host: state.attempt.host }
+      : requirements;
+  }
+
   private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number):
     | { kind: "ready"; worker_id: string; fingerprint: string }
     | { kind: "unprovisioned"; reason: string }
@@ -4527,7 +4537,7 @@ export class KnowledgeHub {
           const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
-          const blockers = capabilityBlockers(ExecutionRequirementsSchema.parse(requirements ?? {}), capabilities, token.label);
+          const blockers = capabilityBlockers(this.executionSchedulingRequirements(String(body.id), requirements), capabilities, token.label);
           if (blockers.length) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
         }
       }
@@ -4566,9 +4576,10 @@ export class KnowledgeHub {
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     if (command.kind === "inspect") return current;
     if (command.kind === "availability") {
+      const requirements = this.executionSchedulingRequirements(req.id, meta.execution_requirements);
       const hosts = this.state.storage.sql.exec(`SELECT t.label, h.token_id, h.capabilities, h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(h => {
         const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(h.capabilities)));
-        const blockers = capabilityBlockers(current.requirements, capabilities, String(h.label));
+        const blockers = capabilityBlockers(requirements, capabilities, String(h.label));
         const active = this.one(`SELECT count(*) AS n FROM execution_state WHERE json_extract(state, '$.attempt.host') = ? AND json_extract(state, '$.attempt.phase') IN ('running','restoring') AND json_extract(state, '$.attempt.lease_until') > ?`, h.label, now);
         const readiness = this.executorReadiness(String(h.token_id), String(h.label), capabilities, now);
         return { host: h.label, observed_ts: h.observed_ts, expires_ts: Number(h.observed_ts) + 120_000, capabilities, readiness, blockers, busy: Number(active?.n ?? 0) >= capabilities.capacity };
@@ -4576,7 +4587,7 @@ export class KnowledgeHub {
       const eligible = hosts.filter(h => !h.blockers.length);
       const live = eligible.filter(h => h.expires_ts > now);
       const runnable = live.filter(h => h.readiness.kind === "ready");
-      return { requirements: current.requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : !runnable.length ? "unavailable" : runnable.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
+      return { requirements, phase: !eligible.length ? "not_configured" : !live.length ? "offline" : !runnable.length ? "unavailable" : runnable.every(h => h.busy) ? "capacity_wait" : "ready", hosts };
     }
     // A released failed-start acknowledgement never authorises a writer or an
     // external operation. Its exact authenticated replay survives owner clear.
@@ -4621,7 +4632,10 @@ export class KnowledgeHub {
       const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
       const reason = command.kind === "start_failed" ? command.reason : "Canonical worker readiness restored after a legacy pre-begin credential rejection";
       const stage = command.kind === "start_failed" ? command.stage : "begin";
-      const barrier = command.kind === "start_failed" ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
+      // Begin's task prerequisites (e.g. checkpoint transfer) do not invalidate
+      // a proved worker credential for unrelated work on the same gateway.
+      const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && readiness.kind === "ready";
+      const barrier = command.kind === "start_failed" && !taskPrerequisite ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
       const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;
       const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
       meta.execution_requirements = requirements;

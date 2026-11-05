@@ -49,7 +49,7 @@ describe("durable executor on real SQLite", () => {
       command: { kind: "start_failed", stage: "begin", reason: "forged", retained_work: false } });
     expect(spoof.data.error).toMatch(/authority|authenticated runner/);
     expect((await cmd("begin", { kind: "begin", worker: `${host}/worker`, attempt_id: "startup", action_budget_ms: 60_000 })).data.error).toBeUndefined();
-    const failure = { kind: "start_failed", stage: "begin", reason: "launch never happened", retained_work: true };
+    const failure = { kind: "start_failed", stage: "begin", reason: "launch transport unavailable", retained_work: true, failure_class: "transport" };
     // A lost begin response is not permission to release an unknown writer.
     expect((await cmd("unsafe-release", failure)).data.kind).toBe("held");
     expect((await post("get", { id: task.id })).data.status).toBe("in_progress");
@@ -63,6 +63,39 @@ describe("durable executor on real SQLite", () => {
     expect(released.meta).toMatchObject({ execution_requirements: { host } });
     expect((await cmd("cooldown", { kind: "advertise", capabilities: ready })).data.ok).toBe(false);
     expect((await cmd("changed-prerequisite", { kind: "advertise", capabilities: { ...ready, config_revision: "repaired" } })).data.ok).toBe(true);
+  });
+  it("keeps task prerequisites from poisoning the gateway and projects persisted checkpoint affinity before claim", async () => {
+    const provision = async (host: string) => {
+      const gw = (await post<{ secret: string }>("admin.mint", { label: host, tags: ["gateway"] })).data;
+      const token_id = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data.token_id;
+      await post("agent.provision", { label: `${host}/worker`, actor: host });
+      const auth = { actor: host, token_id, gateway: true, agent: `${host}/worker`, session: "dispatch-affinity" };
+      const capabilities = { tier: "medium", tools: ["git"], environment: ["linux"], worker: { kind: "provisioned", label: `${host}/worker` } };
+      await post("execution", { ...auth, id: "gateway", command_id: "ready", command: { kind: "advertise", capabilities } });
+      return { auth, capabilities };
+    };
+    const original = await provision("affinity-original");
+    const other = await provision("affinity-other");
+    const task = (await post<{ id: string }>("create", { type: "task", title: "Task startup prerequisite", roles: ["review"], qualified: true })).data;
+    const auth = { ...original.auth, id: task.id };
+    const cmd = (command_id: string, command: object) => post("execution", { ...auth, command_id, command });
+    expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
+    const rejected = await cmd("task-prerequisite", { kind: "start_failed", stage: "begin", reason: "gate: task prerequisite missing", retained_work: false });
+    expect(rejected.data).toMatchObject({ kind: "released", barrier: null });
+    expect((await post("execution", { ...auth, command_id: "still-ready", command: { kind: "advertise", capabilities: original.capabilities } })).data.ok).toBe(true);
+    expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
+    expect((await cmd("begin", { kind: "begin", worker: "affinity-original/worker", attempt_id: "prior", action_budget_ms: 60_000 })).data.error).toBeUndefined();
+    await cmd("quiet", { kind: "quiesce", generation: 1, attempt_id: "prior", writers: "process_group_empty" });
+    expect((await cmd("release", { kind: "start_failed", stage: "begin", reason: "gate: task prerequisite missing", retained_work: false })).data.kind).toBe("released");
+    // Legacy metadata may predate the execution record. Durable affinity must win.
+    await post("update", { id: task.id, meta: { execution_requirements: {} } });
+    const foreign = { ...other.auth, id: task.id };
+    const availability = await post<{ requirements: { host: string }; hosts: { host: string; blockers: string[] }[] }>("execution", { ...foreign, command_id: "availability", command: { kind: "availability" } });
+    expect(availability.data.requirements.host).toBe("affinity-original");
+    expect(availability.data.hosts.find(h => h.host === "affinity-other")?.blockers).toContain("host:affinity-original");
+    expect((await post("transition", { ...foreign, to: "in_progress" })).data.error).toMatch(/host:affinity-original/);
+    expect((await post("get", { id: task.id })).data.status).toBe("todo");
+    expect((await post("execution", { ...foreign, command_id: "other-still-ready", command: { kind: "advertise", capabilities: other.capabilities } })).data.ok).toBe(true);
   });
   it("recovers only proven legacy never-launched credential failures, retaining WIP affinity and real execution fences", async () => {
     const host = "legacy-startup-host";

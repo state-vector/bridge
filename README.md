@@ -78,6 +78,11 @@ A changed credential/configuration can
 restore readiness, and other ready hosts can pick up the released work. Unknown
 writers and unresolved external effects remain held. Startup preparation is
 not displayed as a successfully dispatched worker.
+Task-specific begin prerequisites do not hold unrelated work on the gateway.
+Scheduling checks persisted execution/checkpoint host affinity before claiming;
+a failed launch stops that claim sweep until readiness is re-proved next tick.
+Startup failure logs include the actual reason and whether the task or gateway
+is held, rather than reporting every rejection as a credential failure.
 
 Paired operators can run `bridge execution ready` to prove the live hub/worker
 handshake without claiming work. `bridge execution recover-unstarted 'BR#N'`

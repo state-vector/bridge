@@ -173,7 +173,7 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
     let mut capabilities = executor_capabilities(bc.reasoning_tier, &worker);
     capabilities["backend"] = json!(name);
     capabilities["model"] = json!(bc.model.or_else(|| cfg.model.clone()));
-    capabilities["config_revision"] = json!(format!("worker-ready-v2:{}", serde_json::to_string(&cfg.backends).unwrap_or_default()));
+    capabilities["config_revision"] = json!(format!("worker-ready-v2:task-affinity-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default()));
     capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
@@ -231,7 +231,7 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
     })();
     // Progress after release would re-claim todo through the legacy API.
     match result {
-        Ok(value) if value["kind"] == "released" => dlog(tid, "startup failed before worker launch; claim released, host cooling down, local work retained"),
+        Ok(value) if value["kind"] == "released" => dlog(tid, &format!("startup failed before worker launch: {reason}; claim released; {}", if value["barrier"].is_null() { "task prerequisite retained; gateway remains ready" } else { "gateway readiness held; inspect the startup cause" })),
         Ok(value) => dlog(tid, &format!("startup reconciliation held: {value}")),
         Err(error) => dlog(tid, &format!("startup reconciliation unavailable: {error}; preserve claim and work")),
     }
@@ -4569,6 +4569,22 @@ fn tick(
         // re-enter the claim → clone-fail → watchdog-stall loop forever. A
         // changed URL drops the record and dispatch resumes.
         if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) { continue; }
+        // The task's persisted writer/checkpoint affinity is authoritative;
+        // metadata alone can predate the last execution. Never claim first.
+        match execution_call(cfg, tid, json!({ "kind": "availability" })) {
+            Ok(state) => {
+                let host = state["hosts"].as_array().and_then(|hosts| hosts.iter().find(|h| h["host"].as_str() == cfg.label.as_deref()));
+                let eligible = host.map(|h| h["blockers"].as_array().map(|b| b.is_empty()).unwrap_or(false)
+                    && h.pointer("/readiness/kind").and_then(|k| k.as_str()) == Some("ready")).unwrap_or(false);
+                if !eligible {
+                    if gated_announced.insert(format!("{tid}:execution-availability")) {
+                        dlog(tid, &format!("SKIP: execution prerequisites on this host: {}", host.map(|h| h["blockers"].to_string()).unwrap_or_else(|| "no live host observation".into())));
+                    }
+                    continue;
+                }
+            }
+            Err(error) => { dlog(tid, &format!("execution preflight unavailable: {error}; no claim attempted")); continue; }
+        }
         let candidate_url = source_repo(&body_md, &task_meta);
         let mut refused = refused_cache_load();
         if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
@@ -4640,6 +4656,7 @@ fn tick(
             msgs.push(msg);
         } else {
             snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
+            break; // re-prove gateway readiness next tick before another claim
         }
     }
     if malformed_candidates > 0 {
