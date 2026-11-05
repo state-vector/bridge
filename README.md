@@ -1761,6 +1761,10 @@ updated train executor, independently of merge-control decisions.
 Bound tasks expose typed `meta.recovery_links`; the agent operating instructions
 name the journal protocol so repair executors can publish action/result facts
 without relying on an operator to transcribe runner output.
+Execution events and journal progress are owner-fenced. Other agents can add
+diagnostic comments, but cannot replace a repair executor's next action. Claim
+events record assignment separately from action execution. Historical incident
+observations also preserve the repair's current root-fix commit binding.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery

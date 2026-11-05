@@ -225,7 +225,7 @@ import {
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
-import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, type RecoveryEpisode, type RecoveryEvent } from "@bridge/contracts";
+import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -5390,6 +5390,9 @@ export class KnowledgeHub {
     if (row.type === "task" && (verdict.status === "in_review" || verdict.status === "done")) {
       this.recordTaskRecovery(id, { kind: "delivery_submitted", task_id: id }, actor);
     }
+    if (row.type === "task" && verdict.status === "in_progress" && row.status !== "in_progress") {
+      this.recordTaskRecovery(id, { kind: "executor_assigned", task_id: id }, actor);
+    }
     if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(ts);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
@@ -6135,7 +6138,15 @@ export class KnowledgeHub {
     );
     this.audit(actor, "progress", id, { note, sentiment, will: will || undefined });
     this.version(id, actor, "progress", note, { note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct });
-    if (will && !note.startsWith("runner:")) this.recordTaskRecovery(id, { kind: "progress", task_id: id, did: note.slice(0, 2000), next: will.slice(0, 2000) }, actor);
+    if (will && !note.startsWith("runner:")) {
+      const current = this.one(`SELECT owner, status FROM artefacts WHERE id = ?`, id);
+      const principal = body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, String(body.token_id))?.principal : null;
+      // Additive comments remain legal, but another diagnostic session cannot
+      // overwrite the repair executor's next action or recovery stage.
+      if (current?.status === "in_progress" && (current.owner === actor || (principal && current.owner === principal))) {
+        this.recordTaskRecovery(id, { kind: "progress", task_id: id, did: note.slice(0, 2000), next: will.slice(0, 2000) }, actor);
+      }
+    }
     return {
       id, note, will: will || undefined, sentiment, completion_pct, confidence_pct, risk_pct, context_pct,
       grace_until: graceUntil, instructions,
@@ -8782,8 +8793,22 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const ledger = RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {});
     const key = recoveryEpisodeKey(cmd.head_sha, cmd.cause);
     const previous = ledger[key];
-    const task = this.one(`SELECT type, status, status_ts, meta, tags FROM artefacts WHERE id = ?`, cmd.event.task_id);
+    const task = this.one(`SELECT type, status, status_ts, owner, meta, tags FROM artefacts WHERE id = ?`, cmd.event.task_id);
     if (!task || task.type !== "task") throw new Error("recovery must bind an existing repair task");
+    if (cmd.event.kind !== "observed" && cmd.event.kind !== "delivery_submitted") {
+      const tokenId = (body as { token_id?: string }).token_id;
+      const principal = tokenId ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, tokenId)?.principal : null;
+      const ownsRepair = task.owner === actor || (principal && task.owner === principal);
+      const attemptId = cmd.event.kind === "attempt_finished" ? cmd.event.attempt_id : null;
+      const retryOutcome = attemptId && previous?.attempts.some((a) => a.id === attemptId && a.kind === "retry");
+      const retryStart = cmd.event.kind === "attempt_started" && cmd.event.attempt_kind === "retry";
+      const machineRetry = meta.lease?.holder === actor && cmd.cause.kind === "check_failure" && (retryStart || retryOutcome);
+      if (!ownsRepair && !machineRetry) throw new Error("recovery execution events require the bound repair owner or the lease holder's generic retry authorization");
+    }
+    if (cmd.event.kind === "delivery_submitted") {
+      const phase = mergePhaseOf(JSON.parse(task.meta ?? "{}"));
+      if (task.status !== "in_review" && task.status !== "done" && phase !== "queued" && phase !== "awaiting-ci" && phase !== "landed") throw new Error("repair task has no delivered submission to verify");
+    }
     if (cmd.event.kind === "observed") {
       const source = cmd.event.source;
       const runUrl = `https://github.com/${cmd.repo}/actions/runs/${source.run_id}`;
@@ -8800,17 +8825,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (cmd.event.kind === "observed" && accepted) {
       const repairMeta = JSON.parse(task.meta ?? "{}");
       if (repairMeta.root_fix?.repo && repairMeta.root_fix.repo !== cmd.repo) throw new Error("repair task belongs to another repository's red episode");
-      repairMeta.root_fix = { ...(repairMeta.root_fix ?? {}), repo: cmd.repo, base: cmd.base, head_sha: cmd.head_sha,
-        why: `Cause-specific recovery: ${cmd.cause.kind}`, bound_at: Date.now(), lane: laneKey(cmd.repo, cmd.base) };
+      repairMeta.root_fix = { ...(repairMeta.root_fix ?? {}), repo: cmd.repo, base: cmd.base,
+        head_sha: repairMeta.root_fix?.head_sha ?? cmd.head_sha,
+        why: repairMeta.root_fix?.why ?? `Cause-specific recovery: ${cmd.cause.kind}`,
+        bound_at: repairMeta.root_fix?.bound_at ?? Date.now(), lane: laneKey(cmd.repo, cmd.base) };
       repairMeta.boosted = Date.now();
       const links = RecoveryLinksSchema.parse(repairMeta.recovery_links ?? []);
       if (!links.some((l) => l.repo === cmd.repo && l.base === cmd.base && recoveryEpisodeKey(l.head_sha, l.cause) === key)) links.push({ repo: cmd.repo, base: cmd.base, head_sha: cmd.head_sha, cause: cmd.cause });
       repairMeta.recovery_links = links;
       const tags = [...new Set([...parseTags(task.tags), "root_blocker", "main-red", "merge-train", "p0"])];
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, tags = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(repairMeta), JSON.stringify(tags), Date.now(), cmd.event.task_id);
-      if (task.status === "in_review" || task.status === "done") episode = reduceRecoveryEpisode(episode, {
+      const deliveryPhase = mergePhaseOf(repairMeta);
+      if (task.status === "in_review" || task.status === "done" || deliveryPhase === "queued" || deliveryPhase === "awaiting-ci" || deliveryPhase === "landed") episode = reduceRecoveryEpisode(episode, {
         head_sha: cmd.head_sha, cause: cmd.cause, event_id: `existing-delivery:${cmd.event.task_id}:${task.status_ts}`,
         event: { kind: "delivery_submitted", task_id: cmd.event.task_id }, actor: "system:recovery", now: Date.now() });
+      else if (task.status === "in_progress") episode = reduceRecoveryEpisode(episode, {
+        head_sha: cmd.head_sha, cause: cmd.cause, event_id: `existing-claim:${cmd.event.task_id}:${task.status_ts}`,
+        event: { kind: "executor_assigned", task_id: cmd.event.task_id }, actor: "system:recovery", now: Date.now() });
     }
     ledger[key] = episode;
     // A more specific diagnosis replaces a job-name placeholder. It does not
@@ -8829,7 +8860,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   /** Existing task events add facts to the journal. A code handoff or done
    * verdict only moves to verification; it never certifies live recovery. */
-  private recordTaskRecovery(taskId: string, event: RecoveryEvent, actor: string): void {
+  private recordTaskRecovery(taskId: string, event: RecoveryReducerEvent, actor: string): void {
+    const repair = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+    const repairMeta = JSON.parse(repair?.meta ?? "{}");
+    if (!repairMeta.root_fix && !repairMeta.recovery_links) return;
     const rows = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
     const now = Date.now();
     for (const row of rows) {

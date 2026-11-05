@@ -107,6 +107,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     const repo = "state-vector/recovery-loop-6522", head = "7".repeat(40);
     const repair = await kbJson("/create", { type: "task", title: "Repair callers availability", qualified: true, roles: ["impl"] });
     const task = String(repair.body.id);
+    await kbJson("/transition", { id: task, to: "in_progress", actor: "repairer", session: "impl-6522", note: "claim repair" });
     await acquire(repo, "merger-6522", { required_workflows: ["deploy / Deploy to dev"] });
     await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [] } });
     const cause = { kind: "capability_unavailable", check: "Cortex Quality Smoke", scenario: "php-sql-injection", capability: "callers", scope: "includes/User/User.php:2416" };
@@ -122,6 +123,11 @@ describe("merge train DO drill (real bundled worker)", () => {
     const command = (event_id: string, event: Record<string, unknown>) => kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id, event, actor: "repairer" });
     const diagnosed = await command("diagnosis", { kind: "diagnosed", task_id: task, diagnosis: "Adjacency read exceeds callers deadline", next: "Implement pruning" });
     expect(diagnosed.body.episode.stage.phase).toBe("repairing");
+    await kbJson("/progress.log", { id: task, actor: "observer", did: "Independent diagnostic comment", will: "Await impl claim" });
+    expect((await laneSnap(repo)).line.recoveries[0].episode.stage.next).toBe("Implement pruning");
+    const wrongExecutor = await kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id: "not-owner",
+      event: { kind: "diagnosed", task_id: task, diagnosis: "Different diagnosis", next: "Replace next step" }, actor: "observer" });
+    expect(wrongExecutor.status).toBe(400);
     const started = { kind: "attempt_started", task_id: task, attempt_id: "repair-1", attempt_kind: "repair", action: "Implement pruning and regression", next: "Publish repair" };
     expect((await command("start", started)).body.authorized).toBe(true);
     expect((await command("start", started)).body.authorized).toBe(false);
@@ -140,8 +146,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(snap.line.recoveries[0].episode.stage.phase).toBe("verifying");
     expect(snap.line.recoveries[0].episode.verified_receipts).toHaveLength(1);
     // A passing live run does not accept a still-unreviewed code repair.
-    await kbJson("/transition", { id: task, to: "in_progress", actor: "repairer-6522", session: "impl-6522", note: "implement repair" });
-    const handoff = await kbJson("/transition", { id: task, to: "in_review", actor: "repairer-6522", session: "impl-6522", note: `Direct main https://github.com/${repo}/commit/${head}` });
+    const handoff = await kbJson("/transition", { id: task, to: "in_review", actor: "repairer", session: "impl-6522", note: `Direct main https://github.com/${repo}/commit/${head}` });
     expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
     const verifyId = handoff.body.verify_task;
     await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "verifier-6522", session: "verify-6522", note: "checking repair" });

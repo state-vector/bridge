@@ -40,6 +40,7 @@ export const RecoveryEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery_submitted"), task_id: TaskId }),
 ]);
 export type RecoveryEvent = z.infer<typeof RecoveryEventSchema>;
+export type RecoveryReducerEvent = RecoveryEvent | { kind: "executor_assigned"; task_id: string };
 export const RecoveryEpisodeSchema = z.object({
   id: z.string(), head_sha: z.string(), cause: RecoveryCauseSchema,
   stage: RecoveryStageSchema, retry_limit: z.number().int().nonnegative(),
@@ -80,7 +81,7 @@ export function recoveryIsOpen(episode: RecoveryEpisode): boolean {
 /** Closed recovery reducer. Progress and code delivery cannot emit recovery.
  * Only the hub's matched-deployment verifier below can do that. */
 export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, input: {
-  head_sha: string; cause: RecoveryCause; event_id: string; event: RecoveryEvent; actor: string; now: number;
+  head_sha: string; cause: RecoveryCause; event_id: string; event: RecoveryReducerEvent; actor: string; now: number;
 }): RecoveryEpisode {
   const { event, now } = input;
   if (previous?.history.some((h) => h.event_id === input.event_id)) return previous;
@@ -103,6 +104,12 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
   if (episode.history.length >= 500) throw new Error("recovery event history budget exhausted; explicit disposition required");
   let summary = "";
   switch (event.kind) {
+    case "executor_assigned":
+      episode.stage = episode.stage.phase === "repairing"
+        ? { ...episode.stage, next: "Resume the preserved repair and report the next execution step" }
+        : { phase: "diagnosing", task_id: event.task_id, next: "Inspect this cause and preserved work, then report the concrete diagnosis and repair action" };
+      summary = "Repair executor assigned; assignment is not an execution outcome";
+      break;
     case "observed": {
       if (event.successful_deployments_required != null) {
         if (event.successful_deployments_required < episode.successful_deployments_required) throw new Error("recovery verification requirement cannot be weakened by an observation");

@@ -119,6 +119,9 @@ The banner exposes these cause-specific records so independent defects cannot
 silently replace each other under one smoke-job label.
 Bound repair tasks carry typed recovery links and receive the action/result
 reporting protocol in their agent instructions.
+Only the bound repair owner can publish its execution/next-step updates; external
+comments remain commentary. Executor assignment is visible without being
+misreported as an action result.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

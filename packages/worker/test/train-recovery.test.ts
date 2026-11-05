@@ -41,6 +41,7 @@ describe("durable cause-specific recovery loop", () => {
     episode = apply(episode, "task-done", { kind: "delivery_submitted", task_id: "BR#6494" });
     expect(episode.stage.phase).toBe("verifying");
     expect(RecoveryEventSchema.safeParse({ kind: "recovered", task_id: "BR#6494" }).success).toBe(false);
+    expect(RecoveryEventSchema.safeParse({ kind: "executor_assigned", task_id: "BR#6494" }).success).toBe(false);
   });
   it("an outcome requires an actual running attempt and bound repair ownership", () => {
     expect(() => apply(initial(), "result", { kind: "attempt_finished", task_id: "BR#6494", attempt_id: "missing", outcome: "delivered", summary: "done", receipts: [], next: "Verify" })).toThrow("running attempt");
