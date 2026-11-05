@@ -175,6 +175,14 @@ and cannot silently weaken. Use backend `enabled`, `projects` and
 declare actual capacity (example IDs; use your CLI's exact IDs). Legacy single
 `model` + `reasoning_tier` configuration remains supported. Desktop Providers
 exposes all three tier slots, and doctor reports the configured supply.
+For old configs, `bridge doctor` previews conversion; `bridge doctor --fix`
+migrates legacy model pins and flat maps into backend tier maps, preserving IDs
+and existing tier declarations. Use `--tier opencode=medium` (repeat per backend)
+to classify a legacy model explicitly. Unclassified legacy pins retain the old
+small default; model names are never used to infer capability. Existing tier maps
+are untouched. Migration is idempotent, keeps a private original-file backup,
+preserves other config fields and credentials, and refuses invalid/future configs.
+Running gateways adopt the saved supply after a safe restart, not mid-attempt.
 
 **Model policy is global, not per gateway.** Built-in defaults run analysis on
 the largest live usable model tier, implementation on the smallest, and

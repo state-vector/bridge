@@ -372,6 +372,31 @@ smaller model is running. The hub verifies the selected backend/model/tier again
 that live inventory at begin and retains the actual selection in the attempt and
 delivery receipt.
 
+**Upgrade existing gateway configurations with doctor:**
+
+```sh
+bridge doctor                                      # show the migration plan
+bridge doctor --fix                                # preserve existing tier declarations
+bridge doctor --fix --tier opencode=medium          # explicitly classify a legacy model
+```
+
+Doctor migrates legacy flat `models`/`agents` maps, backend arrays, backend
+single-model pins and the global model fallback into backend tier maps. Model IDs,
+agent profiles, scope, disabled backends, transport, binary paths, and config
+extensions are preserved. Existing tier maps are authoritative and never replaced.
+Without an explicit old tier, migration retains the historical **small** default
+and says so; it never guesses from the model name. Use repeated `--tier backend=tier`
+options to choose tiers explicitly during migration. Missing model IDs are reported,
+not invented. Merely planning does not rewrite the config.
+
+`--fix` saves through the atomic config store and keeps the exact previous file at
+`~/.bridge/config.pre-model-tiers.json`, with both files private (0600). Legacy
+credentials are preserved through their existing stores before removal from the
+config; failed preservation leaves the original config intact. Invalid or newer
+configs are refused without rewriting, and successful migration is idempotent.
+Doctor migrates the saved file, not environment overrides, and does not restart
+running gateways; the saved supply is advertised after their next safe restart.
+
 **Workspace-wide defaults:** analysis chooses the largest live usable tier;
 implementation chooses the smallest; verification chooses the smallest at least
 as large as the implementation delivery. Busy gateways still count as available

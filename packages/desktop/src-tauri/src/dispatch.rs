@@ -480,7 +480,7 @@ where D: serde::Deserializer<'de> {
         serde_json::Value::Object(o) => {
             let mut m = std::collections::BTreeMap::new();
             for (name, section) in o {
-                let cfg = serde_json::from_value(section).unwrap_or_default();
+                let cfg = serde_json::from_value(section).map_err(serde::de::Error::custom)?;
                 m.insert(name, cfg);
             }
             Ok(m)
