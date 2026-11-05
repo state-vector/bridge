@@ -8859,16 +8859,18 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (existing && existing.status !== "done" && existing.status !== "superseded") {
       // config updates ride the op that knows better (operator/executor):
       // required_workflows / ci_typical_minutes / burst_max refresh in place.
-      const cur = laneOfMeta(existing.meta);
+      const existingMeta = JSON.parse(existing.meta ?? "{}");
+      const cur = laneOfMeta(existingMeta);
       if (cfg && cur && (cfg.required_workflows || cfg.ci_typical_minutes != null || cfg.burst_max != null) &&
           (JSON.stringify(cfg.required_workflows ?? cur.required_workflows) !== JSON.stringify(cur.required_workflows) ||
             (cfg.ci_typical_minutes ?? cur.ci_typical_minutes) !== cur.ci_typical_minutes ||
             (cfg.burst_max ?? cur.burst_max) !== cur.burst_max)) {
-        const meta = JSON.parse(existing.meta ?? "{}");
+        const meta = existingMeta;
         meta.lane = { ...meta.lane, ...(cfg.required_workflows ? { required_workflows: cfg.required_workflows } : {}), ...(cfg.ci_typical_minutes != null ? { ci_typical_minutes: cfg.ci_typical_minutes } : {}), ...(cfg.burst_max != null ? { burst_max: parseBurstMax(cfg.burst_max) } : {}) };
         meta.lane.key = key;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), existing.id);
+        this.saveLaneState(existing.id, meta, Date.now());
         this.audit(actor, "train_lane_config", existing.id, { lane: meta.lane });
+        return this.laneRow(key);
       }
       return existing;
     }

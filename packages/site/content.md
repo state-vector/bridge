@@ -114,6 +114,8 @@ show the failed run and recovery task with live executor progress and next
 action, including when no PRs remain queued. Unknown or stale observations are
 never presented as healthy. A retry dispatch is activity, not proof of recovery;
 only observed line recovery permits stale-gate healing and stop clearance.
+Lane required-check updates apply to existing lanes and are returned immediately
+so operators can verify that a configuration correction actually took effect.
 
 ### Blocker rollup: many parked cards, one root
 

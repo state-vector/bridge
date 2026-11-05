@@ -103,6 +103,14 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
 }
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("an existing lane accepts explicit required-check configuration atomically and returns the refreshed row", async () => {
+    const repo = "state-vector/lane-reconfigure-6389";
+    const first = await kbJson("/train.lane", { repo, spec: { required_workflows: ["Deploy"] } });
+    const changed = await kbJson("/train.lane", { repo, spec: { required_workflows: ["Deploy", "Cortex Quality Smoke"] } });
+    expect(changed.body.id).toBe(first.body.id);
+    expect(JSON.parse(changed.body.meta).lane.required_workflows).toEqual(["Deploy", "Cortex Quality Smoke"]);
+    expect((await laneSnap(repo)).required_workflows).toEqual(["Deploy", "Cortex Quality Smoke"]);
+  });
   it("one standing lane card per (repo, base) — created once, blocked from birth, config rides settings + acquire (never hardcoded)", async () => {
     // settings-seeded config for a repo nobody has touched yet
     const seed = await kbJson("/admin.settings_set", {

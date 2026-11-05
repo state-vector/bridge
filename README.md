@@ -1698,6 +1698,8 @@ stays visible even with an empty queue. Recovery names the failing evidence,
 the repair task, its executor and heartbeat, progress and next action. Missing
 or stale observations fail closed. A human action is shown only with a concrete
 linked request; an exhausted machine retry budget alone is not a human task.
+Explicit `train.lane` configuration updates refresh an existing lane atomically
+and return the updated required-check set, rather than silently retaining it.
 
 ### One merge classification (BR#6330)
 
