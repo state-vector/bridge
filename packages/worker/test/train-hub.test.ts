@@ -103,6 +103,35 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
 }
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("out-of-band repair merge observations require the accepted PR/head and do not certify live recovery", async () => {
+    const repo = "state-vector/repair-delivery-6522", baseline = "7".repeat(40), acceptedHead = "9".repeat(40);
+    const task = await queueViaAccept({ repo, pr: 991, head: acceptedHead });
+    await acquire(repo, "delivery-merger", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: baseline, red: [], unsettled: [] } });
+    const cause = { kind: "test_failure", check: "Cortex Quality Smoke", suite: "classifier", test: "honest_refusal" };
+    await kbJson("/train.observe_deploy", { repo, observation: { tip_sha: baseline, observed_at: Date.now(), runs: [{ id: 100, name: "Deploy Dev", head_sha: baseline,
+      status: "completed", conclusion: "failure", html_url: `https://github.com/${repo}/actions/runs/100` }],
+      failures: [{ run_id: 100, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/100/job/1`, cause, repair_task_id: task }] } });
+    const args = { repo, head_sha: baseline, cause, event_id: "merge-observation", event: { kind: "repair_delivery_observed", task_id: task, pr: 991,
+      head_sha: acceptedHead, merge_sha: "8".repeat(40), url: `https://github.com/${repo}/pull/991` }, actor: "observer" };
+    const result = await kbJson("/train.recovery_event", args);
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect(result.body.episode.delivery.kind).toBe("observed_merge");
+    expect(result.body.episode.stage.phase).toBe("verifying");
+    expect(result.body.episode.verified_receipts).toHaveLength(0);
+    const wrong = await kbJson("/train.recovery_event", { ...args, event_id: "wrong-head", event: { ...args.event, head_sha: "a".repeat(40) } });
+    expect(wrong.status).toBe(400);
+    const prove = async (tip: string, run: number) => {
+      await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [] } });
+      await kbJson("/train.observe_deploy", { repo, observation: { tip_sha: tip, observed_at: Date.now(), runs: [{ id: run, name: "Deploy Dev", head_sha: tip,
+        status: "completed", conclusion: "success", html_url: `https://github.com/${repo}/actions/runs/${run}` }] } });
+      await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [],
+        deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 60, covered_by_sha: tip, covered_by_run_id: run } } });
+      return (await laneSnap(repo)).line.recoveries[0].episode;
+    };
+    expect((await prove(baseline, 101)).verified_receipts).toHaveLength(0);
+    expect((await prove("8".repeat(40), 102)).stage.phase).toBe("recovered");
+  });
   it("recovery records survive retries and task delivery; only matched successful deployment proves recovery", async () => {
     const repo = "state-vector/recovery-loop-6522", head = "7".repeat(40);
     const repair = await kbJson("/create", { type: "task", title: "Repair callers availability", qualified: true, roles: ["impl"] });

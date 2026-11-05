@@ -125,6 +125,8 @@ misreported as an action result.
 Recovery comments do not claim work or refresh another executor's heartbeat.
 Repair-merge receipts appear in the recovery history without claiming that the
 deployment has passed.
+Out-of-band merge observations must match the independently accepted repair
+head and still require live deployment verification.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

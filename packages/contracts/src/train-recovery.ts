@@ -38,6 +38,8 @@ export const RecoveryEventSchema = z.discriminatedUnion("kind", [
     outcome: z.enum(["failed", "delivered", "inconclusive"]), summary: Text, receipts: z.array(z.string().url()), next: Text }),
   z.object({ kind: z.literal("progress"), task_id: TaskId, did: Text, next: Text }),
   z.object({ kind: z.literal("delivery_submitted"), task_id: TaskId }),
+  z.object({ kind: z.literal("repair_delivery_observed"), task_id: TaskId, pr: z.number().int().positive(),
+    head_sha: z.string().regex(/^[0-9a-f]{40}$/), merge_sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().url() }),
 ]);
 export type RecoveryEvent = z.infer<typeof RecoveryEventSchema>;
 export type RecoveryReducerEvent = RecoveryEvent | { kind: "executor_assigned"; task_id: string }
@@ -46,6 +48,11 @@ export const RecoveryEpisodeSchema = z.object({
   id: z.string(), head_sha: z.string(), cause: RecoveryCauseSchema,
   stage: RecoveryStageSchema, retry_limit: z.number().int().nonnegative(),
   successful_deployments_required: z.number().int().min(1).max(10), verified_receipts: z.array(RecoveryReceiptSchema),
+  delivery: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("pending") }), z.object({ kind: z.literal("submitted") }),
+    z.object({ kind: z.literal("train_merge"), pr: z.number(), merge_sha: z.string(), url: z.string().url() }),
+    z.object({ kind: z.literal("observed_merge"), pr: z.number(), head_sha: z.string(), merge_sha: z.string(), url: z.string().url() }),
+  ]).default({ kind: "pending" }),
   sources: z.array(RecoveryReceiptSchema).min(1), attempts: z.array(RecoveryAttemptSchema),
   history: z.array(z.object({ event_id: z.string(), at: z.number(), actor: z.string(), kind: z.string(), summary: z.string() })),
   created_at: z.number(), updated_at: z.number(),
@@ -94,12 +101,13 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
     id: recoveryEpisodeKey(input.head_sha, input.cause), head_sha: input.head_sha, cause: input.cause,
     stage: { phase: "diagnosing", task_id: event.task_id, next: event.kind === "observed" ? event.next : "Inspect failure evidence" },
     retry_limit: 1, successful_deployments_required: event.kind === "observed" ? event.successful_deployments_required ?? 1 : 1,
-    verified_receipts: [], sources: initialSource, attempts: [], history: [], created_at: now, updated_at: now,
+    delivery: { kind: "pending" }, verified_receipts: [], sources: initialSource, attempts: [], history: [], created_at: now, updated_at: now,
   };
   if (episode.stage.phase === "recovered" && event.kind === "observed") {
     const receipt = episode.stage.receipt;
     if (event.source.run_id < receipt.run_id || (event.source.run_id === receipt.run_id && event.source.run_attempt <= receipt.run_attempt)) return episode;
     episode.stage = { phase: "diagnosing", task_id: event.task_id, next: event.next };
+    episode.delivery = { kind: "pending" };
   } else if (episode.stage.phase === "recovered" || episode.stage.phase === "superseded") throw new Error("closed recovery episode cannot accept work events");
   if (episode.stage.task_id !== event.task_id) throw new Error("recovery event must name the bound repair task");
   if (episode.history.length >= 500) throw new Error("recovery event history budget exhausted; explicit disposition required");
@@ -112,8 +120,16 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
       summary = "Repair executor assigned; assignment is not an execution outcome";
       break;
     case "repair_merged":
+      if (!("merge_sha" in episode.delivery) || episode.delivery.merge_sha !== event.merge_sha) episode.verified_receipts = [];
+      episode.delivery = { kind: "train_merge", pr: event.pr, merge_sha: event.merge_sha, url: event.url };
       episode.stage = { phase: "verifying", task_id: event.task_id, next: "Observe the merged repair's decisive deployment and complete the verification bar" };
       summary = `Repair PR #${event.pr} merged as ${event.merge_sha.slice(0, 9)}; deployment verification remains pending — ${event.url}`;
+      break;
+    case "repair_delivery_observed":
+      if (!("merge_sha" in episode.delivery) || episode.delivery.merge_sha !== event.merge_sha) episode.verified_receipts = [];
+      episode.delivery = { kind: "observed_merge", pr: event.pr, head_sha: event.head_sha, merge_sha: event.merge_sha, url: event.url };
+      episode.stage = { phase: "verifying", task_id: event.task_id, next: "Observe the merged repair's decisive deployment and complete the verification bar" };
+      summary = `Observed verified repair PR #${event.pr} merged as ${event.merge_sha.slice(0, 9)}; live verification remains pending — ${event.url}`;
       break;
     case "observed": {
       if (event.successful_deployments_required != null) {
@@ -168,6 +184,7 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
       summary = event.did;
       break;
     case "delivery_submitted":
+      if (episode.delivery.kind === "pending") episode.delivery = { kind: "submitted" };
       episode.stage = { phase: "verifying", task_id: event.task_id, next: "Review the delivered repair, then prove recovery on a decisive deployment" };
       summary = "Repair submitted for verification; live recovery is not yet proven";
       break;

@@ -1769,6 +1769,11 @@ Comments on linked recovery work cannot implicitly claim a released task or
 refresh another executor's liveness. Recovery work requires an explicit claim.
 Train merge receipts add an explicit repair-merged history event, distinct from
 the still-pending deployment verification.
+An executor can also report a first-hand out-of-band repair merge through
+`repair_delivery_observed`, but its PR/head must match the task's independently
+accepted binding. That only advances verification; it cannot certify recovery.
+Before the accepted repair lifecycle closes, merge-observed verification requires
+deployment of that exact merge SHA; workflow ordering alone is not ancestry proof.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery

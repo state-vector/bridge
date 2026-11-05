@@ -8807,7 +8807,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const previous = ledger[key];
     const task = this.one(`SELECT type, status, status_ts, owner, meta, tags FROM artefacts WHERE id = ?`, cmd.event.task_id);
     if (!task || task.type !== "task") throw new Error("recovery must bind an existing repair task");
-    if (cmd.event.kind !== "observed" && cmd.event.kind !== "delivery_submitted") {
+    if (cmd.event.kind !== "observed" && cmd.event.kind !== "delivery_submitted" && cmd.event.kind !== "repair_delivery_observed") {
       const tokenId = (body as { token_id?: string }).token_id;
       const principal = tokenId ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, tokenId)?.principal : null;
       const ownsRepair = task.owner === actor || (principal && task.owner === principal);
@@ -8820,6 +8820,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (cmd.event.kind === "delivery_submitted") {
       const phase = mergePhaseOf(JSON.parse(task.meta ?? "{}"));
       if (task.status !== "in_review" && task.status !== "done" && phase !== "queued" && phase !== "awaiting-ci" && phase !== "landed") throw new Error("repair task has no delivered submission to verify");
+    }
+    if (cmd.event.kind === "repair_delivery_observed") {
+      const receipt = cmd.event;
+      const repair = JSON.parse(task.meta ?? "{}");
+      const bound = trainLegs(repair).find((p) => p.repo === cmd.repo && p.number === receipt.pr);
+      if (!bound || bound.head_sha_at_acceptance !== receipt.head_sha || receipt.url !== `https://github.com/${cmd.repo}/pull/${receipt.pr}`) throw new Error("observed repair delivery must match the task's independently accepted PR/head binding and receipt URL");
     }
     if (cmd.event.kind === "observed") {
       const source = cmd.event.source;
@@ -8924,7 +8930,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const newestFailure = episode.sources.reduce((a, b) => b.run_id > a.run_id || (b.run_id === a.run_id && b.run_attempt > a.run_attempt) ? b : a);
         if (run.id < newestFailure.run_id || (run.id === newestFailure.run_id && (run.run_attempt ?? 1) < newestFailure.run_attempt)) continue;
         const repair = this.one(`SELECT status FROM artefacts WHERE id = ?`, episode.stage.task_id);
-        const repairAccepted = repair?.status === "done" || (episode.cause.kind === "check_failure" && episode.attempts.some((a) => a.kind === "retry" && a.status === "finished" && a.outcome === "delivered"));
+        // A merge observation is not an ancestry proof for an unrelated tip.
+        // Until the accepted lifecycle closes, require deployment of that exact
+        // merge rather than inferring containment from run ordering.
+        if (repair?.status !== "done" && "merge_sha" in episode.delivery && episode.delivery.merge_sha !== cov.tip_sha) continue;
+        const repairAccepted = repair?.status === "done" || episode.delivery.kind === "train_merge" || episode.delivery.kind === "observed_merge" ||
+          (episode.cause.kind === "check_failure" && episode.attempts.some((a) => a.kind === "retry" && a.status === "finished" && a.outcome === "delivered"));
         ledger[key] = verifyRecoveryEpisode(episode, { head_sha: cov.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: run.html_url }, now, repairAccepted);
       }
     }
