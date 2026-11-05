@@ -13866,7 +13866,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         },
       });
     }
-    return { lanes: out };
+    const hubBuild = (await import("../__version.json")) as { commit?: string };
+    return { hub_commit: hubBuild.commit ?? "unknown", lanes: out };
   }
 
   /** train.history — the train_events ledger (provenance serving). */

@@ -67,6 +67,7 @@ const acquire = (repo: string, actor: string, extra: Record<string, unknown> = {
 
 async function laneSnap(repo: string): Promise<any> {
   const { body } = await kbJson("/train.status", { repo });
+  expect(body.hub_commit).toMatch(/^[0-9a-f]{40}$/);
   return body.lanes[0];
 }
 

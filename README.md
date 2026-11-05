@@ -1789,6 +1789,8 @@ A submitted root repair awaiting independent review is machine-owned even if
 earlier watchdog attempts failed. Historical attempts alone cannot demand human
 re-arming after submission; an explicit permission or authority escalation still
 remains actionable. A submitted PR is not accepted train admission.
+`train_status.hub_commit` identifies the Durable Object build actually serving
+lane state, independently of the edge Worker's `/__version` stamp.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery

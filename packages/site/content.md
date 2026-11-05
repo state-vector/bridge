@@ -132,6 +132,8 @@ main-failure banner, while explicit human requirements remain visible.
 Submitted repairs awaiting independent review are not exhausted merely because
 earlier attempts stalled. The machine continues verification; submission alone
 never grants acceptance or merge authority.
+Lane snapshots expose the serving hub's `hub_commit` so deployment verification
+can distinguish the live state engine from the edge version marker.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action
