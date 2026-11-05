@@ -122,6 +122,8 @@ reporting protocol in their agent instructions.
 Only the bound repair owner can publish its execution/next-step updates; external
 comments remain commentary. Executor assignment is visible without being
 misreported as an action result.
+Repair-merge receipts appear in the recovery history without claiming that the
+deployment has passed.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

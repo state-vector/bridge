@@ -8842,6 +8842,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       else if (task.status === "in_progress") episode = reduceRecoveryEpisode(episode, {
         head_sha: cmd.head_sha, cause: cmd.cause, event_id: `existing-claim:${cmd.event.task_id}:${task.status_ts}`,
         event: { kind: "executor_assigned", task_id: cmd.event.task_id }, actor: "system:recovery", now: Date.now() });
+      if ((deliveryPhase === "awaiting-ci" || deliveryPhase === "landed") && repairMeta.merge_train?.merge_sha && Number(repairMeta.merge_train?.pr) > 0) {
+        episode = reduceRecoveryEpisode(episode, { head_sha: cmd.head_sha, cause: cmd.cause,
+          event_id: `existing-merge:${repairMeta.merge_train.merge_sha}`,
+          event: { kind: "repair_merged", task_id: cmd.event.task_id, pr: Number(repairMeta.merge_train.pr),
+            merge_sha: String(repairMeta.merge_train.merge_sha), url: `https://github.com/${cmd.repo}/pull/${repairMeta.merge_train.pr}` },
+          actor: "system:recovery", now: Date.now() });
+      }
     }
     ledger[key] = episode;
     // A more specific diagnosis replaces a job-name placeholder. It does not
@@ -9849,6 +9856,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — burst pass settled (${burstMerged} merged), awaiting main CI on the final merge`
           : `PR #${pr} merged as ${mergeSha.slice(0, 9)} — merging burst (${burstMerged} merged, cap ${burstCap === 0 ? "unlimited" : burstCap}), no settle between merges`;
       this.version(lane.id, actor, `train:${kind}`, laneNote + (midWalk ? ` — lease lost mid-walk (${midWalk.action}), receipt admitted by the mid-walk law (BR#5385)` : ""), { currently: meta.currently, reason });
+      if (chain.task_id) this.recordTaskRecovery(chain.task_id, { kind: "repair_merged", task_id: chain.task_id,
+        pr, merge_sha: mergeSha, url: `https://github.com/${repo}/pull/${pr}` }, actor);
       return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, reason };
     }
 

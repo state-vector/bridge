@@ -1765,6 +1765,8 @@ Execution events and journal progress are owner-fenced. Other agents can add
 diagnostic comments, but cannot replace a repair executor's next action. Claim
 events record assignment separately from action execution. Historical incident
 observations also preserve the repair's current root-fix commit binding.
+Train merge receipts add an explicit repair-merged history event, distinct from
+the still-pending deployment verification.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery

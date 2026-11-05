@@ -40,7 +40,8 @@ export const RecoveryEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery_submitted"), task_id: TaskId }),
 ]);
 export type RecoveryEvent = z.infer<typeof RecoveryEventSchema>;
-export type RecoveryReducerEvent = RecoveryEvent | { kind: "executor_assigned"; task_id: string };
+export type RecoveryReducerEvent = RecoveryEvent | { kind: "executor_assigned"; task_id: string }
+  | { kind: "repair_merged"; task_id: string; pr: number; merge_sha: string; url: string };
 export const RecoveryEpisodeSchema = z.object({
   id: z.string(), head_sha: z.string(), cause: RecoveryCauseSchema,
   stage: RecoveryStageSchema, retry_limit: z.number().int().nonnegative(),
@@ -109,6 +110,10 @@ export function reduceRecoveryEpisode(previous: RecoveryEpisode | undefined, inp
         ? { ...episode.stage, next: "Resume the preserved repair and report the next execution step" }
         : { phase: "diagnosing", task_id: event.task_id, next: "Inspect this cause and preserved work, then report the concrete diagnosis and repair action" };
       summary = "Repair executor assigned; assignment is not an execution outcome";
+      break;
+    case "repair_merged":
+      episode.stage = { phase: "verifying", task_id: event.task_id, next: "Observe the merged repair's decisive deployment and complete the verification bar" };
+      summary = `Repair PR #${event.pr} merged as ${event.merge_sha.slice(0, 9)}; deployment verification remains pending — ${event.url}`;
       break;
     case "observed": {
       if (event.successful_deployments_required != null) {
