@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md, AskOptions, askKernel, askOptionVariant } from "./decide";
+import { md, AskOptions, askOptionVariant } from "./decide";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -722,7 +722,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
         <h2 className="detail-question">
           {task && (task.meta as any)?.ask
-            ? <RefText text={askKernel(task.title)} onOpen={nav} />
+            ? <RefText text={task.title} onOpen={nav} />
             : <RefText text={task?.title ?? taskId} onOpen={nav} />}
         </h2>
 
@@ -935,4 +935,3 @@ function DepGraph({ selfId, selfTitle, relations, related, onOpen }: {
     </div>
   );
 }
-

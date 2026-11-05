@@ -6,6 +6,7 @@ import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, md } from "./decide";
 import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
+import { isHumanDecisionAsk } from "@bridge/contracts";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -70,17 +71,12 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
       put(String((latest.meta as any)?.task ?? (latest.meta as any)?.verify_target ?? ""), { kind: "verdict", latest, prior });
     }
     for (const d of generic) put(null, { kind: "decision", d });
-    // question-node asks: BR#-numbered, child_of their subject (part_of on the
-    // board payload) — surfaced by the same exactly-once rule. Self-asks
-    // (agent → itself) are coordination, not a human decision: excluded.
-    // the human band: asks NOT session-scoped to another agent. Ray-gates
-    // address bare labels (rayh, human, opencode-ray — dispatch sessions ask
-    // under the coordinator's label). Session-qualified addresses
-    // ('<agent>@<session>') are agent-to-agent coordination: not human mail.
+    // Audience comes from the shared request contract. Agent names, session
+    // syntax and presence never turn coordination into a human decision.
     const seenAsk = new Set<string>();
     for (const nodeAsk of nodeAsks) {
       const am = (nodeAsk.meta ?? {}).ask ?? {};
-      if (String(am.to ?? "").includes("@")) continue;
+      if (!isHumanDecisionAsk(am)) continue;
       // identical re-asked asks collapse to the newest
       const key = `${nodeAsk.part_of ?? ""}:${nodeAsk.title}`;
       if (seenAsk.has(key)) continue;
@@ -225,7 +221,8 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
             commands, PR links, why) live in body_md and must never hide
             behind Details. */}
         <span className="ab-title">{nodeAsk.title}</span>
-        {m.ask?.reason && <span className="ab-reason">why escalated: {m.ask.reason}</span>}
+        <span className="ab-reason">Choose how Bridge should proceed. An option will say explicitly if it needs you to do something.</span>
+        {m.ask?.reason && <span className="ab-reason">Why Bridge needs you: {m.ask.reason}</span>}
         {String(nodeAsk.body_md ?? "").trim() && (
           <div
             className="ask-band-body md-body"

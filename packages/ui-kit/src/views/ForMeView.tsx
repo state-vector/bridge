@@ -207,7 +207,8 @@ function QuestionNodeRow({ node, onDone, answered }: { node: any; onDone: (id: s
         </span>
       </div>
       <h3 className="ask-question">{node.title}</h3>
-      {ask.reason && <p className="ask-reason"><b>why escalated:</b> {ask.reason}</p>}
+      <p className="ask-reason">Choose how Bridge should proceed. An option will say explicitly if it needs you to do something.</p>
+      {ask.reason && <p className="ask-reason"><b>Why Bridge needs you:</b> {ask.reason}</p>}
       {ask.escalated?.reason && <p className="ask-reason"><b>escalation:</b> {ask.escalated.reason}</p>}
       {/* BR#6390 (Ray: "the question/body needs to be clear in the UI, not
           buried ... not small truncated text"): the ask's full body_md — the
@@ -272,17 +273,6 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
 
   // Blocked-on-ask queue: tasks parked on Ray's GO, with one-click approval.
   // The ask.answer auto-resumes the blocked task server-side.
-  const blockedOnAsk = tasks.filter((t: any) => t.meta?.awaiting_ask?.ask_id && t.status === "blocked");
-  const answerGo = async (t: any) => {
-    try {
-      await kbApi.askAnswer(t.meta.awaiting_ask.ask_id, "GO — approved per the receipts on this ask");
-      setTick((x) => x + 1);
-    } catch (err) {
-      console.error("Failed to answer ask:", err);
-      // Error will also be handled by the refresh in bump()
-      setTick((x) => x + 1);
-    }
-  };
   useEffect(() => { void load(); }, [tick]);
 
   // open question nodes = the ask feed (one plane)
@@ -291,13 +281,13 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
       if (t.type !== "question" || !t.meta?.ask) return false;
       if (!["todo", "in_progress", "blocked"].includes(t.status)) return false;
       const am = t.meta.ask ?? {};
-      return !(String(am.to ?? "").includes("@")); // session-scoped asks are agent-to-agent
+      return isHumanDecisionAsk(am);
     }),
     [tasks],
   );
 
   const questions = useMemo(
-    () => tasks.filter((t) => t.type === "question" || t.meta?.kind === "question"),
+    () => tasks.filter((t) => (t.type === "question" || t.meta?.kind === "question") && !t.meta?.ask && !["done", "superseded"].includes(t.status)),
     [tasks],
   );
 
@@ -338,7 +328,7 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
     });
   }, [asked, merged]);
 
-  const total = grouped.verdictCards.length + grouped.generic.length + asked.length + blockedOnAsk.length;
+  const total = grouped.verdictCards.length + grouped.generic.length + asked.length;
 
   return (
     <div className="disc-wrap">
@@ -362,24 +352,6 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
             );
           })}
           <p className="muted-note">Per-role guidance delivered to sessions at orient — the merge ladder, verification standard, and deployment rules live here.</p>
-        </Card>
-      )}
-      {blockedOnAsk.length > 0 && (
-        <Card>
-          <h2>Blocked — awaiting your GO ({blockedOnAsk.length})</h2>
-          {blockedOnAsk.map((t: any) => {
-            const hours = t.meta?.awaiting_ask?.annotated_h ?? 0;
-            const reason = String(t.meta?.blocked?.reason ?? "").replace(/^⏳ blocked \d+h — .*? · /, "");
-            return (
-              <div key={t.id} className="forme-item">
-                <span>{t.id}</span>
-                <span title={t.title}>{t.title}</span>
-                <span className="muted-note">blocked {hours}h · {reason.slice(0, 120)}</span>
-                <Btn onClick={() => void answerGo(t)}>GO — approve & resume</Btn>
-              </div>
-            );
-          })}
-          <p className="muted-note">GO answers the ask and auto-resumes the task server-side.</p>
         </Card>
       )}
 
@@ -419,3 +391,4 @@ export function ForMeView({ openThread }: { openThread?: (taskId: string) => voi
     </div>
   );
 }
+import { isHumanDecisionAsk } from "@bridge/contracts";

@@ -222,7 +222,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { DeployCoverageStateSchema, TrainLineFactsSchema, projectTrainLine, type TrainLineProjection } from "@bridge/contracts";
+import { DeployCoverageStateSchema, TrainLineFactsSchema, projectTrainLine, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -321,6 +321,17 @@ export function headMatches(observed: string, expected: string): boolean {
  *  refused, and (pre-#288) the refusal rode as a retryable 503 — three
  *  blind retries, three transition_rejected events, a breach card. */
 export function verifyDutyBody(parentId: string, rootTitle: string, prLink: string, leg?: { repo: string; n: number }, rootFix?: { repo: string; pr: number }): string {
+  const direct = !leg ? parseDirectCommitReceipt(prLink) : null;
+  if (direct?.repo) return `Independent review of ${parentId} — "${rootTitle}".
+
+The change is already on main: ${prLink}. Check it in a fresh session; do not ask the human to arrange a reviewer.
+
+1. Confirm this commit is an ancestor of current main, its GitHub signature is valid, and CI succeeded for this commit.
+2. Check that the delivered behaviour meets the parent task, including current deployed behaviour where applicable. Cite the evidence and tests you actually checked.
+3. If accepted, close THIS duty done with review_result {kind:"accepted_direct_main",repo:"${direct.repo}",commit:"${direct.sha}",ci_run_url:"<green GitHub Actions run URL>"} and the evidence in your note. Bridge closes the parent automatically. There is no pending PR or merge step.
+4. If there are defects, bounce the parent to in_progress with concrete findings, then close this duty done with review_result {kind:"findings",summary:"<findings>"} and receipts. Cannot proceed is a findings result, never acceptance.
+
+Use answer_ask for any coordination question you answer; progress notes do not resolve questions.`;
   // BR#5190: the fast-lane note rides ONLY for a QUALIFIED root-fix parent
   // (the caller derives it from isRootFixCard + a live PR stamp — no stamp,
   // no fast lane to name). The verifier's duty is unchanged; the note exists
@@ -2470,8 +2481,12 @@ export class KnowledgeHub {
     // planes can show "asked to X (offline, N min ago)" without any new
     // permission: the board payload is the ask band's only data source.
     for (const t of tasks) {
+      const pending = askChildOf.get(t.id);
+      const pendingAsk = pending ? JSON.parse(String(pending.cmeta ?? "{}")).ask : undefined;
+      if (pendingAsk) t.meta.awaiting_ask = { ask_id: pending.id, route: askRoute(pendingAsk), to: this.askRecipient(pendingAsk) };
       if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
-        t.ask_target = this.askTargetPresence(String(t.meta.ask.to ?? ""), Date.now());
+        t.meta.ask.route = askRoute(t.meta.ask);
+        t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
       }
     }
     return { tasks, sessions, progress, series, agents: this.agentScores() };
@@ -3730,6 +3745,9 @@ export class KnowledgeHub {
     // an ask node REQUIRES options (the human answers by clicking) — enforced
     // here, not just in ask.create, so every door is covered
     if (createMeta.ask && (type === "task" || type === "question")) {
+      if (createMeta.ask.answer || createMeta.ask.resolution) throw new Error("new asks start open; record answers through answer_ask");
+      createMeta.ask.route = askRoute(createMeta.ask);
+      if (createMeta.ask.route.kind === "independent_review") throw new Error("independent review is work: use ask.create with route independent_review, not a question node");
       const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
       if (opts.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (meta.ask.options)");
       if (!String(body.title ?? "").trimEnd().endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?'");
@@ -4222,12 +4240,19 @@ export class KnowledgeHub {
     // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    if (preMeta.ask && (metaDel.includes("ask") || (body.meta && Object.hasOwn(body.meta, "ask") && !body.meta.ask))) throw new Error("an ask's authoritative lifecycle cannot be deleted through metadata updates");
     // the re-claim transition above rewrote meta in DB (cleared the dead-end
     // blocked record) — merge against the POST-transition row, never the stale
     // pre-claim snapshot, or the parked reason resurrects
     const postRow = reclaimed ? this.one(`SELECT meta FROM artefacts WHERE id = ?`, id) : null;
     const metaObj: any = { ...(postRow ? JSON.parse(postRow.meta ?? "{}") : preMeta) };
     if (body.meta !== undefined) Object.assign(metaObj, JSON.parse(JSON.stringify(body.meta)));
+    if (body.meta?.ask) {
+      for (const key of ["answer", "answered_by", "answered_ts", "resolution"]) {
+        if (JSON.stringify(body.meta.ask[key]) !== JSON.stringify(JSON.parse(String(row.meta ?? "{}")).ask?.[key])) throw new Error("ask lifecycle fields are owned by answer_ask and machine cancellation, not metadata updates");
+      }
+      metaObj.ask.route = askRoute(metaObj.ask);
+    }
     // BR#5807 fail-closed guard: meta_delete is the only remaining way to drop
     // keys, so it carries the authority check the close-protection law uses
     // (machine.ts) — lane-config keys on a lane card, and a typed await on a
@@ -4755,6 +4780,13 @@ export class KnowledgeHub {
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
   private ruleCtx(row: any, body: any, id: string, tTags: string[]): RuleCtx {
+    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.meta FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
+      const meta = JSON.parse(String(child.meta ?? "{}"));
+      if (meta.machine_duty || meta.ask?.review_leg) return false;
+      // Peer coordination is retired on terminal work; it is not unfinished
+      // implementation and must not deadlock completion behind itself.
+      return !(child.type === "question" && meta.ask && !isHumanDecisionAsk(meta.ask));
+    });
     return {
       qualify: (kind) => {
         // Bar-based claim gate: a claim is legal unless the task DECLARES
@@ -4792,34 +4824,13 @@ export class KnowledgeHub {
       // the landed close; the duty session burned 3 audited breach events
       // discovering it must close itself first. The in_review flow's own
       // Verify spawn stays UNMARKED — that one IS the review acceptance.
-      openChildren: () =>
-        this.one(
-          `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')
-             AND c.meta NOT LIKE '%"machine_duty"%'`,
-          id,
-        )?.n ?? 0,
-      openChildIds: () =>
-        (this.state.storage.sql.exec(
-          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND r.src_id != r.dst_id AND c.meta NOT LIKE '%"machine_duty"%'`,
-          id,
-        ).toArray() as any[]).map((r) => String(r.id)),
+      openChildren: () => blockingChildren().length,
+      openChildIds: () => blockingChildren().map((r) => String(r.id)),
       // BR#5370 (finding B): the rejection names the open children — ids AND
       // statuses — so attempt 1 points at the right action (close the named
       // child, or first-line force-close-children). Same exclusions as
       // openChildren (self-edges, review-leg asks, machine-duty children).
-      openChildDetails: () =>
-        (this.state.storage.sql.exec(
-          `SELECT c.id AS id, c.status AS status FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done', 'superseded')
-             AND r.src_id != r.dst_id AND NOT (c.type = 'question' AND c.meta LIKE '%"review_leg"%')
-             AND c.meta NOT LIKE '%"machine_duty"%'
-           ORDER BY c.id`,
-          id,
-        ).toArray() as any[]).map((r) => ({ id: String(r.id), status: String(r.status) })),
+      openChildDetails: () => blockingChildren().map((r) => ({ id: String(r.id), status: String(r.status) })),
       // verify-of-verify / nesting-cap guard: the spawn-blocker reason or null
       spawnGuard: () => {
         let cursor = id, depth = 0;
@@ -5053,6 +5064,13 @@ export class KnowledgeHub {
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = ts0;
     const meta = JSON.parse(row.meta ?? "{}");
+    const reviewResult = body.review_result === undefined ? undefined : ReviewResultSchema.parse(body.review_result);
+    if (row.type === "question" && meta.ask && body.to === "done") throw new Error("answer an ask with ask.answer / answer_ask; a transition or progress note is not an answer");
+    if (reviewResult) {
+      if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
+      if (reviewResult.kind === "accepted_direct_main" && !reviewResult.ci_run_url.startsWith(`https://github.com/${reviewResult.repo}/actions/runs/`)) throw new Error("review CI receipt must belong to the delivered repository");
+      meta.review_result = reviewResult;
+    }
     if (isSubprocess && row.type === "task" && row.status === "in_progress") {
       const bm = Math.max(1, Math.min(1440, Number(body.budget_minutes) || 0));
       if (!bm) throw new Error("class: subprocess requires budget_minutes (1-1440) — a declared window without a deadline never trips, which is worse than abandonment");
@@ -5342,6 +5360,7 @@ export class KnowledgeHub {
       ...(body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
+    if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(ts);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
     // onto the train (the train owns delivery; the verifier never merges).
@@ -5378,13 +5397,13 @@ export class KnowledgeHub {
               this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
               this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
             } else {
-              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), review_result: reviewResult }, actor);
               this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
             }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
-            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? "") }, actor);
+            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), review_result: reviewResult }, actor);
           }
         }
       } catch (e) {
@@ -5533,8 +5552,10 @@ export class KnowledgeHub {
           if (reviewNote || notePrLegs.length > 0) {
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
           }
-          const prLink: string =
-            typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
+          const directReceipt = parseDirectCommitReceipt(reviewNote);
+          const prLink: string = directReceipt?.repo
+            ? `https://github.com/${directReceipt.repo}/commit/${directReceipt.sha}`
+            : typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
               ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
               : fx.pr && isClonableRepoRef(fx.pr)
                 ? fx.pr
@@ -5553,7 +5574,7 @@ export class KnowledgeHub {
                 id,
                 rootTitle,
                 prLink,
-                typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
+                !directReceipt && typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
                   ? { repo: stamp.repo, n: Number(stamp.number) }
                   : undefined,
                 parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
@@ -6334,18 +6355,18 @@ export class KnowledgeHub {
     return Number(old?.epoch ?? 1) + 1;
   }
 
-  /** Ask addressees that ARE the final escalation themselves — an ask to one
-   *  of these is already human mail; the TTL re-route never applies. Bare
-   *  coordinator labels count (dispatch sessions ask under the coordinator's
-   *  label — the same law the ask band's human filter uses). */
-  private static readonly HUMAN_ASK_TARGETS = new Set(["human", "ray", "rayh", "opencode-ray"]);
-
   /** Can a non-human ask target still be answered? Direct token OR the
    *  gateway-dispatch edge seen inside the presence window (10 min — the
    *  same clock listAgents uses). A label with no record at all has NEVER
    *  connected: offline by construction (the BR#3930 addressee). */
   private askTargetPresence(to: string, now: number): { online: boolean; last_seen_ts: number | null; source: "token" | "gateway" | "unknown" } {
     const cutoff = now - 10 * 60_000;
+    if (to.includes("@")) {
+      const [label, session] = to.split("@", 2);
+      const seen = this.one(`SELECT MAX(s.last_seen_ts) AS ts FROM sessions s JOIN auth_tokens t ON t.id = s.token_id WHERE t.label = ? AND s.name = ? AND t.revoked_ts IS NULL`, label, session);
+      const ts = Number(seen?.ts ?? 0);
+      return { online: ts >= cutoff, last_seen_ts: ts || null, source: ts ? "token" : "unknown" };
+    }
     const t = this.one(`SELECT last_seen_ts FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, to) as any;
     if (t) return { online: Number(t.last_seen_ts) >= cutoff, last_seen_ts: Number(t.last_seen_ts), source: "token" };
     const g = this.one(`SELECT last_seen_ts FROM gateway_agents WHERE agent = ? ORDER BY last_seen_ts DESC LIMIT 1`, to) as any;
@@ -6353,11 +6374,11 @@ export class KnowledgeHub {
     return { online: false, last_seen_ts: null, source: "unknown" };
   }
 
-  /** BR#3942 — stamp meta.ask.escalated on unanswered, offline-addressee
-   *  asks (agent-identity targets only). Idempotent: a node already carrying
-   *  escalated is skipped, so repeated sweeps never duplicate. `now` is
-   *  injectable for the admin drill door and the alarm path passes Date.now(). */
+  /** Recover failed peer delivery on the same request. Human audience is
+   * explicit and never inferred from a timeout. `now` is injectable for drills. */
   private async escalateStaleAsks(now: number): Promise<string[]> {
+    await this.reconcileCompletedReviews();
+    this.retireCompletedCoordination(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
     const ttlMs = ttlMin * 60_000;
@@ -6371,31 +6392,76 @@ export class KnowledgeHub {
       let m: any;
       try { m = JSON.parse(r.meta ?? "{}"); } catch { continue; }
       const ask = m.ask;
-      if (!ask || ask.escalated) continue;
-      const to = String(ask.to ?? "");
-      // human-directed, open-floor, capability-tag and session-scoped asks
-      // are NOT agent-identity asks: the first are already human mail, the
-      // rest are pool/roster/agent-to-agent routing that the human band
-      // deliberately never claimed (AskBand's @-filter law).
-      if (!to || to === "any" || to.startsWith("tag:") || to.includes("@")) continue;
-      if (KnowledgeHub.HUMAN_ASK_TARGETS.has(to)) continue;
+      if (!ask || ask.recovery || isHumanDecisionAsk(ask)) continue;
+      const to = this.askRecipient(ask);
+      // Pools and capabilities already have a recipient set; a failed exact
+      // agent/session delivery returns to that set, without human escalation.
+      if (!to || to === "any" || to.startsWith("tag:")) continue;
       const presence = this.askTargetPresence(to, now);
       if (presence.online) continue;
-      m.ask.escalated = {
+      m.ask.route = askRoute(ask);
+      m.ask.to = "any";
+      delete m.ask.escalated;
+      m.ask.recovery = {
         ts: now,
         from_target: to,
         ttl_min: ttlMin,
         addressee_last_seen_ts: presence.last_seen_ts,
         presence_source: presence.source,
-        reason: `addressee ${to} offline (${presence.last_seen_ts ? `last seen ${Math.round((now - presence.last_seen_ts) / 60_000)}m ago via ${presence.source}` : "never seen"}) and the ask sat unanswered ${Math.round((now - Number(r.created_ts)) / 60_000)}m > ${ttlMin}m TTL — escalated to the human For Me band with the proof below; original options intact (BR#3942)`,
+        reason: `The requested agent is unavailable. Bridge has returned this request to the agent pool; no human action is needed.`,
       };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(m), r.id);
-      const summary = `ask escalated to human: ${to} offline, unanswered > ${ttlMin}m (BR#3942)`;
-      this.version(r.id, "system:watchdog", "escalate", summary, { to, ttl_min: ttlMin, presence_source: presence.source });
-      this.audit("system:watchdog", "ask_escalated", r.id, { to, ttl_min: ttlMin, presence_source: presence.source, artefact_bound: ask.artefact_id ?? null });
+      const summary = `agent coordination returned to pool: ${to} unavailable`;
+      this.version(r.id, "system:watchdog", "reroute", summary, { to, ttl_min: ttlMin, presence_source: presence.source });
+      this.audit("system:watchdog", "ask_rerouted", r.id, { to, ttl_min: ttlMin, presence_source: presence.source, artefact_bound: ask.artefact_id ?? null });
       escalated.push(r.id);
     }
     return escalated;
+  }
+
+  /** Terminal work retires its coordination obligations, not human decisions.
+   * No fabricated answer and no answer-dispatch side effects. Also runs on the
+   * alarm to heal old rows and on task completion for immediate convergence. */
+  private retireCompletedCoordination(now: number): void {
+    const rows = this.state.storage.sql.exec(`SELECT q.id, q.meta, p.id AS parent_id, p.status AS parent_status FROM artefacts q JOIN relations r ON r.src_id = q.id AND r.relation = 'child_of' JOIN artefacts p ON p.id = r.dst_id WHERE q.type = 'question' AND q.status IN ('todo','in_progress','blocked') AND p.type = 'task' AND p.status IN ('done','superseded')`).toArray();
+    for (const row of rows) {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      if (!meta.ask || isHumanDecisionAsk(meta.ask)) continue;
+      this.cancelRequest(String(row.id), `Linked work ${row.parent_id} is ${row.parent_status}. No further agent coordination is needed.`, "system:coordination");
+    }
+  }
+
+  /** Machine-owned cancellation: the condition requiring a decision vanished.
+   * It records no human answer and never runs answer verb dispatch. */
+  private cancelRequest(id: string, reason: string, actor: string): void {
+    const row = this.one(`SELECT type, status, meta FROM artefacts WHERE id = ?`, id);
+    if (!row || row.type !== "question") return;
+    const meta = JSON.parse(String(row.meta ?? "{}"));
+    if (!meta.ask || askLifecycle({ status: String(row.status), meta }).state !== "open") return;
+    const now = Date.now();
+    meta.ask.resolution = { kind: "cancelled", reason, by: actor, ts: now };
+    delete meta.human_claimed;
+    this.state.storage.sql.exec(`UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), id);
+    this.version(id, actor, "transition", `request cancelled: ${reason}`, { from: row.status, to: "done", resolution: meta.ask.resolution });
+    this.audit(actor, "ask_cancelled", id, { reason });
+  }
+
+  /** Replay only the latest review round, completed after this submission.
+   * This repairs interrupted accept hooks without inventing a new verdict. */
+  private async reconcileCompletedReviews(): Promise<void> {
+    const rows = this.state.storage.sql.exec(`SELECT p.id AS parent_id, c.id, c.meta FROM artefacts p JOIN relations r ON r.dst_id = p.id AND r.relation = 'child_of' JOIN artefacts c ON c.id = r.src_id WHERE p.type = 'task' AND p.status = 'in_review' AND c.type = 'task' AND c.status = 'done' AND c.roles LIKE '%review%' AND c.status_ts >= p.status_ts AND NOT EXISTS (SELECT 1 FROM relations nr JOIN artefacts nc ON nc.id = nr.src_id WHERE nr.dst_id = p.id AND nr.relation = 'child_of' AND nc.roles LIKE '%review%' AND nc.created_ts > c.created_ts)`).toArray();
+    for (const row of rows) {
+      const result = JSON.parse(String(row.meta ?? "{}")).review_result;
+      const receipt = this.one(`SELECT actor, data FROM artefact_versions WHERE artefact_id = ? AND action = 'transition' AND json_extract(data, '$.to') = 'done' ORDER BY seq DESC LIMIT 1`, row.id);
+      if (!receipt) continue;
+      const note = String(JSON.parse(String(receipt.data ?? "{}")).note ?? "");
+      if (!result && !parseDirectCommitReceipt(note)) continue;
+      try {
+        await this.trainQueueOnAccept(String(row.parent_id), { note, review_result: result ? ReviewResultSchema.parse(result) : undefined }, String(receipt.actor));
+      } catch (e) {
+        this.audit("system:coordination", "review_reconcile_error", String(row.parent_id), { review: row.id, error: String(e) });
+      }
+    }
   }
 
   /**
@@ -6600,7 +6666,20 @@ export class KnowledgeHub {
   }
 
   private async askCreate(body: any, actor: string) {
-    const to = String(body.to ?? "any");
+    let to = String(body.to ?? (body.route?.kind === "human_decision" ? "human" : "any"));
+    const route = askRoute({ route: body.route, to });
+    if (route.kind === "independent_review") {
+      return this.ensureIndependentReview(route.task_id, actor);
+    }
+    if (route.kind === "executor_coordination") {
+      const target = this.one(`SELECT id, type FROM artefacts WHERE id = ?`, route.task_id);
+      if (!target || target.type !== "task") throw new Error(`executor coordination needs an existing task: ${route.task_id}`);
+      to = this.askRecipient({ route, to });
+    }
+    if (route.kind === "human_decision" && !isHumanDecisionAsk({ to })) {
+      throw new Error("human decisions must be addressed to human, ray or rayh; agent identities are not human recipients");
+    }
+    if (route.kind === "agent_coordination" && isHumanDecisionAsk({ to })) throw new Error("agent coordination must target an agent, task executor, capability or pool; use human_decision for an actual human choice");
     const question = String(body.question ?? "").trim();
     if (!question) throw new Error("question is required");
     // the question IS the ask — one answerable sentence ending in '?'.
@@ -6615,17 +6694,18 @@ export class KnowledgeHub {
     // which is exactly the unreadable-ask failure Ray bounced back. 1200 with
     // the narrative living in details below.)
     const reason = String(body.reason ?? "").trim().slice(0, 1200);
-    if (!reason && (to === "human" || to === "ray")) throw new Error("asks to a human must state why they are escalated instead of automatic (reason: '…')");
+    if (!reason && route.kind === "human_decision") throw new Error("asks to a human must state the specific decision or authority Bridge lacks (reason: '…'); assigning another agent is Bridge's responsibility");
     // PLAIN-READING BAR (2026-10-28, Ray directive): a human-directed ask must
     // be answerable on its own — what is this about, current state, why it
     // needs a human. details is that brief (rendered as markdown under the
     // question); without it an ask degrades to BR#-reference soup nobody can
     // act on. Agent-directed asks may stay light.
-    if ((to === "human" || to === "ray") && !details) {
+    if (route.kind === "human_decision" && !details) {
       throw new Error("human-directed asks require details: a self-contained brief (what this is about, current state, why it needs a human) — gloss every BR#/PR# reference in one clause instead of bare references");
     }
     if (!isValidAskTarget(to)) throw new Error(`invalid ask target '${to}'`);
     const artefactId = body.artefact_id ? String(body.artefact_id).trim() : "";
+    if (artefactId && !this.one(`SELECT id FROM artefacts WHERE id = ?`, artefactId)) throw new Error(`no such artefact: ${artefactId}`);
     // asks REQUIRE options: the human answers by clicking one of 2-4 buttons
     // (free-text refinement lives in the detail view). No options = rejected
     // at the contract, not a button-less ask the UI can't surface.
@@ -6652,20 +6732,20 @@ export class KnowledgeHub {
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
            AND c.type = 'question' AND c.title = ? LIMIT 1`,
-        artefactId, question.slice(0, 200),
+        artefactId, question,
       );
       if (dup) throw new Error(`an identical ask is already open: ${dup.id} — answer or reframe it instead of re-asking`);
     }
     const created = await this.create(
       {
         type: "question",
-        title: question.slice(0, 200),
+        title: question,
         // the artefact body must read whole even when details were skipped
         // (agent-directed asks): embed the reason so the detail view carries
         // the why, never just the bare question.
         body_md: details || (reason ? `${question}\n\nWHY ESCALATED: ${reason}` : question),
         owner: "",
-        meta: { ask: { to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
+        meta: { ask: { route, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
       },
       actor,
     );
@@ -6695,7 +6775,7 @@ export class KnowledgeHub {
           // (awaiting_ask?.ask_id === id → delete), the sweep's ask-resolution
           // cleanup and the reaper's annotation + loop-ask stamp.
           const sm = JSON.parse(row.meta ?? "{}");
-          sm.awaiting_ask = { ...(sm.awaiting_ask ?? {}), ask_id: id, ts: Date.now() };
+          sm.awaiting_ask = { ...(sm.awaiting_ask ?? {}), ask_id: id, route, to, ts: Date.now() };
           this.state.storage.sql.exec(
             `UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(sm), artefactId,
           );
@@ -6737,6 +6817,48 @@ export class KnowledgeHub {
     }
     this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
     return { id, ask: id, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
+  }
+
+  /** The same review pool used by in_review, never a human staffing question.
+   * Reuse the active round; already-complete work needs no second review. */
+  private readonly reviewRequests = new Map<string, Promise<IndependentReviewReceipt>>();
+  private async ensureIndependentReview(taskId: string, actor: string): Promise<IndependentReviewReceipt> {
+    const pending = this.reviewRequests.get(taskId);
+    if (pending) return pending;
+    const request = this.createIndependentReview(taskId, actor);
+    this.reviewRequests.set(taskId, request);
+    try { return await request; }
+    finally { this.reviewRequests.delete(taskId); }
+  }
+
+  private async createIndependentReview(taskId: string, actor: string): Promise<IndependentReviewReceipt> {
+    await this.reconcileCompletedReviews();
+    const parent = this.one(`SELECT * FROM artefacts WHERE id = ?`, taskId);
+    if (!parent || parent.type !== "task") throw new Error(`independent review requires an existing task: ${taskId}`);
+    if (parent.status === "done" || parent.status === "superseded") return { kind: "independent_review", task_id: taskId, id: taskId, status: "complete", message: "This work is already complete. No action is needed from you." };
+    if (parent.status !== "in_review") throw new Error("submit the implementation to in_review with delivery receipts first; Bridge automatically assigns an independent review");
+    const active = this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task' AND c.status IN ('todo','in_progress') AND c.roles LIKE '%review%' LIMIT 1`, taskId);
+    if (active) return { kind: "independent_review", task_id: taskId, id: active.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
+    const accepted = this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND c.status_ts >= ? AND json_extract(c.meta, '$.review_result.kind') = 'accepted_direct_main' ORDER BY c.created_ts DESC LIMIT 1`, taskId, parent.status_ts);
+    if (accepted) return { kind: "independent_review", task_id: taskId, id: String(accepted.id), status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
+    const meta = JSON.parse(parent.meta ?? "{}");
+    const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
+    const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: verifyDutyBody(taskId, parent.title, link), roles: ["review"], session: "" }, actor);
+    this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
+    this.audit(actor, "review_requested", taskId, { verify: review.id });
+    return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
+  }
+
+  private askRecipient(ask: { route?: unknown; to?: unknown }): string {
+    const route = askRoute(ask);
+    if (route.kind !== "executor_coordination") return String(ask.to ?? "any");
+    const task = this.one(`SELECT status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, route.task_id);
+    if (!task || task.status !== "in_progress" || !task.owner) return "any";
+    const meta = JSON.parse(String(task.meta ?? "{}"));
+    if (Date.now() - Number(task.updated_ts) > 10 * 60_000 && !this.holderIsAlive(meta, String(task.owner))) return "any";
+    const session = meta.session;
+    return `${this.canonLabel(this.displayOwner(String(task.owner)))}${session ? `@${session}` : ""}`;
   }
   // ---------- question human-claim hold (BR#3911) ----------
 
@@ -6839,9 +6961,9 @@ export class KnowledgeHub {
     // nodes are the inbox; open legacy rows are shown until the v2 migration
     // converts them (they then read status 'migrated' and vanish naturally)
     const nodes = this.state.storage.sql.exec(
-      `SELECT id, meta, created_ts FROM artefacts
+      `SELECT id, title, meta, created_ts FROM artefacts
        WHERE type = 'question' AND status IN ('todo','in_progress','blocked')
-       ORDER BY created_ts DESC LIMIT 50`,
+       ORDER BY created_ts DESC`,
     ).toArray() as any[];
     // BR#3578 follow-up (the cody inbox dump): the addressee filter used to
     // end in `|| true` (a debug leftover) — EVERY open ask landed in EVERY
@@ -6855,12 +6977,12 @@ export class KnowledgeHub {
     const inbox = nodes
       .map((n) => {
         const m = JSON.parse(n.meta ?? "{}");
-        if (!m.ask) return null;
+        if (!m.ask || isHumanDecisionAsk(m.ask)) return null;
         // BR#3911: a human has this question in hand — it leaves the agent
         // pool ("stop nudging"). The hold auto-expires; the sweep clears the
         // stamp and the question resurfaces here on its own.
         if (humanClaimLive(m, Date.now())) return null;
-        const out: any = { id: n.id, from_label: m.ask.from ?? "agent", to_target: m.ask.to ?? "any", question: n.title, created_ts: n.created_ts, node: true };
+        const out: any = { id: n.id, from_label: m.ask.from ?? "agent", to_target: this.askRecipient(m.ask), question: n.title, created_ts: n.created_ts, node: true };
         if (m.ask.reframe) out.reframe = m.ask.reframe;
         return out;
       })
@@ -6880,7 +7002,12 @@ export class KnowledgeHub {
        WHERE from_label = ? ORDER BY created_ts DESC LIMIT 50`,
       label,
     ).toArray();
-    return { inbox: [...inbox, ...open], sent };
+    const legacyInbox = open.filter((x) => x.to_target === "any" || x.to_target === label || String(x.to_target).startsWith(`${label}@`) || tags.some((t) => x.to_target === `tag:${t}`));
+    const nodeSent = this.state.storage.sql.exec(`SELECT id, title, status, meta, created_ts FROM artefacts WHERE type = 'question' AND json_extract(meta, '$.ask.from') = ? ORDER BY created_ts DESC LIMIT 50`, label).toArray().map((n) => {
+      const meta = JSON.parse(String(n.meta ?? "{}"));
+      return { id: n.id, to_target: this.askRecipient(meta.ask), question: n.title, status: askLifecycle({ status: String(n.status), meta }).state, answer: meta.ask.answer, answered_by: meta.ask.answered_by, created_ts: n.created_ts };
+    });
+    return { inbox: [...inbox, ...legacyInbox].slice(0, 50), sent: [...nodeSent, ...sent].sort((a, b) => Number(b.created_ts) - Number(a.created_ts)).slice(0, 50) };
   }
 
 
@@ -6960,7 +7087,8 @@ export class KnowledgeHub {
       const node = this.one(`SELECT id, status, meta, created_ts, title, body_md, project FROM artefacts WHERE id = ?`, id);
       if (!node) throw new Error(`no such ask: ${id}`);
       const m = JSON.parse(node.meta ?? "{}");
-      if (m.ask?.answer) throw new Error(`ask ${id} already answered`);
+      if (!m.ask) throw new Error(`${id} is not an ask`);
+      if (askLifecycle({ status: String(node.status), meta: m }).state !== "open") throw new Error(`ask ${id} is already resolved`);
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
       // BR#3911: an answer resolves a live human-claim hold — the timer is
       // cancelled by the very act the hold was waiting for.
@@ -7334,14 +7462,7 @@ export class KnowledgeHub {
         const roles: string[] = s.roles ?? [];
         return roles.length === 0 || roles.some((r: string) => tags.includes(`role:${r}`));
       });
-    const askPlaceholders = ["any", label, ...tags.map((t) => `tag:${t}`)];
-    const askMarks = askPlaceholders.map(() => "?").join(",");
-    const pendingAsks = this.state.storage.sql.exec(
-      `SELECT id, from_label, to_target, question, created_ts FROM asks
-       WHERE status = 'open' AND from_label != ? AND to_target IN (${askMarks})
-       ORDER BY created_ts DESC LIMIT 10`,
-      label, ...askPlaceholders,
-    ).toArray();
+    const pendingAsks = (await this.askInbox({ label, tags })).inbox.slice(0, 10);
     // decisions_awaiting_consensus (BR#903): proposed decisions with an open
     // feedback round — the actionable "review requested" signal the pool only
     // carried passively before. Ranked by recency, shaped like pending_asks:
@@ -10881,15 +11002,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       });
       if (ep.ask_id) {
         try {
-          await this.transition(
-            {
-              id: String(ep.ask_id),
-              to: "done",
-              session: "",
-              note: `auto-closed (BR#5883): the ${repo}@${base} lane's fresh base stamp no longer carries the gate-blocked qualifier — the repo merge gate now judges the tip green (or a louder red verdict owns the lane). The queue drains itself; the ask re-files automatically if the qualifier re-appears.`,
-            },
-            actor,
-          );
+          this.cancelRequest(String(ep.ask_id), `The merge gate for ${repo}@${base} no longer needs this decision. The queue drains automatically when healthy.`, actor);
           this.audit(actor, "train:gate_blocked_ask_closed", lane.id, { ask: String(ep.ask_id) });
         } catch (e) {
           this.audit(actor, "train:gate_blocked_ask_close_error", lane.id, { ask: String(ep.ask_id), error: String((e as Error).message ?? e).slice(0, 160) });
@@ -10944,15 +11057,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         });
         if (ep.ask_id) {
           try {
-            await this.transition(
-              {
-                id: String(ep.ask_id),
-                to: "done",
-                session: "",
-                note: `auto-closed (BR#6179): dark tip ${String(ep.sha ?? "").slice(0, 8)} on ${repo}@${base} is now ${deployCov ? deployCov.phase : String(baseState.verdict ?? "covered")} — deploy coverage restored or settling in flight.`,
-              },
-              actor,
-            );
+            this.cancelRequest(String(ep.ask_id), `Deployment for ${repo}@${base} has recovered or is running. No deployment decision is needed.`, actor);
             this.audit(actor, "train:dark_tip_ask_closed", lane.id, { ask: String(ep.ask_id) });
           } catch (e) {
             this.audit(actor, "train:dark_tip_ask_close_error", lane.id, { ask: String(ep.ask_id), error: String((e as Error).message ?? e).slice(0, 160) });
@@ -11056,12 +11161,36 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  one unbound leg fail-closes the queue. Bounce guards (defect 2): a
    *  verify close on an in_progress (bounced) card or a card blocked on a
    *  non-train reason never re-queues it. */
-  private async trainQueueOnAccept(parentId: string, src: { note?: string }, actor: string): Promise<void> {
+  private async trainQueueOnAccept(parentId: string, src: { note?: string; review_result?: ReviewResult }, actor: string): Promise<void> {
     const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
     const meta = JSON.parse(parent.meta ?? "{}");
     const blockedReason = () => [String(meta.blocked?.reason ?? ""), String(meta.blocked_reason ?? "")].find((r) => r) ?? "";
     const note = String(src.note ?? "");
+    if (src.review_result?.kind === "findings") return;
+    // A verifier's explicit accepted main-commit receipt supersedes historical
+    // PR metadata. Never infer acceptance from the implementer's receipts:
+    // cannot-proceed/findings closes must not silently deliver the parent.
+    const typedAccept = src.review_result?.kind === "accepted_direct_main" ? src.review_result : null;
+    // Compatibility adapter for historical verdicts; new reviews use the
+    // closed result above. A parent body alone is never an accepted verdict.
+    const legacyCommit = !src.review_result && /\b(?:VERIFY ACCEPT|VERIFIED|ACCEPTED)\b/i.test(note) && !/\b(?:BOUNCE|CANNOT PROCEED|REJECTED|CHANGES REQUESTED)\b/i.test(note) && /https:\/\/github\.com\/[^\s]+\/actions\/runs\/\d+/.test(note) ? parseDirectCommitReceipt(note) : null;
+    const acceptedCommit = typedAccept ? { sha: typedAccept.commit, repo: typedAccept.repo } : legacyCommit;
+    if (parent.status === "in_review" && acceptedCommit) {
+      await this.transition({ id: parentId, to: "done", session: "", note: `Verified direct-to-main commit ${acceptedCommit.sha}; ${note}` }, actor);
+      // Read the completed row again: terminal-transition cleanup owns its
+      // metadata. Never overwrite that cleanup with the pre-transition copy.
+      const completed = this.one(`SELECT meta FROM artefacts WHERE id = ?`, parentId);
+      const delivered = JSON.parse(String(completed?.meta ?? "{}"));
+      delete delivered.review_pr;
+      delete delivered.merge_train;
+      delete delivered.pr;
+      delete delivered.prs;
+      delivered.delivery = { kind: "direct_main", sha: acceptedCommit.sha, repo: acceptedCommit.repo ?? null };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(delivered), parentId);
+      this.audit("system:coordination", "direct_main_closed_on_accept", parentId, { sha: acceptedCommit.sha });
+      return;
+    }
     // the legs: the note's PR/Head pairs (one head after each PR — the multi-
     // PR convention), folded onto the existing stamp; without a note PR, the
     // existing stamp re-queues as-is; with neither, the card body is the last
@@ -11102,32 +11231,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       if (legs.length && loneHead) legs = legs.map((l, i) => (i === 0 ? { ...l, head_sha_at_acceptance: loneHead } : l));
     }
     if (!legs.length) {
-      // BR#5658 / AGENTS.md Rule 7: when a card landed direct to main (no PR,
-      // commit receipt cited in the close note, review note, or card body) and
-      // its Verify duty just closed done without bouncing the parent, the work
-      // is already on main and verified — transition the in_review parent
-      // straight to done instead of stranding it in_review or parking it on a
-      // phantom merge-train proxy.
-      if (parent.status === "in_review" && !/\bBOUNCE\b/i.test(note)) {
-        const directCommit =
-          parseDirectCommitReceipt(note) ??
-          parseDirectCommitReceipt(String(meta.review_note ?? "")) ??
-          parseDirectCommitReceipt(String(meta.last_progress?.note ?? "")) ??
-          parseDirectCommitReceipt(String(parent.body_md ?? ""));
-        if (directCommit) {
-          await this.transition(
-            {
-              id: parentId,
-              to: "done",
-              session: "",
-              note: `verified direct-to-main commit ${directCommit.sha.slice(0, 9)}${directCommit.repo ? ` (${directCommit.repo})` : ""} — closed on verify acceptance (Rule 7)`,
-            },
-            actor,
-          );
-          this.audit("system:merge-train", "direct_main_closed_on_accept", parentId, { sha: directCommit.sha, repo: directCommit.repo ?? null });
-          return;
-        }
-      }
       // not a PR card (or the verifier forgot the link) — nothing to queue
       this.audit("system:merge-train", "queue_skipped", parentId, { reason: "no PR reference in the close note, stamp, or card body" });
       return;
@@ -11370,7 +11473,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
        JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
          AND c.type = 'question' AND c.title = ? LIMIT 1`,
-      sinkId, askTitle.slice(0, 200),
+      sinkId, askTitle,
     ) as any;
     // BR#6390 (Ray 2026-11-05, from the BR#6382→BR#6385 churn): an ANSWERED
     // gate must not be re-minted before the executor acts on it. Two stamps
@@ -11400,7 +11503,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       warranted &&
       fix.curePr &&
       declinedStamp &&
-      String(declinedStamp.ask_title ?? "").slice(0, 200) === askTitle.slice(0, 200) &&
+      String(declinedStamp.ask_title ?? "") === askTitle &&
       Number(declinedStamp.pr ?? -1) === Number(fix.curePr.number) &&
       Date.now() - Number(declinedStamp.at ?? 0) < 24 * 3_600_000
     ) {
@@ -11410,15 +11513,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (!warranted) {
       if (existing) {
         try {
-          await this.transition(
-            {
-              id: String(existing.id),
-              to: "done",
-              session: "",
-              note: `auto-closed (BR#5631, 2026-11-03 ruling): no human-actionable act remains on this red episode — no cure PR bound and the fix path is not exhausted. The fix work lives on ${fix.card ? fix.card.id : "the root-fix card (auto-spawned)"} and the queue drains itself the moment main is green. The ask re-files automatically if a bypass decision (a bound cure PR) or an exhausted fix path re-arises.`,
-            },
-            actor,
-          );
+          this.cancelRequest(String(existing.id), "Bridge can continue fixing this failure automatically. No human decision remains.", actor);
           this.audit(actor, "train:base_red_ask_closed_unwarranted", lane.id, { ask: String(existing.id) });
         } catch (e) {
           this.audit(actor, "train:base_red_ask_close_error", lane.id, { ask: String(existing.id), error: String((e as Error).message ?? e).slice(0, 160) });
@@ -11579,7 +11674,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const freshAsk = this.one(
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
-        sinkId, askTitle.slice(0, 200),
+        sinkId, askTitle,
       ) as any;
       meta.lane.gate_blocked.ask_id = freshAsk?.id ? String(freshAsk.id) : meta.lane.gate_blocked.ask_id ?? null;
       meta.lane.gate_blocked.duty_id = ep.duty_id ?? meta.lane.gate_blocked.duty_id ?? null;
@@ -11630,7 +11725,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
          AND c.type = 'question' AND c.title = ? LIMIT 1`,
       sinkId,
-      askTitle.slice(0, 200),
+      askTitle,
     ) as any;
     if (existing) {
       const em = JSON.parse(existing.meta ?? "{}");
@@ -11668,7 +11763,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
          WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
         sinkId,
-        askTitle.slice(0, 200),
+        askTitle,
       ) as any;
       if (freshAsk?.id) ep.ask_id = String(freshAsk.id);
     }
@@ -11889,7 +11984,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question'
                AND c.status IN ('todo','in_progress','blocked') AND c.title = ? LIMIT 1`,
-            sinkId, askTitle.slice(0, 200),
+            sinkId, askTitle,
           ) as any;
           if (openAsk?.id) askId = String(openAsk.id);
         }

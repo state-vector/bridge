@@ -8,11 +8,47 @@
  */
 import { z } from "zod";
 
+/** Audience and lifecycle are explicit. Review is executable work, never a
+ * human decision disguised as an ask. Missing routes are legacy input only. */
+export const AskRouteSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("human_decision") }),
+  z.object({ kind: z.literal("agent_coordination") }),
+  z.object({ kind: z.literal("executor_coordination"), task_id: z.string().min(1) }),
+  z.object({ kind: z.literal("independent_review"), task_id: z.string().min(1) }),
+]);
+export type AskRoute = z.infer<typeof AskRouteSchema>;
+
+/** The artefact row is authoritative: progress is never an answer and
+ * terminal requests cannot be reopened by an escalation/presence timer. */
+export type AskLifecycle =
+  | { state: "open" }
+  | { state: "answered"; answer: string; by: string }
+  | { state: "cancelled"; reason: string }
+  | { state: "expired"; reason: string };
+export function askLifecycle(node: { status: string; meta?: { ask?: { answer?: string; answered_by?: string; resolution?: { kind?: string; reason?: string } } } }): AskLifecycle {
+  const ask = node.meta?.ask;
+  if (ask?.answer) return { state: "answered", answer: ask.answer, by: ask.answered_by ?? "unknown" };
+  if (node.status === "done" || node.status === "superseded") return { state: ask?.resolution?.kind === "expired" ? "expired" : "cancelled", reason: ask?.resolution?.reason ?? "The coordination request is no longer needed." };
+  return { state: "open" };
+}
+
+const HUMAN_TARGETS = new Set(["human", "ray", "rayh"]);
+export function askRoute(ask: { route?: unknown; to?: unknown }): AskRoute {
+  if (ask.route !== undefined) return AskRouteSchema.parse(ask.route);
+  // A coordinator's agent token is still an agent. Neither bare labels nor
+  // offline/escalated stamps confer human audience or authority.
+  return { kind: HUMAN_TARGETS.has(String(ask.to ?? "")) ? "human_decision" : "agent_coordination" };
+}
+export function isHumanDecisionAsk(ask: { route?: unknown; to?: unknown }): boolean {
+  return askRoute(ask).kind === "human_decision";
+}
+
 export const AskCreatePayloadSchema = z.looseObject({
+  route: AskRouteSchema.optional(),
   /** Agent label, label@session, tag:<capability>, "human", or "any". */
   to: z.string().optional(),
   /** THE ask itself — one answerable sentence, ≤240 chars. */
-  question: z.string().min(1).max(240),
+   question: z.string().min(1).max(240).optional(),
   /** WHY this is escalated instead of automatic (required for humans). */
   reason: z.string().optional(),
   /**

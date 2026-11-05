@@ -608,6 +608,34 @@ transition). Window: `question_claim_minutes` setting (default 10).
 
 ## The ask contract: asks are question nodes
 
+**Bridge coordinates agents; humans make decisions (BR#6455).** Requests have a
+closed `route` in `@bridge/contracts`, shared by the MCP door, hub and human UI:
+
+| Route | Resolution | Human attention |
+| --- | --- | --- |
+| `{kind:"human_decision"}` | Human chooses; specify the actual missing authority and plain-English context | For Me / Top asks |
+| `{kind:"agent_coordination"}` | Named peer, capability or agent pool answers | None |
+| `{kind:"executor_coordination",task_id:"BR#6395"}` | Current claim holder of that task answers; addressing follows claim changes | None |
+| `{kind:"independent_review",task_id:"BR#6395"}` | Bridge reuses or schedules a review task; no question/options needed | None |
+
+The authoritative question row projects `open → answered | cancelled | expired`.
+`answer_ask` records the answer and terminal status in one SQLite write; progress
+notes never answer a request, and an ordinary done transition is refused for asks.
+Resolved requests cannot be answered again or escalated by a timer. Cancellation
+records a reason without fabricating an answer or dispatching answer verbs.
+Linked peer coordination retires when its work completes. An accepted direct-main
+review records `{kind:"accepted_direct_main",repo,commit,ci_run_url}` in the review
+duty's `review_result`; `{kind:"findings",summary}` is explicitly not acceptance.
+The acceptance hook and alarm reconciliation close delivered work even when an old
+PR stamp remains; only the latest review round after the current submission is replayed.
+
+Write questions in plain English: user-visible outcome first, technical evidence
+second. Every option names who acts and the consequence. Questions are stored
+whole (up to 240 characters) and rendered whole, including in the detail header.
+For Me has no duplicate blanket GO action detached from the actual question.
+Legacy exact human targets (`human`, `ray`, `rayh`) adapt to human decisions;
+bare agent labels, coordinator tokens and offline stamps never imply human audience.
+
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
@@ -662,22 +690,12 @@ your pointer.
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
 
-**Asks to offline agents escalate to you (BR#3942).** An ask addressed to an agent identity
-that sits unanswered past `ask_escalation_minutes` (a setting, default 30, clamped 5–240)
-while that identity is offline — no direct token or gateway-dispatch edge seen in the last
-10 minutes, or never seen at all — is escalated by the watchdog to the human planes, as its
-own guarded phase of every alarm tick (BR#6202 — the step previously ran only when another
-sweep errored): the
-**same** ask node is stamped `escalated` (one re-route, never a duplicate ask), the ask band
-and For Me render an **ESCALATED — addressee offline** chip with the proof attached, and the
-row shows the addressee's presence (`offline · last seen Nm ago` / `never seen`) so a stalled
-card tells you who it is waiting on and whether that identity is even alive. The original
-options stay on the ask and answering it resumes the blocked subject as usual.
-Human-directed, open-floor (`any`), capability-tag and session-scoped (`agent@session`) asks
-never re-route. The dispatcher bootstrap teaches the companion law (rule 6d + PROTOCOL
-CARD): **verdict duties ask the authority, not the identity** — when a gated act's authority
-class is owner-agent-OR-human, the ask goes to the human at file time rather than waiting
-for the TTL rescue.
+**Offline agents are a delivery problem, not a human decision.** After
+`ask_escalation_minutes` (default 30, clamped 5–240), unanswered requests to unavailable
+bare agent identities return to the agent pool on the same node, with an audited recovery
+receipt and original options. Executor-relative requests resolve the current holder at
+delivery time. Human authority requests must address `human` from birth and explain the
+actual choice Bridge cannot make; they do not expire merely because the human is offline.
 
 **Human comments post from every web surface.** The comment boxes (task detail's
 "Comment / steer", the decision popover, discussion replies) all write to the card's
@@ -700,6 +718,9 @@ shared-checkout discipline (worktree off fresh origin/main, explicit-path stagin
 in_review, verify separation, human legs escalate to you. The button only copies text —
 it mutates no card state; if the clipboard API is unavailable the prompt opens in a
 fallback window instead, so it is never lost.
+Question cards instead copy a question-resolution prompt with explicit sender and
+recipient, current-state checking and review coordination instructions. They never copy
+the implementation claim/worktree/commit/PR protocol; questions are answered, not claimed.
 
 **Interactive claim takeover (BR#6135, amended BR#6436)** — the other half of the
 interactive loop, for cards already claimed: when a card's live claim is held by a

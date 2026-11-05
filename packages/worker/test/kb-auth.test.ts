@@ -157,9 +157,11 @@ describe("bootstrap composition", () => {
     // (ask-escalation.test.ts), but the protocol must teach filing-time
     // authority addressing, not timeout rescue.
     const b = composeBootstrap("My Project", DEFAULT_BOARD);
-    expect(b).toContain("6d. ASK THE AUTHORITY, NOT THE IDENTITY");
+    expect(b).toContain("6d. REQUEST ROUTING");
     expect(b).toContain("ask the authority, not the identity");
-    expect(b).toContain("the human sees the ask immediately");
+    expect(b).toContain('Human decisions use route {kind:"human_decision"}, to:"human"');
+    expect(b).toContain("Agent delivery failures return to the agent pool");
+    expect(b).toContain("progress is commentary, not an answer");
     // the mirrored clause in the delegated-subagent card
     expect(b).toMatch(/PROTOCOL CARD:.*Verdict duties ask the authority, not the identity.*BR#3942.*6\. FINISH/s);
   });

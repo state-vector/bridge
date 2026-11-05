@@ -12,6 +12,7 @@ export * from "./table.ts";
 export * from "./pairing.ts";
 export * from "./provision.ts";
 export * from "./ask.ts";
+export * from "./review.ts";
 export * from "./config.ts";
 export * from "./train.ts";
 export * from "./train-line.ts";

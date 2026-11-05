@@ -248,13 +248,13 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("get_history", { id: args.id, limit: args.limit }), null, 1)),
   },
   ask_agent: {
-    description: "Ask another agent or the human for insight/help/decisions. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), 'human', or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. OPTIONS ARE REQUIRED: give the human 2-8 one-click answers (e.g. [\"GO — merge now\", \"NO-GO — hold\"]) — they answer by clicking, and the ask is rejected without them. ASK QUALITY BAR (enforced): (1) if you recommend an option, make it FIRST and prefix it \"(Recommended)\" — the first button IS the recommendation; (2) human-directed asks REQUIRE details: a self-contained plain-reading brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected; (3) never cram the narrative into reason — question ≤240 chars, details carries the story, reason is the one-line why.",
+    description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
     schema: TOOL_ARG_SCHEMAS.ask_agent,
     handler: async (args, ctx) => {
-      const a = await ctx.call("ask.create", { to: args.to ?? "any", question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
+      const a = await ctx.call("ask.create", { route: args.route, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
       return text(JSON.stringify({
         ...a,
-        note: a.task_status === "blocked"
+        note: a.kind === "independent_review" ? a.message : a.task_status === "blocked"
           ? "your task is now blocked-on-decision (watchdog paused for it) and the ask is published in the Bridge app. check asks for the answer."
           : "they will see it on their next orient. check yours too.",
       }));

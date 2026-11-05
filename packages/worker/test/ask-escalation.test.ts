@@ -94,11 +94,14 @@ describe("ask TTL escalation (real DO)", () => {
     // the SAME node carries the escalation — no duplicate ask was minted
     const node = await kbJson("/get", { id: askId });
     expect(node.body.type).toBe("question");
-    const esc = node.body.meta?.ask?.escalated;
+    const esc = node.body.meta?.ask?.recovery;
     expect(esc).toBeTruthy();
     expect(esc.from_target).toBe("escal-ghost-agent");
     expect(esc.ttl_min).toBe(30); // the default TTL
-    expect(String(esc.reason)).toMatch(/offline/);
+    expect(String(esc.reason)).toMatch(/agent pool/);
+    expect(node.body.meta.ask.to).toBe("any");
+    expect(node.body.meta.ask.route.kind).toBe("agent_coordination");
+    expect(node.body.meta.ask.escalated).toBeUndefined();
     expect(node.body.meta.ask.options).toEqual(["RELEASE — back to the pool", "KEEP — keep it blocked"]);
     expect(node.body.status).toBe("todo"); // still the one open ask, re-routed not re-asked
 
@@ -106,13 +109,12 @@ describe("ask TTL escalation (real DO)", () => {
     const board = await kb("/board");
     const boardBody = await board.json();
     const row = (boardBody.tasks ?? []).find((x: any) => x.id === askId);
-    expect(row?.ask_target).toMatchObject({ online: false, last_seen_ts: null, source: "unknown" });
-    expect(row?.meta?.ask?.escalated).toBeTruthy();
+    expect(row?.meta?.ask?.recovery).toBeTruthy();
 
     // the escalation is audited + versioned (receipts, not side effects)
     const ev = await kb("/events?since=0&limit=500");
     const evBody = await ev.json();
-    const audited = (evBody.events ?? []).some((e: any) => e.op === "ask_escalated" && e.artefact_id === askId);
+    const audited = (evBody.events ?? []).some((e: any) => e.op === "ask_rerouted" && e.artefact_id === askId);
     expect(audited).toBe(true);
   });
 
@@ -154,14 +156,15 @@ describe("ask TTL escalation (real DO)", () => {
     const sweep = await kbJson("/admin.ask_escalation_sweep", { now: t0 + 34 * 60_000 });
     expect(sweep.body.escalated).not.toContain(String(human.body.id));
     expect(sweep.body.escalated).not.toContain(String(any.body.id));
-    expect(sweep.body.escalated).not.toContain(String(scoped.body.id));
+    expect(sweep.body.escalated).toContain(String(scoped.body.id));
+    expect((await kbJson("/get", { id: scoped.body.id })).body.meta.ask.to).toBe("any");
   });
 
   it("answering an escalated ask still dispatches — resume AND release-class answers both work (the BR#3822 hand-release, automated)", async () => {
     // the ghost ask from test 1 is bound to its blocked carrier task
     const board = await kb("/board");
     const boardBody = await board.json();
-    const askRow = (boardBody.tasks ?? []).find((x: any) => x.id && x.meta?.ask?.escalated);
+    const askRow = (boardBody.tasks ?? []).find((x: any) => x.id && x.meta?.ask?.recovery && x.meta.ask.artefact_id);
     expect(askRow).toBeTruthy();
 
     // generic rule-6 resume: a GO-class answer (no option-word hit) resumes

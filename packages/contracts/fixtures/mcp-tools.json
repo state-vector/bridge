@@ -11,11 +11,7 @@
     },
     {
       "name": "ask_agent",
-      "required": [
-        "question",
-        "options",
-        "reason"
-      ]
+      "required": []
     },
     {
       "name": "asks",

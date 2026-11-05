@@ -1358,6 +1358,8 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
 
   it("non-empty queue + no capable lease >10min ⇒ starved — `lane.starved` broadcast + red ask ONCE per episode", async () => {
     const repo = "state-vector/starve-lane";
+    const sink = (await kbJson("/create", { type: "task", title: "Starvation alarm sink", meta: { infra_anchor: true } })).body.id;
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: sink } });
     const a = await acquire(repo, "gw-cody", { merge_capable: true });
     expect(a.body.error ?? "").toBe("");
     const seeded = await laneSnap(repo);
@@ -3231,7 +3233,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       id: rev.verify_task,
       to: "done",
       session: "sess-direct-verify",
-      note: "VERIFY ACCEPT — commit 68ef20ed1e2797072411ac99bdfa832a39866b54 passed all checks on main",
+      note: "VERIFY ACCEPT — commit 68ef20ed1e2797072411ac99bdfa832a39866b54 passed all checks on main https://github.com/state-vector/bridge/actions/runs/123",
       actor: "verifier-agent",
     });
     const directAfter = (await kbJson("/get", { id: directCard.id })).body;

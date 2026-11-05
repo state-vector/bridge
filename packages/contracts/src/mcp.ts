@@ -15,6 +15,8 @@
  * generated surface against `fixtures/mcp-tools.json`.
  */
 import { z } from "zod";
+import { AskRouteSchema } from "./ask.ts";
+import { ReviewResultSchema } from "./review.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
@@ -108,6 +110,7 @@ export const TOOL_ARG_SCHEMAS = {
     roles: z.array(z.string()).optional(),
   }),
   transition: z.looseObject({
+    review_result: ReviewResultSchema.optional().describe("For a review duty closing done: accepted_direct_main carries verified commit and green CI receipts; findings is not acceptance. Prefer this typed result over prose."),
     id: z.string(),
     to: z.string(),
     note: z.string().optional(),
@@ -168,15 +171,16 @@ export const TOOL_ARG_SCHEMAS = {
     limit: z.number().int().max(200).optional(),
   }),
   ask_agent: z.looseObject({
+    route: AskRouteSchema.optional().describe("human_decision: a choice only the human can make; agent_coordination: peer assistance; independent_review with task_id: Bridge schedules/reuses a fresh review automatically, without asking the human"),
     to: z.string().optional(),
-    question: z.string().max(240),
+    question: z.string().max(240).optional().describe("Required for decisions and coordination; plain English, one complete question. Omit for independent_review work."),
     // one-line WHY escalated (≤1200); the narrative goes in details
-    reason: z.string(),
+    reason: z.string().optional(),
     // self-contained plain-reading brief — REQUIRED by the hub for
     // human-directed asks (what/why/current state; gloss BR#/PR# refs)
     details: z.string().optional(),
     // 2–8 one-click answers; recommended option FIRST, prefixed "(Recommended)"
-    options: z.array(z.string()).min(2).max(8),
+    options: z.array(z.string()).min(2).max(8).optional(),
     artefact_id: z.string().optional(),
     session: z.string().optional(),
   }),

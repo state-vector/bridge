@@ -136,6 +136,14 @@ export function isAwaitingMerge(t: { meta?: any }): boolean {
 
 /** The exit-class table — single source; exitClassOf returns entries from it. */
 export const EXIT_CLASSES: Record<string, ExitClass> = {
+  coordination: {
+    key: "coordination",
+    title: "Waiting for another agent",
+    icon: "◉",
+    unblockedBy: "Bridge (agent coordination)",
+    unblockedTone: "scope",
+    note: "Bridge is coordinating with another agent. No action is needed from you.",
+  },
   ask: {
     key: "ask",
     title: "Awaiting you — ask pending",
@@ -260,7 +268,7 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "time", "main", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed phase and await_event outrank prose. */
@@ -277,7 +285,7 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   // pr_merged await_event rides along on an Awaiting park, but the HUMAN
   // force-review owns the exit, not the proxy
   if (AWAITING_RX.test(reason)) return EXIT_CLASSES.awaiting;
-  if (ev === "ask" || m.awaiting_ask?.ask_id) return EXIT_CLASSES.ask;
+  if (ev === "ask" || m.awaiting_ask?.ask_id) return ["agent_coordination", "executor_coordination"].includes(m.awaiting_ask?.route?.kind) ? EXIT_CLASSES.coordination : EXIT_CLASSES.ask;
   // BR#6330 / BR#6395 — ONE classification: ONLY the typed merge_train phase
   // (queued|awaiting-ci) enters EXIT_CLASSES.merge ("Awaiting PR merge — train").
   // Non-train pr_merged / br_pr_merged waits (upstream PR dependencies with
