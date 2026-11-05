@@ -477,19 +477,26 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    base_red_resolution only while a non-green base holds cars, so it vanishes
    the moment main goes green. */
 .train-blocked-banner {
-  display: grid; gap: 3px; min-width: 0;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 24px; min-width: 0;
   border: 1px solid color-mix(in srgb, var(--red) 55%, var(--line));
   border-radius: 8px;
   background: color-mix(in srgb, var(--red) 10%, transparent);
-  color: var(--red);
-  padding: 7px 10px; margin: 2px 0 8px;
+  color: var(--text-dim);
+  padding: 12px 14px; margin: 0 0 8px 26px;
   font-size: 12px; line-height: 1.45;
 }
 .train-blocked-banner-amber {
   border-color: color-mix(in srgb, var(--amber) 55%, var(--line));
   background: color-mix(in srgb, var(--amber) 10%, transparent);
-  color: var(--amber);
 }
+.train-lane-group { min-width: 0; }
+.train-lane-interrupted > .train-row { border-bottom-color: transparent; }
+.train-banner-cause, .train-banner-recovery { display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.train-banner-cause > .train-banner-line:first-child { color: var(--red); }
+.train-blocked-banner-amber .train-banner-cause > .train-banner-line:first-child { color: var(--amber); }
+.train-banner-checks { font-size: 11px; }
+.train-banner-recovery details { font-size: 11px; }
+.train-banner-recovery details div { max-height: 160px; overflow: auto; white-space: pre-wrap; }
 .train-blocked-banner a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .train-blocked-banner .train-banner-line { min-width: 0; }
 .train-blocked-banner .train-banner-dim { opacity: 0.75; }
@@ -502,7 +509,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   word-break: break-word;
   opacity: 0.95;
 }
-.train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.train-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 12px; margin-bottom: 10px; }
 .train-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
 .train-lane {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -580,9 +587,70 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
 .train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
+/* ---------- BR#5658 (Ray 2026-11-03, v2): the verification colour law ----------
+   1. Per-lane PR stats: in progress (muted) · verifying (amber) · ready (green).
+   2. Backlog train: groups of verifying/ready PRs partitioned into sequential
+      merge batches (Batch 1 | Batch 2 | …), separated by .train-block-gap.
+   3. Block colour strictly denotes verification state (no red on awaiting per
+      BR#5476, no diagonal stripes):
+      - green solid (.tb-ready)     = ready (verified, mergeable)
+      - orange pulsing (.tb-verifying) = being verified right now
+      - orange solid (.tb-wait)     = waiting to be verified */
+.train-block-group { display: inline-flex; align-items: center; gap: 3px; }
+.tb-verifying { background: var(--amber, #d29a4b); animation: tb-pulse 1.6s ease-in-out infinite; }
+.tb-wait { background: var(--amber, #d29a4b); }
+@keyframes tb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.train-stats { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; max-width: 100%; overflow: hidden; font-size: 11.5px; }
+.train-stat { font-weight: 600; }
+.train-stat.ts-ip { color: var(--text-faint, #8b94a7); }
+.train-stat.ts-verifying { color: var(--amber, #d29a4b); }
+.train-stat.ts-ready { color: var(--green, #3fb26a); }
+.train-stat-sep { color: var(--text-faint, #8b94a7); opacity: 0.7; }
+
 /* ---------- dashboard ---------- */
-.dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
-.dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
+.dashboard { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0 22px; align-items: stretch; }
+.dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.dash-cell-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-height: 18px; }
+.dash-cell-head h3 { margin: 0; color: var(--text-dim); font-size: 11px; font-weight: 600; }
+.dash-cell-head .muted-note { font-size: 10px; }
+.dash-metric { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; color: var(--text); font-size: 24px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.dash-metric > span { color: var(--text-faint); font-size: 11px; font-weight: 400; }
+.dash-metric-word { font-size: 21px; }
+.dash-trend { min-width: 0; }
+.dash-chart { width: 100%; height: 64px; display: block; overflow: visible; }
+.dash-chart-grid { fill: none; stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.dash-chart-scale, .dash-chart-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--text-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.dash-chart-axis { margin-top: 3px; }
+.dash-caption { margin: auto 0 0; color: var(--text-faint); font-size: 10.5px; line-height: 1.5; }
+.dash-empty { min-height: 88px; display: flex; align-items: center; color: var(--text-faint); font-size: 11px; }
+.dashboard .sentiment-bar { height: 8px; width: 100%; max-width: none; flex: none; margin: 12px 0 4px; }
+.dash-legend { display: flex; flex-wrap: wrap; gap: 7px 12px; font-size: 10.5px; color: var(--text-dim); }
+.dash-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.dash-legend i { width: 6px; height: 6px; border-radius: 50%; }
+.dash-task-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 10px; margin: 0; }
+.dash-task-counts dt { color: var(--text-faint); font-size: 10.5px; }
+.dash-task-counts dd { margin: 4px 0 0; color: var(--text); font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dash-task-counts dd.bad { color: var(--red); }
+.top-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.top-section-title { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.top-section-title h2 { margin: 0; }
+.top-section-title .muted-note { line-height: 1.5; }
+@media (max-width: 1100px) {
+  .dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .train-blocked-banner { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 560px) {
+  .dashboard { grid-template-columns: minmax(0, 1fr); }
+  .train-blocked-banner { margin-left: 0; }
+}
+@media (max-width: 760px) {
+  .train-panel .train-head-cols { display: none; }
+  .train-panel .train-row { --cols: 18px minmax(0, 1fr); padding: 10px 4px; gap: 6px 8px; }
+  .train-panel .train-row > span { grid-column: 2; }
+  .train-panel .train-row > .trainc-dot { grid-column: 1; grid-row: 1; }
+  .train-panel .trainc-msg { white-space: normal; }
+  .train-panel .trainc-status { overflow: visible; }
+}
 .chart-svg { width: 100%; height: 28px; }
 .chart-bar.hot { fill: var(--accent); }
 .sentiment-word { text-transform: capitalize; }
@@ -835,10 +903,24 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-band-row:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 .ab-kind { display: flex; gap: 4px; align-items: center; }
 .ab-main { display: flex; flex-direction: column; min-width: 0; }
-.ab-title { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* BR#6390 (Ray 2026-11-05: "not small truncated text"): the ask title WRAPS
+   at a readable size — never nowrap/ellipsis. The full question is the UI. */
+.ab-title { font-size: 13px; font-weight: 650; line-height: 1.4; white-space: normal; overflow: visible; }
 .ab-prior { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 10px; margin-left: 8px; padding: 0; }
 .ab-prior:hover { color: var(--accent); }
 .ab-prior-line { font-size: 10px; color: var(--text-faint); margin-left: 2px; }
+/* BR#6390: the ask's full body_md rendered INLINE in the band row — readable
+   markdown (links, code blocks for merge commands), bounded so a huge brief
+   scrolls instead of eating the board. */
+.ask-band-body {
+  margin: 4px 0 2px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg-raised, #161d2b) 65%, transparent);
+  border: 1px solid var(--border, #232b3b);
+  border-radius: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
 /* BR#3942 — ask addressee presence: the dead-addressee warning reads at a glance */
 .ab-offline { color: var(--amber, #c77700); font-weight: 600; }
 .ab-meta { font-size: 10.5px; color: var(--text-faint); text-align: right; }
@@ -918,8 +1000,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* band rows hosting a vertical option list: let the row grow naturally */
 /* (column-fold hack removed — rows are column-flex, any content fits) */
 
-/* the why-escalated line: muted, italic, always second */
-.ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }
+/* the why-escalated line: muted, italic, always second — BR#6390: full text, no truncation */
+.ab-reason { font-size: 11px; color: var(--text, #dbe2ee); white-space: normal; }
 
 .ab-id { font-family: var(--mono, ui-monospace, monospace); font-size: 10px; color: var(--text-faint, #8b94a7); }
 
@@ -1167,13 +1249,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---- tag themes (BR#2983): tags are user-defined labels; the theme bar is
    the general-themes view (counts) + an AND filter shared by Top/Backlog ---- */
+.tag-theme-filter { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; flex-wrap: wrap; font-size: 11px; }
+.tag-theme-panel { position: relative; }
+.tag-theme-panel > summary { cursor: pointer; color: var(--text-dim); padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; user-select: none; }
+.tag-theme-options { position: absolute; z-index: 15; left: 0; top: calc(100% + 5px); width: min(380px, 85vw); box-sizing: border-box; padding: 12px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px #0005; }
+.top-section-head .tag-theme-options { left: auto; right: 0; }
+@media (max-width: 560px) { .top-section-head .tag-theme-options { left: 0; right: auto; } }
+.tag-theme-options > .muted-note { display: block; margin-bottom: 8px; }
+.tag-theme-selected-count { margin-left: 7px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.tag-theme-active { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
 .tag-theme-bar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
   padding: 4px 0 2px; margin-bottom: 6px;
-  border-bottom: 1px dashed var(--line);
 }
 .tag-theme-bar .tag-theme-label { margin-right: 4px; text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
-.tag-theme-chip { cursor: pointer; user-select: none; font-size: 11px; }
+.tag-theme-chip { cursor: pointer; user-select: none; font: inherit; font-size: 11px; border: 1px solid var(--line); border-radius: 5px; background: transparent; color: var(--text-dim); padding: 4px 7px; }
+.tag-theme-chip.tag-theme-selected { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .tag-theme-chip:hover { filter: brightness(1.2); }
 .tag-theme-n { opacity: .65; font-size: 10px; }
 .tag-theme-clear {
@@ -1189,12 +1280,18 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tag-chip { font-size: 10px; flex: none; }
 .tag-chip-more { font-size: 10px; flex: none; }
 
-/* optimistic answering (2026-10-24, Ray): a clicked accept/reject/option
-   INSTANTLY sinks the row to the bottom of its list, grays it out, and spins
-   until the server confirms (refresh drops it) or the call fails (the row
-   returns to place with the error). Never a silent no-op. */
+/* answering feedback (2026-10-24, Ray; revised BR#6390): a clicked
+   accept/reject/option grays the row IN PLACE — it never sinks to the bottom
+   (any click-time re-order was the "cards jump around / jump back under my
+   pointer" defect). It spins while in flight (ask-pending), then holds an
+   ANSWERED gray (ask-answered) until the refreshed board drops it. */
 .ask-band-row.ask-pending { opacity: .45; }
 .ask-band-row.ask-pending .ab-actions { pointer-events: none; }
+.ask-band-row.ask-answered { opacity: .5; }
+.ask-band-row.ask-answered .ab-actions { pointer-events: none; }
+/* For Me rows: same in-place law — ACTIONING gray while in flight, ANSWERED
+   gray after the call settles, both until the refetch confirms. */
+.forme-item.forme-answered { opacity: .5; }
 .ask-spinner {
   display: inline-block; width: 11px; height: 11px; border-radius: 50%;
   border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
@@ -1203,7 +1300,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 @keyframes ask-spin { to { transform: rotate(360deg); } }
 
-/* BR#3457 actioning affordance: a held card grays out while its decision is
-   in flight — pin-to-bottom comes from holdOrder, this is the visual half
-   (spinner chip + dead buttons ship in ForMeView). */
+/* BR#3457 actioning affordance (BR#6390: in-place, never pinned): a held
+   card grays out in its exact slot while its decision is in flight — the
+   spinner chip + dead buttons ship in ForMeView. */
 .forme-actioning { opacity: .6; transition: opacity .15s ease; }

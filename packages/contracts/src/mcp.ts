@@ -15,12 +15,17 @@
  * generated surface against `fixtures/mcp-tools.json`.
  */
 import { z } from "zod";
+import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
+import { ExecutionResultSchema } from "./work.ts";
+import { ReviewResultSchema } from "./review.ts";
+import { DeployObservationSchema } from "./train.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
   "answer_ask",
   "ask_agent",
   "asks",
+  "claim_takeover",
   "create_artefact",
   "get_artefact",
   "get_history",
@@ -47,6 +52,7 @@ export const TOOL_NAMES = [
   "train_queue_facts",
   "train_lease",
   "train_status",
+  "train_observe_deploy",
   "transition",
   "update_artefact",
 ] as const;
@@ -59,6 +65,7 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * Schema is what the fixture pins.
  */
 export const TOOL_ARG_SCHEMAS = {
+  train_observe_deploy: z.looseObject({ repo: z.string(), base: z.string().optional(), observation: DeployObservationSchema }),
   orient: z.looseObject({
     session: z
       .string()
@@ -71,6 +78,13 @@ export const TOOL_ARG_SCHEMAS = {
     limit: z.number().int().max(100).optional(),
   }),
   get_artefact: z.looseObject({ id: z.string() }),
+  claim_takeover: z.looseObject({
+    id: z.string(),
+    note: z.string().optional(),
+    session: z.string().optional(),
+  }).describe(
+    "Interactive claim takeover (BR#2997/BR#6135, amended BR#6436): the card's OWNER agent, a human via web, or an authenticated FULL-AGENT credential (your token's LIVE tags say full agent — gateway/cron credentials excluded; never body-declared) atomically re-takes an in_progress task claim held by a dispatched runner session — across owners. No release→pool→re-claim race. Status stays in_progress; meta.session flips to you; the ex-holder's next state-change is gate-rejected with a stand-down order (checkpoint last_will, exit). Refused on verify/unblock duty cards and cards holding a typed wait (train slot / await_event / bound ask). Credentials with no authority anchor: ask the human or coordinate via ask_agent.",
+  ),
   create_artefact: z.looseObject({
     type: z.string(),
     title: z.string().max(300),
@@ -88,11 +102,20 @@ export const TOOL_ARG_SCHEMAS = {
     id: z.string(),
     title: z.string().optional(),
     body_md: z.string().optional(),
+    /** BR#5807: per-key MERGE against the stored meta (omitted keys preserved,
+     *  present top-level keys replace wholesale) — not a whole-object replace. */
     meta: z.record(z.string(), z.unknown()).optional(),
+    /** Explicit key removal (the only way to drop a meta key now). Lane-card
+     *  infrastructure keys (lane/lease/currently/stop) and a parked card's
+     *  blocked (when it carries a typed await) refuse meta_delete from agent
+     *  sessions — machinery/human authority only, BR#5807. */
+    meta_delete: z.array(z.string()).optional(),
     tags: z.array(z.string()).optional(),
     roles: z.array(z.string()).optional(),
   }),
   transition: z.looseObject({
+    execution_result: ExecutionResultSchema.optional().describe("Execution tasks complete only after their actual outcome is achieved. Supply an outcome and per-action receipts; a prerequisite PR merge is not completion."),
+    review_result: ReviewResultSchema.optional().describe("For a review duty closing done: accepted_direct_main carries verified commit and green CI receipts; findings is not acceptance. Prefer this typed result over prose."),
     id: z.string(),
     to: z.string(),
     note: z.string().optional(),
@@ -104,6 +127,20 @@ export const TOOL_ARG_SCHEMAS = {
     class: z.enum(["subprocess"]).optional(),
     budget_minutes: z.number().int().max(1440).optional(),
     replacement_id: z.string().optional(),
+    session: z.string().optional(),
+    /** BR#6135 interactive claim takeover, amended BR#6436: with
+     *  to:"in_progress" and takeover:true the transition becomes a claim
+     *  re-take (owner/web-anchored, or a full-agent credential across
+     *  owners — same op as claim_takeover) instead of the (illegal)
+     *  in_progress→in_progress edge. */
+    takeover: z.boolean().optional(),
+    /** BR#6432 executor-applied batch SUPERSEDE authorization: with
+     *  to:"superseded" on a blocked task, carries the answered
+     *  authorization ask (batch_auth.ask, "BR#N"). The hub verifies the
+     *  human answer server-side, scopes the drop to the card ids the ask
+     *  names, rechecks the target's current state, and executes the drop
+     *  as system:question(<answered_by>) — the agent never writes it. */
+    batch_auth: z.object({ ask: z.string() }).loose().optional(),
   }),
   link_artefacts: z.looseObject({
     src: z.string(),
@@ -116,7 +153,10 @@ export const TOOL_ARG_SCHEMAS = {
     id: z.string(),
     limit: z.number().int().max(50).optional(),
   }),
-  session_alive: z.looseObject({ id: z.string() }),
+  session_alive: z.looseObject({
+    id: z.string(),
+    session: z.string().optional(),
+  }),
   log_progress: z.looseObject({
     id: z.string(),
     note: z.string(),
@@ -129,22 +169,26 @@ export const TOOL_ARG_SCHEMAS = {
     confidence_pct: z.number().int().min(0).max(100).optional(),
     risk_pct: z.number().int().min(0).max(100).optional(),
     context_pct: z.number().int().min(0).max(100).optional(),
+    session: z.string().optional(),
   }),
   get_history: z.looseObject({
     id: z.string(),
     limit: z.number().int().max(200).optional(),
   }),
   ask_agent: z.looseObject({
+    decision: HumanDecisionSchema.optional().describe("For a human decision: the affected task, concise context, the actual missing authority/information/preference, and choices with named executor, consequence and typed action. Machine investigation is not a human decision."),
+    route: AskRouteSchema.optional().describe("human_decision: a choice only the human can make; agent_coordination: peer assistance; independent_review with task_id: Bridge schedules/reuses a fresh review automatically, without asking the human"),
     to: z.string().optional(),
-    question: z.string().max(240),
+    question: z.string().max(240).optional().describe("Required for decisions and coordination; plain English, one complete question. Omit for independent_review work."),
     // one-line WHY escalated (≤1200); the narrative goes in details
-    reason: z.string(),
+    reason: z.string().optional(),
     // self-contained plain-reading brief — REQUIRED by the hub for
     // human-directed asks (what/why/current state; gloss BR#/PR# refs)
     details: z.string().optional(),
     // 2–8 one-click answers; recommended option FIRST, prefixed "(Recommended)"
-    options: z.array(z.string()).min(2).max(8),
+    options: z.array(z.string()).min(2).max(8).optional(),
     artefact_id: z.string().optional(),
+    session: z.string().optional(),
   }),
   asks: z.looseObject({}),
   answer_ask: z.looseObject({ id: z.string(), answer: z.string() }),

@@ -31,10 +31,23 @@ name: main-green gate
 
 on:
   pull_request:
+  # Manual re-check / red-green drills: judge an EXPLICIT historic sha
+  # (main_sha, with pr_sha for the remediation carve-out) to reproduce a
+  # historic episode without waiting for one.
+  #
+  # main_sha is REQUIRED on dispatch (BR#5487): a sha-less dispatch with
+  # --ref main runs on main's HEAD, attaches its own `main-green gate`
+  # check-run to that sha, and the script then finds itself in flight on the
+  # very commit it judges — UNSETTLED → exit 1, reding a green main (run
+  # 41391348652). Judging a historic sha breaks the self-reference: the
+  # check-run still lands on HEAD, but the judged commit is settled and
+  # independent. Never pass live HEAD. The composite action's drill guard is
+  # the in-run backstop for any API path that still slips a sha-less
+  # dispatch through.
   workflow_dispatch:
     inputs:
       main_sha:
-        description: "main HEAD sha to judge (REQUIRED for drills — a sha-less drill self-fails, BR#5487)"
+        description: "main sha to judge (REQUIRED — a historic, settled sha; never live HEAD)"
         required: true
       pr_sha:
         description: "PR head sha for the remediation carve-out (optional)"

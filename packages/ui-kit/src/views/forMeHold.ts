@@ -1,8 +1,10 @@
-/** For Me busy-hold (BR#3457): a decision being actioned must NOT vanish from
- *  the list mid-flight — the card jumps down to the bottom of its section with
- *  an "actioning…" chip and stays there until a refetch CONFIRMS the decision
- *  left `proposed`. Only then does it disappear. On error the hold drops and
- *  the card snaps back to its normal position with the error inline.
+/** For Me busy-hold (BR#3457, ordering revised BR#6390): a decision being
+ *  actioned must NOT vanish from the list mid-flight — the card STAYS in its
+ *  exact slot, grayed out with an "actioning…" chip, until a refetch
+ *  CONFIRMS the decision left `proposed`. Only then does it disappear. On
+ *  error the hold drops and the card shows the error inline, in place.
+ *  (BR#6390: the card no longer pins to the bottom — any click-time reorder
+ *  is the "cards jump around / jump back under my pointer" defect.)
  *
  *  This module is deliberately dependency-free (no react, no zustand, and a
  *  structural artefact type instead of the ui-kit's KbArtefact) so the
@@ -67,16 +69,15 @@ export function reconcileHold<T extends HoldArtefact>(held: HeldMap<T>, proposed
   return { held: changed ? next : held, confirmed };
 }
 
-/** Busy-hold ordering, the no-jump law: busy cards LAST (most recent click
- *  first among equals), everything else by created_ts descending. Stable —
- *  idle lists render in exactly the order they always did. */
-export function holdOrder<T extends HoldArtefact>(items: T[], held: HeldMap): T[] {
-  return items.slice().sort((a, b) => {
-    const ab = held.has(a.id) ? 1 : 0;
-    const bb = held.has(b.id) ? 1 : 0;
-    if (ab !== bb) return ab - bb;
-    return b.created_ts - a.created_ts;
-  });
+/** BR#6390 (Ray 2026-11-05: "cards jump around and sometimes jump back under
+ *  my pointer"): STABLE ordering — created_ts descending, ALWAYS. The old
+ *  busy-last pin moved the clicked card (and every card below it) at click
+ *  time and again when the hold dropped — both jumps are gone. A busy card
+ *  stays in its exact slot, grayed with its ACTIONING chip, until the
+ *  refetch confirms it left `proposed` (row unmounts) or the action failed
+ *  (hold drops, error shows, still in place). */
+export function holdOrder<T extends HoldArtefact>(items: T[], _held?: HeldMap): T[] {
+  return items.slice().sort((a, b) => b.created_ts - a.created_ts);
 }
 
 /** Held-only entries — cards the list no longer carries but we must keep
@@ -117,11 +118,8 @@ export function groupBusy(g: { latest: HoldArtefact; prior: HoldArtefact[] }, he
   return held.has(g.latest.id) || g.prior.some((d) => held.has(d.id));
 }
 
-/** holdOrder for verdict GROUP cards (the group is one card: busy last, then
- *  by the latest round's created_ts desc). */
-export function holdOrderGroups<T extends HoldArtefact>(cards: Array<{ latest: T; prior: T[] }>, held: HeldMap): Array<{ latest: T; prior: T[] }> {
-  return cards.slice().sort((a, b) =>
-    (groupBusy(a, held) ? 1 : 0) - (groupBusy(b, held) ? 1 : 0)
-    || b.latest.created_ts - a.latest.created_ts,
-  );
+/** holdOrder for verdict GROUP cards — BR#6390 stable law: created_ts desc on
+ *  the latest round; a busy group stays in its slot (grayed via groupBusy). */
+export function holdOrderGroups<T extends HoldArtefact>(cards: Array<{ latest: T; prior: T[] }>, _held?: HeldMap): Array<{ latest: T; prior: T[] }> {
+  return cards.slice().sort((a, b) => b.latest.created_ts - a.latest.created_ts);
 }

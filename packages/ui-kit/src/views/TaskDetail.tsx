@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md, AskOptions, askKernel } from "./decide";
+import { md, AskOptions, askOptionVariant } from "./decide";
+import { AskContext } from "./AskContext";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -264,6 +265,18 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#6135: the takeover click — the same in_progress door with takeover:true;
+  // the server verifies the web-session human anchor, flips holder+owner atomically.
+  const takeover = async () => {
+    setBusy(true);
+    try {
+      await kbApi.transition(task.id, "in_progress", { takeover: true, note: "interactive takeover — human took the live claim" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "takeover failed"); useKb.getState().reportError("claim takeover", e); } finally {
+      setBusy(false);
+    }
+  };
   // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
   // force-review — approve re-anchors the verdict at the parked head and
   // re-queues the train; request_changes bounces impl. No ask was filed;
@@ -365,6 +378,27 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
           <SupersedeBtn task={task as any} onChanged={onChanged} />
         </div>
       )}
+      {/* BR#6135: interactive claim takeover — a runner-held in_progress claim can
+          be flipped to the human in ONE atomic write (holder + owner move together,
+          no pool pass, the ex-holder is stood down by the next gate it hits). The
+          affordance targets the interactive loop's runner-held claims (BR#6159);
+          authority is still server-verified on click (owner/web anchor, BR#2673)
+          and any refusal renders inline — never a silent no-op. */}
+      {!m.blocked && task.type === "task" && task.status === "in_progress" && /^dispatch-/.test(String(m.session ?? "")) && (
+        <div className="task-blocked-info" style={{ marginBottom: 6 }}>
+          <div className="row" style={{ marginTop: 0 }}>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title="Take over the live claim: you become the holder and owner in one atomic write — the runner session is stood down (its next state change is refused). For interactive steering: the agent keeps its worktree and WIP; you drive the card from here."
+              onClick={() => void takeover()}
+            >Take over claim</Btn>
+            <span className="muted-note">
+              held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
+            </span>
+            {cardErr && <span className="k-err">{cardErr}</span>}
+          </div>
+        </div>
+      )}
       {((task.meta as TaskMeta | undefined)?.superseded_by || (task.meta as TaskMeta | undefined)?.superseded_reason) && (
         <div className="progress-note" title="supersede lineage (BR#3910) — the replacement link opens the successor card">
           <b>superseded</b>
@@ -385,7 +419,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
           {ask.options.length > 0 && (
             <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
               {ask.options.map((o) => (
-                <Btn key={o} size="sm" variant="accept" disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
+                <Btn key={o} size="sm" variant={askOptionVariant(o)} disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
               ))}
             </div>
           )}
@@ -494,7 +528,7 @@ function QuestionHoldBand({ task, onChanged }: { task: KbArtefact & { meta?: any
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
-function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
+function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const ask = task.meta?.ask ?? {};
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -523,12 +557,9 @@ function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: 
         <span className="gw-mono ab-id">{task.id}</span>
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
-      {ask.reason && (
-        <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
-      )}
-      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={onOpen} repo={task.meta?.provenance?.repo} /></div>
+      <AskContext body={task.body_md} ask={ask} />
       {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
+        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />
@@ -689,7 +720,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
         <h2 className="detail-question">
           {task && (task.meta as any)?.ask
-            ? <RefText text={askKernel(task.title)} onOpen={nav} />
+            ? <RefText text={task.title} onOpen={nav} />
             : <RefText text={task?.title ?? taskId} onOpen={nav} />}
         </h2>
 
@@ -902,4 +933,3 @@ function DepGraph({ selfId, selfTitle, relations, related, onOpen }: {
     </div>
   );
 }
-

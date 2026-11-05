@@ -148,4 +148,21 @@ describe("bootstrap composition", () => {
     // the mirrored clause in the delegated-subagent card
     expect(b).toMatch(/PROTOCOL CARD:.*9\. RETRY LAW/s);
   });
+
+  it("carries the authority routing law — verdict duties ask the authority, not the identity (BR#3942)", () => {
+    // BR#3930: a verdict ask addressed to an offline owner identity black-holed —
+    // Ray saw nothing in his band until he released the lane by hand. The law
+    // must ride in the bootstrap rules AND the PROTOCOL CARD (the only thing
+    // delegated subagents receive); the runtime backstop is escalateStaleAsks
+    // (ask-escalation.test.ts), but the protocol must teach filing-time
+    // authority addressing, not timeout rescue.
+    const b = composeBootstrap("My Project", DEFAULT_BOARD);
+    expect(b).toContain("6d. REQUEST ROUTING");
+    expect(b).toContain("ask the authority, not the identity");
+    expect(b).toContain('Human decisions use route {kind:"human_decision"}, to:"human"');
+    expect(b).toContain("Agent delivery failures return to the agent pool");
+    expect(b).toContain("progress is commentary, not an answer");
+    // the mirrored clause in the delegated-subagent card
+    expect(b).toMatch(/PROTOCOL CARD:.*Verdict duties ask the authority, not the identity.*BR#3942.*6\. FINISH/s);
+  });
 });

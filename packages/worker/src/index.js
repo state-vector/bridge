@@ -285,6 +285,12 @@ export default {
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        // BR#6135: a web-plane takeover names its holder — the taker's
+        // session is its web:<login> actor, so the holder flip (and with it
+        // the ex-holder stand-down and the idempotent re-click) engages on
+        // the DO (claim takeover is owner/web-anchored, BR#2673). Machine
+        // (bearer) transitions keep their own session semantics.
+        if (!auth.bearer && body.takeover === true && !body.session) body.session = body.actor;
         // do ops are dot-namespaced (ask.answer); the web plane uses snake_case.
         // web `progress` is DO `progress.log` (BR#3462 leg 1): the bare name has
         // no underscore so the dot-mapping passed it through and the DO 404'd

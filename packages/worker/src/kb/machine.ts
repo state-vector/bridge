@@ -14,6 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
+import { mergeCompletesTask, ExecutionResultSchema } from "@bridge/contracts";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -31,10 +32,16 @@ export function effectiveRole(roles: string[]): Role {
 
 export const VERDICT_ROLES: Role[] = ["review", "unblock"];
 
+// BR#6432: exported for the batch-auth application leg in do.ts — the same
+// human-principal test the answer dispatch's authority rests on.
 const HUMAN_ACTOR = /^web(:|$)|^human:/;
+export { HUMAN_ACTOR };
 // system actors (watchdog, churn-guard, separation) act ON claims — releases
-// they perform are the machinery working, not agents dumping each other's work
-const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
+// they perform are the machinery working, not agents dumping each other's work.
+// Exported for the BR#5807 meta-integrity guard (do.ts update): the same
+// human/machinery authority that protects lane cards from closing protects
+// their lane-config meta keys from meta_delete.
+export const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
 
 export interface RuleInput {
   id: string;
@@ -92,8 +99,10 @@ export interface Rule {
 const role = (i: RuleInput) => effectiveRole(i.roles ?? []);
 const isTask = (i: RuleInput) => i.type === "task";
 const noteOf = (i: RuleInput) => String(i.body?.note ?? i.body?.resolution ?? i.body?.reason ?? "").trim();
-const hasEvidenceLink = (s: string) => /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s);
-const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|merged|passed|unblocked|still blocked)\b/i.test(s);
+const hasEvidenceLink = (s: string) =>
+  /https?:\/\/\S+|(^|\s)PR[\s#:]/i.test(s) ||
+  /(?:^|[\s(—–-])(?:commit|landed(?:\s+direct(?:ly)?\s+to\s+main)?(?:\s+on\s+main)?(?:\s+as)?|main\s+commit)[\s#:@=/]+[0-9a-f]{7,40}\b/i.test(s);
+const hasReceipts = (s: string) => /https?:\/\/\S+|(^|\s)(PR|commit|merged|passed|unblocked|still blocked)\b/i.test(s);
 /** BR#4295: the receipts shape hasReceipts accepts — one source of truth for
  *  the guard's rejection text (so an agent obeying it verbatim passes on the
  *  retry, never flails: each rejection is a breach event) and for every
@@ -167,7 +176,7 @@ export const UNBLOCK_FLOOD_MS = 60 * 60_000;
  *  fragments, runs/issues pages of unknown repos, prose) is not a receipt the
  *  runner should clone. */
 export function isClonableRepoRef(url: string): boolean {
-  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/pull\/\d+)?\/?$/.test(url)
+  return /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/(?:pull\/\d+|commit\/[0-9a-f]{7,40}))?\/?$/.test(url)
     || /^https?:\/\/\S+\.git$/.test(url);
 }
 
@@ -188,6 +197,59 @@ export function prFromNote(note: string): string | null {
     if (isClonableRepoRef(url)) return url;
   }
   return null;
+}
+
+/** The GitHub PR(s) a card covers — BR#5874: the verify-round supersede has to
+ *  tell the parent's OWN verify duty from a disposition duty covering a
+ *  DIFFERENT PR, and auto-spawned verify duties carry NO meta.pr stamp (the
+ *  binding lives on the parent; the duty's PR surfaces in its body URL and
+ *  title). Resolution order per card:
+ *  1. meta.pr / meta.prs legs (repo+number — the authoritative binding),
+ *  2. canonical github.com owner/repo/pull/N URLs in the body,
+ *  3. "…slug PR #N" (or bare "PR #N") mentions in the title.
+ *  Empty array = no PR signal anywhere on the card. */
+export function prTargetsOf(row: { meta?: unknown; body_md?: unknown; title?: unknown } | null | undefined): { repo?: string; number: number }[] {
+  if (!row) return [];
+  const out: { repo?: string; number: number }[] = [];
+  const push = (t: { repo?: string; number: number }) => {
+    if (!Number.isInteger(t.number) || t.number <= 0) return;
+    if (out.some((x) => x.number === t.number && (x.repo ?? undefined) === (t.repo ?? undefined))) return;
+    out.push(t);
+  };
+  let m: any = {};
+  try { m = typeof row.meta === "string" ? JSON.parse(row.meta) : (row.meta ?? {}); } catch { m = {}; }
+  const bound = (leg: any) => {
+    const repo = String(leg?.repo ?? "");
+    return repo.includes("/") && Number.isInteger(Number(leg?.number)) ? { repo, number: Number(leg.number) } : null;
+  };
+  const direct = bound(m?.pr);
+  if (direct) push(direct);
+  if (Array.isArray(m?.prs)) for (const leg of m.prs) { const t = bound(leg); if (t) push(t); }
+  if (out.length) return out; // a meta binding wins — body/title only for unbound duties
+  const body = String(row.body_md ?? "");
+  for (const u of body.matchAll(/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/g)) push({ repo: `${u[1]}/${u[2]}`, number: Number(u[3]) });
+  if (out.length) return out;
+  const title = String(row.title ?? "");
+  for (const t of title.matchAll(/([\w.-]+)[/ ]PR #(\d+)/gi)) push({ repo: t[1], number: Number(t[2]) });
+  if (!out.length) {
+    const bare = title.match(/\bPR #(\d+)\b/i);
+    if (bare) push({ number: Number(bare[1]) });
+  }
+  return out;
+}
+
+/** Do two PR targets denote the same pull request? Numbers must be equal;
+ *  slugs compare case-insensitively, equal on the full slug OR the repo's
+ *  local segment (a title may carry the bare slug — "superpositional PR
+ *  #2329" vs the binding's "state-vector/superpositional"). A target with no
+ *  slug (bare "PR #N" in a title) matches on the number alone — PR numbers
+ *  are per-repo sequences, but a duty that names only a number under a parent
+ *  whose world is one repo is best read as naming that repo's PR. */
+export function prTargetMatch(a: { repo?: string; number: number } | null | undefined, b: { repo?: string; number: number } | null | undefined): boolean {
+  if (!a || !b || a.number !== b.number) return false;
+  if (!a.repo || !b.repo) return true;
+  const la = a.repo.toLowerCase(), lb = b.repo.toLowerCase();
+  return la === lb || la.split("/").pop() === lb.split("/").pop();
 }
 
 export type Effect =
@@ -318,6 +380,33 @@ export const RULES: Rule[] = [
       !i.body?.awaiting_ask_id, // an ask-gate pauses the duty; it auto-resumes on the answer
     guard: (i) =>
       `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
+  },
+  {
+    // BR#6135 interactive claim takeover — the stand-down half. A takeover
+    // atomically flips meta.session to the taker; the EX-holder (the
+    // dispatched runner session named in meta.taken_over.from_session) must
+    // not act on the card afterwards — its finish/bounce/state writes are
+    // the BR#3348 two-writers class. This rule makes the stand-down law
+    // ENFORCED, not advisory: any transition by the ex-holder's session
+    // while the new holder's claim is live is refused with a named order
+    // (checkpoint last_will via log_progress — which stays open, additive —
+    // then exit). Keyed on the SERVER-stamped taken_over record, never a
+    // client claim. The watchdog (system:watchdog) and web/human planes
+    // carry no session and are structurally unaffected; a pooled re-claim
+    // (todo → in_progress) restamps meta.session, ending the refusal for
+    // whoever legitimately re-claimed.
+    name: "takeover-stale-holder",
+    when: (i) =>
+      isTask(i) &&
+      i.status === "in_progress" &&
+      !!i.meta?.taken_over &&
+      !!i.body?.session &&
+      String(i.body.session) === String(i.meta.taken_over.from_session ?? "") &&
+      !!i.meta?.session &&
+      String(i.meta.session) !== String(i.body.session),
+    guard: (i) =>
+      `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. ` +
+      "STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish.",
   },
   {
     name: "release-needs-ownership",
@@ -471,7 +560,7 @@ export const RULES: Rule[] = [
     name: "review-needs-pr",
     when: (i) => isTask(i) && i.to === "in_review",
     guard: (i) =>
-      hasEvidenceLink(noteOf(i))
+      hasEvidenceLink(noteOf(i)) || (!mergeCompletesTask(i.meta ?? {}) && ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success)
         ? null
         : `moving to in_review requires the PR link in the note (you stay owner until the verdict — done requires review acceptance, not your call)`,
   },
@@ -643,11 +732,16 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     // the demote to a claimable todo destroys no queue slot; the train meta
     // rides along and the fresh accept re-queues. Keyed on the explicit body
     // flag the sweep sets + in_progress (a live re-entry, never a park) +
-    // state bounced — queued/awaiting-ci/awaiting stay protected even with a
-    // forged
+    // state bounced — queued/awaiting-ci stay protected even with a forged
     // flag, and so does a bounced card parked BLOCKED.
+    // BR#5750 — the carve-out widens to awaiting + stopped: an in_progress
+    // card is NEVER a live awaiting park (the human-leg park lives on
+    // blocked) nor a live stop-park; only the blocked parks stay protected,
+    // flag or no flag.
     const demoteReentry =
-      st === "bounced" && i.status === "in_progress" && i.body?.demote_bounced_reentry === true;
+      (st === "bounced" || st === "awaiting" || st === "stopped") &&
+      i.status === "in_progress" &&
+      i.body?.demote_bounced_reentry === true;
     if ((st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") && pr && !demoteReentry) {
       const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
       return {
@@ -1061,6 +1155,18 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // held, and unbounded refusal storms are fixed at the emitter.
   "release-holds-typed-await": "release:held-typed-await",
   "release-holds-train-queue": "release:held-train-queue",
+  // BR#6135 claim takeover (interactive claim interception): every takeover
+  // refusal is the ownership machinery working, never a breach —
+  // authority/target rejections join the claim_race family (BR#3429
+  // symmetry: a non-owner probing a takeover is the same observable as a
+  // non-owner probing a release), a held wait joins release_held (BR#4562
+  // symmetry), the verdict-duty refusal is the SoD gate (BR#2997), and the
+  // ex-holder stand-down rejection is the lost-claim race settling (5d).
+  "takeover-authority": "claim_race",
+  "takeover-target": "claim_race",
+  "takeover-held": "release_held",
+  "takeover-verdict-duty": "gate:separation",
+  "takeover-stale-holder": "claim_race",
 };
 
 export function breachClass(reason: string): string {
@@ -1076,6 +1182,17 @@ export function breachClass(reason: string): string {
   // `status 'x' is terminal for task`). Benign and self-healing: the loser
   // skips and the winner proceeds. Observable as claim_race, never a breach.
   if (r.includes("not allowed (allowed:") || r.includes("is terminal for")) return "claim_race";
+  // BR#6135 takeover refusals, tag-cut variant: the takeover messages
+  // interpolate ids/actors/principals, so a >300-char audit slice can cut
+  // the trailing [rule: takeover-*] tag (BR#4295 anchoring) — the ladder
+  // owns the structural shape then, folding to the same never-breach
+  // families the tag table uses (the BR#3611 lesson: match the structure,
+  // not a sentence literal). Verdict-duty needs no leg of its own — its
+  // text carries "separation of duties" and falls to gate:separation below.
+  if (r.includes("claim takeover applies to an in_progress task")) return "claim_race"; // takeover-target
+  if (r.includes("owner/web/human-anchored")) return "claim_race"; // takeover-authority
+  if (r.includes("was taken over by") || r.includes("you are the superseded holder")) return "claim_race"; // takeover-stale-holder
+  if (r.includes("the wait owns the exit, not the executor")) return "release_held"; // takeover-held
   // BR#3429: ownership-gate rejections are claim races too — a non-owner
   // (dispatched session vs runner-held claim) tried to release a claimed
   // card. The gate refuses, the loser skips, the owner/human decides.

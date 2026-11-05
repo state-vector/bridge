@@ -11,15 +11,17 @@
     },
     {
       "name": "ask_agent",
-      "required": [
-        "question",
-        "options",
-        "reason"
-      ]
+      "required": []
     },
     {
       "name": "asks",
       "required": []
+    },
+    {
+      "name": "claim_takeover",
+      "required": [
+        "id"
+      ]
     },
     {
       "name": "create_artefact",
@@ -174,6 +176,10 @@
     {
       "name": "train_status",
       "required": []
+    },
+    {
+      "name": "train_observe_deploy",
+      "required": ["repo", "observation"]
     },
     {
       "name": "transition",

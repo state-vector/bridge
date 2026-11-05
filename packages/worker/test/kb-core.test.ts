@@ -208,7 +208,7 @@ import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from
 const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
   reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
-  artefacts_created: 0, verify_duty_backlog: 0,
+  artefacts_created: 0, verify_duty_backlog: 0, train_red: 0,
 };
 
 describe("role playbook resolution (settings.roles overrides)", () => {
@@ -265,6 +265,15 @@ describe("agent behaviour score", () => {
     const mixed = scoreAgent({ ...zero, result_lost: 2, abandoned: 1 });
     expect(mixed.score).toBe(40);
     expect(mixed.hints.join(" ")).toMatch(/watchdog-blocked/);
+  });
+
+  it("BR#5517: a train_red ding costs 5 per episode, capped at 15, with the exoneration hint", () => {
+    const one = scoreAgent({ ...zero, train_red: 1 });
+    expect(one.score).toBe(45);
+    expect(one.hints.join(" ")).toMatch(/stop-the-line episode/);
+    const many = scoreAgent({ ...zero, train_red: 5 });
+    expect(many.score).toBe(35); // min(15, 5×5) — capped, one bad night ≠ zero
+    expect(many.hints.join(" ")).toMatch(/5 stop-the-line episode/);
   });
 });
 
@@ -478,7 +487,7 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
   });
 });
 
-import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
+import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS, mergeTrainHoldPrefix, isWatchdogTrainHoldPark } from "../src/kb/core.ts";
 
 // BR#4067 — the typed-proxy hold predicate: every watchdog release path
 // consults this one function. The PR #257/BR#4015 class: a card carrying a
@@ -528,6 +537,46 @@ describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
 
   it("the hold result-class is the abandonment-scoring exemption stamp", () => {
     expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+  });
+});
+
+// BR#5750 — the queue-preserving park prefix: mergeTrainQueue admits cars by
+// the merge-train: reason prefix alone, so a watchdog hold-park of a
+// queued/awaiting-ci car whose note lacks the prefix silently dropped the
+// live queue slot out of the train queue forever (the BR#4995 class,
+// root-caused from the BR#5674 Mission 2 audit).
+describe("mergeTrainHoldPrefix + isWatchdogTrainHoldPark (BR#5750)", () => {
+  it("live-slot states get the state-named merge-train prefix; every other hold stays unprefixed", () => {
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "queued" } })).toBe("merge-train: queued — ");
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "awaiting-ci" } })).toBe("merge-train: awaiting-ci — ");
+    // bounced/awaiting are NOT queue slots — their legs re-enter through the
+    // board (fresh verify accept), never the queue
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" } })).toBeNull();
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge" } })).toBeNull();
+    expect(mergeTrainHoldPrefix(null)).toBeNull();
+    expect(mergeTrainHoldPrefix({})).toBeNull();
+  });
+
+  it("legacy watchdog hold-parks of queued cars are recognised on their park facts (the already-dropped BR#4995 cars)", () => {
+    const park = { merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" } };
+    expect(isWatchdogTrainHoldPark({
+      ...park,
+      blocked: { reason: "silence-release held (watchdog): no update for >10m, but the card carries merge-train queued on PR state-vector/bridge#259 — parked on the typed proxy, not released (BR#4067)" },
+    })).toBe(true);
+    expect(isWatchdogTrainHoldPark({
+      ...park,
+      blocked_reason: "declared subprocess window (45m) lapsed, but the card carries merge-train queued on PR state-vector/bridge#259 — release held (BR#4067)",
+    })).toBe(true);
+  });
+
+  it("non-queued states and non-hold reasons are never admitted by the legacy detector", () => {
+    const hold = "silence-release held (watchdog): no update for >10m — parked on the typed proxy, not released (BR#4067)";
+    for (const state of ["awaiting-ci", "bounced", "awaiting", "stopped", "landed", ""]) {
+      expect(isWatchdogTrainHoldPark({ merge_train: { state }, blocked: { reason: hold } })).toBe(false);
+    }
+    expect(isWatchdogTrainHoldPark({ merge_train: { state: "queued" }, blocked: { reason: "blocked on a human ruling" } })).toBe(false);
+    expect(isWatchdogTrainHoldPark({ merge_train: { state: "queued" } })).toBe(false);
+    expect(isWatchdogTrainHoldPark(null)).toBe(false);
   });
 });
 

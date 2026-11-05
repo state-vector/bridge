@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, exitClassOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, exitClassOf, blockedSummaryOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
@@ -41,6 +41,8 @@ interface BlGroup {
   showRank: boolean;
   showBoost: boolean;
   icon?: string;
+  unblockedBy?: string;
+  unblockedTone?: "urgent" | "warn" | "scope";
 }
 
 export function BacklogView({ openTask }: { openTask?: (id: string) => void } = {}) {
@@ -81,6 +83,9 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     const byExit = new Map<string, any[]>();
     for (const t of ts) {
       if (t.status !== "blocked" && t.status !== "in_review") continue;
+      // Standing merge-lane cards and infra anchors belong to the Trains panel /
+      // infra sinks, not the task backlog (BR#6395).
+      if (t.meta?.lane?.key || t.meta?.infra_anchor) continue;
       const cls = exitClassOf(t);
       const list = byExit.get(cls.key) ?? [];
       list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
@@ -95,7 +100,17 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       const rows = byExit.get(key) ?? [];
       if (rows.length === 0) continue;
       const cls = EXIT_CLASSES[key];
-      exitGroups.push({ key, title: cls.title, note: cls.note, icon: cls.icon, rows, showRank: false, showBoost: false });
+      exitGroups.push({
+        key,
+        title: cls.title,
+        note: cls.note,
+        icon: cls.icon,
+        unblockedBy: cls.unblockedBy,
+        unblockedTone: cls.unblockedTone,
+        rows,
+        showRank: false,
+        showBoost: false,
+      });
     }
 
     return [
@@ -187,6 +202,11 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
         <div key={g.key} className="backlog-group">
           <div className="view-head backlog-group-head">
             <h2>{g.title}</h2>
+            {g.unblockedBy && (
+              <Chip tone={g.unblockedTone ?? "scope"} title="who or what unblocks cards in this section">
+                unblocked by: {g.unblockedBy}
+              </Chip>
+            )}
             <span className="muted-note">{g.rows.length} · {g.note}</span>
             {g.key === "timeout" && g.rows.length > 0 && (
               <Btn
@@ -205,6 +225,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
               const rank = r.rank;
               const boosted = !!r.boosted;
               const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
+              const bs = (t.status === "blocked" || t.status === "in_review") ? blockedSummaryOf(t) : null;
               return (
                 <div
                   key={t.id}
@@ -212,21 +233,19 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                   onClick={() => openDetails(t.id)}
                 >
                   <span className="backlog-rank" title={`pickup rank: ${r.why ?? parkedReason(t)}`}>
-                    {boosted ? "▲" : g.showRank ? rank + 1 : g.key === "human" ? "⚑" : g.key === "awaiting" ? "◉" : g.key === "verify" ? "✓" : g.key === "unblocking" ? "↻" : g.key === "timeout" ? "⏱" : "▪"}
+                    {boosted ? "▲" : g.showRank ? rank + 1 : g.icon ?? "▪"}
                   </span>
                   <span className="backlog-id">{t.id}</span>
                   <span className="backlog-main">
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
                     <TagChips tags={t.tags} />
-                    {t.status === "blocked" && (t.meta?.blocked?.unblock_condition || t.meta?.awaiting_ask?.ask_id) && (
+                    {bs && (
                       <span className="backlog-why">
-                        {t.meta?.awaiting_ask?.ask_id
-                          ? <><Chip tone="urgent">ask</Chip> {t.meta.awaiting_ask.ask_id}</>
-                          : <><Chip tone="scope">exit</Chip> {(t.meta.blocked.unblock_condition ?? "").slice(0, 90)}</>}
+                        <Chip tone={bs.unblockedTone}>{bs.whatUnblocks}</Chip>{" "}
+                        {bs.whyBlocked}
                       </span>
                     )}
-                    {t.status === "in_review" && <span className="backlog-why"><Chip tone="warn">verify</Chip> awaiting a fresh verify session</span>}
                     {t.type === "question" && (t.meta?.human_claimed?.expires_ts ?? 0) > Date.now() && (
                       <span className="backlog-why">
                         <Chip tone="scope" title={`${t.meta.human_claimed.by || "a human"} claimed this question — it leaves the agent pool and auto-reopens when the hold expires`}>

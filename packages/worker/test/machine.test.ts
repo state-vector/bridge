@@ -17,6 +17,8 @@ import {
   SILENT_REDIRECT_CYCLES,
   blockedParkVerdict,
   UNBLOCK_SPAWN_CAP,
+  prTargetsOf,
+  prTargetMatch,
   type RuleCtx,
   type RuleInput,
   type Applied,
@@ -481,6 +483,7 @@ describe("loop regressions", () => {
         "review-needs-pr",
         "review-separation-of-duties",
         "supersede-authority",
+        "takeover-stale-holder",
         "unblock-needs-resolution",
         "verdict-done-needs-receipts",
         "verdict-no-blocked",
@@ -503,6 +506,34 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "agent-x" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "web:ray" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
+  });
+
+  it("BR#6135: a taken-over (superseded) holder is refused on its next state change — stand down, not race", async () => {
+    const takenOver = {
+      status: "in_progress" as const,
+      to: "in_review" as const,
+      owner: "opencode-ray",
+      actor: "opencode-ray",
+      meta: {
+        session: "ray-local-1",
+        taken_over: { from_session: "bridge-task-BR-1", to_session: "ray-local-1", by: "opencode-ray", at: 1, reason: "test" },
+      },
+      body: { session: "bridge-task-BR-1", note: "PR https://example.com/1" },
+    };
+    const v = await decide(input(takenOver), baseCtx());
+    expect(v.ok).toBe(false);
+    if (v.ok === false) {
+      expect(v.code).toBe("guard-failed");
+      expect(v.rule).toBe("takeover-stale-holder");
+      expect(v.message).toContain("STAND DOWN");
+    }
+    // the NEW holder is unaffected
+    expect((await decide(input({ ...takenOver, body: { session: "ray-local-1", note: "PR https://example.com/2" } }), baseCtx())).ok).toBe(true);
+    // a session-less actor (watchdog/web) is structurally exempt — the
+    // watchdog must keep its release path through a takeover
+    expect((await decide(input({ ...takenOver, to: "todo", actor: "system:watchdog", body: {} }), baseCtx())).ok).toBe(true);
+    // the refusal dies once the card is pooled (todo → claim restamps session)
+    expect((await decide(input({ ...takenOver, status: "todo", to: "in_progress", body: { session: "bridge-task-BR-1" } }), baseCtx())).ok).toBe(true);
   });
 
   it("BR#5151: infrastructure close-protection no longer exempts the owner's own actor", async () => {
@@ -1395,6 +1426,51 @@ describe("claim-race classification (BR#3337)", () => {
     ]);
   });
 
+  // BR#6135: interactive claim takeover — every takeover refusal is the
+  // ownership machinery working, never a breach. The audited reason ends in
+  // its [rule: takeover-*] tag (do.ts trims messages to keep the tag inside
+  // the 300-char slice, BR#4295 anchoring), and RULE_BREACH_CLASSES folds
+  // each tag: authority/target/stale-holder → claim_race (BR#3429
+  // symmetry), held → release_held (BR#4562 symmetry), verdict-duty →
+  // gate:separation (SoD is not transferable). Message texts mirror
+  // takeover.ts / machine.ts verbatim — wording edits must land together
+  // with these pins (the BR#3611 specimen lesson).
+  it("takeover refusal tags classify without raising breach cards (BR#6135)", () => {
+    expect(breachClass("claim takeover of BR#6135A is owner/web/human-anchored or full-agent-credentialed (BR#2673: authority is server-verified, never self-declared; BR#6436: a full authenticated agent token — not gateway, not cron — may pull rank across owners) — you are random-agent and the card is held by dispatch-BR-1. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane). [rule: takeover-authority]")).toBe("claim_race");
+    expect(breachClass("claim takeover applies to an in_progress task — BR#6135A is a todo task. A todo card is claimed normally (claim = todo → in_progress); a blocked card is released/unblocked through its typed wait; an in_review card is bounced or closed through review. [rule: takeover-target]")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135A was taken over by web:rayh (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder]")).toBe("claim_race");
+    expect(breachClass("BR#6135A is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg. [rule: takeover-held]")).toBe("release_held");
+    expect(breachClass("BR#6135A is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over. [rule: takeover-verdict-duty]")).toBe("gate:separation");
+    // tag-cut variants: the audit slice truncates at 300 chars and the
+    // long takeover messages interpolate ids/actors/principals, so the
+    // ladder must own the structural shape too (BR#4295/BR#3611) — same
+    // families, tag or no tag:
+    expect(breachClass("claim takeover of BR#6135C is owner/web/human-anchored or full-agent-credentialed (BR#2673: authority is server-verified, never self-declared; BR#6436: a full authenticated agent token — not gateway, not cron — may pull rank across owners) — you are a-very-long-actor-label-at-the-limit-of-the-schema-field and the card is held by p_a_long_principal_identifier_from_the_auth_tokens_table. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane).")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135D was taken over by web:rayh (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder] (this tail would be cut past 300 chars in a real audit)".slice(0, 300))).toBe("claim_race");
+    expect(breachClass("BR#6135E is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg.".padEnd(301, " x"))).toBe("release_held");
+    expect(breachClass("BR#6135F is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over.".padEnd(301, " y"))).toBe("gate:separation");
+    // the audit shape: a refusal storm on one card folds to claim_race and
+    // raises nothing; a genuine gate refusal on the same card is untouched
+    const takeoverEvents = (n: number, task = "BR#6135A") =>
+      Array.from({ length: n }, (_, i) => ({
+        ts: 1_000_000 + i * 60_000,
+        task,
+        op: "transition_rejected",
+        reason: `takeover needs an owner/web/human-anchored or full-agent-credentialed taker — bearer 'random-agent' is neither; the holder keeps the claim. [rule: takeover-authority]`,
+      }));
+    expect(detectBreaches(takeoverEvents(9), new Set())).toHaveLength(0);
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#6135B",
+      op: "transition_rejected",
+      reason: "task BR#6135B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const mixed = [...takeoverEvents(5, "BR#6135B"), ...genuine];
+    expect(detectBreaches(mixed, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
+  });
+
   it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
     const genuine = [0, 1, 2].map((n) => ({
       ts: 1_000_000 + n * 60_000,
@@ -1664,6 +1740,36 @@ describe("release-holds-train-queue (BR#4067)", () => {
       body: { note: "forged flag", demote_bounced_reentry: true },
     }), baseCtx());
     expect(awaiting).toMatch(/merge-train awaiting-ci/);
+  });
+
+  // BR#5750 — the carve-out widens to awaiting + stopped: an in_progress
+  // card is never a live awaiting park (that park lives on blocked) nor a
+  // live stop-park; the stranded re-entry demotes exactly like bounced. The
+  // BLOCKED parks of both stay protected, flag or no flag.
+  it("BR#5750 carve-out: the sweep's demote of a stranded in_progress awaiting/stopped re-entry passes — flag + in_progress", async () => {
+    for (const state of ["awaiting", "stopped"]) {
+      const reentry = {
+        merge_train: { state, pr: 259, repo: "state-vector/bridge", ...(state === "awaiting" ? { awaiting: { at: 1 } } : {}) },
+        pr: { repo: "state-vector/bridge", number: 259 },
+      };
+      const msg = await check(input({
+        status: "in_progress", to: "todo", actor: "system:watchdog", meta: reentry as any,
+        body: { note: "bounce re-entry demoted (watchdog, BR#4494/BR#5750)", demote_bounced_reentry: true },
+      }), baseCtx());
+      expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+    }
+  });
+
+  it("BR#5750 carve-out stays narrow: an AWAITING card parked BLOCKED stays held even with the flag", async () => {
+    const parked = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: {
+        merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge", awaiting: { at: 1 } },
+        pr: { repo: "state-vector/bridge", number: 259 },
+      } as any,
+      body: { note: "forged flag", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(parked).toMatch(/merge-train awaiting/);
   });
 
   it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
@@ -2066,5 +2172,64 @@ describe("blockedParkVerdict (BR#2893)", () => {
   it("the spawner cap is a real, exported constant", () => {
     expect(UNBLOCK_SPAWN_CAP).toBeGreaterThanOrEqual(2);
     expect(Number.isInteger(UNBLOCK_SPAWN_CAP)).toBe(true);
+  });
+});
+
+// ---- BR#5874: PR-target resolution + same-round matching -----------------
+// The verify-round supersede must tell the parent's OWN duty (round for the
+// deliverable PR) from a disposition duty covering a DIFFERENT PR. Duties
+// carry no meta.pr — their PR surfaces in the body URL or the title.
+describe("prTargetsOf / prTargetMatch (BR#5874)", () => {
+  it("meta.pr / meta.prs bindings win over body and title", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ pr: { repo: "state-vector/superpositional", number: 2573 }, prs: [{ repo: "state-vector/superpositional", number: 2573 }, { repo: "state-vector/bridge", number: 300 }] }),
+      body_md: "see https://github.com/other/repo/pull/999",
+      title: "Verify: something PR #1",
+    });
+    expect(t).toEqual([
+      { repo: "state-vector/superpositional", number: 2573 },
+      { repo: "state-vector/bridge", number: 300 },
+    ]);
+  });
+
+  it("an unbound duty resolves from the body's canonical pull URL (the auto-spawn prLink)", () => {
+    // BR#5735 shape: no meta.pr; the spawn template wrote the parent's PR URL into the body
+    const t = prTargetsOf({
+      meta: JSON.stringify({ superseded_reason: "x" }),
+      body_md: "Receipts: https://github.com/state-vector/superpositional/pull/2573, merge state...",
+      title: "Verify: Backlog disposition",
+    });
+    expect(t).toEqual([{ repo: "state-vector/superpositional", number: 2573 }]);
+  });
+
+  it("an unbound duty with no body URL resolves from the title's 'slug PR #N' (BR#5746 shape)", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ session: "dispatch-BR-5746" }),
+      body_md: "no urls here",
+      title: "Verify: superpositional PR #2329 — canary: judge chat CONVERSATION answer shape",
+    });
+    expect(t).toEqual([{ repo: "superpositional", number: 2329 }]);
+  });
+
+  it("a bare 'PR #N' title yields a repo-less target; no signal anywhere yields []", () => {
+    expect(prTargetsOf({ title: "Verify: fix the widget (PR #12)" })).toEqual([{ number: 12 }]);
+    expect(prTargetsOf({ meta: "{}", body_md: "nothing", title: "Verify: docs pass" })).toEqual([]);
+    expect(prTargetsOf(null)).toEqual([]);
+  });
+
+  it("garbage meta does not throw", () => {
+    expect(prTargetsOf({ meta: "{not json", title: "PR #7" })).toEqual([{ number: 7 }]);
+  });
+
+  it("prTargetMatch: number decides; slugs compare full or local segment; missing slug matches on number", () => {
+    const full = { repo: "state-vector/superpositional", number: 2573 };
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2573 })).toBe(true);
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2573 })).toBe(true); // bare slug vs full
+    expect(prTargetMatch(full, { repo: "state-vector/bridge", number: 2573 })).toBe(false); // same number, other repo
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2329 })).toBe(false);
+    expect(prTargetMatch(full, { number: 2573 })).toBe(true); // repo-less title target
+    expect(prTargetMatch(full, null)).toBe(false);
+    // the incident pair must NOT match: round for #2573 vs disposition for #2329
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2329 })).toBe(false);
   });
 });

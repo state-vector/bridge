@@ -30,20 +30,24 @@
 //! Loop (one tick): preflight → train_status → per lane: CAS-lease →
 //! reconcile from live GitHub → awaiting-CI poll → else WALK the derived
 //! queue in order and drive the first entry that can act (BR#3935: a
-//! permanently unlandable entry — CLOSED PR, stamp-less leg, no unlanded leg
-//! on this lane — is logged and the walk advances in the SAME tick; a
-//! transient no-op still blocks) → decideTrainGate → act: merge →
-//! train:merged → next tick polls CI on the merge commit. Carry law
-//! (BR#3516 §5): machine-clean carries, human-resolved invalidates. Local
-//! git plumbing is three-valued (BR#3935): a git FAILURE is never folded
-//! into a conflict/behind verdict — the PR head is fetched explicitly
-//! before any local op names it.
+//! permanently unlandable entry must not starve the lane — a stamp-less leg
+//! is BOUNCED off the hub so lane.queue self-heals (BR#5753), a CLOSED PR or
+//! an entry with no unlanded leg on this lane is logged and the walk
+//! advances in the SAME tick; a transient no-op still blocks) →
+//! decideTrainGate → act: merge → train:merged → next tick polls CI on the
+//! merge commit. Carry law (BR#3516 §5): machine-clean carries,
+//! human-resolved invalidates. Local git plumbing is three-valued (BR#3935):
+//! a git FAILURE is never folded into a conflict/behind verdict — the PR
+//! head is fetched explicitly before any local op names it.
 
 use crate::train_gate::{
-    classify_base_check_runs, classify_main_check_runs, decide_train_gate, drain_burst_decision, is_root_fix_card,
-    merge_sweep_human_leg_title, normalize_gh_mergeable,
-    normalize_gh_merge_state, parse_burst_max, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs, verdict_covers_head_leg,
-    CheckVerdict, DrainDecision, MainCheckRun, MainVerdict, MergeAction, TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
+    classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
+    is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
+    reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
+    verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun,
+    DrainDecision, MainCheckRun, MainVerdict, MergeAction, DEPLOY_RECONCILE_GRACE_SECS, TRAIN_CI_BOUND_MULTIPLIER,
+    TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
 use std::io::BufRead;
@@ -52,7 +56,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::logging::{emit, now_ms, prefer_stdout};
+use crate::logging::{emit, iso, now_ms, prefer_stdout};
 
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -226,6 +230,22 @@ struct Ctx {
     tick_attempted: bool,
     tick_landed: u32,
     tick_error: Option<String>,
+    /// Per-(lane, sha) auto-rerun guard for rapid red-train self-healing:
+    /// when a lane stops on a failing required workflow (no burst bisect),
+    /// the executor automatically triggers one `gh run rerun` per `(key, sha)`
+    /// so marginal races (e.g. Post-Deploy Smoke deadline race) self-heal.
+    auto_rerun_shas: std::collections::HashSet<String>,
+    /// BR#6179: Per-(lane, tip_sha) auto-dispatch guard (`"{key}:{sha}"` -> `dispatched_at_ms`)
+    /// so level-based deploy reconciliation dispatches `workflow_dispatch` at most ONCE per sha.
+    auto_deploy_dispatched_shas: std::collections::HashMap<String, u64>,
+    /// BR#6179: Redundant queued workflow run IDs already cancelled this process lifetime.
+    cancelled_redundant_runs: std::collections::HashSet<i64>,
+    #[cfg(test)]
+    sh_mock: Option<std::sync::Arc<dyn Fn(&str, &[&str]) -> Option<Result<String, String>> + Send + Sync>>,
+    // ---- token-rot visibility (BR#4754) ----
+    /// The lane card id train_status last reported (the one-per-episode
+    /// token-rot note lands there after a self-healed blind episode).
+    last_lane_card: Option<String>,
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -310,6 +330,12 @@ impl Ctx {
             tick_attempted: false,
             tick_landed: 0,
             tick_error: None,
+            auto_rerun_shas: std::collections::HashSet::new(),
+            auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+            cancelled_redundant_runs: std::collections::HashSet::new(),
+            #[cfg(test)]
+            sh_mock: None,
+            last_lane_card: None,
         })
     }
 
@@ -360,6 +386,12 @@ impl Ctx {
 
     // gh/git inside the target clone; we read stdout, surface stderr on failure.
     fn sh(&self, cmd: &str, cmd_args: &[&str]) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some(ref mock) = self.sh_mock {
+            if let Some(res) = mock(cmd, cmd_args) {
+                return res;
+            }
+        }
         let out = Command::new(cmd)
             .args(cmd_args)
             .current_dir(&self.workdir)
@@ -547,21 +579,123 @@ impl Ctx {
         Ok(raw)
     }
 
+    /// BR#5623: PAGINATED — GitHub defaults to per_page=30 and returns runs
+    /// newest-first. The 2026-11-02 lane death (10.6h BLOCKED, 54-PR pileup):
+    /// the tip froze after the last merge while scheduled workflows kept
+    /// attaching check-runs to it; once the newest-30 were all newer than the
+    /// deploy runs, the four lane-required runs fell onto page 2 and the
+    /// base-green gate read a false "empty" verdict every tick — fail-closed
+    /// on a green base, self-sustaining (no merge → frozen tip → still more
+    /// runs → worse each hour). Read per_page=100 pages until a short page;
+    /// any gh/parse failure still yields an EMPTY vec (→ Empty verdict →
+    /// lane blocked → fail-closed), never a partial read.
     fn check_runs(&self, repo: &str, sha: &str) -> Vec<MainCheckRun> {
-        let out = self.gh_json(&["api", &format!("repos/{repo}/commits/{sha}/check-runs"), "--jq", "[.check_runs[] | {id, name, status, conclusion, html_url}]"]);
-        let arr = match out {
-            Ok(Value::Array(a)) => a,
-            _ => return vec![],
-        };
-        arr.iter()
-            .map(|r| MainCheckRun {
-                id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                status: r.get("status").and_then(|v| v.as_str()).map(String::from),
-                conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
-                html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
-            })
-            .collect()
+        let mut pages: Vec<Option<Vec<Value>>> = Vec::new();
+        for page in 1..=10 {
+            let out = self.gh_json(&[
+                "api",
+                &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"),
+                "--jq",
+                "[.check_runs[] | {id, name, status, conclusion, html_url}]",
+            ]);
+            match out {
+                Ok(Value::Array(a)) => {
+                    let short = a.len() < 100;
+                    pages.push(Some(a));
+                    if short {
+                        break;
+                    }
+                }
+                _ => {
+                    pages.push(None);
+                    break;
+                }
+            }
+        }
+        let mut runs = check_runs_from_pages(&pages);
+        // BR#6142: when a GitHub Actions workflow fails with `conclusion ==
+        // "startup_failure"` (e.g. invalid reusable workflow permissions or YAML
+        // syntax error), GitHub creates a workflow_run in `/actions/runs` with
+        // `conclusion: "startup_failure"` and ZERO job entries in `/check-runs`.
+        // Without folding those workflow-level startup_failures into `check_runs`,
+        // a PR whose CI workflow died at startup reads 0 red checks (Green), and
+        // a main deploy that died at startup reads 0 required checks (Empty /
+        // 60m pending settle).
+        if let Ok(Value::Array(wf_runs)) = self.gh_json(&[
+            "api",
+            &format!("repos/{repo}/actions/runs?head_sha={sha}&per_page=100"),
+            "--jq",
+            "[.workflow_runs[] | {id, name, status, conclusion, html_url}]",
+        ]) {
+            runs.extend(workflow_startup_failures(&wf_runs));
+        }
+        runs
+    }
+
+    /// BR#6179: Read the base branch tip SHA and its commit age in seconds
+    /// (`now_ms - committed_at`). Accepts either `{sha, committed_at}` JSON
+    /// or a bare SHA string (backwards-compatible with `.sha` mocks).
+    fn base_tip_facts(&self, repo: &str, base: &str) -> Result<(String, u64), String> {
+        if let Ok(out) = self.sh(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{repo}/commits/{base}"),
+                "--jq",
+                "{sha: .sha, committed_at: (.commit.committer.date // .commit.author.date)}",
+            ],
+        ) {
+            if let Ok(v) = serde_json::from_str::<Value>(&out) {
+                if let Some(sha) = v.get("sha").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+                    let age_secs = v
+                        .get("committed_at")
+                        .and_then(|d| d.as_str())
+                        .and_then(parse_iso8601_epoch_ms)
+                        .map(|ms| now_ms().saturating_sub(ms) / 1000)
+                        .unwrap_or(0);
+                    return Ok((sha.to_string(), age_secs));
+                }
+            }
+            let trimmed = out.trim().trim_matches('"').to_string();
+            if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                return Ok((trimmed, 0));
+            }
+        }
+        let sha = self.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
+        Ok((sha.trim().trim_matches('"').to_string(), 0))
+    }
+
+    /// BR#6179: Read recent workflow runs on `base` (and on `tip_sha`) for
+    /// level-based deploy coverage and redundant-queued-run detection.
+    fn workflow_runs(&self, repo: &str, base: &str, tip_sha: &str) -> Vec<DeployWorkflowRun> {
+        let mut combined: Vec<DeployWorkflowRun> = Vec::new();
+        if let Ok(Value::Array(branch_runs)) = self.gh_json(&[
+            "api",
+            &format!("repos/{repo}/actions/runs?branch={base}&per_page=30"),
+            "--jq",
+            "[.workflow_runs[] | {id, name, path, head_sha, event, status, conclusion, html_url}]",
+        ]) {
+            for r in parse_deploy_workflow_runs(&branch_runs) {
+                if !combined.iter().any(|x| x.id == r.id) {
+                    combined.push(r);
+                }
+            }
+        }
+        if !tip_sha.is_empty() {
+            if let Ok(Value::Array(sha_runs)) = self.gh_json(&[
+                "api",
+                &format!("repos/{repo}/actions/runs?head_sha={tip_sha}&per_page=100"),
+                "--jq",
+                "[.workflow_runs[] | {id, name, path, head_sha, event, status, conclusion, html_url}]",
+            ]) {
+                for r in parse_deploy_workflow_runs(&sha_runs) {
+                    if !combined.iter().any(|x| x.id == r.id) {
+                        combined.push(r);
+                    }
+                }
+            }
+        }
+        combined
     }
 
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
@@ -712,8 +846,107 @@ impl Ctx {
     }
 }
 
+/// BR#5623: fold paginated check-run pages into MainCheckRuns. A `None`
+/// page (gh/parse failure) fails CLOSED — empty vec, never a partial read:
+/// downstream classifies empty as an "empty" verdict and blocks the lane,
+/// which is the safe direction (a partial page-1-only read is exactly the
+/// bug that killed the lane for 10.6h).
+fn check_runs_from_pages(pages: &[Option<Vec<Value>>]) -> Vec<MainCheckRun> {
+    let mut runs = Vec::new();
+    for page in pages {
+        let arr = match page {
+            None => return vec![],
+            Some(a) => a,
+        };
+        runs.extend(arr.iter().map(|r| MainCheckRun {
+            id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        }));
+    }
+    runs
+}
+
+/// BR#6142: extract workflow-level `startup_failure` runs from `/actions/runs`
+/// when the newest non-cancelled run of a workflow on the commit died at
+/// startup (producing 0 job check-runs in `/commits/{sha}/check-runs`).
+fn workflow_startup_failures(wf_runs: &[Value]) -> Vec<MainCheckRun> {
+    let mut by_name: Vec<(String, Vec<MainCheckRun>)> = Vec::new();
+    for r in wf_runs {
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let item = MainCheckRun {
+            id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            name: name.clone(),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        };
+        match by_name.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, list)) => list.push(item),
+            None => by_name.push((name, vec![item])),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut list) in by_name {
+        list.sort_by(|a, b| b.id.cmp(&a.id));
+        if let Some(judge) = list.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled")) {
+            if judge.conclusion.as_deref() == Some("startup_failure") {
+                out.push(judge);
+            }
+        }
+    }
+    out
+}
+
+fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
+    let mut out = Vec::new();
+    for r in wf_runs {
+        let id = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let head_sha = r.get("head_sha").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if id <= 0 || name.is_empty() {
+            continue;
+        }
+        out.push(DeployWorkflowRun {
+            id,
+            name,
+            path: r.get("path").and_then(|v| v.as_str()).map(String::from),
+            head_sha,
+            event: r.get("event").and_then(|v| v.as_str()).map(String::from),
+            status: r.get("status").and_then(|v| v.as_str()).map(String::from),
+            conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
+            html_url: r.get("html_url").and_then(|v| v.as_str()).map(String::from),
+        });
+    }
+    out
+}
+
 fn vstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
+}
+
+/// BR#5911 (F2): the self-heal's stall fact, stamped onto the entry's
+/// queue_facts payload. PRECONDITION: only called from the RerunGate arm —
+/// the gate firing already proves the classification found ≥1 healable
+/// deploy-health red, so `dispatched == 0` (every gh rerun attempt failed,
+/// or the dispatch set resolved no run ids) is a loud contradiction: a
+/// remediation reporting success while doing nothing (proactive-support:
+/// a no-op loop ran 5h on PR #2707 logging "dispatched 0" every tick).
+/// The hub panel and the starvation duty read the stamp off train.status;
+/// the next walk's entries rebuild drops it (self-clearing on success).
+fn self_heal_stall_fact(reds: usize, dispatched: usize, last_error: Option<&str>) -> Option<Value> {
+    (dispatched == 0).then(|| {
+        json!({
+            "reds": reds,
+            "dispatched": dispatched,
+            "error": last_error.unwrap_or("(no run resolved — dispatch set was empty against a red verdict)"),
+        })
+    })
 }
 
 /// Lease renewal carries proof-of-progress (BR#4104): the last ledger action
@@ -1070,6 +1303,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     ctx.tick_attempted = false;
     ctx.tick_landed = 0;
     ctx.tick_error = None;
+    ctx.note(&format!("ticking {key}"));
     let result = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap);
     // BR#5376: the tick's landing truth feeds the stall tracker BEFORE the
     // error path releases the lease. Pure state here; the EVENT fires on the
@@ -1107,8 +1341,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
 fn root_fix_head_under_stop(lane: &Value) -> bool {
     lane.get("queue")
         .and_then(|q| q.as_array())
-        .and_then(|q| q.first())
-        .map(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false))
+        .map(|q| q.iter().any(|h| h.get("root_fix").and_then(|v| v.as_bool()).unwrap_or(false)))
         .unwrap_or(false)
 }
 
@@ -1125,7 +1358,379 @@ struct BatchCandidate {
     root_fix: bool,
 }
 
+// ---- BR#5633: the Awaiting-park sweep ---------------------------------
+//
+// The Awaiting park had NO machine exit: a card parked by a coverage
+// bounce (hub train:bounced → awaiting_park) was never re-evaluated —
+// the machine re-queue existed only at bounce-event time, so cars whose
+// verdicts lapsed while the lane was blocked sat parked forever
+// (bridge#364: 10 cars dead since Oct 30; the panel's aging/lapsed chips
+// are render-only). The sweep re-asserts every parked card through the
+// EXISTING audited bounce path with LIVE facts; the hub handler branches
+// correctly for all three cases:
+//   (a) accepted verdict covers the live head → machine re-queue (BR#5226)
+//   (b) machine-clean lapse / head moved → impl bounce — the verify pool
+//       re-verifies at the new head
+//   (c) human-leg class (conflict files / dismissed review / signing env)
+//       → stays parked (the hub classifies a re-asserted park on its
+//       STORED defect/conflict files — the sweep reason is only a trigger
+//       marker, deliberately free of the human-leg vocabulary)
+// Verdict validity becomes head-anchored, not clock-anchored. Runs every
+// tick BEFORE the stop arm: verdicts lapse exactly while the lane is
+// stopped / settling — the states the walk never reaches.
+
+/// One Awaiting-park entry as the hub's train.status serves it on the lane.
+struct AwaitingPark {
+    task: String,
+    pr: i64,
+}
+
+/// The per-card sweep decision (pure — table-tested below).
+#[derive(Debug, PartialEq)]
+enum SweepAction {
+    /// Re-assert the bounce through the audited hub path with live facts.
+    Reassert {
+        task: String,
+        pr: i64,
+        head_sha: String,
+    },
+    /// Leave the card this tick; the reason names whose path owns it.
+    Skip {
+        task: String,
+        why: &'static str,
+    },
+}
+
+fn awaiting_sweep_action(task: &str, pr: i64, facts: Result<&Value, &str>, last_sweep: Option<&Value>) -> SweepAction {
+    let facts = match facts {
+        Ok(f) => f,
+        Err(_) => {
+            // transient gh read — no stamp, the next tick retries
+            return SweepAction::Skip { task: task.to_string(), why: "live facts unreadable — retry next tick" };
+        }
+    };
+    if vstr(facts, "state").unwrap_or("") != "OPEN" {
+        // MERGED/CLOSED — the landed/close path owns the card
+        return SweepAction::Skip { task: task.to_string(), why: "PR not OPEN — the landed/close path owns it" };
+    }
+    let head = vstr(facts, "headRefOid").unwrap_or("").to_string();
+    if head.is_empty() {
+        return SweepAction::Skip { task: task.to_string(), why: "OPEN PR with no live head — fail closed, retry next tick" };
+    }
+    if let Some(last) = last_sweep {
+        let same_head = last.get("head").and_then(|v| v.as_str()) == Some(head.as_str());
+        let settled = last.get("outcome").and_then(|v| v.as_str()) == Some("awaiting_park");
+        if same_head && settled {
+            // a human-leg park re-asserted at an unchanged head re-parked
+            // identically — one event per (card, head), never per tick
+            return SweepAction::Skip { task: task.to_string(), why: "settled human-leg park at an unchanged head — rate-limited" };
+        }
+    }
+    SweepAction::Reassert { task: task.to_string(), pr, head_sha: head }
+}
+
+/// The train_event payload a sweep re-assert emits — mirrors the executor's
+/// real coverage-bounce shape (kind bounced + bounce_kind coverage + the
+/// live head + the task). The reason is a trigger marker: it must carry NO
+/// human-leg vocabulary (conflict files ride `conflict_files`, never prose;
+/// "dismiss…review" / "signing environment" / "key unavailable" /
+/// "NO_USER" would misclassify a re-asserted park).
+fn awaiting_sweep_bounce_event(repo: &str, base: &str, task: &str, pr: i64, head_sha: &str) -> Value {
+    json!({
+        "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": task,
+        "head_sha": head_sha, "bounce_kind": "coverage",
+        "reason": "awaiting sweep: re-assert parked card with live facts (BR#5633)",
+    })
+}
+
+/// Per-tick awaiting sweep (BR#5633) — see the block comment above.
+/// Never fails the tick: per-card errors are logged and retried next tick.
+fn awaiting_sweep(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) {
+    let parks: Vec<AwaitingPark> = lane
+        .get("awaiting")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| {
+            let task = e.get("task").and_then(|v| v.as_str())?.to_string();
+            let pr = e.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+            Some(AwaitingPark { task, pr })
+        })
+        .filter(|p| p.pr > 0)
+        .collect();
+    if parks.is_empty() {
+        return;
+    }
+    log(Some(key), &format!("awaiting sweep: {} parked card(s) (BR#5633)", parks.len()));
+    let stamps = lane.get("awaiting_sweep").cloned().unwrap_or(json!({}));
+    let mut asserted: Vec<(String, Value)> = Vec::new();
+    for park in parks {
+        let facts = ctx.pr_facts(repo, park.pr);
+        let action = match &facts {
+            Ok(f) => awaiting_sweep_action(&park.task, park.pr, Ok(f), stamps.get(park.task.as_str())),
+            Err(e) => awaiting_sweep_action(&park.task, park.pr, Err(e.as_str()), stamps.get(park.task.as_str())),
+        };
+        let (task, pr, head) = match action {
+            SweepAction::Reassert { task, pr, head_sha } => (task, pr, head_sha),
+            SweepAction::Skip { task, why } => {
+                log(Some(key), &format!("awaiting sweep: {task} PR #{} — {why}", park.pr));
+                continue;
+            }
+        };
+        renew_lease(ctx, repo, base);
+        match ctx.mcp("train_event", awaiting_sweep_bounce_event(repo, base, &task, pr, &head)) {
+            Ok(resp) => {
+                let outcome = if resp.get("machine_requeue").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "machine_requeue"
+                } else if resp.get("awaiting_park").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "awaiting_park"
+                } else {
+                    "impl_bounce"
+                };
+                log(Some(key), &format!("awaiting sweep: {task} PR #{pr} re-asserted at {} → {outcome}", &head[..head.len().min(9)]));
+                ctx.note(&format!("awaiting sweep: {task} PR #{pr} → {outcome} (BR#5633)"));
+                asserted.push((task, json!({ "head": head, "outcome": outcome, "at": now_ms() })));
+            }
+            Err(e) => {
+                // no stamp — the refusal is loud here and the next tick retries
+                log(Some(key), &format!("awaiting sweep: {task} re-assert refused — {} (retry next tick)", trunc(&e, 200)));
+            }
+        }
+    }
+    if asserted.is_empty() {
+        return;
+    }
+    // one stamp op for the whole tick (the rate-limit ledger lives hub-side
+    // — the executor is stateless across ticks by design). ABSENT entries
+    // preserve the walk's stored queue blocks (the hub merges, BR#5633).
+    let mut map = serde_json::Map::new();
+    for (task, v) in asserted {
+        map.insert(task, v);
+    }
+    if let Err(e) = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "awaiting_sweep": Value::Object(map) })) {
+        log(Some(key), &format!("awaiting sweep: rate-limit stamp failed — settled parks may re-assert next tick: {}", trunc(&e, 200)));
+    }
+}
+
+fn lane_required_workflows(lane: &Value) -> Vec<String> {
+    lane.get("required_workflows")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn has_rerun_request(lane: &Value) -> bool {
+    lane.get("rerun_failed").filter(|v| !v.is_null()).is_some()
+}
+
+/// Extract the GitHub Actions workflow run ID from a check-run `html_url`
+/// (`https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>`),
+/// falling back to the last all-digit path segment when no `/runs/<id>` pair
+/// is present.
+fn extract_actions_run_id(url: &str) -> Option<i64> {
+    let segs: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    for w in segs.windows(2) {
+        if w[0] == "runs" && w[1].chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(id) = w[1].parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    segs.iter()
+        .rev()
+        .find(|p| p.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|p| p.parse::<i64>().ok())
+}
+
+fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged: u32) -> Value {
+    let mut base_state = json!({
+        // mid-drain (pass_merged > 0): destination-green is owned by the
+        // pass settle (BR#4934) — only non-red unsettled/empty reads are
+        // suppressed mid-burst; a RED base is ALWAYS reported as red so the
+        // UI never lies that a red base is green.
+        "verdict": if pass_merged > 0 && base_class.verdict != MainVerdict::Red {
+            "green"
+        } else {
+            base_class.verdict.as_str()
+        },
+        "scoped_to_required": !required.is_empty(),
+        "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
+        "unsettled": base_class.unsettled,
+    });
+    // BR#5674 P1 (empty-is-loud): annotate base_state with the alarm string
+    // when the base verdict is empty (either N runs read with 0 matching
+    // required_workflows, or 0 total runs on the tip).
+    if pass_merged == 0 {
+        if let Some(ref alarm) = base_class.alarm {
+            base_state.as_object_mut().unwrap().insert("alarm".into(), json!(alarm));
+        }
+        // BR#5883 (gate-consumed qualifier): the scoped verdict reads green
+        // but the repo's own merge gate (`main-green gate`, which judges
+        // main's WHOLE tip) would judge it non-green — stamp the qualifier
+        // whole so the hub escalates at P1 (immediate diagnostic duty +
+        // one-per-episode ask) instead of the P4 starve clock, and the lane
+        // vocabulary names the gate-blocking checks. Mid-drain the stamp
+        // mirrors the gate's forced green (BR#4934) and omits the
+        // qualifier — the pass settle owns destination-green.
+        if let Some(ref gate) = base_class.gate {
+            let obj = base_state.as_object_mut().unwrap();
+            obj.insert("gate_blocked".into(), json!(true));
+            obj.insert("gate_verdict".into(), json!(gate.verdict.as_str()));
+            obj.insert(
+                "gate_red".into(),
+                json!(gate.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>()),
+            );
+            obj.insert("gate_unsettled".into(), json!(gate.unsettled));
+        }
+    }
+    base_state
+}
+
+fn build_base_state_with_coverage(
+    base_class: &CheckVerdict,
+    required: &[String],
+    pass_merged: u32,
+    plan: Option<&DeployReconcilePlan>,
+    cancelled_runs: &[i64],
+) -> Value {
+    let reconciled_class = match plan {
+        Some(p) => reconcile_base_verdict_with_deploy_coverage(base_class, &p.coverage),
+        None => base_class.clone(),
+    };
+    let mut base_state = build_base_state(&reconciled_class, required, pass_merged);
+    if pass_merged == 0 {
+        if let Some(p) = plan {
+            let obj = base_state.as_object_mut().unwrap();
+            let (tip_sha, tip_age_secs) = match &p.coverage {
+                DeployCoverageState::Covered { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::Settling { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredGrace { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredDispatched { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::UncoveredDark { tip_sha, tip_age_secs, .. }
+                | DeployCoverageState::Failed { tip_sha, tip_age_secs, .. } => (tip_sha.clone(), *tip_age_secs),
+            };
+            if !tip_sha.is_empty() {
+                obj.insert("tip_sha".into(), json!(tip_sha));
+                obj.insert("tip_age_secs".into(), json!(tip_age_secs));
+                obj.insert("covered_by".into(), json!(p.covered_by_sha));
+                obj.insert("coverage_age_secs".into(), json!(p.coverage_age_secs));
+                if let Ok(cov_val) = serde_json::to_value(&p.coverage) {
+                    obj.insert("deploy_coverage".into(), cov_val);
+                }
+            }
+            if !cancelled_runs.is_empty() {
+                obj.insert("cancelled_redundant_runs".into(), json!(cancelled_runs));
+            }
+        }
+    }
+    base_state
+}
+
+/// BR#6179 level-based deploy reconciler (A + B + D):
+/// 1. Evaluates `reconcile_deploy_coverage` on `tip_sha`.
+/// 2. (D) Cancels redundant queued deploy runs (`gh run cancel <id>`) when the
+///    same `head_sha` is already covered by an `in_progress` or `completed/success`
+///    deploy run (or duplicate queued runs).
+/// 3. (A) Auto-dispatches `workflow_dispatch` (`gh workflow run <wf> --ref <base>`)
+///    ONCE per `tip_sha` when the tip is uncovered past `DEPLOY_RECONCILE_GRACE_SECS`.
+/// 4. (B) Returns the enriched `base_state` JSON carrying `deploy_coverage`,
+///    `covered_by`, `coverage_age_secs`, and `cancelled_redundant_runs`.
+fn reconcile_base_deploy(
+    ctx: &mut Ctx,
+    lane: &Value,
+    key: &str,
+    repo: &str,
+    base: &str,
+    tip_sha: &str,
+    tip_age_secs: u64,
+    base_class: &mut CheckVerdict,
+    required: &[String],
+    pass_merged: u32,
+) -> Value {
+    if tip_sha.is_empty() || !ctx.base_probe {
+        return build_base_state(base_class, required, pass_merged);
+    }
+    let wf_runs = ctx.workflow_runs(repo, base, tip_sha);
+    let auto_key = format!("{key}:{tip_sha}");
+    let manual_redispatch = lane.get("dispatch_deploy").filter(|v| !v.is_null()).is_some();
+    let hub_dispatched_at = if manual_redispatch {
+        None
+    } else {
+        lane.get("deploy_dispatched")
+            .filter(|d| d.get("sha").and_then(|v| v.as_str()) == Some(tip_sha))
+            .and_then(|d| d.get("at").and_then(|v| v.as_u64()))
+    };
+    let already_dispatched = if manual_redispatch {
+        None
+    } else {
+        hub_dispatched_at.or_else(|| ctx.auto_deploy_dispatched_shas.get(&auto_key).copied())
+    };
+    let mut plan = reconcile_deploy_coverage(
+        tip_sha,
+        tip_age_secs,
+        DEPLOY_RECONCILE_GRACE_SECS,
+        base_class,
+        required,
+        &wf_runs,
+        already_dispatched,
+    );
+    let mut cancelled_ok: Vec<i64> = Vec::new();
+    for &run_id in &plan.cancel_run_ids {
+        if !ctx.cancelled_redundant_runs.contains(&run_id) {
+            if ctx.sh("gh", &["run", "cancel", &run_id.to_string(), "--repo", repo]).is_ok() {
+                ctx.cancelled_redundant_runs.insert(run_id);
+                cancelled_ok.push(run_id);
+                log(
+                    Some(key),
+                    &format!(
+                        "deploy reconcile (D): cancelled redundant queued deploy run #{run_id} for already-covered sha {} (BR#6179)",
+                        &tip_sha[..tip_sha.len().min(8)]
+                    ),
+                );
+            }
+        }
+    }
+    if pass_merged == 0 {
+        if let Some(ref wf) = plan.dispatch_workflow.clone() {
+            if ctx.sh("gh", &["workflow", "run", wf, "--repo", repo, "--ref", base]).is_ok() {
+                let ts = now_ms();
+                ctx.auto_deploy_dispatched_shas.insert(auto_key, ts);
+                let (last_green_sha, last_green_run_id) = match &plan.coverage {
+                    DeployCoverageState::UncoveredDark { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::UncoveredGrace { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::UncoveredDispatched { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::Settling { last_green_sha, last_green_run_id, .. }
+                    | DeployCoverageState::Failed { last_green_sha, last_green_run_id, .. } => {
+                        (last_green_sha.clone(), *last_green_run_id)
+                    }
+                    DeployCoverageState::Covered { covered_by_sha, covered_by_run_id, .. } => {
+                        (Some(covered_by_sha.clone()), *covered_by_run_id)
+                    }
+                };
+                plan.coverage = DeployCoverageState::UncoveredDispatched {
+                    tip_sha: tip_sha.to_string(),
+                    tip_age_secs,
+                    workflow: wf.clone(),
+                    dispatched_at: ts,
+                    last_green_sha,
+                    last_green_run_id,
+                };
+                let summary = format_deploy_coverage_summary(&plan.coverage);
+                ctx.note(&format!("self-heal: {summary}"));
+                log(
+                    Some(key),
+                    &format!("deploy reconcile (A): {summary} on {base} (once per sha, BR#6179)"),
+                );
+            }
+        }
+    }
+    *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
+    build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
+    let required = lane_required_workflows(lane);
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
     // happens — it's broken"): the answered alarm ask IS the authority. The
     // hub's askAnswer stamps `meta.lane.bypass_merge {pr}` (a BYPASS answer on
@@ -1151,14 +1756,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|b| b.get("pr"))
         .and_then(|v| v.as_i64())
         .filter(|p| *p > 0);
-    let rerun_requested = lane.get("rerun_failed").map(|_| true).unwrap_or(false);
+    let rerun_requested = has_rerun_request(lane);
     if let Some(bpr) = bypass_pr {
         renew_lease(ctx, repo, base);
         let facts = ctx.pr_facts(repo, bpr);
         let ack = |ctx: &mut Ctx, outcome: &str| -> Result<(), String> {
             ctx.mcp(
                 "train_queue_facts",
-                json!({ "repo": repo, "base": base, "entries": [], "bypass_consumed": outcome }),
+                json!({ "repo": repo, "base": base, "bypass_consumed": outcome }),
             )
             .map(|_| ())
         };
@@ -1169,16 +1774,49 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 vstr(f, "headRefOid").unwrap_or("").to_string(),
             )
         }) {
-            Ok((state, Some(_), _)) if state == "MERGED" => {
+            Ok((state, Some(merge_sha), head_sha)) if state == "MERGED" => {
+                // BR#6390: the human merged it themselves (the HUMAN GATE's
+                // DONE) — stamp the merged event so the lane settles on the
+                // cure (awaiting-ci on this sha, provenance, the episode
+                // phase flips to cure_pr_merged_awaiting_ci and any straggler
+                // ask auto-closes). Consuming the stamp WITHOUT the event left
+                // external merges invisible to the episode state.
+                ctx.tick_landed += 1;
+                ctx.mcp(
+                    "train_event",
+                    json!({
+                        "repo": repo, "base": base, "kind": "merged", "pr": bpr,
+                        "merge_sha": merge_sha, "head_sha": head_sha,
+                        "signer": ctx.holder, "bypass": true,
+                        "reason": "bypass-merge (merged-elsewhere) — the human landed the cure out of turn via the answered HUMAN GATE ask; stamping the merged event so the lane settles on it",
+                    }),
+                )?;
                 ack(ctx, "merged-elsewhere")?;
-                ctx.note(&format!("bypass: PR #{bpr} already MERGED — authorization consumed"));
-                log(Some(key), &format!("bypass: PR #{bpr} already merged — nothing to do, stamp consumed"));
+                ctx.note(&format!("bypass: PR #{bpr} already MERGED by the human ({}) — merged event stamped, authorization consumed", &merge_sha[..merge_sha.len().min(9)]));
+                log(Some(key), &format!("bypass: PR #{bpr} already merged by the human as {} — merged event stamped, stamp consumed", &merge_sha[..merge_sha.len().min(9)]));
             }
             Ok((state, _, _)) if state == "CLOSED" => {
                 ack(ctx, "closed")?;
                 log(Some(key), &format!("bypass: PR #{bpr} is CLOSED — authorization consumed (nothing to merge)"));
             }
             Ok((_, _, head_sha)) => {
+                // BR#6390 DONE grace: the human clicked DONE ("I merged it") —
+                // GitHub may lag the click by seconds, or the click landed a
+                // hair early. Give the authorization a 10-minute window where
+                // the tick only WATCHES (no merge attempt, stamp kept); the
+                // next tick after the merge lands takes the MERGED arm above.
+                // Past the window, the pre-existing behavior applies: try the
+                // machine merge (plain, then --admin), else consume with the
+                // needs-human receipt.
+                let stamped_at = lane
+                    .pointer("/bypass_merge/at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let grace_ms = 10 * 60 * 1000i64;
+                if stamped_at > 0 && (now_ms() as i64 - stamped_at) < grace_ms {
+                    ctx.note(&format!("bypass: PR #{bpr} authorized (DONE) — watching for the human's merge (stamp held, grace {}s left)", ((grace_ms - (now_ms() as i64 - stamped_at)) / 1000).max(0)));
+                    log(Some(key), &format!("bypass: PR #{bpr} authorized (DONE) and still open — holding the stamp inside the 10m DONE grace; no merge attempt this tick"));
+                } else {
                 // open: land it out of turn with the BR#5376 method fallback
                 // (squash → rebase → merge, remembered per repo) — a policy
                 // mismatch must ride the landing path, not loop.
@@ -1201,8 +1839,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                                 refusal = Some(e);
                                 continue;
                             }
-                            refusal = Some(e);
-                            break; // non-method refusal: branch protection et al — never loop
+                            // BR#6012: branch protection refuses plain `gh pr merge` on a
+                            // circular red-base gate (`BLOCKED`). Try `--admin` in case the
+                            // gateway token holds admin; if not, report that human `--admin`
+                            // is required instead of pretending the machine could bypass.
+                            match ctx.sh("gh", &["pr", "merge", &bpr.to_string(), "--repo", repo, method_flag_for(m), "--admin"]) {
+                                Ok(_) => {}
+                                Err(admin_err) => {
+                                    if is_merge_method_refusal(&admin_err) {
+                                        refusal = Some(admin_err);
+                                        continue;
+                                    }
+                                    refusal = Some(format!("{e} (--admin also refused: {admin_err})"));
+                                    break; // non-method refusal: branch protection et al — never loop
+                                }
+                            }
                         }
                     }
                     // claimed ok — verify from live facts, never trust the exit code
@@ -1234,9 +1885,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     }
                     None => {
                         let why = refusal.unwrap_or_else(|| "gh pr merge reported ok but no mergeCommit — DO NOT trust this tick".into());
-                        ack(ctx, &format!("refused: {}", trunc(&why, 200)))?;
-                        log(Some(key), &format!("bypass: PR #{bpr} merge refused — authorization consumed, reason on the lane card: {}", trunc(&why, 200)));
+                        ack(ctx, &format!("refused (needs human --admin: gh pr merge {bpr} --repo {repo} --admin --squash): {}", trunc(&why, 160)))?;
+                        log(Some(key), &format!("bypass: PR #{bpr} merge refused — needs human --admin (`gh pr merge {bpr} --repo {repo} --admin --squash`), reason on the lane card: {}", trunc(&why, 160)));
                     }
+                }
                 }
             }
             Err(e) => {
@@ -1247,22 +1899,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     if rerun_requested {
         renew_lease(ctx, repo, base);
         let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
-        // the red verdict carries urls (`…/actions/runs/<id>`) — rerun by id
+        let v = classify_base_check_runs(&ctx.check_runs(repo, &base_sha), &required);
+        // the red verdict carries urls (`…/actions/runs/<id>/job/<job_id>`) — rerun by workflow run id
         let reds: Vec<(i64, &str)> = v
             .red
             .iter()
             .filter_map(|r| {
-                let id = r
-                    .url
-                    .rsplit('/')
-                    .find(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-                    .and_then(|p| p.parse::<i64>().ok())?;
+                let id = extract_actions_run_id(&r.url)?;
                 Some((id, r.name.as_str()))
             })
             .collect();
         if reds.is_empty() {
-            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": "nothing-red" }));
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "rerun_consumed": "nothing-red" }));
             log(Some(key), "rerun: nothing red on the base tip — stamp consumed");
         } else {
             let mut rerun_ok = 0;
@@ -1274,17 +1922,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
             }
             let outcome = if rerun_ok == reds.len() { "issued".to_string() } else { format!("partial: {rerun_ok}/{}", reds.len()) };
-            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "rerun_consumed": outcome }));
+            let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "rerun_consumed": outcome }));
             log(Some(key), &format!("rerun: re-ran {} failing check(s) on the base tip — stamp consumed ({outcome})", reds.len()));
         }
     }
+    // ---- BR#5633 awaiting-park sweep: every parked card gets its machine
+    // exit EVERY tick, before any arm that can return early — verdicts
+    // lapse exactly while the lane is stopped / mid-settle, the states the
+    // walk never reaches (bridge#364: 10 cars parked dead since Oct 30).
+    // See the block comment at awaiting_sweep for the three hub outcomes. ----
+    awaiting_sweep(ctx, key, repo, base, lane);
+
     // ---- stop-the-line arm: main is RED and the lane is stopped ----
     if !lane.get("stop").map(|s| s.is_null()).unwrap_or(true) {
         let stop = lane.get("stop").unwrap();
         let stop_sha = vstr(stop, "sha").unwrap_or("");
         log(Some(key), &format!("line stopped — {} @ {}", vstr(stop, "reason").unwrap_or("?"), &stop_sha[..stop_sha.len().min(9)]));
-        let base_sha = ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])?;
-        let v = classify_main_check_runs(&ctx.check_runs(repo, &base_sha));
+        let (base_sha, base_age_secs) = ctx.base_tip_facts(repo, base)?;
+        let base_runs = ctx.check_runs(repo, &base_sha);
+        let mut v = classify_base_check_runs(&base_runs, &required);
+        let observed = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut v, &required, 0);
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": observed }));
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
             ctx.train_lease(repo, base, "release", json!({ "line_green": true }))?;
@@ -1306,12 +1964,59 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
             // drive the walk ONE step per tick while the line holds (state
             // hub-side, crash-safe: any executor picks it up mid-flight).
-            match bisect_step(ctx, key, repo, base, stop) {
+            match bisect_step(ctx, key, repo, base, stop, &required) {
                 Ok(()) => {}
                 Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
             }
+            // Rapid self-heal on a non-bisect red stop: auto-rerun failing
+            // required workflow runs ONCE per (lane, base_sha) so transient/race
+            // failures (e.g. Post-Deploy Smoke 300s race) heal automatically.
+            let has_bisect = stop.get("bisect").filter(|b| !b.is_null()).is_some();
+            let auto_key = format!("{key}:{base_sha}");
+            if v.verdict == MainVerdict::Red && !has_bisect && !rerun_requested && !base_sha.is_empty() && !ctx.auto_rerun_shas.contains(&auto_key) {
+                ctx.auto_rerun_shas.insert(auto_key);
+                let mut auto_rerun_ok = 0usize;
+                for r in &v.red {
+                    if let Some(run_id) = extract_actions_run_id(&r.url) {
+                        if ctx.sh("gh", &["run", "rerun", &run_id.to_string(), "--repo", repo]).is_ok() {
+                            auto_rerun_ok += 1;
+                        }
+                    }
+                }
+                if auto_rerun_ok > 0 {
+                    log(Some(key), &format!("self-heal: auto-dispatched rerun for {auto_rerun_ok} failing required workflow(s) on stopped tip {}", &base_sha[..base_sha.len().min(9)]));
+                }
+            }
+            // BR#6012 stopped-lane self-healing & live base_state refresh:
+            // (a) Keep queue_facts.base_state fresh while stopped so the UI banner
+            //     reflects live failing/pending checks instead of a stale stop.failing
+            //     snapshot from hours ago. When base_sha reads Empty (e.g. a hotfix
+            //     merged onto main and its deploy workflow is queued behind stop_sha's
+            //     concurrency lock), fall back to stop_sha's live check-runs.
+            // (b) Run settle_window_rebase over the held queue so any queued PR that
+            //     became CONFLICTING against moved main (e.g. PR #2800 after #2817)
+            //     is immediately trial-merged and bounced (`kind: "bounced"`,
+            //     `bounce_kind: "conflict"`, `conflict_files`) — the hub parks it
+            //     TYPED conflicting (BR#6348: queue-visible, bounded budget, loud
+            //     alarm at expiry; the mechanical rebase leg owns the exit) instead
+            //     of churning it through the pool.
+            if ctx.base_probe {
+                let mut effective_v = if v.verdict == MainVerdict::Empty && !stop_sha.is_empty() && stop_sha != base_sha {
+                    let stop_runs = ctx.check_runs(repo, stop_sha);
+                    let sv = classify_base_check_runs(&stop_runs, &required);
+                    if sv.verdict != MainVerdict::Empty { sv } else { v.clone() }
+                } else {
+                    v.clone()
+                };
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut effective_v, &required, 0);
+                let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
+                let _ = settle_window_rebase(ctx, key, repo, base, lane);
+            }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
-            log(Some(key), &format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") }));
+            let hold_msg = format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") });
+            ctx.note(&hold_msg);
+            renew_lease(ctx, repo, base);
+            log(Some(key), &hold_msg);
             return Ok(());
         }
     }
@@ -1357,7 +2062,31 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("reconcile: PR #{cur_pr} merged on GitHub, event recovered"));
         }
         renew_lease(ctx, repo, base);
-        let runs = ctx.check_runs(repo, &merge_sha);
+        let mut runs = ctx.check_runs(repo, &merge_sha);
+        if ctx.base_probe {
+            if let Ok((live_base_sha, live_base_age_secs)) = ctx.base_tip_facts(repo, base) {
+                let live_runs = if live_base_sha == merge_sha {
+                    runs.clone()
+                } else {
+                    ctx.check_runs(repo, &live_base_sha)
+                };
+                let mut live_base_class = classify_base_check_runs(&live_runs, &required);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &mut live_base_class, &required, 0);
+                let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
+                // If merge_sha's own runs are all completed with a cancelled required run
+                // or missing/startup_failure required runs (superseded because a hotfix
+                // live_base_sha was pushed on top of merge_sha), judge the settle from
+                // live_base_sha's runs instead of hanging on merge_sha.
+                let merge_all_done = !runs.is_empty() && runs.iter().all(|r| r.status.as_deref() == Some("completed"));
+                let merge_req_cancelled = runs.iter().any(|r| required.iter().any(|n| n == &r.name) && r.conclusion.as_deref() == Some("cancelled"));
+                let merge_req_missing_or_startup_fail = !required.is_empty()
+                    && (!runs.iter().any(|r| required.iter().any(|n| n == &r.name))
+                        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure")));
+                if live_base_sha != merge_sha && merge_all_done && (merge_req_cancelled || merge_req_missing_or_startup_fail) {
+                    runs = live_runs;
+                }
+            }
+        }
         // BR#4934: the settle feed carries executor-fed git ancestry — the
         // pass's earlier merge shas verified on base — so the hub can close
         // the pass's parked cards on a green verdict (BR#3516: no hub
@@ -1387,12 +2116,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             if left > 0 {
                 log(Some(key), &format!("fail-closed bound in ~{}m", (left / 60_000).max(1)));
             }
+            let cur_merged = cur.get("burst_merged").and_then(|v| v.as_u64()).unwrap_or(1).min(u32::MAX as u64) as u32;
+            let cur_task = vstr(cur, "task_id").unwrap_or("");
+            let has_other_queued = lane
+                .get("queue")
+                .and_then(|q| q.as_array())
+                .map(|q| q.iter().any(|item| vstr(item, "id").unwrap_or("") != cur_task && item.get("pr").and_then(|v| v.as_i64()) != Some(cur_pr)))
+                .unwrap_or(false);
+            if (burst_cap == 0 || cur_merged < burst_cap) && has_other_queued {
+                log(Some(key), &format!("awaiting-ci with batch slot open ({cur_merged}/{}) — checking remaining queued PRs to merge into this batch before settling CI", if burst_cap == 0 { "∞".to_string() } else { burst_cap.to_string() }));
+            } else {
+                settle_window_rebase(ctx, key, repo, base, lane)?;
+                return Ok(());
+            }
+        } else {
+            // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
+            // update-branch per tick on the first behind+covered queued head, so
+            // conflicts surface during the wait, not at the drain.
+            settle_window_rebase(ctx, key, repo, base, lane)?;
+            return Ok(());
         }
-        // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
-        // update-branch per tick on the first behind+covered queued head, so
-        // conflicts surface during the wait, not at the drain.
-        settle_window_rebase(ctx, key, repo, base, lane)?;
-        return Ok(());
     }
 
     // ---- drain arm (idle, or mid-pass "bursting"): THREE phases (BR#4996,
@@ -1409,9 +2152,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // per-member merge leg law is unchanged — and the pass runs exactly
     // ONE settle wait, on the FINAL merge commit. The pass state is the
     // HUB's (currently.phase/​burst_*), never executor-local — crash-safe.
-    // A PERMANENTLY unlandable entry — PR CLOSED, a leg with no PR stamp,
-    // no unlanded leg on this lane — must NOT starve the lane (BR#3935):
-    // it is logged and classification advances to the next entry. A red
+    // A PERMANENTLY unlandable entry must NOT starve the lane (BR#3935): a
+    // leg with no PR stamp is BOUNCED off the hub — the card leaves the
+    // derived queue that tick (BR#5753, the self-heal); a CLOSED PR or an
+    // entry with no unlanded leg on this lane is logged and classification
+    // advances to the next entry. A red
     // pass sha (tip classify, re-checked before EACH member) stops the
     // line IMMEDIATELY (GH#2261) — it never waits for the settle; earlier
     // pass-sha reds surface at the settle (and its bisect, if the settle
@@ -1419,12 +2164,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // settles, the refused member waits for the next pass (a fresh pass —
     // pass_merged == 0 — keeps the loud tick error).
     let cur = lane.get("currently").filter(|c| !c.is_null());
-    let bursting = lane.pointer("/currently/phase").and_then(|p| p.as_str()) == Some("bursting");
+    let cur_phase = lane.pointer("/currently/phase").and_then(|p| p.as_str());
+    let from_awaiting_ci = cur_phase == Some("awaiting-ci");
+    let bursting = cur_phase == Some("bursting") || from_awaiting_ci;
     let mut pass_merged: u32 = if bursting {
-        cur.and_then(|c| c.get("burst_merged")).and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32
+        cur.and_then(|c| c.get("burst_merged")).and_then(|v| v.as_u64()).unwrap_or(if from_awaiting_ci { 1 } else { 0 }).min(u32::MAX as u64) as u32
     } else {
         0
     };
+    let initial_pass_merged = pass_merged;
     let mut tip_sha: String = if bursting {
         cur.and_then(|c| c.get("merge_sha")).and_then(|v| v.as_str()).unwrap_or("").to_string()
     } else {
@@ -1459,7 +2207,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let base_class = if !ctx.base_probe {
+    let (probed_base_sha, probed_base_age_secs, mut base_class) = if !ctx.base_probe {
         // BR#5265 fix-up (verify bounce, CI run 41261611797 — the PR's own
         // drills failed in CI): the hoisted read is HERMETIC — the drills
         // (base_probe=false) never shell out to gh; the Unsettled stamp
@@ -1470,28 +2218,44 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // walks on — the gate still refuses to merge onto a non-green
         // destination (leg 3), so the fail-closed law holds; the lane just
         // says WHY it holds.
-        CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0 }
+        (
+            String::new(),
+            0u64,
+            CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None },
+        )
     } else {
-        match ctx.sh("gh", &["api", &format!("repos/{repo}/commits/{base}"), "--jq", ".sha"])
-            .map(|base_sha| {
-                let runs = ctx.check_runs(repo, &base_sha);
-                (base_sha, runs)
-            })
-        {
-            Ok((_, runs)) => classify_base_check_runs(&runs, &required),
-            Err(e) => CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0 },
+        match ctx.base_tip_facts(repo, base).map(|(base_sha, age_secs)| {
+            let runs = ctx.check_runs(repo, &base_sha);
+            (base_sha, age_secs, runs)
+        }) {
+            Ok((base_sha, age_secs, runs)) => (base_sha, age_secs, classify_base_check_runs(&runs, &required)),
+            Err(e) => (
+                String::new(),
+                0u64,
+                CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
+            ),
         }
     };
-    let base_state = json!({
-        // mid-drain (pass_merged > 0): destination-green is owned by the
-        // pass settle (BR#4934) — the gate composes with base FORCED green;
-        // the stamp mirrors the gate so the panel never shows a false red
-        // mid-burst.
-        "verdict": if pass_merged > 0 { "green" } else { base_class.verdict.as_str() },
-        "scoped_to_required": !required.is_empty(),
-        "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
-        "unsettled": base_class.unsettled,
-    });
+    let base_state = reconcile_base_deploy(
+        ctx,
+        lane,
+        key,
+        repo,
+        base,
+        &probed_base_sha,
+        probed_base_age_secs,
+        &mut base_class,
+        &required,
+        if from_awaiting_ci { 0 } else { pass_merged },
+    );
+    if let Some(ref alarm) = base_class.alarm {
+        log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
+    }
+    if from_awaiting_ci && base_class.verdict == MainVerdict::Red {
+        let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": base_state }));
+        log(Some(key), "awaiting-ci: base tip is RED — holding batch continuation until base is green");
+        return Ok(());
+    }
     for (qi, head) in queue.iter().enumerate() {
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
@@ -1509,7 +2273,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // pending/green keeps draining (destination-green is the settle's).
         if pass_merged > 0 && !tip_sha.is_empty() {
             let tip_runs = ctx.check_runs(repo, &tip_sha);
-            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+            if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("burst drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
@@ -1527,10 +2291,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // is PARKED on this pass (its merge is in; the settle owns it) and
         // must never re-gate as if unmerged.
         let legs = train_legs(&card_meta);
+        // "On this lane" is repo AND base — a leg without a base stamp
+        // defaults to "main" (the card-stamp convention), the exact scoping
+        // the hub's derived queue uses (core.ts trainLegsRemaining,
+        // BR#4977). Without the base half, a second base's leg on this repo
+        // could be classified (and driven) by the wrong lane's walk; with it,
+        // an entry whose legs all target other bases is honestly "no unlanded
+        // leg on this lane" below. (BR#5753 walk half.)
         let lane_legs: Vec<usize> = legs
             .iter()
             .enumerate()
-            .filter(|(_, leg)| leg.repo == repo && !train_leg_landed(&card_meta, leg))
+            .filter(|(_, leg)| {
+                leg.repo == repo
+                    && leg.base.as_deref().unwrap_or("main") == base
+                    && !train_leg_landed(&card_meta, leg)
+            })
             .map(|(i, _)| i)
             .collect();
         if lane_legs.is_empty() {
@@ -1555,6 +2330,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             // BR#3935: this entry can never drive on this lane — advance.
+            // BR#5753: this stays an ADVANCE, not a bounce — post-BR#4977 the
+            // hub's derived queue only lists cards with an unlanded leg on
+            // THIS repo+base, so a static no-lane-leg entry cannot persist in
+            // lane.queue (the snapshot re-derives within one tick). A firing
+            // here is mid-tick drift, and the card may legitimately ride a
+            // SIBLING lane via its other unlanded legs — a hub bounce here
+            // would yank it off that lane's queue.
             log(Some(key), &format!("queue[{qi}] {head_id} has no unlanded leg on this lane ({} leg(s) cited) — advancing to the next queue entry", legs.len()));
             continue;
         }
@@ -1573,19 +2355,62 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let leg_number = leg_idx + 1;
         let pr = leg.number;
         if pr == 0 || leg.repo.is_empty() {
-            // BR#3935: a stamp-less leg can never drive — advance (the hub
-            // audit owns the convention violation; the card stays queued).
-            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
+            // BR#5753: a stamp-less leg can NEVER drive — and the old
+            // advance-only path left the card in the hub's derived queue
+            // FOREVER: the hub keeps matching the leg on repo+base+unlanded
+            // regardless of its missing number, so the entry re-derived into
+            // lane.queue every tick, a silent zombie inflating queue.length.
+            // Un-queue it on the hub: the audited impl bounce (train:bounced,
+            // gate class) stamps merge_train.state = "bounced" and flips the
+            // card blocked → in_progress with the fix-up brief — impl
+            // re-stamps the PR binding, re-verifies, re-queues. The bounce
+            // needs pr > 0: the card's own merge_train stamp supplies it
+            // (the hub's laneQueue SQL only queues cards with
+            // merge_train.pr > 0, falling back to any stamped leg). When
+            // even that is missing the entry is not hub-queueable anymore —
+            // snapshot drift: advance and let the snapshot re-derive.
+            let bounce_pr = card_meta
+                .pointer("/merge_train/pr")
+                .and_then(|v| v.as_i64())
+                .filter(|&n| n > 0)
+                .or_else(|| legs.iter().map(|l| l.number).find(|&n| n > 0))
+                .unwrap_or(0);
+            if bounce_pr > 0 {
+                renew_lease(ctx, repo, base);
+                let defect = format!(
+                    "queue entry leg {leg_number} on this lane carries no PR stamp (number 0 / empty repo) — the entry can never drive or land (BR#5753); re-stamp the card's PR binding (meta.prs leg), re-verify, re-queue"
+                );
+                ctx.mcp("train_event", json!({
+                    "repo": repo, "base": base, "kind": "bounced", "pr": bounce_pr, "task_id": head_id,
+                    "reason": defect, "bounce_kind": "gate",
+                }))?;
+                ctx.note(&format!("bounced {head_id} (gate, stamp-less) — leg {leg_number} carries no PR stamp; lane.queue self-heals this tick"));
+                log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — bounced off the hub (impl re-stamps the binding, re-verifies, re-queues; BR#5753)"));
+                release_if_idle(ctx, key, repo, base)?;
+                return Ok(());
+            }
+            // BR#3935 (fail-open residue): no bounceable pr stamp at all —
+            // advance (the hub audit owns the convention violation).
+            log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp and no bounceable train stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
             continue;
         }
         let mut facts = ctx.pr_facts(repo, pr)?;
+        if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
+            // reconcile: merged on GitHub, no train event (crash between merge and
+            // event) — stamp it and continue walking the remaining queue entries.
+            renew_lease(ctx, repo, base);
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
+            ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
+            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
+            continue;
+        }
         // L1.1 (BR#4685): poll, don't bounce. An unanswered mergeStateStatus
         // (null/UNKNOWN — GitHub computing, typical right after a base merge)
         // is backoff-polled inside this tick — bounded by the lease heartbeat
         // (renewed around every wait) — until GitHub answers. The gate below
         // bounces ONLY on definitive DIRTY/CONFLICTING; a merge/closure that
         // lands mid-poll reconciles through the arms below instead of gating.
-        if !mergeability_definitive(&facts) {
+        if vstr(&facts, "state") == Some("OPEN") && !mergeability_definitive(&facts) {
             log(Some(key), &format!("queue[{qi}] PR #{pr} mergeStateStatus not yet computed — backoff-polling before the gate (BR#4685, lease-bounded)"));
             for wait in mergeability_poll_secs() {
                 renew_lease(ctx, repo, base);
@@ -1599,19 +2424,25 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
         }
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
-            // reconcile: merged on GitHub, no train event (crash between merge and
-            // event) — stamp it and let the CI poll take over next tick.
             renew_lease(ctx, repo, base);
             ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
-            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, awaiting CI"));
-            return Ok(());
+            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
+            continue;
         }
-        if vstr(&facts, "state") == Some("CLOSED") {
-            // BR#3935: a CLOSED PR can never merge — the old drop-and-return
-            // starved the whole lane behind its card. Log it, leave the card
-            // for the humans, and drive the NEXT entry this same tick.
-            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED on GitHub — unlandable, advancing to the next queue entry (card stays for the humans)"));
+        // BR#5639 ghost car + BR#3935/BR#5897 lineage, fail-closed
+        // (BR#5911 F3): a leg whose live PR state is not OPEN can NEVER be
+        // a batch candidate — the 2026-11-03 incident reached batch `ready`
+        // while binding CLOSED PR #2659 (real leg #2759). The old
+        // `== CLOSED` shape let non-CLOSED fall-throughs (MERGED without a
+        // mergeCommit, an unreadable state) sail into the gate. Only a live
+        // OPEN read passes; everything else stamps cls:"blocked" so the
+        // hub never counts an unlandable PR as ready/green, and advances —
+        // the card stays for the humans, the queue is not held.
+        if !crate::train_gate::pr_state_is_batch_candidate(vstr(&facts, "state")) {
+            let st = vstr(&facts, "state").unwrap_or("(unreadable)");
+            qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
+            log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} live state is {st} (not OPEN) — unlandable, never a batch candidate, advancing to the next queue entry (card stays for the humans)"));
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
@@ -1640,8 +2471,24 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
         // on the card row, the binding under meta.root_fix).
         let root_fix = is_root_fix_card(&card);
+        // BR#5880 (live incident, tick 2026-11-03T21:23:47Z): every gate
+        // DECISION reads the LIVE check-runs for THIS head sha — the
+        // paginated ctx.check_runs() fetch above, this tick — never a
+        // cached, panel, or prior-tick value. The incident shape: the
+        // self-heal cited Nov-2 red runs on PR #2707's head while that
+        // head's latest run was SUCCESS (id 126074493096, 17:07Z) — the
+        // classification newest-wins law (aeae01cd2) plus this live-read
+        // rule make the cited-verdict-must-be-the-live-verdict invariant:
+        // a cache may speed renders, it must never feed a merge or
+        // self-heal decision.
         let head_checks = ctx.check_runs(repo, &head_sha);
         let commits = ctx.pr_commits(repo, pr);
+        // BR#5883: the tip's whole-tip gate predicate (the `main-green gate`
+        // judge) is green iff the hoisted scoped verdict is Green with NO
+        // gate qualifier attached — walk-start truth, never composed with
+        // the mid-drain forced green (a stale gate re-run must rest on the
+        // gate's own predicate, not on the burst's pass-green fiction).
+        let base_gate_green = base_class.verdict == MainVerdict::Green && base_class.gate.is_none();
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -1655,7 +2502,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             leg_number: Some(leg_number),
             root_fix,
             base_red_names: &base_red_names,
+            base_gate_green,
         });
+        // BR#6348: a car ALREADY parked TYPED conflicting is a clock, not a
+        // bounce. The hub's conflict bounce parks it (merge_train.state =
+        // "conflicting") IN the derived queue on a bounded budget with a
+        // loud alarm at expiry; re-verdicting it every tick would bounce-
+        // storm the ledger (the #279 ×31 class) and end this walk behind a
+        // car whose exit is the mechanical rebase leg, not a re-bounce.
+        // Convert the repeat conflicting verdict to a Skip: the walk
+        // advances (the queue is not held), and the queue_facts stamp below
+        // keeps cls "conflict" so the panel + starvation accounting still
+        // see the car. The FIRST conflicting verdict still bounces — that
+        // establishes the typed park with the trial-merge file list.
+        let gate = match gate {
+            MergeAction::Bounce { bounce_kind: crate::train_gate::BounceKind::Conflict, defect }
+                if card_meta.pointer("/merge_train/state").and_then(|v| v.as_str()) == Some("conflicting") =>
+            {
+                log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) already parked TYPED conflicting — skip (the bounded clock + budget alarm own the exit, BR#6348)"));
+                MergeAction::Skip { reason: format!("parked conflicting (BR#6348) — the typed clock + budget alarm own the exit; {defect}") }
+            }
+            g => g,
+        };
         let (kind, detail) = match &gate {
             MergeAction::Merge { .. } => ("merge", String::new()),
             MergeAction::CloseSuperseded { reason } => ("close_superseded", format!(" — {reason}")),
@@ -1663,8 +2531,34 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::RerunGate { reason } => ("rerun_gate", format!(" — {reason}")),
         };
         log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}): gate → {kind}{detail}"));
+        let ready_on_own_head = if gate_base != MainVerdict::Green && matches!(&gate, MergeAction::Skip { reason } if reason.starts_with("base main ")) {
+            matches!(
+                decide_train_gate(crate::train_gate::TrainGateInput {
+                    pr_number: pr,
+                    head_sha: &head_sha,
+                    card_meta: &card_meta,
+                    card_status: card_status.as_deref(),
+                    base_verdict: MainVerdict::Green,
+                    mergeable: facts.get("mergeable").and_then(|v| v.as_bool()),
+                    merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
+                    commits: &commits,
+                    head_checks: &head_checks,
+                    leg_number: Some(leg_number),
+                    root_fix,
+                    base_red_names: &[],
+                    // simulated green base ⇒ the qualifier-free green tip the
+                    // BR#5883 field encodes (RerunGate ≠ Merge, so the
+                    // ready_on_own_head predicate reads identically either way)
+                    base_gate_green: true,
+                }),
+                MergeAction::Merge { .. }
+            )
+        } else {
+            false
+        };
         qfacts.push(json!({ "id": head_id, "pr": pr, "cls": match &gate {
             MergeAction::Merge { .. } => "ready",
             MergeAction::Bounce { bounce_kind, .. } => match bounce_kind {
@@ -1672,7 +2566,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 crate::train_gate::BounceKind::Coverage => "needs-review",
                 _ => "blocked",
             },
-            MergeAction::Skip { reason } => if reason.contains("no accepted verify") { "needs-review" } else { "waiting" },
+            MergeAction::Skip { reason } => if reason.contains("no accepted verify") {
+                "needs-review"
+            } else if reason.contains("parked conflicting (BR#6348)") {
+                // BR#6348: a parked conflicting car stays honestly conflict-
+                // classed in the queue block — not "waiting"
+                "conflict"
+            } else if ready_on_own_head {
+                "ready"
+            } else {
+                "waiting"
+            },
+            MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));
 
@@ -1698,6 +2603,80 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
                 continue;
             }
+            MergeAction::RerunGate { reason } => {
+                // STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive —
+                // "the train already runs; the system aggressively
+                // self-heals"): the red is entirely the deploy-health class on
+                // a GREEN base — a verdict stamped against a superseded main
+                // deploy. Dispatch the re-run (check-runs rerequest, the same
+                // write the bisect re-run leg uses) and treat the entry as a
+                // clock: the next tick reads the fresh run green → merge, or
+                // honestly red → the standing law owns it. Once the rerequest
+                // is accepted the check goes in-flight (conclusion null →
+                // unsettled → Skip), so this arm fires once, never a storm.
+                if !ctx.write_allowed() {
+                    log(Some(key), &format!("IDENTITY GATE: gate re-run dispatch for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); a worker gateway heals the stale red"));
+                } else {
+                    // BR#5880: the dispatch set uses the SAME newest-wins law
+                    // as the verdict that fired this arm (latest judge run per
+                    // check name) — re-requesting a SUPERSEDED red (an older
+                    // run of a name whose latest is green) would re-open a
+                    // healed check and flip the head back to unsettled next
+                    // tick. Never the raw historical list.
+                    let stale = latest_red_deploy_health_runs(&head_checks);
+                    let mut dispatched = 0usize;
+                    let mut last_err: Option<String> = None;
+                    for r in &stale {
+                        // BR#5911 (F2): "classified fixable, dispatched 0" is a
+                        // loud contradiction, never a quiet no-op — the 5h
+                        // silent self-heal loop on PR #2707 dispatched 0 re-runs
+                        // every tick while logging success-shaped lines. The
+                        // failure is CAPTURED per attempt and, when nothing
+                        // dispatched, escalated: error-level log + a
+                        // self_heal_stalled stamp on this entry's queue_facts
+                        // (the hub panel and the starvation duty read it).
+                        let attempt = ctx
+                            .sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"])
+                            .or_else(|check_err| {
+                                ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"])
+                                    .map_err(|job_err| format!("check-runs rerequest: {check_err}; actions rerun: {job_err}"))
+                            });
+                        match attempt {
+                            Ok(_) => dispatched += 1,
+                            Err(e) => last_err = Some(trunc(&e, 240)),
+                        }
+                    }
+                    renew_lease(ctx, repo, base);
+                    // BR#5911 (F2): RerunGate firing already proves the
+                    // classification found ≥1 healable red — dispatched == 0
+                    // (gh rerun failed, or the dispatch set resolved no run
+                    // ids) is therefore always a loud contradiction, never a
+                    // quiet no-op. The 5h silent loop on PR #2707 logged
+                    // success-shaped "dispatched 0" lines every tick.
+                    if let Some(fact) = self_heal_stall_fact(stale.len(), dispatched, last_err.as_deref()) {
+                        // the stall stamp rides THIS tick's entry — the next
+                        // walk rebuilds the entries, so a tick that dispatches
+                        // cleanly drops it (self-clearing, same law as the
+                        // whole-row stalled field).
+                        if let Some(entry) = qfacts.last_mut() {
+                            entry.as_object_mut().map(|o| o.insert("self_heal_stalled".into(), fact.clone()));
+                        }
+                        let err_note = last_err.as_deref().unwrap_or("(no run resolved — dispatch set was empty against a red verdict)");
+                        ctx.note(&format!("SELF-HEAL STALLED on PR #{pr}: classified healable red(s), dispatched 0 — {err_note}"));
+                        log(Some(key), &format!("ERROR — queue[{qi}] PR #{pr} self-heal STALLED: dispatch set resolved {reds} run(s), 0 re-run(s) dispatched ({err_note}); stamped self_heal_stalled into queue_facts (BR#5911)", reds = stale.len()));
+                    } else {
+                        let err_suffix = match last_err.as_deref() {
+                            Some(e) => format!(" (partial: {e})"),
+                            None => String::new(),
+                        };
+                        ctx.note(&format!("self-heal: dispatched {dispatched} stale gate re-run(s) on PR #{pr} — {reason}"));
+                        log(Some(key), &format!("queue[{qi}] PR #{pr} self-heal: {dispatched} stale deploy-health gate re-run(s) dispatched on a green base — polling next tick{err_suffix}"));
+                    }
+                }
+                // the entry is a clock (waiting), never a defect: advance —
+                // the queue is not held by a stale red
+                continue;
+            }
             MergeAction::HumanLeg { reason } => {
                 // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
                 // deploy-health class — the deterministic one-click merge ask
@@ -1706,21 +2685,35 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // merges the cure onto the red base.
                 if root_fix {
                     renew_lease(ctx, repo, base);
+                    // BR#6390 human-gate contract: the ask says DO THIS, then
+                    // CLICK DONE — the copyable --admin merge command + PR and
+                    // card links inline, and the options are the accept/decline
+                    // pair the ask planes render as inline buttons. DONE is
+                    // dispatched hub-side (trainAlarmAnswerDispatch stamps
+                    // lane.bypass_merge; the executor's stamp consumer lands or
+                    // acks the merge). DECLINE holds the line, stamps nothing.
                     let fast_details = [
                         format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
                         "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
-                        "Merging the cure is what turns main green again; declining holds the line (bisect stays parked on the cure).".to_string(),
+                        "HUMAN GATE — do this and click DONE when done to unblock:".to_string(),
+                        "1. Merge the cure out of turn (the gate fails every PR — including this fix PR itself — until the fix lands on the base). Copy-paste:".to_string(),
+                        "   ```".to_string(),
+                        format!("   gh pr merge {pr} --repo {repo} --admin --squash"),
+                        "   ```".to_string(),
+                        format!("2. Click DONE — PR #{pr} merged below. The queue unblocks itself: main's checks re-run on the new merge commit and the train drains once they settle green."),
+                        format!("Links: fix PR {repo}#{pr} — https://github.com/{repo}/pull/{pr} · fix card {head_id}."),
+                        "DECLINE — hold the line keeps the queue parked until main greens some other way; the fix work keeps digging.".to_string(),
                     ].join("\n\n");
                     ctx.mcp("ask_agent", json!({
                         "to": "human",
                         "question": root_fix_fast_lane_title(repo, pr),
                         "reason": reason,
                         "details": fast_details,
-                        "options": ["Merge the cure now", "Not yet — hold the line"],
+                        "options": [format!("DONE — PR #{pr} merged"), "DECLINE — hold the line"],
                         "artefact_id": head_id,
                     }))?;
-                    ctx.note(&format!("root-fix fast lane: filed the one-click merge ask for PR #{pr} (circular deploy-health class)"));
-                    log(Some(key), &format!("root-fix fast lane: human merge ask filed for PR #{pr} — the train cannot merge through the circular gate"));
+                    ctx.note(&format!("root-fix fast lane: filed the human-gate merge ask for PR #{pr} (circular deploy-health class)"));
+                    log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
                     release_if_idle(ctx, key, repo, base)?;
                     return Ok(());
                 }
@@ -1817,6 +2810,63 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // the truth of this pass: which entries are ready (the next batch) and
     // which wait/leave. One write per tick; failures never break the tick.
     // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
+    // ---- PHASE B (BR#4996 + BR#5658): select the batch — the maximal set of
+    // MUTUALLY non-conflicting candidates, queue order = landing order.
+    // Conflict pairs come from the candidates' changed-file sets (merge-base
+    // diff), then each intersecting pair is CONFIRMED head-vs-head with
+    // merge-tree (BR#3935 fail-closed: a probe that cannot run counts as
+    // conflicting, and a candidate whose file set cannot be computed is
+    // excluded as not-known-clean — select_batch's clean[i] == false law).
+    // Computed before the queue_facts stamp so conflict_pairs ([pr_a, pr_b])
+    // ride the stamp and the hub can partition the backlog into sequential
+    // merge batches (Batch 1 | Batch 2 | …).
+    let mut batch: Vec<usize> = Vec::new();
+    let mut conflict_pairs_prs: Vec<[i64; 2]> = Vec::new();
+    let mut batch_deferred_log: Option<String> = None;
+    let mut batch_selected_log: Option<(usize, String)> = None;
+    if !candidates.is_empty() {
+        let mut clean: Vec<bool> = vec![true; candidates.len()];
+        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
+                Ok(set) => file_sets.push(set),
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
+                    clean[i] = false;
+                    file_sets.push(crate::train_gate::FileSet::new());
+                }
+            }
+        }
+        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
+        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
+            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
+                Ok(true) => {
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
+                    conflict_pairs.push((i, j));
+                    conflict_pairs_prs.push([candidates[i].pr, candidates[j].pr]);
+                }
+            }
+        }
+        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
+        if batch.len() < candidates.len() {
+            let dropped: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !batch.contains(i))
+                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
+                .collect();
+            batch_deferred_log = Some(format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
+        }
+        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
+        batch_selected_log = Some((batch.len(), batch_ids.join(", ")));
+    }
+
+    // BR#5265: the stamp now rides whenever CARS ARE QUEUED (not only when
     // the walk produced verdicts — entries can short-circuit pre-gate) and
     // carries base_state (Fix A): the hub renders the lane BLOCKED with
     // the base red names + files the one-per-episode human alarm ask.
@@ -1826,6 +2876,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // base_state); the next stamp after a landing omits it, which clears
         // the state by itself.
         let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state });
+        if !conflict_pairs_prs.is_empty() {
+            qf.as_object_mut().unwrap().insert("conflict_pairs".into(), json!(conflict_pairs_prs));
+        }
         if let Some(st) = ctx.stall.get(key) {
             qf.as_object_mut().unwrap().insert(
                 "stalled".into(),
@@ -1848,52 +2901,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         }
     }
 
-
-    // ---- PHASE B (BR#4996): select the batch — the maximal set of MUTUALLY
-    // non-conflicting candidates, queue order = landing order. Conflict
-    // pairs come from the candidates' changed-file sets (merge-base diff),
-    // then each intersecting pair is CONFIRMED head-vs-head with merge-tree
-    // (BR#3935 fail-closed: a probe that cannot run counts as conflicting,
-    // and a candidate whose file set cannot be computed is excluded as
-    // not-known-clean — select_batch's clean[i] == false law).
-    let mut batch: Vec<usize> = Vec::new();
-    if !candidates.is_empty() {
-        let mut clean: Vec<bool> = vec![true; candidates.len()];
-        let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
-        for (i, c) in candidates.iter().enumerate() {
-            match ctx.pr_file_set(base, c.pr, &c.head_sha) {
-                Ok(set) => file_sets.push(set),
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} file set unreadable ({}) — excluded from the batch as not-known-clean (BR#3935 fail-closed)", c.pr, trunc(&e, 160)));
-                    clean[i] = false;
-                    file_sets.push(crate::train_gate::FileSet::new());
-                }
-            }
-        }
-        let mut conflict_pairs: Vec<(usize, usize)> = Vec::new();
-        for (i, j) in crate::train_gate::conflicts_from_file_sets(&file_sets) {
-            match ctx.heads_conflict(&candidates[i].head_sha, &candidates[j].head_sha) {
-                Ok(true) => conflict_pairs.push((i, j)),
-                Ok(false) => {}
-                Err(e) => {
-                    log(Some(key), &format!("batch: PR #{} × #{} conflict probe unreadable ({}) — pair counted CONFLICTING (BR#3935 fail-closed)", candidates[i].pr, candidates[j].pr, trunc(&e, 160)));
-                    conflict_pairs.push((i, j));
-                }
-            }
-        }
-        batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
-        if batch.len() < candidates.len() {
-            let dropped: Vec<String> = candidates
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !batch.contains(i))
-                .map(|(_, c)| format!("PR #{} (queue[{}])", c.pr, c.qi))
-                .collect();
-            log(Some(key), &format!("batch selection: {} of {} candidate(s) — deferred to the next pass: {}", batch.len(), candidates.len(), dropped.join(", ")));
-        }
-        let batch_ids: Vec<String> = batch.iter().map(|&i| format!("PR #{} [{}]", candidates[i].pr, candidates[i].head_id)).collect();
-        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", batch.len()));
-        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", batch.len(), batch_ids.join(", ")));
+    if let Some(msg) = batch_deferred_log {
+        log(Some(key), &msg);
+    }
+    if let Some((n_sel, ids_str)) = batch_selected_log {
+        ctx.note(&format!("batch selected: {} member(s) — landing back-to-back", n_sel));
+        log(Some(key), &format!("batch (BR#4996): {} mutually non-conflicting member(s), landing in queue order: {}", n_sel, ids_str));
     }
 
     // identity gate at the write boundary (BR#3181): the batch's merge legs
@@ -1938,7 +2951,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // pending/green keeps landing (destination-green is the settle's).
         if pass_merged > 0 && !tip_sha.is_empty() {
             let tip_runs = ctx.check_runs(repo, &tip_sha);
-            if classify_main_check_runs(&tip_runs).verdict == MainVerdict::Red {
+            if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("batch drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
@@ -1965,7 +2978,33 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             None => method_flag_for(&ctx.method),
         };
         ctx.tick_attempted = true;
-        if let Err(err) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]) {
+        let mut merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+        if merge_res.is_err() && cand.root_fix {
+            if let Ok(out) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin"]) {
+                merge_res = Ok(out);
+            }
+        }
+        if pass_merged > 0 {
+            for wait_secs in [3u64, 5, 8] {
+                let is_transient_post_merge = match &merge_res {
+                    Err(e) => {
+                        let l = e.to_lowercase();
+                        l.contains("base branch was modified")
+                            || l.contains("try the merge again")
+                            || l.contains("pull request is not mergeable")
+                    }
+                    Ok(_) => false,
+                };
+                if !is_transient_post_merge {
+                    break;
+                }
+                renew_lease(ctx, repo, base);
+                std::thread::sleep(Duration::from_secs(wait_secs));
+                renew_lease(ctx, repo, base);
+                merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+            }
+        }
+        if let Err(err) = merge_res {
             let low = err.to_lowercase();
             if low.contains("up to date") || low.contains("behind") || low.contains("out of date") {
                 // strict protection wants the branch current — the one case
@@ -1985,9 +3024,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 match merge_refusal_fallback(zero_behind, clean, &tm_files) {
                     RefusalFallback::UpdateBranch => {
                         ctx.sh("gh", &["pr", "update-branch", &pr.to_string(), "--repo", repo])?;
-                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carries); merging next tick"));
-                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch clean, merging next tick"));
-                        break; // BR#4996: the batch tail below settles the landed prefix honestly
+                        if let Ok(updated) = ctx.pr_facts(repo, pr) {
+                            let to_head = vstr(&updated, "headRefOid").unwrap_or("");
+                            if !to_head.is_empty() && !to_head.eq_ignore_ascii_case(head_sha) {
+                                let _ = ctx.mcp("train_carry", json!({
+                                    "repo": repo,
+                                    "base": base,
+                                    "pr": pr,
+                                    "from_head": head_sha,
+                                    "to_head": to_head,
+                                }));
+                            }
+                        }
+                        ctx.note(&format!("strict protection: machine update-branch PR #{pr} (verdict carried); merging next tick"));
+                        log(Some(key), &format!("PR #{pr}: merge refused (branch not up to date) — machine update-branch + train_carry recorded, continuing batch"));
+                        continue;
                     }
                     RefusalFallback::ConflictBounce => {
                         // BR#4066: the event kind is REFINED from the
@@ -2007,16 +3058,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         ctx.mcp("train_event", ev)?;
                         ctx.note(&format!("bounced PR #{pr} [{event_kind}] — {}", trunc(&conflict_reason, 120)));
                         let files_note = format!("conflicts in {} file(s): {}{}", tm_files.len(), tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" });
-                        log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
-                        // BR#4996: mid-batch the landed prefix still owes its
-                        // settle; a fresh pass releases honestly (the bounce
-                        // already ended the batch walk).
-                        if pass_merged > 0 {
-                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                        } else {
-                            release_if_idle(ctx, key, repo, base)?;
-                        }
-                        return Ok(());
+                        log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}; continuing batch"));
+                        continue;
                     }
                     RefusalFallback::StaleOrInfra => {
                         // BR#5252 (b): a file-less not-clean read (real text
@@ -2033,16 +3076,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                             if zero_behind { "; head is 0 behind (base tip ∈ ancestry)" } else { "" },
                             trunc(&err, 200)
                         ));
-                        log(Some(key), &format!("PR #{pr}: phantom merge refusal (BR#5252) — no bounce, retrying next tick"));
-                        // Same batch courtesy as a soft-break: the landed
-                        // prefix settles, the phantom-refused member waits
-                        // for the next pass (BR#4996).
-                        if pass_merged > 0 {
-                            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                        } else {
-                            release_if_idle(ctx, key, repo, base)?;
-                        }
-                        return Ok(());
+                        log(Some(key), &format!("PR #{pr}: phantom merge refusal (BR#5252) — no bounce, continuing batch"));
+                        continue;
                     }
                 }
             }
@@ -2069,12 +3104,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
             } else {
                 // BR#4996 soft-break: a refused merge mid-batch must not fail the
-                // whole tick — the landed prefix settles, the refused member
-                // waits for the next pass. A fresh pass keeps the loud error.
-                if pass_merged > 0 {
-                    log(Some(key), &format!("batch soft-break: gh pr merge refused PR #{pr} mid-batch ({}) — settling the landed prefix of {} merge(s)", trunc(&err, 200), pass_merged));
-                    burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-                    return Ok(());
+                // whole tick — continue to the remaining batch members and settle
+                // at the end of the batch.
+                if pass_merged > 0 || bi + 1 < batch.len() {
+                    log(Some(key), &format!("batch soft-skip: gh pr merge refused PR #{pr} ({}) — continuing to remaining batch members", trunc(&err, 200)));
+                    continue;
                 }
                 return Err(err);
             }
@@ -2128,6 +3162,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // per drain pass, on the FINAL merge commit (BR#4934, unchanged).
     // Otherwise the lane is honestly idle.
     if pass_merged > 0 && !tip_sha.is_empty() {
+        if from_awaiting_ci && pass_merged == initial_pass_merged {
+            settle_window_rebase(ctx, key, repo, base, lane)?;
+            return Ok(());
+        }
         burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
         return Ok(());
     }
@@ -2252,13 +3290,13 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
             }
             // BR#4066 refinement rides here too — one law, both implementations.
             let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, files.len());
-            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts bounced to impl agent to resolve; the verdict does not carry");
             let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "bounce_kind": event_kind, "reason": reason });
             if event_kind == "conflict" {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
             ctx.mcp("train_event", ev)?;
-            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced for human resolution", files.len()));
+            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced to impl agent to resolve", files.len()));
             return Ok(());
         }
         // Ray 2026-10-30: "if it's still mergeable, go — we only need a
@@ -2279,7 +3317,7 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
 /// probes pin the final card; an unreadable or bound-stalled probe stamps
 /// inconclusive and the pass bounces oldest-first, one per tick. GitHub
 /// re-run dispatch (check-runs rerequest) is a WRITE — worker-class only.
-fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -> Result<(), String> {
+fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, required: &[String]) -> Result<(), String> {
     let bisect = match stop.get("bisect").filter(|b| !b.is_null()) {
         Some(b) => b,
         None => return Ok(()), // legacy stop — nothing to bisect
@@ -2367,7 +3405,7 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value) -
         }
     };
     let runs = ctx.check_runs(repo, &sha);
-    match classify_main_check_runs(&runs).verdict {
+    match classify_base_check_runs(&runs, required).verdict {
         MainVerdict::Red => {
             renew_lease(ctx, repo, base);
             ctx.mcp("train_bisect", json!({ "repo": repo, "base": base, "step": { "sha": sha, "verdict": "red" }, "culprit_task": task, "culprit_sha": sha }))?;
@@ -2460,6 +3498,11 @@ fn tick(ctx: &mut Ctx) -> Result<(), String> {
             log(Some(&key), "lane retired (lane card closed) — skipping (BR#4977)");
             continue;
         }
+        // BR#4754: remember the lane card — the one-per-episode token-rot
+        // note lands there when a blind episode self-heals.
+        if let Some(c) = lane.get("card").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            ctx.last_lane_card = Some(c.to_string());
+        }
         // Daemon mode resolves the workdir per lane from the managed clone
         // cache (or the MERGE_TRAIN_WORKDIR override) before driving it.
         if ctx.in_process {
@@ -2502,19 +3545,212 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
     if ctx.once {
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
-            return 1;
-        }
-        return 0;
+        return once_run(&mut ctx);
     }
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     loop {
         let started = now_ms();
-        if let Err(e) = tick(&mut ctx) {
-            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+        match tick(&mut ctx) {
+            Ok(()) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — report it once so the
+                // board learns WHY the lane went quiet (the token-rot class),
+                // not just that it did.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
+            Err(e) => {
+                log(None, &format!("tick failed: {}", trunc(&e, 300)));
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // BR#4754: fail LOUDLY and exit non-zero — a supervisor
+                        // (systemd/launchd/nohup loop) restarts a fresh process
+                        // that re-resolves the store and re-runs the ladder with
+                        // a clean slate; the pre-fix loop instead ticked blindly
+                        // forever (1,684 silent failures on the super lane).
+                        let (since, ticks) = match blind.as_ref() {
+                            Some(b) => (b.since_ms, b.ticks),
+                            None => (now_ms(), 0),
+                        };
+                        log(
+                            None,
+                            &format!(
+                                "TOKEN-BLIND — EXITING (exit 1): the hub rejected this executor's credential for {} tick(s) since {} and the auth ladder (store reload + principal re-vend) failed {} consecutive runs. A supervisor restart picks up fresh credentials; if the principal itself is dead, the operator must re-pair (`bridge pair <hub-url>`).",
+                                ticks,
+                                iso(since),
+                                heal.streak,
+                            ),
+                        );
+                        return 1;
+                    }
+                }
+            }
         }
         let spent = now_ms() - started;
         std::thread::sleep(Duration::from_millis(ctx.interval_ms.saturating_sub(spent).max(1000)));
+    }
+}
+
+/// `--once`: one tick, one ladder attempt on an auth-class failure (cron
+/// re-runs pick up the healed pairing). Exit 0 on a clean tick, else 1.
+fn once_run(ctx: &mut Ctx) -> i32 {
+    match tick(ctx) {
+        Ok(()) => 0,
+        Err(e) => {
+            log(None, &format!("tick failed: {}", trunc(&e, 300)));
+            if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                log(None, "auth-class failure — one ladder attempt before giving up");
+                if try_auth_ladder(ctx, &mut crate::dispatch::AuthHeal::new()) {
+                    return match tick(ctx) {
+                        Ok(()) => 0,
+                        Err(e2) => {
+                            log(None, &format!("tick failed after re-vend: {}", trunc(&e2, 300)));
+                            1
+                        }
+                    };
+                }
+            }
+            1
+        }
+    }
+}
+
+/// BR#4754 — a token-rot episode: consecutive auth-class tick failures since
+/// `since_ms`. Cleared by the first successful tick (which also fires the
+/// one-per-episode board note once the episode is worth naming).
+struct BlindStreak {
+    since_ms: u64,
+    ticks: u32,
+}
+
+/// A blind episode shorter than this is a hiccup (a single rotated mid-flight
+/// tick), not an outage — it does not earn a board note.
+const BLIND_NOTE_MIN_TICKS: u32 = 3;
+
+/// What the daemon loop should do after an auth-classified tick failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthOutcome {
+    /// stay in the loop (ladder attempted or paced out)
+    Continue,
+    /// the ladder is exhausted — exit loudly (standalone daemon only)
+    Park,
+}
+
+/// Shared auth failure path for BOTH daemon loops: the caller has already
+/// classified the error auth-class and streaked it; this paces (the hub
+/// rate-limits /api/token/repair at 6/h per row — an unpaced ladder in a 45s
+/// loop would burn the mint budget in minutes) and attempts the ladder when
+/// due. Returns Park when AUTH_PARK_ATTEMPTS consecutive ladder runs failed.
+fn on_tick_auth_failure(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal, e: &str) -> AuthOutcome {
+    if crate::dispatch::classify_hub_error(e) != crate::dispatch::HubErrClass::Auth {
+        return AuthOutcome::Continue;
+    }
+    match heal.on_auth_failure(std::time::Instant::now()) {
+        crate::dispatch::HealStep::Wait => AuthOutcome::Continue,
+        crate::dispatch::HealStep::Attempt => {
+            if try_auth_ladder(ctx, heal) {
+                AuthOutcome::Continue
+            } else if heal.streak >= crate::dispatch::AUTH_PARK_ATTEMPTS {
+                AuthOutcome::Park
+            } else {
+                AuthOutcome::Continue
+            }
+        }
+    }
+}
+
+/// One run of the BR#4754 auth ladder when a hub call comes back
+/// auth-rejected. True = the ctx now carries a fresh pairing.
+/// `Ok`/`Err` reasons are logged by the caller — never swallowed (the 2026-10-27
+/// incidents: "repair failed" with zero why).
+fn try_auth_ladder(ctx: &mut Ctx, heal: &mut crate::dispatch::AuthHeal) -> bool {
+    match auth_ladder_with(&ctx.hub, &ctx.token, &|| crate::dispatch::DispatchConfig::resolve()) {
+        Ok((hub, token)) => {
+            ctx.hub = hub;
+            ctx.token = token;
+            heal.on_repair_success();
+            log(None, "hub rejected the stored token — the auth ladder re-vended the pairing; re-ticking");
+            true
+        }
+        Err(why) => {
+            log(
+                None,
+                &format!(
+                    "auth ladder failed (attempt {}/{}): {}",
+                    heal.streak,
+                    crate::dispatch::AUTH_PARK_ATTEMPTS,
+                    trunc(&why.join("; "), 240)
+                ),
+            );
+            false
+        }
+    }
+}
+
+/// BR#4754 — the train executor's auth self-heal ladder (the BR#4113
+/// ladder's train-leg twin). A token-blind daemon cannot ask the hub for
+/// ANYTHING under the dead bearer — but the repair route authenticates by
+/// PRINCIPAL (the durable device credential, BR#2711 §2), so self-heal is
+/// possible while fully blind: (1) reload the store — another process on
+/// this device (the runner's dispatch loop) may have re-vended the token;
+/// (2) agent-plane re-vend by principal (`repair_by_principal` —
+/// headless-safe, and it PERSISTS the fresh secret to the store so a
+/// supervisor-restarted process resolves it directly). The human-plane leg
+/// is desktop-only by design. Returns the fresh (hub, token) to adopt.
+/// The store leg is injected (see `auth_ladder_with`) so unit tests stay
+/// machine-independent.
+fn auth_ladder_with(
+    prev_url: &str,
+    prev_token: &str,
+    store: &dyn Fn() -> Option<crate::dispatch::DispatchConfig>,
+) -> Result<(String, String), Vec<String>> {
+    let mut failures: Vec<String> = Vec::new();
+    match store() {
+        Some(fresh) if !fresh.token.is_empty() && fresh.token != prev_token => {
+            return Ok((fresh.url, fresh.token));
+        }
+        Some(_) => failures.push("store token unchanged".into()),
+        None => failures.push("no resolvable config in the store".into()),
+    }
+    let client = match reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            failures.push(format!("repair client build failed: {e}"));
+            return Err(failures);
+        }
+    };
+    match crate::dispatch::repair_by_principal(&client, prev_url) {
+        Ok(cfg) => Ok((cfg.url, cfg.token)),
+        Err(e) => {
+            failures.push(format!("principal repair: {e}"));
+            Err(failures)
+        }
+    }
+}
+
+/// BR#4754 — the board-visible half of the token-rot fix. A token-blind
+/// daemon is board-MUTE by construction (every hub write needs the bearer
+/// the hub just rejected), so the alarm cannot fire mid-blind; what CAN
+/// reach the board is the retroactive note once the ladder heals: one
+/// log_progress per episode on the lane card naming the class, the window,
+/// and the remedy — so the board holds the CAUSE, not just a lease-less lane.
+fn board_note_token_rot(ctx: &mut Ctx, streak: &BlindStreak) {
+    let Some(card) = ctx.last_lane_card.clone() else {
+        return;
+    };
+    let did = format!(
+        "token-rot episode: {} tick(s) failed 'unknown auth token' since {} — the executor self-healed via the auth ladder (store reload / principal re-vend, BR#4754) and the lane tick resumed",
+        streak.ticks,
+        iso(streak.since_ms)
+    );
+    if let Err(e) = ctx.mcp("log_progress", json!({ "id": card, "did": did, "will": "none — the executor is ticking again", "sentiment": "neutral" })) {
+        log(None, &format!("token-rot board note failed (non-fatal): {}", trunc(&e, 160)));
     }
 }
 
@@ -2869,6 +4105,12 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         tick_attempted: false,
         tick_landed: 0,
         tick_error: None,
+        auto_rerun_shas: std::collections::HashSet::new(),
+        auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+        cancelled_redundant_runs: std::collections::HashSet::new(),
+        #[cfg(test)]
+        sh_mock: None,
+        last_lane_card: None,
     })
 }
 
@@ -2895,6 +4137,11 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
     let mut preflighted = false;
     let mut failures: u32 = 0;
     let mut ticks: u64 = 0;
+    // BR#4754: the same paced auth ladder the standalone daemon runs —
+    // role:"train" nodes have NO dispatch loop, so this leg is the only
+    // thing that can re-vend a rotated pairing on those hosts.
+    let mut heal = crate::dispatch::AuthHeal::new();
+    let mut blind: Option<BlindStreak> = None;
     let mut last_reconcile: Option<std::time::Instant> = None;
     loop {
         // sleep in small slices so stop is responsive (same law as run_loop)
@@ -2948,15 +4195,32 @@ fn daemon_loop(cfg: DaemonTrainConfig, stop: std::sync::Arc<AtomicBool>) {
         // loudly, continue — the lease TTL reconciles any half-state.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(&mut ctx)));
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                heal.on_hub_accepted();
+                // BR#4754: a blind episode just ended — name it on the lane
+                // card (once per episode) so the board holds the CAUSE.
+                if let Some(s) = blind.take() {
+                    if s.ticks >= BLIND_NOTE_MIN_TICKS {
+                        board_note_token_rot(&mut ctx, &s);
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 failures += 1;
-                if e.contains("401") {
-                    // the pairing rotated under us — rebuild from the
-                    // keychain/config and let the next tick retry
-                    if let Ok(fresh) = ctx_for_daemon(&cfg) {
-                        ctx = fresh;
-                        log(None, "gateway token rotated — train leg re-vended its pairing");
+                // BR#4754: the old sniff (`e.contains("401")`) missed the
+                // JSON-RPC shape the hub actually returns for a dead token
+                // ("unknown auth token" — no HTTP status in the string), so a
+                // rotated pairing stayed broken here too on role:"train"
+                // nodes (no dispatch loop to refresh the store). Classified
+                // + paced ladder now; the leg NEVER exits its host.
+                if crate::dispatch::classify_hub_error(&e) == crate::dispatch::HubErrClass::Auth {
+                    let s = blind.get_or_insert(BlindStreak { since_ms: now_ms(), ticks: 0 });
+                    s.ticks += 1;
+                    if on_tick_auth_failure(&mut ctx, &mut heal, &e) == AuthOutcome::Park {
+                        // the leg itself survives — it just stops hammering
+                        // the ladder; the capped cadence keeps retrying (the
+                        // dispatch loop's park path owns the loud surface)
+                        log(None, "auth ladder exhausted — the train leg keeps ticking on the capped cadence (host loop owns the park/alarm surface)");
                     }
                 }
                 log(None, &format!("tick failed: {}", trunc(&e, 300)));
@@ -3038,10 +4302,19 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
         // Read-only by construction: `gh pr list` is the ONLY GitHub call
         // this leg makes (accepted BR#3499/BR#3507 — the gateway holds no
         // board authority and the hub holds no VCS credentials).
-        let rows = ctx.gh_json(&[
+        let rows = match ctx.gh_json(&[
             "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
             "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
-        ])?;
+        ]) {
+            Ok(r) => r,
+            Err(e) if e.contains("502") || e.contains("504") || e.contains("Bad Gateway") || e.contains("timeout") => {
+                ctx.gh_json(&[
+                    "pr", "list", "--repo", &repo, "--state", "open", "--limit", "100",
+                    "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft",
+                ])?
+            }
+            Err(e) => return Err(e),
+        };
         let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3322,6 +4595,91 @@ mod tests {
         assert!(!f2);
     }
 
+    // ---- BR#5633: the awaiting-park sweep decision (bridge#364) ----
+
+    fn open_pr_at(head: &str) -> Value {
+        json!({ "state": "OPEN", "headRefOid": head, "mergeable": true, "mergeStateStatus": "CLEAN" })
+    }
+
+    const SWEEP_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The covered-head case: an OPEN parked card with no prior sweep stamp
+    /// (or a stamp from a DIFFERENT head) is re-asserted through the audited
+    /// bounce path — the hub then re-queues it (verdict covers the live
+    /// head) or bounces it to impl for a fresh verify. Either way the park
+    /// has its machine exit.
+    #[test]
+    fn awaiting_sweep_reasserts_an_open_card_br5633() {
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), None);
+        assert_eq!(a, SweepAction::Reassert { task: "BR#1".into(), pr: 2518, head_sha: SWEEP_HEAD.into() });
+        // a stamp at a DIFFERENT head never rate-limits — live facts moved
+        let stamp = json!({ "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "outcome": "awaiting_park", "at": T0 });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+        assert!(matches!(a, SweepAction::Reassert { .. }));
+    }
+
+    /// The pr-closed case: MERGED/CLOSED PRs are skipped entirely — the
+    /// landed/close path owns those cards; the sweep never speaks for them.
+    #[test]
+    fn awaiting_sweep_skips_non_open_prs_br5633() {
+        for state in ["MERGED", "CLOSED"] {
+            let facts = json!({ "state": state, "headRefOid": SWEEP_HEAD });
+            let a = awaiting_sweep_action("BR#1", 2518, Ok(&facts), None);
+            assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("landed/close")), "{state} must skip to the landed/close path");
+        }
+    }
+
+    /// The unchanged-human-leg case: a card the hub re-parked (awaiting_park
+    /// outcome) at the SAME head is rate-limited — one event per
+    /// (card, head), never one per tick. Any other outcome at the same head
+    /// re-asserts (the card should have LEFT the awaiting set; if it did
+    /// not, it must not strand).
+    #[test]
+    fn awaiting_sweep_rate_limits_the_settled_human_leg_park_br5633() {
+        let stamp = json!({ "head": SWEEP_HEAD, "outcome": "awaiting_park", "at": T0 });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("rate-limited")));
+        for outcome in ["machine_requeue", "impl_bounce"] {
+            let stamp = json!({ "head": SWEEP_HEAD, "outcome": outcome, "at": T0 });
+            let a = awaiting_sweep_action("BR#1", 2518, Ok(&open_pr_at(SWEEP_HEAD)), Some(&stamp));
+            assert!(matches!(a, SweepAction::Reassert { .. }), "{outcome} at an unchanged head must re-assert, not strand");
+        }
+    }
+
+    /// Unreadable live facts and headless OPEN PRs fail closed: skip with no
+    /// stamp, retry next tick — the sweep never asserts a head it did not
+    /// read.
+    #[test]
+    fn awaiting_sweep_fails_closed_on_unreadable_facts_br5633() {
+        let a = awaiting_sweep_action("BR#1", 2518, Err("gh: connection reset"), None);
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("retry next tick")));
+        let headless = json!({ "state": "OPEN", "headRefOid": "" });
+        let a = awaiting_sweep_action("BR#1", 2518, Ok(&headless), None);
+        assert!(matches!(a, SweepAction::Skip { why, .. } if why.contains("fail closed")));
+    }
+
+    /// The wire contract: the sweep's bounce event mirrors the executor's
+    /// real coverage-bounce shape, and its reason carries NONE of the
+    /// human-leg vocabulary (the hub classifies a re-asserted park on the
+    /// card's STORED defect/conflict files — a marker that named a human leg
+    /// would strand every machine-lapsed park back into the park).
+    #[test]
+    fn awaiting_sweep_bounce_event_mirrors_the_real_coverage_bounce_br5633() {
+        let ev = awaiting_sweep_bounce_event("state-vector/superpositional", "main", "BR#4711", 2518, SWEEP_HEAD);
+        assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("bounced"));
+        assert_eq!(ev.get("bounce_kind").and_then(|v| v.as_str()), Some("coverage"));
+        assert_eq!(ev.get("task_id").and_then(|v| v.as_str()), Some("BR#4711"));
+        assert_eq!(ev.get("pr").and_then(|v| v.as_i64()), Some(2518));
+        assert_eq!(ev.get("head_sha").and_then(|v| v.as_str()), Some(SWEEP_HEAD));
+        assert_eq!(ev.get("repo").and_then(|v| v.as_str()), Some("state-vector/superpositional"));
+        assert_eq!(ev.get("base").and_then(|v| v.as_str()), Some("main"));
+        let reason = ev.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(reason.to_lowercase().contains("awaiting sweep"), "the reason must carry the sweep marker the hub restores on");
+        for banned in ["dismiss", "review", "approval", "signing environment", "key unavailable", "NO_USER", "conflict"] {
+            assert!(!reason.to_lowercase().contains(&banned.to_lowercase()), "reason must not carry human-leg vocabulary: {banned}");
+        }
+    }
+
     #[test]
     fn merge_method_refusal_matches_githubs_exact_class_br5376() {
         // the 2026-10-30 → 11-01 sp outage text, verbatim from the executor log
@@ -3362,6 +4720,148 @@ mod tests {
         assert_eq!(method_flag_for("squash"), "--squash");
         assert_eq!(method_flag_for("rebase"), "--rebase");
         assert_eq!(method_flag_for("merge"), "--merge");
+    }
+
+    // ---- BR#5623: paginated check-run read — the base-green gate must see
+    // past GitHub's default 30-entry page 1 ----
+
+    fn filler_run(i: usize) -> Value {
+        json!({
+            "id": 1_000_000 + i as i64,
+            "name": format!("Product surface canary (dev) #{i}"),
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": format!("https://github.example/run/{i}"),
+        })
+    }
+
+    fn required_run(name: &str, id: i64) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": format!("https://github.example/run/{id}"),
+        })
+    }
+
+    const LANE_REQUIRED: [&str; 4] = [
+        "deploy / Deploy to dev",
+        "post-deploy / Post-Deploy Smoke",
+        "post-deploy / DNS chain (front doors)",
+        "post-deploy / Lodestar Storage Health",
+    ];
+
+    #[test]
+    fn check_runs_pagination_finds_required_runs_past_page_one_br5623() {
+        // The 2026-11-02 lane-death shape: a frozen tip with 100 scheduled
+        // runs newer than the four lane-required deploy runs — page 1 (even
+        // at per_page=100) holds only filler, the required runs live on
+        // page 2. The old single-page read classified this exact shape as
+        // verdict "empty" and blocked the lane for 10.6h.
+        let page1: Vec<Value> = (0..100).map(filler_run).collect();
+        let page2: Vec<Value> = LANE_REQUIRED
+            .iter()
+            .enumerate()
+            .map(|(i, name)| required_run(name, 2_000_000 + i as i64))
+            .collect();
+        let runs = check_runs_from_pages(&[Some(page1), Some(page2)]);
+        assert_eq!(runs.len(), 104, "both pages accumulated");
+        let required: Vec<String> = LANE_REQUIRED.iter().map(|s| s.to_string()).collect();
+        assert_eq!(classify_base_check_runs(&runs, &required).verdict, MainVerdict::Green);
+    }
+
+    #[test]
+    fn check_runs_fail_closed_on_a_failed_page_br5623() {
+        // A None page (gh/parse failure) yields an EMPTY vec — never a
+        // partial read. Downstream classifies empty as an "empty" verdict
+        // and blocks the lane: the fail-closed direction is unchanged.
+        let page1: Vec<Value> = (0..100).map(filler_run).collect();
+        assert!(check_runs_from_pages(&[Some(page1), None]).is_empty());
+        assert!(check_runs_from_pages(&[None]).is_empty());
+        assert!(check_runs_from_pages(&[]).is_empty());
+    }
+
+    #[test]
+    fn workflow_startup_failure_surfaces_red_on_base_and_pr_head_br6142() {
+        // 2026-11-04 incident (BR#6142): PR #2707 added `actions: read` to
+        // reusable deploy.yml without granting it on caller workflows. GitHub
+        // Actions failed `PR` (on PR #2707) and `Deploy Dev` (on main 66c506a99)
+        // with `conclusion: "startup_failure"` in `/actions/runs` and created
+        // ZERO job entries in `/commits/{sha}/check-runs`.
+        let wf_runs = vec![
+            json!({
+                "id": 41783432309i64,
+                "name": "Deploy Dev",
+                "status": "completed",
+                "conclusion": "startup_failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+            }),
+            // A workflow whose older startup_failure was superseded by a newer success must NOT report red
+            json!({
+                "id": 100i64,
+                "name": "Deploy Health Branch Gate",
+                "status": "completed",
+                "conclusion": "startup_failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/100",
+            }),
+            json!({
+                "id": 200i64,
+                "name": "Deploy Health Branch Gate",
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/200",
+            }),
+        ];
+        let sf = workflow_startup_failures(&wf_runs);
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0].name, "Deploy Dev");
+        assert_eq!(sf[0].conclusion.as_deref(), Some("startup_failure"));
+
+        let mut base_runs = check_runs_from_pages(&[Some(vec![filler_run(1)])]);
+        base_runs.extend(sf);
+        let required: Vec<String> = LANE_REQUIRED.iter().map(|s| s.to_string()).collect();
+        let base_verdict = classify_base_check_runs(&base_runs, &required);
+        assert_eq!(base_verdict.verdict, MainVerdict::Red);
+        assert_eq!(base_verdict.red.len(), 1);
+        assert_eq!(base_verdict.red[0].name, "Deploy Dev");
+        assert_eq!(base_verdict.red[0].conclusion, "startup_failure");
+    }
+
+    // ---- BR#5911 (F2): the self-heal stall fact — "classified fixable,
+    // dispatched 0" is a loud contradiction, never a quiet no-op ----
+
+    #[test]
+    fn self_heal_stall_fact_fires_when_dispatched_zero_with_failures_br5911() {
+        // gh rerun failed on every resolved run: the 5h no-op loop shape on
+        // PR #2707 — classified healable, dispatched nothing, logged
+        // success-shaped lines. The fact names the failure verbatim.
+        let f = self_heal_stall_fact(2, 0, Some("gh: HttpError 403 — resource not accessible"));
+        let f = f.expect("stalled: reds>=1, dispatched 0");
+        assert_eq!(f["reds"], json!(2));
+        assert_eq!(f["dispatched"], json!(0));
+        assert_eq!(f["error"], json!("gh: HttpError 403 — resource not accessible"));
+    }
+
+    #[test]
+    fn self_heal_stall_fact_fires_when_no_run_ids_resolved_br5911() {
+        // The "resolves no run ids" cause: dispatch set empty against a red
+        // verdict — still dispatched 0, still a contradiction, fact fires
+        // with the no-ids error.
+        let f = self_heal_stall_fact(0, 0, None).expect("stalled: no ids resolved, dispatched 0");
+        assert_eq!(f["reds"], json!(0));
+        assert_eq!(f["error"], json!("(no run resolved — dispatch set was empty against a red verdict)"));
+    }
+
+    #[test]
+    fn self_heal_stall_fact_absent_when_dispatch_succeeded_br5911() {
+        // Healthy and partial dispatches never stamp — partial failures ride
+        // the normal log line's error suffix, and post-F1 the dispatch set
+        // holds at most one run per check name, so a partial dispatch still
+        // settles every name it re-requested; the missed name re-fires
+        // RerunGate next tick (retry, not silence).
+        assert!(self_heal_stall_fact(2, 2, None).is_none());
+        assert!(self_heal_stall_fact(2, 1, Some("one job rerun failed")).is_none());
     }
 
     // ---- pure helpers: the identity law and its plumbing (BR#4104) ----
@@ -3454,6 +4954,87 @@ mod tests {
         assert!(cfg.lanes.is_empty());
         let nolabel = DaemonTrainConfig::from_runner("https://hub.example", "tok", None);
         assert!(nolabel.holder.starts_with("merge-train@"));
+    }
+
+    // ---- BR#4754: token rot is auth-class, heals through the ladder, and
+    // ---- parks LOUDLY when the ladder is exhausted ----
+
+    #[test]
+    fn token_rot_jsonrpc_errors_classify_auth() {
+        // The incident shape (1,684 consecutive super-lane failures): mcp()
+        // wraps the hub's error TEXT and a rotted token carries no HTTP
+        // status — the old `contains("401")` sniff and the status-prefix
+        // classifier patterns both missed it.
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_status): unknown auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+        assert_eq!(
+            crate::dispatch::classify_hub_error("hub rpc error (train_lease): invalid auth token"),
+            crate::dispatch::HubErrClass::Auth
+        );
+    }
+
+    #[test]
+    fn lane_lease_contention_stays_transient() {
+        // NOT auth: the token is fine, another executor holds the lane.
+        assert_eq!(
+            crate::dispatch::classify_hub_error(
+                "hub rpc error (train_lease): lane lease held live by merge-train@other — stand down this tick"
+            ),
+            crate::dispatch::HubErrClass::Transient
+        );
+    }
+
+    #[test]
+    fn auth_ladder_failure_names_every_failed_leg() {
+        // Store leg injected to None (dev machines hold a REAL pairing — an
+        // un-injected store leg makes this test machine-dependent), repair
+        // leg aimed at a dead port: BOTH legs must be NAMED in the reasons —
+        // never a bare "repair failed" (the 2026-10-27 class).
+        let errs = auth_ladder_with("http://127.0.0.1:9", "sentinel-store-token", &||
+            None::<crate::dispatch::DispatchConfig>)
+            .expect_err("unreachable hub must fail the ladder");
+        let joined = errs.join("; ");
+        assert!(joined.contains("no resolvable config in the store"), "names the store leg: {joined}");
+        assert!(joined.contains("principal repair:"), "names the principal-repair leg: {joined}");
+    }
+
+    #[test]
+    fn auth_ladder_adopts_a_changed_store_token() {
+        // Leg 1: another process (the runner's dispatch loop) re-vended the
+        // store token — the ladder adopts it WITHOUT hitting the repair route.
+        let fresh = crate::dispatch::DispatchConfig {
+            url: "https://hub.example".into(),
+            token: "fresh-from-store".into(),
+            ..crate::dispatch::default_config()
+        };
+        let (hub, token) = auth_ladder_with("https://hub.example", "stale-snapshot", &move || {
+            Some(fresh.clone())
+        })
+        .expect("a changed store token is a completed ladder");
+        assert_eq!(token, "fresh-from-store");
+        assert_eq!(hub, "https://hub.example");
+    }
+
+    #[test]
+    fn both_daemon_loops_wire_the_ladder_and_park_loudly() {
+        // Source-scan pin (the dispatch.rs convention): the standalone run()
+        // loop AND the in-process daemon loop must classify auth errors,
+        // run the injected ladder, pace it, and the standalone must exit
+        // non-zero when the ladder is exhausted — a regression to the silent
+        // tick-forever loop is the exact Oct-29 incident.
+        let src = include_str!("train.rs");
+        for needle in [
+            "fn auth_ladder_with",
+            "fn on_tick_auth_failure",
+            "AuthOutcome::Park",
+            "TOKEN-BLIND — EXITING (exit 1)",
+            "fn board_note_token_rot",
+            "BLIND_NOTE_MIN_TICKS",
+        ] {
+            assert!(src.contains(needle), "BR#4754 machinery missing: {needle}");
+        }
     }
 
     // ---- the gate law, restated: writes flow only through worker creds ----
@@ -3575,6 +5156,12 @@ mod tests {
             tick_attempted: false,
             tick_landed: 0,
             tick_error: None,
+            auto_rerun_shas: std::collections::HashSet::new(),
+            auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+            cancelled_redundant_runs: std::collections::HashSet::new(),
+            #[cfg(test)]
+            sh_mock: None,
+            last_lane_card: None,
         }
     }
 
@@ -3668,6 +5255,76 @@ mod tests {
         let recorded = calls.lock().unwrap();
         assert!(recorded.is_empty(), "incapable host must not touch the hub, got {:?}", recorded.iter().map(call_name).collect::<Vec<_>>());
         assert!(ctx.last_action.contains("cannot merge PRs"), "skip must be self-naming, got: {}", ctx.last_action);
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_bounces_off_the_hub_br5753() {
+        // BR#5753: a queued card whose lane leg carries no PR stamp used to be
+        // logged and advanced — the hub keeps matching that leg on
+        // repo+base+unlanded, so the entry re-derived into lane.queue on every
+        // tick, a silent zombie inflating queue.length forever. The walk now
+        // bounces it off the hub (the audited impl bounce: train:bounced, gate
+        // class) with the card's own merge_train.pr stamp, and the tick ends —
+        // lane.queue self-heals within one tick.
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+                "merge_train": { "pr": 7, "state": "queued" },
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // renew_lease (bounce arm)
+            ok(json!({ "ok": true })),                                // train_event bounced
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_lease", "train_event", "train_status", "train_lease"],
+            "the stamp-less arm must bounce (renew → train_event) and end the tick, got {:?}",
+            names
+        );
+        let ev = call_args(&recorded[3]);
+        assert_eq!(call_name(&recorded[3]), "train_event");
+        assert_eq!(ev.get("kind"), Some(&json!("bounced")));
+        assert_eq!(ev.get("pr"), Some(&json!(7)), "the bounce rides the card's own merge_train.pr stamp");
+        assert_eq!(ev.get("task_id"), Some(&json!("BR#1")));
+        assert_eq!(ev.get("bounce_kind"), Some(&json!("gate")));
+        assert!(
+            String::from(ev.get("reason").and_then(|v| v.as_str()).unwrap_or("")).contains("no PR stamp"),
+            "the defect must name the stamp-less leg, got: {:?}",
+            ev.get("reason")
+        );
+    }
+
+    #[test]
+    fn queue_head_stampless_leg_without_train_stamp_advances_br5753() {
+        // Fail-open residue: a stamp-less leg on a card with NO bounceable
+        // merge_train.pr / stamped leg anywhere cannot call train:bounced (the
+        // hub requires pr > 0) — the walk advances instead of erroring the
+        // tick (the entry is not hub-queueable anymore; snapshot drift).
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 0 } ],
+            } })),                                                    // get_artefact
+            ok(json!({ "ok": true })),                                // train_queue_facts (walk end)
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert_eq!(
+            names,
+            vec!["train_lease", "get_artefact", "train_queue_facts", "train_status", "train_lease"],
+            "no bounceable stamp → advance (no train_event), got {:?}",
+            names
+        );
     }
 
     #[test]
@@ -3899,6 +5556,12 @@ mod tests {
                 tick_attempted: false,
                 tick_landed: 0,
                 tick_error: None,
+                auto_rerun_shas: std::collections::HashSet::new(),
+                auto_deploy_dispatched_shas: std::collections::HashMap::new(),
+                cancelled_redundant_runs: std::collections::HashSet::new(),
+                #[cfg(test)]
+                sh_mock: None,
+                last_lane_card: None,
             }
         }
     }
@@ -4192,5 +5855,342 @@ mod tests {
         let args = call_args(&recorded[0]);
         assert_eq!(args.get("action").and_then(|v| v.as_str()), Some("acquire"));
         assert_eq!(args.get("merge_capable"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn rerun_failed_null_is_not_a_request_and_run_id_ignores_job_suffix_br5679() {
+        assert!(!has_rerun_request(&json!({})));
+        assert!(!has_rerun_request(&json!({ "rerun_failed": null })));
+        assert!(has_rerun_request(&json!({ "rerun_failed": { "at": 1793680000000_i64 } })));
+        assert_eq!(
+            extract_actions_run_id("https://github.com/state-vector/superpositional/actions/runs/41576347395/job/125726311965"),
+            Some(41576347395)
+        );
+        assert_eq!(
+            extract_actions_run_id("https://github.com/state-vector/superpositional/actions/runs/41576347395"),
+            Some(41576347395)
+        );
+        assert_eq!(extract_actions_run_id("https://github.example/run/999"), Some(999));
+        assert_eq!(extract_actions_run_id("https://github.example/no-digits"), None);
+    }
+
+    #[test]
+    fn stop_recovery_and_all_lane_arms_scope_to_required_workflows_br5679() {
+        // Structural guard (BR#5679): train.rs production code must never call
+        // unscoped `classify_main_check_runs(` — every base/stop/mid-drain/bisect
+        // classification routes through `classify_base_check_runs(&runs, &required)`
+        // so a non-required nightly failure (e.g. Guard Fixture Gate) cannot
+        // trap a stopped lane after its required workflows recover green.
+        let src = include_str!("train.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !prod.contains("classify_main_check_runs("),
+            "train.rs production code must use classify_base_check_runs(&runs, &required), never unscoped classify_main_check_runs"
+        );
+    }
+
+    #[test]
+    fn base_state_annotates_empty_alarm_and_omits_it_mid_burst_br5674_p1() {
+        let tip = vec![
+            MainCheckRun { id: 1, name: "Product surface canary (dev)".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Nightly Release".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+        ];
+        let required = vec!["deploy / Deploy to dev".to_string()];
+        // N runs read, none matched required set → alarm on base_state
+        let c_unmatched = classify_base_check_runs(&tip, &required);
+        let bs_unmatched = build_base_state(&c_unmatched, &required, 0);
+        assert_eq!(bs_unmatched.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(bs_unmatched.get("scoped_to_required").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            bs_unmatched.get("alarm").and_then(|v| v.as_str()),
+            Some("2 runs read, none matched required set — check names/pagination")
+        );
+        // mid-burst (pass_merged > 0): verdict is forced green and no false alarm rides
+        let bs_burst = build_base_state(&c_unmatched, &required, 1);
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert!(bs_burst.get("alarm").is_none());
+        // zero total runs on tip → sibling alarm
+        let c_zero = classify_base_check_runs(&[], &required);
+        let bs_zero = build_base_state(&c_zero, &required, 0);
+        assert_eq!(bs_zero.get("verdict").and_then(|v| v.as_str()), Some("empty"));
+        assert_eq!(
+            bs_zero.get("alarm").and_then(|v| v.as_str()),
+            Some("tip carries no check runs at all")
+        );
+    }
+
+    #[test]
+    fn base_state_stamps_the_gate_blocked_qualifier_br5883() {
+        // The 2026-11-03 starve stamp: scoped green + `Deploy drift alarm`
+        // red on the tip → base_state carries the qualifier whole (verdict
+        // STAYS green — BR#5265 law — but a plain green is never certified).
+        let tip = vec![
+            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("failure".into()), html_url: Some("https://example.test/drift".into()) },
+        ];
+        let required = vec!["Test".to_string(), "main-green gate".to_string()];
+        let c = classify_base_check_runs(&tip, &required);
+        assert_eq!(c.verdict, MainVerdict::Green);
+        let bs = build_base_state(&c, &required, 0);
+        assert_eq!(bs.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs.get("gate_blocked").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(bs.get("gate_verdict").and_then(|v| v.as_str()), Some("red"));
+        assert_eq!(bs.pointer("/gate_red/0/name").and_then(|v| v.as_str()), Some("Deploy drift alarm"));
+        assert_eq!(bs.pointer("/gate_red/0/url").and_then(|v| v.as_str()), Some("https://example.test/drift"));
+        // honest green (no qualifier) → no gate fields on the stamp
+        let tip_green = vec![
+            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+        ];
+        let bs_green = build_base_state(&classify_base_check_runs(&tip_green, &required), &required, 0);
+        assert!(bs_green.get("gate_blocked").is_none());
+        assert!(bs_green.get("gate_red").is_none());
+        // mid-burst: forced green composes away the qualifier (the pass
+        // settle owns destination-green, BR#4934)
+        let bs_burst = build_base_state(&c, &required, 1);
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert!(bs_burst.get("gate_blocked").is_none());
+    }
+
+    #[test]
+    fn synthetic_dark_tip_drill_dispatches_once_cancels_redundant_and_merges_when_green_br6179() {
+        // Synthetic dark-tip drill (BR#6179 Done-When):
+        // - Tick 1 (dark tip 7f5efec2, 17m old, zero required check runs, only DHR ran):
+        //   executor auto-dispatches `gh workflow run deploy-dev.yml --repo state-vector/superpositional --ref main`
+        //   ONCE for 7f5efec2, stamps `deploy_coverage: { phase: "uncovered_dispatched", ... }`
+        //   and `covered_by: ebbe1826...` in `train_queue_facts`, holds queued PR #2880 without bouncing.
+        // - Tick 2 (dispatched run 41798951196 is in_progress + duplicate push run 41798949143 is queued
+        //   for the SAME sha 7f5efec2): executor does NOT re-dispatch `deploy-dev.yml`, cancels the
+        //   redundant queued run (`gh run cancel 41798949143`), stamps `cancelled_redundant_runs: [41798949143]`.
+        // - Tick 3 (deploy + post-deploy jobs settle green on 7f5efec2): executor stamps
+        //   `deploy_coverage: { phase: "covered", covered_by_sha: 7f5efec2... }` and merges PR #2880
+        //   (`gh pr merge 2880` -> `train_event` `kind: "merged"`), zero human legs.
+        let repo = "state-vector/superpositional";
+        let dark_tip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+        let prev_green = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+        let pr_head = "9533e5ffbc0b3c94f420adb24fd58f1b297a137b";
+        let merged_sha = "dd91af5f33c5351f5bcbc9cd6d4924659bd604a2";
+        let required = vec![
+            "deploy / Deploy to dev".to_string(),
+            "post-deploy / Post-Deploy Smoke".to_string(),
+            "post-deploy / DNS chain".to_string(),
+            "post-deploy / Lodestar Storage Health".to_string(),
+        ];
+        let lane_val = json!({
+            "lane": "state-vector/superpositional@main",
+            "required_workflows": required,
+            "queue": [{ "id": "BR#6165", "pr": 2880 }]
+        });
+        let card_val = json!({
+            "id": "BR#6165",
+            "status": "blocked",
+            "meta": {
+                "prs": [{
+                    "repo": repo,
+                    "number": 2880,
+                    "head_sha_at_acceptance": pr_head
+                }],
+                "merge_train": { "pr": 2880, "state": "queued" }
+            }
+        });
+
+        let (hub, calls) = mock_hub(vec![
+            // ---- Tick 1 (dark tip -> auto-dispatch deploy-dev.yml, hold car) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // train_queue_facts
+            ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
+            ok(json!({ "note": "lease released" })),     // train_lease release
+            // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // train_queue_facts
+            ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
+            ok(json!({ "note": "lease released" })),     // train_lease release
+            // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
+            ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(card_val.clone()),                        // get_artefact BR#6165
+            ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
+            ok(json!({ "ok": true })),                   // train_queue_facts (ready)
+            ok(json!({ "ok": true })),                   // renew_lease (before merge)
+            ok(json!({ "ok": true })),                   // train_event (merged)
+            ok(json!({ "ok": true })),                   // renew_lease (burst_settle_feed)
+            ok(json!({ "decided": "pending" })),         // train_ci (burst_settle_feed)
+        ]);
+
+        let tick_phase = std::sync::Arc::new(Mutex::new(1u32));
+        let pr_merged_flag = std::sync::Arc::new(Mutex::new(false));
+        let sh_log: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tick_phase_c = tick_phase.clone();
+        let pr_merged_c = pr_merged_flag.clone();
+        let sh_log_c = sh_log.clone();
+
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.identity = Some(IdentityClass::Worker("detached-cody".into()));
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            let line = format!("{cmd} {}", args.join(" "));
+            sh_log_c.lock().unwrap().push(line.clone());
+            let phase = *tick_phase_c.lock().unwrap();
+            if cmd == "git" {
+                return Some(Ok(String::new()));
+            }
+            if cmd == "gh" {
+                if args.first() == Some(&"workflow") && args.get(1) == Some(&"run") {
+                    return Some(Ok(String::new()));
+                }
+                if args.first() == Some(&"run") && args.get(1) == Some(&"cancel") {
+                    return Some(Ok(String::new()));
+                }
+                if args.first() == Some(&"pr") && args.get(1) == Some(&"merge") {
+                    *pr_merged_c.lock().unwrap() = true;
+                    return Some(Ok("merged".into()));
+                }
+                if args.first() == Some(&"pr") && args.get(1) == Some(&"view") {
+                    let is_merged = *pr_merged_c.lock().unwrap();
+                    return Some(Ok(if is_merged {
+                        json!({
+                            "number": 2880,
+                            "headRefOid": pr_head,
+                            "mergeable": "MERGEABLE",
+                            "mergeStateStatus": "CLEAN",
+                            "state": "MERGED",
+                            "mergeCommit": { "oid": merged_sha },
+                            "baseRefName": "main"
+                        }).to_string()
+                    } else {
+                        json!({
+                            "number": 2880,
+                            "headRefOid": pr_head,
+                            "mergeable": "MERGEABLE",
+                            "mergeStateStatus": "CLEAN",
+                            "state": "OPEN",
+                            "mergeCommit": null,
+                            "baseRefName": "main"
+                        }).to_string()
+                    }));
+                }
+                if args.first() == Some(&"api") {
+                    let endpoint = args.get(1).copied().unwrap_or("");
+                    if endpoint.ends_with("/commits/main") {
+                        let committed_iso = crate::logging::iso(now_ms().saturating_sub(17 * 60_000));
+                        return Some(Ok(json!({ "sha": dark_tip, "committed_at": committed_iso }).to_string()));
+                    }
+                    if endpoint.contains(&format!("/commits/{dark_tip}/check-runs")) {
+                        return Some(Ok(match phase {
+                            1 => json!([]).to_string(),
+                            2 => json!([
+                                { "id": 9001, "name": "deploy / Deploy to dev", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/1" }
+                            ]).to_string(),
+                            _ => json!([
+                                { "id": 9001, "name": "deploy / Deploy to dev", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/1" },
+                                { "id": 9002, "name": "post-deploy / Post-Deploy Smoke", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/2" },
+                                { "id": 9003, "name": "post-deploy / DNS chain", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/3" },
+                                { "id": 9004, "name": "post-deploy / Lodestar Storage Health", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196/job/4" }
+                            ]).to_string(),
+                        }));
+                    }
+                    if endpoint.contains(&format!("/commits/{pr_head}/check-runs")) || endpoint.contains(&format!("/commits/{merged_sha}/check-runs")) {
+                        return Some(Ok(json!([
+                            { "id": 8001, "name": "ci / Rust Tests", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41790000000/job/1" }
+                        ]).to_string()));
+                    }
+                    if endpoint.contains("/actions/runs") {
+                        return Some(Ok(match phase {
+                            1 => json!([
+                                { "id": 41791923312_i64, "name": "Deploy Health Record", "path": ".github/workflows/deploy-health.yml", "head_sha": dark_tip, "event": "schedule", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41791923312" },
+                                { "id": 41780000001_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": prev_green, "event": "push", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41780000001" }
+                            ]).to_string(),
+                            2 => json!([
+                                { "id": 41798951196_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "workflow_dispatch", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196" },
+                                { "id": 41798949143_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "push", "status": "queued", "conclusion": null, "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798949143" },
+                                { "id": 41780000001_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": prev_green, "event": "push", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41780000001" }
+                            ]).to_string(),
+                            _ => json!([
+                                { "id": 41798951196_i64, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml", "head_sha": dark_tip, "event": "workflow_dispatch", "status": "completed", "conclusion": "success", "html_url": "https://github.com/state-vector/superpositional/actions/runs/41798951196" }
+                            ]).to_string(),
+                        }));
+                    }
+                    if endpoint.contains("/pulls/2880/commits") {
+                        return Some(Ok(json!([{ "sha": pr_head, "verified": true }]).to_string()));
+                    }
+                }
+            }
+            Some(Ok(String::new()))
+        }));
+
+        // Run Tick 1 (dark tip -> auto-dispatches deploy-dev.yml once)
+        drive_lane(&mut ctx, &lane_val);
+        // Run Tick 2 (deploy in flight + redundant queued run -> cancels 41798949143, does NOT dispatch again)
+        *tick_phase.lock().unwrap() = 2;
+        drive_lane(&mut ctx, &lane_val);
+        // Run Tick 3 (deploy settled green -> merges PR #2880, zero human legs)
+        *tick_phase.lock().unwrap() = 3;
+        drive_lane(&mut ctx, &lane_val);
+
+        let sh_calls = sh_log.lock().unwrap().clone();
+        let dispatches: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh workflow run deploy-dev.yml"))
+            .collect();
+        assert_eq!(
+            dispatches.len(),
+            1,
+            "executor must dispatch deploy-dev.yml ONCE for the dark tip sha, got: {dispatches:?}"
+        );
+        assert_eq!(
+            dispatches[0],
+            "gh workflow run deploy-dev.yml --repo state-vector/superpositional --ref main"
+        );
+
+        let cancels: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh run cancel"))
+            .collect();
+        assert_eq!(
+            cancels,
+            vec!["gh run cancel 41798949143 --repo state-vector/superpositional"],
+            "executor must cancel the redundant queued deploy run on the same sha"
+        );
+
+        let merges: Vec<&String> = sh_calls
+            .iter()
+            .filter(|c| c.starts_with("gh pr merge 2880"))
+            .collect();
+        assert_eq!(merges.len(), 1, "PR #2880 must merge automatically on tick 3 once deploy settles green");
+
+        let hub_calls = calls.lock().unwrap().clone();
+        let qf_calls: Vec<&Value> = hub_calls
+            .iter()
+            .filter(|c| call_name(c) == "train_queue_facts")
+            .collect();
+        assert_eq!(qf_calls.len(), 3, "each tick stamps train_queue_facts");
+
+        // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
+        let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
+        assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
+        assert_eq!(bs1.get("covered_by").and_then(|v| v.as_str()), Some(prev_green));
+        assert_eq!(bs1.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("uncovered_dispatched"));
+        assert_eq!(bs1.pointer("/deploy_coverage/workflow").and_then(|v| v.as_str()), Some("deploy-dev.yml"));
+
+        // Tick 2 base_state: settling + cancelled_redundant_runs = [41798949143]
+        let bs2 = call_args(qf_calls[1]).get("base_state").unwrap();
+        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
+        assert_eq!(bs2.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("settling"));
+        assert_eq!(bs2.get("cancelled_redundant_runs"), Some(&json!([41798949143_i64])));
+
+        // Tick 3 base_state: covered by dark_tip + train_event merged fired, ZERO ask_agent calls
+        let bs3 = call_args(qf_calls[2]).get("base_state").unwrap();
+        assert_eq!(bs3.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs3.get("covered_by").and_then(|v| v.as_str()), Some(dark_tip));
+        assert_eq!(bs3.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("covered"));
+        assert!(
+            hub_calls.iter().any(|c| call_name(c) == "train_event" && call_args(c).get("kind") == Some(&json!("merged"))),
+            "tick 3 must record train_event kind=merged"
+        );
+        assert!(
+            !hub_calls.iter().any(|c| call_name(c) == "ask_agent"),
+            "synthetic dark-tip drill must complete with zero human legs"
+        );
     }
 }

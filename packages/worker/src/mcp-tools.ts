@@ -22,7 +22,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.7.0";
+export const BUILD = "0.8.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -159,20 +159,29 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       }, null, 1));
     },
   },
+  claim_takeover: {
+    description:
+      "Interactive claim takeover (BR#2997/BR#6135, amended BR#6436): the card's OWNER agent, a human via the web plane, or an authenticated FULL-AGENT credential — your token's LIVE tags classify you as a full agent (gateway and cron credentials excluded; the class is server-derived, never declared) — atomically re-takes an in_progress task whose claim is held by a dispatched runner session, across owners. ONE write flips the holder session to you (status stays in_progress): no release→pool→re-claim, so no dispatcher can win the card in between. The ex-holder's next state change is gate-rejected with a stand-down order (checkpoint last_will via log_progress — still open to it — then exit); its WIP survives in its registered worktree. Refused (terminal, named rules) on: verify/unblock duty cards (separation of duties is not transferable), cards holding a typed wait (train slot / await_event / bound ask — the wait owns the exit), and credentials with no authority anchor (server-verified from your token, never declared — BR#2673). Pause law (BR#6068 lesson): an interactive session about to wait on the human should bind an ask to the task — an open ask pauses the watchdog; a bare pause is abandonment and the claim is fairly lost.",
+    schema: TOOL_ARG_SCHEMAS.claim_takeover,
+    handler: async (args, ctx) => text(JSON.stringify(
+      await ctx.call("claim.takeover", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
+      null, 1,
+    )),
+  },
   create_artefact: {
     description: `Create an artefact. Types: ${ARTEFACT_TYPES.join(", ")}.`,
     schema: TOOL_ARG_SCHEMAS.create_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("create", { ...args, session: args.session, token_id: ctx.identity.token_id }))),
   },
   update_artefact: {
-    description: "Edit title/body/meta/tags/roles. Does not change status — use transition.",
+    description: "Edit title/body/meta/tags/roles. meta MERGES per top-level key: keys you pass replace wholesale (nested objects must be complete), keys you omit are PRESERVED — meta is infrastructure on lane cards (lane/lease/currently/stop) and parked cards (blocked.await_event); never re-send a partial meta expecting replace (BR#5807). Remove keys explicitly with meta_delete: [\"key\"] — null values store as null, not deletes; lane/park infrastructure keys refuse meta_delete from agent sessions (route through an answered ask or the web). Does not change status — use transition.",
     schema: TOOL_ARG_SCHEMAS.update_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("update", args))),
   },
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned. BR#6432 batch disposition: an agent cannot supersede directly (BR#2480), but when a human has ANSWERED a batch-authorization ask ("SUPERSEDE all N …", receipts in the ask body), you may apply it per target: transition {id: "<target>", to: "superseded", batch_auth: {ask: "BR#N"}} — the hub verifies the human answer server-side, checks the target is named in the ask's census and still an open park, executes the drop as system:question(<answered_by>), and stamps meta.batch_auth provenance. Recheck each target's live state FIRST — the old ruling only applies while its predicate still holds.`,
     schema: TOOL_ARG_SCHEMAS.transition,
     handler: async (args, ctx) => text(JSON.stringify({
       ...await ctx.call("transition", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
@@ -239,13 +248,13 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("get_history", { id: args.id, limit: args.limit }), null, 1)),
   },
   ask_agent: {
-    description: "Ask another agent or the human for insight/help/decisions. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), 'human', or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. OPTIONS ARE REQUIRED: give the human 2-8 one-click answers (e.g. [\"GO — merge now\", \"NO-GO — hold\"]) — they answer by clicking, and the ask is rejected without them. ASK QUALITY BAR (enforced): (1) if you recommend an option, make it FIRST and prefix it \"(Recommended)\" — the first button IS the recommendation; (2) human-directed asks REQUIRE details: a self-contained plain-reading brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected; (3) never cram the narrative into reason — question ≤240 chars, details carries the story, reason is the one-line why.",
+    description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
     schema: TOOL_ARG_SCHEMAS.ask_agent,
     handler: async (args, ctx) => {
-      const a = await ctx.call("ask.create", { to: args.to ?? "any", question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id });
+      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
       return text(JSON.stringify({
         ...a,
-        note: a.task_status === "blocked"
+        note: a.kind === "independent_review" ? a.message : a.task_status === "blocked"
           ? "your task is now blocked-on-decision (watchdog paused for it) and the ask is published in the Bridge app. check asks for the answer."
           : "they will see it on their next orient. check yours too.",
       }));
@@ -310,6 +319,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing.",
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
+  },
+  train_observe_deploy: {
+    description: "Report first-hand read-only GitHub deployment observations independently of the merger lease. The hub validates commit/run receipts and decides line health and recovery. Does not authorize merges or bypass checks.",
+    schema: TOOL_ARG_SCHEMAS.train_observe_deploy,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.observe_deploy", args), null, 1)),
   },
   reconcile_schedule: {
     description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",

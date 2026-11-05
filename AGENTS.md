@@ -75,6 +75,24 @@ Rules, in force:
     apply (signed commits, CI on the push). If main is red, land the fix
     first or hold — never stack work on a red main silently. Bigger or
     riskier changes still get a second pair of eyes — ask, don't assume.
+ 8. **Closed state machines, single source of truth, and end-to-end tracing
+    (`.kiro/steering/state-machine-and-train-discipline.md`).**
+    - **Trace end-to-end on turn 1:** Before proposing a fix for a stuck
+      lane, banner, or ask, trace live GitHub/AWS state → executor
+      (`train.rs`) → hub SQLite (`do.ts`/`core.ts`) → UI (`TrainPanel.tsx`)
+      in one pass. Never peel the onion one symptom at a time.
+    - **Make illegal states unrepresentable:** Model multi-phase lifecycles
+      as closed discriminated unions in `@bridge/contracts` / `core.ts` and
+      Rust `enum`s (`LanePhase`, `CandidateGatePhase`, `BaseRedEpisodeState`)
+      with strong types — never bags of optional booleans, `any` casts, or
+      title-scavenging regexes.
+    - **Atomic persistence, no split-brain:** Every lane state mutation must
+      persist unconditionally via `saveLaneState` (`lane_state` table + card
+      mirror) — never skip SQLite writes based on whether a derived `reason`
+      string changed.
+    - **Self-heal mechanical work:** Conflicts, rebases, stale gate re-runs,
+      and landing a verified root-fix PR through a circular base-red gate
+      are 100% machine work — never punt them to the human.
 
 The signature failure mode of this repo is not bugs in code — it is two
 sessions each holding a stale model of the tree. Every rule above exists

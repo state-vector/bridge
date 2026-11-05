@@ -34,6 +34,15 @@ const TAKEOVER_PROTOCOL = `TAKEOVER PROTOCOL (Superpositional bridge — follow 
 
 export function buildClaimLocallyPrompt({ task, ask }: ClaimLocallyInput): string {
   const lines: string[] = [];
+  if (task.type === "question" && task.meta?.ask) {
+    const a = task.meta.ask;
+    lines.push(`Help resolve Bridge question ${task.id}: "${task.title}"`);
+    lines.push(`Asked by ${ask?.from ?? a.from ?? "an agent"}; addressed to ${ask?.to ?? a.to ?? "the agent pool"}.`);
+    lines.push("This is a question, not an implementation claim. Read its current state and linked work first. Do not claim the question or create a PR just to answer it. If it requests independent review, use the existing review task or request route {kind: 'independent_review', task_id: '<parent task>'}; Bridge owns assigning reviewers. Do not ask the human to arrange another agent.");
+    if (task.body_md) lines.push(task.body_md);
+    lines.push(`Card: https://hub.fleetbridge.run/card/${task.id.replace("#", "-")}`);
+    return lines.join("\n\n");
+  }
   lines.push(`Take over this bridge task locally: ${task.id} — "${task.title}"`);
   lines.push("");
   lines.push(`Card state: ${task.type} · status ${task.status}${task.owner ? ` · owner ${task.owner}` : " · unclaimed"}${task.part_of ? ` · part of ${task.part_of}` : ""}${task.tags?.length ? ` · tags: ${task.tags.join(", ")}` : ""}`);

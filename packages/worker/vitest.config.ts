@@ -7,6 +7,7 @@ import { defineConfig } from "vitest/config";
  * tests spuriously. globalSetup regenerates it before the suite.
  */
 export default defineConfig({
+  esbuild: { jsx: "automatic" },
   test: {
     globalSetup: ["./test/bundle-global-setup.ts"],
   },
