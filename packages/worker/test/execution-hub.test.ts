@@ -153,11 +153,17 @@ describe("local handoff authority and lifecycle", () => {
     expect(results.map(r => r.data.kind).sort()).toEqual(["accepted", "stale_episode"]);
     const winner = results[0].data.kind === "accepted" ? { ...a, session: "local-a" } : { ...b, session: "local-b" };
     expect((await post("handoff.accept", { ...request, session: winner.session, token_id: winner.token_id })).data.kind).toBe("already_accepted");
+    const model = await post<{ execution: { current: { kind: string; tier: string; session: string } } }>("get", { id: r.id });
+    expect(model.data.execution.current).toMatchObject({ kind: "local", tier: "large", session: winner.session });
     expect((await post("transition", { id: r.id, to: "todo", actor: winner.label, token_id: winner.token_id, session: winner.session })).data.error).toMatch(/explicit human-authorised return/);
     const cp = await post("handoff.checkpoint", { ...request, session: winner.session, token_id: winner.token_id, checkpoint: { ...checkpoint, commit: "d".repeat(40) } });
     expect(cp.data.version).toBe(2);
     expect((await post("handoff.control", { kind: "return_autonomous", id: r.id, handoff_id: r.h.id, version: 1, writers: "human_confirmed_quiescent", actor: "web:test" })).data.kind).toBe("stale_episode");
     expect((await post("handoff.control", { kind: "return_autonomous", id: r.id, handoff_id: r.h.id, version: 2, writers: "human_confirmed_quiescent", actor: "web:test" })).data.kind).toBe("returned_autonomous");
+    const history = await post<{ versions: { action: string; data: { kind?: string } }[] }>("get_history", { id: r.id, limit: 100 });
+    for (const kind of ["local_handoff_requested", "local_handoff_accepted", "local_handoff_returned"]) {
+      expect(history.data.versions.filter(v => v.action === "execution" && v.data.kind === kind)).toHaveLength(1);
+    }
   });
   it("blocks unsupported seeded requirements immediately and restores only its capability wait", async () => {
     const task = (await post<{ id: string; status: string }>("create", { actor: "test", type: "task", title: "Needs unavailable environment", project: "bridge", qualified: true, meta: { execution_requirements: { tier: "large", tools: ["cargo"], environment: ["special-access"] } } })).data;

@@ -1,4 +1,5 @@
 import { getKbHubConfig } from "./config";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
  *  Auth: the human session cookie — browser (webapp) sends it same-origin via
@@ -20,6 +21,8 @@ export interface KbArtefact {
   owner?: string;
   body_md?: string;
   meta?: Record<string, unknown>;
+  /** Read-only model observation projected from the canonical execution attempt. */
+  execution?: ExecutionModelView;
   created_ts: number;
   updated_ts: number;
   status_ts?: number;

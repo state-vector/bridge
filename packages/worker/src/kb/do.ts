@@ -231,6 +231,7 @@ import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSche
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
+import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
@@ -2427,6 +2428,12 @@ export class KnowledgeHub {
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END ASC, a.updated_ts DESC
        LIMIT 250`,
     ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (${tasks.map(() => "?").join(",")})`, ...tasks.map(task => String(task.id))).toArray() : [];
+    const executionByTask = new Map(executionRows
+      .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
+    const executionNow = Date.now();
+    for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
+      { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements }, executionNow);
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -4214,7 +4221,10 @@ export class KnowledgeHub {
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const shaped = this.shape(row);
-    if (row.type === "task") shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
+    if (row.type === "task") {
+      shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
+      shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements }, Date.now());
+    }
     return shaped;
   }
 
@@ -4550,7 +4560,8 @@ export class KnowledgeHub {
   private executionWork(): ExecutionWork {
     return new ExecutionWork(this.state.storage, (actor, op, id, data) => this.audit(actor, op, id, data), this.wsSlug() ?? DEFAULT_WS_SLUG,
       (token, host, capabilities, now) => this.executorReadiness(token, host, capabilities, now),
-      () => ModelPolicySchema.parse(this.settingsMap().model_policy ?? {}));
+      () => ModelPolicySchema.parse(this.settingsMap().model_policy ?? {}),
+      (id, actor, event) => this.version(id, actor, "execution", executionHistorySummary(ExecutionHistoryEventSchema.parse(event)), event));
   }
   private protectedExecution(id: string, meta: Record<string, unknown>, ignoreStartup = false): boolean {
     const h = this.executionState(id)?.handoff;
@@ -5190,6 +5201,8 @@ export class KnowledgeHub {
       if (command.kind === "poll") this.state.storage.sql.exec(`DELETE FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' AND rowid NOT IN (SELECT rowid FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' ORDER BY rowid DESC LIMIT 32)`, req.id, req.id);
       // Requirements are persistent infrastructure, never a prompt-only hint.
       meta.execution_requirements = next.requirements;
+      const history = executionCommandHistory(current, next, command);
+      if (history) this.version(req.id, actor, "execution", executionHistorySummary(history), history);
       if (command.kind === "yield") {
         delete meta.session;
         const local = next.handoff.phase === "waiting" ? next.handoff : null;
@@ -5906,7 +5919,7 @@ export class KnowledgeHub {
         const subject = meta.execution_review_of;
         const parent = this.one(`SELECT dst_id FROM relations WHERE src_id=? AND relation='child_of' AND dst_id=?`, id, reviewResult.task_id);
         if (subject !== reviewResult.task_id && !parent) throw new Error("gate: stronger implementation verdict must name this review's subject");
-        this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, false);
+        this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, false, id);
       }
     }
     if (isSubprocess && row.type === "task" && row.status === "in_progress") {
@@ -6187,7 +6200,7 @@ export class KnowledgeHub {
           if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
         }
       }
-      if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor);
+      if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, true, id);
       if (row.type === "task" && verdict.status === "in_review") {
         const execution = this.executionState(id);
         if (execution) {

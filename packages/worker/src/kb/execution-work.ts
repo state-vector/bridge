@@ -6,6 +6,7 @@ import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, Ex
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
 import { gatewayOccupancy } from "./scheduling.ts";
+import { ExecutionModelIdentitySchema, type ExecutionHistoryEvent } from "@bridge/contracts";
 
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
@@ -23,7 +24,8 @@ export function interactiveCredential(token: Credential | null): boolean {
 export class ExecutionWork {
   constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace: string,
     private readiness: (token: string, host: string, capabilities: ExecutorCapabilities, now: number) => ExecutorReadiness,
-    private modelPolicy: () => ModelPolicy = () => DEFAULT_MODEL_POLICY) {}
+    private modelPolicy: () => ModelPolicy = () => DEFAULT_MODEL_POLICY,
+    private record: (id: string, actor: string, event: ExecutionHistoryEvent) => void = () => {}) {}
   private get sql() { return this.storage.sql; }
   private one<T>(query: string, ...args: (string | number | null)[]): T | null { return (this.sql.exec(query, ...args).toArray()[0] as unknown as T) ?? null; }
   private task(id: string): TaskRow {
@@ -61,7 +63,7 @@ export class ExecutionWork {
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
-  strongerImplementation(id: string, summary: string, actor: string, apply = true) {
+  strongerImplementation(id: string, summary: string, actor: string, apply = true, reviewId: string | null = null) {
     const task = this.task(id); const state = this.state(task);
     if (!["in_review", "in_progress"].includes(task.status) || (state.attempt && state.attempt.phase !== "quiesced") || !["none", "returned"].includes(state.handoff.phase)) throw new Error("gate: stronger implementation verdict requires an idle delivered parent, not a live writer or local handoff");
     const current = state.delivery?.tier ?? state.attempt?.executor?.tier ?? state.requirements.tier;
@@ -76,6 +78,7 @@ export class ExecutionWork {
     // Called inside the review completion transaction: verdict + requeue commit together.
     this.sql.exec(`INSERT INTO execution_state(task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(state));
     this.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,updated_ts=?,status_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), Date.now(), id);
+    this.record(id, actor, { kind: "model_escalated", from_tier: current, to_tier: tier, reason: summary, source: "review", review_id: reviewId, generation: state.generation });
     this.audit(actor, "review_model_escalation", id, { tier, summary });
     return tier;
   }
@@ -214,6 +217,7 @@ export class ExecutionWork {
       const asks = this.asks(task.id);
       if (asks.length) meta.blocked = { reason: asks[0].question, unblock_condition: `Answer ${asks[0].id}`, ts: Date.now(), await_event: { event: "ask", ask_id: asks[0].id } };
       this.sql.exec(`UPDATE artefacts SET status=?,owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, asks.length ? "blocked" : "todo", JSON.stringify(meta), Date.now(), Date.now(), task.id);
+      this.record(task.id, actor, { kind: "local_handoff_returned", handoff_id: h.id, checkpoint_commit: h.checkpoint.commit });
     });
     this.audit(actor, "local_execution_returned", task.id, { handoff: h.id, writers: cmd.writers, checkpoint: h.checkpoint.commit });
     this.sweep(); // capability/human blockers remain independent of this return
@@ -240,6 +244,7 @@ export class ExecutionWork {
     this.storage.transactionSync(() => {
       this.save(task.id, state);
       this.sql.exec(`UPDATE artefacts SET status='in_progress',owner=?,meta=?,status_ts=?,updated_ts=? WHERE id=?`, token!.principal ?? token!.label, JSON.stringify(meta), Date.now(), Date.now(), task.id);
+      this.record(task.id, token!.label, { kind: "local_handoff_accepted", handoff_id: h.id, ...ExecutionModelIdentitySchema.parse(grant.capabilities), host: grant.host, session: cmd.session });
     });
     this.audit(token!.label, "local_execution_accepted", task.id, { handoff: h.id, version: h.version, session: cmd.session, grant: grant.id });
     return { kind: "accepted" as const, task_id: task.id, session: cmd.session, checkpoint: h.checkpoint };
@@ -273,6 +278,7 @@ export class ExecutionWork {
       this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
       this.sql.exec(`INSERT INTO execution_state (task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(state));
       this.sql.exec(`UPDATE artefacts SET status='blocked',owner=CASE WHEN ?='waiting' THEN '' ELSE owner END,meta=?,updated_ts=? WHERE id=?`, state.handoff.phase, JSON.stringify(meta), Date.now(), id);
+      this.record(id, actor, { kind: "local_handoff_requested", handoff_id: details.id, reason, action: question, next: details.next });
     });
     this.audit(actor, "local_handoff_decision", id, { handoff: details.id, phase: state.handoff.phase, startup_wait: startup });
   }

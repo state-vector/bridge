@@ -204,6 +204,17 @@ session with the preserved checkpoint. Confidence/risk gauges prompt judgement,
 not automatic bumps or human asks. Human blocking is reserved for precise missing
 decisions/authority/information or concrete local-only actions, not mechanical
 repairs or ordinary review iteration.
+
+**Top displays observed model size.** Each active agent row shows its actual
+recorded tier; the tooltip identifies model/backend/host/session. A larger pending
+minimum appears separately as requested, while expired, paused, stopping and
+previous attempts are explicitly labelled. Missing observations say size
+unreported, never an inferred tier. Task details use the same canonical projection.
+Task History includes model starts, agent/reviewer escalation reasons and tier
+changes, checkpointed yields and local handoff request/accept/return. Typed history
+events commit with state and remain once-only across command retries; routine
+polls do not flood the timeline. Human questions keep their linked decision and
+blocked/resume history.
 After scoped-inventory adoption, obsolete producers sharing that gateway's
 credential can finish active work but cannot overwrite or borrow newer readiness.
 

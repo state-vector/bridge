@@ -1,7 +1,7 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { ExecutionStateSchema } from "@bridge/contracts";
+import { ExecutionStateSchema, type ExecutionModelView } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
 let mf: Miniflare;
@@ -9,6 +9,8 @@ let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
 interface Reply {
   error?: string; id: string; secret: string; token_id: string; ok: boolean; status: string; verify_task: string;
   meta: { execution_scheduling_requirements: { tier: string }; execution_blockers: unknown[] };
+  execution: ExecutionModelView;
+  versions: { action: string; summary: string; data: Record<string, unknown> }[];
 }
 async function post(op: string, body: object): Promise<Reply> {
   const response = await stub.fetch(`https://kb/${op}`, { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(executorRequest(body)) });
@@ -50,6 +52,10 @@ it("atomically closes a stronger-implementation verdict and requeues its idle su
   const state = ExecutionStateSchema.parse(await post("execution", { ...auth, command_id: "read-delivery", command: { kind: "inspect" } }));
   expect(state.delivery).toMatchObject({ model: "test/medium", tier: "medium" });
   expect((await post("get", { id: delivery.verify_task })).status).toBe("done");
+  const history = await post("get_history", { id: parent.id, limit: 100 });
+  expect(history.versions.filter(v => v.action === "execution" && v.data.kind === "model_escalated")).toEqual([
+    expect.objectContaining({ data: expect.objectContaining({ from_tier: "medium", to_tier: "large", source: "review", review_id: delivery.verify_task }) }),
+  ]);
 });
 afterAll(async () => { await mf?.dispose(); });
 
@@ -72,14 +78,24 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   const begin = await post("execution", { ...auth, command_id: "begin", command: { kind: "begin", attempt_id: "one", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/medium", tier: "medium" } } });
   expect(begin.error).toBeUndefined();
   expect(ExecutionStateSchema.parse(begin).attempt?.executor).toMatchObject({ model: "test/medium", tier: "medium" });
+  expect((await post("get", { id: impl.id })).execution.current).toMatchObject({ kind: "managed", tier: "medium", phase: "running", model: "test/medium" });
+  const boardResponse = await stub.fetch("https://kb/board", { method: "GET" });
+  const board = await boardResponse.json() as { tasks: { id: string; execution: ExecutionModelView }[] };
+  expect(board.tasks.find(t => t.id === impl.id)?.execution.current).toMatchObject({ kind: "managed", tier: "medium", model: "test/medium" });
   const verify = await make("Verify actual delivery", ["review"], { execution_review_of: impl.id });
   expect((await post("get", { id: verify.id })).meta.execution_scheduling_requirements.tier).toBe("medium");
   const cmd = (command_id: string, command: object) => post("execution", { ...auth, command_id, command: { generation: 1, attempt_id: "one", ...command } });
   expect((await cmd("escalate", { kind: "escalate", tier: "large", reason: "Cross-system reasoning exceeds this execution" })).error).toBeUndefined();
+  expect((await cmd("escalate", { kind: "escalate", tier: "large", reason: "Cross-system reasoning exceeds this execution" })).error).toBeUndefined(); // exact retry, one history event
+  expect((await post("get", { id: impl.id })).execution).toMatchObject({ minimum_tier: "large", current: { tier: "medium", phase: "stopping" } });
+  const escalationHistory = await post("get_history", { id: impl.id, limit: 100 });
+  expect(escalationHistory.versions.filter(v => v.action === "execution" && v.data.kind === "model_escalated")).toHaveLength(1);
+  expect(escalationHistory.versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "model_started", tier: "medium", model: "test/medium" }) })]));
   const checkpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/models/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: [], next: "Continue implementation", tests: [] };
   await cmd("checkpoint", { kind: "checkpoint", checkpoint });
   await cmd("quiesce", { kind: "quiesce", writers: "process_group_empty" });
   expect((await cmd("yield", { kind: "yield" })).error).toBeUndefined();
+  expect((await post("get_history", { id: impl.id, limit: 100 })).versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "execution_yielded", destination: "agent_pool", minimum_tier: "large" }) })]));
   await advertise(false, "remove-large");
   const blocked = await post("get", { id: impl.id });
   expect(blocked.status).toBe("blocked");

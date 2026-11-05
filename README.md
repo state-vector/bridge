@@ -439,6 +439,21 @@ available, it rejects that optional bump with a precise error rather than invent
 a capability or asking a human to staff an agent. The implementation may still
 explicitly declare a hard unmet requirement and wait for capability restoration.
 Low confidence/risk gauges are evidence, not automatic tier or human escalations.
+**Model visibility and history:** Top shows the recorded model size beneath each
+agent, with the exact model ID/backend/host/session in its tooltip. A separate
+`→ large requested` indicator is a pending minimum, never a claim that large is
+already running. Restoring, stopping, paused, expired and previous/quiesced
+attempts are labelled explicitly; older agents without a receipt say **size
+unreported**. Task details show the same observation and the full model ID.
+Both board snapshots and task reads derive this typed view from canonical
+execution state, not model names or gateway defaults.
+
+The task's normal History records model selection per attempt, agent/reviewer
+escalations with from/to tiers and full reasons, checkpointed yields, and local
+handoff request/accept/return. Structured events commit alongside their state
+changes, and replayed commands/acceptances do not duplicate history. Routine polls
+and checkpoint heartbeats stay out of this readable history. Bound human asks
+retain their ordinary blocked/resume transitions and linked decision context.
 Human asks must name a concrete missing decision/authority/information; local
 handoffs must name the precise local-only action. Use them sparingly, not for CI
 waits, review iteration or routine mechanical repairs.

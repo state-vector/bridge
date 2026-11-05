@@ -1,0 +1,39 @@
+import { expect, it, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { ExecutionModelViewSchema } from "@bridge/contracts";
+import { ExecutionModel } from "../../ui-kit/src/views/ExecutionModel.tsx";
+import { TaskHistoryLine } from "../../ui-kit/src/views/TaskDetail.tsx";
+import { TopView } from "../../ui-kit/src/views/TopView.tsx";
+import { useKb } from "../../ui-kit/src/server/kbStore.ts";
+
+// Zustand SSR normally reads its empty initial snapshot. Select the seeded
+// live snapshot while rendering the actual Top component and its children.
+vi.mock("../../ui-kit/src/server/kbStore.ts", async importOriginal => {
+  const original = await importOriginal<typeof import("../../ui-kit/src/server/kbStore.ts")>();
+  return { ...original, useKb: Object.assign(<T,>(select: (state: ReturnType<typeof original.useKb.getState>) => T) => select(original.useKb.getState()), original.useKb) };
+});
+
+const view = ExecutionModelViewSchema.parse({ minimum_tier: "large", current: { kind: "managed", tier: "medium", model: "provider/glm-5.3", backend: "opencode", host: "gateway", session: "working", generation: 1, lease_until: Date.now() + 60_000, phase: "stopping" } });
+it("renders the real Top agent row with actual size and a distinct requested tier", () => {
+  const previous = useKb.getState();
+  useKb.setState({ tasks: [{ id: "BR#100", type: "task", title: "Cross-system repair", status: "in_progress", owner: "gateway/worker", created_ts: Date.now(), updated_ts: Date.now(), meta: { session: "working" }, execution: view }], sessions: [], agents: [], events: [] });
+  try {
+    const html = renderToStaticMarkup(<TopView />);
+    expect(html).toContain("gateway/worker");
+    expect(html).toContain("medium · stopping");
+    expect(html).toContain("large requested");
+    expect(html).toContain("provider/glm-5.3");
+  } finally { useKb.setState(previous); }
+});
+it("renders missing/expired receipts honestly instead of claiming large is running", () => {
+  expect(renderToStaticMarkup(<ExecutionModel value={{ minimum_tier: "large", current: { kind: "unreported" } }} now={1} />)).toContain("size unreported");
+  const expired = ExecutionModelViewSchema.parse({ ...view, current: { ...view.current, phase: "running", lease_until: 10 } });
+  expect(renderToStaticMarkup(<ExecutionModel value={expired} now={20} />)).toContain("medium · expired");
+});
+it("renders structured escalation history with the complete reason, actor, and source", () => {
+  const reason = "This needs a larger reasoning model. ".repeat(30);
+  const html = renderToStaticMarkup(<TaskHistoryLine version={{ seq: 1, ts: Date.now(), actor: "reviewer", action: "execution", summary: "bounded ledger summary",
+    data: { kind: "model_escalated", from_tier: "medium", to_tier: "large", reason, source: "review", review_id: "BR#101", generation: 1 } }} />);
+  expect(html).toContain("escalation"); expect(html).toContain("medium → large"); expect(html).toContain("review BR#101");
+  expect(html).toContain(reason.trim()); expect(html).toContain("reviewer"); expect(html).not.toContain("bounded ledger summary");
+});
