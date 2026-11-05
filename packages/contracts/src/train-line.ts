@@ -84,7 +84,7 @@ export const TrainLineFactsSchema = z.object({
     base_state: z.object({
       verdict: z.enum(["green", "red", "unsettled", "empty"]),
       red: z.array(EvidenceSchema).optional(), unsettled: z.array(z.string()).optional(),
-      gate_blocked: z.boolean().optional(), gate_red: z.array(EvidenceSchema).optional(),
+      gate_blocked: z.boolean().optional(), gate_red: z.array(EvidenceSchema).optional(), gate_unsettled: z.array(z.string()).optional(),
       deploy_coverage: DeployCoverageStateSchema.nullable().optional(),
     }).optional(),
     stalled: z.object({ last_error: z.string().nullable().optional() }).optional(),
@@ -106,9 +106,10 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
   const cov = bs?.deploy_coverage;
   const fresh = !!q && now - q.at < 15 * 60_000;
   const task = f.base_red_resolution?.fix_card ?? f.diagnostic;
+  const gatePending = bs?.gate_blocked && bs.gate_red?.length === 0 && !!bs.gate_unsettled?.length;
   // A starvation prompt is not a concrete human requirement for a failed
   // deployment. Prefer the cause-bound repair's actual human action only.
-  const mainFailed = bs?.verdict === "red" || bs?.gate_blocked || cov?.phase === "failed" || !!f.stop;
+  const mainFailed = bs?.verdict === "red" || (bs?.gate_blocked && !gatePending) || cov?.phase === "failed" || !!f.stop;
   const ask = f.base_red_resolution?.ask ?? (mainFailed ? null : f.diagnostic_ask);
   const make = (phase: TrainLineProjection["phase"], label: string, reason: string,
     blocker: TrainLineProjection["blocker"] = null, evidence: TrainLineProjection["evidence"] = [],
@@ -128,14 +129,17 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       : "Automatic recovery has no active repair task. The recovery monitor must assign one; work remains held." };
   };
   if (f.retired) return make("retired", "retired", "This line is retired.");
-  if ((fresh && (bs?.verdict === "red" || bs?.gate_blocked || cov?.phase === "failed")) || f.stop) {
+  if ((fresh && (bs?.verdict === "red" || (bs?.gate_blocked && !gatePending) || cov?.phase === "failed")) || f.stop) {
     const failure = cov?.phase === "failed" ? [{ name: `Deploy Dev${cov.failing_run_id ? ` run #${cov.failing_run_id}` : ""}`, ...(cov.failing_run_url ? { url: cov.failing_run_url } : {}) }] : [];
     const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];
     const names = evidence.map((e) => e.name).join(", ");
     return make("stopped", "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, repair());
   }
-  if (q && !fresh && (f.queue.length || f.currently || bs?.verdict !== "green")) return make(
+  if (q && !fresh && (f.queue.length || f.currently || bs?.verdict !== "green" || bs?.gate_blocked)) return make(
     "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());
+  if (fresh && gatePending) return make("waiting", "Waiting for required checks",
+    `The merge gate is waiting for: ${bs.gate_unsettled!.join(", ")}. No gate check has failed.`, "checks_running", [],
+    { kind: "machine", text: "The executor rechecks automatically when these checks settle.", url: null });
   if (fresh && cov?.phase === "settling") return make("waiting", "Build and deployment running",
     "The deployment is running. Changes resume automatically when required checks pass.", "checks_running", [],
     { kind: "machine", text: `Watching deployment${cov.active_run_id ? ` #${cov.active_run_id}` : ""}.`, url: cov.active_run_url ?? null });

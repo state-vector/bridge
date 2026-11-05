@@ -164,6 +164,13 @@ Out-of-band merge observations must match the independently accepted repair
 head and still require live deployment verification.
 Cause-bound repairs take precedence over stale generic diagnostic tasks in the
 main-failure banner, while explicit human requirements remain visible.
+Submitted repairs awaiting independent review are not exhausted merely because
+earlier attempts stalled. The machine continues verification; submission alone
+never grants acceptance or merge authority.
+Lane snapshots expose the serving hub's `hub_commit` so deployment verification
+can distinguish the live state engine from the edge version marker.
+Pending merge-gate checks display as waiting, with their names, rather than
+claiming main failed. Actual red checks and active stop episodes still block.
 
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action

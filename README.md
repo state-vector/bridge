@@ -1859,6 +1859,15 @@ Before the accepted repair lifecycle closes, merge-observed verification require
 deployment of that exact merge SHA; workflow ordering alone is not ancestry proof.
 The live main-failure banner selects an open cause-bound repair ahead of stale
 starvation diagnostics, preserving concrete human-action requests when present.
+A submitted root repair awaiting independent review is machine-owned even if
+earlier watchdog attempts failed. Historical attempts alone cannot demand human
+re-arming after submission; an explicit permission or authority escalation still
+remains actionable. A submitted PR is not accepted train admission.
+`train_status.hub_commit` identifies the Durable Object build actually serving
+lane state, independently of the edge Worker's `/__version` stamp.
+A merge gate waiting only on unsettled checks displays "Waiting for required
+checks". It never calls a pending check a failed main; actual failures and
+persisted stop-the-line episodes retain precedence.
 
 Repair ownership displays the agent label through the identity join, never its
 stored principal. Runner output is liveness/diagnostic detail; the main recovery
