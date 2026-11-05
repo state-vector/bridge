@@ -162,6 +162,10 @@ fn requested_worker_label(cfg: &DispatchConfig) -> String {
     }
 }
 
+fn worker_config_revision(cfg: &DispatchConfig) -> String {
+    format!("worker-ready-v2:task-affinity-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default())
+}
+
 fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(WorkerCredential, serde_json::Value), String> {
     let backend = avail.iter().max_by_key(|b| {
         let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
@@ -173,7 +177,7 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
     let mut capabilities = executor_capabilities(bc.reasoning_tier, &worker);
     capabilities["backend"] = json!(name);
     capabilities["model"] = json!(bc.model.or_else(|| cfg.model.clone()));
-    capabilities["config_revision"] = json!(format!("worker-ready-v2:task-affinity-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default()));
+    capabilities["config_revision"] = json!(worker_config_revision(cfg));
     capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
@@ -3410,7 +3414,7 @@ fn spawn_opencode(
     let mut capabilities = executor_capabilities(bc.reasoning_tier, worker);
     capabilities["backend"] = json!(backend_name);
     capabilities["model"] = json!(model);
-    capabilities["config_revision"] = json!(format!("worker-ready-v2:{}", serde_json::to_string(&cfg.backends).unwrap_or_default()));
+    capabilities["config_revision"] = json!(worker_config_revision(cfg));
     capabilities["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
     let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|ready| {
