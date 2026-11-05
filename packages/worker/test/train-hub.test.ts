@@ -3698,6 +3698,23 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     const exhausted = await laneSnap(repo);
     expect(exhausted.line.remediation.kind).toBe("human");
     expect(exhausted.line.remediation.action.url).toContain("/card/");
+    // A subsequent real submission supersedes historical watchdog failures,
+    // without making an unreviewed PR eligible for train admission.
+    await kbJson("/update", { id: repair, meta_delete: ["escalate"] });
+    const submitted = await kbJson("/transition", { id: repair, to: "in_review", actor: "repair-agent", session: "repair-6389",
+      note: `PR https://github.com/${repo}/pull/6587 — delivered repair awaiting independent review` });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    await stamp();
+    const reviewing = await laneSnap(repo);
+    expect(reviewing.base_red_resolution.phase).toBe("fix_in_progress");
+    expect(reviewing.base_red_resolution.ask).toBeNull();
+    expect(reviewing.line.remediation.kind).toBe("queued");
+    expect(reviewing.queue.some((q: { id: string }) => q.id === repair)).toBe(false);
+    expect((await kbJson("/get", { id: exhausted.line.remediation.action.id })).body.status).toBe("done");
+    // A concrete authority/permission escalation still warrants attention.
+    await kbJson("/update", { id: repair, meta: { escalate: { reason: "Deployment credential still unavailable" } } });
+    await stamp();
+    expect((await laneSnap(repo)).line.remediation.kind).toBe("human");
     await kbJson("/train.queue_facts", { repo, actor: "gw-6389", entries: [], base_state: { verdict: "green", red: [], unsettled: [] } });
     expect((await laneSnap(repo)).line.blocker).toBeNull();
     await kbJson("/train.lease", { repo, action: "release", actor: "gw-6389" });

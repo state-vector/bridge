@@ -12805,6 +12805,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   private rootFixExhausted(m: any, status?: string): boolean {
     if (!m || typeof m !== "object") return false;
     if (m.escalate || m.unblock_escalated) return true;
+    // Historical watchdog failures do not exhaust a subsequently delivered
+    // repair. review_pr is submission evidence only: it does not populate
+    // accepted train legs or authorize a merge.
+    if (status === "in_review" && isValidGitHubRepo(String(m.review_pr?.repo ?? "")) &&
+      Number.isInteger(m.review_pr?.number) && m.review_pr.number > 0) return false;
     const attempts = Number(m?.attempt?.attempts ?? 0);
     if (Number.isFinite(attempts) && attempts >= 3) return true;
     if (status === "blocked") {
