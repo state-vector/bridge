@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine } from "@bridge/contracts";
-import { normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
+import { applyDeployObservation, normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
 
 const now = 2_000_000;
 const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", url: "https://hub.test/card/BR-1", owner: "agent", active_agent: true,
@@ -43,6 +43,16 @@ describe("one line status and recovery contract", () => {
   it("healthy/ready cannot carry failure facts or a recovery request", () => {
     expect(TrainLineProjectionSchema.safeParse({ phase: "ready", label: "ready", reason: "", blocker: "main_failed", evidence: [], held: 1, observed_at: now,
       remediation: { kind: "attention", text: "fix it" } }).success).toBe(false);
+  });
+  it("a newer matching gateway receipt clears an older pending observation; a borrowed older green run cannot", () => {
+    const tip = "7".repeat(40);
+    const observation = { tip_sha: tip, observed_at: now - 1000, runs: [{ id: 123, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml", head_sha: tip,
+      status: "in_progress" as const, conclusion: null, html_url: "https://github.com/o/r/actions/runs/123" }] };
+    const state = { verdict: "green", tip_sha: tip, red: [], unsettled: [], deploy_coverage: {
+      phase: "covered", tip_sha: tip, tip_age_secs: 50, covered_by_sha: tip, covered_by_run_id: 122,
+    } };
+    expect(applyDeployObservation(state, observation, required, now)?.verdict).toBe("unsettled");
+    expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_id: 123 } }, observation, required, now)?.verdict).toBe("green");
   });
   it("the original empty-checks plus active Spot build is waiting, never deployment-missing", () => {
     const base_state = { verdict: "empty", red: [], unsettled: [], deploy_coverage: {

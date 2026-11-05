@@ -4223,9 +4223,21 @@ export function applyDeployObservation(
   baseState: Record<string, unknown> | null | undefined,
   observation: DeployObservation | undefined,
   required: string[],
+  checksObservedAt?: number,
 ): Record<string, unknown> | null | undefined {
   if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
-  const raw = baseState ?? { verdict: "empty", red: [], unsettled: [] };
+  const raw: Record<string, unknown> & { check_observed_at: number } = { ...(baseState ?? { verdict: "empty", red: [], unsettled: [] }),
+    check_observed_at: checksObservedAt ?? Number(baseState?.check_observed_at ?? 0) };
+  const knownRun = Math.max(...observation.runs.filter((r) => r.head_sha === observation.tip_sha).map((r) => r.id));
+  const newerCoverage = DeployCoverageStateSchema.safeParse(raw.deploy_coverage);
+  if (raw.check_observed_at > observation.observed_at && newerCoverage.success && newerCoverage.data.tip_sha === observation.tip_sha) {
+    const cov = newerCoverage.data;
+    const receipt = cov.phase === "covered" ? cov.covered_by_run_id : cov.phase === "failed" ? cov.failing_run_id : null;
+    // A newer, matching terminal receipt supersedes an older observation.
+    // This lets an ordinary gateway publish recovery after a watched rerun;
+    // a borrowed older green run cannot clear the failure or pending state.
+    if (receipt != null && receipt >= knownRun) return normalizeBaseStateWithCoverage(raw);
+  }
   const verdict: MainCheckVerdict = {
     verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",
     red: Array.isArray(raw.red) ? raw.red : [], unsettled: Array.isArray(raw.unsettled) ? raw.unsettled.map(String) : [], green: Number(raw.green ?? 0),

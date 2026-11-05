@@ -10857,7 +10857,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // guard dedupes the per-tick repeats — same shape as the stopped
     // flow's stop ask).
     const rawBaseState = body.base_state && typeof body.base_state === "object" ? body.base_state : null;
-    const baseState = applyDeployObservation(rawBaseState, meta.lane?.deploy_observation, laneOfMeta(meta)?.required_workflows ?? []);
+    const baseState = applyDeployObservation(rawBaseState, meta.lane?.deploy_observation, laneOfMeta(meta)?.required_workflows ?? [], Date.now());
     // BR#5376: the ACTIVE batch-stall episode rides the stamp (executor-fed;
     // the next stamp after a landing omits it, which clears the state by
     // itself). The lane renders a loud STALLED reason/banner off it and the

@@ -120,6 +120,8 @@ First-hand deployment observations can also be reported independently of the
 merge-control lease through `train_observe_deploy`. The hub validates the
 commit/run/job receipts and preserves them across older gateway snapshots;
 reporting evidence grants no merge or bypass authority.
+Newer matching terminal receipts clear older pending observations; an old
+successful run from another deployment cannot clear a known failure.
 
 ### Blocker rollup: many parked cards, one root
 

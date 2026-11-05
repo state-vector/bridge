@@ -1706,6 +1706,9 @@ merge or bypass checks. The hub persists those facts and folds them into every
 subsequent gateway snapshot, so an outdated merger cannot erase a known failed
 deployment with a scoped-green report. Other-commit, stale, or mismatched
 receipt observations are rejected.
+A newer gateway observation with a matching terminal deployment receipt can
+supersede an earlier pending observation, so the watched retry can recover
+normally without a second manual report. Older borrowed receipts cannot.
 
 ### One merge classification (BR#6330)
 
