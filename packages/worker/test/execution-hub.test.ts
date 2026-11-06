@@ -1,7 +1,7 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { ExecutionStateSchema } from "@bridge/contracts";
+import { ExecutionStateSchema, WorkerStatusSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
 let mf: Miniflare;
@@ -64,6 +64,14 @@ async function interactive(label: string) {
 }
 
 describe("local handoff authority and lifecycle", () => {
+  it("serves scheduler readiness and per-host counts on the public board projection", async () => {
+    const r = await runtimeTask();
+    const response = await stub.fetch("https://kb/board", { method: "GET" });
+    expect(response.status).toBe(200);
+    const board = await response.json() as { workers: unknown[] };
+    const workers = board.workers.map(value => WorkerStatusSchema.parse(value));
+    expect(workers.find(worker => worker.host === r.auth.actor)).toMatchObject({ state: "ready", active: 0, reserved: 0, capacity: 4 });
+  });
   it("lets a direct interactive claimant resolve an unstarted gateway prerequisite without repairing that gateway", async () => {
     const r = await runtimeTask();
     const id = (await post<{ id: string }>("create", { type: "task", title: "Unstarted gateway prerequisite", project: "bridge", qualified: true })).data.id;

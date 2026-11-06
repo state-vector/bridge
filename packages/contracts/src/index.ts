@@ -26,3 +26,4 @@ export * from "./execution-availability.ts";
 export * from "./runner-update.ts";
 export * from "./model-policy.ts";
 export * from "./execution-observability.ts";
+export { WorkerStatusSchema, currentWorkerStatus, type WorkerStatus } from "./worker-status.ts";

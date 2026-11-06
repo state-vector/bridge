@@ -3,7 +3,7 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { TrainPanel } from "./TrainPanel";
-import { ExecutionAttentionPanel } from "./ExecutionAttention";
+import { WorkerAvailabilityBanner } from "./WorkerAvailability";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
@@ -248,10 +248,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   return (
     <div className="top-wrap">
+      <WorkerAvailabilityBanner />
       <TrainPanel openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
-      <ExecutionAttentionPanel openTask={openDetails} />
       <TopSectionHeader theme={tagTheme} />
 
       <div className="top-table" role="region" aria-label="Active fleet tasks" tabIndex={0}>

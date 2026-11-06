@@ -922,20 +922,19 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* title-bar status lights: hub / kb / gateways, click for details */
 .status-lights { position: relative; margin-right: 8px; }
-.lights-btn { display: inline-flex; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+.lights-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font: inherit; font-size: 11px; background: none; border: none; cursor: pointer; padding: 5px 7px; border-radius: 4px; }
 .lights-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .lights-count { font-size: 10px; color: var(--text-faint); margin-left: 3px; }
 /* (superseded by the fixed-position .lights-pop block at the end) */
 .light-row { display: flex; align-items: center; gap: 6px; }
-.light-meta { color: var(--text-faint); margin-left: auto; font-size: 10px; }
+.light-meta { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); margin-left: auto; font-size: 11px; }
 
 /* lights popover: fixed overlay — never grows the title bar, never themed light */
 .lights-pop {
   position: fixed;
-  top: 34px;
-  right: 12px;
+  box-sizing: border-box;
   z-index: 1000;
-  min-width: 280px; max-width: 380px;
+  width: min(340px, calc(100vw - 32px));
   background: #10151f;
   color: var(--text, #dbe2ee);
   border: 1px solid #232b3b;
@@ -947,6 +946,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   max-height: 60vh; overflow-y: auto;
 }
 .lights-pop .light-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.lights-pop h3 { margin: 6px 0 2px; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+.light-worker { padding: 6px 0; border-top: 1px solid var(--line); }
+.light-worker-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.light-worker-state { margin-left: auto; color: var(--amber); }
+.worker-ready, .worker-busy { color: var(--green); }
+.worker-offline { color: var(--red); }
+.light-worker-detail { margin-top: 3px; color: var(--text-dim); overflow-wrap: anywhere; }
+.light-error { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--line); padding-top: 8px; color: var(--red); overflow-wrap: anywhere; }
+.worker-warning { padding: 10px 12px; border: 1px solid var(--amber); border-radius: 7px; color: var(--amber); background: color-mix(in srgb, var(--amber) 8%, transparent); }
 
 /* detail OS windows: the overlay components render full-bleed */
 .task-window { height: 100vh; background: var(--bg, #0d1117); }

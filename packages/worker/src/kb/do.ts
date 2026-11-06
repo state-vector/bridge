@@ -9,6 +9,7 @@
  * Transport: the worker forwards JSON op requests via fetch("https://kb/<op>").
  * Ops: create | get | list | search | update | transition | link | stats
  */
+import { WorkerStatusSchema } from "@bridge/contracts";
 import {
   scaffoldBody,
   EMBED_MODEL,
@@ -2535,7 +2536,22 @@ export class KnowledgeHub {
         if (!isHumanDecisionAsk(t.meta.ask)) t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
       }
     }
-    return { tasks, sessions, progress, series, agents: this.agentScores() };
+    const now = Date.now();
+    const workers = this.state.storage.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => {
+      const host = String(row.label), tokenId = String(row.token_id);
+      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+      const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
+      const readiness = this.executorReadiness(tokenId, host, capabilities, now);
+      const usable = [capabilities, ...capabilities.alternatives].some(model => model.availability.kind === "usable");
+      const state = now - Number(row.observed_ts) >= 120_000 ? "offline"
+        : readiness.kind === "draining" ? "draining"
+        : readiness.kind !== "ready" || !usable || capabilities.capacity <= 0 ? "unavailable"
+        : occupancy.active + occupancy.reserved >= capabilities.capacity ? "busy" : "ready";
+      return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, ...occupancy, capacity: capabilities.capacity,
+        reason: state === "offline" ? "Worker heartbeat is stale." : readiness.kind !== "ready" ? readiness.reason
+          : !usable ? "No configured model is usable." : capabilities.capacity <= 0 ? "No worker slots configured." : state === "busy" ? "All worker slots are occupied." : "" });
+    });
+    return { tasks, sessions, progress, series, agents: this.agentScores(), workers };
   }
 
   /** Blocker rollup (BR#2645): cluster the blocked cards by machine root key

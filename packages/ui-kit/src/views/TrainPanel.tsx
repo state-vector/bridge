@@ -139,14 +139,15 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
 export function TrainPanelView({ lanes, error, now, openTask }: {
   lanes: KbTrainLane[] | null; error: string | null; now: number; openTask?: (id: string) => void;
 }) {
+  const activeLanes = lanes?.filter(lane => !lane.retired && lane.line?.phase !== "retired");
   return <div className="train-panel">
     <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
-    {lanes?.length === 0 && <div className="muted-note">No merge lines configured.</div>}
-    {!!lanes?.length && <div className="ktable-head train-head-cols">
+    {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
+    {!!activeLanes?.length && <div className="ktable-head train-head-cols">
       <span title="Executor heartbeat" aria-label="Executor heartbeat">●</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
     </div>}
-    {(lanes ?? []).map((l) => {
+    {(activeLanes ?? []).map((l) => {
       const line = l.line ?? unavailable;
       const live = !!l.lease && now - l.lease.heartbeat_ts < 300_000;
       const machine = l.lease?.holder ?? l.capable?.holder;

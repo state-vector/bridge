@@ -167,6 +167,7 @@ export interface KbAsk {
 }
 
 export interface KbBoard {
+  workers?: import("@bridge/contracts").WorkerStatus[];
   tasks: KbArtefact[];
   sessions: KbSession[];
   progress: KbProgress[];
@@ -543,7 +544,7 @@ export function wsPushAvailable(): boolean {
 }
 export function connectKbWs(
   onEvent: (e: KbEvent) => void,
-  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[] }) => void,
+  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[]; workers?: import("@bridge/contracts").WorkerStatus[] }) => void,
   onStatus: (s: "open" | "closed") => void,
   sinceRef: () => number,
 ) {
