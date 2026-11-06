@@ -184,6 +184,7 @@ fn cli_answer(question: &str, context: &str, history: &str) -> Result<Option<(St
         None, // no extra config — the console is read-only, no bridge MCP
         None,
         None,
+        None,
     );
     if outcome.ok {
         let text = outcome.stdout_tail.trim().to_string();

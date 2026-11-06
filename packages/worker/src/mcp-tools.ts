@@ -16,6 +16,8 @@ import {
   TOOL_ARG_SCHEMAS,
   defineToolTable,
   mcpToolsList,
+  StartupWaitSchema,
+  startupWaitReason,
   type ToolCtx,
   type ToolName,
   type ToolTable,
@@ -81,13 +83,33 @@ async function seeAlso(a: any, rel: any, identity: ToolCtx["identity"], call: To
  * this row are what tools/list ADVERTISES and what the fixture test pins.
  */
 export const TOOL_TABLE: ToolTable = defineToolTable({
+  handoffs: {
+    description: "Read pending local handoffs without claiming, acknowledging or resuming work. Paginated, project/recipient scoped. Includes continuation prompt, all current blockers, can_accept/prerequisites and explicit acceptance reference.",
+    schema: TOOL_ARG_SCHEMAS.handoffs,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.read", { ...args, session: ctx.sessionName }))),
+  },
+  handoff_accept: {
+    description: "Explicit episode/version-bound local acceptance. Requires a live full interactive credential (never a provisioned worker/gateway/cron) and a matching human-web authorised session/capability grant. Returns accepted/already_accepted/stale_episode/unauthorized/unmet_prerequisites. Copying a prompt or answering an ask is not acceptance.",
+    schema: TOOL_ARG_SCHEMAS.handoff_accept,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.accept", args))),
+  },
+  handoff_checkpoint: {
+    description: "Record the winning local session's newly published checkpoint before explicit human-authorised return to autonomous execution. Increments the handoff version; never requeues work by itself.",
+    schema: TOOL_ARG_SCHEMAS.handoff_checkpoint,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
+  },
+  execution: {
+    description: "Durable executor protocol v1: eligibility-first schedule (inspect/reserve/request_capacity), read-only schedule_status, full-agent gateway_control (draining/enabled), inspect/advertise, fenced begin/poll, checkpoint/restore/quiesce, mailbox, escalation and effect receipts. request_capacity arranges safe recovery preemption without reserving work. Reservations count against gateway capacity; lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
+    schema: TOOL_ARG_SCHEMAS.execution,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("execution", { ...args, session: args.session ?? ctx.sessionName }))),
+  },
   orient: {
     description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags. Every artefact row carries url — its stable deep link (/card/BR-NNNN), pasteable in a browser.",
     schema: TOOL_ARG_SCHEMAS.orient,
     handler: async (args, ctx) => {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
       const session = await ctx.call("session.touch", { token_id: ctx.identity.token_id, session: args.session ?? ctx.sessionName });
-      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags });
+      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags, session: args.session ?? ctx.sessionName });
       const named = args.session ?? ctx.sessionName;
       const required: string[] = Array.isArray(o.action_required) ? o.action_required : [];
       return text(JSON.stringify(
@@ -127,11 +149,12 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       const m: any = a.meta ?? {};
       const isQuestion = aTags.includes("question");
       const gated = m.operator_gated;
+      const startup = StartupWaitSchema.safeParse(m.startup_wait);
       const traits = isTask
         ? {
             is_question: isQuestion,
-            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated,
-            claim_reason: isQuestion
+            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated && !startup.success,
+            claim_reason: startup.success ? startupWaitReason(startup.data) : isQuestion
               ? "question — answered, not claimed (contribute via log_progress {id, did})"
               : gated
                 ? `operator gated: ${gated} — a human clears the gate`
@@ -281,7 +304,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lease", args), null, 1)),
   },
   train_event: {
-    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue). Requires the lane lease.",
+    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue), updated (BR#4687: machine update-branch on a behind worker-authored branch — stamps the carry chain, the verdict carries, the card silently re-enters the queue). Requires the lane lease.",
     schema: TOOL_ARG_SCHEMAS.train_event,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.event", args), null, 1)),
   },
@@ -311,7 +334,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.carry", args), null, 1)),
   },
   train_history: {
-    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed with provenance (sha → PR → task → verdict → session).",
+    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed/updated with provenance (sha → PR → task → verdict → session).",
     schema: TOOL_ARG_SCHEMAS.train_history,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.history", args), null, 1)),
   },
@@ -324,6 +347,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Report first-hand read-only GitHub deployment observations independently of the merger lease. The hub validates commit/run receipts and decides line health and recovery. Does not authorize merges or bypass checks.",
     schema: TOOL_ARG_SCHEMAS.train_observe_deploy,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.observe_deploy", args), null, 1)),
+  },
+  train_recovery_event: {
+    description: "Record cause-specific recovery diagnosis, action attempt, outcome and next step. Repeated event IDs are idempotent; retry budgets survive executor restarts. Code submission never marks live recovery. Only a matched successful decisive deployment closes an episode.",
+    schema: TOOL_ARG_SCHEMAS.train_recovery_event,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.recovery_event", args), null, 1)),
   },
   reconcile_schedule: {
     description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",

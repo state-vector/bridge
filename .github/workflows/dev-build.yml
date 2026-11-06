@@ -38,6 +38,8 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build bridge CLI (dev)
         working-directory: packages/cli
+        env:
+          BRIDGE_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
         shell: bash
@@ -67,3 +69,23 @@ jobs:
           files: |
             bridge-*.tar.gz
             bridge-*.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runner-${{ matrix.target }}
+          path: bridge-*.tar.gz
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runner-*
+          path: runner-assets
+          merge-multiple: true
+      - name: Publish commit-addressed binaries and manifest (never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRIDGE_BUILD_COMMIT: ${{ github.sha }}
+        run: python3 scripts/publish-runner.py runner-assets

@@ -1,4 +1,5 @@
 import { getKbHubConfig } from "./config";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
  *  Auth: the human session cookie — browser (webapp) sends it same-origin via
@@ -20,6 +21,8 @@ export interface KbArtefact {
   owner?: string;
   body_md?: string;
   meta?: Record<string, unknown>;
+  /** Read-only model observation projected from the canonical execution attempt. */
+  execution?: ExecutionModelView;
   created_ts: number;
   updated_ts: number;
   status_ts?: number;
@@ -164,6 +167,7 @@ export interface KbAsk {
 }
 
 export interface KbBoard {
+  workers?: import("@bridge/contracts").WorkerStatus[];
   tasks: KbArtefact[];
   sessions: KbSession[];
   progress: KbProgress[];
@@ -446,6 +450,8 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const kbApi = {
+  executionAttention: () => j<unknown>("/api/kb/execution_attention"),
+  handoffControl: (body: import("@bridge/contracts").HandoffControl) => j<{ kind: string; prerequisites?: unknown[] }>("/api/kb/handoff_control", { method: "POST", body: JSON.stringify(body) }),
   board: () => j<KbBoard>("/api/kb/board"),
   throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
@@ -538,7 +544,7 @@ export function wsPushAvailable(): boolean {
 }
 export function connectKbWs(
   onEvent: (e: KbEvent) => void,
-  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[] }) => void,
+  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[]; workers?: import("@bridge/contracts").WorkerStatus[] }) => void,
   onStatus: (s: "open" | "closed") => void,
   sinceRef: () => number,
 ) {

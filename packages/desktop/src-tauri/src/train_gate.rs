@@ -31,9 +31,18 @@ const MERGE_EXEMPT_CHECK_PATTERNS: [&str; 7] = [
     "superpositional",
 ];
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckSource {
+    Unknown,
+    CheckRun { suite_id: i64, app_id: i64 },
+    WorkflowRun { workflow_id: i64, run_attempt: u64 },
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MainCheckRun {
     pub id: i64,
+    pub source: CheckSource,
     pub name: String,
     pub status: Option<String>,
     pub conclusion: Option<String>,
@@ -107,7 +116,11 @@ fn settled_green(c: &str) -> bool {
     c == "success" || c == "skipped" || c == "neutral"
 }
 
-fn is_exempt_check_name(name: &str) -> bool {
+/// BR#2267 exempt-external names (BR#6001 list). BR#6568: now also consumed
+/// by the probe path (train.rs classify_rollup, the observation behind the
+/// typed pr_checks_green await) — an exempt external failing must not park a
+/// typed await, exactly as it must not bounce a merge (BR#3177 law).
+pub fn is_exempt_check_name(name: &str) -> bool {
     let n = name.to_lowercase();
     MERGE_EXEMPT_CHECK_PATTERNS.iter().any(|p| n.contains(p))
 }
@@ -115,12 +128,21 @@ fn is_exempt_check_name(name: &str) -> bool {
 fn parse_runs(runs: &[MainCheckRun]) -> Vec<(String, Vec<&MainCheckRun>)> {
     let mut by_name: Vec<(String, Vec<&MainCheckRun>)> = Vec::new();
     for r in runs {
-        match by_name.iter_mut().find(|(n, _)| *n == r.name) {
+        match by_name.iter_mut().find(|(n, list)| *n == r.name && same_check_obligation(&list[0].source, &r.source)) {
             Some((_, list)) => list.push(r),
             None => by_name.push((r.name.clone(), vec![r])),
         }
     }
     by_name
+}
+
+fn same_check_obligation(a: &CheckSource, b: &CheckSource) -> bool {
+    match (a, b) {
+        (CheckSource::Unknown, CheckSource::Unknown) => true,
+        (CheckSource::CheckRun { suite_id: a, app_id: aa }, CheckSource::CheckRun { suite_id: b, app_id: ba }) => a == b && aa == ba,
+        (CheckSource::WorkflowRun { workflow_id: a, .. }, CheckSource::WorkflowRun { workflow_id: b, .. }) => a == b,
+        _ => false,
+    }
 }
 
 /// core.ts classifyMainCheckRuns (764): newest non-cancelled run per name
@@ -283,6 +305,9 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
 /// with exempt-external failures pulled OUT of red into `external`
 /// (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
+    if runs.is_empty() {
+        return finish_verdict(vec![], vec!["head checks have not started or could not be read".into()], vec![], 0);
+    }
     let mut red = Vec::new();
     let mut unsettled = Vec::new();
     let mut external = Vec::new();
@@ -701,13 +726,9 @@ pub struct TrainGateInput<'a> {
     pub commits: &'a [(String, bool)],
     pub head_checks: &'a [MainCheckRun],
     pub leg_number: Option<usize>,
-    /// BR#5190: the candidate IS the bound main-breakage fix (is_root_fix_card
-    /// over the WHOLE card — tags live on the card row, the binding under
-    /// meta.root_fix — the executor mirror of the hub's isRootFixCard).
+    /// The candidate is the bound main-breakage cure (BR#5190).
     pub root_fix: bool,
-    /// BR#5190: the base's failing check NAMES ride the gate — the fast lane
-    /// matches the circular deploy-health class off them (the receipt names
-    /// the red the fix cures).
+    /// Names of the base failures, used by the circular-gate fast lane.
     pub base_red_names: &'a [String],
     /// BR#5883: the tip's whole-tip gate predicate is GREEN — main's tip
     /// classifies fully green under `classify_main_check_runs` (the exact
@@ -717,6 +738,12 @@ pub struct TrainGateInput<'a> {
     /// tip re-runs; a conviction against a still-red tip is honest and
     /// stands (the base alarm / P1 escalation owns it).
     pub base_gate_green: bool,
+    /// BR#4687 (L1.2): every commit's GitHub author login is on the worker
+    /// allowlist — the branch belongs to the train's own fleet. Provenance
+    /// gate for the behind pre-clear below: the train machine-updates its
+    /// OWN branches; a protected human branch still bounces to its owner.
+    /// Fail-closed: absent/false is human-treated.
+    pub train_owned_branch: bool,
 }
 
 /// core.ts decideMergeAction (907): the 5c gate + verify lineage as one
@@ -1127,8 +1154,17 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                     }
                 }
                 CandidateHeadCheckState::Green => {
+                    if blocked {
+                        return MergeAction::Note { reason: format!("PR #{} GitHub branch policy remains BLOCKED despite observed green head checks — reconcile required checks and policy; no merge attempted", i.pr_number) };
+                    }
+                    if behind && !i.train_owned_branch {
+                        return MergeAction::Bounce {
+                            defect: format!("PR #{} mergeStateStatus=behind against base on a protected (non-worker-authored) branch — the train does not move human branches. Rebase, re-sign, re-push and re-enter the queue", i.pr_number),
+                            bounce_kind: BounceKind::Gate,
+                        };
+                    }
                     let state_clause = if behind {
-                        "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)"
+                        "behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687)"
                     } else if blocked {
                         "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)"
                     } else {
@@ -1270,9 +1306,22 @@ pub fn merge_sweep_human_leg_title(repo: &str, reasons: &[String]) -> String {
 /// `workflow_dispatch` and fast-page escalation (BR#6179). Mirrored in `core.ts`.
 pub const DEPLOY_RECONCILE_GRACE_SECS: u64 = 300;
 
+/// Wire mirror of @bridge/contracts RecoveryCauseSchema. Only an unknown
+/// check failure is eligible for a generic retry; identified test/capability
+/// defects belong to their repair executors.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoveryCause {
+    TestFailure { check: String, suite: String, test: String },
+    CapabilityUnavailable { check: String, scenario: String, capability: String, scope: String },
+    CheckFailure { check: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeployWorkflowRun {
     pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_attempt: Option<i64>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -1281,7 +1330,11 @@ pub struct DeployWorkflowRun {
     pub event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized ALWAYS — explicit `null` while a run is queued/in_progress.
+    /// The hub schema rejects a MISSING conclusion key (nullable ≠ optional),
+    /// so `skip_serializing_if` here made every observation containing an
+    /// in-flight deploy run fail validation (2026-11-05 incident, 123 rejects).
+    #[serde(default)]
     pub conclusion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
@@ -1885,12 +1938,29 @@ pub fn reconcile_base_verdict_with_deploy_coverage(
 
 #[cfg(test)]
 fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
-    MainCheckRun { id, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
+    MainCheckRun { id, source: CheckSource::Unknown, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_name_different_suites_remain_independent_obligations() {
+        let mut original = run(126988470498, "Deploy health (merge gate)", Some("failure"));
+        original.source = CheckSource::CheckRun { suite_id: 10, app_id: 1 };
+        let mut republished = run(127642055356, "Deploy health (merge gate)", Some("success"));
+        republished.source = CheckSource::CheckRun { suite_id: 20, app_id: 1 };
+        let mut runs = vec![original.clone(), republished];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        assert_eq!(classify_main_check_runs(&runs).verdict, MainVerdict::Red);
+        assert_eq!(latest_red_deploy_health_runs(&runs)[0].id, original.id);
+        original.id = 127653739994;
+        original.conclusion = Some("success".into());
+        runs.push(original);
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Green);
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
 
     #[test]
     fn decisive_failed_deploy_overrules_scoped_green_and_never_borrows_old_receipt() {
@@ -1899,7 +1969,7 @@ mod tests {
         let runs: Vec<MainCheckRun> = required.iter().enumerate().map(|(i, name)| run(i as i64, name, Some("success"))).collect();
         let scoped = classify_base_check_runs(&runs, &required);
         assert_eq!(scoped.verdict, MainVerdict::Green);
-        let workflow = |id, sha: &str, conclusion: &str| DeployWorkflowRun { id, name: "Deploy Dev".into(),
+        let workflow = |id, sha: &str, conclusion: &str| DeployWorkflowRun { id, run_attempt: Some(1), name: "Deploy Dev".into(),
             path: Some(".github/workflows/deploy-dev.yml".into()), head_sha: sha.into(), event: Some("push".into()),
             status: Some("completed".into()), conclusion: Some(conclusion.into()), html_url: Some(format!("https://github.com/actions/runs/{id}")) };
         let workflows = vec![workflow(41926939169, "78760d10", "failure"), workflow(41924676992, "e99f74f8", "success")];
@@ -2076,6 +2146,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("BR#3516"), "receipt: {receipt}"),
@@ -2227,6 +2298,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: true,
+            train_owned_branch: false,
         });
         match action {
             MergeAction::RerunGate { reason } => {
@@ -2252,6 +2324,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(
             !matches!(action, MergeAction::RerunGate { .. }),
@@ -2381,6 +2454,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -2422,6 +2496,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Bounce { bounce_kind, .. } => assert_eq!(bounce_kind, BounceKind::Coverage),
@@ -2451,6 +2526,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: true,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -2484,6 +2560,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Skip { reason } => {
@@ -2508,6 +2585,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Note { reason } => assert!(reason.contains("head check RED"), "reason: {reason}"),
@@ -2516,10 +2594,8 @@ mod tests {
     }
 
     #[test]
-    fn blocked_green_verdict_anchor_merges_br4633_l4_2() {
-        // mirrored from merge-train.test.ts: blocked + GREEN head checks +
-        // covered verdict MERGES — the BR verify verdict is the approval of
-        // record (supersedes BR#3727's "blocked+green bounce stands" posture)
+    fn blocked_green_verdict_does_not_override_github_admission_br6776() {
+        // Substance approval is not evidence of GitHub branch admission.
         let meta = serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 4700, "head_sha_at_acceptance": "ccccccccc" } });
         let head = "c".repeat(40);
         let checks = [run(1, "ci", Some("success"))];
@@ -2537,14 +2613,11 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
-            MergeAction::Merge { receipt } => {
-                assert!(receipt.contains("blocked pre-cleared"), "receipt: {receipt}");
-                assert!(receipt.contains("approval of record"), "receipt: {receipt}");
-                assert!(receipt.contains("BR#4633 L4.2"), "receipt: {receipt}");
-            }
-            other => panic!("expected merge, got {other:?}"),
+            MergeAction::Note { reason } => assert!(reason.contains("GitHub branch policy remains BLOCKED")),
+            other => panic!("expected policy reconciliation, got {other:?}"),
         }
     }
 
@@ -2601,6 +2674,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("leg 1/1") && receipt.contains("BR#3516")),
@@ -2668,6 +2742,38 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: true,
+        }
+    }
+
+    // ---- BR#4687 (L1.2): the provenance-gated behind pre-clear + the
+    // BR#3727 blocked rows, one row per gate input ----
+
+    #[cfg(test)]
+    fn gate_input_provenance<'a>(
+        head: &'a str,
+        meta: &'a Value,
+        status: Option<&'a str>,
+        state: Option<&str>,
+        checks: &'a [MainCheckRun],
+        commits: &'a [(String, bool)],
+        owned: bool,
+    ) -> TrainGateInput<'a> {
+        TrainGateInput {
+            pr_number: 7,
+            head_sha: head,
+            card_meta: meta,
+            card_status: status,
+            base_verdict: MainVerdict::Green,
+            mergeable: Some(true),
+            merge_state_status: state.map(String::from),
+            commits,
+            head_checks: checks,
+            leg_number: Some(1),
+            train_owned_branch: owned,
+            root_fix: false,
+            base_red_names: &[],
+            base_gate_green: false,
         }
     }
 
@@ -2675,11 +2781,12 @@ mod tests {
     fn train_gate_behind_preclear_receipts_byte_identical() {
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
-        // BEHIND uppercase → normalized, pre-cleared, merge carries
+        // BEHIND uppercase → normalized, pre-cleared, merge carries (BR#4687:
+        // the receipt names the worker-authored branch provenance)
         let gate = decide_train_gate(gate_input(&meta, Some("BEHIND"), &[run(1, "ci", Some("success"))]));
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains(
-                "5c gate pass (mergeable, behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5), 1 verified commits)"
+                "5c gate pass (mergeable, behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687), 1 verified commits)"
             )),
             other => panic!("expected merge, got {other:?}"),
         }
@@ -2691,6 +2798,20 @@ mod tests {
                 assert!(!receipt.contains("behind pre-cleared"));
             }
             other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_behind_worker_authored_preclears_to_merge() {
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Merge { receipt } => {
+                assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}");
+                assert!(receipt.contains("BR#4687"), "receipt: {receipt}");
+            }
+            other => panic!("expected merge with pre-clear, got {other:?}"),
         }
     }
 
@@ -2872,6 +2993,7 @@ mod tests {
             root_fix: true,
             base_red_names: &["Deploy health (merge gate)".to_string(), "Deploy Dev".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::Merge { receipt } => {
@@ -2879,6 +3001,20 @@ mod tests {
                 assert!(receipt.contains("Deploy health (merge gate)"), "{receipt}");
             }
             other => panic!("expected fast-track merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_behind_human_branch_still_bounces() {
+        let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], false));
+        match gate {
+            MergeAction::Bounce { defect, bounce_kind } => {
+                assert!(defect.contains("behind"), "defect must name the state: {defect}");
+                assert_eq!(bounce_kind, BounceKind::Gate);
+            }
+            other => panic!("expected gate bounce for a human-owned behind branch, got {other:?}"),
         }
     }
 
@@ -2901,6 +3037,7 @@ mod tests {
             root_fix: false,
             base_red_names: &["Deploy Dev".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(matches!(gate, MergeAction::Skip { .. }), "got {gate:?}");
     }
@@ -2925,12 +3062,26 @@ mod tests {
             root_fix: true,
             base_red_names: &["Deploy health (merge gate)".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::HumanLeg { reason } => {
                 assert!(reason.contains("circular deploy-health class") && reason.contains("BR#5189"), "{reason}");
             }
             other => panic!("expected human fast lane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_blocked_pending_checks_skip_a_tick() {
+        // BR#3727: blocked + re-running required checks is a clock, not a defect
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let checks = [run(1, "ci", Some("in_progress"))];
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("blocked"), &checks, &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Skip { reason } => assert!(reason.contains("pending, not a defect"), "reason: {reason}"),
+            other => panic!("expected skip-a-tick, got {other:?}"),
         }
     }
 
@@ -2953,6 +3104,7 @@ mod tests {
             root_fix: false,
             base_red_names: &["Deploy health (merge gate)".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
     }
@@ -2978,6 +3130,7 @@ mod tests {
             root_fix: true,
             base_red_names: &["Deploy Dev".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::Merge { .. }) && !matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
     }
@@ -3001,6 +3154,7 @@ mod tests {
             root_fix: true,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "got {gate:?}");
     }
@@ -3031,6 +3185,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         match gate {
             MergeAction::RerunGate { reason } => {
@@ -3065,6 +3220,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::RerunGate { .. }), "got {gate:?}");
         assert!(matches!(gate, MergeAction::Note { .. }), "got {gate:?}");
@@ -3090,6 +3246,7 @@ mod tests {
             root_fix: false,
             base_red_names: &["Deploy health (merge gate)".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::RerunGate { .. }), "got {gate:?}");
     }
@@ -3122,6 +3279,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: false,
+            train_owned_branch: true,
         });
         assert!(matches!(gate, MergeAction::Merge { .. }), "expected Merge when newest gate run is green, got {gate:?}");
     }
@@ -3148,6 +3306,7 @@ mod tests {
             root_fix: false,
             base_red_names: &[],
             base_gate_green: true,
+            train_owned_branch: false,
         });
         assert!(matches!(gate, MergeAction::RerunGate { .. }), "expected RerunGate on stale main-green gate, got {gate:?}");
     }
@@ -3181,6 +3340,7 @@ mod tests {
             root_fix: true,
             base_red_names: &["deploy / Deploy to dev".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(
             matches!(circular_blocked, MergeAction::HumanLeg { .. }),
@@ -3202,6 +3362,7 @@ mod tests {
             root_fix: true,
             base_red_names: &["deploy / Deploy to dev".to_string()],
             base_gate_green: false,
+            train_owned_branch: false,
         });
         assert!(
             matches!(
@@ -3233,6 +3394,7 @@ mod tests {
         let wf_runs_with_dhr = vec![
             DeployWorkflowRun {
                 id: 41791923312,
+                run_attempt: Some(1),
                 name: "Deploy Health Record".into(),
                 path: Some(".github/workflows/deploy-health.yml".into()),
                 head_sha: dark_tip.into(),
@@ -3243,6 +3405,7 @@ mod tests {
             },
             DeployWorkflowRun {
                 id: 41780000001,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3321,6 +3484,7 @@ mod tests {
         let wf_runs_redundant = vec![
             DeployWorkflowRun {
                 id: 41798951196,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3331,6 +3495,7 @@ mod tests {
             },
             DeployWorkflowRun {
                 id: 41798949143,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: prev_green_tip.into(),
@@ -3343,6 +3508,7 @@ mod tests {
         let unsettled_verdict = classify_base_check_runs(
             &[MainCheckRun {
                 id: 1,
+                source: CheckSource::Unknown,
                 name: "deploy / Deploy to dev".into(),
                 status: Some("in_progress".into()),
                 conclusion: None,
@@ -3375,6 +3541,7 @@ mod tests {
         let spot_build_verdict = classify_base_check_runs(
             &[MainCheckRun {
                 id: 126859440408,
+                source: CheckSource::Unknown,
                 name: "deploy / Prepare deploy to dev (build on spot)".into(),
                 status: Some("in_progress".into()),
                 conclusion: None,
@@ -3391,6 +3558,7 @@ mod tests {
             &required,
             &[DeployWorkflowRun {
                 id: 41911085476,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),
@@ -3421,6 +3589,7 @@ mod tests {
             &required,
             &[DeployWorkflowRun {
                 id: 41911085476,
+                run_attempt: Some(1),
                 name: "Deploy Dev".into(),
                 path: Some(".github/workflows/deploy-dev.yml".into()),
                 head_sha: "20b508b3281abf77e7cfec680d920df0e27a7ef2".into(),
@@ -3445,5 +3614,35 @@ mod tests {
         assert_eq!(parse_iso8601_epoch_ms("2026-11-04T08:01:57Z"), Some(1_793_779_317_000));
         assert_eq!(parse_iso8601_epoch_ms("2026-11-04T08:01:57.250Z"), Some(1_793_779_317_250));
         assert_eq!(parse_iso8601_epoch_ms("invalid"), None);
+    }
+
+    #[test]
+    fn train_gate_blocked_red_checks_note_not_bounce() {
+        // blocked + RED on a QUEUED card: the linked session owns it — a Note,
+        // never a bounce cascade (core.ts verbatim parity)
+        let head = "dddddddddddddddddddddddddddddddddddddddd";
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
+        let checks = [run(1, "ci", Some("failure"))];
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("blocked"), Some("blocked"), &checks, &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Note { reason } => assert!(reason.contains("no bounce"), "reason: {reason}"),
+            other => panic!("expected note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_gate_repeated_behind_on_carried_verdict_still_preclears() {
+        // stamp → carry → head: the leg's verdict covers the post-update head,
+        // so a SECOND behind machine-updates again instead of attempting a
+        // doomed merge (BR#3659's per-leg coverage + BR#4687's carry)
+        let stamp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let carry = serde_json::json!([{ "from_head": stamp, "to_head": head, "prior_verdict_id": null, "carried_ts": 0, "via": "update-branch" }]);
+        let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": stamp, "carry": carry } ] });
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], true));
+        match gate {
+            MergeAction::Merge { receipt } => assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}"),
+            other => panic!("expected carried verdict to pre-clear a second behind, got {other:?}"),
+        }
     }
 }

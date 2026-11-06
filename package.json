@@ -23,5 +23,14 @@
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "workerd@1.20250906.0": true,
+    "workerd@1.20261019.1": true,
+    "workerd@1.20250718.0": true,
+    "esbuild": true,
+    "sharp@0.33.5": true,
+    "sharp@0.35.5": true,
+    "fsevents@2.3.3": true
   }
 }

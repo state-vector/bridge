@@ -6,6 +6,9 @@
  * the UI (`kb.ts`/`TrainPanel.tsx`), and the Rust executor (`train.rs`/`train_gate.rs`).
  */
 import { z } from "zod";
+import { RecoveryCauseSchema } from "./train-recovery.ts";
+import { ExecutionBlockerSchema } from "./execution.ts";
+import { RecoveryPreemptionSchema } from "./scheduling.ts";
 
 export const TrainEntryClassSchema = z.enum([
   "ready",
@@ -43,6 +46,8 @@ export const TrainFixCardSchema = z.object({
   executor_session: z.string().optional(),
   active_agent: z.boolean().optional(),
   blocked_reason: z.string().optional(),
+  execution_blockers: z.array(ExecutionBlockerSchema).optional(),
+  preemption: RecoveryPreemptionSchema.optional(),
   last_progress: TrainFixCardProgressSchema.nullable().optional(),
   pr: z.number().int().positive().optional(),
   pr_url: z.string().optional(),
@@ -129,12 +134,21 @@ export type DeployCoveragePhase = DeployCoverageState["phase"];
 export const DeployObservationSchema = z.object({
   tip_sha: z.string().regex(/^[0-9a-f]{40}$/),
   observed_at: z.number().int().positive(),
-  failures: z.array(z.object({ run_id: z.number().int().positive(), name: z.string().min(1), url: z.string().url() })).max(100).optional(),
+  failures: z.array(z.object({ run_id: z.number().int().positive(), name: z.string().min(1), url: z.string().url(),
+    cause: RecoveryCauseSchema.optional(), repair_task_id: z.string().regex(/^BR#\d+$/).optional(),
+  })).max(100).optional(),
   runs: z.array(z.object({
     id: z.number().int().positive(), name: z.string(), path: z.string().optional(),
+    run_attempt: z.number().int().positive().optional(),
     head_sha: z.string().regex(/^[0-9a-f]{40}$/),
     status: z.enum(["queued", "waiting", "pending", "requested", "in_progress", "completed"]),
-    conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullable(),
+    // GitHub reports conclusion: null while a run is queued/in_progress, and the
+    // Rust runner's `skip_serializing_if` OMITS the key for None — so the key may
+    // legitimately be absent (in-flight run). `.default(null)` accepts the missing
+    // key and normalizes to null, keeping the parsed type `string | null` exactly
+    // as before (2026-11-05 incident: whole observations rejected with a misleading
+    // invalid_value whenever a deploy run was in flight).
+    conclusion: z.enum(["success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "startup_failure", "stale"]).nullish().default(null),
     html_url: z.string().url(),
   })).min(1).max(100),
 });

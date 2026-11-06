@@ -4,10 +4,14 @@ import { handleMcp, KnowledgeHub } from "./mcp.ts";
 import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
 
 export { KnowledgeHub };
+export { RunnerUpdates } from "./runner-updates.ts";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/runner-updates/")) {
+      return env.RUNNER_UPDATES.get(env.RUNNER_UPDATES.idFromName("channels")).fetch(request);
+    }
 
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);
@@ -126,6 +130,10 @@ export default {
       // the label is free-form, so class is read from the tag
       const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
       if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
+      if (typeof body.cached_secret === "string") return kbGuard("kb.worker.resolve", kbId.fetch("https://kb/worker.resolve", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret: body.cached_secret, token_id: ident.token_id, actor: ident.label }),
+      }));
       return kbGuard("kb.agent.provision", kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
@@ -203,6 +211,12 @@ export default {
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
+        if (sub === "execution_attention") {
+          return kbCors(await kbGuard("kb.execution.attention", env.KB.get(kbId).fetch("https://kb/execution.attention", {
+            method: "POST", headers: { "content-type": "application/json", ...(auth.bearer ? {} : { "x-kb-admin": "1" }) },
+            body: JSON.stringify({ limit: 100, project: url.searchParams.get("project") || undefined, actor: auth.bearer ? "gateway" : `web:${auth.login}` }),
+          })));
+        }
         const kbUrl = sub === "board" ? "https://kb/board"
           : sub === "events" ? "https://kb/events"
           : sub === "artefacts" ? "https://kb/artefacts"
@@ -250,6 +264,13 @@ export default {
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
         return kbCors(await kbGuard("kb.purge_smoke", env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        })));
+      }
+      if (sub === "handoff_control" && request.method === "POST") {
+        if (auth.bearer) return kbCors(json({ error: "local authorisation/return requires a human session" }, 403));
+        const body = await request.json().catch(() => ({}));
+        return kbCors(await kbGuard("kb.handoff.control", env.KB.get(kbId).fetch("https://kb/handoff.control", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify({ ...body, actor: `web:${auth.login}` }),
         })));
       }
       if (sub === "supersede" && request.method === "POST") {

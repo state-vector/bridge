@@ -24,6 +24,8 @@
 #[path = "../../desktop/src-tauri/src/dispatch.rs"]
 #[allow(dead_code)]
 mod dispatch;
+#[path = "../../desktop/src-tauri/src/checkpoint.rs"]
+mod checkpoint;
 #[path = "../../desktop/src-tauri/src/keychain.rs"]
 #[allow(dead_code)]
 mod keychain;
@@ -63,6 +65,7 @@ mod canary;
 /// death hook / give-up escalation unit that `bridge service install`
 /// emits. Machine infrastructure notes, session "host-supervisor".
 mod alarm;
+mod update;
 
 use dispatch::DispatchConfig;
 use std::path::{Path, PathBuf};
@@ -78,6 +81,10 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
+        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1})),
+        "update" => {
+            if let Err(error) = update::command(&args[2..]) { eprintln!("update: {error}"); std::process::exit(1); }
+        }
         "pair" => {
             let url = args
                 .get(2)
@@ -115,6 +122,64 @@ fn main() {
                     eprintln!("no runner state — is a runner running?");
                     std::process::exit(1);
                 }
+            }
+        }
+        "execution" => {
+            if args.get(2).map(String::as_str) == Some("drain") {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                match dispatch::drain_gateway(&cfg) {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()),
+                    Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+                }
+                return;
+            }
+            if args.get(2).map(String::as_str) == Some("schedule-status") {
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                match dispatch::scheduling_status(&cfg, args.get(3).map(String::as_str)) {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()),
+                    Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+                }
+                return;
+            }
+            if matches!(args.get(2).map(String::as_str), Some("pause" | "resume" | "coordinate")) {
+                logging::emit("cli", "", &format!("{}: loading gateway configuration and credential", args[2]));
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                let result = if args[2] == "coordinate" {
+                    let id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("usage: bridge execution coordinate <BR#id> <message>"); std::process::exit(2); });
+                    let message = args.get(4).filter(|text| !text.is_empty()).unwrap_or_else(|| { eprintln!("coordination message required"); std::process::exit(2); });
+                    dispatch::execution_coordinate(&cfg, id, message)
+                } else { dispatch::execution_claims(&cfg, args[2] == "pause") };
+                match result { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default()), Err(error) => { eprintln!("{error}"); std::process::exit(1); } }
+                return;
+            }
+            if args.get(2).map(String::as_str) == Some("ready") {
+                logging::emit("cli", "", "ready: loading gateway configuration and credential");
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
+                match dispatch::execution_ready(&cfg) {
+                    Ok(reply) => println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default()),
+                    Err(error) => { eprintln!("bridge readiness: {error}"); std::process::exit(1); }
+                }
+                return;
+            }
+            if args.get(2).map(String::as_str) == Some("recover-unstarted") {
+                let tid = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("execution recover-unstarted requires a BR# task id"); std::process::exit(2); });
+                let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
+                match dispatch::recover_unstarted(&cfg, tid) {
+                    Ok(reply) => println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default()),
+                    Err(error) => { eprintln!("bridge startup recovery: {error}"); std::process::exit(1); }
+                }
+                return;
+            }
+            let kind = match args.get(2).map(String::as_str) {
+                Some("inspect") => dispatch::ExecutionRead::Inspect,
+                Some("availability") => dispatch::ExecutionRead::Availability,
+                _ => { eprintln!("usage: bridge execution ready | recover-unstarted <task-id> | inspect|availability <task-id>"); std::process::exit(2); }
+            };
+            let task_id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("execution requires a BR# task id"); std::process::exit(2); });
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
+            match dispatch::execution_read(&cfg, task_id, kind) {
+                Ok(state) => println!("{}", serde_json::to_string_pretty(&state).unwrap_or_default()),
+                Err(error) => { eprintln!("bridge execution: {error}"); std::process::exit(1); }
             }
         }
         "reset-principal" => {
@@ -164,7 +229,11 @@ fn main() {
             std::process::exit(canary::run(&args[2..]));
         }
         "doctor" => {
-            let bad = doctor();
+            let options = match DoctorOptions::parse(&args[2..]) {
+                Ok(options) => options,
+                Err(error) => { eprintln!("bridge doctor: {error}"); std::process::exit(2); }
+            };
+            let bad = doctor(options);
             std::process::exit(if bad { 1 } else { 0 });
         }
         "logs" => {
@@ -348,6 +417,7 @@ fn run(cfg: Option<DispatchConfig>) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
+                    auto_update: None,
                     identity: None, // built-in worker class applies (BR#3185)
                 },
             });
@@ -726,7 +796,52 @@ fn cmd_logs(cfg: &DispatchConfig, args: &[String]) {
 
 /// Headless setup check: every failure names the fix. Exit 1 when setup is
 /// incomplete so scripts can gate on it.
-fn doctor() -> bool {
+struct DoctorOptions {
+    fix: bool,
+    tiers: std::collections::BTreeMap<String, dispatch::ReasoningTier>,
+}
+impl DoctorOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self { fix: false, tiers: Default::default() };
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--fix" => options.fix = true,
+                "--tier" => {
+                    let (backend, tier) = args.next().and_then(|v| v.split_once('='))
+                        .ok_or("--tier requires backend=small|medium|large (for legacy model migration)")?;
+                    if backend.is_empty() { return Err("--tier requires a backend name".into()); }
+                    let tier = match tier {
+                        "small" => dispatch::ReasoningTier::Small,
+                        "medium" => dispatch::ReasoningTier::Medium,
+                        "large" => dispatch::ReasoningTier::Large,
+                        _ => return Err(format!("invalid tier {tier}; use small, medium or large")),
+                    };
+                    if options.tiers.insert(backend.to_string(), tier).is_some() { return Err(format!("duplicate --tier for {backend}")); }
+                }
+                other => return Err(format!("unknown option {other}; usage: bridge doctor [--fix] [--tier backend=small|medium|large]")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+#[cfg(test)]
+mod doctor_options_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<DoctorOptions, String> { DoctorOptions::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()) }
+    #[test]
+    fn doctor_migration_options_are_explicit_and_validated() {
+        assert!(!parse(&[]).unwrap().fix);
+        let options = parse(&["--fix", "--tier", "opencode=medium", "--tier", "kiro=large"]).unwrap();
+        assert!(options.fix);
+        assert_eq!(options.tiers["opencode"], dispatch::ReasoningTier::Medium);
+        assert_eq!(options.tiers["kiro"], dispatch::ReasoningTier::Large);
+        for args in [vec!["--unknown"], vec!["--tier"], vec!["--tier", "=small"], vec!["--tier", "opencode=huge"], vec!["--tier", "opencode=small", "--tier", "opencode=large"]] { assert!(parse(&args).is_err()); }
+    }
+}
+
+fn doctor(options: DoctorOptions) -> bool {
     let mut bad = false;
     let ok = |name: &str, detail: &str, bad: &mut bool, fatal: bool| {
         if detail.is_empty() {
@@ -738,6 +853,27 @@ fn doctor() -> bool {
         }
     };
     println!("bridge doctor");
+
+    // Use the saved file before resolve applies environment/runtime overrides.
+    // A failed migration must not fall through to resolve's legacy credential cleanup.
+    let migration = match store::TokenStore::open().migrate_model_config(options.fix, &options.tiers) {
+        Ok(migration) => migration,
+        Err(error) => { eprintln!("  FAIL config migration — {error}"); return true; }
+    };
+    let (changes, unconfigured, applied) = match &migration {
+        store::ModelConfigMigration::Current { unconfigured } => (&[][..], unconfigured, false),
+        store::ModelConfigMigration::Planned { changes, unconfigured } => (changes.as_slice(), unconfigured, false),
+        store::ModelConfigMigration::Applied { changes, unconfigured } => (changes.as_slice(), unconfigured, true),
+    };
+    for change in changes {
+        let source = match change.source { store::MigrationTierSource::Operator => "operator-selected tier", store::MigrationTierSource::Declared => "existing declared tier", store::MigrationTierSource::LegacyDefault => "historical small default; no capability inferred from model name" };
+        println!("  {} model migration [{}]: {} → {:?} ({source})", if applied { "fixed" } else { "plan" }, change.backend, change.model, change.tier);
+    }
+    if !changes.is_empty() {
+        println!("  {}", if applied { "Saved tier maps atomically; original is config.pre-model-tiers.json (0600). Running gateways adopt the config on their next safe restart." }
+            else { "Run bridge doctor --fix to apply; optionally --tier opencode=medium (repeat for other backends). Existing tier maps are never replaced." });
+    }
+    for backend in unconfigured { println!("  warn model migration [{backend}] — no explicit CLI model ID; configure backends.{backend}.models before advertising capacity"); }
 
     let cfg = DispatchConfig::resolve();
     match &cfg {
@@ -952,6 +1088,12 @@ fn doctor() -> bool {
     // as configuration, it does NOT validate it against anything hub-side.
     let backends = &cfg.backends;
     for (b, section) in backends {
+        if !section.models.is_empty() {
+            for (tier, model) in &section.models {
+                println!("  \x1b[32mok\x1b[0m   model[{b}][{}] = {model} (CLI-resolved supply; lane policy is global)", serde_json::to_string(tier).unwrap_or_default());
+            }
+            continue;
+        }
         match &section.model {
             Some(m) if !m.trim().is_empty() => {
                 println!("  \x1b[32mok\x1b[0m   model[{b}] = {m} (resolved by the agent CLI against its own provider config)");
@@ -1476,6 +1618,12 @@ USAGE:
   bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
+                         --fix             migrate legacy models into backend tier maps
+                         --tier BACKEND=T  explicit migration tier: small|medium|large
+  bridge build-info      embedded source commit and update protocol
+  bridge update install  install independent Linux updater (does not enable it)
+  bridge update enable main|stable|pinned   explicitly opt in via config
+  bridge update disable|status             disable updates or inspect receipts
   bridge logs [opts]     view the hub event log (headless):
                            --limit N    last N events (default 30)
                            -f           follow — poll for new events

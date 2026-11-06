@@ -79,10 +79,10 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     // class with prose fallback) — one group per class, ordered by
     // EXIT_CLASS_ORDER; in_review rides the same classifier ("Awaiting PR
     // verification"). The live unblock duty is a chip on the row, not a group.
-    const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false).sort(byUpdated);
+    const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false && !t.meta?.startup_wait).sort(byUpdated);
     const byExit = new Map<string, any[]>();
     for (const t of ts) {
-      if (t.status !== "blocked" && t.status !== "in_review") continue;
+      if (t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
       // Standing merge-lane cards and infra anchors belong to the Trains panel /
       // infra sinks, not the task backlog (BR#6395).
       if (t.meta?.lane?.key || t.meta?.infra_anchor) continue;
@@ -225,7 +225,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
               const rank = r.rank;
               const boosted = !!r.boosted;
               const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
-              const bs = (t.status === "blocked" || t.status === "in_review") ? blockedSummaryOf(t) : null;
+              const bs = (t.status === "blocked" || t.status === "in_review" || t.meta?.startup_wait) ? blockedSummaryOf(t) : null;
               return (
                 <div
                   key={t.id}

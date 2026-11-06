@@ -67,6 +67,7 @@ const acquire = (repo: string, actor: string, extra: Record<string, unknown> = {
 
 async function laneSnap(repo: string): Promise<any> {
   const { body } = await kbJson("/train.status", { repo });
+  expect(body.hub_commit).toMatch(/^[0-9a-f]{40}$/);
   return body.lanes[0];
 }
 
@@ -102,7 +103,170 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
   return (await queueViaAcceptBoth(opts)).implId;
 }
 
+describe("BR#6776 durable check recovery", () => {
+  it("reserves one retry per head/obligation across lease takeover, including unknown effects", async () => {
+    const repo = "state-vector/retry-6776", actor = "gw-retry6776", head = "a".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 1, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const reserve = { kind: "reserve", task_id: id, head_sha: head, name: "Deploy health (merge gate)",
+      source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 }, target: { kind: "workflow_run", id: 41734497120 } };
+    const command = (check_retry: object, who = actor) => kbJson("/train.queue_facts", { repo, actor: who, check_retry });
+    const first = await command(reserve);
+    expect(first.body, JSON.stringify(first.body)).toMatchObject({ kind: "reserved" });
+    expect((await command(reserve)).body).toMatchObject({ kind: "held", state: "prepared" });
+    const result = { kind: "result", key: first.body.key, outcome: "outcome_unknown", receipt: "Response lost after POST" };
+    expect((await command(result)).body.kind).toBe("recorded");
+    expect((await command(result)).body.kind).toBe("recorded");
+    expect((await command({ ...result, outcome: "dispatched" })).body.error).toMatch(/contradicts/);
+    await kbJson("/train.lease", { repo, action: "release", actor });
+    await acquire(repo, "gw-replacement6776");
+    expect((await command(reserve, "gw-replacement6776")).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    expect((await command({ ...reserve, head_sha: "b".repeat(40) }, "gw-replacement6776")).body.kind).toBe("reserved");
+    expect((await command(reserve)).body.error).toMatch(/lease/);
+    await kbJson("/train.lease", { repo, action: "release", actor: "gw-replacement6776" });
+  });
+  it("gives an ownerless queued red head exactly one repair duty and projects its actual startup blocker", async () => {
+    const repo = "state-vector/candidate-6776", actor = "gw-candidate6776", head = "c".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 2, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const stamp = () => kbJson("/train.queue_facts", { repo, actor, entries: [{ id, pr: 2, cls: "blocked",
+      repair: { kind: "head_checks", head_sha: head, checks: [{ name: "Test", url: "https://github.com/run/failure" }] } }],
+      base_state: { verdict: "green", tip_sha: "d".repeat(40), red: [], unsettled: [] },
+      stalled: { batch: [2], ticks: 3, since: 1, last_error: "Required candidate check failed" } });
+    expect((await stamp()).body.error).toBeUndefined();
+    const lane = await laneSnap(repo), duty = lane.queue_facts.entries[0].repair_task;
+    expect(duty).toMatch(/^BR#/);
+    expect(lane.line.remediation).toMatchObject({ task: { id: duty } });
+    await stamp();
+    expect((await laneSnap(repo)).queue_facts.entries[0].repair_task).toBe(duty);
+    const repair = (await kbJson("/get", { id: duty })).body;
+    expect(repair.meta.machine_duty).toMatchObject({ subject: id, reason: "head_checks" });
+    // No live capabilities support this typed repair: a todo card is blocked,
+    // not advertised as an available-agent wait by the line projection.
+    await kbJson("/update", { id: duty, meta: { execution_requirements: { host: "missing-host", tier: "large" } } });
+    const blocked = await laneSnap(repo);
+    expect(blocked.line.remediation).toMatchObject({ kind: "blocked", task: { id: duty,
+      execution_blockers: expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable" })]) } });
+    await kbJson("/train.lease", { repo, action: "release", actor });
+  });
+});
+
 describe("merge train DO drill (real bundled worker)", () => {
+  it("out-of-band repair merge observations require the accepted PR/head and do not certify live recovery", async () => {
+    const repo = "state-vector/repair-delivery-6522", baseline = "7".repeat(40), acceptedHead = "9".repeat(40);
+    const task = await queueViaAccept({ repo, pr: 991, head: acceptedHead });
+    await acquire(repo, "delivery-merger", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: baseline, red: [], unsettled: [] } });
+    const cause = { kind: "test_failure", check: "Cortex Quality Smoke", suite: "classifier", test: "honest_refusal" };
+    await kbJson("/train.observe_deploy", { repo, observation: { tip_sha: baseline, observed_at: Date.now(), runs: [{ id: 100, name: "Deploy Dev", head_sha: baseline,
+      status: "completed", conclusion: "failure", html_url: `https://github.com/${repo}/actions/runs/100` }],
+      failures: [{ run_id: 100, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/100/job/1`, cause, repair_task_id: task }] } });
+    const args = { repo, head_sha: baseline, cause, event_id: "merge-observation", event: { kind: "repair_delivery_observed", task_id: task, pr: 991,
+      head_sha: acceptedHead, merge_sha: "8".repeat(40), url: `https://github.com/${repo}/pull/991` }, actor: "observer" };
+    const result = await kbJson("/train.recovery_event", args);
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect(result.body.episode.delivery.kind).toBe("observed_merge");
+    expect(result.body.episode.stage.phase).toBe("verifying");
+    expect(result.body.episode.verified_receipts).toHaveLength(0);
+    const wrong = await kbJson("/train.recovery_event", { ...args, event_id: "wrong-head", event: { ...args.event, head_sha: "a".repeat(40) } });
+    expect(wrong.status).toBe(400);
+    const prove = async (tip: string, run: number) => {
+      await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [] } });
+      await kbJson("/train.observe_deploy", { repo, observation: { tip_sha: tip, observed_at: Date.now(), runs: [{ id: run, name: "Deploy Dev", head_sha: tip,
+        status: "completed", conclusion: "success", html_url: `https://github.com/${repo}/actions/runs/${run}` }] } });
+      await kbJson("/train.queue_facts", { repo, actor: "delivery-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [],
+        deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 60, covered_by_sha: tip, covered_by_run_id: run } } });
+      return (await laneSnap(repo)).line.recoveries[0].episode;
+    };
+    expect((await prove(baseline, 101)).verified_receipts).toHaveLength(0);
+    expect((await prove("8".repeat(40), 102)).stage.phase).toBe("recovered");
+  });
+  it("observations carrying an IN-FLIGHT deploy run (conclusion key absent) are accepted, not rejected wholesale (2026-11-05 incident)", async () => {
+    const repo = "state-vector/observe-inflight-run", tip = "7".repeat(40);
+    await acquire(repo, "observe-merger", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "observe-merger", entries: [], base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [] } });
+    // The exact incident shape: the Rust runner's skip_serializing_if OMITS
+    // conclusion for runs GitHub still reports as in_progress. Before the fix
+    // the whole observation (settled runs included) died on a missing-key
+    // invalid_value that read like an enum violation.
+    const mixed = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 200, name: "Deploy Dev", head_sha: tip, status: "in_progress", html_url: `https://github.com/${repo}/actions/runs/200` },
+        { id: 199, name: "Deploy Dev", head_sha: tip, status: "completed", conclusion: "success", html_url: `https://github.com/${repo}/actions/runs/199` },
+      ] } });
+    expect(mixed.status, JSON.stringify(mixed.body)).toBe(200);
+    // Explicit null (the hardened runner's shape) is accepted too.
+    const explicitNull = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 201, name: "Deploy Dev", head_sha: tip, status: "queued", conclusion: null, html_url: `https://github.com/${repo}/actions/runs/201` },
+      ] } });
+    expect(explicitNull.status, JSON.stringify(explicitNull.body)).toBe(200);
+    // The enum itself stays closed.
+    const bad = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: tip, observed_at: Date.now(), runs: [
+        { id: 202, name: "Deploy Dev", head_sha: tip, status: "completed", conclusion: "nope", html_url: `https://github.com/${repo}/actions/runs/202` },
+      ] } });
+    expect(bad.status).toBe(400);
+  });
+  it("recovery records survive retries and task delivery; only matched successful deployment proves recovery", async () => {
+    const repo = "state-vector/recovery-loop-6522", head = "7".repeat(40);
+    const repair = await kbJson("/create", { type: "task", title: "Repair callers availability", qualified: true, roles: ["impl"] });
+    const task = String(repair.body.id);
+    await kbJson("/transition", { id: task, to: "in_progress", actor: "repairer", session: "impl-6522", note: "claim repair" });
+    await acquire(repo, "merger-6522", { required_workflows: ["deploy / Deploy to dev"] });
+    await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [] } });
+    const cause = { kind: "capability_unavailable", check: "Cortex Quality Smoke", scenario: "php-sql-injection", capability: "callers", scope: "includes/User/User.php:2416" };
+    const observe = (id: number, conclusion: string, attempt = 1) => kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+      tip_sha: head, observed_at: Date.now(), runs: [{ id, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml", head_sha: head, run_attempt: attempt,
+        status: "completed", conclusion, html_url: `https://github.com/${repo}/actions/runs/${id}` }],
+      failures: conclusion === "failure" ? [{ run_id: id, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/${id}/job/456`, cause, repair_task_id: task }] : [],
+    } });
+    expect((await observe(123, "failure", 5)).body.error ?? "").toBe("");
+    const sponsored = (await kbJson("/get", { id: task })).body;
+    expect(sponsored.tags).toContain("root_blocker");
+    expect(sponsored.meta.root_fix).toMatchObject({ repo, head_sha: head });
+    const command = (event_id: string, event: Record<string, unknown>) => kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id, event, actor: "repairer" });
+    const diagnosed = await command("diagnosis", { kind: "diagnosed", task_id: task, diagnosis: "Adjacency read exceeds callers deadline", next: "Implement pruning" });
+    expect(diagnosed.body.episode.stage.phase).toBe("repairing");
+    await kbJson("/progress.log", { id: task, actor: "observer", did: "Independent diagnostic comment", will: "Await impl claim" });
+    expect((await laneSnap(repo)).line.recoveries[0].episode.stage.next).toBe("Implement pruning");
+    expect((await kbJson("/get", { id: task })).body.meta.last_progress?.actor).not.toBe("observer");
+    const wrongExecutor = await kbJson("/train.recovery_event", { repo, head_sha: head, cause, event_id: "not-owner",
+      event: { kind: "diagnosed", task_id: task, diagnosis: "Different diagnosis", next: "Replace next step" }, actor: "observer" });
+    expect(wrongExecutor.status).toBe(400);
+    const started = { kind: "attempt_started", task_id: task, attempt_id: "repair-1", attempt_kind: "repair", action: "Implement pruning and regression", next: "Publish repair" };
+    expect((await command("start", started)).body.authorized).toBe(true);
+    expect((await command("start", started)).body.authorized).toBe(false);
+    await command("delivered", { kind: "attempt_finished", task_id: task, attempt_id: "repair-1", outcome: "delivered", summary: "Repair published", receipts: [`https://github.com/${repo}/commit/123`], next: "Verify deployment" });
+    let snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("verifying");
+    expect((await observe(123, "failure", 6)).body.error ?? "").toBe("");
+    snap = await laneSnap(repo);
+    expect(snap.line.recoveries).toHaveLength(1);
+    expect(snap.line.recoveries[0].episode.sources).toHaveLength(2);
+    expect(snap.line.recoveries[0].episode.stage.phase).not.toBe("recovered");
+    await observe(124, "success");
+    await kbJson("/train.queue_facts", { repo, actor: "merger-6522", entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [],
+      deploy_coverage: { phase: "covered", tip_sha: head, tip_age_secs: 60, covered_by_sha: head, covered_by_run_id: 124 } } });
+    snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("verifying");
+    expect(snap.line.recoveries[0].episode.verified_receipts).toHaveLength(1);
+    // A passing live run does not accept a still-unreviewed code repair.
+    const handoff = await kbJson("/transition", { id: task, to: "in_review", actor: "repairer", session: "impl-6522", note: `Direct main https://github.com/${repo}/commit/${head}` });
+    expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
+    const verifyId = handoff.body.verify_task;
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "verifier-6522", session: "verify-6522", note: "checking repair" });
+    const accepted = await kbJson("/transition", { id: verifyId, to: "done", actor: "verifier-6522", session: "verify-6522",
+      note: `VERIFY ACCEPT commit ${head} https://github.com/${repo}/actions/runs/124`,
+      review_result: { kind: "accepted_direct_main", repo, commit: head, ci_run_url: `https://github.com/${repo}/actions/runs/124` } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await kbJson("/get", { id: task })).body.status).toBe("done");
+    snap = await laneSnap(repo);
+    expect(snap.line.recoveries[0].episode.stage.phase).toBe("recovered");
+    expect(snap.line.recoveries[0].episode.stage.receipt.run_id).toBe(124);
+    const fake = await command("fake-recovery", { kind: "recovered", task_id: task });
+    expect(fake.status).toBe(400);
+  });
   it("deployment observations stop a failed line independently of the merge lease and survive stale green gateway snapshots", async () => {
     const repo = "state-vector/observe-deploy-6389";
     const tip = "7".repeat(40);
@@ -425,6 +589,8 @@ describe("merge train DO drill (real bundled worker)", () => {
     const repo = "state-vector/lane-coverage";
     const H = "e".repeat(40), H2 = "d".repeat(40);
     const c1 = await queueViaAccept({ repo, pr: 2611, head: H, title: "IMPL: coverage bounce drill" });
+    const historical = await kbJson("/update", { id: c1, meta: { session: "historical-impl-session" } });
+    expect(historical.body.error).toBeUndefined();
     await acquire(repo, "gw-c", { required_workflows: ["Test"] });
     // an authored push moved the head past the stamp: no conflicts exist, no
     // human leg — the machine verdict lapses and the verify pool re-verifies
@@ -440,7 +606,10 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.awaiting_park).toBeUndefined();
     expect(bounced.body.machine_requeue).toBeUndefined();
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    expect(card1.status).toBe("todo");
+    expect(card1.owner).toBe("");
+    expect(card1.meta?.session).toBeUndefined();
+    expect(card1.meta?.attempt).toBeUndefined(); // a handoff is not a failed execution
     expect(card1.meta?.merge_train?.state).toBe("bounced");
     expect(card1.meta?.merge_train?.bounce_kind).toBe("coverage");
     expect(card1.meta?.merge_train?.awaiting).toBeUndefined();
@@ -463,6 +632,15 @@ describe("merge train DO drill (real bundled worker)", () => {
     const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 8 })).body);
     expect(hist).toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict");
     expect(hist).not.toContain("parked Awaiting review");
+    const repeated = await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-c", pr: 2611,
+      head_sha: H2, task_id: c1, bounce_kind: "coverage", reason: "fresh verify required" });
+    expect(repeated.body.error).toBeUndefined();
+    expect((await kbJson("/get", { id: c1 })).body.meta?.attempt).toBeUndefined();
+    const pickup = await kbJson("/transition", { id: c1, to: "in_progress", actor: "fresh-repair-worker", session: "fresh-repair-session" });
+    expect(pickup.body.error).toBeUndefined();
+    const claimed = (await kbJson("/get", { id: c1 })).body;
+    expect(claimed.owner).toBe("fresh-repair-worker");
+    expect(claimed.meta.session).toBe("fresh-repair-session");
   });
 
   it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
@@ -477,7 +655,8 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.error ?? "", `gate bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.bounce_kind).toBe("gate");
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    expect(card1.status).toBe("todo");
+    expect(card1.owner).toBe("");
     const brief = String(card1.body_md);
     expect(brief).toContain("Merge-train bounce (gate): PR #2621");
     expect(brief).toContain("mergeStateStatus=BLOCKED");
@@ -1065,7 +1244,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(reasserted.body.machine_requeue).toBeUndefined();
     expect(reasserted.body.awaiting_park).toBeUndefined();
     const c = (await kbJson("/get", { id: card })).body;
-    expect(c.status).toBe("in_progress");
+    expect(c.status).toBe("todo");
     expect(c.meta?.merge_train?.state).toBe("bounced");
     expect(c.meta?.merge_train?.awaiting).toBeUndefined();
     // the STORED defect survives on the bounce record — the marker never
@@ -1363,6 +1542,98 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(snap4.stop?.culprit_task).toBe(card1);
 
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-vocab", line_green: true });
+  });
+
+  // BR#4687 (L1.2): the executor machine-updated a behind worker-authored
+  // branch — `updated` stamps the carry chain the moment the update lands,
+  // and the card re-enters the queue SILENTLY: no bounce, no status change,
+  // no review ask, no boost. The merge at the carried head must NOT
+  // double-append the chain leg.
+  it("BR#4687: train:updated carries the verdict across a machine update-branch — card re-enters silently, merged dedupes the chain", async () => {
+    const repo = "state-vector/lane-updated";
+    const A = "e".repeat(40), B = "f".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4687, head: A, title: "IMPL: behind carry drill" });
+    await acquire(repo, "gw-upd", { required_workflows: ["Test"] });
+
+    const upd = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd",
+      pr: 4687, task_id: card, from_head: A, head_sha: B,
+    });
+    expect(upd.body.error ?? "", `train:updated failed: ${JSON.stringify(upd.body)}`).toBe("");
+    expect(upd.body.task).toBe(card);
+
+    // the carry chain holds stamp→new head, and the card is EXACTLY where
+    // it was — queued (blocked) with the queue's own stamp untouched (the
+    // handler never writes meta.merge_train), unbounced, unboosted, no ask
+    const c = (await kbJson("/get", { id: card })).body;
+    expect(c.status).toBe("blocked");
+    const legCarry = c.meta?.prs?.find((l: any) => l.number === 4687)?.carry;
+    const legacyCarry = c.meta?.pr?.number === 4687 ? c.meta?.pr?.carry : undefined;
+    const carry = legCarry ?? legacyCarry;
+    expect(Array.isArray(carry)).toBe(true);
+    expect(carry).toHaveLength(1);
+    expect(String(carry[0].from_head).toLowerCase()).toBe(A);
+    expect(String(carry[0].to_head).toLowerCase()).toBe(B);
+    expect(carry[0].via).toBe("update-branch");
+    expect(c.meta?.merge_train?.state).toBe("queued");
+    expect(c.meta?.boosted).toBeUndefined();
+    expect(await reviewAsks(card)).toHaveLength(0);
+    const hist = (await kbJson("/train.history", { repo })).body.events;
+    expect(hist.filter((e: any) => e.kind === "updated")).toHaveLength(1);
+    expect(hist.filter((e: any) => e.kind === "bounced")).toHaveLength(0);
+
+    // A second clean update extends the chain's current end, not its stamp.
+    const C = "8".repeat(40);
+    const secondArgs = { repo, base: "main", kind: "updated", actor: "gw-upd", pr: 4687, task_id: card, from_head: B, head_sha: C };
+    expect((await kbJson("/train.event", secondArgs)).status).toBe(200);
+    expect((await kbJson("/train.event", secondArgs)).status).toBe(200); // replay is not another append
+    const gap = await kbJson("/train.event", { ...secondArgs, from_head: A, head_sha: "7".repeat(40) });
+    expect(gap.status).toBe(400);
+    // The merge lands at the carried head without appending a duplicate.
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-upd",
+      pr: 4687, merge_sha: "9".repeat(40), head_sha: C, task_id: card,
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const c2 = (await kbJson("/get", { id: card })).body;
+    const carry2 = c2.meta?.prs?.find((l: any) => l.number === 4687)?.carry ?? (c2.meta?.pr?.number === 4687 ? c2.meta?.pr?.carry : undefined);
+    expect(carry2).toHaveLength(2);
+    expect(carry2[1]).toMatchObject({ from_head: B, to_head: C });
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-upd" });
+  });
+
+  // BR#4687: the carry is only as good as its contiguity — a from_head that
+  // is not THIS leg's stamp is refused loud (a broken chain can never be
+  // extended), and garbage sha shapes never reach the meta write.
+  it("BR#4687: train:updated fails loud off-contiguity — from_head must be the leg's stamp, heads must be 40-hex", async () => {
+    const repo = "state-vector/lane-updated-guard";
+    const A = "1".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 4688, head: A, title: "IMPL: behind carry guard" });
+    await acquire(repo, "gw-upd2", { required_workflows: ["Test"] });
+    const wrongBinding = await kbJson("/train.event", { repo, kind: "updated", actor: "gw-upd2", task_id: card,
+      pr: 9999, from_head: A, head_sha: "4".repeat(40) });
+    expect(wrongBinding.status).toBe(400);
+
+    const offChain = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd2",
+      pr: 4688, task_id: card, from_head: "2".repeat(40), head_sha: "3".repeat(40),
+    });
+    expect(String(offChain.body.error)).toContain("stamp");
+
+    const badShape = await kbJson("/train.event", {
+      repo, base: "main", kind: "updated", actor: "gw-upd2",
+      pr: 4688, task_id: card, from_head: "not-a-sha", head_sha: "4".repeat(40),
+    });
+    expect(String(badShape.body.error)).toContain("40-hex");
+
+    // nothing was written: the chain is untouched, the card still queued
+    const c = (await kbJson("/get", { id: card })).body;
+    const carry = c.meta?.prs?.find((l: any) => l.number === 4688)?.carry ?? (c.meta?.pr?.number === 4688 ? c.meta?.pr?.carry : undefined);
+    expect(carry ?? []).toHaveLength(0);
+    expect(c.status).toBe("blocked");
+
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-upd2" });
   });
 });
 
@@ -1813,7 +2084,9 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-pardon", sha: M2, checks: [check(75, "Test", "failure")] });
     expect(ci.body.decided).toBe("stopped");
     const rowIn = (agents: any[], label: string) => agents.find((a: any) => a.label === label);
-    const afterStop = (await kbJson("/board")).body.agents as any[];
+    const afterStopReply = await kbJson("/board");
+    expect(afterStopReply.status, JSON.stringify(afterStopReply.body)).toBe(200);
+    const afterStop = afterStopReply.body.agents as any[];
     expect(rowIn(afterStop, "impl-stop-ding")?.train_red).toBe(1);
     expect(rowIn(afterStop, "impl-true-ding")?.train_red).toBe(0);
 
@@ -2256,6 +2529,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // the card finishes and closes done — the bounce stamp survives the
     // close (stamps are records, not liveness), but the zombie must not
     // keep counting
+    await kbJson("/transition", { id: card, to: "in_progress", actor: "drill", session: "zombie-close-drill" });
     const closed = await kbJson("/transition", { id: card, to: "done", actor: "drill", note: "drill: landed out-of-band — closing (BR#5677 zombie drill)" });
     expect(closed.status, `zombie close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
     const after = (await kbJson("/get", { id: card })).body;
@@ -2843,6 +3117,9 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await acquire(repo, "gw-stall", { merge_capable: true, required_workflows: ["Test"] });
     const c1 = await queueViaAccept({ repo, pr: 53761, head: "e".repeat(40), title: "IMPL: stall drill 1" });
     const c2 = await queueViaAccept({ repo, pr: 53762, head: "f".repeat(40), title: "IMPL: stall drill 2" });
+    const initialLane = await laneSnap(repo);
+    const staleDiagnostic = await kbJson("/create", { type: "task", title: "Yesterday's starvation diagnosis", qualified: true,
+      meta: { machine_duty: { kind: "diagnostic", subject: initialLane.card } } });
 
     const stamp = (stalled: unknown) =>
       kbJson("/train.queue_facts", {
@@ -2869,8 +3146,13 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`));
     expect(ask).toBeUndefined();
     expect(sr.ask ?? null).toBeNull();
-    const repair = (await kbJson("/get", { id: lane.card })).body.meta.recovery.task_id;
-    expect((await kbJson("/get", { id: repair })).body.meta.machine_duty.kind).toBe("task-recovery");
+    expect(lane.line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge" });
+    expect(lane.line.remediation.task.id).not.toBe(staleDiagnostic.body.id);
+    const repair = lane.line.remediation.task.id;
+    expect((await kbJson("/get", { id: repair })).body.meta.machine_duty).toMatchObject({
+      kind: "line_recovery", subject: lane.card,
+    });
+    expect((await laneSnap(repo)).line.remediation.task.id).toBe(repair);
 
     // ONE ask per episode — the per-tick stamp repeats dedupe on the
     // numberless title (no tick counts, no ages)
@@ -3610,6 +3892,23 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     const exhausted = await laneSnap(repo);
     expect(exhausted.line.remediation.kind).toBe("human");
     expect(exhausted.line.remediation.action.url).toContain("/card/");
+    // A subsequent real submission supersedes historical watchdog failures,
+    // without making an unreviewed PR eligible for train admission.
+    await kbJson("/update", { id: repair, meta_delete: ["escalate"] });
+    const submitted = await kbJson("/transition", { id: repair, to: "in_review", actor: "repair-agent", session: "repair-6389",
+      note: `PR https://github.com/${repo}/pull/6587 — delivered repair awaiting independent review` });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    await stamp();
+    const reviewing = await laneSnap(repo);
+    expect(reviewing.base_red_resolution.phase).toBe("fix_in_progress");
+    expect(reviewing.base_red_resolution.ask).toBeNull();
+    expect(reviewing.line.remediation.kind).toBe("queued");
+    expect(reviewing.queue.some((q: { id: string }) => q.id === repair)).toBe(false);
+    expect((await kbJson("/get", { id: exhausted.line.remediation.action.id })).body.status).toBe("done");
+    // A concrete authority/permission escalation still warrants attention.
+    await kbJson("/update", { id: repair, meta: { escalate: { reason: "Deployment credential still unavailable" } } });
+    await stamp();
+    expect((await laneSnap(repo)).line.remediation.kind).toBe("human");
     await kbJson("/train.queue_facts", { repo, actor: "gw-6389", entries: [], base_state: { verdict: "green", red: [], unsettled: [] } });
     expect((await laneSnap(repo)).line.blocker).toBeNull();
     await kbJson("/train.lease", { repo, action: "release", actor: "gw-6389" });

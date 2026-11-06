@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readyGateway, executorRequest } from "./executor-fixture";
 
 /**
  * DO integration tests — the tier that would have caught today's production
@@ -61,7 +62,7 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   const r = await kb(path, {
     method: "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(executorRequest(body)),
   });
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
@@ -1249,6 +1250,7 @@ describe("interactive claim takeover (BR#6135)", () => {
   it("happy path: a web taker takes a runner-held claim atomically; the ex-holder is stood down", async () => {
     // the runner: a gateway token with a principal, its dispatch session
     const gw = await kbJson("/admin.mint", { label: "br6135-gw", tags: ["gateway"], principal: "p_br6135_box" });
+    await readyGateway(kbJson, gw.body.id, "br6135-gw");
     expect(gw.status).toBe(200);
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover happy path br6135" });
     const claim = await kbJson("/transition", {
@@ -1337,6 +1339,7 @@ describe("interactive claim takeover (BR#6135)", () => {
 
   it("a non-owner agent bearer is refused [rule: takeover-authority] — and the refusals fold never-breach (BR#3430)", async () => {
     const gw = await kbJson("/admin.mint", { label: "br6135-gw2", tags: ["gateway"], principal: "p_br6135_box2" });
+    await readyGateway(kbJson, gw.body.id, "br6135-gw2");
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover authority br6135" });
     await kbJson("/transition", {
       id: card.id, to: "in_progress", note: "claim",
@@ -1386,6 +1389,7 @@ describe("interactive claim takeover (BR#6135)", () => {
 
   it("verify duty cards refuse (SoD is not transferable) and typed-wait holds refuse", async () => {
     const gw = await kbJson("/admin.mint", { label: "br6135-gw3", tags: ["gateway"] });
+    await readyGateway(kbJson, gw.body.id, "br6135-gw3", 2);
     // verdict duty
     const { body: duty } = await kbJson("/create", { type: "task", title: "Verify: takeover duty br6135", roles: ["review"] });
     const dc = await kbJson("/transition", {
@@ -1397,9 +1401,10 @@ describe("interactive claim takeover (BR#6135)", () => {
     expect(String(dr.body.error)).toContain("[rule: takeover-verdict-duty]");
     // typed wait: an in_progress card holding awaiting_ask is held by the ask
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover held br6135" });
-    await kbJson("/transition", {
+    const heldClaim = await kbJson("/transition", {
       id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw3", gateway: true, agent: "br6135-agent3", token_id: gw.body.id, session: "dispatch-BR-6135D",
     });
+    expect(heldClaim.status).toBe(200);
     const upd = await kbJson("/update", { id: card.id, meta: { awaiting_ask: { ask_id: "BR#999" } } });
     expect(upd.status).toBe(200);
     const hr = await kbJson("/transition", { id: card.id, to: "in_progress", takeover: true, actor: "web:rayh" });
@@ -1410,6 +1415,7 @@ describe("interactive claim takeover (BR#6135)", () => {
   it("idempotent: the holder re-running the takeover reports already, without rewriting the stamp", async () => {
     const ownerTok = await kbJson("/admin.mint", { label: "br6135-owner", tags: [], principal: "p_br6135_box4" });
     const gw = await kbJson("/admin.mint", { label: "br6135-gw4", tags: ["gateway"], principal: "p_br6135_box4" });
+    await readyGateway(kbJson, gw.body.id, "br6135-gw4");
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover idempotent br6135" });
     await kbJson("/transition", {
       id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw4", gateway: true, agent: "br6135-agent4", token_id: gw.body.id, session: "dispatch-BR-6135E",
@@ -1433,6 +1439,7 @@ describe("interactive claim takeover (BR#6135)", () => {
 
   it("the REST door claim_takeover routes through the same op; the lifecycle edge stays illegal without the flag", async () => {
     const gw = await kbJson("/admin.mint", { label: "br6135-gw5", tags: ["gateway"] });
+    await readyGateway(kbJson, gw.body.id, "br6135-gw5");
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover doors br6135" });
     await kbJson("/transition", {
       id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw5", gateway: true, agent: "br6135-agent5", token_id: gw.body.id, session: "dispatch-BR-6135F",

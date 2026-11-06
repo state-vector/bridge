@@ -1,0 +1,23 @@
+name: runner-channel
+on:
+  workflow_run:
+    workflows: [CI, dev-build, release]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: runner-channel
+  cancel-in-progress: false
+jobs:
+  promote:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconcile green source builds into update channels and wake subscribers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: python3 scripts/promote-runner.py

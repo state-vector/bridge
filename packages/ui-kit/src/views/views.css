@@ -855,12 +855,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---- Top view: compressed fleet process list ---- */
 .top-wrap { display: flex; flex-direction: column; gap: 8px; padding: 12px; height: 100%; overflow-y: auto; }
-.top-head, .top-row {
-  display: grid;
-  grid-template-columns: 118px 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(90px, 1fr) 64px 64px;
-  gap: 8px; align-items: center;
-  font-size: 12px; padding: 6px 10px; border-radius: 8px;
-}
 .wt-row:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .wt-dot { width: 8px; height: 8px; border-radius: 50%; }
 .wt-dot.wt-active { background: var(--green); animation: wt-pulse 1.6s ease-in-out infinite; }
@@ -928,20 +922,19 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* title-bar status lights: hub / kb / gateways, click for details */
 .status-lights { position: relative; margin-right: 8px; }
-.lights-btn { display: inline-flex; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+.lights-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font: inherit; font-size: 11px; background: none; border: none; cursor: pointer; padding: 5px 7px; border-radius: 4px; }
 .lights-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .lights-count { font-size: 10px; color: var(--text-faint); margin-left: 3px; }
 /* (superseded by the fixed-position .lights-pop block at the end) */
 .light-row { display: flex; align-items: center; gap: 6px; }
-.light-meta { color: var(--text-faint); margin-left: auto; font-size: 10px; }
+.light-meta { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); margin-left: auto; font-size: 11px; }
 
 /* lights popover: fixed overlay — never grows the title bar, never themed light */
 .lights-pop {
   position: fixed;
-  top: 34px;
-  right: 12px;
+  box-sizing: border-box;
   z-index: 1000;
-  min-width: 280px; max-width: 380px;
+  width: min(340px, calc(100vw - 32px));
   background: #10151f;
   color: var(--text, #dbe2ee);
   border: 1px solid #232b3b;
@@ -953,6 +946,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   max-height: 60vh; overflow-y: auto;
 }
 .lights-pop .light-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.lights-pop h3 { margin: 6px 0 2px; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+.light-worker { padding: 6px 0; border-top: 1px solid var(--line); }
+.light-worker-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.light-worker-state { margin-left: auto; color: var(--amber); }
+.worker-ready, .worker-busy { color: var(--green); }
+.worker-offline { color: var(--red); }
+.light-worker-detail { margin-top: 3px; color: var(--text-dim); overflow-wrap: anywhere; }
+.light-error { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--line); padding-top: 8px; color: var(--red); overflow-wrap: anywhere; }
+.worker-warning { padding: 10px 12px; border: 1px solid var(--amber); border-radius: 7px; color: var(--amber); background: color-mix(in srgb, var(--amber) 8%, transparent); }
 
 /* detail OS windows: the overlay components render full-bleed */
 .task-window { height: 100vh; background: var(--bg, #0d1117); }
@@ -1035,14 +1037,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .steer-box { max-width: 640px; }
 .steer-box input, .steer-box .kit-input { flex: 1 1 180px; min-width: 0; width: auto; }
 
-/* age/agent tracks size to content at wide widths (no clipped "4h 12m") */
-.top-head, .top-row {
-  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(120px, 1fr) 84px 84px;
-}
-
-/* compact template LAST so it actually overrides (cascade order): the visible
-   columns at ≤1280 are agent, goal, status, score, bar, ages */
-
 /* rows are ONE line, dense — wrap fixes overcorrected into tall rows.
    Overflow ellipsizes (full text on hover); tracks + min-width keep cells
    from ever escaping the viewport (the actual wide-width bug). */
@@ -1055,35 +1049,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* THE unblock/exit cell rule: one line, ellipsis — the wrap variant made
    every blocked row 3 lines tall (vertically fat rows) */
 .top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
-
-/* ============================================================
-   TOP TABLE — the whole table layout in two rules (+1 compact).
-   Rows are one line; EVERY cell clips (ellipsis); columns align
-   because tracks are fixed. Full text on hover via title attr.
-   ============================================================ */
-.top-head, .top-row {
-  display: grid;
-  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 48px 48px 48px 48px minmax(120px, 1fr) 84px 84px;
-  gap: 8px;
-  align-items: center;
-  font-size: 12px;
-  padding: 5px 10px;
-}
-.top-head > span, .top-row > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.top-row-child { margin-left: 22px; }
-
-/* compact: hide session + gauges; template matches the visible cells */
-@media (max-width: 1280px) {
-  .topc-session, .topc-gauge, .top-sent { display: none; }
-  .top-head, .top-row {
-    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 48px minmax(120px, 1fr) 84px 84px;
-  }
-}
 
 /* goal cell: a flex row — single line BY CONSTRUCTION (flex never wraps
    without flex-wrap), immune to any surviving line-box rule */
@@ -1125,7 +1090,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ktable-child { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent, #5b9dff) 40%, transparent); padding-left: 20px; }
 
 /* per-table column templates — layout lives ONLY here, as --cols */
-.top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
+.top-table { overflow-x: auto; flex-shrink: 0; }
+.top-table-body { min-width: 1420px; }
+.top-head, .top-row { --cols: 92px 140px 180px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
+/* Nest in the task cell; never shift all child-row columns off the header. */
+.top-row.ktable-child { padding-left: 10px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
 /* 2026-11-02 rebalance (Ray: "column width still disproportionate") — the
    BR#5412 swing overshot: status crushed to 0.7fr/150px while its chips
@@ -1135,7 +1104,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-head-cols, .train-row { --cols: 26px minmax(150px, 0.9fr) minmax(210px, 1.1fr) 112px minmax(220px, 1.3fr) 86px minmax(190px, 1fr); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
-  .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
+  .top-table-body { min-width: 1170px; }
+  .top-head, .top-row { --cols: 92px 140px 180px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
   /* narrow: PROGRESS and RATE fold away; STATUS/CURRENT/MSG/BACKLOG stay */
   .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(190px, 1fr) minmax(200px, 1.2fr) minmax(160px, 0.9fr); }
   .trainc-prog, .trainc-rate { display: none; }
@@ -1188,6 +1158,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    release button moved to Backlog's timeout group (keeps its class) */
 .sinbin-release { font-size: 11px; }
 .topc-agent { font-weight: 600; }
+.top-agent-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-model { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; font-size: 10px; font-weight: 500; line-height: 1.5; white-space: normal; }
+.execution-model-size { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.topc-model .execution-model { flex-wrap: nowrap; font-size: 11px; }
+.topc-model .execution-model-size { flex: 0 0 auto; }
+.task-model-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.execution-state { display: block; font-size: 10px; font-weight: 500; color: var(--muted); white-space: normal; }
 .topc-session { font-size: 11px; }
 .top-will { color: var(--accent); opacity: .8; }
 .top-sent { display: none; }

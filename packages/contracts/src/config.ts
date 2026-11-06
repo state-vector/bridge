@@ -17,11 +17,16 @@
  *   on LOAD and folded in; the WRITTEN shape is the dict form below.
  */
 import { z } from "zod";
+import { ReasoningTierSchema } from "./execution.ts";
 
 /** Keys that must never appear in a serialized config file. */
 export const CONFIG_FORBIDDEN_KEYS = ["token", "principal"] as const;
 
 export const BackendConfigSchema = z.looseObject({
+  enabled: z.boolean().optional(),
+  projects: z.array(z.string()).optional(),
+  reasoning_tier: ReasoningTierSchema.optional(),
+  models: z.partialRecord(ReasoningTierSchema, z.string().trim().min(1)).optional(),
   bin: z.string().optional(),
   agent: z.string().optional(),
   model: z.string().optional(),
@@ -64,6 +69,8 @@ export const BridgeConfigSchema = z.looseObject({
   // leg, reding the drift alarm on every push since — found completing the
   // main-red base fix.
   sweep_repos: z.array(z.string()),
+  /** Automatic binary replacement is opt-in, never inferred from an install channel. */
+  auto_update: z.strictObject({ enabled: z.boolean(), channel: z.enum(["main", "stable", "pinned"]) }).nullable(),
   // legacy (accepted on load, folded into backends, never written once empty)
   models: z.record(z.string(), z.string()).optional(),
   agents: z.record(z.string(), z.string()).optional(),

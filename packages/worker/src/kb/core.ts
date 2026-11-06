@@ -8,7 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
-import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask } from "@bridge/contracts";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask, checkObligationKey } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -458,7 +458,7 @@ export function isValidAskTarget(to: string): boolean {
   if (!to || to.length > 120) return false;
   if (to === "any") return true;
   if (to.startsWith("tag:")) return /^[a-z0-9:_-]{1,100}$/.test(to.slice(4));
-  return /^[a-zA-Z0-9._@-]{1,100}$/.test(to);
+  return /^[a-zA-Z0-9._-]+(?:\/[a-zA-Z0-9._-]+)*(?:@[a-zA-Z0-9._-]+)?$/.test(to);
 }
 
 export const ASK_OPEN = "open";
@@ -504,9 +504,12 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `6c. ASK QUALITY BAR — an ask must be answerable on plain reading. (a) If you recommend an option, put it FIRST in options and prefix it "(Recommended)" — the first button IS the recommendation. (b) Human-directed asks REQUIRE details: a self-contained brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected by the hub. (c) Split the fields: question ≤240 chars, details carries the full story, reason is the one-line WHY escalated. Never cram the narrative into reason or reference cards the reader hasn't read.`,
     `6d. REQUEST ROUTING: use route {kind:"executor_coordination",task_id:"BR#N"} to ask the current executor of work — the recipient follows claim changes. Use route {kind:"independent_review",task_id:"BR#N"} for review: Bridge schedules/reuses a fresh review agent, no human staffing question. Agent delivery failures return to the agent pool, never become human decisions merely because a recipient is offline. Human decisions use route {kind:"human_decision"}, to:"human", only for a specific choice/authority Bridge lacks. Write the complete question in plain English: explain the user-visible issue before task/commit evidence; each option names who acts and what happens. Answer coordination via answer_ask (even "No overlap"), never log_progress: progress is commentary, not an answer.`,
     `6e. EXPLICIT EFFECTS: human_decision requests require decision {kind:authority|information|preference,task_id,context,why_human,choices:[{label,executor:bridge|human,consequence,action:resume|hold|release}]}. Diagnostics are machine recovery work, not a human choice. Operational/post-deploy tasks declare meta.completion {kind:"execution",outcome}; prerequisite delivery only resumes them. Record actual execution_result {outcome,receipts}, submit to independent outcome review, and accept with review_result {kind:"accepted_execution",task_id,receipts}. Never mark prerequisite arrival as completed execution.`,
+    `6f. RECOVERY EXECUTION: a task's meta.recovery_links identifies its cause-specific recovery journals. Use train_recovery_event with that repo/base/head_sha/cause, a unique event_id, and event {kind:"diagnosed",task_id,diagnosis,next}, then {kind:"attempt_started",task_id,attempt_id,attempt_kind:"repair"|"retry"|"verification",action,next} before the action and {kind:"attempt_finished",task_id,attempt_id,outcome:"failed"|"delivered"|"inconclusive",summary,receipts,next} after the real result. A denied/replayed retry is not authorization to execute again. Report structured did/next via log_progress; a heartbeat or stdout fragment is not a repair result. Code delivery only starts verification; never claim live recovery without the matched deployment evidence and acceptance bar.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch — the docs are the interface, stale docs are a defect.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
+    `8b. HUMAN-DIRECTED INTERACTIVE CLAIMS (BR#6788): a live full-agent credential and named session may claim todo, capability-blocked or fully prepared local-pickup work directly via transition {to:"in_progress",session,note}; no second human-web grant is needed. Credential class is server-verified; gateway/cron/provisioned workers cannot impersonate it. Original writers must be quiescent, preparation complete and unknown effects reconciled; human decisions, qualification and review separation still apply. Owner progress refreshes heartbeat/gauges even after an old runner quiesced. To release, stop writers, preserve/publish work and transition to todo with a done/next/location note; capability requirements remain for automation.`,
+    `8c. RECOVERY CAPACITY (BR#6835): concrete repair/root-fix work outranks routine verification. A scheduler recovery-preemption interrupt means safely checkpoint, stop, confirm quiescence and yield; it is a temporary pause, NOT a review finding or acceptance. The managed verifier returns to todo with preserved work and resumes after priority dispatch. Never overbook, fabricate stopped-writer proof or fight the slot handoff by re-claiming the verifier before recovery. Interactive/human holds and unknown external effects remain protected.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
     `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited. The owner may instead claim_takeover the card (rule 5e) — if that happens your next transition is refused with a stand-down order: checkpoint and exit.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
@@ -975,11 +978,25 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
 
 export type MainCheckRun = {
   id: number;
+  source?: import("@bridge/contracts").CheckSource;
   name: string;
   status?: string | null;
   conclusion?: string | null;
   html_url?: string | null;
 };
+
+/** Newest attempt wins only inside one enforcing obligation. A separately
+ * published green check with the same name cannot erase another suite's red. */
+function checkObligations(runs: MainCheckRun[]): MainCheckRun[][] {
+  const groups = new Map<string, MainCheckRun[]>();
+  for (const run of runs) {
+    const key = checkObligationKey(run);
+    const list = groups.get(key) ?? [];
+    list.push(run);
+    groups.set(key, list);
+  }
+  return [...groups.values()];
+}
 
 export type MainRedCheck = { name: string; conclusion: string; url: string };
 
@@ -1016,16 +1033,11 @@ export const MAIN_RED_CONCLUSIONS = new Set([
 
 export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
   if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
-  const byName = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const list = byName.get(r.name ?? "") ?? [];
-    list.push(r);
-    byName.set(r.name ?? "", list);
-  }
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   let green = 0;
-  for (const [name, list] of byName) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     // the newest non-cancelled run judges; cancelled runs say nothing
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge || judge.conclusion == null) {
@@ -1059,15 +1071,9 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   // in `required`. Include any non-exempt workflow whose newest non-cancelled
   // run is `startup_failure` in `scoped` so the base verdict immediately speaks
   // RED instead of Empty.
-  const byNameAll = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const n = r.name ?? "";
-    const list = byNameAll.get(n) ?? [];
-    list.push(r);
-    byNameAll.set(n, list);
-  }
   const startupFailedNames = new Set<string>();
-  for (const [name, list] of byNameAll) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     if (!name || isExemptCheckName(name)) continue;
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (judge?.conclusion === "startup_failure") {
@@ -1177,18 +1183,13 @@ export type HeadCheckVerdict = {
  *  and recorded as `external` — they are collected into the class ask, never
  *  bounce a PR. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
-  const byName = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const name = r.name ?? "";
-    const list = byName.get(name) ?? [];
-    list.push(r);
-    byName.set(name, list);
-  }
+  if (!runs.length) return { verdict: "unsettled", red: [], unsettled: ["head checks have not started or could not be read"], external: [], green: 0 };
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
-  for (const [name, list] of byName) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge) {
       if (!isExemptCheckName(name)) unsettled.push(`${name} (only cancelled runs)`);
@@ -2582,6 +2583,18 @@ export type TrainLeg = {
   carry?: CarryRecord[];
 };
 
+/** The only valid append point for a machine-clean carry. */
+export function trainCarryChainEnd(leg: Pick<TrainLeg, "head_sha_at_acceptance" | "carry">): string {
+  let end = String(leg.head_sha_at_acceptance ?? "").toLowerCase();
+  for (const link of Array.isArray(leg.carry) ? leg.carry : []) {
+    const from = String(link.from_head ?? "").toLowerCase();
+    const to = String(link.to_head ?? "").toLowerCase();
+    if (from !== end || !/^[0-9a-f]{7,40}$/.test(to)) break;
+    end = to;
+  }
+  return end;
+}
+
 /** The card's legs: meta.prs when stamped (multi-PR), else the legacy
  *  meta.pr single leg. Empty when neither exists. */
 export function trainLegs(meta: any): TrainLeg[] {
@@ -2712,18 +2725,16 @@ export function classifyRequiredRuns(
   const missing: string[] = [];
   const pending: string[] = [];
   for (const name of judgeNames) {
-    const list = byName.get(name) ?? [];
-    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
-    if (!judge || judge.conclusion == null) {
-      // unconfigured mode: a cancelled-only run (or in-flight with no
-      // conclusion) is UNSETTLED — the commit has not finished proving itself
-      (list.length || !required.length ? pending : missing).push(name);
-      continue;
-    }
-    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
-      failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
-    } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
-      pending.push(name);
+    const named = byName.get(name) ?? [];
+    if (!named.length) { missing.push(name); continue; }
+    for (const list of checkObligations(named)) {
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (!judge || judge.conclusion == null) { pending.push(name); continue; }
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+        failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
+        pending.push(name);
+      }
     }
   }
   if (required.length) {
@@ -2731,7 +2742,8 @@ export function classifyRequiredRuns(
     // GitHub creates 0 job check-runs, so none of the job names in `required`
     // ever appear. Fold any non-exempt workflow-level `startup_failure` into
     // `failing` immediately instead of waiting 60m on missing required jobs.
-    for (const [name, list] of byName) {
+    for (const list of checkObligations(runs)) {
+      const name = list[0].name;
       if (!name || required.includes(name) || isExemptCheckName(name)) continue;
       const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
       if (judge?.conclusion === "startup_failure") {
@@ -2767,6 +2779,11 @@ export type TrainGateInput = {
   mergeStateStatus: string | null;
   /** commits of the PR: REST verification (verified=true = signed+valid) */
   commits: { sha: string; verified: boolean }[];
+  /** BR#4687 (L1.2): the branch is worker-authored — every commit's GitHub
+   *  author login sits on the worker allowlist. The behind pre-clear below
+   *  is provenance-gated on this: the train machine-updates its OWN
+   *  branches; a protected human branch still bounces to its owner. */
+  trainOwnedBranch?: boolean;
   headChecks: MainCheckRun[];
   /** BR#3659: which leg of the card's PR list this gate drives (1-based
    *  position in meta.prs) — the gate checks THAT leg's stamp, and the
@@ -3011,10 +3028,25 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
           ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
           : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
       }
-      // (5) Mechanically sound + base green + head green -> Merge
+      // (5) Mechanically sound + base green + head green -> Merge.
+      // BR#4687 (L1.2): the behind pre-clear is PROVENANCE-GATED. The train
+      // machine-updates branches its own fleet authored (every commit's
+      // GitHub author on the worker allowlist); a protected human branch is
+      // not the train's to move — it still bounces to its owner with the
+      // named state. Fail-closed: an input that does not say
+      // worker-authored is human-treated.
+      const behindPrecleared = behind && i.trainOwnedBranch === true;
+      if (blocked) return { kind: "note", reason: `PR #${i.prNumber} GitHub branch policy remains BLOCKED despite observed green head checks — reconcile required checks and policy; no merge attempted` };
+      if (behind && !behindPrecleared) {
+        return {
+          kind: "bounce",
+          defect: `PR #${i.prNumber} mergeStateStatus=behind against base on a protected (non-worker-authored) branch — the train does not move human branches. Rebase, re-sign, re-push and re-enter the queue`,
+          bounceKind: "gate",
+        };
+      }
       return {
         kind: "merge",
-        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
+        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behindPrecleared ? "behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
       };
     }
   }

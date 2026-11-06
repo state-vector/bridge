@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText } from "@bridge/contracts";
+import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText, withRecoveryEpisodes, reduceRecoveryEpisode, taskRemediation } from "@bridge/contracts";
 import { applyDeployObservation, normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
 
 const now = 2_000_000;
@@ -8,6 +8,70 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("shows the actual priority capacity handoff rather than passively waiting for an executor", () => {
+    const repair = { ...task, status: "todo", active_agent: false, execution_blockers: [{ kind: "capacity_wait" as const, episode_id: "capacity", text: "Full" }],
+      preemption: { phase: "stopping_verification" as const, recovery_id: task.id, victim_id: "BR#2", generation: 1, attempt_id: "one", session: "verify", requested_at: now, checkpoint_commit: "a".repeat(40) } };
+    expect(taskRemediation(repair)).toMatchObject({ kind: "queued", text: expect.stringContaining("verification BR#2 is checkpointing and yielding") });
+    expect(taskRemediation({ ...repair, preemption: { ...repair.preemption, phase: "slot_available" } })).toMatchObject({ text: expect.stringContaining("reclaimed slot is available") });
+    expect(taskRemediation({ ...repair, execution_blockers: [{ kind: "human_answer_required", episode_id: "human", ask_id: "BR#3", text: "Needs a human choice" }] }).kind).toBe("blocked");
+  });
+  it("a todo repair with a rejected startup is blocked, not queued for an available agent", () => {
+    const wait = { host: "runner", fingerprint: "proof", reason: "execution command requires task executor authority", since: now,
+      retained_work: false, attention_at: null, phase: "recovery_required" as const, source: "start_failed" as const };
+    const repair = { ...task, status: "todo", active_agent: false,
+      execution_blockers: [{ kind: "startup_wait" as const, episode_id: "start:1", text: "Startup prerequisite requires repair; no work has started.", wait }] };
+    expect(taskRemediation(repair)).toMatchObject({ kind: "blocked", task: repair });
+    const line = projectTrainLine(facts({ stop: { reason: "Deploy failed" }, base_red_resolution: {
+      verdict: "red", phase: "diagnosing", held: 1, whats_broken: [], ask: null, fix_card: repair,
+    } }), now);
+    expect(line.remediation).toMatchObject({ kind: "blocked", text: expect.stringContaining("no work has started") });
+    expect(taskRemediation({ ...repair, execution_blockers: [] }).kind).toBe("queued");
+  });
+  it("a bound, non-conflicting cure is an explicit PR merge action, even before the request is published", () => {
+    const fix = { ...task, pr: 2916, pr_url: "https://github.com/o/r/pull/2916", merged: false, conflict: false };
+    const f = facts({ stop: { reason: "Deployment failed" }, base_red_resolution: {
+      verdict: "red", phase: "cure_pr_awaiting_force_merge", held: 12, whats_broken: [], ask: null, fix_card: fix,
+    } });
+    const line = projectTrainLine(f, now);
+    expect(line).toMatchObject({ label: "Fix ready — your merge is needed", remediation: {
+      kind: "merge", pr: 2916, url: fix.pr_url, request: null,
+    } });
+    f.base_red_resolution!.ask = { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Merge cure", options: ["DONE", "HOLD"] };
+    expect(projectTrainLine(f, now).remediation).toMatchObject({ kind: "merge", request: { id: "BR#2" } });
+    f.base_red_resolution!.fix_card!.conflict = true;
+    expect(projectTrainLine(f, now).remediation?.kind).not.toBe("merge");
+    f.base_red_resolution!.fix_card!.conflict = false;
+    f.base_red_resolution!.fix_card!.merged = true;
+    expect(projectTrainLine(f, now).remediation?.kind).not.toBe("merge");
+  });
+  it("a current merge refusal cannot advertise yesterday's starvation diagnosis as its repair", () => {
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#3974" }], diagnostic: { ...task, id: "BR#6442" },
+      queue_facts: { at: now, base_state: { verdict: "green" }, stalled: { last_error: "gh pr merge 2513 --merge: base branch policy prohibits the merge" } },
+    }), now);
+    expect(line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge", remediation: { kind: "attention" } });
+    expect(JSON.stringify(line)).not.toContain("BR#6442");
+    expect(line.reason).not.toContain("gh pr merge");
+  });
+  it("a scoped-green base waiting only for the drift check is pending, not a failing main", () => {
+    const q = { at: now, base_state: { verdict: "green", red: [], unsettled: [], gate_blocked: true, gate_red: [], gate_unsettled: ["Deploy drift alarm"] } };
+    expect(projectTrainLine(facts({ queue_facts: q }), now)).toMatchObject({ phase: "waiting", blocker: "checks_running", label: "Waiting for required checks", remediation: { kind: "machine" } });
+    expect(projectTrainLine(facts({ queue_facts: q }), now + 16 * 60_000).phase).toBe("unknown");
+    expect(projectTrainLine(facts({ queue_facts: { ...q, base_state: { ...q.base_state, gate_red: [{ name: "Deploy drift alarm" }] } } }), now).phase).toBe("stopped");
+    expect(projectTrainLine(facts({ queue_facts: q, stop: { reason: "Actual stop", failing: [{ name: "Test" }] } }), now).phase).toBe("stopped");
+  });
+  it("cause-bound repairs replace stale diagnostic selection without concealing a concrete human requirement", () => {
+    const line = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [], unsettled: [] } },
+      diagnostic: { ...task, id: "BR#6442", active_agent: false } }), now);
+    const episode = reduceRecoveryEpisode(undefined, { head_sha: "7".repeat(40),
+      cause: { kind: "capability_unavailable", check: "Smoke", scenario: "php", capability: "callers", scope: "User.php:2416" }, event_id: "cause", actor: "observer", now,
+      event: { kind: "observed", task_id: "BR#6494", next: "Publish callers repair", source: { head_sha: "7".repeat(40), run_id: 100, run_attempt: 1, url: "https://github.com/o/r/actions/runs/100" } } });
+    const recoveries = [{ episode, task: { ...task, id: "BR#6494" } }];
+    expect(withRecoveryEpisodes(line, recoveries)).toMatchObject({ remediation: { kind: "agent", task: { id: "BR#6494" } } });
+    expect(withRecoveryEpisodes(line, [{ episode, task: { ...task, id: "BR#6494", active_agent: false } }])).toMatchObject({ remediation: { kind: "queued", task: { id: "BR#6494" } } });
+    if (line.phase !== "stopped") throw new Error("expected stopped fixture");
+    const human = { ...line, remediation: { kind: "human" as const, text: "Missing credential", action: { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Grant access?", options: ["Grant"] } } };
+    expect(withRecoveryEpisodes(human, recoveries).remediation).toEqual(human.remediation);
+  });
   it("runner transcripts remain diagnostic output, never an invented next action", () => {
     const runner = { ...task, last_progress: { note: "runner: agent output — timing suggests classifier...", ts: now } };
     expect(repairProgressText(runner)).toBe("Agent session is active; next action has not yet been reported.");

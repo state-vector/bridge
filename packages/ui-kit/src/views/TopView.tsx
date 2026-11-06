@@ -3,10 +3,13 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { TrainPanel } from "./TrainPanel";
+import { WorkerAvailabilityBanner } from "./WorkerAvailability";
 import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
+import { ExecutionModel } from "./ExecutionModel";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -62,6 +65,7 @@ const STATUS_DOT_TITLE: Record<string, string> = {
 };
 
 interface TopRow {
+  execution?: ExecutionModelView;
   key: string;
   agent: string;
   session?: string;
@@ -138,6 +142,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       const unblock: string | undefined = meta.blocked?.unblock_condition;
       const askPending: string | undefined = meta.awaiting_ask?.ask_id;
       return {
+        execution: t.execution,
         key: t.id,
         agent,
         session: meta.session ?? p?.session,
@@ -243,14 +248,18 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   return (
     <div className="top-wrap">
+      <WorkerAvailabilityBanner />
       <TrainPanel openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <TopSectionHeader theme={tagTheme} />
 
+      <div className="top-table" role="region" aria-label="Active fleet tasks" tabIndex={0}>
+      <div className="top-table-body">
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
         <span className="topc-agent">machine / agent</span>
+        <span className="topc-model" title="Model size; a => b means a larger model is requested. Interactive sessions use custom.">model size</span>
         <span className="topc-session">session</span>
         <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
@@ -275,7 +284,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <div
           key={r.key}
           className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${depth > 0 ? "ktable-child" : ""}`}
-          style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-task" title={r.taskId ?? ""}>
@@ -286,7 +294,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
           </span>
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
-            {r.agent}
+            <span className="top-agent-name">{r.agent}</span>
+          </span>
+          <span className="topc-model">
+            <ExecutionModel value={r.execution} now={now} />
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
@@ -384,6 +395,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         ),
         ];
       })}
+      </div>
+      </div>
 
       {treeRows.length === 0 && (
         <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Parked cards file in Backlog under their exit condition."}</p>

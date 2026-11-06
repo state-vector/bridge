@@ -4,6 +4,7 @@ import {
   isActionableDutyCard,
   normalizePr,
   prAgeMs,
+  prRowIsOpen,
   reconcileJoin,
   type ReconcileBinding,
   type ReconcileConfig,
@@ -44,6 +45,8 @@ const pr = (number: number, over: Partial<ReconcilePr> = {}): ReconcilePr => ({
   headRefName: `feature/${number}`,
   updatedAt: iso(5),
   isDraft: false,
+  state: "OPEN", // BR#6384: the helper mints open-feed rows by default
+  mergeCommit: null,
   ...over,
 });
 
@@ -150,7 +153,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 3, bound: 1, ignored: 1, inflight: 0, spawned: 1,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 3, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 3, ok: true,
     });
     expect(line).toBe("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
   });
@@ -159,7 +162,7 @@ describe("accountingLine", () => {
     const a = {
       repo: "r", open_reviewed: 1, bound: 0, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 0, ok: false,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 0, ok: false,
     };
     expect(accountingLine(a)).toContain("ALARM: 1 unaccounted");
     expect(accountingLine({ ...a, unaccounted: 0, ok: true, accounted: 1, bound: 1 })).not.toContain("ALARM");
@@ -169,7 +172,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1,
-      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, accounted: 1, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("(+2 in age grace, +3 unreviewed)");
     expect(line).toContain("[reverse: 1 missing, 1 closed, 0 dutied]");
@@ -179,7 +182,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
-      reverse_dutied: 0, reverse_lane_exempt: 2, reverse_train_exempt: 0, accounted: 1, ok: true,
+      reverse_dutied: 0, reverse_lane_exempt: 2, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("[reverse: 2 lane-exempt]");
   });
@@ -544,5 +547,194 @@ describe("reconcileJoin — lane exemption (BR#5151)", () => {
     });
     expect(r.accounting.reverse_lane_exempt).toBe(1);
     expect(accountingLine(r.accounting)).toContain("1 lane-exempt");
+  });
+});
+
+// ---------- BR#6384: the merged feed + the observed-merge close ----------
+
+describe("normalizePr — BR#6384 merged-feed passthrough", () => {
+  it("keeps state/mergeCommit on a MERGED row", () => {
+    const n = normalizePr({ number: 7, state: "MERGED", mergeCommit: "f".repeat(40), title: "x" });
+    expect(n).not.toBeNull();
+    expect(n!.state).toBe("MERGED");
+    expect(n!.mergeCommit).toBe("f".repeat(40));
+  });
+
+  it("a legacy open-feed row (no state field) normalizes to null/null — identical shape to before", () => {
+    const n = normalizePr({ number: 8, title: "y", reviewDecision: "APPROVED" });
+    expect(n).not.toBeNull();
+    expect(n!.state).toBeNull();
+    expect(n!.mergeCommit).toBeNull();
+  });
+});
+
+describe("prRowIsOpen — BR#6384 feed partition", () => {
+  it("legacy rows (null state) and OPEN rows are queue members; MERGED/CLOSED are observation receipts", () => {
+    expect(prRowIsOpen({ ...pr(1), state: null })).toBe(true);
+    expect(prRowIsOpen({ ...pr(1) })).toBe(true);
+    expect(prRowIsOpen({ ...pr(1), state: "MERGED", mergeCommit: "a".repeat(40) })).toBe(false);
+    expect(prRowIsOpen({ ...pr(1), state: "CLOSED" })).toBe(false);
+    expect(prRowIsOpen({ ...pr(1), state: "open" })).toBe(true); // case-insensitive
+  });
+});
+
+describe("reconcileJoin — BR#6384 observed-merge close", () => {
+  it("a bound PR observed MERGED emits observed_merge_close citing the live mergeCommit", () => {
+    const sha = "f".repeat(40);
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(11, { state: "MERGED", mergeCommit: sha, headRefOid: sha }) }],
+      bindings: [binding(11)],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    const j = r.judgements.find((x) => x.pr === 11);
+    expect(j?.decision).toEqual({ action: "observed_merge_close", card: "BR#90011", merge_sha: sha });
+    expect(r.accounting.observed_merged).toBe(1);
+  });
+
+  it("the observation accounts the run green — the merged row is not an open PR, not unaccounted, not grace", () => {
+    const sha = "f".repeat(40);
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(11, { state: "MERGED", mergeCommit: sha }) }],
+      bindings: [binding(11)],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.accounting.ok).toBe(true);
+    expect(r.accounting.unaccounted).toBe(0);
+    expect(r.accounting.open_reviewed).toBe(0);
+    expect(r.accounting.grace).toBe(0);
+    expect(r.accounting.accounted).toBe(1);
+    expect(accountingLine(r.accounting)).toContain("1 observed-merged closed");
+  });
+
+  it("a MERGED row with no bound card is silence — no judgement, no count", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(12, { state: "MERGED", mergeCommit: "a".repeat(40) }) }],
+      bindings: [],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.judgements).toHaveLength(0);
+    expect(r.accounting.observed_merged).toBe(0);
+    expect(r.accounting.ok).toBe(true);
+  });
+
+  it("a lane binding observed MERGED is exempt (BR#5151) — never closed, never counted", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(13, { state: "MERGED", mergeCommit: "a".repeat(40) }) }],
+      bindings: [binding(13, { lane: true })],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.judgements[0]?.decision).toEqual({ action: "lane_exempt", card: "BR#90013" });
+    expect(r.accounting.observed_merged).toBe(0);
+    expect(r.accounting.bound).toBe(1);
+  });
+
+  it("the reverse loop skips observation-owned bindings — no missing clock, no reverse close, no duty", () => {
+    const sha = "f".repeat(40);
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(14, { state: "MERGED", mergeCommit: sha }) }],
+      bindings: [binding(14, { missing: true, missing_set_before_report: true, provenance: { merge_sha: "b".repeat(40), signer: "train" } })],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    const actions = r.judgements.map((x) => x.decision.action);
+    expect(actions).toContain("observed_merge_close");
+    expect(actions).not.toContain("reverse_close");
+    expect(actions).not.toContain("mark_missing");
+    expect(actions).not.toContain("spawn_reverse");
+    expect(r.accounting.reverse_missing).toBe(0);
+    expect(r.accounting.reverse_closed).toBe(0);
+    expect(r.accounting.reverse_dutied).toBe(0);
+  });
+
+  it("a genuinely vanished binding still flows the reverse path beside an observed merge", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(15, { state: "MERGED", mergeCommit: "c".repeat(40) }) }],
+      bindings: [
+        binding(15),
+        binding(16, { missing: true, missing_set_before_report: false }),
+      ],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    const actions = r.judgements.map((x) => x.decision.action);
+    expect(actions).toContain("observed_merge_close");
+    expect(actions).toContain("mark_missing");
+    expect(r.accounting.reverse_missing).toBe(1);
+    expect(r.accounting.reverse_dutied).toBe(0);
+  });
+
+  it("a MERGED row with no mergeCommit is not a receipt — the binding falls to the reverse path, never the observation close", () => {
+    // the true projection: a merged row is absent from the OPEN set, so the
+    // DO passes missing=true — and with no citable sha the observation loop
+    // must not close; the reverse guard owns the ruling
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(17, { state: "MERGED", mergeCommit: null }) }],
+      bindings: [binding(17, { missing: true })],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.judgements.map((x) => x.decision.action)).toEqual(["mark_missing"]);
+    expect(r.accounting.observed_merged).toBe(0);
+  });
+
+  it("a CLOSED row is not a merge receipt either — the binding falls to the reverse path, never the observation close", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(18, { state: "CLOSED" }) }],
+      bindings: [binding(18, { missing: true })],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.judgements.map((x) => x.decision.action)).toEqual(["mark_missing"]);
+    expect(r.accounting.observed_merged).toBe(0);
+  });
+
+  it("open-feed rows keep the legacy forward invariant beside merged rows (partition holds)", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [
+        pr(19), // unbound, approved+mergeable, 5h old > 2h grace → spawn_verify
+        { ...pr(20, { state: "MERGED", mergeCommit: "d".repeat(40) }) },
+      ],
+      bindings: [binding(20)],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.accounting.spawned).toBe(1); // #19 the orphan verify spawn
+    expect(r.accounting.observed_merged).toBe(1); // #20 the observation close
+    expect(r.accounting.open_reviewed).toBe(1); // only #19 counts as open
+  });
+
+  it("a queued binding observed MERGED closes too — the train's settle path is not the only honest writer", () => {
+    const r = reconcileJoin({
+      repo: "o/r",
+      prs: [{ ...pr(21, { state: "MERGED", mergeCommit: "e".repeat(40) }) }],
+      bindings: [binding(21, { queued: true })],
+      ignores: [],
+      duties: [],
+      cfg: CFG,
+    });
+    expect(r.judgements[0]?.decision).toEqual({ action: "observed_merge_close", card: "BR#90021", merge_sha: "e".repeat(40) });
+    expect(r.accounting.observed_merged).toBe(1);
   });
 });

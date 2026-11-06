@@ -25,6 +25,24 @@
 use std::path::{Path, PathBuf};
 
 use crate::dispatch::DispatchConfig;
+use crate::dispatch::ReasoningTier;
+use std::collections::BTreeMap;
+
+#[derive(Debug, PartialEq)]
+pub enum MigrationTierSource { Operator, Declared, LegacyDefault }
+#[derive(Debug, PartialEq)]
+pub struct ModelConfigChange {
+    pub backend: String,
+    pub model: String,
+    pub tier: ReasoningTier,
+    pub source: MigrationTierSource,
+}
+#[derive(Debug)]
+pub enum ModelConfigMigration {
+    Current { unconfigured: Vec<String> },
+    Planned { changes: Vec<ModelConfigChange>, unconfigured: Vec<String> },
+    Applied { changes: Vec<ModelConfigChange>, unconfigured: Vec<String> },
+}
 
 /// Current config shape. Bump on any breaking change to the serialized
 /// struct; loaders warn loudly on files from the future.
@@ -63,10 +81,37 @@ impl TokenStore {
     /// temp+rename, 0600. Every caller (pairing, self-provision, settings
     /// apply, CLI onboarding, loop persist) funnels through here.
     pub fn save_config(&self, cfg: &DispatchConfig) -> Result<(), String> {
+        self.save_config_preserving(cfg, None)
+    }
+
+    fn save_config_preserving(&self, cfg: &DispatchConfig, original: Option<serde_json::Value>) -> Result<(), String> {
         let mut out = cfg.clone();
         out.normalize();
         out.schema_version = CONFIG_SCHEMA_VERSION;
-        let body = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+        let mut written = serde_json::to_value(&out).map_err(|e| e.to_string())?;
+        // Doctor upgrades known fields while retaining extensions it does not own.
+        if let Some(mut original) = original {
+            if let Some(old) = original.as_object_mut() {
+                if let Some(sections) = old.get("backends").and_then(|v| v.as_object()).cloned() {
+                    for (name, section) in sections {
+                        if let (Some(old_section), Some(new_section)) = (section.as_object(), written["backends"][&name].as_object_mut()) {
+                            for (key, value) in old_section {
+                                if !["enabled", "projects", "reasoning_tier", "models", "bin", "agent", "model", "mode"].contains(&key.as_str()) {
+                                    new_section.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(new) = written.as_object() {
+                    for (key, value) in new { old.insert(key.clone(), value.clone()); }
+                }
+                // Normalised legacy maps and credentials never ride the new file.
+                for key in ["models", "agents", "token", "principal"] { old.remove(key); }
+                written = original;
+            }
+        }
+        let body = serde_json::to_string_pretty(&written).map_err(|e| e.to_string())?;
         self.atomic_write(&self.config_path(), body.as_bytes())?;
         crate::logging::emit(
             "store",
@@ -74,6 +119,54 @@ impl TokenStore {
             &format!("config saved to {}", self.config_path().display()),
         );
         Ok(())
+    }
+
+    /// Offline, explicit doctor migration. Plain doctor plans; --fix commits.
+    /// Never resolve env overrides into the saved file or infer tiers from IDs.
+    pub fn migrate_model_config(&self, apply: bool, tiers: &BTreeMap<String, ReasoningTier>) -> Result<ModelConfigMigration, String> {
+        let raw = match std::fs::read_to_string(self.config_path()) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && tiers.is_empty() => return Ok(ModelConfigMigration::Current { unconfigured: vec![] }),
+            Err(e) => return Err(format!("cannot read saved config for migration: {e}")),
+        };
+        let original: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("invalid saved config; not migrating: {e}"))?;
+        let mut cfg: DispatchConfig = serde_json::from_value(original.clone()).map_err(|e| format!("invalid saved config; not migrating: {e}"))?;
+        if cfg.schema_version > CONFIG_SCHEMA_VERSION { return Err("config is from a newer Bridge version; update doctor before migrating".into()); }
+        cfg.normalize();
+        for name in tiers.keys() {
+            let bc = cfg.backends.get(name).ok_or_else(|| format!("unknown backend in --tier: {name}"))?;
+            if !bc.models.is_empty() && !bc.models.contains_key(&tiers[name]) {
+                return Err(format!("backend {name} already has tier models; edit its map rather than replacing it with --tier"));
+            }
+        }
+        let mut changes = Vec::new();
+        let mut unconfigured = Vec::new();
+        for (name, bc) in &mut cfg.backends {
+            if !bc.models.is_empty() { continue; }
+            let Some(model) = bc.model.as_ref().or(cfg.model.as_ref()).filter(|m| !m.trim().is_empty()).cloned() else {
+                if tiers.contains_key(name) { return Err(format!("backend {name} has no model ID to migrate; configure an actual CLI model ID first")); }
+                if bc.enabled { unconfigured.push(name.clone()); }
+                continue;
+            };
+            let (tier, source) = if let Some(tier) = tiers.get(name) { (*tier, MigrationTierSource::Operator) }
+                else if original["backends"][name].get("reasoning_tier").is_some() { (bc.reasoning_tier, MigrationTierSource::Declared) }
+                else { (bc.reasoning_tier, MigrationTierSource::LegacyDefault) };
+            bc.models.insert(tier, model.clone());
+            changes.push(ModelConfigChange { backend: name.clone(), model, tier, source });
+        }
+        if changes.is_empty() { return Ok(ModelConfigMigration::Current { unconfigured }); }
+        if !apply { return Ok(ModelConfigMigration::Planned { changes, unconfigured }); }
+        // Back up the exact input privately before touching credential/config state.
+        self.atomic_write(&self.root.join("config.pre-model-tiers.json"), raw.as_bytes())?;
+        if !cfg.token.is_empty() && self.load_token().is_empty() {
+            crate::keychain::save_token(cfg.token.trim()).map_err(|e| format!("credential migration failed; original config retained: {e}"))?;
+        }
+        if let Some(principal) = original["principal"].as_str().filter(|p| !p.trim().is_empty()) {
+            if self.principal().is_empty() { return Err(format!("cannot preserve legacy principal {principal}; original config retained")); }
+        }
+        if std::fs::read_to_string(self.config_path()).map_err(|e| e.to_string())? != raw { return Err("config changed during doctor migration; original changes retained, rerun doctor".into()); }
+        self.save_config_preserving(&cfg, Some(original))?;
+        Ok(ModelConfigMigration::Applied { changes, unconfigured })
     }
 
     /// Loud parse: a bad config file is an error event, never a silent
@@ -335,6 +428,105 @@ mod tests {
         let d = std::env::temp_dir().join(format!("bridge-store-{tag}-{uniq}"));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn doctor_tier_migration_plans_then_atomically_migrates_legacy_maps() {
+        let root = temp_root("tier-migration");
+        let store = TokenStore::from_root(root.clone());
+        let raw = r#"{"url":"https://hub.test","backends":["opencode","kiro"],"models":{"opencode":"provider/glm","kiro":"provider/other"},"agents":{"opencode":"bridge"},"max_sessions":7,"custom_extension":{"keep":true}}"#;
+        std::fs::write(root.join("config.json"), raw).unwrap();
+        let tiers = BTreeMap::from([("opencode".to_string(), ReasoningTier::Medium)]);
+        let planned = store.migrate_model_config(false, &tiers).unwrap();
+        let ModelConfigMigration::Planned { changes, .. } = planned else { panic!("expected plan"); };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(std::fs::read_to_string(root.join("config.json")).unwrap(), raw);
+        assert!(!root.join("config.pre-model-tiers.json").exists());
+        assert!(matches!(store.migrate_model_config(true, &tiers).unwrap(), ModelConfigMigration::Applied { .. }));
+        let written = std::fs::read_to_string(root.join("config.json")).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(saved["backends"]["opencode"]["models"]["medium"], "provider/glm");
+        assert_eq!(saved["backends"]["kiro"]["models"]["small"], "provider/other");
+        assert_eq!(saved["backends"]["opencode"]["agent"], "bridge");
+        assert_eq!(saved["max_sessions"], 7);
+        assert_eq!(saved["custom_extension"]["keep"], true);
+        assert!(saved.get("models").is_none()); assert!(saved.get("agents").is_none());
+        assert_eq!(std::fs::read_to_string(root.join("config.pre-model-tiers.json")).unwrap(), raw);
+        assert!(matches!(store.migrate_model_config(true, &tiers).unwrap(), ModelConfigMigration::Current { .. }));
+        assert_eq!(std::fs::read_to_string(root.join("config.json")).unwrap(), written);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            for file in ["config.json", "config.pre-model-tiers.json"] {
+                assert_eq!(std::fs::metadata(root.join(file)).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_preserves_declared_tiers_existing_models_and_backend_extensions() {
+        let root = temp_root("tier-preserve"); let store = TokenStore::from_root(root.clone());
+        let raw = r#"{"url":"https://hub.test","model":"provider/global","backends":{"opencode":{"model":"provider/sol","reasoning_tier":"large","enabled":false,"projects":["bridge"],"mode":"stdio","bin":"/custom/cli","custom_backend":{"keep":true}},"kiro":{"models":{"medium":"provider/current"},"model":"unused-legacy"}}}"#;
+        std::fs::write(root.join("config.json"), raw).unwrap();
+        let ModelConfigMigration::Applied { changes, .. } = store.migrate_model_config(true, &BTreeMap::new()).unwrap() else { panic!("expected migration"); };
+        assert_eq!(changes.len(), 1); assert_eq!(changes[0].source, MigrationTierSource::Declared);
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved["backends"]["opencode"]["models"]["large"], "provider/sol");
+        assert_eq!(saved["backends"]["opencode"]["enabled"], false);
+        assert_eq!(saved["backends"]["opencode"]["projects"][0], "bridge");
+        assert_eq!(saved["backends"]["opencode"]["mode"], "stdio");
+        assert_eq!(saved["backends"]["opencode"]["bin"], "/custom/cli");
+        assert_eq!(saved["backends"]["opencode"]["custom_backend"]["keep"], true);
+        assert_eq!(saved["backends"]["kiro"]["models"], serde_json::json!({"medium":"provider/current"}));
+        assert!(store.migrate_model_config(true, &BTreeMap::from([("kiro".into(), ReasoningTier::Large)])).unwrap_err().contains("already has tier models"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_never_guesses_tiers_or_overwrites_invalid_or_future_config() {
+        let root = temp_root("tier-invalid"); let store = TokenStore::from_root(root.clone());
+        let raw = r#"{"url":"https://hub.test","model":"name-that-sounds-large","backends":{"opencode":{}}}"#;
+        std::fs::write(root.join("config.json"), raw).unwrap();
+        let ModelConfigMigration::Planned { changes, .. } = store.migrate_model_config(false, &BTreeMap::new()).unwrap() else { panic!("expected plan"); };
+        assert_eq!(changes[0].tier, ReasoningTier::Small);
+        assert_eq!(changes[0].source, MigrationTierSource::LegacyDefault);
+        for raw in ["invalid JSON", r#"{"url":"https://hub.test","backends":{"opencode":{"models":{"huge":"x"}}}}"#, r#"{"url":"https://hub.test","schema_version":999,"model":"x"}"#] {
+            std::fs::write(root.join("config.json"), raw).unwrap();
+            assert!(store.migrate_model_config(true, &BTreeMap::new()).is_err());
+            assert_eq!(std::fs::read_to_string(root.join("config.json")).unwrap(), raw);
+            assert!(!root.join("config.pre-model-tiers.json").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_unconfigured_models_without_fabricating_supply() {
+        let root = temp_root("tier-missing"); let store = TokenStore::from_root(root.clone());
+        let raw = r#"{"url":"https://hub.test","backends":{"opencode":{}}}"#;
+        std::fs::write(root.join("config.json"), raw).unwrap();
+        let ModelConfigMigration::Current { unconfigured } = store.migrate_model_config(true, &BTreeMap::new()).unwrap() else { panic!("expected no migration"); };
+        assert_eq!(unconfigured, vec!["opencode"]);
+        assert!(store.migrate_model_config(true, &BTreeMap::from([("other".into(), ReasoningTier::Medium)])).is_err());
+        assert!(store.migrate_model_config(true, &BTreeMap::from([("opencode".into(), ReasoningTier::Medium)])).is_err());
+        assert_eq!(std::fs::read_to_string(root.join("config.json")).unwrap(), raw);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_migration_preserves_external_credentials_and_normalises_optional_nulls() {
+        guard_real_token(|| {
+            crate::keychain::save_token("bkw_current_credential").unwrap();
+            let root = temp_root("tier-credentials"); let store = TokenStore::from_root(root.clone());
+            let raw = r#"{"url":"https://hub.test","token":"bkw_obsolete_legacy","principal":"device-legacy","backends":{"opencode":{"model":"provider/model","agent":null,"bin":null,"mode":null}}}"#;
+            std::fs::write(root.join("config.json"), raw).unwrap();
+            store.migrate_model_config(true, &BTreeMap::new()).unwrap();
+            assert_eq!(store.load_token(), "bkw_current_credential");
+            assert_eq!(store.principal(), "device-legacy");
+            let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap()).unwrap();
+            assert!(written.get("token").is_none()); assert!(written.get("principal").is_none());
+            for key in ["agent", "bin", "mode"] { assert!(written["backends"]["opencode"].get(key).is_none()); }
+            std::fs::remove_dir_all(root).unwrap();
+        });
     }
 
     /// The real persistent token store must not be disturbed by tests:

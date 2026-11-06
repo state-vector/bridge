@@ -19,6 +19,7 @@ jobs:
       - run: npm ci
       - name: Worker unit tests (kb core) + contracts + webapp build + specs gate
         run: |
+          python3 -m unittest discover -s packages/cli/updater -p 'test_*.py'
           npm run test -w packages/contracts
           npm run test -w packages/worker
           npm run build -w @bridge/webapp

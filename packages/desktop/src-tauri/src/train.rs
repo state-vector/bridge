@@ -50,6 +50,7 @@ use crate::train_gate::{
     TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
@@ -85,6 +86,34 @@ fn classify_login(login: &str, worker_identities: &[String]) -> IdentityClass {
     } else {
         IdentityClass::Personal(login.trim().to_string())
     }
+}
+
+/// BR#4687 (L1.2) branch provenance — pure, unit-pinned. The branch is the
+/// train's own (machine-updatable) iff it is non-empty and EVERY commit was
+/// authored by a worker-class identity. An empty commit list (API hiccup)
+/// fails closed to human-owned: a bounce is the safe direction, a machine
+/// rewrite of an unknown branch is not.
+fn branch_is_worker_authored(commit_logins: &[String], worker_identities: &[String]) -> bool {
+    !commit_logins.is_empty()
+        && commit_logins
+            .iter()
+            .all(|l| matches!(classify_login(l, worker_identities), IdentityClass::Worker(_)))
+}
+
+/// A merge recorded from GitHub may be an intermediate topic merge with no
+/// main-push CI of its own. Only a proven containing live tip can settle it.
+fn settle_from_descendant_ci(proven_descendant: bool, runs: &[MainCheckRun], required: &[String]) -> bool {
+    if !proven_descendant || required.is_empty() || !runs.iter().all(|r| r.status.as_deref() == Some("completed")) {
+        return false;
+    }
+    let required_run = |r: &MainCheckRun| required.iter().any(|n| n == &r.name);
+    if runs.iter().any(|r| required_run(r) && matches!(r.conclusion.as_deref(), Some("failure" | "timed_out" | "action_required"))) {
+        return false;
+    }
+    runs.is_empty()
+        || runs.iter().any(|r| required_run(r) && r.conclusion.as_deref() == Some("cancelled"))
+        || !runs.iter().any(required_run)
+        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure"))
 }
 
 /// "detached-cody, rayh" → ["detached-cody", "rayh"] — trimmed, lowercased.
@@ -596,7 +625,7 @@ impl Ctx {
                 "api",
                 &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"),
                 "--jq",
-                "[.check_runs[] | {id, name, status, conclusion, html_url}]",
+                "[.check_runs[] | {id, name, status, conclusion, html_url, check_suite, app}]",
             ]);
             match out {
                 Ok(Value::Array(a)) => {
@@ -625,7 +654,7 @@ impl Ctx {
             "api",
             &format!("repos/{repo}/actions/runs?head_sha={sha}&per_page=100"),
             "--jq",
-            "[.workflow_runs[] | {id, name, status, conclusion, html_url}]",
+            "[.workflow_runs[] | {id, name, status, conclusion, html_url, workflow_id, run_attempt}]",
         ]) {
             runs.extend(workflow_startup_failures(&wf_runs));
         }
@@ -709,6 +738,24 @@ impl Ctx {
                         c.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
                     )
                 })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
+    /// commit on the PR head. The pulls API resolves the commit email to the
+    /// owning account (`author.login`; null when the email maps to no
+    /// account). Worker-authored = every commit's login on the worker
+    /// allowlist; anything else (a human's login, an unlinked email) fails
+    /// closed to human-owned — the train never machine-updates a branch it
+    /// cannot prove is its own fleet's.
+    fn pr_commit_logins(&self, repo: &str, n: i64) -> Vec<String> {
+        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {login: (.author.login // \"\")}]"]);
+        match out {
+            Ok(Value::Array(a)) => a
+                .iter()
+                .map(|c| c.get("login").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
                 .collect(),
             _ => vec![],
         }
@@ -830,6 +877,12 @@ impl Ctx {
     /// merge arm fails the tick closed; the awaiting-CI reconcile defers to
     /// its live pr_facts double-check.
     fn is_ancestor(&self, a: &str, b: &str) -> Result<bool, String> {
+        #[cfg(test)]
+        if let Some(mock) = &self.sh_mock {
+            if let Some(result) = mock("git", &["merge-base", "--is-ancestor", a, b]) {
+                return result.map(|value| value.trim() != "false");
+            }
+        }
         let out = Command::new("git")
             .args(["merge-base", "--is-ancestor", a, b])
             .current_dir(&self.workdir)
@@ -860,6 +913,10 @@ fn check_runs_from_pages(pages: &[Option<Vec<Value>>]) -> Vec<MainCheckRun> {
         };
         runs.extend(arr.iter().map(|r| MainCheckRun {
             id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            source: match r.pointer("/check_suite/id").and_then(Value::as_i64).filter(|id| *id > 0) {
+                Some(suite_id) => crate::train_gate::CheckSource::CheckRun { suite_id, app_id: r.pointer("/app/id").and_then(Value::as_i64).unwrap_or(0) },
+                None => crate::train_gate::CheckSource::Unknown,
+            },
             name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             status: r.get("status").and_then(|v| v.as_str()).map(String::from),
             conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
@@ -881,6 +938,10 @@ fn workflow_startup_failures(wf_runs: &[Value]) -> Vec<MainCheckRun> {
         }
         let item = MainCheckRun {
             id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            source: match r.get("workflow_id").and_then(Value::as_i64).filter(|id| *id > 0) {
+                Some(workflow_id) => crate::train_gate::CheckSource::WorkflowRun { workflow_id, run_attempt: r.get("run_attempt").and_then(Value::as_u64).unwrap_or(1) },
+                None => crate::train_gate::CheckSource::Unknown,
+            },
             name: name.clone(),
             status: r.get("status").and_then(|v| v.as_str()).map(String::from),
             conclusion: r.get("conclusion").and_then(|v| v.as_str()).map(String::from),
@@ -903,6 +964,71 @@ fn workflow_startup_failures(wf_runs: &[Value]) -> Vec<MainCheckRun> {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CheckRetryTarget {
+    CheckRun { id: i64 },
+    ActionsJob { id: i64 },
+    WorkflowRun { id: i64 },
+}
+
+impl CheckRetryTarget {
+    fn endpoint(&self, repo: &str) -> String {
+        match self {
+            Self::CheckRun { id } => format!("repos/{repo}/check-runs/{id}/rerequest"),
+            Self::ActionsJob { id } => format!("repos/{repo}/actions/jobs/{id}/rerun"),
+            Self::WorkflowRun { id } => format!("repos/{repo}/actions/runs/{id}/rerun"),
+        }
+    }
+}
+
+fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget, String> {
+    use crate::train_gate::CheckSource;
+    if run.id <= 0 { return Err("Cannot retry a check without a positive GitHub id".into()); }
+    match &run.source {
+        CheckSource::Unknown => Err("Cannot retry an untyped observation; refresh GitHub source identity".into()),
+        CheckSource::WorkflowRun { .. } => Ok(CheckRetryTarget::WorkflowRun { id: run.id }),
+        CheckSource::CheckRun { .. } => {
+            // The Actions job id is not the Checks API id. Read the job's
+            // explicit GitHub URL, scoped to this repository; never guess.
+            let prefix = format!("https://github.com/{repo}/actions/runs/");
+            if let Some(path) = run.html_url.as_deref().and_then(|url| url.strip_prefix(&prefix)) {
+                let parts: Vec<_> = path.split('/').collect();
+                if parts.len() == 3 && parts[1] == "job" {
+                    if let (Ok(workflow), Ok(job)) = (parts[0].parse::<i64>(), parts[2].parse::<i64>()) {
+                        if workflow > 0 && job > 0 { return Ok(CheckRetryTarget::ActionsJob { id: job }); }
+                    }
+                }
+                return Err("Actions check URL does not identify a dispatchable job".into());
+            }
+            if run.html_url.as_deref().is_some_and(|url| url.contains("/actions/runs/")) {
+                return Err("Actions job URL belongs to a different repository".into());
+            }
+            Ok(CheckRetryTarget::CheckRun { id: run.id })
+        }
+    }
+}
+
+fn dispatch_check_retry(ctx: &mut Ctx, repo: &str, base: &str, task: &str, head: &str, run: &MainCheckRun) -> Result<(), String> {
+    let target = check_retry_target(repo, run)?;
+    let reservation = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "check_retry": {
+        "kind": "reserve", "task_id": task, "head_sha": head, "name": run.name, "source": run.source, "target": target,
+    } }))?;
+    if reservation.get("kind").and_then(Value::as_str) != Some("reserved") {
+        return Err(format!("Retry budget consumed for this head/obligation: {}", reservation));
+    }
+    let key = reservation.get("key").and_then(Value::as_str).ok_or("Retry reservation missing key")?;
+    let endpoint = target.endpoint(repo);
+    let result = ctx.sh("gh", &["api", &endpoint, "-X", "POST"]);
+    // A lost response is an unknown effect, never permission to repeat. The
+    // durable prepared reservation already fences restarts and lease takeovers.
+    ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "check_retry": {
+        "kind": "result", "key": key, "outcome": if result.is_ok() { "dispatched" } else { "outcome_unknown" },
+        "receipt": match &result { Ok(_) => endpoint.clone(), Err(e) => e.clone() },
+    } }))?;
+    result.map(|_| ())
+}
+
 fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
     let mut out = Vec::new();
     for r in wf_runs {
@@ -914,6 +1040,7 @@ fn parse_deploy_workflow_runs(wf_runs: &[Value]) -> Vec<DeployWorkflowRun> {
         }
         out.push(DeployWorkflowRun {
             id,
+            run_attempt: r.get("run_attempt").and_then(|v| v.as_i64()),
             name,
             path: r.get("path").and_then(|v| v.as_str()).map(String::from),
             head_sha,
@@ -983,12 +1110,14 @@ fn release_if_idle(ctx: &mut Ctx, key: &str, repo: &str, base: &str) -> Result<(
 /// remaining allowed methods (squash first), loud, and land the member.
 /// The working method is remembered per-repo for the process so the batch's
 /// next members go straight to it (no wasted refusal per member).
-fn method_fallback_merge(ctx: &mut Ctx, key: &str, repo: &str, pr: i64, refused_err: &str) -> Result<(), String> {
+fn method_fallback_merge(ctx: &mut Ctx, key: &str, repo: &str, base: &str, pr: i64, head_sha: &str, refused_err: &str) -> Result<(), String> {
     let configured = ctx.method.clone();
     let candidates = merge_fallback_candidates(&configured, refused_merge_method(refused_err), true);
+    let allowed = effective_merge_methods(ctx, repo, base)?;
     let mut last: Option<String> = None;
     for m in candidates {
-        match ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag_for(&m)]) {
+        if !allowed.iter().any(|method| method.name() == m) { continue; }
+        match ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag_for(&m), "--match-head-commit", head_sha]) {
             Ok(_) => {
                 ctx.note(&format!(
                     "merge-method fallback: repo refuses {} — landed PR #{pr} as {} (if unintended, check the repo/org merge-commit policy)",
@@ -1169,11 +1298,20 @@ fn stall_next(
 }
 
 /// BR#5376: does this gh refusal name a MERGE METHOD the repo disallows?
-/// GitHub's mergePullRequest answers "Merge commits are not allowed on this
-/// repository." (squash/rebase variants exist) — that phrase is specific to
-/// the merge-method policy; every other refusal is NOT a method mismatch.
+/// Two eras of the same repo-policy refusal, both method mismatches:
+/// - the classic repo-settings GraphQL answer "Merge commits are not allowed
+///   on this repository." (squash/rebase variants exist), and
+/// - the ruleset-era REST/gh answer "the base branch policy prohibits the
+///   merge." (BR#6442/BR#6673: ruleset 24656303 "main: signed commits and
+///   PRs" pins allowed_merge_methods to squash+rebase with no bypass, so
+///   every `gh pr merge --merge` attempt is refused with that text — the
+///   sp@main lane read fake-busy 22h+ while the queue starved because the
+///   fallback never fired on this string).
+/// Every other refusal is NOT a method mismatch.
 fn is_merge_method_refusal(err: &str) -> bool {
-    err.to_lowercase().contains("not allowed on this repository")
+    let low = err.to_lowercase();
+    low.contains("not allowed on this repository")
+        || low.contains("base branch policy prohibits the merge")
 }
 
 /// Which merge method did the refusal name? (Drives the fallback's skip.)
@@ -1210,6 +1348,59 @@ fn method_flag_for(m: &str) -> &'static str {
         "rebase" => "--rebase",
         _ => "--merge",
     }
+}
+
+/// Effective branch rules can forbid a method even when the repository's
+/// allow_merge_commit flag is true. Read policy BEFORE writing: gh's generic
+/// "base branch policy prohibits the merge" does not identify a method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergeMethod {
+    Squash,
+    Rebase,
+    Merge,
+}
+
+impl MergeMethod {
+    fn name(self) -> &'static str {
+        match self { Self::Squash => "squash", Self::Rebase => "rebase", Self::Merge => "merge" }
+    }
+}
+
+fn policy_merge_methods(repo: &Value, rules: &Value, preferred: &str) -> Result<Vec<MergeMethod>, String> {
+    let rules = rules.as_array().ok_or("Cannot read effective branch merge rules; holding merges")?;
+    let mut allowed = vec![MergeMethod::Squash, MergeMethod::Rebase, MergeMethod::Merge];
+    for (method, flag) in [(MergeMethod::Squash, "allow_squash_merge"), (MergeMethod::Rebase, "allow_rebase_merge"), (MergeMethod::Merge, "allow_merge_commit")] {
+        let enabled = repo.get(flag).and_then(Value::as_bool).ok_or_else(|| format!("Cannot read repository {flag}; holding merges"))?;
+        if !enabled { allowed.retain(|m| *m != method); }
+    }
+    for rule in rules {
+        match vstr(rule, "type") {
+            Some("required_linear_history") => allowed.retain(|m| *m != MergeMethod::Merge),
+            Some("pull_request") => {
+                if let Some(methods) = rule.pointer("/parameters/allowed_merge_methods") {
+                    let methods = methods.as_array().ok_or("Cannot read allowed_merge_methods; holding merges")?;
+                    allowed.retain(|m| methods.iter().any(|v| v.as_str() == Some(m.name())));
+                }
+            }
+            _ => {}
+        }
+    }
+    if allowed.is_empty() { return Err("No merge method satisfies the repository and effective branch rules; holding merges".into()); }
+    // Honour configuration only within the policy intersection. Squash is
+    // the first alternative, never an implicit admin/policy bypass.
+    allowed.sort_by_key(|m| usize::from(m.name() != preferred));
+    Ok(allowed)
+}
+
+fn effective_merge_methods(ctx: &Ctx, repo: &str, base: &str) -> Result<Vec<MergeMethod>, String> {
+    let settings = ctx.gh_json(&["api", &format!("repos/{repo}")])?;
+    let branch: String = base.bytes().map(|b| {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() }
+        else { format!("%{b:02X}") }
+    }).collect();
+    let rules = ctx.gh_json(&["api", &format!("repos/{repo}/rules/branches/{branch}")])?;
+    let preferred = ctx.method_sub.get(repo).unwrap_or(&ctx.method);
+    policy_merge_methods(&settings, &rules, preferred)
 }
 
 /// BR#5252 — the merge-refusal fallback's decision law, pure so the fixture
@@ -1351,11 +1542,42 @@ fn root_fix_head_under_stop(lane: &Value) -> bool {
 struct BatchCandidate {
     qi: usize,
     head_id: String,
-    leg: crate::train_gate::TrainLeg,
-    leg_number: usize,
     pr: i64,
     head_sha: String,
     root_fix: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IntegrationAdmission {
+    Current,
+    AwaitingCi { base_sha: String, head_sha: String },
+    RepairDispatched,
+}
+
+fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate) -> Result<IntegrationAdmission, String> {
+    let pr = cand.pr;
+    let head = cand.head_sha.as_str();
+    ctx.fetch_pr_head(pr)?;
+    ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
+    let base_sha = ctx.sh("git", &["rev-parse", &format!("origin/{base}")])?.trim().to_string();
+    if ctx.is_ancestor(&base_sha, head)? { return Ok(IntegrationAdmission::Current); }
+    renew_lease(ctx, repo, base);
+    let owned = branch_is_worker_authored(&ctx.pr_commit_logins(repo, pr), &ctx.worker_identities);
+    let (clean, files) = ctx.trial_merge(base, head)?;
+    if !clean || !owned {
+        ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr,
+            "task_id": cand.head_id, "head_sha": head, "bounce_kind": if clean { "gate" } else { "conflict" },
+            "conflict_files": files, "reason": if clean {
+                "Candidate has not been tested against current base; branch is not worker-authored. Repair executor must integrate current base and re-run CI."
+            } else { "Current-base integration conflicts; resolve the named files and run fresh CI." } }))?;
+        return Ok(IntegrationAdmission::RepairDispatched);
+    }
+    ctx.sh("gh", &["api", &format!("repos/{repo}/pulls/{pr}/update-branch"), "-X", "PUT", "-f", &format!("expected_head_sha={head}")])?;
+    let updated = ctx.pr_facts(repo, pr)?;
+    let to_head = vstr(&updated, "headRefOid").ok_or("Updated branch has no readable head")?;
+    if to_head == head { return Err("Branch update accepted but new head not yet observable; hold for fresh CI".into()); }
+    ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head, "to_head": to_head }))?;
+    Ok(IntegrationAdmission::AwaitingCi { base_sha, head_sha: to_head.into() })
 }
 
 // ---- BR#5633: the Awaiting-park sweep ---------------------------------
@@ -1652,6 +1874,22 @@ fn reconcile_base_deploy(
         return build_base_state(base_class, required, pass_merged);
     }
     let wf_runs = ctx.workflow_runs(repo, base, tip_sha);
+    // Observation is not a merger action. Keep the hub's durable recovery
+    // proof current on every normal base probe, including matching reruns.
+    if pass_merged == 0 && tip_sha.len() == 40 {
+        let reportable: Vec<&DeployWorkflowRun> = wf_runs.iter().filter(|r|
+            crate::train_gate::is_deploy_workflow_run(r, required) && r.head_sha.len() == 40 && r.html_url.is_some()
+        ).collect();
+        if reportable.iter().any(|r| r.head_sha == tip_sha) {
+            if let Err(e) = ctx.mcp("train_observe_deploy", json!({ "repo": repo, "base": base,
+                "observation": { "tip_sha": tip_sha, "observed_at": now_ms(), "runs": reportable } })) {
+                // 600 chars keeps the zod issue's `path` + `message` visible —
+                // 200 cut the error inside the enum values list and hid the
+                // failing field entirely during the 2026-11-05 incident.
+                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 600)));
+            }
+        }
+    }
     let auto_key = format!("{key}:{tip_sha}");
     let manual_redispatch = lane.get("dispatch_deploy").filter(|v| !v.is_null()).is_some();
     let hub_dispatched_at = if manual_redispatch {
@@ -1727,6 +1965,31 @@ fn reconcile_base_deploy(
     }
     *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
     build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
+}
+
+fn request_main_recovery_retry(ctx: &mut Ctx, lane: &Value, repo: &str, base: &str, head: &str) -> Option<Value> {
+    let episodes = lane.pointer("/line/recoveries").and_then(Value::as_array)?;
+    for view in episodes {
+        let episode = view.get("episode")?;
+        if vstr(episode, "head_sha") != Some(head) { continue; }
+        let cause: crate::train_gate::RecoveryCause = serde_json::from_value(episode.get("cause")?.clone()).ok()?;
+        if !matches!(cause, crate::train_gate::RecoveryCause::CheckFailure { .. }) { continue; }
+        let stage = episode.get("stage")?;
+        if !matches!(vstr(stage, "phase"), Some("diagnosing" | "repairing")) { continue; }
+        let task = vstr(stage, "task_id")?;
+        let attempt_id = format!("auto-main-retry:{head}");
+        let command = json!({ "repo": repo, "base": base, "head_sha": head, "cause": cause,
+            "event_id": format!("retry-request:{head}:{}", vstr(episode, "id").unwrap_or("")),
+            "event": { "kind": "attempt_started", "task_id": task, "attempt_id": attempt_id,
+                "attempt_kind": "retry", "action": "Re-run failed required workflows on main once",
+                "next": "Read the actual rerun result; repeated failure requires diagnosis and repair" } });
+        match ctx.mcp("train_recovery_event", command.clone()) {
+            Ok(result) if result.get("authorized").and_then(Value::as_bool) == Some(true) => return Some(command),
+            Ok(_) => log(None, "main retry not authorized: durable recovery budget or replay guard owns the next action"),
+            Err(e) => log(None, &format!("main retry withheld: no durable authorization ({})", trunc(&e, 160))),
+        }
+    }
+    None
 }
 
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
@@ -1820,14 +2083,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // open: land it out of turn with the BR#5376 method fallback
                 // (squash → rebase → merge, remembered per repo) — a policy
                 // mismatch must ride the landing path, not loop.
-                let mut methods: Vec<String> = vec![
-                    ctx.method_sub.get(repo).cloned().unwrap_or_else(|| ctx.method.clone()),
-                ];
-                for alt in ["squash", "rebase", "merge"] {
-                    if !methods.iter().any(|m| m == alt) {
-                        methods.push(alt.to_string());
-                    }
-                }
+                let methods: Vec<String> = effective_merge_methods(ctx, repo, base)?.iter().map(|m| m.name().to_string()).collect();
                 let mut landed_sha: Option<String> = None;
                 let mut refusal: Option<String> = None;
                 ctx.tick_attempted = true;
@@ -1975,13 +2231,27 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             let auto_key = format!("{key}:{base_sha}");
             if v.verdict == MainVerdict::Red && !has_bisect && !rerun_requested && !base_sha.is_empty() && !ctx.auto_rerun_shas.contains(&auto_key) {
                 ctx.auto_rerun_shas.insert(auto_key);
+                let retry = request_main_recovery_retry(ctx, lane, repo, base, &base_sha);
                 let mut auto_rerun_ok = 0usize;
+                let mut seen_run_ids = HashSet::new();
                 for r in &v.red {
+                    if retry.is_none() { break; }
                     if let Some(run_id) = extract_actions_run_id(&r.url) {
+                        if !seen_run_ids.insert(run_id.clone()) { continue; }
                         if ctx.sh("gh", &["run", "rerun", &run_id.to_string(), "--repo", repo]).is_ok() {
                             auto_rerun_ok += 1;
                         }
                     }
+                }
+                if let Some(mut command) = retry {
+                    let attempt_id = command.pointer("/event/attempt_id").cloned().unwrap_or(Value::Null);
+                    let task_id = command.pointer("/event/task_id").cloned().unwrap_or(Value::Null);
+                    command["event_id"] = json!(format!("auto-retry-result:{base_sha}"));
+                    command["event"] = json!({ "kind": "attempt_finished", "task_id": task_id, "attempt_id": attempt_id,
+                        "outcome": if auto_rerun_ok > 0 { "delivered" } else { "failed" },
+                        "summary": format!("Dispatched {auto_rerun_ok} required-workflow rerun(s); recovery not yet verified"),
+                        "receipts": [], "next": "Observe the actual workflow result; diagnose and repair if the same cause remains" });
+                    if let Err(e) = ctx.mcp("train_recovery_event", command) { log(Some(key), &format!("recovery outcome recording failed: {}", trunc(&e, 200))); }
                 }
                 if auto_rerun_ok > 0 {
                     log(Some(key), &format!("self-heal: auto-dispatched rerun for {auto_rerun_ok} failing required workflow(s) on stopped tip {}", &base_sha[..base_sha.len().min(9)]));
@@ -2077,12 +2347,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // or missing/startup_failure required runs (superseded because a hotfix
                 // live_base_sha was pushed on top of merge_sha), judge the settle from
                 // live_base_sha's runs instead of hanging on merge_sha.
-                let merge_all_done = !runs.is_empty() && runs.iter().all(|r| r.status.as_deref() == Some("completed"));
-                let merge_req_cancelled = runs.iter().any(|r| required.iter().any(|n| n == &r.name) && r.conclusion.as_deref() == Some("cancelled"));
-                let merge_req_missing_or_startup_fail = !required.is_empty()
-                    && (!runs.iter().any(|r| required.iter().any(|n| n == &r.name))
-                        || runs.iter().any(|r| r.conclusion.as_deref() == Some("startup_failure")));
-                if live_base_sha != merge_sha && merge_all_done && (merge_req_cancelled || merge_req_missing_or_startup_fail) {
+                let proven_descendant = live_base_sha != merge_sha && ctx.is_ancestor(&merge_sha, &live_base_sha).unwrap_or(false);
+                if settle_from_descendant_ci(proven_descendant, &runs, &required) {
                     runs = live_runs;
                 }
             }
@@ -2489,6 +2755,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // the mid-drain forced green (a stale gate re-run must rest on the
         // gate's own predicate, not on the burst's pass-green fiction).
         let base_gate_green = base_class.verdict == MainVerdict::Green && base_class.gate.is_none();
+        // BR#4687 (L1.2): branch provenance for the behind pre-clear — the
+        // PR's commit author logins against the worker allowlist. One extra
+        // read-only gh call, fetched only when the state could be behind
+        // (the only provenance-sensitive state) to keep the common tick's
+        // gh budget unchanged.
+        let merge_state = vstr(&facts, "mergeStateStatus").unwrap_or("").to_lowercase();
+        let train_owned_branch = if merge_state == "behind" {
+            let logins = ctx.pr_commit_logins(repo, pr);
+            let owned = branch_is_worker_authored(&logins, &ctx.worker_identities);
+            if !owned {
+                log(
+                    Some(key),
+                    &format!(
+                        "PR #{pr} is behind but NOT worker-authored ({} commit author(s)) — the bounce goes to its owner; the train does not move human branches",
+                        logins.len()
+                    ),
+                );
+            }
+            owned
+        } else {
+            false
+        };
         let gate = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: pr,
             head_sha: &head_sha,
@@ -2503,6 +2791,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             root_fix,
             base_red_names: &base_red_names,
             base_gate_green,
+            train_owned_branch,
         });
         // BR#6348: a car ALREADY parked TYPED conflicting is a clock, not a
         // bounce. The hub's conflict bounce parks it (merge_train.state =
@@ -2553,6 +2842,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     // BR#5883 field encodes (RerunGate ≠ Merge, so the
                     // ready_on_own_head predicate reads identically either way)
                     base_gate_green: true,
+                    train_owned_branch,
                 }),
                 MergeAction::Merge { .. }
             )
@@ -2580,6 +2870,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));
+        let head_verdict = crate::train_gate::classify_head_checks(&head_checks);
+        if matches!(&gate, MergeAction::Note { .. }) && !head_verdict.red.is_empty() {
+            qfacts.last_mut().unwrap()["repair"] = json!({ "kind": "head_checks", "head_sha": head_sha,
+                "checks": head_verdict.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>() });
+        }
+        if matches!(&gate, MergeAction::Note { .. }) && head_verdict.red.is_empty() && merge_state == "blocked" {
+            qfacts.last_mut().unwrap()["repair"] = json!({ "kind": "head_checks", "head_sha": head_sha,
+                "checks": [{ "name": "GitHub branch policy remains BLOCKED", "url": format!("https://github.com/{repo}/pull/{pr}") }] });
+        }
 
         // ONE write action per tick (strict serialization): a Bounce /
         // HumanLeg / CloseSuperseded fires ON SIGHT and the walk ends — the
@@ -2635,12 +2934,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         // dispatched, escalated: error-level log + a
                         // self_heal_stalled stamp on this entry's queue_facts
                         // (the hub panel and the starvation duty read it).
-                        let attempt = ctx
-                            .sh("gh", &["api", &format!("repos/{repo}/check-runs/{}/rerequest", r.id), "-X", "POST"])
-                            .or_else(|check_err| {
-                                ctx.sh("gh", &["api", &format!("repos/{repo}/actions/jobs/{}/rerun", r.id), "-X", "POST"])
-                                    .map_err(|job_err| format!("check-runs rerequest: {check_err}; actions rerun: {job_err}"))
-                            });
+                        let attempt = dispatch_check_retry(ctx, repo, base, &head_id, &head_sha, r);
                         match attempt {
                             Ok(_) => dispatched += 1,
                             Err(e) => last_err = Some(trunc(&e, 240)),
@@ -2660,6 +2954,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         // whole-row stalled field).
                         if let Some(entry) = qfacts.last_mut() {
                             entry.as_object_mut().map(|o| o.insert("self_heal_stalled".into(), fact.clone()));
+                            entry["repair"] = json!({ "kind": "head_checks", "head_sha": head_sha,
+                                "checks": stale.iter().map(|r| json!({ "name": r.name, "url": r.html_url.clone().unwrap_or_default() })).collect::<Vec<_>>() });
                         }
                         let err_note = last_err.as_deref().unwrap_or("(no run resolved — dispatch set was empty against a red verdict)");
                         ctx.note(&format!("SELF-HEAL STALLED on PR #{pr}: classified healable red(s), dispatched 0 — {err_note}"));
@@ -2795,8 +3091,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 candidates.push(BatchCandidate {
                     qi,
                     head_id: head_id.clone(),
-                    leg: leg.clone(),
-                    leg_number,
                     pr,
                     head_sha: head_sha.clone(),
                     root_fix,
@@ -2930,6 +3224,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // hub sanitizes it; do.ts).
     let batch_prs: Vec<i64> = batch.iter().map(|&i| candidates[i].pr).collect();
     ctx.tick_batch = batch_prs.clone();
+    if !batch.is_empty() {
+        let allowed_methods = effective_merge_methods(ctx, repo, base)?;
+        let selected_method = allowed_methods[0].name();
+        ctx.method_sub.insert(repo.to_string(), selected_method.to_string());
+    }
     for (bi, &ci) in batch.iter().enumerate() {
         let cand = &candidates[ci];
         let head_id = cand.head_id.as_str();
@@ -2959,16 +3258,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
         }
-        // ---- the merge leg (Ray, 2026-10-30: "if it's still mergeable, go
-        // (squash merges). We only need a rebase if there are conflicts") ----
-        // The gate passed mergeable=true, so NO proactive update-branch — no
-        // machine push, no PR-branch CI cycle, no extra tick. Conflicts never
-        // reach the merge leg: the gate bounces CONFLICTING with a trial-merge
-        // file list first (impl rebases, re-verify, re-queue at the back).
-        // The machine update-branch survives ONLY as the
-        // strict-branch-protection fallback: repos that refuse to merge an
-        // out-of-date branch get ONE machine update-branch (verdict carries,
-        // BR#3516 §5) and the batch's landed prefix settles (BR#4996).
+        // Current-base admission (BR#6776): file-clean is not compile-clean.
+        // A stale car integrated against newer contracts caused the E0063
+        // main-red. Carry the substance verdict across a clean base update,
+        // but never carry CI: the integrated head must run its actual checks.
+        // Re-evaluate for EACH member, including after this pass advanced base.
+        match admit_current_base(ctx, repo, base, cand)? {
+            IntegrationAdmission::Current => {},
+            IntegrationAdmission::RepairDispatched => break,
+            IntegrationAdmission::AwaitingCi { base_sha, head_sha: integrated_head } => {
+                for entry in &mut qfacts {
+                    if entry.get("id").and_then(Value::as_str) == Some(cand.head_id.as_str()) {
+                        entry["cls"] = json!("waiting");
+                        entry["integration"] = json!({ "phase": "awaiting_ci", "base_sha": base_sha, "head_sha": integrated_head });
+                    }
+                }
+                ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }))?;
+                log(Some(key), &format!("PR #{pr}: current base integrated; substance verdict carried, fresh integrated-head CI required"));
+                break;
+            }
+        }
         renew_lease(ctx, repo, base);
         // BR#5376: a remembered working method (the repo refused the
         // configured one earlier) goes straight there — no wasted refusal
@@ -2978,9 +3287,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             None => method_flag_for(&ctx.method),
         };
         ctx.tick_attempted = true;
-        let mut merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+        let mut merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
         if merge_res.is_err() && cand.root_fix {
-            if let Ok(out) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin"]) {
+            if let Ok(out) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin", "--match-head-commit", head_sha]) {
                 merge_res = Ok(out);
             }
         }
@@ -3001,7 +3310,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 renew_lease(ctx, repo, base);
                 std::thread::sleep(Duration::from_secs(wait_secs));
                 renew_lease(ctx, repo, base);
-                merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag]);
+                merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
             }
         }
         if let Err(err) = merge_res {
@@ -3089,7 +3398,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // method (squash first — Ray's 2026-10-30 law) and LAND the
             // member; the refusal that precedes it is the episode's receipt.
             if is_merge_method_refusal(&err) {
-                match method_fallback_merge(ctx, key, repo, pr, &err) {
+                match method_fallback_merge(ctx, key, repo, base, pr, head_sha, &err) {
                     Ok(()) => {
                         // landed via the fallback — control falls through to
                         // the post-merge verification below.
@@ -3444,7 +3753,7 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, r
                         if !seen.insert(r.name.clone()) {
                             continue; // newest run per name only
                         }
-                        let ok = ctx.sh("gh", &["api", &format!("repos/{}/check-runs/{}/rerequest", repo, r.id), "-X", "POST"]).is_ok();
+                        let ok = dispatch_check_retry(ctx, repo, base, &task, &sha, r).is_ok();
                         if ok {
                             dispatched += 1;
                         }
@@ -3823,7 +4132,7 @@ impl DaemonTrainConfig {
 /// seconds — the dispatch loop must not stall behind it), and NEVER kills its
 /// host: panics are caught per tick, auth failures rebuild the pairing, and
 /// errors just log — the 5-minute lease TTL is the designed fail-closed.
-pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::sync::Arc<AtomicBool>) {
+pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::sync::Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
     let cfg = DaemonTrainConfig::from_runner(hub, token, label);
     if !cfg.enabled {
         emit(
@@ -3831,7 +4140,7 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
             "",
             "gateway train leg disabled (MERGE_TRAIN_ENABLED=0) — not spawning",
         );
-        return;
+        return None;
     }
     // BR#4806: the event-driven wake leg (best-effort; spawn failure or
     // MERGE_TRAIN_EVENTS=0 leaves the daemon poll-only — today's behaviour)
@@ -3841,12 +4150,9 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
         emit("train", "", "train wake leg disabled (MERGE_TRAIN_EVENTS=0) — poll cadence only");
     }
     let spawned = std::thread::Builder::new().name("merge-train".into()).spawn(move || daemon_loop(cfg, stop));
-    if let Err(e) = spawned {
-        emit(
-            "train",
-            "",
-            &format!("failed to spawn gateway train leg: {e}"),
-        );
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => { emit("train", "", &format!("failed to spawn gateway train leg: {e}")); None }
     }
 }
 
@@ -4315,7 +4621,18 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
             }
             Err(e) => return Err(e),
         };
-        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
+        // BR#6384: the merged feed rides ADDITIVELY beside the open list —
+        // best-effort by construction (a gh failure here shrinks the report
+        // to the open feed alone and can never fail the pass; the observed-
+        // merge close just waits for the next cycle).
+        let merged_rows = ctx
+            .gh_json(&[
+                "pr", "list", "--repo", &repo, "--state", "merged", "--limit", "50",
+                "--json", "number,title,state,mergeCommit,headRefOid,headRefName,updatedAt",
+            ])
+            .unwrap_or(Value::Array(Vec::new()));
+        let payload = concat_pr_rows(&pr_payload(&rows), &merged_rows);
+        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": payload }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         lines.push(format!("[reconcile] {repo}: {line}{}", if ok { String::new() } else { " — ALARM routed to the sink".to_string() }));
@@ -4330,6 +4647,74 @@ fn pr_payload(rows: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().filter(|r| r.is_object()).cloned().collect()),
         _ => Value::Array(Vec::new()),
     }
+}
+
+/// BR#6384 — the merge-state classifier for a pr_merged probe (pure —
+/// unit-testable). MERGED with a citable mergeCommit is Satisfied (the
+/// mergeCommit rides head_sha — for the merge atom the merge IS the awaited
+/// fact, so the hub's expected-head law is inert: pr_merged probes carry
+/// expected_head NULL by construction); CLOSED is the conclusive no (the
+/// wait can provably never fire — the hub stamps an honest negative,
+/// fail-closed BR#3409); OPEN — and a "MERGED" row with a junk sha, which
+/// names no citable receipt — stays transient.
+fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeVerdict {
+    match state.to_ascii_uppercase().as_str() {
+        "MERGED" => {
+            let sha = merge_commit.trim().to_ascii_lowercase();
+            let citable = sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit());
+            if citable {
+                ProbeVerdict::Satisfied {
+                    receipt: url.to_string(),
+                    head_sha: sha,
+                    conclusion: "merged".into(),
+                }
+            } else {
+                ProbeVerdict::Transient {
+                    error: "PR reads MERGED but carries no citable mergeCommit — no receipt, park stands".into(),
+                }
+            }
+        }
+        "CLOSED" => ProbeVerdict::Conclusive {
+            error: "PR state CLOSED — unmerged; the wait can provably never fire".into(),
+            receipt: url.to_string(),
+            conclusion: "closed".into(),
+        },
+        _ => ProbeVerdict::Transient { error: format!("PR state {state:?} — not merged yet") },
+    }
+}
+
+/// BR#6384 — the merged feed is ADDITIVE: the open list stays the source of
+/// record and the merged rows append beside it (each carrying state MERGED +
+/// mergeCommit), so the hub's observed-merge close sees out-of-band merges
+/// without redefining what an open PR is. Junk drops (non-objects, invalid
+/// numbers, non-MERGED rows — the daemon never ships garbage it can see),
+/// and gh's mergeCommit OBJECT shape flattens to the oid STRING the hub's
+/// row contract names. Pure; best-effort by construction — an upstream
+/// failure leaves the caller feeding the open feed alone.
+fn concat_pr_rows(open: &Value, merged: &Value) -> Value {
+    let mut out: Vec<Value> = match open {
+        Value::Array(a) => a.iter().filter(|r| r.is_object()).cloned().collect(),
+        _ => Vec::new(),
+    };
+    if let Value::Array(a) = merged {
+        for r in a {
+            let number = r.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+            let merged_row = r.is_object()
+                && number > 0
+                && vstr(r, "state").map(|s| s.eq_ignore_ascii_case("MERGED")).unwrap_or(false);
+            if !merged_row {
+                continue;
+            }
+            let mut row = r.clone();
+            // gh emits mergeCommit as {"oid": "<sha>"} — flatten to the
+            // string the hub's normalizePr contract reads.
+            if let Some(oid) = r.pointer("/mergeCommit/oid").and_then(|v| v.as_str()) {
+                row["mergeCommit"] = json!(oid);
+            }
+            out.push(row);
+        }
+    }
+    Value::Array(out)
 }
 
 // ===========================================================================
@@ -4402,11 +4787,21 @@ fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
 /// pr_checks_green: gh's statusCheckRollup reflects the PR's CURRENT head
 /// (head-consistency by construction). SUCCESS/NEUTRAL/SKIPPED don't block;
 /// the terminal-failure classes are conclusive; everything else is pending.
+/// BR#6568: failing checks whose NAME matches MERGE_EXEMPT_CHECK_PATTERNS
+/// (BR#2267 mechanism, BR#6001 list — the same law the head gate applies via
+/// classify_head_checks) route into a NON-BLOCKING external bucket: the
+/// verdict still names the exempt external in its conclusion (the receipt
+/// stays the GitHub checks URL per the BR#4658 evidence contract), but it
+/// SATISFIES the probe — a degraded Superpositional flow runner must not
+/// park a typed pr_checks_green await (live: PR state-vector/bridge#323,
+/// BR#4694). A REQUIRED (non-exempt) check failing still stamps negative,
+/// and any pending check still stays transient (fail-closed, BR#3409).
 fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict {
     if rollup.is_empty() {
         return ProbeVerdict::Transient { error: "no checks reported on the PR yet".into() };
     }
     let mut failed: Vec<String> = Vec::new();
+    let mut external: Vec<String> = Vec::new();
     let mut pending = 0usize;
     for e in rollup {
         let state = e
@@ -4417,7 +4812,13 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
         let name = e.get("name").and_then(|v| v.as_str()).or_else(|| e.get("context").and_then(|v| v.as_str())).unwrap_or("?");
         match state.to_ascii_uppercase().as_str() {
             "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => failed.push(format!("{name}={state}")),
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => {
+                if crate::train_gate::is_exempt_check_name(name) {
+                    external.push(format!("{name}={state}"));
+                } else {
+                    failed.push(format!("{name}={state}"));
+                }
+            }
             _ => pending += 1,
         }
     }
@@ -4431,6 +4832,16 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
     }
     if pending > 0 {
         return ProbeVerdict::Transient { error: format!("checks pending ({pending} of {} not concluded)", rollup.len()) };
+    }
+    if let Some(first) = external.first() {
+        // green-modulo-externals: satisfied, and the verdict NAMES what was
+        // exempted (BR#6568 — the atom passes, the receipt still speaks)
+        let more = if external.len() > 1 { format!(" (+{} more)", external.len() - 1) } else { String::new() };
+        return ProbeVerdict::Satisfied {
+            receipt: url.to_string(),
+            head_sha: head_sha.to_string(),
+            conclusion: format!("checks green (exempt external: {first}{more})"),
+        };
     }
     ProbeVerdict::Satisfied { receipt: url.to_string(), head_sha: head_sha.to_string(), conclusion: "checks green".into() }
 }
@@ -4467,6 +4878,21 @@ fn observe_probe(ctx: &Ctx, repo: &str, kind: &str, p: &Value) -> Result<ProbeVe
                 &rollup,
                 vstr(&v, "url").unwrap_or(""),
                 vstr(&v, "headRefOid").unwrap_or(""),
+            ))
+        }
+        "pr_merged" => {
+            // BR#6384: the merge atom is probe-backed — gh pr view answers
+            // state + mergeCommit with one read-only call; the classifier
+            // maps it (Satisfied rides the mergeCommit as the head receipt).
+            let pr = p.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pr <= 0 {
+                return Ok(ProbeVerdict::Transient { error: "probe carries no PR number".into() });
+            }
+            let v = ctx.gh_json(&["pr", "view", &pr.to_string(), "--repo", repo, "--json", "state,mergeCommit,url"])?;
+            Ok(classify_pr_merge_state(
+                vstr(&v, "state").unwrap_or(""),
+                v.get("mergeCommit").and_then(|m| m.get("oid")).and_then(|o| o.as_str()).unwrap_or(""),
+                vstr(&v, "url").unwrap_or(""),
             ))
         }
         other => Ok(ProbeVerdict::Transient { error: format!("unknown probe kind {other}") }),
@@ -4535,6 +4961,29 @@ fn proxy_probe_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_branch_rules_override_repo_merge_flags() {
+        let repo = json!({"allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true});
+        // Exact live #2513 incident: repo flags all true; the effective
+        // ruleset permits only squash/rebase and enforces linear history.
+        let rules = json!([
+            {"type": "pull_request", "parameters": {"allowed_merge_methods": ["squash", "rebase"]}},
+            {"type": "required_linear_history"}
+        ]);
+        assert_eq!(policy_merge_methods(&repo, &rules, "merge").unwrap(), vec![MergeMethod::Squash, MergeMethod::Rebase]);
+        assert_eq!(policy_merge_methods(&repo, &rules, "rebase").unwrap()[0], MergeMethod::Rebase);
+        assert_eq!(policy_merge_methods(&repo, &json!([]), "merge").unwrap()[0], MergeMethod::Merge);
+        // Every applicable rule intersects; policy never widens another rule.
+        let rules = json!([
+            {"type": "pull_request", "parameters": {"allowed_merge_methods": ["merge"]}},
+            {"type": "required_linear_history"}
+        ]);
+        assert!(policy_merge_methods(&repo, &rules, "merge").is_err());
+        assert!(policy_merge_methods(&repo, &json!({"message": "Forbidden"}), "merge").is_err());
+        assert!(policy_merge_methods(&json!({}), &json!([]), "merge").is_err());
+        let repo = json!({"allow_merge_commit": false, "allow_squash_merge": false, "allow_rebase_merge": true});
+        assert_eq!(policy_merge_methods(&repo, &json!([]), "squash").unwrap(), vec![MergeMethod::Rebase]);
+    }
     use super::*;
     use std::collections::VecDeque;
     use std::io::{Read, Write as IoWrite};
@@ -4686,6 +5135,12 @@ mod tests {
         assert!(is_merge_method_refusal("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"));
         assert!(is_merge_method_refusal("Squash merges are not allowed on this repository."));
         assert!(is_merge_method_refusal("Rebase merges are not allowed on this repository."));
+        // BR#6673: the ruleset-era REST/gh refusal — ruleset 24656303 pins
+        // allowed_merge_methods to squash+rebase (no bypass), so every
+        // `gh pr merge --merge` attempt is refused with exactly this text
+        assert!(is_merge_method_refusal(
+            "Pull request state-vector/superpositional#2513 is not mergeable: the base branch policy prohibits the merge."
+        ));
         // a PR defect or a permission refusal is NOT a method mismatch
         assert!(!is_merge_method_refusal("gh: permission denied"));
         assert!(!is_merge_method_refusal("Pull request is not up to date"));
@@ -4697,9 +5152,23 @@ mod tests {
         assert_eq!(refused_merge_method("GraphQL: Merge commits are not allowed on this repository. (mergePullRequest)"), Some("merge"));
         assert_eq!(refused_merge_method("Squash merges are not allowed on this repository."), Some("squash"));
         assert_eq!(refused_merge_method("gh: something else"), None);
+        // BR#6673: the ruleset-era text names NO method — None is correct
+        assert_eq!(
+            refused_merge_method(
+                "Pull request state-vector/superpositional#2513 is not mergeable: the base branch policy prohibits the merge."
+            ),
+            None
+        );
         // sp class: configured merge refused → squash first (Ray's law), then rebase
         assert_eq!(
             merge_fallback_candidates("merge", Some("merge"), true),
+            vec!["squash".to_string(), "rebase".to_string()]
+        );
+        // BR#6673 ruleset-era shape: the refusal names no method (None) but
+        // the PRIMARY attempt was refused, so the configured method is still
+        // skipped — squash first, then rebase (the standing sp landing shape)
+        assert_eq!(
+            merge_fallback_candidates("merge", None, true),
             vec!["squash".to_string(), "rebase".to_string()]
         );
         // a squash-configured lane refused squash → rebase, then merge
@@ -4769,6 +5238,21 @@ mod tests {
         assert_eq!(runs.len(), 104, "both pages accumulated");
         let required: Vec<String> = LANE_REQUIRED.iter().map(|s| s.to_string()).collect();
         assert_eq!(classify_base_check_runs(&runs, &required).verdict, MainVerdict::Green);
+    }
+
+    #[test]
+    fn retry_routes_workflow_and_job_ids_without_guessing_namespaces() {
+        let workflows = workflow_startup_failures(&[json!({ "id": 41734497120i64, "workflow_id": 90,
+            "run_attempt": 1, "name": "Deploy Health Branch Gate", "conclusion": "startup_failure", "status": "completed" })]);
+        assert_eq!(check_retry_target("o/r", &workflows[0]).unwrap().endpoint("o/r"),
+            "repos/o/r/actions/runs/41734497120/rerun");
+        let checks = check_runs_from_pages(&[Some(vec![json!({ "id": 100, "name": "Deploy health (merge gate)",
+            "check_suite": { "id": 3 }, "app": { "id": 1 }, "conclusion": "failure",
+            "html_url": "https://github.com/o/r/actions/runs/200/job/300" })])]);
+        assert_eq!(check_retry_target("o/r", &checks[0]).unwrap(), CheckRetryTarget::ActionsJob { id: 300 });
+        assert!(check_retry_target("other/repo", &checks[0]).is_err());
+        let untyped = check_runs_from_pages(&[Some(vec![json!({ "id": 41734497120i64, "name": "Gate", "conclusion": "failure" })])]);
+        assert!(check_retry_target("o/r", &untyped[0]).is_err());
     }
 
     #[test]
@@ -4885,6 +5369,40 @@ mod tests {
     }
 
     #[test]
+    fn branch_provenance_worker_authored_fail_closed() {
+        // BR#4687 (L1.2): the branch is machine-updatable iff EVERY commit was
+        // authored by a worker-class identity — and every missing/blank/unknown
+        // case fails closed to human-owned.
+        let workers = vec!["detached-cody".to_string()];
+        // all-worker authorship → the train owns the branch (case-insensitive)
+        assert!(branch_is_worker_authored(&["detached-cody".into(), "Detached-Cody".into()], &workers));
+        // ONE personal author → a protected human branch, never machine-moved
+        assert!(!branch_is_worker_authored(&["detached-cody".into(), "rayh".into()], &workers));
+        // empty logins (API hiccup) → fail-closed human-owned
+        assert!(!branch_is_worker_authored(&[], &workers));
+        // empty allowlist → every login personal → never owned
+        assert!(!branch_is_worker_authored(&["detached-cody".into()], &vec![]));
+        // blank/unknown login → not worker class → not owned
+        assert!(!branch_is_worker_authored(&["".into()], &workers));
+        assert!(!branch_is_worker_authored(&["ghost-login".into()], &workers));
+    }
+
+    #[test]
+    fn intermediate_merge_without_ci_settles_only_from_proven_descendant() {
+        let required = vec!["Test".to_string()];
+        let run = |status: &str, conclusion: &str| MainCheckRun { id: 1, source: crate::train_gate::CheckSource::Unknown, name: "Test".into(), status: Some(status.into()),
+            conclusion: Some(conclusion.into()), html_url: None };
+        assert!(settle_from_descendant_ci(true, &[], &required));
+        assert!(!settle_from_descendant_ci(false, &[], &required));
+        assert!(!settle_from_descendant_ci(true, &[], &[]));
+        assert!(!settle_from_descendant_ci(true, &[run("in_progress", "")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "failure")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "failure"), run("completed", "cancelled")], &required));
+        assert!(!settle_from_descendant_ci(true, &[run("completed", "success")], &required));
+        assert!(settle_from_descendant_ci(true, &[run("completed", "cancelled")], &required));
+    }
+
+    #[test]
     fn write_gate_allows_only_worker_class() {
         let hub = mock_hub(vec![]).0;
         let mut ctx = test_ctx(&hub);
@@ -4931,6 +5449,78 @@ mod tests {
         for s in ["clean", "CLEAN", "dirty", "behind", "blocked", "unstable"] {
             assert!(mergeability_definitive(&json!({ "mergeStateStatus": s })), "answered: {s}");
         }
+    }
+
+    #[test]
+    fn pr_merged_merged_with_merge_commit_is_satisfied_citing_it_br6384() {
+        let v = classify_pr_merge_state("MERGED", "ABC123DEF4560000000000000000000000000000", "https://github.com/o/r/pull/9");
+        match v {
+            ProbeVerdict::Satisfied { receipt, head_sha, conclusion } => {
+                assert_eq!(head_sha, "abc123def4560000000000000000000000000000"); // the mergeCommit IS the head receipt
+                assert_eq!(conclusion, "merged");
+                assert_eq!(receipt, "https://github.com/o/r/pull/9");
+            }
+            other => panic!("expected Satisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_merged_closed_unmerged_is_conclusive_br6384() {
+        let v = classify_pr_merge_state("CLOSED", "", "https://github.com/o/r/pull/10");
+        match v {
+            ProbeVerdict::Conclusive { error, conclusion, .. } => {
+                assert!(error.contains("CLOSED"), "{error}");
+                assert_eq!(conclusion, "closed");
+            }
+            other => panic!("expected Conclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_merged_open_and_sha_drift_stay_transient_br6384() {
+        // OPEN: a future merge can still satisfy — transient
+        match classify_pr_merge_state("OPEN", "", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for OPEN, got {other:?}"),
+        }
+        // junk sha on a MERGED row: no citable receipt — transient, never satisfied
+        match classify_pr_merge_state("MERGED", "nope", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for junk sha, got {other:?}"),
+        }
+        match classify_pr_merge_state("MERGED", "", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for missing sha, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concat_pr_rows_appends_merged_rows_and_drops_junk_br6384() {
+        let open = json!([
+            { "number": 1, "title": "open pr", "state": "OPEN" },
+            "junk-string",
+            { "noNumber": true }
+        ]);
+        let merged = json!([
+            { "number": 2, "title": "merged pr", "state": "MERGED", "mergeCommit": { "oid": "f".repeat(40) } },
+            { "number": 0, "title": "bad number", "state": "MERGED" },
+            { "number": 3, "title": "closed pr", "state": "CLOSED" },
+            { "number": "seven", "title": "string number", "state": "MERGED" }
+        ]);
+        let out = concat_pr_rows(&open, &merged);
+        let rows = out.as_array().expect("array");
+        // the daemon drops non-OBJECTS only (both sides) — number-level junk
+        // is the hub's normalizePr contract; the merged side additionally
+        // keeps MERGED rows with a positive number
+        assert_eq!(rows.len(), 3, "2 open objects + 1 valid merged row");
+        assert_eq!(rows[0]["number"], 1);
+        assert_eq!(rows[2]["number"], 2);
+        assert_eq!(rows[2]["state"], "MERGED");
+        // the gh object shape flattens to the string the hub contract reads
+        assert_eq!(rows[2]["mergeCommit"], json!("f".repeat(40)));
+        // a broken merged feed degrades to the open feed alone
+        let open_only = concat_pr_rows(&pr_payload(&json!([{ "number": 5 }])), &json!(null));
+        assert_eq!(open_only.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -5572,6 +6162,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_clean_but_compile_broken_stale_head_must_integrate_and_wait_for_ci() {
+        let repo = Repo::new("semantic-integration");
+        std::fs::write(repo.dir.join("contracts.rs"), "pub struct Metadata { pub a: u8 }\n").unwrap();
+        repo.git(&["add", "contracts.rs"]);
+        repo.git(&["commit", "-qm", "contract"]);
+        repo.git(&["checkout", "-qb", "feature"]);
+        std::fs::write(repo.dir.join("main.rs"), "mod contracts; fn main() { let _ = contracts::Metadata { a: 1 }; }\n").unwrap();
+        repo.git(&["add", "main.rs"]);
+        repo.git(&["commit", "-qm", "old constructor"]);
+        let old = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["push", "-q", "origin", "feature:refs/pull/7/head"]);
+        repo.git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.dir.join("contracts.rs"), "pub struct Metadata { pub a: u8, pub b: u8 }\n").unwrap();
+        repo.git(&["commit", "-qam", "new required field"]);
+        repo.git(&["push", "-q", "origin", "main"]);
+        let base = repo.git(&["rev-parse", "HEAD"]);
+        assert!(repo.ctx().trial_merge("main", &old).unwrap().0, "file merge is clean");
+        repo.git(&["merge", "-q", "--no-edit", "feature"]);
+        let integrated = repo.git(&["rev-parse", "HEAD"]);
+        let compile = Command::new("rustc").args(["main.rs", "-o", "probe"]).current_dir(&repo.dir).output().unwrap();
+        assert!(!compile.status.success());
+        assert!(String::from_utf8_lossy(&compile.stderr).contains("missing field `b`"));
+
+        let (hub, calls) = mock_hub(vec![ok(json!({"ok": true})), ok(json!({"ok": true}))]);
+        let mut ctx = test_ctx(&hub);
+        ctx.workdir = repo.dir.to_string_lossy().to_string();
+        ctx.worker_identities = vec!["worker".into()];
+        let new_head = integrated.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            if cmd != "gh" { return None; }
+            if args.get(1) == Some(&"repos/o/r/pulls/7/commits") { return Some(Ok(json!([{"login":"worker"}]).to_string())); }
+            if args.get(1) == Some(&"repos/o/r/pulls/7/update-branch") { return Some(Ok("{}".into())); }
+            if args.first() == Some(&"pr") { return Some(Ok(json!({"headRefOid":new_head,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}).to_string())); }
+            panic!("unexpected command {args:?}");
+        }));
+        let candidate = BatchCandidate { qi: 0, head_id: "BR#7".into(), pr: 7, head_sha: old.clone(), root_fix: false };
+        assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate).unwrap(),
+            IntegrationAdmission::AwaitingCi { base_sha: base, head_sha: integrated });
+        let events = calls.lock().unwrap();
+        assert!(events.iter().any(|c| call_name(c) == "train_carry"));
+        assert!(!events.iter().any(|c| call_name(c) == "train_event"), "integration is not a merge receipt");
+        assert_eq!(crate::train_gate::classify_head_checks(&[]).verdict, MainVerdict::Unsettled, "no fresh CI is never admission");
+    }
+
     const BOGUS_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
@@ -5766,6 +6401,72 @@ mod tests {
         }
     }
 
+    // ---- BR#6568: the probe path applies the BR#2267/BR#6001 external-check
+    // exemption the head gate already applies — a degraded Superpositional
+    // flow runner must not park a typed pr_checks_green await (live: PR
+    // state-vector/bridge#323, BR#4694). ----
+
+    #[test]
+    fn rollup_exempt_external_failure_satisfies_and_names_the_external() {
+        // the exact live specimen: required checks SUCCESS, only the exempt
+        // external 'Superpositional' FAILURE → SATISFIED naming the external
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "CLI build (packages/cli)", "conclusion": "SUCCESS" },
+            { "name": "main-green gate", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Satisfied { conclusion, head_sha, .. } => {
+                assert!(conclusion.contains("Superpositional=FAILURE"), "verdict must name the exempt external, got: {conclusion}");
+                assert_eq!(head_sha, "deadbeef");
+            }
+            other => panic!("expected satisfied (exempt external must not fail the atom), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollup_exempt_external_failure_with_pending_stays_transient() {
+        // fail-closed: exempting an external never greens an unsettled head
+        let rollup = json!([
+            { "name": "Test", "conclusion": null, "status": "IN_PROGRESS" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "u", "");
+        assert!(matches!(v, ProbeVerdict::Transient { .. }));
+    }
+
+    #[test]
+    fn rollup_required_check_failure_beats_exempt_external_and_stays_conclusive() {
+        let rollup = json!([
+            { "name": "Test", "conclusion": "FAILURE" },
+            { "name": "Superpositional", "conclusion": "FAILURE" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Conclusive { error, .. } => {
+                assert!(error.contains("Test=FAILURE"), "required red must gate, got: {error}");
+                assert!(!error.contains("Superpositional"), "exempt external must not ride the gating error, got: {error}");
+            }
+            other => panic!("expected conclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollup_exempt_external_success_is_plain_green() {
+        // no regression: the external succeeding keeps the plain green receipt
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "conclusion": "SUCCESS" }
+        ]);
+        let v = classify_rollup(rollup.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match v {
+            ProbeVerdict::Satisfied { conclusion, .. } => assert_eq!(conclusion, "checks green"),
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rollup_pending_is_transient_and_empty_rollup_is_transient() {
         let rollup = json!([{ "name": "Test", "conclusion": null, "status": "IN_PROGRESS" }]);
@@ -5892,8 +6593,8 @@ mod tests {
     #[test]
     fn base_state_annotates_empty_alarm_and_omits_it_mid_burst_br5674_p1() {
         let tip = vec![
-            MainCheckRun { id: 1, name: "Product surface canary (dev)".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
-            MainCheckRun { id: 2, name: "Nightly Release".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 1, source: crate::train_gate::CheckSource::Unknown, name: "Product surface canary (dev)".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, source: crate::train_gate::CheckSource::Unknown, name: "Nightly Release".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
         ];
         let required = vec!["deploy / Deploy to dev".to_string()];
         // N runs read, none matched required set → alarm on base_state
@@ -5925,8 +6626,8 @@ mod tests {
         // red on the tip → base_state carries the qualifier whole (verdict
         // STAYS green — BR#5265 law — but a plain green is never certified).
         let tip = vec![
-            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
-            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("failure".into()), html_url: Some("https://example.test/drift".into()) },
+            MainCheckRun { id: 1, source: crate::train_gate::CheckSource::Unknown, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, source: crate::train_gate::CheckSource::Unknown, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("failure".into()), html_url: Some("https://example.test/drift".into()) },
         ];
         let required = vec!["Test".to_string(), "main-green gate".to_string()];
         let c = classify_base_check_runs(&tip, &required);
@@ -5939,8 +6640,8 @@ mod tests {
         assert_eq!(bs.pointer("/gate_red/0/url").and_then(|v| v.as_str()), Some("https://example.test/drift"));
         // honest green (no qualifier) → no gate fields on the stamp
         let tip_green = vec![
-            MainCheckRun { id: 1, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
-            MainCheckRun { id: 2, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 1, source: crate::train_gate::CheckSource::Unknown, name: "Test".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
+            MainCheckRun { id: 2, source: crate::train_gate::CheckSource::Unknown, name: "Deploy drift alarm".into(), status: Some("completed".into()), conclusion: Some("success".into()), html_url: None },
         ];
         let bs_green = build_base_state(&classify_base_check_runs(&tip_green, &required), &required, 0);
         assert!(bs_green.get("gate_blocked").is_none());
@@ -5950,6 +6651,26 @@ mod tests {
         let bs_burst = build_base_state(&c, &required, 1);
         assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
         assert!(bs_burst.get("gate_blocked").is_none());
+    }
+
+    #[test]
+    fn recovery_retry_needs_durable_authorization_and_never_retries_known_capability_defects() {
+        let head = "7".repeat(40);
+        let lane = json!({ "line": { "recoveries": [{ "episode": { "id": "cause", "head_sha": head,
+            "cause": { "kind": "check_failure", "check": "Deploy smoke" },
+            "stage": { "phase": "diagnosing", "task_id": "BR#1" } } }] } });
+        let (hub, calls) = mock_hub(vec![ok(json!({ "authorized": true }))]);
+        let mut ctx = test_ctx(&hub);
+        assert!(request_main_recovery_retry(&mut ctx, &lane, "o/r", "main", &head).is_some());
+        assert_eq!(call_name(&calls.lock().unwrap()[0]), "train_recovery_event");
+        let (refused, _) = mock_hub(vec![ok(json!({ "authorized": false }))]);
+        assert!(request_main_recovery_retry(&mut test_ctx(&refused), &lane, "o/r", "main", &head).is_none());
+        let known = json!({ "line": { "recoveries": [{ "episode": { "id": "cause", "head_sha": head,
+            "cause": { "kind": "capability_unavailable", "check": "Deploy smoke", "scenario": "php-sql-injection", "capability": "callers", "scope": "User.php" },
+            "stage": { "phase": "repairing", "task_id": "BR#1" } } }] } });
+        let (untouched, calls) = mock_hub(vec![]);
+        assert!(request_main_recovery_retry(&mut test_ctx(&untouched), &known, "o/r", "main", &head).is_none());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -6003,12 +6724,14 @@ mod tests {
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // train_queue_facts
             ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
             ok(json!({ "ok": true })),                   // train_queue_facts (ready)
@@ -6036,6 +6759,12 @@ mod tests {
                 return Some(Ok(String::new()));
             }
             if cmd == "gh" {
+                if args == ["api", "repos/state-vector/superpositional"] {
+                    return Some(Ok(json!({"allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true}).to_string()));
+                }
+                if args == ["api", "repos/state-vector/superpositional/rules/branches/main"] {
+                    return Some(Ok(json!([{"type": "required_linear_history"}, {"type": "pull_request", "parameters": {"allowed_merge_methods": ["squash", "rebase"]}}]).to_string()));
+                }
                 if args.first() == Some(&"workflow") && args.get(1) == Some(&"run") {
                     return Some(Ok(String::new()));
                 }
@@ -6043,6 +6772,8 @@ mod tests {
                     return Some(Ok(String::new()));
                 }
                 if args.first() == Some(&"pr") && args.get(1) == Some(&"merge") {
+                    assert!(args.contains(&"--squash"), "effective rules prohibit --merge even though repository flags allow it");
+                    assert!(!args.contains(&"--admin"), "method selection must not bypass checks");
                     *pr_merged_c.lock().unwrap() = true;
                     return Some(Ok("merged".into()));
                 }

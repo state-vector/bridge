@@ -19,9 +19,16 @@ import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
+import { RecoveryCommandSchema } from "./train-recovery.ts";
+import { CheckRetryCommandSchema, CandidateRepairSchema, CandidateIntegrationSchema } from "./train-checks.ts";
+import { ExecutionRequestSchema, HandoffReadSchema, HandoffAcceptSchema, HandoffCheckpointSchema } from "./execution.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
 export const TOOL_NAMES = [
+  "handoffs",
+  "handoff_accept",
+  "handoff_checkpoint",
+  "execution",
   "answer_ask",
   "ask_agent",
   "asks",
@@ -53,6 +60,7 @@ export const TOOL_NAMES = [
   "train_lease",
   "train_status",
   "train_observe_deploy",
+  "train_recovery_event",
   "transition",
   "update_artefact",
 ] as const;
@@ -65,7 +73,12 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * Schema is what the fixture pins.
  */
 export const TOOL_ARG_SCHEMAS = {
+  handoffs: HandoffReadSchema,
+  handoff_accept: HandoffAcceptSchema,
+  handoff_checkpoint: HandoffCheckpointSchema,
+  execution: ExecutionRequestSchema,
   train_observe_deploy: z.looseObject({ repo: z.string(), base: z.string().optional(), observation: DeployObservationSchema }),
+  train_recovery_event: RecoveryCommandSchema,
   orient: z.looseObject({
     session: z
       .string()
@@ -221,10 +234,14 @@ export const TOOL_ARG_SCHEMAS = {
     // STALL_ALARM_TICKS consecutive ticks (default 3, env
     // MERGE_TRAIN_STALL_TICKS). The hub renders the STALLED lane/banner and
     // files the one-per-episode alarm ask.
-    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled"]),
+    // BR#4687 "updated": the executor's silent machine-rebase carry — the
+    // train updates its OWN behind worker-authored branch and stamps the
+    // carry the moment the update lands (no bounce, no status change).
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
+    from_head: z.string().optional(),
     merge_sha: z.string().optional(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
@@ -308,7 +325,10 @@ export const TOOL_ARG_SCHEMAS = {
       id: z.string(),
       pr: z.number().int().optional(),
       cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]),
-    })),
+      repair: CandidateRepairSchema.optional(),
+      integration: CandidateIntegrationSchema.optional(),
+    })).optional(),
+    check_retry: CheckRetryCommandSchema.optional(),
     // BR#5376: the ACTIVE batch-stall episode, executor-fed (freshness law:
     // the next stamp after a landing omits it, which clears the state by
     // itself). batch = the members in landing order; ticks = consecutive
@@ -381,6 +401,10 @@ export const TOOL_ARG_SCHEMAS = {
         headRefName: z.string().nullish(),
         updatedAt: z.string().nullish(),
         isDraft: z.boolean().nullish(),
+        // BR#6384: the merged feed — MERGED rows ride beside the open feed
+        // with their mergeCommit; null state = the legacy open feed.
+        state: z.string().nullish(),
+        mergeCommit: z.string().nullish(),
       }),
     ),
   }),
