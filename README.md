@@ -498,7 +498,8 @@ agents show **custom** because they use whatever model is configured locally;
 Bridge does not assign or infer their tier, even after a previous gateway run.
 Missing observations show **unknown**. Gateway model ID/backend/host/session
 remain in the tooltip. Execution state (running, stopping, lease expired,
-previous execution, etc.) is separate in the status column and task details.
+previous execution, etc.) is available in task details. Top retains its original
+single task-status chip, without an additional execution-state label or row wrap.
 The automation minimum remains enforced independently of interactive display.
 Both board snapshots and task reads derive this typed view from canonical
 execution state, not model names or gateway defaults.

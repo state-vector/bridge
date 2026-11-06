@@ -255,7 +255,8 @@ repairs or ordinary review iteration.
 or `medium => large` for a pending upgrade. Interactive agents display `custom`
 (their locally configured model has no Bridge-assigned tier); absent observations
 display `unknown`. Execution state such as lease expired, stopping or previous
-execution appears separately in the status column and task details. The tooltip
+execution appears in task details. Top keeps one compact task-status chip without
+an additional execution-state label. The tooltip
 identifies recorded gateway model/backend/host/session. Automation requirements
 remain strict and independent of these display labels.
 Task History includes model starts, agent/reviewer escalation reasons and tier
