@@ -8,6 +8,12 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+Top keeps machine/agent identity and actual **model / tier** in separate aligned
+columns. Parent and child rows share the same tracks; narrower windows scroll
+the task table horizontally rather than folding cells onto a second row.
+Execution attention loads through the authenticated GET API, with local-session
+controls available when a task has an explicit handoff.
+
 The web and desktop headers include **Go to BR#…** on every signed-in view.
 Enter `BR#6690`, `BR-6690`, `#6690`, or `6690`, then press Enter or **Go** to
 open the card directly, regardless of board filters or whether it is loaded in

@@ -2,6 +2,10 @@
 
 ### Jump straight to a card
 
+Top has a dedicated **model / tier** column beside machine/agent identity.
+Task and child rows stay aligned; on narrow screens the task table scrolls
+horizontally. Execution-attention controls load through the authenticated API.
+
 Use **Go to BR#…** in the web or desktop header to open a card by number from
 any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press
 Enter or **Go**. **⌘K / Ctrl+K** focuses the lookup, and Escape clears it.

@@ -254,9 +254,12 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       <ExecutionAttentionPanel openTask={openDetails} />
       <TopSectionHeader theme={tagTheme} />
 
+      <div className="top-table" role="region" aria-label="Active fleet tasks" tabIndex={0}>
+      <div className="top-table-body">
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
         <span className="topc-agent">machine / agent</span>
+        <span className="topc-model" title="Actual execution size and state; hover for model identity. Requested minimum is separate.">model / tier</span>
         <span className="topc-session">session</span>
         <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
@@ -281,7 +284,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <div
           key={r.key}
           className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${depth > 0 ? "ktable-child" : ""}`}
-          style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-task" title={r.taskId ?? ""}>
@@ -293,6 +295,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
           </span>
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
             <span className="top-agent-name">{r.agent}</span>
+          </span>
+          <span className="topc-model">
             <ExecutionModel value={r.execution} now={now} />
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
@@ -391,6 +395,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         ),
         ];
       })}
+      </div>
+      </div>
 
       {treeRows.length === 0 && (
         <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Parked cards file in Backlog under their exit condition."}</p>

@@ -211,6 +211,12 @@ export default {
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
+        if (sub === "execution_attention") {
+          return kbCors(await kbGuard("kb.execution.attention", env.KB.get(kbId).fetch("https://kb/execution.attention", {
+            method: "POST", headers: { "content-type": "application/json", ...(auth.bearer ? {} : { "x-kb-admin": "1" }) },
+            body: JSON.stringify({ limit: 100, project: url.searchParams.get("project") || undefined, actor: auth.bearer ? "gateway" : `web:${auth.login}` }),
+          })));
+        }
         const kbUrl = sub === "board" ? "https://kb/board"
           : sub === "events" ? "https://kb/events"
           : sub === "artefacts" ? "https://kb/artefacts"
@@ -258,12 +264,6 @@ export default {
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
         return kbCors(await kbGuard("kb.purge_smoke", env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-        })));
-      }
-      if (sub === "execution_attention" && request.method === "GET") {
-        return kbCors(await kbGuard("kb.execution.attention", env.KB.get(kbId).fetch("https://kb/execution.attention", {
-          method: "POST", headers: { "content-type": "application/json", ...(auth.bearer ? {} : { "x-kb-admin": "1" }) },
-          body: JSON.stringify({ limit: 100, project: url.searchParams.get("project") || undefined, actor: auth.bearer ? "gateway" : `web:${auth.login}` }),
         })));
       }
       if (sub === "handoff_control" && request.method === "POST") {
