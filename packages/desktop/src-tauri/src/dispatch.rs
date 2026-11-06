@@ -277,6 +277,104 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
     prepare_worker_with_progress(cfg, avail, &|_| {})
 }
 
+#[derive(Clone)]
+struct GatewayReadyProof { worker: WorkerCredential, observed: Instant }
+
+enum GatewayReadinessState {
+    Unavailable(String),
+    Ready(GatewayReadyProof),
+}
+
+struct GatewayReadinessData {
+    cfg: DispatchConfig,
+    key: String,
+    state: GatewayReadinessState,
+}
+
+/// Capability TTL is a gateway clock, not a side effect of completing a tick.
+/// A single producer owns worker provisioning/probing and publishes no claims,
+/// attempt leases, writer counts or synthetic progress.
+struct GatewayReadiness {
+    data: Arc<Mutex<GatewayReadinessData>>,
+    maintenance: LeaseMaintenance,
+}
+
+fn gateway_readiness_key(cfg: &DispatchConfig) -> String {
+    json!({"url":cfg.url,"host":cfg.label,"worker":requested_worker_label(cfg),
+        "inventory":worker_config_revision(cfg),"fallback_model":cfg.model,
+        "opencode_bin":cfg.opencode_bin,"capacity":cfg.max_sessions}).to_string()
+}
+
+impl GatewayReadiness {
+    fn start(cfg: &DispatchConfig) -> Self {
+        Self::with_probe(cfg, Duration::from_secs(20), |cfg| {
+            let available = available_backends(cfg);
+            if available.is_empty() {
+                if let Some(name) = cfg.backends.keys().next() {
+                    let capabilities = capability_inventory(cfg, &[], None, name);
+                    execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
+                }
+                return Err("no runnable configured backend".into());
+            }
+            prepare_worker(cfg, &available).map(|(worker, _)| worker)
+        })
+    }
+
+    fn with_probe(cfg: &DispatchConfig, interval: Duration,
+        mut probe: impl FnMut(&DispatchConfig) -> Result<WorkerCredential, String> + Send + 'static) -> Self {
+        let initial = match probe(cfg) {
+            Ok(worker) => GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() }),
+            Err(error) => GatewayReadinessState::Unavailable(error),
+        };
+        let data = Arc::new(Mutex::new(GatewayReadinessData { cfg: cfg.clone(), key: gateway_readiness_key(cfg), state: initial }));
+        let shared = data.clone();
+        let maintenance = LeaseMaintenance::start(interval, move || {
+            let (cfg, key) = { let data = shared.lock().expect("gateway readiness poisoned"); (data.cfg.clone(), data.key.clone()) };
+            let result = probe(&cfg); // no shared lock held across bounded probes/network
+            let mut data = shared.lock().expect("gateway readiness poisoned");
+            if data.key == key && data.cfg.token == cfg.token {
+                data.state = match result {
+                    Ok(worker) => {
+                        dlog("gateway", "readiness renewed independently of dispatch");
+                        GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() })
+                    }
+                    Err(error) => {
+                        dlog("gateway", &format!("readiness renewal failed: {error}; no fresh local admission proof"));
+                        GatewayReadinessState::Unavailable(error)
+                    }
+                };
+            }
+            true // retry failed readiness; never renew from a cached success
+        });
+        Self { data, maintenance }
+    }
+
+    fn update_config(&self, cfg: &DispatchConfig) {
+        let mut data = self.data.lock().expect("gateway readiness poisoned");
+        let key = gateway_readiness_key(cfg);
+        if data.key != key || data.cfg.token != cfg.token {
+            data.state = GatewayReadinessState::Unavailable("configuration or credential changed; awaiting fresh readiness".into());
+            data.key = key;
+            data.cfg = cfg.clone();
+            self.maintenance.wake();
+        }
+    }
+
+    fn proof(&self, cfg: &DispatchConfig) -> Result<GatewayReadyProof, String> {
+        self.proof_with_max_age(cfg, Duration::from_secs(60))
+    }
+
+    fn proof_with_max_age(&self, cfg: &DispatchConfig, max_age: Duration) -> Result<GatewayReadyProof, String> {
+        let data = self.data.lock().expect("gateway readiness poisoned");
+        if data.key != gateway_readiness_key(cfg) { return Err("configuration has no matching readiness proof".into()); }
+        match &data.state {
+            GatewayReadinessState::Ready(proof) if proof.observed.elapsed() < max_age => Ok(proof.clone()),
+            GatewayReadinessState::Ready(_) => Err("local gateway readiness proof expired".into()),
+            GatewayReadinessState::Unavailable(error) => Err(error.clone()),
+        }
+    }
+}
+
 fn begin_with_fresh_readiness<T>(
     observed: &mut Instant,
     force_refresh: bool,
@@ -479,26 +577,31 @@ struct ExecutionRuntime {
 /// dispatch cadence must never starve a running writer's lease or inbox.
 /// Cancellation joins the poller before quiesce/transfer, so no late poll can
 /// renew an attempt after its finalization barrier.
+enum MaintenanceSignal { Wake, Stop }
 struct LeaseMaintenance {
-    cancel: std::sync::mpsc::Sender<()>,
+    cancel: std::sync::mpsc::Sender<MaintenanceSignal>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl LeaseMaintenance {
     fn start(interval: Duration, mut poll: impl FnMut() -> bool + Send + 'static) -> Self {
         let (cancel, cancelled) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            while matches!(cancelled.recv_timeout(interval), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
-                if !poll() { break; }
+            loop {
+                match cancelled.recv_timeout(interval) {
+                    Ok(MaintenanceSignal::Wake) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if !poll() { break; },
+                    _ => break,
+                }
             }
         });
         Self { cancel, thread: Mutex::new(Some(thread)) }
     }
     fn stop(&self) {
-        let _ = self.cancel.send(());
+        let _ = self.cancel.send(MaintenanceSignal::Stop);
         if let Ok(mut thread) = self.thread.lock() {
             if let Some(thread) = thread.take() { let _ = thread.join(); }
         }
     }
+    fn wake(&self) { let _ = self.cancel.send(MaintenanceSignal::Wake); }
 }
 impl Drop for LeaseMaintenance {
     fn drop(&mut self) { self.stop(); }
@@ -3927,6 +4030,7 @@ impl CircuitBreaker {
 
 fn tick(
     cfg: &DispatchConfig,
+    readiness: &GatewayReadiness,
     id: &mut i64,
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
@@ -3970,13 +4074,16 @@ fn tick(
         snap_activity(snap, "info", "agents available — resuming claims");
     }
     *last_avail_ok = avail_ok;
-    let mut prepared_worker = None;
-    if !avail.is_empty() {
-        match prepare_worker(cfg, avail) {
-            Ok((worker, _)) => prepared_worker = Some((worker, Instant::now())),
-            Err(error) => dlog("", &format!("execution protocol not ready: {error}; no new claims until worker readiness succeeds")),
+    let mut prepared_worker = match readiness.proof(cfg) {
+        Ok(proof) => Some((proof.worker, proof.observed)),
+        Err(error) => {
+            // A refused background credential must still reach the existing
+            // gateway auth-heal ladder, rather than silently waiting forever.
+            if classify_hub_error(&error) == HubErrClass::Auth { return Err(error); }
+            dlog("", &format!("execution protocol not ready: {error}; waiting for independent readiness renewal"));
+            None
         }
-    }
+    };
 
     // Lease/action/inbox clocks are independent of stdout. A lost hub or an
     // expired action budget stops the process group; it never buys more work
@@ -5004,6 +5111,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // auth failures park instead of exiting.)
     let mut heal = AuthHeal::new();
     let mut cfg = cfg;
+    let readiness = dispatch_enabled.then(|| {
+        dispatch_stage(&snap, DispatchStage::Readiness);
+        GatewayReadiness::start(&cfg)
+    });
     loop {
         if let Some(request) = update_request() {
             // Natural completion only: do not signal worker stop, discard
@@ -5065,8 +5176,11 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         // BR#4489 role:"train" — skip ONLY the dispatch tick; the tail of the
         // loop (runner-state sync + responsive stop) still runs every pass.
         if dispatch_enabled {
+            let readiness = readiness.as_ref().expect("dispatch has a readiness producer");
+            readiness.update_config(&cfg);
             match tick(
                 &cfg,
+                readiness,
                 &mut id,
                 &mut in_flight,
                 &mut attempts,
@@ -5082,7 +5196,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 &stop,
             ) {
             Ok(msgs) => {
-                if update_request().is_some() && !avail.is_empty() && snap.lock().map(|s| s.needs_attention.is_none()).unwrap_or(false) {
+                if update_request().is_some() && !avail.is_empty() && readiness.proof(&cfg).is_ok() && snap.lock().map(|s| s.needs_attention.is_none()).unwrap_or(false) {
                     update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
                 }
                 for msg in msgs {
@@ -5564,6 +5678,114 @@ mod tests {
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(count.load(Ordering::SeqCst), at_barrier, "no renewal after quiescence barrier");
         pump.stop(); // finalization and Drop can both cancel safely
+    }
+
+    fn readiness_fixture() -> DispatchConfig {
+        serde_json::from_value(json!({"url":"http://fixture.invalid","label":"fixture-gateway","token":"fixture-only"})).unwrap()
+    }
+
+    fn wait_for_readiness_test(mut condition: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(Instant::now() < until, "readiness transition did not happen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn gateway_readiness_stays_fresh_without_any_dispatch_ticks_and_stops_at_join() {
+        let cfg = readiness_fixture();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes = count.clone();
+        let (observed, events) = std::sync::mpsc::channel();
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(10), move |_| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            let _ = observed.send(());
+            Ok(WorkerCredential { label:"fixture-gateway/worker".into(), secret:"fixture-only".into() })
+        });
+        // No tick/prepare/launch calls for several simulated capability TTLs.
+        for _ in 0..35 { events.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        assert!(readiness.proof_with_max_age(&cfg, Duration::from_millis(100)).is_ok());
+        readiness.maintenance.stop();
+        let at_join = count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(count.load(Ordering::SeqCst), at_join, "dead gateway must not keep advertising");
+        assert!(readiness.proof_with_max_age(&cfg, Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn gateway_readiness_failure_withdraws_local_admission_and_recovers_from_a_real_probe() {
+        let cfg = readiness_fixture();
+        let failing = Arc::new(AtomicBool::new(false));
+        let fail = failing.clone();
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(10), move |_| {
+            if fail.load(Ordering::SeqCst) { Err("backend unavailable".into()) }
+            else { Ok(WorkerCredential {label:"fixture/worker".into(),secret:"fixture-only".into()}) }
+        });
+        assert!(readiness.proof(&cfg).is_ok());
+        failing.store(true, Ordering::SeqCst);
+        readiness.maintenance.wake();
+        wait_for_readiness_test(|| readiness.proof(&cfg).is_err());
+        assert!(readiness.proof(&cfg).err().unwrap().contains("backend unavailable"));
+        failing.store(false, Ordering::SeqCst);
+        readiness.maintenance.wake();
+        wait_for_readiness_test(|| readiness.proof(&cfg).is_ok());
+        readiness.maintenance.stop();
+    }
+
+    #[test]
+    fn gateway_config_change_rejects_an_in_flight_obsolete_readiness_proof() {
+        for credential_only in [false, true] {
+        let cfg = readiness_fixture();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (fresh_entered, fresh_started) = std::sync::mpsc::channel();
+        let (fresh_release, fresh_wait) = std::sync::mpsc::channel();
+        let mut round = 0;
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(5), move |cfg| {
+            round += 1;
+            if round == 2 { entered.send(()).unwrap(); wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            if round == 3 { fresh_entered.send(()).unwrap(); fresh_wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            Ok(WorkerCredential {label:cfg.label.clone().unwrap(),secret:cfg.token.clone()})
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut changed = cfg.clone();
+        if credential_only { changed.token = "rotated-fixture".into(); }
+        else { changed.label = Some("renamed-gateway".into()); }
+        readiness.update_config(&changed);
+        assert!(readiness.proof(&changed).is_err());
+        release.send(()).unwrap();
+        fresh_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(readiness.proof(&changed).is_err(), "obsolete result won the config/credential race");
+        fresh_release.send(()).unwrap();
+        wait_for_readiness_test(|| readiness.proof(&changed).is_ok());
+        let proof = readiness.proof(&changed).unwrap();
+        assert_eq!(proof.worker.label, changed.label.clone().unwrap());
+        assert_eq!(proof.worker.secret, changed.token);
+        if !credential_only { assert!(readiness.proof(&cfg).is_err()); }
+        readiness.maintenance.stop();
+        }
+    }
+
+    #[test]
+    fn stopping_gateway_readiness_joins_an_in_flight_publication() {
+        let cfg = readiness_fixture();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut round = 0;
+        let readiness = Arc::new(GatewayReadiness::with_probe(&cfg, Duration::from_millis(5), move |_| {
+            round += 1;
+            if round == 2 { entered.send(()).unwrap(); wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            Ok(WorkerCredential {label:"fixture/worker".into(),secret:"fixture-only".into()})
+        }));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (joined, done) = std::sync::mpsc::channel();
+        let stopping = readiness.clone();
+        let stopper = std::thread::spawn(move || { stopping.maintenance.stop(); joined.send(()).unwrap(); });
+        assert!(done.recv_timeout(Duration::from_millis(30)).is_err(), "stop must wait for the pending bounded publication");
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        stopper.join().unwrap();
     }
 
     #[test]
@@ -6792,6 +7014,7 @@ mod tests {
 /// with rotate (old token revoked, fresh secret issued, cached). Without
 /// this the runner dead-ends forever — the 2026-10-24 churn engine (38
 /// fake in-flight cards, 38–58 watchdog releases each).
+#[derive(Clone)]
 struct WorkerCredential { label: String, secret: String }
 fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<WorkerCredential, String> {
     // Credentials belong to the gateway, not an individual runner's ephemeral
@@ -6837,6 +7060,10 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Work
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         let body: serde_json::Value = resp.json().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("hub {}: worker provisioning refused: {}", status.as_u16(),
+                body.get("error").and_then(|e| e.as_str()).unwrap_or("no error detail")));
+        }
         if provision_response_needs_rotate(status.is_success(), &body) {
             last_err = format!(
                 "hub {status}: {}",
@@ -6865,10 +7092,10 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Work
     ))
 }
 
-/// The provisioning retry decision, extracted for the regression test: a
-/// response that carries no USABLE vended secret (exists:true, an empty
-/// secret, or any error — including the revoked-token error that also
-/// demands rotate) is only recoverable by a rotate re-vend.
+/// The vended-secret check for the bounded re-show/rotate path. The caller
+/// rejects HTTP failures first (auth must reach the repair ladder, and an
+/// infrastructure failure must never revoke a worker). A successful response
+/// without a usable secret is the existing-token re-show case.
 fn provision_response_needs_rotate(status_ok: bool, body: &serde_json::Value) -> bool {
     let usable_secret = body
         .get("secret")

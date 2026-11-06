@@ -15,6 +15,11 @@ slow work and logs launch-preparation durations. Slot reuse still requires real
 writer quiescence; a concurrency limit is not a guarantee of sustained occupancy.
 Refill batches reuse a fresh worker inventory for at most 60 seconds instead of
 re-advertising it for every launch; live begin authorization still applies.
+Gateway capability readiness renews independently every 20 seconds from fresh
+local probes and worker-credential proof, so slow dispatch/handoffs cannot let a
+live gateway's observation expire. Failures still block admission and the hub's
+120-second freshness limit is unchanged; readiness is separate from task leases
+and useful progress.
 
 Open a merge lane for live status, deployment and recovery links, queue blockers
 and repair tasks, executor heartbeat and throughput. The detail view shares the
