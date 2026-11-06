@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig, setKbAuthEscalator, kbApi, notifyExecutionAttention, type ExecutionNotice } from "@bridge/ui-kit";
 import { ExecutionAttentionSchema, type ReasoningTier } from "@bridge/contracts";
 import { openDetailWindow } from "./detailWindow";
-import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
+import { Btn, Card, CardLookup, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
 
@@ -455,6 +455,7 @@ export function App() {
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
           <StatusLights />
         </nav>
+        <CardLookup onOpen={(id) => openDetailWindow("task", id)} />
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 

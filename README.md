@@ -6,6 +6,14 @@
 
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
+## Quick card lookup
+
+The web and desktop headers include **Go to BR#…** on every signed-in view.
+Enter `BR#6690`, `BR-6690`, `#6690`, or `6690`, then press Enter or **Go** to
+open the card directly, regardless of board filters or whether it is loaded in
+the current list. **⌘K / Ctrl+K** focuses the lookup; Escape clears it. The web
+app opens the existing URL-synced card detail; desktop opens its task window.
+
 ## Opt-in runner auto-updates (Linux/systemd)
 
 Automatic binary replacement is **off by default**. Installing from `dev` does

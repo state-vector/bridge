@@ -8,6 +8,7 @@ export { Chip, type ChipProps, type ChipTone } from "./Chip";
 export { Card, type CardProps } from "./Card";
 export { Field, type FieldProps } from "./Field";
 export { TextInput, TextArea, Select } from "./Inputs";
+export { CardLookup } from "./CardLookup";
 export { ActionRow, FormRow } from "./Rows";
 export { ConnDot, type ConnState } from "./ConnDot";
 export { RelTime } from "./RelTime.tsx";

@@ -1,5 +1,12 @@
 # bridge
 
+### Jump straight to a card
+
+Use **Go to BR#…** in the web or desktop header to open a card by number from
+any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press
+Enter or **Go**. **⌘K / Ctrl+K** focuses the lookup, and Escape clears it.
+Lookup works independently of board filters and the currently loaded list.
+
 ### Opt-in server updates
 
 Linux runners can explicitly opt into automatic updates in config:
