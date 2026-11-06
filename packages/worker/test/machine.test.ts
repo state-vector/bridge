@@ -1955,6 +1955,41 @@ describe("breachClass: release_held (BR#4562)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#7008/BR#7028 — the durable-execution mutation fence refuses a stale
+// bound writer ("gate: execution mutation fenced — stop and checkpoint;
+// runner must verify restore/quiescence before resuming", do.ts
+// executionMutationGuard). The fence refusing IS the system working
+// (BR#4562/BR#6654 pricing law): the specimen runners complied — stopped,
+// checkpointed, re-established, delivered — yet 3 fence events inside the
+// 30-min window folded "unclassified" and raised breach cards (BR#7008 on
+// BR#5971, 2026-11-06 13:26–13:28Z; sibling BR#7028 on BR#3630, same
+// shape). The class is named so the Log says WHAT fenced, and priced
+// never-a-breach so compliance can never arm a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: execution_fence (BR#7008/BR#7028)", () => {
+  // the exact audited reason shape (do.ts:5164, thrown message, no [rule:] tag)
+  const FENCE = "gate: execution mutation fenced — stop and checkpoint; runner must verify restore/quiescence before resuming";
+
+  it("the fence refusal classifies execution_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("execution_fence");
+    // ~105 chars — far inside the audit trail's 300-char reason slice; the
+    // stem sits ~15 chars in, so classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("execution_fence");
+  });
+
+  it("a fence-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#5971", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["execution_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,

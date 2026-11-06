@@ -8,6 +8,8 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@bridge/ui-kit/tokens.css", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/tokens.css") },
+      { find: "@bridge/ui-kit/ui-kit.css", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/ui-kit.css") },
+      { find: "@bridge/ui-kit/views.css", replacement: path.resolve(import.meta.dirname, "../../ui-kit/src/views/views.css") },
     ],
   },
   server: {
