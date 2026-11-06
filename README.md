@@ -14,7 +14,17 @@ the task table horizontally rather than folding cells onto a second row.
 Top shows one **No workers available** warning when no registered worker can
 run automation. Busy workers do not trigger that warning. The header's **Status**
 popover groups hub/live-update connections and workers, using scheduler readiness
-and per-host running/reserved/slot counts. Retired merge lines are hidden.
+and per-host **leased / starting / unconfirmed / slots held** counts. A leased
+execution has a current matching claim and unexpired execution/action lease;
+it is not an independently verified OS process count. Old/expired or claimless
+attempts are **unconfirmed**, with expandable task, generation, session and reason.
+They still hold capacity until the gateway confirms their process groups stopped.
+Card release, heartbeat expiry and daemon restart alone never free those slots.
+The same occupancy facts back scheduler admission, availability and the board;
+lease/inventory renewals push a bounded status refresh so an idle task board does
+not age a healthy worker into a false outage. During rolling deployment, old
+aggregate-only data is labelled unresolved executions, never running workers.
+Retired merge lines are hidden.
 Per-task execution-attention cards are not shown on Top.
 
 The web and desktop headers include **Go to BR#…** on every signed-in view.

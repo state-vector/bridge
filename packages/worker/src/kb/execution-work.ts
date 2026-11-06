@@ -120,11 +120,13 @@ export class ExecutionWork {
     this.audit(token.label, "interactive_claim", id, { session, checkpoint: state.attempt?.checkpoint?.commit ?? null });
   }
   private hosts(taskId?: string): CapabilityObservation[] {
-    return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
+    return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => {
+      const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label));
+      return {
       host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
-      active: (() => { const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label)); return n.active + n.reserved; })(),
+       active: n.active + n.reserved, occupancy: n.occupancy,
       readiness: this.taskReadiness(taskId, String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)))),
-    }));
+    }; });
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
     const proof = this.readiness(token, host, capabilities, Date.now());

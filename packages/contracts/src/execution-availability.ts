@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { WorkerOccupancy } from "./worker-status.ts";
 import { capabilityBlockers, ExecutionBlockerSchema, ExecutionRequirementsSchema, LocalHandoffSchema, type ExecutionBlocker, type ExecutionRequirements, type ExecutorCapabilities, type LocalHandoff } from "./execution.ts";
 
 export const ExecutionAttentionSchema = z.object({
@@ -12,7 +13,7 @@ export type ExecutionAttention = z.infer<typeof ExecutionAttentionSchema>;
 export type ExecutionAttentionItem = ExecutionAttention["items"][number];
 
 export type ExecutorReadiness = { kind: "ready"; worker_id: string; fingerprint: string } | { kind: "unprovisioned" | "repair_required" | "draining"; reason: string } | { kind: "cooldown"; reason: string; until_ts: number };
-export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number; readiness?: ExecutorReadiness }
+export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number; readiness?: ExecutorReadiness; occupancy?: WorkerOccupancy }
 export function usableFor(required: ExecutionRequirements, capability: ExecutorCapabilities | ExecutorCapabilities["alternatives"][number], host: string, project: string): boolean {
   return capability.availability.kind === "usable" && capability.model !== null && capability.projects.some(p => p === "*" || p === project)
     && capabilityBlockers(required, capability, host).length === 0;
@@ -45,7 +46,9 @@ export function projectExecutionBlockers(input: {
         : reason === "offline" ? `The last supporting gateway for ${requirements.tier} reasoning is offline.` : `Supporting gateways report the required model/capability unavailable.`,
       evidence: configured.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}; model ${h.capabilities.model ?? "unreported"}${h.capabilities.availability.kind === "unavailable" ? `; ${h.capabilities.availability.reason}` : ""}`) });
   } else if (!localReady && usable.every(h => h.active >= h.capabilities.capacity)) {
-    blockers.push({ kind: "capacity_wait", episode_id: `capacity:${id}`, text: "Capable gateways are busy; waiting for capacity." });
+    blockers.push({ kind: "capacity_wait", episode_id: `capacity:${id}`, text: usable.some(h => (h.occupancy?.unconfirmed ?? 0) > 0)
+      ? "Capacity held for unconfirmed executions; the gateway must reconcile stopped process groups."
+      : "Capable gateways are busy; waiting for capacity." });
   }
   for (const ask of input.asks) blockers.push({ kind: "human_answer_required", episode_id: `ask:${ask.id}`, ask_id: ask.id, text: ask.question });
   if (handoff.phase === "preparing") blockers.push({ kind: "writer_quiescence_required", episode_id: handoff.id, text: "Publishing the checkpoint and stopping the old writer before local pickup." });

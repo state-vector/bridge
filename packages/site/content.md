@@ -192,6 +192,16 @@ Humans may explicitly request local pickup for unserved work; it goes through
 the same preparation barriers and direct agent pickup. Episode-deduplicated browser/
 desktop notifications link to the task; dismissal never changes execution state.
 
+Worker capacity distinguishes **leased executions**, **starting reservations** and
+**unconfirmed old executions**, with an explicit total of slots held. Leased is
+execution-lease evidence, not a claim that Bridge has counted OS processes.
+Expired leases and changed/released task claims become unconfirmed; their task,
+generation, session and reason are inspectable. They retain capacity until the
+gateway supplies actual stopped-process-group proof. The board never labels
+these held slots as running workers, and heartbeat-only renewals refresh its
+status independently of task edits. Older aggregate-only publishers are labelled
+unresolved executions during rollout.
+
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
 unavailable and merely busy hosts produce different facts. Queued unsupported

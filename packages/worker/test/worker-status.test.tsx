@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { currentWorkerStatus, WorkerStatusSchema } from "@bridge/contracts";
+import { currentWorkerStatus, currentWorkerOccupancy, WorkerStatusSchema, type WorkerSlot } from "@bridge/contracts";
 import { useKb } from "../../ui-kit/src/server/kbStore";
 import { WorkerAvailabilityBanner } from "../../ui-kit/src/views/WorkerAvailability";
 import { StatusDetails } from "../../ui-kit/src/views/StatusLights";
@@ -39,9 +39,27 @@ it("shows grouped connection states and independent per-host occupancy", () => {
   const html = renderToStaticMarkup(<StatusDetails hub="open" realtime="closed" lastError={null} workers={[worker, { ...worker, host: "gateway-two", active: 3, reserved: 0, capacity: 3, state: "busy" }]} />);
   expect(html).toContain("Connections"); expect(html).toContain("Live updates");
   expect(html).toContain("Connected"); expect(html).toContain("Disconnected");
-  expect(html).toContain("1 running · 1 reserved · 4 slots");
-  expect(html).toContain("3 running · 0 reserved · 3 slots");
+  expect(html).toContain("1 unresolved executions · 1 reserved · 4 slots");
+  expect(html).toContain("3 unresolved executions · 0 reserved · 3 slots");
   expect(currentWorkerStatus(worker, worker.observed_at + 120_000).state).toBe("offline");
+});
+
+it("separates lease evidence, starts and old unconfirmed capacity without inventing process counts", () => {
+  const now = Date.now();
+  const leased: WorkerSlot = { kind: "leased", task_id: "BR#1", generation: 2, attempt_id: "old-daemon-attempt", session: "dispatch-one",
+    phase: "running", lease_until: now + 1000, action_deadline: now + 5000, task_status: "in_progress" };
+  const slots: WorkerSlot[] = [leased, { ...leased, kind: "unconfirmed", reason: "claim_changed", task_id: "BR#2", task_status: "todo" },
+    { kind: "starting", task_id: "BR#3", session: "dispatch-three", expires_at: now + 2000 }];
+  const occupancy = currentWorkerOccupancy(slots, now);
+  expect(occupancy).toMatchObject({ leased: 1, unconfirmed: 1, starting: 1, held: 3 });
+  const html = renderToStaticMarkup(<StatusDetails hub="open" realtime="open" lastError={null} workers={[{ ...worker, occupancy }]} />);
+  expect(html).toContain("1 leased · 1 starting · 1 unconfirmed · 3/4 slots held");
+  expect(html).toContain("Capacity held for unconfirmed executions");
+  expect(html).toContain("BR#2"); expect(html).toContain("generation 2"); expect(html).toContain("claim changed");
+  expect(html).not.toContain("3 running");
+  const aged = currentWorkerStatus({ ...worker, observed_at: now, occupancy }, now + 1500);
+  expect(aged.state).toBe("ready"); // heartbeat and execution lease are separate clocks
+  expect(aged.occupancy).toMatchObject({ leased: 0, unconfirmed: 2, held: 3 });
 });
 
 it("hides retired lines by either lifecycle flag or typed projection, including the all-retired case", () => {

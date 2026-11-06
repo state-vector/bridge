@@ -495,6 +495,14 @@ export class KnowledgeHub {
   private boardCache: { at: number; body: any } | null = null;
   private boardLastPush = 0;
   private boardDirty = false;
+  private workerStatusPushAt = new Map<string, number>();
+  /** Keep lease/inventory-only renewals visible without a task-mutation storm.
+   * This publishes existing facts; it never extends capability or writer leases. */
+  private publishWorkerStatus(host: string, now: number) {
+    if (now - (this.workerStatusPushAt.get(host) ?? 0) < 30_000) return;
+    this.workerStatusPushAt.set(host, now);
+    this.audit(host, "worker_status_observed", null, { host, observed_at: now });
+  }
   private boardBuilds = 0;
   private boardPushes = 0;
 
@@ -2549,7 +2557,9 @@ export class KnowledgeHub {
         : occupancy.active + occupancy.reserved >= capabilities.capacity ? "busy" : "ready";
       return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, ...occupancy, capacity: capabilities.capacity,
         reason: state === "offline" ? "Worker heartbeat is stale." : readiness.kind !== "ready" ? readiness.reason
-          : !usable ? "No configured model is usable." : capabilities.capacity <= 0 ? "No worker slots configured." : state === "busy" ? "All worker slots are occupied." : "" });
+          : !usable ? "No configured model is usable." : capabilities.capacity <= 0 ? "No worker slots configured."
+          : occupancy.occupancy.unconfirmed ? `${occupancy.occupancy.unconfirmed} slot(s) held for unconfirmed executions; the gateway must reconcile stopped process groups.`
+          : state === "busy" ? "All worker slots are occupied." : "" });
     });
     return { tasks, sessions, progress, series, agents: this.agentScores(), workers };
   }
@@ -5092,6 +5102,7 @@ export class KnowledgeHub {
       this.reconcileStartupWaits(now);
       this.executionWork().sweep();
       this.reconcileSchedulingHealth(now);
+      this.publishWorkerStatus(actor, now);
       return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
@@ -5262,6 +5273,7 @@ export class KnowledgeHub {
       }
     });
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
+    else this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     if (command.kind === "yield") this.executionWork().sweep();
     return next;
   }

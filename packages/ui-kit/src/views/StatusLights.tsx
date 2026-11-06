@@ -24,7 +24,15 @@ export function StatusDetails({ hub, realtime, workers, lastError }: {
           {({ ready: "Ready", busy: "Busy", offline: "Offline", draining: "Draining", unavailable: "Unavailable" })[worker.state]}
         </span>
       </div>
-      <div className="light-worker-detail">{worker.active} running · {worker.reserved} reserved · {worker.capacity} slots</div>
+      <div className="light-worker-detail">{worker.occupancy
+        ? `${worker.occupancy.leased} leased · ${worker.occupancy.starting} starting · ${worker.occupancy.unconfirmed} unconfirmed · ${worker.occupancy.held}/${worker.capacity} slots held`
+        : `${worker.active} unresolved executions · ${worker.reserved} reserved · ${worker.capacity} slots`}</div>
+      {!!worker.occupancy?.unconfirmed && <details className="light-worker-detail"><summary>Capacity held for unconfirmed executions</summary>
+        <p>These are not confirmed running workers. The gateway must confirm old process groups stopped before their slots can be released.</p>
+        <ul>{worker.occupancy.slots.filter(slot => slot.kind === "unconfirmed").map(slot => slot.kind === "unconfirmed" && <li key={`${slot.task_id}:${slot.generation}`}>
+          {slot.task_id} · generation {slot.generation} · {slot.session} · {slot.phase} · {slot.reason.replaceAll("_", " ")}
+        </li>)}</ul>
+      </details>}
       {worker.reason && <div className="light-worker-detail">{worker.reason}</div>}
     </div>)}
     {lastError && <div className="light-error"><strong>Last error · {rel(lastError.ts)} ago</strong><span>{lastError.context}: {lastError.message}</span></div>}

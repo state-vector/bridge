@@ -40,6 +40,29 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("keeps released old writers charged but labels them unconfirmed, and frees capacity only after same-host quiescence", async () => {
+    const project = "truthful-occupancy", g = await gateway(project), peer = await gateway(project);
+    const id = await task(project), r = await reserve(g);
+    if (r.kind !== "reserved") throw new Error("no reservation");
+    let status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].occupancy).toMatchObject({ leased: 0, starting: 1, unconfirmed: 0, held: 1 });
+    expect((await g.cmd({ kind: "begin", attempt_id: "retained-writer", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-retained", id, r.session)).error).toBeUndefined();
+    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].occupancy).toMatchObject({ leased: 1, starting: 0, unconfirmed: 0, held: 1 });
+    expect((await post("transition", { id, to: "todo", actor: "system:test", note: "Card released, but no stopped-process evidence exists" })).error).toBeUndefined();
+    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0]).toMatchObject({ active: 1, reserved: 0, occupancy: { leased: 0, starting: 0, unconfirmed: 1, held: 1,
+      slots: [{ kind: "unconfirmed", task_id: id, generation: 1, attempt_id: "retained-writer", session: r.session, reason: "claim_changed", task_status: "todo" }] } });
+    expect(await reserve(g)).toMatchObject({ kind: "at_capacity", active: 1 });
+    const stop = { kind: "quiesce", generation: 1, attempt_id: "retained-writer", writers: "process_group_empty" };
+    expect((await peer.cmd(stop, "foreign-stop", id, r.session)).error).toMatch(/authority|host/);
+    expect((await g.cmd(stop, "confirmed-stop", id, r.session)).error).toBeUndefined();
+    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].occupancy).toMatchObject({ leased: 0, unconfirmed: 0, starting: 0, held: 0 });
+    // Consume the released fixture so later global eligibility censuses do not
+    // inherit its deliberately retained host affinity.
+    expect((await post("transition", { ...g.auth, id, to: "in_progress" })).error).toBeUndefined();
+  });
   it("bootstraps from the authenticated reservation without caller-supplied worker attribution, never from a peer or stale session", async () => {
     const project = "bootstrap", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), reservation = await reserve(g);
