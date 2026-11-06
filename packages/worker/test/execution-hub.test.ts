@@ -481,7 +481,10 @@ describe("durable executor on real SQLite", () => {
     const localTask = (await post("get", { id: localId })).data;
     expect(localTask).toMatchObject({ status: "blocked", meta: { blocked: { await_event: { event: "local_handoff" } } } });
     expect(localTask.meta).not.toHaveProperty("startup_wait");
-  });
+  // This end-to-end drill performs 30+ real Worker/SQLite requests, including
+  // board projections for all accumulated hosts. Budget CI contention without
+  // weakening any prerequisite, isolation or replay assertion.
+  }, 15_000);
 
   it("does not migrate independent waits, recent claims, or any real execution history", async () => {
     const host = "protected-startup-host";
