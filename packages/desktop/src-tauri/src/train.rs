@@ -6070,15 +6070,19 @@ mod tests {
     fn all_terminal_lane_reseeds_and_drives_when_base_is_live_br5186() {
         // The exact call script the incident demanded: train_status (the one
         // visibly-retired row) → train_lane with base_live=true (the reseed
-        // ask) → acquire (the fresh card's inherited config rides it) →
-        // release_if_idle's status + release. A further mock request would
-        // exhaust the script loud.
+        // ask) → acquire (the fresh card's inherited config rides it) → the
+        // BR#5114 empty-queue main-health publish (the fresh card's queue is
+        // empty, so the walk stamps it before idling) → release_if_idle's
+        // status + release. A further mock request would exhaust the script
+        // loud.
         let (hub, calls) = mock_hub(vec![
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "retired": true, "queue": [], "currently": null, "stop": null } ] })),
             // the op returns the raw SQL row — meta rides as a JSON string
             // (the parse the executor must survive)
             ok(json!({ "id": "BR#5199", "status": "blocked", "meta": json!({ "lane": { "repo": "state-vector/bridge", "base": "main", "required_workflows": ["Test"], "ci_typical_minutes": 17, "burst_max": 5, "key": "state-vector/bridge@main" }, "lease": null, "currently": null, "stop": null }).to_string() })),
             ok(json!({ "note": "lease granted — lane was free" })),
+            // the BR#5114 empty-queue main-health observation publish
+            ok(json!({ "ok": true })),
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "card": "BR#5199", "retired": false, "currently": null, "stop": null } ] })),
             ok(json!({ "note": "lease released — idle" })),
         ]);
@@ -6089,7 +6093,7 @@ mod tests {
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         assert_eq!(
             names,
-            vec!["train_status", "train_lane", "train_lease", "train_status", "train_lease"],
+            vec!["train_status", "train_lane", "train_lease", "train_queue_facts", "train_status", "train_lease"],
             "reseed + drive in one tick, got {:?}",
             names
         );
