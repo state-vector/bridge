@@ -8,7 +8,7 @@ import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
-import { ExecutionModel } from "./ExecutionModel";
+import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
 import type { ExecutionModelView } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
@@ -259,7 +259,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
         <span className="topc-agent">machine / agent</span>
-        <span className="topc-model" title="Actual execution size and state; hover for model identity. Requested minimum is separate.">model / tier</span>
+        <span className="topc-model" title="Model size; a => b means a larger model is requested. Interactive sessions use custom.">model size</span>
         <span className="topc-session">session</span>
         <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
@@ -342,6 +342,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
+            <ExecutionStatus value={r.execution} now={now} />
             {r.status === "in_progress" && (
               <Chip tone="live" pill title="in progress — the last log line says what it is running">
                 in progress

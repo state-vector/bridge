@@ -236,7 +236,7 @@ fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value
 
 fn executor_capabilities(tier: ReasoningTier, worker: &WorkerCredential) -> serde_json::Value {
     let tools: Vec<&str> = ["git", "gh", "cargo", "npm", "aws"].into_iter().filter(|bin| {
-        Command::new(bin).arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+        probe_version(bin).is_ok()
     }).collect();
     // Scope facts only: an installed AWS CLI is NOT proof of cloud authority.
     json!({ "tier": tier, "tools": tools, "environment": [std::env::consts::OS, std::env::consts::ARCH],
@@ -255,13 +255,20 @@ fn worker_config_revision(cfg: &DispatchConfig) -> String {
 }
 
 fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(WorkerCredential, serde_json::Value), String> {
+    prepare_worker_with_progress(cfg, avail, &|_| {})
+}
+
+fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value), String> {
     let backend = avail.iter().max_by_key(|b| {
         let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
         cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
     }).ok_or("no configured backend is available")?;
     let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+    report("ready: checking the gateway worker credential");
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
+    report("ready: probing local tools and configured model inventory (2s limit per probe)");
     let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
+    report("ready: advertising capabilities to the hub (8s limit per request)");
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
         return Err(format!("executor readiness held: {}", reply["readiness"]));
@@ -271,7 +278,10 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
 
 /// A bounded paired-operator preflight; never claims or launches a task.
 pub fn execution_ready(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
-    prepare_worker(cfg, &available_backends(cfg)).map(|(_, reply)| reply)
+    let report = |message: &str| logging::emit("cli", "", message);
+    report("ready: checking configured backend CLIs (2s limit per probe)");
+    let available = available_backends_with_progress(cfg, &report);
+    prepare_worker_with_progress(cfg, &available, &report).map(|(_, reply)| reply)
 }
 
 /// Recover only recorded legacy pre-begin failures, under this host's genuine
@@ -381,7 +391,10 @@ fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::
         };
         match result {
             Ok(result) => return Ok(result),
-            Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => std::thread::sleep(Duration::from_millis(250 * (retry + 1))),
+            Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => {
+                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/3 with the same command_id", retry + 2));
+                std::thread::sleep(Duration::from_millis(250 * (retry + 1)));
+            }
             Err(e) => return Err(e), // named semantic gates are terminal
         }
     }
@@ -394,6 +407,7 @@ pub fn execution_read(cfg: &DispatchConfig, task_id: &str, kind: ExecutionRead) 
     execution_call(cfg, task_id, json!({ "kind": command }))
 }
 pub fn execution_claims(cfg: &DispatchConfig, pause: bool) -> Result<serde_json::Value, String> {
+    logging::emit("cli", "", if pause { "pause: asking the hub to pause new claims (8s limit per request)" } else { "resume: asking the hub to resume new claims (8s limit per request)" });
     execution_call(cfg, "gateway", if pause { json!({ "kind": "pause_claims", "reason": "Operator runtime update: preserve active writers while draining", "budget_ms": 300_000 }) } else { json!({ "kind": "resume_claims" }) })
 }
 pub fn scheduling_status(cfg: &DispatchConfig, host: Option<&str>) -> Result<serde_json::Value, String> {
@@ -1486,10 +1500,15 @@ fn mcp_call(
     mcp_call_session(cfg, id, tool, args, None)
 }
 
-/// MCP call with an explicit session name. Task-scoped calls use
-/// `dispatch-<task_id>`: every opencode dispatch IS a fresh agent session, and
-/// per-task attribution is what lets separation-of-duties pass honestly — the
-/// session that implemented a task is never the session that verifies it.
+/// Operator control exchanges fail promptly; task/effect requests retain their
+/// existing transport budget and the same durable retry/replay contract.
+fn mcp_request_timeout(tool: &str, args: &serde_json::Value) -> Duration {
+    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise"));
+    Duration::from_secs(if control { 8 } else { 30 })
+}
+
+/// MCP call with an explicit session name. Per-task attribution keeps the
+/// implementation session distinct from the session that verifies it.
 fn mcp_call_session(
     cfg: &DispatchConfig,
     id: &mut i64,
@@ -1503,8 +1522,10 @@ fn mcp_call_session(
         obj.entry("session").or_insert_with(|| json!(name));
         obj.insert("inventory_protocol".into(), json!(2));
     }
+    let timeout = mcp_request_timeout(tool, &args);
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(if timeout == Duration::from_secs(8) { Duration::from_secs(3) } else { timeout })
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     let fence = args.get("id").and_then(|v| v.as_str()).and_then(|tid| {
@@ -1528,7 +1549,9 @@ fn mcp_call_session(
             .to_string(),
         )
         .send()
-        .map_err(|e| format!("bridge unreachable: {e}"))?;
+        .map_err(|e| if e.is_timeout() {
+            format!("bridge unreachable: {tool}/{} timed out after {}s (command_id={}); the request may have reached the hub", args.pointer("/command/kind").and_then(|v| v.as_str()).unwrap_or("call"), timeout.as_secs(), args["command_id"].as_str().unwrap_or("none"))
+        } else { format!("bridge unreachable: {e}") })?;
     if !resp.status().is_success() {
         return Err(format!("bridge {} on /mcp", resp.status()));
     }
@@ -1542,7 +1565,9 @@ fn mcp_call_session(
     {
         TOKEN_EPOCH_SEEN.store(v, Ordering::Relaxed);
     }
-    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().map_err(|e| if e.is_timeout() {
+        format!("bridge unreachable: {tool} response timed out after {}s (command_id={})", timeout.as_secs(), args["command_id"].as_str().unwrap_or("none"))
+    } else { format!("mcp response decode failed: {e}") })?;
     if let Some(err) = body.get("error") {
         return Err(format!(
             "mcp error {}: {}",
@@ -2025,6 +2050,10 @@ fn pick_backend(avail: &[opencode::Backend]) -> opencode::Backend {
 /// machine. Model is optional per provider — unset means the CLI's own
 /// default config decides (opencode), or the provider's profile (kiro).
 fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
+    available_backends_with_progress(cfg, &|_| {})
+}
+
+fn available_backends_with_progress(cfg: &DispatchConfig, report: &dyn Fn(&str)) -> Vec<opencode::Backend> {
     cfg.backends
         .iter()
         .filter(|(name, bc)| {
@@ -2033,16 +2062,44 @@ fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
                 opencode::Backend::Kiro => "kiro".to_string(),
                 _ => cfg.opencode_bin.clone(),
             });
-            std::process::Command::new(&bin)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            report(&format!("ready: probing backend {name}"));
+            match probe_version(&bin) {
+                Ok(()) => true,
+                Err(error) => { report(&format!("ready: backend {name} unavailable: {error}")); false }
+            }
         })
         .map(|(name, _)| opencode::Backend::parse(Some(name)))
         .collect()
+}
+
+fn probe_version(bin: &str) -> Result<(), String> {
+    let mut command = Command::new(bin);
+    command.arg("--version");
+    probe_command(command, Duration::from_secs(2))
+}
+
+/// Readiness probes must not wait on stdin, pipe descendants, or tool startup
+/// indefinitely. Each probe owns a fresh process group; never a worker's group.
+fn probe_command(mut command: Command, budget: Duration) -> Result<(), String> {
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| format!("cannot start version probe: {e}"))?;
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return if status.success() { Ok(()) } else { Err(format!("version probe failed: {status}")) },
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                #[cfg(unix)] unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result { Err(e) => format!("cannot poll version probe: {e}"), _ => format!("version probe timed out after {}ms", budget.as_millis()) });
+            }
+        }
+    }
 }
 
 fn slugify(s: &str) -> String {
@@ -5151,6 +5208,65 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_probe_kills_its_own_hung_process_group_within_budget() {
+        let mut command = Command::new("sh"); command.args(["-c", "sleep 10 & wait"]);
+        let started = Instant::now();
+        assert!(probe_command(command, Duration::from_millis(100)).unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut quick = Command::new("sh"); quick.args(["-c", "exit 0"]);
+        assert!(probe_command(quick, Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn resume_retry_keeps_the_original_command_id_and_does_not_repeat_a_new_effect() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut ids = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap(); socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = Vec::new(); let mut buffer = [0u8; 1024];
+                let (offset, length) = loop {
+                    let n = socket.read(&mut buffer).unwrap(); assert!(n > 0); request.extend_from_slice(&buffer[..n]);
+                    if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..offset]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap();
+                        if request.len() >= offset + 4 + length { break (offset + 4, length); }
+                    }
+                };
+                let body: serde_json::Value = serde_json::from_slice(&request[offset..offset + length]).unwrap();
+                ids.push(body["params"]["arguments"]["command_id"].as_str().unwrap().to_string());
+                let response = if attempt == 0 { "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string() }
+                    else {
+                        let body = json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[{"type":"text","text":"{\"kind\":\"claims_resumed\"}"}]}}).to_string();
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+            ids
+        });
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"control-test", "token":"fixture-only" })).unwrap();
+        assert_eq!(execution_claims(&cfg, false).unwrap()["kind"], "claims_resumed");
+        let ids = server.join().unwrap(); assert!(!ids[0].is_empty()); assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn operator_rpc_has_a_short_real_timeout_instead_of_a_silent_thirty_second_wait() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || { let (_socket, _) = listener.accept().unwrap(); let _ = wait.recv_timeout(Duration::from_secs(12)); });
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"timeout-test", "token":"fixture-only" })).unwrap();
+        let started = Instant::now(); let mut id = 0;
+        let error = mcp_call_session(&cfg, &mut id, "execution", json!({"id":"gateway","command_id":"same-receipt","command":{"kind":"resume_claims"}}), None).unwrap_err();
+        let _ = done.send(()); server.join().unwrap();
+        assert!(error.contains("timed out after 8s"), "{error}");
+        assert!(error.contains("same-receipt"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(12));
+    }
     #[test]
     fn lease_maintenance_keeps_polling_while_dispatch_is_blocked_and_joins_before_finalization() {
         let (observed, polls) = std::sync::mpsc::channel();

@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { initialExecution, reduceExecution, ExecutorCapabilitiesSchema, projectExecutionModel, executionCommandHistory, executionHistorySummary } from "../src/index.ts";
+import { initialExecution, reduceExecution, ExecutorCapabilitiesSchema, projectExecutionModel, executionCommandHistory, executionHistorySummary, executionPresentation, ReasoningTierSchema } from "../src/index.ts";
 
 function running() {
   const state = reduceExecution(initialExecution(), { kind: "begin", attempt_id: "one", worker: "host/worker", action_budget_ms: 60_000 }, "host", "session", 1_000);
@@ -16,6 +16,16 @@ it("never labels a required tier as an actual model and expires live observation
   expect(projectExecutionModel(state, { ...task, status: "blocked" }, 2_000).current).toMatchObject({ phase: "paused" });
   state.attempt!.phase = "quiesced";
   expect(projectExecutionModel(state, task, 200_000).current).toMatchObject({ phase: "quiesced" });
+});
+it("keeps human-directed model configuration custom and never inherits an old gateway tier", () => {
+  const state = running();
+  const view = projectExecutionModel(state, { status: "in_progress", session: "human", requirements: { tier: "large" }, interactive_execution: { kind: "interactive", session: "human" } }, 200_000);
+  expect(view.current).toEqual({ kind: "interactive", session: "human", phase: "active" });
+  expect(executionPresentation(view, 200_000)).toMatchObject({ size: "custom", requested: null, state: "interactive" });
+  const unknown = projectExecutionModel(null, { status: "in_progress" }, 1);
+  expect(executionPresentation(unknown, 1)).toMatchObject({ size: "unknown", state: "unreported" });
+  expect(ReasoningTierSchema.safeParse("custom").success).toBe(false);
+  expect(ReasoningTierSchema.safeParse("unknown").success).toBe(false);
 });
 it("records actual model selection, escalation reason/from/to, and omits poll noise", () => {
   const before = running();

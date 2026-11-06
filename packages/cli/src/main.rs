@@ -142,6 +142,7 @@ fn main() {
                 return;
             }
             if matches!(args.get(2).map(String::as_str), Some("pause" | "resume" | "coordinate")) {
+                logging::emit("cli", "", &format!("{}: loading gateway configuration and credential", args[2]));
                 let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found"); std::process::exit(1); });
                 let result = if args[2] == "coordinate" {
                     let id = args.get(3).filter(|id| id.starts_with("BR#")).unwrap_or_else(|| { eprintln!("usage: bridge execution coordinate <BR#id> <message>"); std::process::exit(2); });
@@ -152,6 +153,7 @@ fn main() {
                 return;
             }
             if args.get(2).map(String::as_str) == Some("ready") {
+                logging::emit("cli", "", "ready: loading gateway configuration and credential");
                 let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no pairing found — run bridge pair <hub-url>"); std::process::exit(1); });
                 match dispatch::execution_ready(&cfg) {
                     Ok(reply) => println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default()),

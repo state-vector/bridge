@@ -484,14 +484,27 @@ available, it rejects that optional bump with a precise error rather than invent
 a capability or asking a human to staff an agent. The implementation may still
 explicitly declare a hard unmet requirement and wait for capability restoration.
 Low confidence/risk gauges are evidence, not automatic tier or human escalations.
-**Model visibility and history:** Top shows the recorded model size beneath each
-agent, with the exact model ID/backend/host/session in its tooltip. A separate
-`→ large requested` indicator is a pending minimum, never a claim that large is
-already running. Restoring, stopping, paused, expired and previous/quiesced
-attempts are labelled explicitly; older agents without a receipt say **size
-unreported**. Task details show the same observation and the full model ID.
+**Model visibility and history:** Top's model-size column contains only a size
+such as `medium`, or `medium => large` when a larger model is requested. Interactive
+agents show **custom** because they use whatever model is configured locally;
+Bridge does not assign or infer their tier, even after a previous gateway run.
+Missing observations show **unknown**. Gateway model ID/backend/host/session
+remain in the tooltip. Execution state (running, stopping, lease expired,
+previous execution, etc.) is separate in the status column and task details.
+The automation minimum remains enforced independently of interactive display.
 Both board snapshots and task reads derive this typed view from canonical
 execution state, not model names or gateway defaults.
+
+`bridge execution ready` reports backend probing, worker-credential preparation,
+local capability probing and hub advertisement to stderr; `pause`/`resume` also
+report their stage immediately. Successful stdout stays JSON. Each local version
+probe has a two-second deadline and its own process group, so a hung CLI cannot
+silently stall readiness. Pause/resume/advertise RPCs use an eight-second request
+deadline with at most three retries using the same command ID (roughly 25 seconds
+per remote exchange). Credential provisioning retains its separate 15-second
+request bounds. Errors name the stage/deadline; a transport timeout is not proof
+the server did not apply the request. Persistent gateway drain is not cleared by
+`execution resume`, which only removes a temporary claims pause.
 
 The task's normal History records model selection per attempt, agent/reviewer
 escalations with from/to tiers and full reasons, checkpointed yields, and local
