@@ -47,6 +47,9 @@ checks. The public publication endpoint accepts **no caller-provided download
 URLs/manifests**: it independently verifies successful GitHub CI/build runs for
 the source commit (and the versioned release gate for stable), fetches that
 commit's release manifest, and advances channel revisions monotonically.
+The promotion job supplies its short-lived, read-only GitHub job token so
+verification is not dependent on anonymous API quotas; it is used only for
+fixed-repository API reads and is never stored in channel state or notifications.
 
 Before installing, the supervisor verifies SHA256, checks the candidate's
 embedded commit and runs doctor. It asks the runner to stop claiming work, lets

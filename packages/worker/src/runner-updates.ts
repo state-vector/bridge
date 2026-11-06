@@ -2,6 +2,7 @@ import { RunnerManifestSchema as ManifestSchema, RunnerPublishSchema as PublishS
 import { boundedWakeStream } from "./kb/sse.ts";
 export { ManifestSchema };
 const repo = "state-vector/bridge";
+class PublicationUnavailable extends Error {}
 
 /** Public build metadata only. Publication accepts hints, never caller-supplied
  * manifests or URLs. GitHub independently proves every gate and source SHA. */
@@ -11,12 +12,20 @@ export class RunnerUpdates {
   private lastProbe = 0;
   constructor(private state: DurableObjectState, private env: { GITHUB_TOKEN?: string }) {}
 
-  private async github(path: string): Promise<RunnerGithubRun> {
+  private async github(path: string, jobToken?: string): Promise<RunnerGithubRun> {
+    // The publisher's job-scoped read-only token raises API quota without a
+    // long-lived hub secret. Never persist, log, or forward it anywhere except
+    // this fixed GitHub repository API. The supplied facts still prove nothing:
+    // every run/commit/workflow is independently checked below.
+    const token = jobToken || this.env.GITHUB_TOKEN;
     const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, { headers: {
       "user-agent": "bridge-runner-updates", accept: "application/vnd.github+json",
-      ...(this.env.GITHUB_TOKEN ? { authorization: `Bearer ${this.env.GITHUB_TOKEN}` } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
     }, signal: AbortSignal.timeout(15000) });
-    if (!response.ok) throw new Error(`GitHub ${response.status}`);
+    if (!response.ok) {
+      if (response.status >= 500 || response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) throw new PublicationUnavailable(`GitHub verification temporarily unavailable (${response.status})`);
+      throw new Error(`GitHub verification ${response.status}`);
+    }
     return GithubRunSchema.parse(await response.json());
   }
 
@@ -55,22 +64,23 @@ export class RunnerUpdates {
       const body = await request.text();
       if (body.length > 2048) return new Response("too large", { status: 413 });
       const input = PublishSchema.parse(JSON.parse(body));
+      const jobToken = request.headers.get("authorization")?.replace(/^Bearer /, "");
       const current = await this.state.storage.get<{ ci_run: number; release_run?: number }>(`channel:${input.channel}`);
       if (current && (input.channel === "main" ? current.ci_run >= input.ci_run : (current.release_run ?? 0) >= (input.release_run ?? 0))) return Response.json({ unchanged: true });
       if (Date.now() - this.lastProbe < 10000) return new Response("publication validation rate limited", { status: 429 });
       this.lastProbe = Date.now();
       for (const [id, path] of [[input.ci_run, "ci.yml"], [input.build_run, "dev-build.yml"]] as const) {
-        const run = await this.github(`actions/runs/${id}`);
+        const run = await this.github(`actions/runs/${id}`, jobToken);
         if (!eligibleRun(run, input.commit, path)) throw new Error(`unverified ${path} build`);
       }
       if (input.channel === "stable") {
         if (!input.release_run) throw new Error("stable requires a successful versioned release run");
-        const release = await this.github(`actions/runs/${input.release_run}`);
+        const release = await this.github(`actions/runs/${input.release_run}`, jobToken);
         if (!eligibleRun(release, input.commit, "release.yml", true)) throw new Error("unverified stable release");
       }
       const download = `https://github.com/${repo}/releases/download/runner-${input.commit}/manifest.json`;
-      const response = await fetch(download, { signal: AbortSignal.timeout(15000) });
-      if (!response.ok) throw new Error(`manifest ${response.status}`);
+      const response = await fetch(download, { headers: { "user-agent": "bridge-runner-updates" }, signal: AbortSignal.timeout(15000) });
+      if (!response.ok) throw new PublicationUnavailable(`verified build manifest not available (${response.status})`);
       const manifest = ManifestSchema.parse(await response.json());
       if (manifest.commit !== input.commit) throw new Error("manifest commit mismatch");
       for (const [target, artifact] of Object.entries(manifest.artifacts)) {
@@ -84,7 +94,7 @@ export class RunnerUpdates {
       });
       this.send(`data: ${JSON.stringify({ type: "runner.update.available", channel: input.channel, commit: input.commit })}\n\n`);
       return Response.json({ published: input.channel, commit: input.commit });
-    } catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
+    } catch (error) { return Response.json({ error: String(error) }, { status: error instanceof PublicationUnavailable || error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError") ? 503 : 400 }); }
   }
 }
 

@@ -30,6 +30,12 @@ class UpdateTests(unittest.TestCase):
         with patch.object(m.urllib.request, "urlopen", side_effect=AssertionError("disabled updater contacted network")):
             self.u.reconcile()
 
+    def test_http_requests_use_the_application_user_agent(self):
+        with patch.object(m.urllib.request, "urlopen") as open_url:
+            m.fetch("https://hub.example/api/runner-updates/events", 90)
+            request = open_url.call_args.args[0]
+            self.assertEqual(request.get_header("User-agent"), "bridge-runner-updater/1")
+
     def test_digest_origin_channel_and_commit_are_closed(self):
         sha = "a" * 40
         manifest = {"schema_version": 1, "channel": "main", "commit": sha, "artifacts": {"aarch64-unknown-linux-gnu": {
@@ -126,7 +132,7 @@ class UpdateTests(unittest.TestCase):
                     self.assertEqual(self.bin.read_bytes(), b"old binary")
                     return True
                 def fetch(url, timeout):
-                    return io.BytesIO(data if url.endswith("tar.gz") else json.dumps(manifest).encode())
+                    return io.BytesIO(data if url.full_url.endswith("tar.gz") else json.dumps(manifest).encode())
                 machine = type("Uname", (), {"machine": target.split("-unknown")[0], "nodename": "test-host"})()
                 with patch.object(self.u, "config", return_value=config), patch.object(self.u, "pid", return_value=123), \
                      patch.object(self.u, "build", side_effect=lambda p: sha if Path(p).read_bytes() == b"new binary" else "old"), \

@@ -25,6 +25,11 @@ import uuid
 MAX_ARCHIVE = 64 * 1024 * 1024
 
 
+def fetch(url, timeout):
+    # Cloudflare browser-integrity rejects Python's default UA (403/1010).
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"user-agent": "bridge-runner-updater/1"}), timeout=timeout)
+
+
 class Phase(str, enum.Enum):
     AVAILABLE = "available"
     DRAINING = "draining"
@@ -204,7 +209,7 @@ class Supervisor:
         target = {"x86_64": "x86_64", "aarch64": "aarch64"}[os.uname().machine] + "-unknown-linux-gnu"
         url = config["url"].rstrip("/") + "/api/runner-updates/manifest?channel=" + channel
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
+            with fetch(url, timeout=30) as response:
                 manifest = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code == 404:
@@ -222,7 +227,7 @@ class Supervisor:
         self.record(Phase.AVAILABLE, from_commit=current, to_commit=candidate, channel=channel)
         with tempfile.TemporaryDirectory(dir=self.binary.parent) as temp:
             archive, executable = Path(temp) / "build.tar.gz", Path(temp) / "bridge"
-            with urllib.request.urlopen(artifact["url"], timeout=90) as source, open(archive, "wb") as output:
+            with fetch(artifact["url"], timeout=90) as source, open(archive, "wb") as output:
                 data = source.read(MAX_ARCHIVE + 1)
                 if len(data) > MAX_ARCHIVE or hashlib.sha256(data).hexdigest() != artifact["sha256"]:
                     raise ValueError("artifact checksum/size validation failed")
@@ -285,7 +290,7 @@ class Supervisor:
                     time.sleep(30)  # local config only; no network/downloads
                     continue
                 url = config["url"].rstrip("/") + "/api/runner-updates/events"
-                with urllib.request.urlopen(url, timeout=90) as response:
+                with fetch(url, timeout=90) as response:
                     backoff = 5
                     for raw in response:
                         if not opted_in(self.config()):

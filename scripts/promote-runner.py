@@ -29,7 +29,8 @@ for channel, release_run in channels:
     if release_run:
         payload["release_run"] = release_run
     request = urllib.request.Request("https://hub.fleetbridge.run/api/runner-updates/publish",
-                                     data=json.dumps(payload).encode(), headers={"content-type": "application/json"})
+                                     data=json.dumps(payload).encode(), headers={"content-type": "application/json", "user-agent": "bridge-runner-updater/1",
+                                     "authorization": "Bearer " + os.environ["GH_TOKEN"]})
     # Only deployment/transport recovery is retried. A semantic rejection is a
     # broken publication and fails the job instead of looping until it passes.
     for attempt in range(12):
@@ -39,6 +40,7 @@ for channel, release_run in channels:
             break
         except urllib.error.HTTPError as error:
             if error.code not in (404, 429, 500, 502, 503, 504):
+                print(error.read().decode()[:2000])
                 raise
             if attempt == 11:
                 raise
