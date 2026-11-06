@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import urllib.error
 import uuid
 
 MAX_ARCHIVE = 64 * 1024 * 1024
@@ -202,8 +203,13 @@ class Supervisor:
         channel = config["auto_update"]["channel"]
         target = {"x86_64": "x86_64", "aarch64": "aarch64"}[os.uname().machine] + "-unknown-linux-gnu"
         url = config["url"].rstrip("/") + "/api/runner-updates/manifest?channel=" + channel
-        with urllib.request.urlopen(url, timeout=30) as response:
-            manifest = json.load(response)
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                manifest = json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return  # no eligible release yet; subscribe to publication
+            raise
         artifact = validate_manifest(manifest, channel, target)
         current, candidate = self.build(self.binary), manifest["commit"]
         if current == candidate or self.state.get("rejected_commit") == candidate:
@@ -266,10 +272,12 @@ class Supervisor:
         self.recover()
         last_check = 0
         backoff = 5
+        seen = {}
         while True:
             try:
-                # At most once/minute on reconnect storms, once/hour otherwise.
-                if time.monotonic() - last_check > 60:
+                # Reconnect snapshots carry persisted channel revisions. No
+                # manifest polling on the hub's bounded SSE reconnect cadence.
+                if last_check == 0 or time.monotonic() - last_check >= 3600:
                     last_check = time.monotonic()
                     self.reconcile()
                 config = self.config()
@@ -284,7 +292,9 @@ class Supervisor:
                             break
                         if raw.startswith(b"data:"):
                             event = json.loads(raw[5:])
-                            if event.get("type") == "runner.update.available":
+                            channel = self.config()["auto_update"]["channel"]
+                            if event.get("type") == "runner.update.available" and event.get("channel") == channel and seen.get(channel) != event.get("commit"):
+                                seen[channel] = event.get("commit")
                                 last_check = time.monotonic()
                                 self.reconcile()
                         if time.monotonic() - last_check >= 3600:

@@ -27,7 +27,7 @@ describe("real update-channel durable object", () => {
   it("publishes only verified builds, persists the manifest and rejects replay/downgrade", async () => {
     const sha = "a".repeat(40);
     const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
-    const mf = new Miniflare({ workers: [{ name: "updates", scriptPath: bundle, modules: true,
+    const mf = new Miniflare({ port: 0, workers: [{ name: "updates", scriptPath: bundle, modules: true,
       modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")), compatibilityDate: "2025-09-06",
       durableObjects: { RUNNER_UPDATES: { className: "RunnerUpdates", useSQLite: true } },
       outboundService: async request => {
@@ -43,7 +43,7 @@ describe("real update-channel durable object", () => {
     }] });
     try {
       const ns = await mf.getDurableObjectNamespace("RUNNER_UPDATES");
-      const stub = ns.get(ns.idFromName("test")) as unknown as { fetch(input: string, init?: RequestInit): Promise<Response> };
+      const stub = ns.get(ns.idFromName("channels")) as unknown as { fetch(input: string, init?: RequestInit): Promise<Response> };
       const publish = (ci_run: number) => stub.fetch("https://updates/publish", { method: "POST", body: JSON.stringify({ channel: "main", commit: sha, ci_run, build_run: 11 }) });
       expect((await stub.fetch("https://updates/manifest?channel=main")).status).toBe(404);
       const result = await publish(10);
@@ -53,6 +53,14 @@ describe("real update-channel durable object", () => {
       const replay = await publish(9);
       expect(await replay.json()).toMatchObject({ unchanged: true });
       expect((await stub.fetch("https://updates/manifest?channel=unknown")).status).toBe(400);
+      const controller = new AbortController();
+      const events = await fetch(new URL("/api/runner-updates/events", await mf.ready), { signal: controller.signal });
+      const reader = events.body!.getReader();
+      const frame = new TextDecoder().decode((await reader.read()).value);
+      expect(frame).toContain("runner.update.available");
+      expect(frame).toContain(sha); // reconnect gets persisted state, not just a transient wake
+      controller.abort();
+      await reader.cancel().catch(() => {});
     } finally { await mf.dispose(); }
   });
 });

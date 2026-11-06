@@ -1,4 +1,5 @@
 import { RunnerManifestSchema as ManifestSchema, RunnerPublishSchema as PublishSchema, RunnerGithubRunSchema as GithubRunSchema, type RunnerGithubRun } from "@bridge/contracts";
+import { boundedWakeStream } from "./kb/sse.ts";
 export { ManifestSchema };
 const repo = "state-vector/bridge";
 
@@ -32,13 +33,15 @@ export class RunnerUpdates {
     const url = new URL(request.url);
     if (url.pathname.endsWith("/events") && request.method === "GET") {
       if (this.clients.size >= 64) return new Response("subscriber capacity reached", { status: 503 });
-      const stream = new TransformStream<Uint8Array, Uint8Array>();
-      const writer = stream.writable.getWriter();
-      this.clients.add(writer);
-      request.signal.addEventListener("abort", () => { this.clients.delete(writer); void writer.close().catch(() => {}); });
-      void writer.write(this.enc.encode("retry: 10000\n\ndata: {\"type\":\"runner.update.hello\"}\n\n"));
+      let initial = "retry: 10000\n\ndata: {\"type\":\"runner.update.hello\"}\n\n";
+      // Every connection receives persisted revisions. A missed wake never
+      // requires polling the manifest on every bounded-stream reconnect.
+      for (const channel of ["main", "stable"]) {
+        const manifest = await this.state.storage.get<{ commit: string }>(`channel:${channel}`);
+        if (manifest) initial += `data: ${JSON.stringify({ type: "runner.update.available", channel, commit: manifest.commit })}\n\n`;
+      }
       await this.state.storage.setAlarm(Date.now() + 30000);
-      return new Response(stream.readable, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
+      return boundedWakeStream(request, this.clients, initial);
     }
     if (url.pathname.endsWith("/manifest") && request.method === "GET") {
       const channel = url.searchParams.get("channel");
