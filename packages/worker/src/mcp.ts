@@ -158,13 +158,25 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
     );
   }
 
-  const sessionName = String(msg.params?.arguments?.session ?? msg.params?.arguments?.__session ?? "");
+  // Keep omitted session as `undefined` (NOT `""`): in do.ts resolveSession,
+  // `session: ""` is the internal-caller sentinel for "explicitly anonymous,
+  // skip the token's last-session fallback". Coercing a missing MCP session
+  // argument to `""` made every transition/log_progress call that omitted
+  // `session` bypass the agent's orient session.
+  const rawSession = msg.params?.arguments?.session ?? msg.params?.arguments?.__session;
+  const sessionName = typeof rawSession === "string" && rawSession.trim() ? rawSession.trim() : undefined;
 
   const call = async (op: string, payload: object) => {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id }),
+      body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id,
+        execution_scope: request.headers.get("x-bridge-task") ? {
+          id: request.headers.get("x-bridge-task"),
+          generation: Number(request.headers.get("x-bridge-generation")),
+          attempt_id: request.headers.get("x-bridge-attempt"),
+        } : null,
+      }),
     });
     const out = await r.json();
     if (!r.ok) throw kbError(op, r.status, out);
@@ -248,7 +260,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
 interface Ctx {
   call: (op: string, payload: object) => Promise<any>;
   identity: { token_id: string; label: string; tags: string[]; principal: string | null; token_epoch?: number; token_stale?: boolean };
-  sessionName: string;
+  sessionName: string | undefined;
 }
 
 /** BR#4212: DO errors ride typed — result_class + HTTP status survive the

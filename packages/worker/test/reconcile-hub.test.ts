@@ -310,3 +310,62 @@ describe("BR#5151 lane survival (real bundled worker)", () => {
     expect(after.status).toBe("blocked");
   });
 });
+
+// ---------- BR#5677: binding outranks the review gate + stamp legs ----------
+// Census BR#5634: branch protection dismisses the bot's approval on every
+// rebase, so every train-owned PR reads reviewDecision="" — the join gated
+// the binding lookup on a review decision, so "0 bound / 54 unreviewed" read
+// green while the train held 37 cars. Two fixes pinned here: the join's
+// binding-before-review-gate order (reconcile.test.ts tier 1) and the DO's
+// binding PROJECTION treating a meta.merge_train stamp (pr + repo) as
+// binding evidence when no meta.pr/meta.prs leg was ever written.
+
+describe("BR#5677 binding-before-review-gate + merge_train stamp legs (real bundled worker, census BR#5634)", () => {
+  it("train-owned PRs (reviewDecision='') bind via meta.pr AND via the stamp alone — unreviewed counts only the genuinely unbound", async () => {
+    const repo = "state-vector/reconcile-drill-5677";
+
+    // card A: bound the classic way — a meta.pr leg on an open card
+    const a = await kbJson("/create", {
+      type: "task", title: "IMPL: 5677 meta.pr-bound drill", session: "",
+      meta: { pr: { repo, number: 2440 } },
+    });
+    expect(a.status).toBe(200);
+
+    // card B: NO meta.pr/meta.prs leg — only the train's own stamp (the
+    // exact shape the bounce/awaiting/queue paths write: state + pr + repo)
+    const b = await kbJson("/create", { type: "task", title: "IMPL: 5677 stamp-bound drill", session: "" });
+    expect(b.status).toBe(200);
+    const bUpd = await kbJson("/update", {
+      id: String(b.body.id), actor: "drill",
+      meta: { merge_train: { state: "awaiting", pr: 2441, repo } },
+    });
+    expect(bUpd.status, `stamp meta update failed: ${JSON.stringify(bUpd.body)}`).toBeLessThan(400);
+
+    // three train-owned PRs, ALL with the dismissed-bot reviewDecision=""
+    const r = await report(repo, [
+      prRow(2440, { reviewDecision: null }),
+      prRow(2441, { reviewDecision: null }),
+      prRow(2442, { reviewDecision: null }), // genuinely unbound
+    ]);
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(r.body.accounting.bound).toBe(2); // 2440 via meta.pr, 2441 via the stamp
+    expect(r.body.accounting.unreviewed).toBe(1); // 2442 only
+    expect(r.body.accounting.spawned).toBe(0); // unreviewed PRs never spawn
+    expect(r.body.spawned).toHaveLength(0);
+    expect(r.body.line).toContain("2 bound");
+    expect(r.body.line).toContain("+1 unreviewed");
+
+    // a stamp WITHOUT a repo binds nothing — PR numbers are per-repo
+    // namespaces and a bare stamp pr must not cross-bind another repo's PR
+    const repo2 = "state-vector/reconcile-drill-5677b";
+    const c = await kbJson("/create", { type: "task", title: "IMPL: 5677 bare-stamp drill", session: "" });
+    await kbJson("/update", {
+      id: String(c.body.id), actor: "drill",
+      meta: { merge_train: { state: "queued", pr: 2443 } }, // no repo
+    });
+    const r2 = await report(repo2, [prRow(2443, { reviewDecision: null })]);
+    expect(r2.body.accounting.bound).toBe(0);
+    expect(r2.body.accounting.unreviewed).toBe(1);
+  });
+});

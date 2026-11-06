@@ -48,11 +48,19 @@ describe("isExemptCheckName (BR#2267 externals)", () => {
     expect(isExemptCheckName("deploy: production")).toBe(false); // plain deploy is not exempt
   });
 
+  it("BR#6001 (implements BR#3177): exempts the Superpositional external check", () => {
+    // The 'Superpositional' check is posted by the superpositional-sync GitHub
+    // App — NOT a repo workflow. Accepted BR#3177: a failing SP review
+    // pipeline (process error) is a Superpositional quality issue, never a
+    // merge gate.
+    expect(isExemptCheckName("Superpositional")).toBe(true);
+    expect(isExemptCheckName("superpositional (review)")).toBe(true);
+  });
+
   it("never exempts substance checks", () => {
     expect(isExemptCheckName("Test")).toBe(false);
     expect(isExemptCheckName("main-green gate")).toBe(false);
     expect(isExemptCheckName("CLI build")).toBe(false);
-    expect(isExemptCheckName("Superpositional")).toBe(false);
   });
 });
 
@@ -81,6 +89,39 @@ describe("classifyHeadChecks (the head half of the 5c gate)", () => {
     expect(v.red).toEqual([]);
     expect(v.external).toEqual([{ name: "Workers Builds: bridge", conclusion: "failure", url: "https://example.com/r2" }]);
     expect(v.green).toBe(1);
+  });
+
+  it("BR#6001: a Superpositional FAILURE is pulled OUT of red (external, never gating)", () => {
+    // The BR#5994 starvation shape: all substance checks SUCCESS, only
+    // 'Superpositional' FAILURE (the app's indexing pipeline errored) — the
+    // verdict must be GREEN with external[] populated, never red.
+    const v = classifyHeadChecks([
+      run(1, "Test", "success"),
+      run(2, "Superpositional", "failure", "https://example.com/r2"),
+    ]);
+    expect(v.verdict).toBe("green");
+    expect(v.red).toEqual([]);
+    expect(v.external).toEqual([{ name: "Superpositional", conclusion: "failure", url: "https://example.com/r2" }]);
+    expect(v.green).toBe(1);
+  });
+
+  it("BR#6001: a Superpositional SUCCESS still counts green (no regression)", () => {
+    const v = classifyHeadChecks([run(1, "Superpositional", "success"), run(2, "Test", "success")]);
+    expect(v.verdict).toBe("green");
+    expect(v.green).toBe(2);
+    expect(v.external).toEqual([]);
+    // in-flight SP check says nothing (BR#2267 law unchanged)
+    const inflight = classifyHeadChecks([run(1, "Superpositional", null)]);
+    expect(inflight.verdict).toBe("green");
+    expect(inflight.unsettled).toEqual([]);
+  });
+
+  it("BR#6001: unrelated external check names still classify red", () => {
+    // the exemption is pattern-listed, not a blanket — a name not on the list
+    // is unchanged: RED, external[] empty
+    const v = classifyHeadChecks([run(1, "Test", "success"), run(2, "Some Other App", "failure")]);
+    expect(v.verdict).toBe("red");
+    expect(v.external).toEqual([]);
   });
 
   it("null conclusion on a substance check is unsettled — checks still running never vouch", () => {

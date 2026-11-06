@@ -52,6 +52,10 @@ describe("ask targets", () => {
     expect(isValidAskTarget("any")).toBe(true);
     expect(isValidAskTarget("opencode-ray")).toBe(true);
     expect(isValidAskTarget("opencode-ray@fix-auth-2")).toBe(true);
+    expect(isValidAskTarget("ip-172-31-1-230/opencode")).toBe(true);
+    expect(isValidAskTarget("gateway/agent@review-1")).toBe(true);
+    expect(isValidAskTarget("https://example.test/agent")).toBe(false);
+    expect(isValidAskTarget("agent@@session")).toBe(false);
     expect(isValidAskTarget("tag:datadog-access")).toBe(true);
     expect(isValidAskTarget("has spaces")).toBe(false);
     expect(isValidAskTarget("tag:BAD TAG")).toBe(false);
@@ -147,5 +151,22 @@ describe("bootstrap composition", () => {
     expect(b).toContain("audited breach event");
     // the mirrored clause in the delegated-subagent card
     expect(b).toMatch(/PROTOCOL CARD:.*9\. RETRY LAW/s);
+  });
+
+  it("carries the authority routing law — verdict duties ask the authority, not the identity (BR#3942)", () => {
+    // BR#3930: a verdict ask addressed to an offline owner identity black-holed —
+    // Ray saw nothing in his band until he released the lane by hand. The law
+    // must ride in the bootstrap rules AND the PROTOCOL CARD (the only thing
+    // delegated subagents receive); the runtime backstop is escalateStaleAsks
+    // (ask-escalation.test.ts), but the protocol must teach filing-time
+    // authority addressing, not timeout rescue.
+    const b = composeBootstrap("My Project", DEFAULT_BOARD);
+    expect(b).toContain("6d. REQUEST ROUTING");
+    expect(b).toContain("ask the authority, not the identity");
+    expect(b).toContain('Human decisions use route {kind:"human_decision"}, to:"human"');
+    expect(b).toContain("Agent delivery failures return to the agent pool");
+    expect(b).toContain("progress is commentary, not an answer");
+    // the mirrored clause in the delegated-subagent card
+    expect(b).toMatch(/PROTOCOL CARD:.*Verdict duties ask the authority, not the identity.*BR#3942.*6\. FINISH/s);
   });
 });

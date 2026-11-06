@@ -2,6 +2,7 @@ import { Miniflare } from "miniflare";
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ExecutionAttentionSchema } from "@bridge/contracts";
 
 /**
  * Web comment plane + ask-band/detail UX contracts (BR#3462).
@@ -196,6 +197,37 @@ describe("GET /api/kb/train — the merge-train mirror (Top panel leg 1)", () =>
   });
 });
 
+describe("GET /api/kb/execution_attention — reachable human attention route", () => {
+  it("returns the typed attention snapshot through the authenticated public GET route", async () => {
+    const response = await api("/api/kb/execution_attention?project=bridge");
+    expect(response.status).toBe(200);
+    const snapshot = ExecutionAttentionSchema.parse(await response.json());
+    expect(snapshot.items).toEqual([]);
+    expect(snapshot.interactive_agents).toBeDefined();
+  });
+
+  it("still requires authentication, and does not accept POST as a read", async () => {
+    const response = await mf.dispatchFetch("https://main/api/kb/execution_attention");
+    expect(response.status).toBe(401);
+    expect((await api("/api/kb/execution_attention", { method: "POST", body: "{}" })).status).toBe(404);
+  });
+});
+
+describe("Claim-locally takeover prompt carries the worktree registry contract (2026-11-02)", () => {
+  // The sweep enumerates REGISTERED trees only — an unregistered tree is
+  // never swept. The prompt that directs a local session to create a
+  // worktree must therefore also direct it to REGISTER the worktree:
+  // without the registration one-liner the directed tree leaks by design.
+  const claimSrc = readFileSync(new URL("../../ui-kit/src/views/claimLocally.tsx", import.meta.url).pathname, "utf8");
+  it("SHARED-CHECKOUT DISCIPLINE carries the registry append one-liner + the removal duty", () => {
+    expect(claimSrc).toMatch(/SHARED-CHECKOUT DISCIPLINE/);
+    expect(claimSrc).toContain("worktree-registry.jsonl");
+    expect(claimSrc).toMatch(/"path":"<ABS worktree path>"/);
+    expect(claimSrc).toContain("REGISTER it");
+    expect(claimSrc).toContain("an unregistered tree is never swept");
+  });
+});
+
 describe("Top view renders the merge-train panel first (train panel legs 2+3)", () => {
   // Source assertions on the real views (no UI rig exists — repo convention):
   // the panel must sit at the very top of Top (before the dashboard strip) and
@@ -209,10 +241,26 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(topViewSrc.indexOf("<TrainPanel")).toBeLessThan(topViewSrc.indexOf("<DashboardSummary"));
   });
 
+  it("keeps the stop-line cause, checks and recovery next to its affected lane", () => {
+    // the banner keys off the hub-served resolution block and speaks Ray's
+    // plain words: what's broken, what fixes it, what we need from you
+    expect(trainPanelSrc).toContain("lane.line ?? unavailable");
+    expect(trainPanelSrc).toContain("Checks:");
+    expect(trainPanelSrc).toContain("{line.reason}");
+    expect(trainPanelSrc).toContain("Recovery:");
+    // BR#6390: the banner names the human gate, not a bypass suggestion —
+    // "merge the fix PR yourself, then click DONE in the ask"
+    expect(trainPanelSrc).toContain("Your action:");
+    expect(trainPanelSrc).toContain("Open the action request");
+    expect(trainPanelSrc).not.toContain("function laneStatus(");
+    expect(trainPanelSrc).not.toContain("function StalledBanner(");
+    expect(trainPanelSrc.indexOf("<LineStopBanner lane={l}")).toBeGreaterThan(trainPanelSrc.indexOf('className="ktable-row train-row"'));
+  });
+
   it("shows the CAS lock holder machine with a live heartbeat age per lane", () => {
     expect(trainPanelSrc).toMatch(/l\.lease\?\.holder/);
     expect(trainPanelSrc).toContain("lock ");
-    expect(trainPanelSrc).toMatch(/age\(l\.lease\.heartbeat_ts, now\)/);
+    expect(trainPanelSrc).toContain("age(l.lease?.heartbeat_ts ?? l.capable?.at, now)");
     // the free case is explicit, never blank — and ready vs gateway-less are
     // DISTINCT states (2026-10-29, Ray): an idle lane names the machine that
     // last ticked it; only a stale-capable lane reads as gateway-less. Copy
@@ -221,60 +269,61 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).not.toContain("lock free");
     // BR#5114 round 2: the pills speak human — "ready" / "no machine" —
     // and the machine detail lives in the tooltip
-    expect(trainPanelSrc).toMatch(/label: "ready"/);
-    expect(trainPanelSrc).toMatch(/l\.capable\?\.ready/);
-    expect(trainPanelSrc).toMatch(/label: "no machine"/);
+    expect(trainPanelSrc).toContain("No executor reported");
   });
 
   it("renders Ray's column spec — STATUS / CURRENT (card+PR links) / PROGRESS / MSG / RATE / BACKLOG (BR#5114 round 3)", () => {
     // STATUS carries the current PR inline (Ray: combine — "Checking BR#123 (PR #456)")
-    expect(trainPanelSrc).toMatch(/checking \$\{l\.attempt\.card\}/);
-    expect(trainPanelSrc).toMatch(/github\.com\/\$\{repo}\/pull\/\$\{st\.pr\}/);
-    expect(trainPanelSrc).toContain("waiting on review");
+    expect(trainPanelSrc).toContain("{line.label}");
+    expect(trainPanelSrc).toContain("https://github.com/${repo}/pull/${l.currently.pr}");
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
-    expect(trainPanelSrc).toMatch(/1 of 1 merged — settling/);
-    // BACKLOG: one row of colored blocks in walk order (BR#5114 final):
-    // green=ready (merges this pass), amber=waiting, red=conflict,
-    // grey=needs-review; head ringed; click opens the card
+    expect(trainPanelSrc).toContain("Merged — checking deployment");
+    // BACKLOG (BR#5412, Ray: the queue-block row = THE BATCH): only the
+    // cars the machine's walk stamped ready this pass render — the
+    // mergeable set, not the audit trail; head ringed; click opens the card
     expect(trainPanelSrc).toMatch(/train-blocks/);
-    expect(trainPanelSrc).toMatch(/tb-\$\{cls\}/);
-    expect(trainPanelSrc).toMatch(/l\.queue_facts\?\.entries\.find/);
+    expect(trainPanelSrc).toContain('q.state === "ready"');
+    expect(trainPanelSrc).not.toContain("l.queue_facts?.entries.find");
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
-    expect(trainPanelSrc).toContain("merges this pass");
-    expect(trainPanelSrc).toContain("stopped — main is red");
+    expect(trainPanelSrc).toContain("line.remediation?.text ?? line.reason");
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
 
-  it("renders Awaiting parks as blocks in the backlog row — the force-review queue in the one-row block language (BR#4962 per BR#4960, BR#5114 form)", () => {
-    // The DO sorts awaiting parks oldest-first; the panel renders them as
-    // blocks AFTER the queue blocks (divider between): grey (parked), amber
-    // (aging, past the review window), red (lapsed, past window + grace) —
-    // no parked card may sit without a visible state, click opens the card,
-    // age + anchored verdict ride the tooltip. No text chips, no commentary.
-    expect(trainPanelSrc).toMatch(/\(l\.awaiting \?\? \[\]\)\.map/);
-    expect(trainPanelSrc).toMatch(/tb-awaiting\$\{a\.lapsed \? " tb-awaiting-lapsed" : a\.aging \? " tb-awaiting-aging" : ""\}/);
+  it("renders the PRs column as 3-bucket PR stats (in progress · verifying · ready) + sequential merge batches coloured strictly by verification state (BR#5658 v2, Ray 2026-11-03)", () => {
+    // 1. strictly 3-bucket lane PR stats: in progress · verifying · ready (no 4th waiting stat)
+    expect(trainPanelSrc).toMatch(/train-stats/);
+    expect(trainPanelSrc).toMatch(/ts-ip/);
+    expect(trainPanelSrc).toMatch(/ts-verifying/);
+    expect(trainPanelSrc).toMatch(/ts-ready/);
+    expect(trainPanelSrc).not.toMatch(/ts-waiting/);
+    // 2. sequential merge batches (Batch 1 | Batch 2 | …) separated by .train-block-gap
+    expect(trainPanelSrc).toMatch(/train-block-group/);
     expect(trainPanelSrc).toMatch(/train-block-gap/);
-    expect(trainPanelSrc).toMatch(/age\(Date\.now\(\) - a\.age_ms, Date\.now\(\)\)/);
-    expect(trainPanelSrc).toContain("force-review from the backlog");
-    expect(trainPanelSrc).not.toContain("◉ awaiting");
-    // a parked card keeps the lane's signal lit even with an empty queue
-    expect(trainPanelSrc).toMatch(/l\.awaiting\?\.length/);
+    expect(trainPanelSrc).toMatch(/Batch \$\{bi \+ 1\}/);
+    // 3. verification colour law: green = ready (.tb-ready), orange pulsing =
+    // being verified (.tb-verifying), orange solid = waiting to be verified (.tb-wait);
+    // no red on awaiting parks (BR#5476)
+    expect(trainPanelSrc).toContain('q.state === "ready"');
+    expect(trainPanelSrc).toMatch(/tb-ready/);
+    expect(trainPanelSrc).toMatch(/tb-verifying/);
+    expect(trainPanelSrc).toMatch(/tb-wait/);
+    expect(trainPanelSrc).not.toMatch(/tb-awaiting-lapsed/);
+    // a parked card or non-zero PR stat keeps the lane's signal lit
+    expect(trainPanelSrc).toContain("l.pr_stats ??");
   });
 
   it("shows activity: what the train is working on, for how long, queue depth + head, and merge throughput (1h/24h) with the last executor event", () => {
     // in-flight phase (STATUS pill maps phases to words)
-    expect(trainPanelSrc).toMatch(/l\.currently\.phase/);
+    expect(trainPanelSrc).toContain("l.currently?.phase");
     // MSG: the freshest true message — the live machine note (aged out at
     // the lease TTL), else the attempt sentence, else the last ledger action
-    expect(trainPanelSrc).toMatch(/l\.now_action/);
-    expect(trainPanelSrc).toMatch(/nowAction\(l, now\)/);
-    expect(trainPanelSrc).toContain("ageSec > 300");
+    expect(trainPanelSrc).toContain("line.remediation?.text ?? line.reason");
     // RATE: merges per hour / 24h
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
-    expect(trainPanelSrc).toMatch(/l\.activity\.last_event\.kind/);
+    expect(trainPanelSrc).toContain("line.observed_at");
   });
 });
 

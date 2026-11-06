@@ -94,11 +94,14 @@ describe("ask TTL escalation (real DO)", () => {
     // the SAME node carries the escalation — no duplicate ask was minted
     const node = await kbJson("/get", { id: askId });
     expect(node.body.type).toBe("question");
-    const esc = node.body.meta?.ask?.escalated;
+    const esc = node.body.meta?.ask?.recovery;
     expect(esc).toBeTruthy();
     expect(esc.from_target).toBe("escal-ghost-agent");
     expect(esc.ttl_min).toBe(30); // the default TTL
-    expect(String(esc.reason)).toMatch(/offline/);
+    expect(String(esc.reason)).toMatch(/agent pool/);
+    expect(node.body.meta.ask.to).toBe("any");
+    expect(node.body.meta.ask.route.kind).toBe("agent_coordination");
+    expect(node.body.meta.ask.escalated).toBeUndefined();
     expect(node.body.meta.ask.options).toEqual(["RELEASE — back to the pool", "KEEP — keep it blocked"]);
     expect(node.body.status).toBe("todo"); // still the one open ask, re-routed not re-asked
 
@@ -106,13 +109,12 @@ describe("ask TTL escalation (real DO)", () => {
     const board = await kb("/board");
     const boardBody = await board.json();
     const row = (boardBody.tasks ?? []).find((x: any) => x.id === askId);
-    expect(row?.ask_target).toMatchObject({ online: false, last_seen_ts: null, source: "unknown" });
-    expect(row?.meta?.ask?.escalated).toBeTruthy();
+    expect(row?.meta?.ask?.recovery).toBeTruthy();
 
     // the escalation is audited + versioned (receipts, not side effects)
     const ev = await kb("/events?since=0&limit=500");
     const evBody = await ev.json();
-    const audited = (evBody.events ?? []).some((e: any) => e.op === "ask_escalated" && e.artefact_id === askId);
+    const audited = (evBody.events ?? []).some((e: any) => e.op === "ask_rerouted" && e.artefact_id === askId);
     expect(audited).toBe(true);
   });
 
@@ -154,14 +156,15 @@ describe("ask TTL escalation (real DO)", () => {
     const sweep = await kbJson("/admin.ask_escalation_sweep", { now: t0 + 34 * 60_000 });
     expect(sweep.body.escalated).not.toContain(String(human.body.id));
     expect(sweep.body.escalated).not.toContain(String(any.body.id));
-    expect(sweep.body.escalated).not.toContain(String(scoped.body.id));
+    expect(sweep.body.escalated).toContain(String(scoped.body.id));
+    expect((await kbJson("/get", { id: scoped.body.id })).body.meta.ask.to).toBe("any");
   });
 
   it("answering an escalated ask still dispatches — resume AND release-class answers both work (the BR#3822 hand-release, automated)", async () => {
     // the ghost ask from test 1 is bound to its blocked carrier task
     const board = await kb("/board");
     const boardBody = await board.json();
-    const askRow = (boardBody.tasks ?? []).find((x: any) => x.id && x.meta?.ask?.escalated);
+    const askRow = (boardBody.tasks ?? []).find((x: any) => x.id && x.meta?.ask?.recovery && x.meta.ask.artefact_id);
     expect(askRow).toBeTruthy();
 
     // generic rule-6 resume: a GO-class answer (no option-word hit) resumes
@@ -221,5 +224,63 @@ describe("ask TTL escalation (real DO)", () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../src/kb/do.ts", import.meta.url), "utf8");
     expect(src).toContain("await this.escalateStaleAsks(now0)");
+
+    /** index of the `}` matching the `{` at openIdx (balanced-text match —
+     *  the alarmSweep region holds no unbalanced braces in strings/comments) */
+    const matchBrace = (s: string, openIdx: number): number => {
+      let depth = 0;
+      for (let i = openIdx; i < s.length; i++) {
+        if (s[i] === "{") depth++;
+        else if (s[i] === "}") { depth--; if (depth === 0) return i; }
+      }
+      return -1;
+    };
+    /** the whole `try { … } catch (…) { … }` statement starting at tryIdx */
+    const tryCatchStmt = (s: string, tryIdx: number): string => {
+      const tryClose = matchBrace(s, s.indexOf("{", tryIdx));
+      const catchKw = s.indexOf("catch", tryClose);
+      const end = catchKw === -1 ? tryClose : matchBrace(s, s.indexOf("{", catchKw));
+      return s.slice(tryIdx, end + 1);
+    };
+
+    // alarmSweep's body
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    expect(sweepOpen).toBeGreaterThan(-1);
+    const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
+
+    // BR#6202 placement pin — the escalation used to sit INSIDE the
+    // starvation sweep's catch (ran only when sweepLaneStarvation threw),
+    // so a plain `toContain` passed while the happy path never escalated.
+    // The contract: the starvation sweep's try statement and the escalation
+    // phase are SIBLINGS, and the escalation carries its own guard.
+    const starveCall = body.indexOf("await this.sweepLaneStarvation(now0);");
+    expect(starveCall).toBeGreaterThan(-1);
+    const starveTry = body.lastIndexOf("try", starveCall);
+    const starveStmt = tryCatchStmt(body, starveTry);
+    const escCall = body.indexOf("await this.escalateStaleAsks(now0);");
+    expect(escCall).toBeGreaterThan(-1);
+    // the call lives OUTSIDE the starvation sweep's try/catch — a successful
+    // starvation sweep no longer skips it
+    expect(starveStmt).not.toContain("escalateStaleAsks");
+    expect(escCall).toBeGreaterThan(starveTry + starveStmt.length);
+    // and it is guarded by its OWN try/catch with a phase audit line — an
+    // escalation error degrades alone instead of riding another phase's catch
+    const escTry = body.lastIndexOf("try", escCall);
+    const escStmt = tryCatchStmt(body, escTry);
+    expect(escStmt).toContain("await this.escalateStaleAsks(now0);");
+    expect(escStmt).toContain("} catch");
+    expect(escStmt).toContain("ask_escalation_error");
+  });
+
+  it("a full alarm-sweep tick completes green with the escalation phase in place (the drill DO's healthy lane: sweepLaneStarvation SUCCEEDS on this tick)", async () => {
+    // The alarm cadence's own code path (admin.alarm_sweep → alarmSweep):
+    // with no lanes configured, sweepLaneStarvation resolves — the happy
+    // path. Under the BR#6202 defect this tick still passed (the escalation
+    // merely never ran); the placement contract above pins WHERE the call
+    // sits, and the ask-escalation drill above pins WHAT it does. Together:
+    // every tick escalates.
+    const sweep = await kbJson("/admin.alarm_sweep");
+    expect(sweep.status, JSON.stringify(sweep.body)).toBe(200);
+    expect(sweep.body.ok).toBe(true);
   });
 });

@@ -15,6 +15,7 @@ import {
   taskKind,
   validateTransition,
   verifyVerdictStatement,
+  canonicalVerdictTitle,
 } from "../src/kb/core.ts";
 
 describe("tag parsing (stored column is untrusted)", () => {
@@ -207,7 +208,7 @@ import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from
 const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
   reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
-  artefacts_created: 0, verify_duty_backlog: 0,
+  artefacts_created: 0, verify_duty_backlog: 0, train_red: 0,
 };
 
 describe("role playbook resolution (settings.roles overrides)", () => {
@@ -264,6 +265,15 @@ describe("agent behaviour score", () => {
     const mixed = scoreAgent({ ...zero, result_lost: 2, abandoned: 1 });
     expect(mixed.score).toBe(40);
     expect(mixed.hints.join(" ")).toMatch(/watchdog-blocked/);
+  });
+
+  it("BR#5517: a train_red ding costs 5 per episode, capped at 15, with the exoneration hint", () => {
+    const one = scoreAgent({ ...zero, train_red: 1 });
+    expect(one.score).toBe(45);
+    expect(one.hints.join(" ")).toMatch(/stop-the-line episode/);
+    const many = scoreAgent({ ...zero, train_red: 5 });
+    expect(many.score).toBe(35); // min(15, 5×5) — capped, one bad night ≠ zero
+    expect(many.hints.join(" ")).toMatch(/5 stop-the-line episode/);
   });
 });
 
@@ -329,8 +339,8 @@ describe("BR#3352 completed_result_lost — session-trail classification", () =>
   });
 });
 
-describe("verify-verdict decision statement (human-facing ask prepended at creation)", () => {
-  it("PASS frames the accept-and-close ask with target, receipts source and round", () => {
+describe("verify-verdict decision statement (machine-application reality, BR#5377 F4)", () => {
+  it("PASS states the machine-apply: accepted on filing, no GO/NO-GO, supersede is the human leg", () => {
     const s = verifyVerdictStatement({
       decision_class: "verify-verdict",
       verify_target: "BR#1865",
@@ -338,37 +348,75 @@ describe("verify-verdict decision statement (human-facing ask prepended at creat
       round: "1",
       session: "dispatch-BR-2391",
     });
-    expect(s).toContain("What you are deciding");
-    expect(s).toContain("agents propose, only a human accepts");
-    expect(s).toContain("closes **BR#1865** as **done**");
+    expect(s).toContain("machine-applied");
+    expect(s).toContain("no human GO/NO-GO");
+    expect(s).toContain("accepted **BR#1865**");
+    expect(s).toContain("merge train");
+    expect(s).toContain("Supersede");
     expect(s).toContain("dispatch-BR-2391");
-    expect(s).toContain("round 1");
     expect(s).toContain("auto-added"); // clearly marked as machine-generated
+    expect(s).not.toContain("What you are deciding"); // the human-gate framing is gone
   });
 
-  it("BOUNCE frames the bounce-back ask", () => {
+  it("BOUNCE states the applied bounce", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#42", verdict: "bounce" });
-    expect(s).toContain("bounces **BR#42** back to `in_progress` with the findings");
-    expect(s).not.toContain("closes **");
+    expect(s).toContain("bounced **BR#42** back to `in_progress` with the findings");
+    expect(s).not.toContain("accepted **");
   });
 
   it("falls back gracefully when meta fields are missing", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict" });
     expect(s).toContain("the task");
     expect(s).not.toContain("by session"); // no session clause when absent
-    expect(s).not.toContain("round ");
   });
 
-  it("accepts meta-shaped round numbers and prefers task over verify_target", () => {
+  it("prefers task over verify_target", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#9", verify_target: "BR#8", verdict: "pass", round: 4, session: "s1" });
     expect(s).toContain("**BR#9**");
     expect(s).not.toContain("BR#8");
-    expect(s).toContain("round 4");
   });
 
   it("stays well under the body limit so prepending never trips checkLimits", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", verify_target: "BR#123456", verdict: "pass", round: "12", session: "a-very-long-session-name-indeed" });
     expect(s.length).toBeLessThan(1000);
+  });
+});
+
+describe("canonical verify-verdict title (BR#5377 F3 — hub-minted, plain language)", () => {
+  it("mints ACCEPT with pr number + repo and the target card", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#5370", verdict: "SUBSTANCE_VERIFIED_ACCEPT",
+      pr: 346, repo: "state-vector/bridge",
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/bridge#346 → BR#5370");
+  });
+
+  it("mints from a /pull/ URL meta.pr (the receipts-dense verifier shape)", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#5305", verdict: "verified",
+      pr: "https://github.com/state-vector/superpositional/pull/2623",
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/superpositional#2623 → BR#5305");
+  });
+
+  it("mints from an object meta.pr {repo, number} (the train stamp shape)", () => {
+    expect(canonicalVerdictTitle({
+      decision_class: "verify-verdict", task: "BR#3574", verdict: "verified",
+      pr: { repo: "state-vector/superpositional", number: 2432 },
+    })).toBe("Verify verdict — ACCEPT — PR state-vector/superpositional#2432 → BR#3574");
+  });
+
+  it("BOUNCE head for a bounce verdict; digits-only pr without repo stays readable", () => {
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", task: "BR#7", verdict: "bounce", pr: "77" }))
+      .toBe("Verify verdict — BOUNCE — PR #77 → BR#7");
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", task: "BR#7", verdict: "bounce", pr: 77, repo: "o/r" }))
+      .toBe("Verify verdict — BOUNCE — PR o/r#77 → BR#7");
+  });
+
+  it("target-only verdicts mint without a PR clause; nothing resolvable returns null (authored title stands)", () => {
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", verify_target: "BR#5305", verdict: "pass" }))
+      .toBe("Verify verdict — ACCEPT — BR#5305");
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", verdict: "pass" })).toBeNull();
+    expect(canonicalVerdictTitle({ decision_class: "verify-verdict", pr: "not-a-pr" })).toBeNull();
+    expect(canonicalVerdictTitle(null)).toBeNull();
   });
 });
 
@@ -439,7 +487,7 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
   });
 });
 
-import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS } from "../src/kb/core.ts";
+import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS, mergeTrainHoldPrefix, isWatchdogTrainHoldPark } from "../src/kb/core.ts";
 
 // BR#4067 — the typed-proxy hold predicate: every watchdog release path
 // consults this one function. The PR #257/BR#4015 class: a card carrying a
@@ -489,6 +537,46 @@ describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
 
   it("the hold result-class is the abandonment-scoring exemption stamp", () => {
     expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+  });
+});
+
+// BR#5750 — the queue-preserving park prefix: mergeTrainQueue admits cars by
+// the merge-train: reason prefix alone, so a watchdog hold-park of a
+// queued/awaiting-ci car whose note lacks the prefix silently dropped the
+// live queue slot out of the train queue forever (the BR#4995 class,
+// root-caused from the BR#5674 Mission 2 audit).
+describe("mergeTrainHoldPrefix + isWatchdogTrainHoldPark (BR#5750)", () => {
+  it("live-slot states get the state-named merge-train prefix; every other hold stays unprefixed", () => {
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "queued" } })).toBe("merge-train: queued — ");
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "awaiting-ci" } })).toBe("merge-train: awaiting-ci — ");
+    // bounced/awaiting are NOT queue slots — their legs re-enter through the
+    // board (fresh verify accept), never the queue
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" } })).toBeNull();
+    expect(mergeTrainHoldPrefix({ merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge" } })).toBeNull();
+    expect(mergeTrainHoldPrefix(null)).toBeNull();
+    expect(mergeTrainHoldPrefix({})).toBeNull();
+  });
+
+  it("legacy watchdog hold-parks of queued cars are recognised on their park facts (the already-dropped BR#4995 cars)", () => {
+    const park = { merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" } };
+    expect(isWatchdogTrainHoldPark({
+      ...park,
+      blocked: { reason: "silence-release held (watchdog): no update for >10m, but the card carries merge-train queued on PR state-vector/bridge#259 — parked on the typed proxy, not released (BR#4067)" },
+    })).toBe(true);
+    expect(isWatchdogTrainHoldPark({
+      ...park,
+      blocked_reason: "declared subprocess window (45m) lapsed, but the card carries merge-train queued on PR state-vector/bridge#259 — release held (BR#4067)",
+    })).toBe(true);
+  });
+
+  it("non-queued states and non-hold reasons are never admitted by the legacy detector", () => {
+    const hold = "silence-release held (watchdog): no update for >10m — parked on the typed proxy, not released (BR#4067)";
+    for (const state of ["awaiting-ci", "bounced", "awaiting", "stopped", "landed", ""]) {
+      expect(isWatchdogTrainHoldPark({ merge_train: { state }, blocked: { reason: hold } })).toBe(false);
+    }
+    expect(isWatchdogTrainHoldPark({ merge_train: { state: "queued" }, blocked: { reason: "blocked on a human ruling" } })).toBe(false);
+    expect(isWatchdogTrainHoldPark({ merge_train: { state: "queued" } })).toBe(false);
+    expect(isWatchdogTrainHoldPark(null)).toBe(false);
   });
 });
 

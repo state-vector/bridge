@@ -232,13 +232,15 @@ pub fn run() {
             voice_permissions
         ])
         .setup(|app| {
-            // Permission prompt at launch so the dialog precedes any ask.
             #[cfg(target_os = "ios")]
             {
-                ios_notify::ensure_authorized();
                 ios_notify::install_delegate(app.handle().clone());
                 voice::init(app.handle().clone());
-                voice::request_permissions();
+                // BR#5449: NO permission prompts at launch. Notification auth
+                // arms on the first notify_ask; mic/speech auth on the first
+                // listen_start (see the modules). System alerts raised during
+                // the launch animation can leak invisibly on device and block
+                // every touch while the UI renders — Ray's dead-taps report.
             }
 
             let handle = app.handle().clone();

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -17,10 +17,40 @@ use crate::logging;
 use crate::opencode;
 use crate::scm;
 
+#[path = "stopped_outbox.rs"]
+mod stopped_outbox;
+
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
     logging::emit("dispatch", scope, msg);
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SchedulingOutcome {
+    Reserved { task_id: String, session: String },
+    Ready { candidates: Vec<String> },
+    NoEligibleWork { eligible: usize, reasons: HashMap<String, usize> },
+    AtCapacity { active: usize, reserved: usize, capacity: usize },
+    GatewayNotReady { reason: String },
+    ReservationPending {},
+    ReservationLapsed { task_id: String },
+}
+
+static CLAIM_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+fn remember_claim_session(cfg: &DispatchConfig, tid: &str, session: &str) {
+    CLAIM_SESSIONS.get_or_init(Default::default).lock().expect("claim session map poisoned")
+        .insert(format!("{}:{tid}", cfg.label.as_deref().unwrap_or("runner")), session.to_string());
+}
+fn claim_session(cfg: &DispatchConfig, tid: &str) -> String {
+    CLAIM_SESSIONS.get_or_init(Default::default).lock().expect("claim session map poisoned")
+        .get(&format!("{}:{tid}", cfg.label.as_deref().unwrap_or("runner"))).cloned()
+        .unwrap_or_else(|| format!("dispatch-{}", slugify(tid))) // legacy claims retain their original identity
+}
+
+fn failed_launch_has_no_writer(state: &serde_json::Value) -> bool {
+    state.get("attempt").is_some_and(|attempt| attempt.is_null() || attempt["phase"] == "quiesced")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +110,21 @@ pub struct DispatchConfig {
     /// case-insensitively against the tail of the repo URL.
     #[serde(default)]
     pub worktree_exempt_repos: Vec<String>,
+    /// 2026-11-02 (Ray: "worktrees are still not being cleaned up — massive
+    /// disk space leakage"): extra git repo ROOTS whose REGISTERED worktrees
+    /// the stale sweep enumerates via `git worktree list` — e.g. the shared
+    /// checkout, where interactive agent sessions create trees per AGENTS.md
+    /// rule 6 with no other lifecycle owner. The dir scans only cover the
+    /// runner's own roots (<workdir>/repos/<repo>/.worktrees, the legacy
+    /// ~/.bridge/worktrees, <workdir>/worktrees); everything else — the
+    /// 30+ GB class observed on the checkout: .worktrees/*, ~/Projects/wt-*,
+    /// /tmp trees — is registered in a repo the sweep never consulted.
+    /// Env BRIDGE_SWEEP_REPOS (comma-separated paths).
+    #[serde(default)]
+    pub sweep_repos: Vec<String>,
+    /// Explicit opt-in. Absent/null/disabled never downloads or replaces binaries.
+    #[serde(default)]
+    pub auto_update: Option<AutoUpdateConfig>,
     /// Enabled backends, keyed by provider name. Each section carries that
     /// provider's own config — model, agent profile, CLI binary override.
     /// A dict, not an array: providers differ (opencode has its own default
@@ -98,10 +143,68 @@ pub struct DispatchConfig {
     pub identity: Option<IdentityProfile>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoUpdateConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub channel: UpdateChannel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel { Main, Stable, Pinned }
+
+/// Local request is written only by the separately supervised updater. It is
+/// deliberately fail-closed across crashes: only its owner removes the hold.
+fn update_request() -> Option<serde_json::Value> {
+    if std::env::var("BRIDGE_MANAGED_UPDATES").as_deref() != Ok("1") { return None; }
+    let home = std::env::var("HOME").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(home).join(".bridge/update/request.json")).ok()?).ok()?;
+    value["nonce"].as_str().filter(|s| !s.is_empty())?;
+    Some(value)
+}
+
+fn update_receipt(name: &str, value: &serde_json::Value) {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".bridge/update").join(name);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, value.to_string()).is_ok() { let _ = std::fs::rename(tmp, path); }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateTrainBarrier { DrainingWorkers, Quiescent }
+
+/// Worker draining may take an entire action budget. Keep delivery running
+/// throughout it; only stop/join the train at the actual restart barrier.
+fn update_train_barrier(
+    active_workers: usize,
+    train_stop: &AtomicBool,
+    train_handle: &mut Option<std::thread::JoinHandle<()>>,
+) -> Result<UpdateTrainBarrier, &'static str> {
+    if active_workers > 0 { return Ok(UpdateTrainBarrier::DrainingWorkers); }
+    train_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = train_handle.take() {
+        handle.join().map_err(|_| "update deferred: train thread panicked; no idle receipt")?;
+    }
+    Ok(UpdateTrainBarrier::Quiescent)
+}
+
 /// Per-provider settings. Everything optional — a provider section can be
 /// empty ({}) and the runner just uses that CLI's own defaults.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
+    #[serde(default = "default_isolate")]
+    pub enabled: bool,
+    #[serde(default = "default_projects")]
+    pub projects: Vec<String>,
+    /// Explicit capability declaration; never inferred from a model-name regex.
+    #[serde(default)]
+    pub reasoning_tier: ReasoningTier,
+    /// Explicit tier supply. Lane policy is global in Bridge, never per host.
+    #[serde(default, deserialize_with = "tier_models_de", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<ReasoningTier, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,   // CLI binary override (default: "opencode" / "kiro")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +213,507 @@ pub struct BackendConfig {
     pub model: Option<String>, // model override; unset = the CLI's own default config decides
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>, // transport: "acp" (default for opencode) | "stdio"
+}
+fn default_projects() -> Vec<String> { vec!["*".into()] }
+impl Default for BackendConfig {
+    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, models: Default::default(), bin: None, agent: None, model: None, mode: None } }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningTier { #[default] Small, Medium, Large }
+
+fn tier_models_de<'de, D: serde::Deserializer<'de>>(de: D) -> Result<std::collections::BTreeMap<ReasoningTier, String>, D::Error> {
+    let models = std::collections::BTreeMap::<ReasoningTier, String>::deserialize(de)?;
+    if models.values().any(|m| m.trim().is_empty()) { return Err(serde::de::Error::custom("tier models must contain non-empty CLI model IDs")); }
+    Ok(models.into_iter().map(|(tier, model)| (tier, model.trim().to_string())).collect())
+}
+
+fn backend_satisfies(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> bool {
+    selected_model(cfg, backend, meta).is_some()
+}
+
+fn configured_models(cfg: &DispatchConfig, bc: &BackendConfig) -> Vec<(ReasoningTier, String)> {
+    if !bc.models.is_empty() {
+        return bc.models.iter().filter(|(_, model)| !model.trim().is_empty()).map(|(tier, model)| (*tier, model.clone())).collect();
+    }
+    bc.model.clone().or_else(|| cfg.model.clone()).filter(|model| !model.trim().is_empty())
+        .map(|model| vec![(bc.reasoning_tier, model)]).unwrap_or_default()
+}
+
+fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> Option<(ReasoningTier, String)> {
+    let required = meta.pointer("/execution_scheduling_requirements/tier").or_else(|| meta.pointer("/execution_requirements/tier"))
+        .and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
+    let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+    let bc = cfg.backends.get(name)?;
+    if !bc.enabled || !bc.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str()) { return None; }
+    let initial_selection = meta.get("execution_scheduling_requirements").is_some() && meta.get("execution_last_model").is_none();
+    configured_models(cfg, bc).into_iter().filter(|(tier, _)| if initial_selection { *tier == required } else { *tier >= required }).min_by_key(|(tier, _)| *tier)
+}
+
+fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
+    task["status"] == "in_progress" && state["attempt"]["phase"] == "quiesced"
+        && state.get("capacity_handoff").map(|h| h.is_null()).unwrap_or(true)
+        && state["attempt"]["host"].as_str() == host && host.is_some()
+        && state["attempt"]["session"].as_str().is_some()
+        && state["attempt"]["session"] == task["meta"]["session"]
+        && matches!(state.pointer("/handoff/phase").and_then(|v| v.as_str()), None | Some("none" | "returned"))
+}
+
+fn executor_capabilities(tier: ReasoningTier, worker: &WorkerCredential) -> serde_json::Value {
+    let tools: Vec<&str> = ["git", "gh", "cargo", "npm", "aws"].into_iter().filter(|bin| {
+        probe_version(bin).is_ok()
+    }).collect();
+    // Scope facts only: an installed AWS CLI is NOT proof of cloud authority.
+    json!({ "tier": tier, "tools": tools, "environment": [std::env::consts::OS, std::env::consts::ARCH],
+        "worker": { "kind": "provisioned", "label": worker.label } })
+}
+
+fn requested_worker_label(cfg: &DispatchConfig) -> String {
+    match &cfg.label {
+        Some(label) if !label.is_empty() => format!("{label}/{}", agent_segment(cfg)),
+        _ => agent_identity(cfg),
+    }
+}
+
+fn worker_config_revision(cfg: &DispatchConfig) -> String {
+    format!("worker-ready-v2:task-affinity-v1:eligibility-first-v1:{}", serde_json::to_string(&cfg.backends).unwrap_or_default())
+}
+
+fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(WorkerCredential, serde_json::Value), String> {
+    prepare_worker_with_progress(cfg, avail, &|_| {})
+}
+
+#[derive(Clone)]
+struct GatewayReadyProof { worker: WorkerCredential, observed: Instant }
+
+enum GatewayReadinessState {
+    Unavailable(String),
+    Ready(GatewayReadyProof),
+}
+
+struct GatewayReadinessData {
+    cfg: DispatchConfig,
+    key: String,
+    state: GatewayReadinessState,
+}
+
+/// Capability TTL is a gateway clock, not a side effect of completing a tick.
+/// A single producer owns worker provisioning/probing and publishes no claims,
+/// attempt leases, writer counts or synthetic progress.
+struct GatewayReadiness {
+    data: Arc<Mutex<GatewayReadinessData>>,
+    maintenance: LeaseMaintenance,
+}
+
+fn gateway_readiness_key(cfg: &DispatchConfig) -> String {
+    json!({"url":cfg.url,"host":cfg.label,"worker":requested_worker_label(cfg),
+        "inventory":worker_config_revision(cfg),"fallback_model":cfg.model,
+        "opencode_bin":cfg.opencode_bin,"capacity":cfg.max_sessions}).to_string()
+}
+
+impl GatewayReadiness {
+    fn start(cfg: &DispatchConfig) -> Self {
+        Self::with_probe(cfg, Duration::from_secs(20), |cfg| {
+            let available = available_backends(cfg);
+            if available.is_empty() {
+                if let Some(name) = cfg.backends.keys().next() {
+                    let capabilities = capability_inventory(cfg, &[], None, name);
+                    execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
+                }
+                return Err("no runnable configured backend".into());
+            }
+            prepare_worker(cfg, &available).map(|(worker, _)| worker)
+        })
+    }
+
+    fn with_probe(cfg: &DispatchConfig, interval: Duration,
+        mut probe: impl FnMut(&DispatchConfig) -> Result<WorkerCredential, String> + Send + 'static) -> Self {
+        let initial = match probe(cfg) {
+            Ok(worker) => GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() }),
+            Err(error) => GatewayReadinessState::Unavailable(error),
+        };
+        let data = Arc::new(Mutex::new(GatewayReadinessData { cfg: cfg.clone(), key: gateway_readiness_key(cfg), state: initial }));
+        let shared = data.clone();
+        let maintenance = LeaseMaintenance::start(interval, move || {
+            let (cfg, key) = { let data = shared.lock().expect("gateway readiness poisoned"); (data.cfg.clone(), data.key.clone()) };
+            let result = probe(&cfg); // no shared lock held across bounded probes/network
+            let mut data = shared.lock().expect("gateway readiness poisoned");
+            if data.key == key && data.cfg.token == cfg.token {
+                data.state = match result {
+                    Ok(worker) => {
+                        dlog("gateway", "readiness renewed independently of dispatch");
+                        GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() })
+                    }
+                    Err(error) => {
+                        dlog("gateway", &format!("readiness renewal failed: {error}; no fresh local admission proof"));
+                        GatewayReadinessState::Unavailable(error)
+                    }
+                };
+            }
+            true // retry failed readiness; never renew from a cached success
+        });
+        Self { data, maintenance }
+    }
+
+    fn update_config(&self, cfg: &DispatchConfig) {
+        let mut data = self.data.lock().expect("gateway readiness poisoned");
+        let key = gateway_readiness_key(cfg);
+        if data.key != key || data.cfg.token != cfg.token {
+            data.state = GatewayReadinessState::Unavailable("configuration or credential changed; awaiting fresh readiness".into());
+            data.key = key;
+            data.cfg = cfg.clone();
+            self.maintenance.wake();
+        }
+    }
+
+    fn proof(&self, cfg: &DispatchConfig) -> Result<GatewayReadyProof, String> {
+        self.proof_with_max_age(cfg, Duration::from_secs(60))
+    }
+
+    fn proof_with_max_age(&self, cfg: &DispatchConfig, max_age: Duration) -> Result<GatewayReadyProof, String> {
+        let data = self.data.lock().expect("gateway readiness poisoned");
+        if data.key != gateway_readiness_key(cfg) { return Err("configuration has no matching readiness proof".into()); }
+        match &data.state {
+            GatewayReadinessState::Ready(proof) if proof.observed.elapsed() < max_age => Ok(proof.clone()),
+            GatewayReadinessState::Ready(_) => Err("local gateway readiness proof expired".into()),
+            GatewayReadinessState::Unavailable(error) => Err(error.clone()),
+        }
+    }
+}
+
+fn begin_with_fresh_readiness<T>(
+    observed: &mut Instant,
+    force_refresh: bool,
+    refresh: impl FnOnce() -> Result<(), String>,
+    begin: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if observed.elapsed() >= Duration::from_secs(60) || force_refresh {
+        refresh()?;
+        *observed = Instant::now();
+    }
+    begin()
+}
+
+fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value), String> {
+    let backend = avail.iter().max_by_key(|b| {
+        let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+        cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
+    }).ok_or("no configured backend is available")?;
+    let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
+    report("ready: checking the gateway worker credential");
+    let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
+    report("ready: probing local tools and configured model inventory (2s limit per probe)");
+    let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
+    report("ready: advertising capabilities to the hub (8s limit per request)");
+    let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
+    if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
+        return Err(format!("executor readiness held: {}", reply["readiness"]));
+    }
+    Ok((worker, reply))
+}
+
+/// A bounded paired-operator preflight; never claims or launches a task.
+pub fn execution_ready(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
+    let report = |message: &str| logging::emit("cli", "", message);
+    report("ready: checking configured backend CLIs (2s limit per probe)");
+    let available = available_backends_with_progress(cfg, &report);
+    prepare_worker_with_progress(cfg, &available, &report).map(|(_, reply)| reply)
+}
+
+/// Recover only recorded legacy pre-begin failures, under this host's genuine
+/// credential, after fresh local proof that its old runner launched no workers.
+pub fn recover_unstarted(cfg: &DispatchConfig, tid: &str) -> Result<serde_json::Value, String> {
+    let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dispatch_dir().ok_or("no dispatch directory")?.join("runner.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if report["label"].as_str() != cfg.label.as_deref() || report["in_flight"].as_array().map(|a| !a.is_empty()).unwrap_or(true)
+        || now_ms().saturating_sub(report["updated_ts"].as_u64().unwrap_or(0)) > 90_000 {
+        return Err("legacy recovery requires a fresh same-host runner report with zero workers".into());
+    }
+    let pid = report["pid"].as_u64().filter(|p| *p > 1).ok_or("runner report has no process")?;
+    let children = Command::new("pgrep").args(["-P", &pid.to_string()]).output().map_err(|e| e.to_string())?;
+    if children.status.code() != Some(1) { return Err("runner children exist or cannot be proved absent; preserve all claims and work".into()); }
+    execution_ready(cfg)?;
+    execution_call(cfg, tid, json!({ "kind": "recover_unstarted", "writers": "not_launched", "retained_work": true }))
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StartStage { Inspect, Begin }
+
+/// These paths have launched no child. Reconcile a committed-but-lost begin
+/// by its exact attempt; never release another writer or discard local work.
+fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str, expected_attempt: Option<&str>, path: Option<&Path>) {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let state = execution_call(cfg, tid, json!({ "kind": "inspect" }))?;
+        if let Some(a) = state.get("attempt").filter(|a| !a.is_null()) {
+            if a["phase"] != "quiesced" {
+                let session = claim_session(cfg, tid);
+                let ours = expected_attempt.is_some() && expected_attempt == a["attempt_id"].as_str()
+                    && a["host"].as_str() == cfg.label.as_deref() && a["session"].as_str() == Some(session.as_str());
+                if !ours { return Err("prior writer is not this never-launched attempt; retain claim/WIP".into()); }
+                execution_call(cfg, tid, json!({ "kind": "quiesce", "generation": a["generation"], "attempt_id": a["attempt_id"], "writers": "process_group_empty" }))?;
+            }
+        }
+        let retained_work = path.map(|p| {
+            let clean = Command::new("git").current_dir(p).args(["status", "--porcelain"]).output();
+            let published = Command::new("git").current_dir(p).args(["branch", "-r", "--contains", "HEAD"]).output();
+            !matches!(clean, Ok(o) if o.status.success() && o.stdout.is_empty())
+                || !matches!(published, Ok(o) if o.status.success() && !o.stdout.is_empty())
+        }).unwrap_or(false);
+        let failure_class = if reason.contains("gate:") { "prerequisite" } else { "transport" };
+        execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
+    })();
+    // Progress after release would re-claim todo through the legacy API.
+    match result {
+        Ok(value) if value["kind"] == "released" => dlog(tid, &format!("startup failed before worker launch: {reason}; claim released; {}", if value["barrier"].is_null() { "task prerequisite retained; gateway remains ready" } else { "gateway readiness held; inspect the startup cause" })),
+        Ok(value) => dlog(tid, &format!("startup reconciliation held: {value}")),
+        Err(error) => dlog(tid, &format!("startup reconciliation unavailable: {error}; preserve claim and work")),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ModelAvailability { Usable, Unavailable { reason: String }, Disabled }
+fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker: Option<&WorkerCredential>) -> serde_json::Value {
+    let bc = cfg.backends.get(name).cloned().unwrap_or_default();
+    let (tier, model) = configured_models(cfg, &bc).into_iter().max_by_key(|(tier, _)| *tier)
+        .map(|(tier, model)| (tier, Some(model))).unwrap_or((bc.reasoning_tier, None));
+    let mut facts = worker.map(|worker| executor_capabilities(tier, worker))
+        .unwrap_or_else(|| json!({ "tier": tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
+    let availability = if !bc.enabled { ModelAvailability::Disabled }
+        else if !runnable { ModelAvailability::Unavailable { reason: "Configured agent CLI is unavailable or its circuit breaker is open".into() } }
+        else if model.as_deref().unwrap_or("").is_empty() { ModelAvailability::Unavailable { reason: "Actual configured model identity is unreported; configure it explicitly".into() } }
+        else { ModelAvailability::Usable };
+    facts["backend"] = json!(name); facts["model"] = json!(model); facts["projects"] = json!(bc.projects);
+    facts["availability"] = json!(availability); facts["capacity"] = json!(cfg.max_sessions.clamp(1, 64));
+    facts["inventory_revision"] = json!(2);
+    facts["config_revision"] = json!(worker_config_revision(cfg));
+    facts
+}
+
+/// Advertise the complete supply even when a task selects a smaller model.
+/// Otherwise running medium temporarily erases this host's large capability.
+fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_json::Value {
+    if held {
+        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update is draining active workers before restart; new claims are paused".into() });
+        facts["availability"] = availability.clone();
+        if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
+            for model in models { model["availability"] = availability.clone(); }
+        }
+    }
+    facts
+}
+
+fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
+    let mut inventory = Vec::new();
+    for (name, bc) in &cfg.backends {
+        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(name)) == *b);
+        let base = backend_capabilities(cfg, name, runnable, worker);
+        let models = configured_models(cfg, bc);
+        if models.is_empty() { inventory.push(base); }
+        else { for (tier, model) in models {
+            let mut facts = base.clone(); facts["tier"] = json!(tier); facts["model"] = json!(model);
+            inventory.push(facts);
+        } }
+    }
+    let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
+    if inventory.is_empty() { return inventory_dispatch_hold(backend_capabilities(cfg, primary, false, worker), update_request().is_some()); }
+    let mut main = inventory.remove(index); main["alternatives"] = json!(inventory);
+    inventory_dispatch_hold(main, update_request().is_some())
+}
+
+static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
+
+fn execution_call(cfg: &DispatchConfig, tid: &str, command: serde_json::Value) -> Result<serde_json::Value, String> {
+    execution_call_session(cfg, tid, command, None)
+}
+
+fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::Value, session: Option<&str>) -> Result<serde_json::Value, String> {
+    let kind = command.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
+    let mut id = 0;
+    let args = json!({ "id": tid, "command_id": format!("{kind}-{}-{nonce}", std::process::id()), "command": command });
+    for retry in 0..3 {
+        let result = match session {
+            Some(session) => mcp_call_session(cfg, &mut id, "execution", args.clone(), Some(session)),
+            None => mcp_call_task(cfg, &mut id, "execution", args.clone(), tid),
+        };
+        match result {
+            Ok(result) => return Ok(result),
+            Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => {
+                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/3 with the same command_id", retry + 2));
+                std::thread::sleep(Duration::from_millis(250 * (retry + 1)));
+            }
+            Err(e) => return Err(e), // named semantic gates are terminal
+        }
+    }
+    unreachable!()
+}
+
+pub enum ExecutionRead { Inspect, Availability }
+pub fn execution_read(cfg: &DispatchConfig, task_id: &str, kind: ExecutionRead) -> Result<serde_json::Value, String> {
+    let command = match kind { ExecutionRead::Inspect => "inspect", ExecutionRead::Availability => "availability" };
+    execution_call(cfg, task_id, json!({ "kind": command }))
+}
+pub fn execution_claims(cfg: &DispatchConfig, pause: bool) -> Result<serde_json::Value, String> {
+    logging::emit("cli", "", if pause { "pause: asking the hub to pause new claims (8s limit per request)" } else { "resume: asking the hub to resume new claims (8s limit per request)" });
+    execution_call(cfg, "gateway", if pause { json!({ "kind": "pause_claims", "reason": "Operator runtime update: preserve active writers while draining", "budget_ms": 300_000 }) } else { json!({ "kind": "resume_claims" }) })
+}
+pub fn scheduling_status(cfg: &DispatchConfig, host: Option<&str>) -> Result<serde_json::Value, String> {
+    let command = match host { Some(host) => json!({ "kind": "schedule_status", "host": host }), None => json!({ "kind": "schedule_status" }) };
+    execution_call(cfg, "gateway", command)
+}
+pub fn drain_gateway(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
+    let host = cfg.label.as_deref().ok_or("gateway label missing")?;
+    execution_call(cfg, "gateway", json!({ "kind": "gateway_control", "host": host, "mode": "draining", "reason": "Operator retired this gateway from autonomous dispatch" }))
+}
+pub fn execution_coordinate(cfg: &DispatchConfig, task_id: &str, message: &str) -> Result<serde_json::Value, String> {
+    execution_call(cfg, task_id, json!({ "kind": "message", "message_id": format!("operator-{}-{}", std::process::id(), now_ms()), "text": message, "priority": "interrupt" }))
+}
+
+#[derive(Clone)]
+struct ExecutionRuntime {
+    generation: u64,
+    attempt_id: String,
+    control: Arc<crate::transport::RunControl>,
+    maintenance: Option<Arc<LeaseMaintenance>>,
+    last_checkpoint: Instant,
+}
+
+/// One clock per attempt: preparing other workers, Git publication and the
+/// dispatch cadence must never starve a running writer's lease or inbox.
+/// Cancellation joins the poller before quiesce/transfer, so no late poll can
+/// renew an attempt after its finalization barrier.
+enum MaintenanceSignal { Wake, Stop }
+struct LeaseMaintenance {
+    cancel: std::sync::mpsc::Sender<MaintenanceSignal>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl LeaseMaintenance {
+    fn start(interval: Duration, mut poll: impl FnMut() -> bool + Send + 'static) -> Self {
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            loop {
+                match cancelled.recv_timeout(interval) {
+                    Ok(MaintenanceSignal::Wake) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if !poll() { break; },
+                    _ => break,
+                }
+            }
+        });
+        Self { cancel, thread: Mutex::new(Some(thread)) }
+    }
+    fn stop(&self) {
+        let _ = self.cancel.send(MaintenanceSignal::Stop);
+        if let Ok(mut thread) = self.thread.lock() {
+            if let Some(thread) = thread.take() { let _ = thread.join(); }
+        }
+    }
+    fn wake(&self) { let _ = self.cancel.send(MaintenanceSignal::Wake); }
+}
+impl Drop for LeaseMaintenance {
+    fn drop(&mut self) { self.stop(); }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum RemoteAttemptState {
+    Restoring { checkpoint: crate::checkpoint::Checkpoint },
+    Running,
+    Stopping,
+    Quiesced,
+}
+#[derive(Deserialize)]
+struct RemoteAttempt {
+    generation: u64,
+    attempt_id: String,
+    #[serde(flatten)]
+    state: RemoteAttemptState,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MailboxState { Queued, Delivered, Acknowledged, Acted }
+#[derive(Deserialize)]
+struct RemoteMessage { state: MailboxState }
+#[derive(Deserialize)]
+struct RemoteExecution {
+    policy_version: u32,
+    attempt: Option<RemoteAttempt>,
+    messages: Vec<RemoteMessage>,
+    #[serde(default)]
+    handoff: RemoteHandoff,
+}
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
+impl RemoteExecution {
+    fn permits_renewal(&self, generation: u64, attempt_id: &str) -> bool {
+        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring { .. }))
+            && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered))
+    }
+    fn parse(value: serde_json::Value) -> Result<Self, String> {
+        let state: Self = serde_json::from_value(value).map_err(|e| format!("durable execution contract drift: {e}"))?;
+        if state.policy_version != 1 { return Err("unsupported execution policy version".into()); }
+        Ok(state)
+    }
+}
+impl ExecutionRuntime {
+    fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str) {
+        let cfg = cfg.clone();
+        let session = claim_session(&cfg, tid);
+        let tid = tid.to_string();
+        let generation = self.generation;
+        let attempt_id = self.attempt_id.clone();
+        let command = self.command("poll");
+        let control = self.control.clone();
+        self.maintenance = Some(Arc::new(LeaseMaintenance::start(Duration::from_secs(20), move || {
+            if control.stop.load(Ordering::SeqCst) { return false; }
+            let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
+            match state {
+                Ok(state) => {
+                    if state.permits_renewal(generation, &attempt_id) {
+                        control.grant_lease();
+                        return true;
+                    }
+                }
+                Err(error) => dlog(&tid, &format!("execution lease/inbox unavailable: {error}; stopping writer and retaining WIP")),
+            }
+            control.stop.store(true, Ordering::SeqCst);
+            false
+        })));
+    }
+    fn stop_maintenance(&self) {
+        if let Some(maintenance) = &self.maintenance { maintenance.stop(); }
+    }
+    fn command(&self, kind: &str) -> serde_json::Value {
+        json!({ "kind": kind, "generation": self.generation, "attempt_id": self.attempt_id })
+    }
+    fn checkpoint(&self, cfg: &DispatchConfig, tid: &str, path: &Path) -> Result<(), String> {
+        let checkpoint = crate::checkpoint::publish(path, tid, self.generation, "Read task history and checkpoint; continue the remaining action, preserving any newer local WIP.", vec![std::env::consts::OS.into(), std::env::consts::ARCH.into()])?;
+        let mut cmd = self.command("checkpoint");
+        cmd["checkpoint"] = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
+        execution_call(cfg, tid, cmd)?;
+        Ok(())
+    }
+}
+
+fn stopped_outbox_root() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".bridge/stopped-attempts"))
+}
+
+fn send_stopped_receipt(cfg: &DispatchConfig, receipt: &stopped_outbox::StoppedReceipt) -> Result<(), String> {
+    if cfg.label.as_deref() != Some(receipt.host.as_str()) || cfg.url.trim_end_matches('/') != receipt.url {
+        return Err("gate: stopped-writer receipt belongs to another gateway or hub".into());
+    }
+    let reply = mcp_call_session(cfg, &mut 0, "execution", receipt.request(), Some(&receipt.session))?;
+    if reply["attempt"]["phase"] != "quiesced" { return Err("hub did not confirm stopped-writer quiescence".into()); }
+    Ok(())
+}
+
+fn persist_stopped_receipt(cfg: &DispatchConfig, tid: &str, runtime: &ExecutionRuntime, group_empty: bool) -> Result<(PathBuf, stopped_outbox::StoppedReceipt), String> {
+    let receipt = stopped_outbox::StoppedReceipt::capture(cfg.label.as_deref().ok_or("gateway label missing")?, &cfg.url,
+        tid, &claim_session(cfg, tid), runtime.generation, &runtime.attempt_id, now_ms(), group_empty)?;
+    let path = stopped_outbox::persist(&stopped_outbox_root().ok_or("outbox home missing")?, &receipt)?;
+    Ok((path, receipt))
 }
 
 /// Accepts the new dict shape ({ "opencode": { ... } }) or the legacy array
@@ -132,7 +736,7 @@ where D: serde::Deserializer<'de> {
         serde_json::Value::Object(o) => {
             let mut m = std::collections::BTreeMap::new();
             for (name, section) in o {
-                let cfg = serde_json::from_value(section).unwrap_or_default();
+                let cfg = serde_json::from_value(section).map_err(serde::de::Error::custom)?;
                 m.insert(name, cfg);
             }
             Ok(m)
@@ -327,6 +931,12 @@ impl DispatchConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            sweep_repos: std::env::var("BRIDGE_SWEEP_REPOS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             backends: std::env::var("BRIDGE_BACKENDS")
                 .ok()
                 .map(|v| {
@@ -345,6 +955,7 @@ impl DispatchConfig {
             agent_name: None,
             ws: None,
             gateway: None,
+            auto_update: None,
             identity: None,
         })
     }
@@ -560,6 +1171,8 @@ pub fn default_config() -> DispatchConfig {
         report_minutes: None,
         isolate: default_isolate(),
         worktree_exempt_repos: Vec::new(),
+        sweep_repos: Vec::new(),
+        auto_update: None,
         backends: Default::default(),
         models: None,
         agents: None,
@@ -725,12 +1338,16 @@ pub fn repair_by_principal(
 /// unreachable mid-deploy, 5xx, 429, timeouts, MCP-level errors) is
 /// transient: back off, keep polling — the hub may just be deploying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HubErrClass {
+pub(crate) enum HubErrClass {
     Auth,
     Transient,
 }
 
-fn classify_hub_error(e: &str) -> HubErrClass {
+/// The repairable-vs-transient decision point. Consumed by BOTH hub-call
+/// loops on this device — the dispatch loop (below) and the merge-train
+/// executor (train.rs, vendored into the CLI) — so one classification law
+/// governs every hub caller (BR#4754 made it crate-visible for the train leg).
+pub(crate) fn classify_hub_error(e: &str) -> HubErrClass {
     // "bridge {status} on /mcp" is mcp_call_session's shape; "hub 401:" is
     // the pairing/session-plane shape. 401 = the token is dead; 403 = the
     // identity was refused — a re-vend usually won't change a 403 either,
@@ -741,10 +1358,18 @@ fn classify_hub_error(e: &str) -> HubErrClass {
         || e.starts_with("hub 401:")
         || e.starts_with("hub 403:")
     {
-        HubErrClass::Auth
-    } else {
-        HubErrClass::Transient
+        return HubErrClass::Auth;
     }
+    // BR#4754 — the train executor's shape: train.rs mcp() wraps every
+    // JSON-RPC error as "hub rpc error (tool): <message>", and a dead/rotted
+    // token surfaces as the hub's message text with NO HTTP status anywhere
+    // in the string ("unknown auth token" — the Oct-29 blind-daemon
+    // incident). Same repairable-by-ladder class: the token is rejected,
+    // everything else about the hub is fine.
+    if e.contains("unknown auth token") || e.contains("invalid auth token") {
+        return HubErrClass::Auth;
+    }
+    HubErrClass::Transient
 }
 
 /// BR#4113 — bounded self-heal pacing for auth failures. The repair ladder
@@ -755,15 +1380,20 @@ fn classify_hub_error(e: &str) -> HubErrClass {
 /// breaks the loop while desired state is "running": a hub-side heal
 /// (rotation grace, rollback, row restore) is picked up by the next poll and
 /// dispatch resumes within one poll interval, zero human action.
-struct AuthHeal {
+///
+/// crate-visible (BR#4754): the merge-train executor (train.rs) reuses the
+/// SAME pacing + park threshold for its daemon loops — one mechanism, two
+/// consumers; the hub rate-limits `/api/token/repair` per row (6/h), so an
+/// unpaced ladder in a 45s tick loop would burn the mint budget in minutes.
+pub(crate) struct AuthHeal {
     /// consecutive FAILED ladder runs
-    streak: u32,
+    pub(crate) streak: u32,
     last_attempt: Option<Instant>,
     parked: bool,
 }
 
 /// What run_loop should do about auth this iteration.
-enum HealStep {
+pub(crate) enum HealStep {
     /// run the repair ladder now
     Attempt,
     /// not yet due — keep polling quietly
@@ -771,22 +1401,22 @@ enum HealStep {
 }
 
 /// Backoff between ladder runs: 5s doubling, capped at AUTH_BACKOFF_CAP_SECS.
-fn auth_backoff_secs(failed_runs: u32) -> u64 {
+pub(crate) fn auth_backoff_secs(failed_runs: u32) -> u64 {
     // failed_runs = 1 after the first failure → first retry after 5s
     let shift = failed_runs.saturating_sub(1).min(6);
     (5u64 << shift).min(AUTH_BACKOFF_CAP_SECS)
 }
 
-const AUTH_BACKOFF_CAP_SECS: u64 = 300;
-const AUTH_PARK_ATTEMPTS: u32 = 5;
+pub(crate) const AUTH_BACKOFF_CAP_SECS: u64 = 300;
+pub(crate) const AUTH_PARK_ATTEMPTS: u32 = 5;
 
 impl AuthHeal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         AuthHeal { streak: 0, last_attempt: None, parked: false }
     }
 
     /// An auth-classified tick error. Decides whether a ladder run is due.
-    fn on_auth_failure(&mut self, now: Instant) -> HealStep {
+    pub(crate) fn on_auth_failure(&mut self, now: Instant) -> HealStep {
         if let Some(t) = self.last_attempt {
             if now.duration_since(t).as_secs() < auth_backoff_secs(self.streak.max(1)) {
                 return HealStep::Wait;
@@ -801,13 +1431,13 @@ impl AuthHeal {
     }
 
     /// A ladder leg succeeded — the hub re-vended this device. Fully re-arm.
-    fn on_repair_success(&mut self) {
+    pub(crate) fn on_repair_success(&mut self) {
         *self = AuthHeal::new();
     }
 
     /// The hub accepted our token again without a repair (rollback, grace
     /// window re-opened, row restored) — same re-arm.
-    fn on_hub_accepted(&mut self) {
+    pub(crate) fn on_hub_accepted(&mut self) {
         if self.streak > 0 || self.parked {
             *self = AuthHeal::new();
         }
@@ -1044,30 +1674,56 @@ fn mcp_call(
     mcp_call_session(cfg, id, tool, args, None)
 }
 
-/// MCP call with an explicit session name. Task-scoped calls use
-/// `dispatch-<task_id>`: every opencode dispatch IS a fresh agent session, and
-/// per-task attribution is what lets separation-of-duties pass honestly — the
-/// session that implemented a task is never the session that verifies it.
+/// Operator control exchanges fail promptly; task/effect requests retain their
+/// existing transport budget and the same durable retry/replay contract.
+fn mcp_request_timeout(tool: &str, args: &serde_json::Value) -> Duration {
+    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise"));
+    Duration::from_secs(if control { 8 } else { 30 })
+}
+
+/// MCP call with an explicit session name. Per-task attribution keeps the
+/// implementation session distinct from the session that verifies it.
 fn mcp_call_session(
+    cfg: &DispatchConfig,
+    id: &mut i64,
+    tool: &str,
+    args: serde_json::Value,
+    session: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let timeout = mcp_request_timeout(tool, &args);
+    mcp_call_session_with_timeout(cfg, id, tool, args, session, timeout)
+}
+
+fn mcp_call_session_with_timeout(
     cfg: &DispatchConfig,
     id: &mut i64,
     tool: &str,
     mut args: serde_json::Value,
     session: Option<&str>,
+    timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     *id += 1;
     if let Some(obj) = args.as_object_mut() {
         let name = session.map(String::from).unwrap_or_else(|| cfg.session_name());
         obj.entry("session").or_insert_with(|| json!(name));
+        obj.insert("inventory_protocol".into(), json!(2));
     }
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(if timeout == Duration::from_secs(8) { Duration::from_secs(3) } else { timeout })
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
+    let fence = args.get("id").and_then(|v| v.as_str()).and_then(|tid| {
+        EXECUTION_FENCES.get_or_init(Default::default).lock().ok().and_then(|m| m.get(tid).cloned().map(|f| (tid.to_string(), f)))
+    });
+    let mut request = client
         .post(format!("{}/mcp", cfg.url))
         .header("Authorization", format!("Bearer {}", cfg.token))
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some((tid, (generation, attempt))) = fence {
+        request = request.header("x-bridge-task", tid).header("x-bridge-generation", generation.to_string()).header("x-bridge-attempt", attempt);
+    }
+    let resp = request
         .body(
             json!({
                 "jsonrpc": "2.0",
@@ -1078,7 +1734,9 @@ fn mcp_call_session(
             .to_string(),
         )
         .send()
-        .map_err(|e| format!("bridge unreachable: {e}"))?;
+        .map_err(|e| if e.is_timeout() {
+            format!("bridge unreachable: {tool}/{} timed out after {}s (command_id={}); the request may have reached the hub", args.pointer("/command/kind").and_then(|v| v.as_str()).unwrap_or("call"), timeout.as_secs(), args["command_id"].as_str().unwrap_or("none"))
+        } else { format!("bridge unreachable: {e}") })?;
     if !resp.status().is_success() {
         return Err(format!("bridge {} on /mcp", resp.status()));
     }
@@ -1092,7 +1750,9 @@ fn mcp_call_session(
     {
         TOKEN_EPOCH_SEEN.store(v, Ordering::Relaxed);
     }
-    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().map_err(|e| if e.is_timeout() {
+        format!("bridge unreachable: {tool} response timed out after {}s (command_id={})", timeout.as_secs(), args["command_id"].as_str().unwrap_or("none"))
+    } else { format!("mcp response decode failed: {e}") })?;
     if let Some(err) = body.get("error") {
         return Err(format!(
             "mcp error {}: {}",
@@ -1129,8 +1789,9 @@ fn mcp_call_task(
 ) -> Result<serde_json::Value, String> {
     if let Some(obj) = args.as_object_mut() {
         obj.insert("agent".into(), json!(agent_identity(cfg)));
+        obj.insert("runner_protocol".into(), json!("worker-ready-v2"));
     }
-    mcp_call_session(cfg, id, tool, args, Some(&format!("dispatch-{}", slugify(task_id))))
+    mcp_call_session(cfg, id, tool, args, Some(&claim_session(cfg, task_id)))
 }
 
 /// The agent name dispatched tasks are attributed to: config override
@@ -1246,6 +1907,25 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DispatchStage { Starting, Readiness, Checkpoint, Finalizing, Admission, Preparing, Hygiene, Waiting }
+
+fn dispatch_stage(snap: &SharedSnapshot, stage: DispatchStage) {
+    let label = match stage {
+        DispatchStage::Starting => "starting",
+        DispatchStage::Readiness => "checking worker readiness",
+        DispatchStage::Checkpoint => "publishing checkpoint",
+        DispatchStage::Finalizing => "draining completed workers",
+        DispatchStage::Admission => "reserving eligible work",
+        DispatchStage::Preparing => "preparing reserved worker",
+        DispatchStage::Hygiene => "worktree hygiene (after admission)",
+        DispatchStage::Waiting => "waiting for completion or poll",
+    };
+    dlog("", &format!("dispatch stage: {label}"));
+    snap_activity(snap, "dispatch-stage", label);
+    write_runner_state(snap);
+}
+
 /// Record an involuntary sign-out (identity-law run gate, hub-rejected token)
 /// as a structured notice on the snapshot — BR#2532: the reason used to live
 /// only in stderr/last_error, which the UI never reads, so an upgrading
@@ -1338,10 +2018,26 @@ pub fn overlay_needs_attention(snap: &SharedSnapshot, v: &mut serde_json::Value)
 // without a PR); failed tasks keep their file until the retry succeeds.
 
 fn dispatch_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(&home).join(".bridge").join("dispatch");
+    let dir = match std::env::var_os("BRIDGE_DISPATCH_DIR").filter(|v| !v.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(std::env::var("HOME").ok()?).join(".bridge").join("dispatch"),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Canonical worker-token cache file: $HOME/.bridge/dispatch/agent-tokens.json.
+/// Deliberately NOT dispatch_dir(): the credential belongs to the gateway, not
+/// an individual runner's ephemeral report directory (562f394) — side-by-side
+/// runners (BRIDGE_DISPATCH_DIR set) must share one cache, so every read,
+/// write AND clear (BR#6682) resolves this same fixed path.
+fn agent_token_cache_path() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".bridge")
+            .join("dispatch")
+            .join("agent-tokens.json"),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -1490,8 +2186,22 @@ pub fn for_you_payload() -> Result<serde_json::Value, String> {
 
 // ---- dispatch state (shared with Tauri commands) ----
 
+/// Wake admission even when a worker panics/disconnects instead of returning.
+struct CompletionSignal(Arc<AtomicBool>);
+impl Drop for CompletionSignal {
+    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+}
+
+fn wait_for_dispatch_wake(poll: Duration, should_wake: impl Fn() -> bool) {
+    let deadline = Instant::now() + poll;
+    while Instant::now() < deadline && !should_wake() {
+        std::thread::sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 struct InFlight {
     task_id: String,
+    completed: Arc<AtomicBool>,
     task_title: String,
     /// role tags recorded at claim time — decide done-vs-in_review from what
     /// the task IS, not title heuristics (analysis/unblock work finished with
@@ -1504,6 +2214,7 @@ struct InFlight {
     pr_url: Option<String>,    // PR opened by the session, monitored after handoff
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
     live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
+    execution: ExecutionRuntime,
 }
 
 impl InFlight {
@@ -1557,23 +2268,56 @@ fn pick_backend(avail: &[opencode::Backend]) -> opencode::Backend {
 /// machine. Model is optional per provider — unset means the CLI's own
 /// default config decides (opencode), or the provider's profile (kiro).
 fn available_backends(cfg: &DispatchConfig) -> Vec<opencode::Backend> {
+    available_backends_with_progress(cfg, &|_| {})
+}
+
+fn available_backends_with_progress(cfg: &DispatchConfig, report: &dyn Fn(&str)) -> Vec<opencode::Backend> {
     cfg.backends
         .iter()
         .filter(|(name, bc)| {
+            if !bc.enabled { return false; }
             let bin = bc.bin.clone().unwrap_or_else(|| match opencode::Backend::parse(Some(name)) {
                 opencode::Backend::Kiro => "kiro".to_string(),
                 _ => cfg.opencode_bin.clone(),
             });
-            std::process::Command::new(&bin)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            report(&format!("ready: probing backend {name}"));
+            match probe_version(&bin) {
+                Ok(()) => true,
+                Err(error) => { report(&format!("ready: backend {name} unavailable: {error}")); false }
+            }
         })
         .map(|(name, _)| opencode::Backend::parse(Some(name)))
         .collect()
+}
+
+fn probe_version(bin: &str) -> Result<(), String> {
+    let mut command = Command::new(bin);
+    command.arg("--version");
+    probe_command(command, Duration::from_secs(2))
+}
+
+/// Readiness probes must not wait on stdin, pipe descendants, or tool startup
+/// indefinitely. Each probe owns a fresh process group; never a worker's group.
+fn probe_command(mut command: Command, budget: Duration) -> Result<(), String> {
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| format!("cannot start version probe: {e}"))?;
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return if status.success() { Ok(()) } else { Err(format!("version probe failed: {status}")) },
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                #[cfg(unix)] unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result { Err(e) => format!("cannot poll version probe: {e}"), _ => format!("version probe timed out after {}ms", budget.as_millis()) });
+            }
+        }
+    }
 }
 
 fn slugify(s: &str) -> String {
@@ -1737,57 +2481,6 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
     }
 }
 
-/// ---- refused-reference cache (BR#3845 self-heal) ----
-/// A card whose repo reference is fatally unclonable (ghost repo, no access)
-/// must not re-enter the claim→clone-fail→watchdog-release loop forever. The
-/// runner records (task → reference + reason) locally and skips the reference
-/// until it CHANGES on the card — the author fixes the URL, the record no
-/// longer matches, dispatch resumes. Local to this runner host: the hub
-/// machine stays the verdict authority; this is provisioning self-defense.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RefusedRef {
-    pub url: String,
-    pub reason: String,
-    pub ts: u64,
-}
-
-fn refused_cache_path() -> Option<PathBuf> {
-    dispatch_dir().map(|d| d.join("refused-repos.json"))
-}
-
-fn refused_cache_load() -> HashMap<String, RefusedRef> {
-    let Some(p) = refused_cache_path() else {
-        return HashMap::new();
-    };
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn refused_cache_store(cache: &HashMap<String, RefusedRef>) {
-    if let Some(p) = refused_cache_path() {
-        let _ = std::fs::write(&p, serde_json::to_string_pretty(cache).unwrap_or_default());
-    }
-}
-
-/// Whether this task's CURRENT reference is the one we already refused:
-/// true = skip dispatch (the defect stands); false = proceed (fresh task, or
-/// the author fixed the URL — the stale record is dropped so it can't pin the
-/// card forever).
-fn refused_reference(cache: &mut HashMap<String, RefusedRef>, tid: &str, url: Option<&str>) -> bool {
-    match (cache.get(tid), url) {
-        (Some(r), Some(u)) if r.url == u => true,
-        (Some(_), _) => {
-            // reference changed (or removed) since the refusal — re-arm
-            cache.remove(tid);
-            refused_cache_store(cache);
-            false
-        }
-        (None, _) => false,
-    }
-}
-
 /// Owning repo of a worktree: the worktree's .git FILE points at
 /// <clone>/.git/worktrees/<name>. Deregistering against cfg.workdir silently
 /// failed whenever the worktree was owned by a clone under <workdir>/repos —
@@ -1898,17 +2591,23 @@ fn preserve_wip(worktree_path: &Path, task_id: &str) -> Option<String> {
 /// fallback so pre-change worktrees re-attach on resume and repos whose
 /// clone predates the convention still isolate.
 /// On resume the branch already exists — attach to it.
+/// 2026-11-02: every provisioned tree is REGISTERED (the machine-local
+/// worktree registry) so the sweep knows it mechanically — see
+/// worktree_registry_append.
 fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<PathBuf> {
     let slug = slugify(task_id);
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
     let nested = repo_path.join(".worktrees").join(&slug);
-    let legacy = std::env::var("HOME").ok().map(|h| {
-        PathBuf::from(&h).join(".bridge").join("worktrees").join(&slug)
+    let legacy = home.as_ref().map(|h| {
+        h.join(".bridge").join("worktrees").join(&slug)
     });
     // reuse: nested first (the convention), legacy second (resume compat)
     if nested.exists() {
+        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
         return Some(nested);
     }
     if legacy.as_ref().map(|p| p.exists()).unwrap_or(false) {
+        worktree_registry_append(home.as_deref(), legacy.as_ref().unwrap(), &repo_path.to_string_lossy(), task_id);
         return legacy;
     }
     std::fs::create_dir_all(nested.parent()?).ok()?;
@@ -1934,6 +2633,7 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         cmd.output().map(|o| o.status.success()).unwrap_or(false)
     };
     if add_at(&nested) {
+        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
         return Some(nested);
     }
     // nested add refused (clone predates the .gitignore convention) — fall
@@ -1941,6 +2641,7 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
     let Some(path) = legacy else { return None };
     std::fs::create_dir_all(path.parent()?).ok()?;
     if add_at(&path) {
+        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
         return Some(path);
     }
     let mut cmd = Command::new("git");
@@ -1948,14 +2649,18 @@ fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<P
         .args(["worktree", "add"])
         .arg(&path)
         .arg(&branch);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false).then_some(path)
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    if ok {
+        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
+    }
+    ok.then_some(path)
 }
 
 /// Run a command with a hard deadline: kill on expiry and report. The sign
 /// check must never hang the dispatch loop (a misconfigured signingProgram —
 /// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
 /// not stall dispatch). ssh-keygen from file signs instantly; 15s is generous.
-fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
+pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
     cmd.stdin(std::process::Stdio::null());
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
@@ -2087,9 +2792,24 @@ fn sign_check(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), Str
 /// uncommitted WIP went to the wip branch). Returns the preservation branch
 /// when one was written.
 fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Option<String> {
+    if !path.exists() { return None; }
+    // No lossy best-effort teardown. A failed status/publication probe retains
+    // the registered tree; only remotely reachable committed content is swept.
+    let status = Command::new("git").current_dir(path).args(["status", "--porcelain"]).output();
+    if !matches!(&status, Ok(o) if o.status.success() && o.stdout.is_empty()) {
+        return Some(format!("retained {}: local WIP requires a published checkpoint before cleanup", path.display()));
+    }
+    let remote = Command::new("git").current_dir(path).args(["branch", "-r", "--contains", "HEAD"]).output();
+    if !matches!(&remote, Ok(o) if o.status.success() && !o.stdout.is_empty()) {
+        return Some(format!("retained {}: unpublished committed work", path.display()));
+    }
     if !path.exists() {
         return None;
     }
+    // 2026-11-02: deregister FIRST — the teardown owns this tree, the
+    // registry must not outlive it (a stale line prunes on next read, but
+    // the contract is explicit).
+    worktree_registry_remove(std::env::var("HOME").ok().map(PathBuf::from).as_deref(), path);
     let preserved = preserve_wip(path, task_id);
     let slug = slugify(task_id);
     // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
@@ -2131,7 +2851,9 @@ fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Opti
 /// while provisioning kept allocating — the BR#3618/BR#3633 leak). Before any
 /// teardown the sweep preserves uncommitted state onto wip/<task>-<date>
 /// (never main).
-const WORKTREE_SWEEP_CAP: usize = 20;
+const WORKTREE_SWEEP_CAP: usize = 4;
+const WORKTREE_SWEEP_PROBE_BUDGET: Duration = Duration::from_secs(3);
+const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 /// Eventual-consistency horizon (BR#3633): a worktree not held by an in-flight
 /// session is swept once older than this, whatever its board status — an id
 /// that no longer resolves, a hub outage, or a parked blocked task all drain
@@ -2161,6 +2883,124 @@ struct WorktreeCandidate {
     slug: String,
     path: PathBuf,
     mtime: std::time::SystemTime,
+}
+
+/// Persist a round's remaining paths, rather than starting from the same kept
+/// trees every tick. Newly registered paths enter at the next oldest-first round.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct WorktreeSweepCursor {
+    remaining: std::collections::VecDeque<PathBuf>,
+}
+
+fn sweep_candidate_batch(
+    candidates: Vec<WorktreeCandidate>,
+    cursor: &mut WorktreeSweepCursor,
+    budget: Duration,
+    mut status: impl FnMut(&WorktreeCandidate, Duration) -> Option<String>,
+    mut cleanup: impl FnMut(&WorktreeCandidate, bool, &str),
+) -> (usize, usize) {
+    if cursor.remaining.is_empty() {
+        cursor.remaining.extend(candidates.iter().map(|c| c.path.clone()));
+    }
+    let mut by_path: HashMap<_, _> = candidates.into_iter().map(|c| (c.path.clone(), c)).collect();
+    let deadline = Instant::now() + budget;
+    let (mut inspected, mut swept) = (0, 0);
+    while inspected < WORKTREE_SWEEP_CAP && Instant::now() < deadline {
+        let Some(path) = cursor.remaining.pop_front() else { break; };
+        let Some(candidate) = by_path.remove(&path) else { continue; };
+        inspected += 1; // retained/unresolvable trees consume the budget too
+        let age = std::time::SystemTime::now().duration_since(candidate.mtime).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+        let state = if age < WORKTREE_STALE_SECS {
+            status(&candidate, WORKTREE_STATUS_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
+        } else { None };
+        let (remove, drop_branch, reason) = sweep_disposition(age, state.as_deref());
+        if remove { cleanup(&candidate, drop_branch, &reason); swept += 1; }
+    }
+    (inspected, swept)
+}
+
+// ---- worktree registry (2026-11-02, Ray: "you can both direct agents AND
+// know what worktrees were made — no guessing, mechanical and structural
+// assertions") ----
+// The machine-local record of every worktree the system directed a session
+// to create. Three mechanical facts close the leak loop:
+//   1. the runner REGISTERS on provision (ensure_worktree) and deregisters
+//      on teardown (cleanup_worktree_at) — its trees are never anonymous;
+//   2. directed agents register theirs at creation — the claim-locally
+//      prompt and AGENTS.md carry the exact append one-liner;
+//   3. the sweep enumerates REGISTERED paths as candidates (a registry×disk
+//      join), never a filesystem hunt or a hardcoded root list — dead lines
+//      are dropped on read so the file stays bounded.
+// Format: JSONL at ~/.bridge/worktree-registry.jsonl, one entry per line:
+// {"path":"/abs","repo":"owner/name or path","task":"BR#N or slug","ts":ms}.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct WorktreeRegEntry {
+    path: String,
+    repo: String,
+    task: String,
+    ts: u64,
+}
+
+fn worktree_registry_path(home: &Path) -> PathBuf {
+    home.join(".bridge").join("worktree-registry.jsonl")
+}
+
+fn worktree_registry_load(home: &Path) -> Vec<WorktreeRegEntry> {
+    let Ok(lines) = std::fs::read_to_string(worktree_registry_path(home)) else {
+        return vec![];
+    };
+    lines.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Best-effort registration — the path IS the record; a failed append never
+/// blocks provisioning (the sweep's dir scans still cover the runner's own
+/// trees). Home comes from the caller so tests inject a scratch root.
+fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: &str) {
+    use std::io::Write;
+    let Some(home) = home else { return };
+    let entry = WorktreeRegEntry {
+        path: path.to_string_lossy().into_owned(),
+        repo: repo.to_string(),
+        task: task.to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    let _ = std::fs::create_dir_all(home.join(".bridge"));
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(worktree_registry_path(home))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+}
+
+/// Deregistration: drop every line naming this path — the teardown owns the
+/// tree, the registry must not outlive it. Home comes from the caller so
+/// tests inject a scratch root.
+fn worktree_registry_remove(home: Option<&Path>, path: &Path) {
+    let Some(home) = home else {
+        return;
+    };
+    let reg = worktree_registry_path(&home);
+    let Ok(s) = std::fs::read_to_string(&reg) else {
+        return;
+    };
+    let p = path.to_string_lossy();
+    let kept: Vec<String> = s
+        .lines()
+        .filter_map(|l| serde_json::from_str::<WorktreeRegEntry>(l).ok())
+        .filter(|e| e.path != p)
+        .filter_map(|e| serde_json::to_string(&e).ok())
+        .collect();
+    let _ = std::fs::write(
+        &reg,
+        if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
+    );
 }
 
 /// Reverse slugify: BR-1003 → BR#1003. Anything else (TASK-010, session-named
@@ -2205,13 +3045,22 @@ fn sweep_disposition(age_secs: u64, status: Option<&str>) -> (bool, bool, String
 /// Collect worktree candidates from both roots. `home` is a parameter (not
 /// read from the env here) so tests can inject a scratch root. A missing root
 /// contributes nothing — a scoped skip, never an abort.
+/// 2026-11-02: also collects (a) the runner's own `<workdir>/worktrees/<slug>`
+/// root (observed leak: br4994-corpus sat there while the sweep passed it by),
+/// and (b) every REGISTERED worktree of the clones under `<workdir>/repos` and
+/// the configured `sweep_repos` roots (`git worktree list --porcelain`) — the
+/// dir scans can only see their own roots, but registered trees live wherever
+/// their session put them (the checkout's .worktrees/, ~/Projects/wt-*,
+/// /tmp/...). Enumeration skips each repo's main worktree (the root itself).
 fn collect_worktree_candidates(
     workdir: &Path,
     home: Option<&Path>,
     active: &HashSet<String>,
+    sweep_repos: &[String],
 ) -> Vec<WorktreeCandidate> {
     let mut found: Vec<WorktreeCandidate> = Vec::new();
-    let mut push = |e: std::fs::DirEntry, found: &mut Vec<WorktreeCandidate>| {
+    let push_entry =
+        |e: std::fs::DirEntry, found: &mut Vec<WorktreeCandidate>| {
         let name = e.file_name().to_string_lossy().to_string();
         if name.is_empty() || active.contains(&name) {
             return;
@@ -2231,17 +3080,109 @@ fn collect_worktree_candidates(
         for repo in repos.flatten() {
             if let Ok(entries) = std::fs::read_dir(repo.path().join(".worktrees")) {
                 for e in entries.flatten() {
-                    push(e, &mut found);
+                    push_entry(e, &mut found);
                 }
             }
+        }
+    }
+    // 2026-11-02: the runner's own trees root — <workdir>/worktrees/<slug>
+    if let Ok(entries) = std::fs::read_dir(workdir.join("worktrees")) {
+        for e in entries.flatten() {
+            push_entry(e, &mut found);
         }
     }
     // legacy: ~/.bridge/worktrees/<slug>
     if let Some(home) = home {
         if let Ok(entries) = std::fs::read_dir(home.join(".bridge").join("worktrees")) {
             for e in entries.flatten() {
-                push(e, &mut found);
+                push_entry(e, &mut found);
             }
+        }
+    }
+    // registered enumeration: every clone under <workdir>/repos plus the
+    // configured sweep_repos roots (e.g. the shared checkout). A repo root
+    // that is not a git repo contributes nothing — scoped skip.
+    let mut repo_roots: Vec<PathBuf> = std::fs::read_dir(workdir.join("repos"))
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    repo_roots.extend(
+        sweep_repos
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.join(".git").exists()),
+    );
+    for root in repo_roots {
+        let Ok(out) = Command::new("git")
+            .current_dir(&root)
+            .args(["worktree", "list", "--porcelain"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(p) = line.strip_prefix("worktree ") else {
+                continue;
+            };
+            let path = PathBuf::from(p);
+            if path == root {
+                continue; // the repo's own main worktree is not a candidate
+            }
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.is_empty() || active.contains(&name) {
+                continue;
+            }
+            // dedup by path against what the dir scans already collected
+            if found.iter().any(|c| c.path == path) {
+                continue;
+            }
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push(WorktreeCandidate { slug: name, path, mtime });
+        }
+    }
+    // registered (2026-11-02): the registry×disk join — every REGISTERED path
+    // is a candidate wherever it lives on disk (the agent chose the path;
+    // the sweep never hunts for it). Dead lines (path gone) are pruned on
+    // read so the file stays bounded; in-flight slugs stay protected by the
+    // `active` set above; the disposition rules then apply as usual.
+    if let Some(home) = home {
+        let entries = worktree_registry_load(home);
+        let mut dead = false;
+        for e in &entries {
+            let p = PathBuf::from(&e.path);
+            if !p.exists() {
+                dead = true;
+                continue;
+            }
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.is_empty() || active.contains(&name) {
+                continue;
+            }
+            if found.iter().any(|c| c.path == p) {
+                continue;
+            }
+            let mtime = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push(WorktreeCandidate { slug: name, path: p, mtime });
+        }
+        if dead {
+            let kept: Vec<String> = entries
+                .iter()
+                .filter(|e| PathBuf::from(&e.path).exists())
+                .filter_map(|e| serde_json::to_string(e).ok())
+                .collect();
+            let _ = std::fs::write(
+                worktree_registry_path(home),
+                if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
+            );
         }
     }
     found
@@ -2257,56 +3198,52 @@ fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlig
         Path::new(&cfg.workdir),
         std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
         &active,
+        &cfg.sweep_repos,
     );
     // dedup by slug (same name in both roots → nested wins), then drain
     // oldest-first: the cap must always bite the worst offenders
     found.sort_by(|a, b| a.slug.cmp(&b.slug));
     found.dedup_by(|a, b| a.slug == b.slug);
-    found.sort_by(|a, b| a.mtime.cmp(&b.mtime));
-    let mut swept = 0;
-    for cand in found {
-        if swept >= WORKTREE_SWEEP_CAP {
-            break;
+    found.sort_by(|a, b| a.mtime.cmp(&b.mtime).then(a.path.cmp(&b.path)));
+    let cursor_path = dispatch_dir().map(|p| p.join("worktree-sweep-cursor.json"));
+    let mut cursor: WorktreeSweepCursor = cursor_path.as_ref().and_then(|p| std::fs::read(p).ok())
+        .and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default();
+    let (inspected, swept) = sweep_candidate_batch(found, &mut cursor, WORKTREE_SWEEP_PROBE_BUDGET,
+        |candidate, timeout| {
+            mcp_call_session_with_timeout(cfg, id, "get_artefact", json!({ "id": reverse_task_slug(&candidate.slug) }), None, timeout)
+                .ok().and_then(|v| v["status"].as_str().map(String::from))
+        },
+        |candidate, drop_branch, reason| {
+            let preserved = cleanup_worktree_at(&candidate.path, &reverse_task_slug(&candidate.slug), drop_branch);
+            msgs.push(format!("swept worktree {} — {}{}", candidate.slug, reason,
+                preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()));
+        });
+    if let Some(path) = cursor_path {
+        if let Ok(data) = serde_json::to_vec(&cursor) {
+            let staged = path.with_extension("tmp");
+            if std::fs::write(&staged, data).is_ok() { let _ = std::fs::rename(staged, path); }
         }
-        let task_id = reverse_task_slug(&cand.slug);
-        let age_secs = std::time::SystemTime::now()
-            .duration_since(cand.mtime)
-            .map(|d| d.as_secs())
-            .unwrap_or(u64::MAX);
-        // status lookup only for trees the age rule would keep — stale trees
-        // sweep regardless, so a hub outage cannot freeze the reconciler
-        let status = if age_secs < WORKTREE_STALE_SECS {
-            mcp_call(cfg, id, "get_artefact", json!({ "id": task_id }))
-                .ok()
-                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
-        } else {
-            None
-        };
-        let (do_sweep, drop_branch, reason) = sweep_disposition(age_secs, status.as_deref());
-        if !do_sweep {
-            continue;
-        }
-        swept += 1;
-        let preserved = cleanup_worktree_at(&cand.path, &task_id, drop_branch);
-        msgs.push(format!(
-            "swept worktree {} — {}{}",
-            cand.slug,
-            reason,
-            preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()
-        ));
     }
+    dlog("", &format!("worktree hygiene: inspected {inspected}, swept {swept}, {} pending in round", cursor.remaining.len()));
     if swept > 0 {
         // prune the clones that actually own the registrations. cfg.workdir is
         // scratch space, NOT a repo — the old prune against it was a silent
         // no-op that left ghost registrations in the owning clones (BR#2421).
-        if let Ok(repos) = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos")) {
-            for repo in repos.flatten() {
-                let _ = Command::new("git")
-                    .current_dir(repo.path())
-                    .arg("worktree")
-                    .arg("prune")
-                    .output();
-            }
+        let mut prune_roots: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos"))
+            .map(|it| it.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        prune_roots.extend(
+            cfg.sweep_repos
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| p.join(".git").exists()),
+        );
+        for repo in prune_roots {
+            let _ = Command::new("git")
+                .current_dir(repo)
+                .arg("worktree")
+                .arg("prune")
+                .output();
         }
     }
 }
@@ -2537,6 +3474,11 @@ fn is_claim_race_error(e: &str) -> bool {
     e.contains("not allowed (allowed:")
         || e.contains("is terminal for")
         || (e.contains("claimed by") && e.contains("only the owner"))
+        // BR#6135 interactive claim takeover: the owner/web re-took the
+        // claim from this runner mid-run; the takeover-stale-holder rule
+        // rejects the runner's next state change with a stand-down order.
+        // Same family as a lost claim race — never a dispatch failure.
+        || e.contains("was taken over by")
 }
 
 /// A spawned session whose output is a wall of lifecycle/ownership gate
@@ -2551,7 +3493,9 @@ fn claim_race_run(stdout: &str, stderr: &str) -> bool {
     // sigs below are stable fragments; the ownership shape is the same
     // structural pair is_claim_race_error uses ("claimed by" + "only the
     // owner", present in every wording of the release-needs-ownership guard).
-    const SIGS: [&str; 2] = ["not allowed (allowed:", "is claimed by"];
+    // BR#6135: "was taken over by" is the takeover-stale-holder rule's stable
+    // prefix — a stood-down runner is a lost race, not a broken agent.
+    const SIGS: [&str; 3] = ["not allowed (allowed:", "is claimed by", "was taken over by"];
     if SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s)) {
         return true;
     }
@@ -2611,11 +3555,21 @@ fn spawn_opencode(
     policy: &str,
     resume_session: Option<String>,
     role_work: bool,
-    role_type: &str,
+    _role_type: &str,
     avail: &[opencode::Backend],
     in_flight: &mut Vec<InFlight>,
+    worker: &WorkerCredential,
+    readiness_observed: &mut Instant,
 ) {
-    let backend = pick_backend(avail);
+    let preparation_started = Instant::now();
+    dispatch_stage(snap, DispatchStage::Preparing);
+    let eligible: Vec<_> = avail.iter().copied().filter(|b| backend_satisfies(cfg, *b, task_meta)).collect();
+    if eligible.is_empty() {
+        failed_start(cfg, tid, StartStage::Begin, "gate: selected capability no longer available on this host", None, None);
+        return;
+    }
+    let backend = *eligible.iter().min_by_key(|b| selected_model(cfg, **b, task_meta).map(|(tier, _)| tier)).unwrap();
+    let (model_tier, model_id) = selected_model(cfg, backend, task_meta).expect("eligible backend has a configured model");
 
     // BR#2460: provisioning is a best-effort optimization; capability belongs
     // to the agent. A resolvable repo reference (meta.repo or the task body)
@@ -2640,9 +3594,14 @@ fn spawn_opencode(
     let bc = cfg.backends.get(backend_name).cloned().unwrap_or_default();
     let bc_mode = bc.mode.clone();
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
-    let model = bc.model.or_else(|| cfg.model.clone());
+    let model = Some(model_id);
     let model_str = model.clone().unwrap_or_default();
-    let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
+    // A different model gets a fresh session, preserving the checkpoint/WIP.
+    let previous = task_meta.get("execution_last_model");
+    let model_changed = previous.and_then(|p| p["model"].as_str()) != model.as_deref()
+        || previous.and_then(|p| serde_json::from_value::<ReasoningTier>(p["tier"].clone()).ok()) != Some(model_tier)
+        || previous.and_then(|p| p["backend"].as_str()) != Some(backend_name);
+    let resume_session = if model_changed { None } else if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
         resume_session
@@ -2703,45 +3662,8 @@ fn spawn_opencode(
                     "error",
                     &format!("{tid}: clone failed ({url}): {}", e.detail()),
                 );
-                let mut refused = refused_cache_load();
-                if e.fatal() {
-                    // BR#3845 self-heal: record the refusal so the claim →
-                    // clone-fail → 10-min-watchdog-stall → release loop stops
-                    // after ONE cycle; the candidate skip re-arms the moment
-                    // the card's reference changes.
-                    refused.insert(
-                        tid.to_string(),
-                        RefusedRef {
-                            url: url.clone(),
-                            reason: match &e {
-                                CloneFailure::NotFound(_) => "repository not found (authoring defect in the card's repo reference)".into(),
-                                CloneFailure::Auth(_) => "access denied (runner lacks credentials for this repo)".into(),
-                                CloneFailure::Transient(_) => unreachable!("fatal arm"),
-                            },
-                            ts: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0),
-                        },
-                    );
-                    refused_cache_store(&refused);
-                    release_claim(
-                        cfg,
-                        tid,
-                        &format!(
-                            "runner: clone of {url} is fatally refused ({}) — recorded; dispatch skipped until the card's repo reference changes (fix meta.repo/body URL, or grant the runner access)",
-                            e.detail()
-                        ),
-                    );
-                } else {
-                    // transient: release the claim so the retry starts NOW —
-                    // holding it only bought a 10-minute watchdog stall
-                    release_claim(
-                        cfg,
-                        tid,
-                        &format!("runner: transient clone failure for {url} ({}) — claim released, will retry next cycle", e.detail()),
-                    );
-                }
+                let reason = format!("{}clone of {url} failed: {}", if e.fatal() { "gate: " } else { "" }, e.detail());
+                failed_start(cfg, tid, StartStage::Begin, &reason, None, None);
                 return;
             }
         };
@@ -2761,6 +3683,7 @@ fn spawn_opencode(
                 "worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)";
             dlog(tid, &format!("error: {detail}"));
             snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
+            failed_start(cfg, tid, StartStage::Begin, &format!("gate: {detail}"), None, Some(&repo_path));
             return;
         }
         // Identity leg (BR#3185): write the profile's repo-local git config and
@@ -2786,6 +3709,7 @@ fn spawn_opencode(
                         e
                     ),
                 );
+                failed_start(cfg, tid, StartStage::Inspect, &format!("gate: {detail}"), None, Some(wt));
                 return;
             }
         }
@@ -2831,10 +3755,13 @@ fn spawn_opencode(
     // decides which contract the session gets. Repo-less dispatches deliver
     // on the board too: there is no provisioned checkout to open a PR from
     // (the agent may still self-serve a clone — the board line covers that).
+    let direct_main = repo_url.as_deref().map(|url| url.trim_end_matches(".git").ends_with("/state-vector/bridge")).unwrap_or(false);
     let delivery_line = if role_work || repo_url.is_none() {
-        "- Deliver on the board: your findings, verdicts, and receipts go into log_progress / knowledge artefacts with exact citations (GitHub PR/issue/run URLs only — a non-GitHub URL is not a receipt). No commit or PR unless you actually changed code.\n- If you DID change code: commit your work, push the branch, and open a PR against the default branch (`gh pr create`), and include the PR URL in your summary. Docs ride with the change: user-visible behaviour updates README.md and packages/site/content.md in the same branch."
+        "- Deliver findings, independent verdicts and exact receipts on the board. Review only work implemented by another session. Execution tasks require actual outcome evidence; prerequisite delivery is not completion. Follow the provisioned repository's delivery policy if code changes are necessary."
+    } else if direct_main {
+        "- Bridge delivery policy v1: signed direct-main delivery. Work in this isolated worktree; fetch/integrate origin/main, run required gates, and push HEAD:main. Submit the commit and green CI receipts through in_review for an independent session. Docs ride with user-visible changes: README.md and packages/site/content.md. Never self-certify acceptance."
     } else {
-        "- Commit your work, push the branch, and open a PR against the default branch (`gh pr create`).\n- Then follow the merge ladder: needs rebase → kick the task back to the pool (note it); base red in CI → block on a base-fix task (create or associate); mergeable + checks green + you agree → merge your own PR (`gh pr merge`) and cite the merge commit in the task.\n- An existing review that is unsatisfactory: sound-but-negative → pass feedback to the implementor, kick the task back; poor and rebuttable → raise a quality issue, merge anyway with a note; incomprehensible → escalate to the human via ask.\n- When finished, output a concise summary including the PR URL and the merge commit.\n- Docs ride with the change: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch."
+        "- Commit signed work, push the branch and open a PR against the repository's default branch. Submit in_review with its URL. Independent verification and the merge train own acceptance/merge; do not merge your own PR or push the default branch. Fix mechanical conflicts/rebases autonomously. Update the repository's user-facing docs with behaviour changes."
     };
     // Identity note (BR#3185): the dispatched session must know which git
     // identity is in force — repo-local in this worktree, applied by the
@@ -2862,13 +3789,12 @@ fn spawn_opencode(
             "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
         )
     };
-    let digits = tid.rsplit('-').next().unwrap_or(tid);
-    let bridge_session = format!("bridge-{role_type}-{}", slugify(digits));
+    let bridge_session = claim_session(cfg, tid);
     let env_block = format!(
         "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
     );
-    let prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract\n\n{}\n{}\n{}\n- Blocked on a decision or missing input? File the ask via ask_agent, transition the task to blocked (note + unblock condition), and END your run — do not wait. The task re-enters the pool when unblocked and a later session (possibly yours, via resume) picks it up.\n- Do NOT merge, do NOT push to the default branch, do NOT touch files outside this worktree.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them (`git worktree remove`, `git branch -d`) before you end the run. Do not leave litter behind: the dispatch worktree itself is managed by the runner, but anything you create beyond it is on you.",
+    let mut prompt = format!(
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract (execution policy v1)\n\n{}\n{}\n{}\n- Blocked on a specific human decision? Bind an ask to this task. Machine capability problems use the execution protocol escalation, not a human staffing request.\n- Do not touch files outside this worktree. Never detach a subprocess from the runner process group: transfer requires a proven empty writer group.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them before you end the run. The dispatch worktree itself is managed by the runner.",
         policy, tid, title, body_md, resume_note, env_block, provisioning_line, heartbeat_line, delivery_line
     );
     // clone for the ephemeral state file: the closure below moves the original
@@ -2876,7 +3802,7 @@ fn spawn_opencode(
     dlog(
         tid,
         &format!(
-            "dispatched — {} opencode session bridge-{tid}{}",
+            "preparing — {} opencode session bridge-{tid}{}",
             if resume {
                 format!(
                     "resuming session {}",
@@ -2896,9 +3822,9 @@ fn spawn_opencode(
     );
     snap_activity(
         snap,
-        "dispatch",
+        "startup",
         &format!(
-            "{tid} dispatched — {}",
+            "{tid} preparing launch — {}",
             if resume { "resumed session" } else { "new session" }
         ),
     );
@@ -2917,10 +3843,6 @@ fn spawn_opencode(
     // (<gateway>.<agent>) — ownership filtering is then a prefix glob
     // (machinename/*), and the namespace survives re-pairings because the
     // gateway label is the stable root.
-    let agent_label = match &cfg.label {
-        Some(l) if !l.is_empty() => format!("{l}/{}", agent_segment(cfg)),
-        _ => agent_identity(cfg),
-    };
     // Provision the worker's per-agent token. There is NO second class check
     // here: the token secret is opaque (bkw_*), so a prefix test can never
     // work, and the class gate is run_loop's (config gateway flag). If
@@ -2928,19 +3850,84 @@ fn spawn_opencode(
     // gateway's own token would mis-attribute every board action. Release
     // the claim instead; transient hub failures self-heal next tick (the
     // runner may release its own claims, BR#2419).
-    let agent_token = match provision_agent_token(cfg, &agent_label) {
-        Ok(t) => t,
-        Err(e) => {
-            dlog(&agent_label, &format!("error: agent token provisioning failed: {e} — no fallback (gateway token would mis-attribute); releasing claim"));
-            snap_activity(snap, "error", &format!("agent token provisioning failed for {agent_label}: {e} — claim released, no fallback attribution"));
-            release_claim(
-                cfg,
-                tid,
-                &format!("runner: per-agent token provisioning failed ({e}) — claim released; no gateway-token fallback"),
-            );
+    // Bind the credential actually proved/minted by the hub, not the cache key
+    // requested before rename/canonicalisation. Labels are not credential IDs.
+    let agent_label = &worker.label;
+    let agent_token = &worker.secret;
+    // Durable lease BEFORE spawning; no legacy fallback when this gate fails.
+    match execution_call(cfg, tid, json!({ "kind": "inspect" })).and_then(RemoteExecution::parse) {
+        Ok(s) if !matches!(s.handoff, RemoteHandoff::None | RemoteHandoff::Returned) || s.attempt.as_ref().map(|a| !matches!(a.state, RemoteAttemptState::Quiesced)).unwrap_or(false) => {
+            dlog(tid, "execution held: prior writer/restoration still requires quiescence reconciliation; not retrying begin");
             return;
         }
+        Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
+        _ => {}
+    }
+    let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
+    let begin = begin_with_fresh_readiness(readiness_observed, update_request().is_some(), || {
+        // The tick already advertised this exact worker/config inventory. Do
+        // not run every local probe + hub advertisement again for every slot.
+        // Refresh after slow provisioning, with margin under the hub's 120s
+        // freshness gate. Begin still atomically checks live selection/scope.
+        let capabilities = capability_inventory(cfg, avail, Some(worker), backend_name);
+        let ready = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities }))?;
+        if ready["ok"] != true { return Err(format!("executor readiness held: {}", ready["readiness"])); }
+        Ok(())
+    }, || {
+        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000),
+            "selection": { "backend": backend_name, "model": model_str, "tier": model_tier } }))
+    });
+    let state = match begin {
+        Ok(s) => s,
+        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&expected_attempt), worktree.as_deref()); return; }
     };
+    let remote = match RemoteExecution::parse(state.clone()).and_then(|s| s.attempt.ok_or("execution begin returned no attempt".into())) {
+        Ok(a) if a.generation > 0 && !a.attempt_id.is_empty() => a,
+        _ => { failed_start(cfg, tid, StartStage::Begin, "durable execution response malformed", Some(&expected_attempt), worktree.as_deref()); return; }
+    };
+    let generation = remote.generation;
+    let attempt_id = remote.attempt_id;
+    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), maintenance: None, last_checkpoint: Instant::now() };
+    execution.control.grant_lease();
+    prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
+    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
+    EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
+    execution.start_maintenance(cfg, tid);
+    if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
+        let restored = (|| -> Result<(), String> {
+            let path = worktree.as_deref().ok_or("portable checkpoint requires an isolated Git worktree")?;
+            crate::checkpoint::restore(path, &cp)?;
+            let mut cmd = execution.command("restore"); cmd["tree"] = json!(cp.tree); cmd["commit"] = json!(cp.commit);
+            execution_call(cfg, tid, cmd)?;
+            Ok(())
+        })();
+        if let Err(e) = restored {
+            execution.stop_maintenance();
+            dlog(tid, &format!("checkpoint restore held: {e}; no agent spawned"));
+            // This attempt has never spawned a child. Preserve checkpoint/WIP;
+            // don't leave an imaginary writer lease blocking reconciliation.
+            let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
+            let _ = execution_call(cfg, tid, cmd);
+            return;
+        }
+    }
+    let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
+        Ok(s) => s,
+        Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
+    };
+    prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", safe_point["messages"]));
+    for message in safe_point["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
+        let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
+        if execution_call(cfg, tid, cmd).is_err() { return; }
+    }
+    if execution.control.stop.load(Ordering::SeqCst) || !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+        execution.stop_maintenance();
+        let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
+        let _ = execution_call(cfg, tid, cmd);
+        dlog(tid, "safe-point interruption before spawn; no writer launched");
+        return;
+    }
+    execution.control.grant_lease();
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
     } else {
@@ -2953,19 +3940,23 @@ fn spawn_opencode(
                     "url": format!("{}/mcp", cfg.url.trim_end_matches('/')),
                     "enabled": true,
                     "oauth": false,
-                    "headers": { "Authorization": format!("Bearer {}", agent_token) }
+                    "headers": { "Authorization": format!("Bearer {}", agent_token), "x-bridge-task": tid, "x-bridge-generation": generation.to_string(), "x-bridge-attempt": execution.attempt_id }
                 }}
             })
             .to_string(),
         )
     };
+    let completed = Arc::new(AtomicBool::new(false));
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
         let bin = bc.bin.clone();
+        let control = execution.control.clone();
+        let execution_for_task = execution.clone();
+        let completion_signal = CompletionSignal(completed.clone());
         let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
         std::thread::spawn(move || {
-            let backend = opencode::Backend::parse(cfg2.backend.as_deref());
+            let _completion_signal = completion_signal;
             let cli_bin = bin.as_deref().unwrap_or(&cfg2.opencode_bin);
             let out = opencode::run_task(
                 &run_dir,
@@ -2980,7 +3971,16 @@ fn spawn_opencode(
                 mcp_json.as_deref(),
                 bc_mode.as_deref(),
                 Some(live_for_task),
+                Some(control),
             );
+            // Capture at transport return, not after the main loop gets around
+            // to draining this receiver. A daemon crash during another task's
+            // network finalization must not lose this stopped-writer proof.
+            if execution_for_task.control.quiesced.load(Ordering::SeqCst) {
+                if let Err(error) = persist_stopped_receipt(&cfg2, &tid2, &execution_for_task, true) {
+                    dlog(&tid2, &format!("transport stopped proof could not be persisted: {error}"));
+                }
+            }
             if backend == opencode::Backend::Kiro {
                 if let Some(sid) = &out.session_id {
                     save_session_id(&tid2, sid);
@@ -2992,6 +3992,7 @@ fn spawn_opencode(
     };
     in_flight.push(InFlight {
         task_id: tid.to_string(),
+        completed,
         task_title: title.to_string(),
         role_work,
         started: std::time::Instant::now(),
@@ -3001,6 +4002,7 @@ fn spawn_opencode(
         pr_url: None,
         rx: outcome,
         live,
+        execution,
     });
     // ephemeral state file: headless observability (removed on completion)
     write_task_state(
@@ -3015,6 +4017,8 @@ fn spawn_opencode(
         }),
     );
     snap_in_flight_list(snap, in_flight);
+    write_runner_state(snap);
+    dlog(tid, &format!("worker launched after {}ms preparation", preparation_started.elapsed().as_millis()));
 }
 
 /// Dispatch circuit breaker: N consecutive failed/void dispatches with the
@@ -3062,6 +4066,7 @@ impl CircuitBreaker {
 
 fn tick(
     cfg: &DispatchConfig,
+    readiness: &GatewayReadiness,
     id: &mut i64,
     in_flight: &mut Vec<InFlight>,
     attempts: &mut HashMap<String, Instant>,
@@ -3074,9 +4079,11 @@ fn tick(
     breaker: &mut CircuitBreaker,
     live_notes: &mut HashMap<String, (String, Instant, Instant)>,
     gated_announced: &mut HashSet<String>,
+    stop: &AtomicBool,
 ) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
 
+    dispatch_stage(snap, DispatchStage::Readiness);
     // dispatchability gate: re-check every tick (cheap: one --version per
     // backend). No dispatchable agent -> never claim, never orient; drain
     // in-flight sessions, then EXIT non-zero. This is fatal, not a wait
@@ -3088,6 +4095,10 @@ fn tick(
     *avail = available_backends(cfg);
     let avail_ok = !avail.is_empty();
     if !avail_ok {
+        if let Some(name) = cfg.backends.keys().next() {
+            let capabilities = capability_inventory(cfg, &[], None, name);
+            let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
+        }
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
         dlog("", msg);
         snap_activity(snap, "error", msg);
@@ -3099,21 +4110,41 @@ fn tick(
         snap_activity(snap, "info", "agents available — resuming claims");
     }
     *last_avail_ok = avail_ok;
+    let mut prepared_worker = match readiness.proof(cfg) {
+        Ok(proof) => Some((proof.worker, proof.observed)),
+        Err(error) => {
+            // A refused background credential must still reach the existing
+            // gateway auth-heal ladder, rather than silently waiting forever.
+            if classify_hub_error(&error) == HubErrClass::Auth { return Err(error); }
+            dlog("", &format!("execution protocol not ready: {error}; waiting for independent readiness renewal"));
+            None
+        }
+    };
 
-    // worktree hygiene: every 10 ticks reconcile disk worktrees with task
-    // state — done/released tasks must not hold ~/.bridge/worktrees/<slug>
-    let n = SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n % 10 == 0 {
-        sweep_stale_worktrees(cfg, id, in_flight, &mut msgs);
+    // Lease/action/inbox clocks are independent of stdout. A lost hub or an
+    // expired action budget stops the process group; it never buys more work
+    // merely because the model keeps printing. No hot interrupt API is assumed.
+    for inf in in_flight.iter_mut() {
+        if !inf.execution.control.stop.load(Ordering::SeqCst) && inf.execution.last_checkpoint.elapsed() >= Duration::from_secs(300) {
+            dispatch_stage(snap, DispatchStage::Checkpoint);
+            if let Some(path) = inf.worktree.as_deref() {
+                if let Err(e) = inf.execution.checkpoint(cfg, &inf.task_id, path) {
+                    dlog(&inf.task_id, &format!("checkpoint publication failed: {e}; retain local WIP/host affinity"));
+                }
+            }
+            inf.execution.last_checkpoint = Instant::now();
+        }
     }
 
     // 1. drain finished sessions: finalize each (progress + in_review + cleanup)
+    dispatch_stage(snap, DispatchStage::Finalizing);
     let mut finished: Vec<(InFlight, opencode::RunOutcome)> = Vec::new();
     in_flight.retain_mut(|inf| match inf.rx.try_recv() {
         Ok(outcome) => {
             finished.push((
                 InFlight {
                     task_id: inf.task_id.clone(),
+                    completed: inf.completed.clone(),
                     task_title: inf.task_title.clone(),
                     role_work: inf.role_work,
                     started: inf.started,
@@ -3123,6 +4154,7 @@ fn tick(
                     scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
+                    execution: inf.execution.clone(),
                 },
                 outcome,
             ));
@@ -3134,6 +4166,7 @@ fn tick(
             finished.push((
                 InFlight {
                     task_id: inf.task_id.clone(),
+                    completed: inf.completed.clone(),
                     task_title: inf.task_title.clone(),
                     role_work: inf.role_work,
                     started: inf.started,
@@ -3143,6 +4176,7 @@ fn tick(
                     scratch: inf.scratch.clone(),
                     rx: std::sync::mpsc::channel().1,
                     live: inf.live.clone(),
+                    execution: inf.execution.clone(),
                 },
                 opencode::RunOutcome {
                     ok: false,
@@ -3200,6 +4234,44 @@ fn tick(
     }
 
     for (mut inf, outcome) in finished {
+        write_task_state(&inf.task_id, &json!({ "task_id": inf.task_id, "status": "result_captured", "generation": inf.execution.generation, "attempt_id": inf.execution.attempt_id, "exit_code": outcome.exit_code, "stdout_tail": outcome.stdout_tail, "stderr_tail": outcome.stderr_tail, "worktree": inf.worktree }));
+        // Capture actual stopped-writer proof durably BEFORE any publication
+        // or hub call. A failed finalization used to discard this proof forever
+        // and charge a stopped process against capacity after every outage.
+        inf.execution.stop_maintenance();
+        let stopped = inf.execution.control.quiesced.load(Ordering::SeqCst);
+        let receipt = persist_stopped_receipt(cfg, &inf.task_id, &inf.execution, stopped);
+        if let Err(error) = &receipt { dlog(&inf.task_id, &format!("stopped-writer receipt not recorded: {error}; capacity retained")); }
+        // Transfer/cleanup still needs a real portable checkpoint. Capacity
+        // reconciliation alone never deletes WIP or resolves unknown effects.
+        let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
+        if let Err(e) = &published { dlog(&inf.task_id, &format!("final checkpoint failed: {e}; worktree retained")); }
+        let quiesced = match receipt {
+            Ok((path, receipt)) => stopped_outbox::deliver(&path, &receipt, now_ms(), |r| send_stopped_receipt(cfg, r))
+                .map_err(|error| dlog(&inf.task_id, &format!("stopped-writer delivery deferred to durable outbox: {error}"))).is_ok(),
+            Err(_) => false,
+        };
+        if inf.execution.control.stop.load(Ordering::SeqCst) {
+            // Deliberate interruption is not a failed implementation/review.
+            // Resume only after the durable checkpoint/quiescence barrier.
+            if quiesced && published.is_ok() {
+                if let Ok(state) = execution_call(cfg, &inf.task_id, json!({ "kind": "inspect" })) {
+                    for m in state["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
+                        let mut cmd = inf.execution.command("ack"); cmd["message_id"] = m["id"].clone(); cmd["state"] = json!("acknowledged");
+                        let _ = execution_call(cfg, &inf.task_id, cmd);
+                    }
+                    let _ = execution_call(cfg, &inf.task_id, inf.execution.command("yield"));
+                }
+                note_task(cfg, &inf.task_id, "runner: writer stopped; checkpoint published and process group quiescent. Coordination/budget interrupt will resume from verified content, not a stdout-based restart.");
+            }
+            attempts.insert(inf.task_id.clone(), Instant::now());
+            continue;
+        }
+        if !quiesced || published.is_err() {
+            note_task(cfg, &inf.task_id, "runner: result captured but portable checkpoint/process quiescence barrier is incomplete. Local work retained; automatic transfer and cleanup held.");
+            attempts.insert(inf.task_id.clone(), Instant::now());
+            continue;
+        }
         // BR#2460: scratch dirs are disposable on every exit path (yield
         // included) — the board is the only deliverable, and a resumed run
         // gets a fresh scratch dir. Unlike worktrees, they hold no resume
@@ -3406,7 +4478,7 @@ fn tick(
             let receipt_note = if pr_url.is_some() {
                 note.clone()
             } else {
-                format!("{note}\nverified against: task artefact + history receipts (exit 0, session dispatch-{})", slugify(&inf.task_id))
+                format!("{note}\nverified against: task artefact + history receipts (exit 0, session {})", claim_session(cfg, &inf.task_id))
             };
             // worker-lane signal: a session that ended with BR-BLOCKED: hit a
             // blocker mid-run. The gateway files the block (and the ask the
@@ -3645,22 +4717,24 @@ fn tick(
     }
 
     // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok {
+    if !avail_ok || stop.load(Ordering::SeqCst) || update_request().is_some() {
         return Ok(msgs);
     }
+    let Some((worker_credential, readiness_observed)) = prepared_worker.as_mut() else { return Ok(msgs); };
 
     // 3c. circuit breaker: agent CLI is failing deterministically — stop
-    // claiming. In-flight sessions keep finishing; the breaker clears on the
-    // first success or a runner restart after the environment is fixed.
+    // claiming. Persist a bounded cooldown at the hub so operators see the
+    // cause and recovery does not require a process restart.
     if breaker.tripped() {
-        msgs.push(format!(
-            "CIRCUIT BREAKER — {} consecutive dispatch failures ({}). Not claiming new work: fix the agent CLI/auth, then restart the runner.",
-            breaker.consecutive_failures, breaker.last_signature
-        ));
+        let reason = format!("{} consecutive dispatch failures ({})", breaker.consecutive_failures, breaker.last_signature);
+        execution_call(cfg, "gateway", json!({ "kind": "gateway_failure", "reason": reason, "cooldown_ms": 300_000 }))?;
+        msgs.push(format!("CIRCUIT BREAKER — {reason}; hub cooldown for 5m, then readiness is re-proved"));
+        *breaker = CircuitBreaker::default();
         return Ok(msgs);
     }
 
     // 4. orient — once per tick when we have capacity
+    dispatch_stage(snap, DispatchStage::Admission);
     let orient = mcp_call(cfg, id, "orient", json!({}))?;
     // BR#2844: silent zeros die here. A drifted orient shape (the renamed-key
     // incident that emptied the work lists) is now a loud tick error naming
@@ -3727,10 +4801,24 @@ fn tick(
         // seconds stale) and carries the hub heartbeat in meta
         // (session_alive_ts / last_progress.ts).
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
+        if let Some(session) = art.pointer("/meta/session").and_then(|v| v.as_str()) { remember_claim_session(cfg, tid, session); }
         let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
+        task_meta["execution_project"] = art["project"].clone();
+        if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) {
+            if gated_announced.insert(format!("{tid}:reasoning")) { dlog(tid, "SKIP: persistent minimum reasoning tier unavailable on this host"); }
+            continue;
+        }
         let meta_obj = task_meta.as_object();
         let sess = find_session(&sessions, tid);
+        if execution_call(cfg, tid, json!({ "kind": "inspect" })).map(|state| quiesced_claim_can_resume(&state, &art, cfg.label.as_deref())).unwrap_or(false) {
+            let role_work = art["roles"].as_array().map(|roles| roles.iter().any(|role| matches!(role.as_str(), Some("analysis" | "review" | "unblock")))).unwrap_or(false);
+            // Authoritative quiescence beats an old conversation's recent
+            // timestamp. Keep the claim/session; begin restores/fences anew.
+            spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess.map(|s| s.id.clone()), role_work, "task", avail, in_flight, worker_credential, readiness_observed);
+            attempts.insert(tid.to_string(), Instant::now());
+            continue;
+        }
         let disposition = claim_liveness(
             sess.and_then(|s| s.updated_ms),
             meta_obj.and_then(|m| m.get("session_alive_ts")).and_then(|v| v.as_u64()),
@@ -3842,7 +4930,7 @@ fn tick(
                     let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
                     (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
                 }).unwrap_or((false, "task".to_string()));
-                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight);
+                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight, worker_credential, readiness_observed);
                 attempts.insert(tid.to_string(), Instant::now());
                 snap_activity(snap, "dispatch", &msg);
                 msgs.push(msg);
@@ -3855,186 +4943,83 @@ fn tick(
         ));
     }
 
-    // 6. claim new claimable tasks until the WIP limit is reached.
-    // BR#2419: blocked tasks are NOT candidates — resuming them is an unblock
-    // duty's verdict, never a client transition. The runner only claims todo
-    // work. RESUME preference: a candidate we hold an opencode session AND
-    // worktree for sorts first — resuming that session restores full context
-    // cheaply, which is how a task that yielded earlier routes back to "the
-    // same agent".
-    let candidates = orient
-        .get("unclaimed_work")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut candidates: Vec<(serde_json::Value, Option<String>)> = candidates
-        .into_iter()
-        .map(|t| {
-            let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sess = find_session(&sessions, &tid).map(|s| s.id.clone());
-            (t, sess)
-        })
-        .collect();
-    candidates.sort_by(|a, b| {
-        let ra = if a.1.is_some() { 0 } else { 1 };
-        let rb = if b.1.is_some() { 0 } else { 1 };
-        ra.cmp(&rb)
-    });
-    // BR#2844: same law as my_tasks — one malformed candidate never zeroes
-    // the dispatch surface, and it is never silent.
-    let mut malformed_candidates = 0usize;
-    for (task, resume_sess) in candidates {
-        if in_flight.len() >= cfg.max_sessions {
-            break;
-        }
-        let (Some(tid), Some(title)) = (
-            task.get("id").and_then(|v| v.as_str()),
-            task.get("title").and_then(|v| v.as_str()),
-        ) else {
-            malformed_candidates += 1;
-            continue;
+    // New work is selected AND reserved by the hub. Local history is not a
+    // second scheduling authority: a human release re-enters this path even
+    // when this process previously gave up or cached a refused reference.
+    // Full runners still ask the hub to arrange safe recovery capacity. This
+    // mode cannot reserve more work if local and hub counts temporarily differ.
+    if in_flight.len() >= cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
+        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "request_capacity" }))?;
+        let outcome = serde_json::from_value::<SchedulingOutcome>(scheduling)
+            .map_err(|error| format!("hub scheduling contract drift: {error}"))?;
+        dlog("", &format!("hub capacity request: {outcome:?}"));
+    }
+    let mut reserved_this_tick = HashSet::new();
+    while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
+        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
+        let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
+            Ok(SchedulingOutcome::Reserved { task_id, session, .. }) => (task_id, session),
+            Ok(other) => {
+                let message = format!("hub scheduling: {other:?}");
+                dlog("", &message);
+                snap_activity(snap, "schedule", &message);
+                break;
+            }
+            Err(error) => return Err(format!("hub scheduling contract drift: {error}")),
         };
-        if in_flight.iter().any(|inf| inf.task_id == tid)
-            || attempts
-                .get(tid)
-                .map(|a| a.elapsed() < Duration::from_secs(300))
-                .unwrap_or(false)
-        {
-            continue;
+        let (tid, session) = (&reservation.0, &reservation.1);
+        if !reserved_this_tick.insert(tid.clone()) {
+            return Err(format!("{tid}: repeated startup reservation in one refill; stop rather than churn"));
         }
-        // not dispatchable at all: question tasks (answered, not claimed),
-        // operator gates, bar-gated work — the claim gate would reject or the
-        // claim is wrong by definition. Respect the verdict; no churn.
-        if task.get("needs_qualification").and_then(|q| q.as_bool()).unwrap_or(false)
-            || task.get("is_claimable").and_then(|q| q.as_bool()) == Some(false)
-        {
-            // silence here reads as a dead runner: the queue looks full and
-            // nothing moves, with no errors anywhere. Say why — once per app
-            // run per task (an operator clearing the gate re-arms the note).
-            if gated_announced.insert(tid.to_string()) {
-                msgs.push(format!("SKIP: {tid} not claimable (qualification bars unmet) — meet the declared bars or re-issue"));
-            }
-            continue;
+        remember_claim_session(cfg, tid, session);
+        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))?;
+        if art["status"].as_str() != Some("in_progress") || art.pointer("/meta/session").and_then(|v| v.as_str()) != Some(session.as_str()) {
+            return Err(format!("{tid}: reservation changed before launch; preserving current holder"));
         }
-        if gave_up.contains(tid) {
-            continue; // escalated or handed off — the watchdog/humans own it now
+        if in_flight.iter().any(|inf| inf.task_id == *tid) {
+            return Err(format!("{tid}: hub reserved a task with a local writer; refusing duplicate launch"));
         }
-        // BR#2419: blocked work is not runner work. Leaving blocked is a
-        // verdict delivered by a role:unblock duty or a human — never a client
-        // transition. The unblock CHILD (a todo task) is what the runner
-        // dispatches; it shows up here as its own candidate.
-        if task.get("status").and_then(|s| s.as_str()) == Some("blocked") {
-            // blocked is a verdict, and claiming it needs a resolution the
-            // runner cannot invent — that is role:unblock duty. Skipping
-            // silently here starved the runner in front of a full backlog:
-            // ten blocked tasks filled the orient slice, every claim was
-            // refused, and nothing announced why. Announce + pace.
-            if gated_announced.insert(format!("{tid}:blocked")) {
-                msgs.push(format!("SKIP: {tid} blocked — needs its unblock condition resolved (unblock duty or human)"));
-            }
-            continue;
-        }
-        // BR#2460: no repo gate — repo-less candidates dispatch into a scratch
-        // dir with the board delivery contract. Provisioning is the runner's
-        // best-effort job; capability is the agent's. Nothing is declined for
-        // missing metadata.
-        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-        // BR#3337: re-read the card's status at claim time — the orient slice
-        // can be seconds stale, and a card another dispatcher claimed in
-        // between must skip silently (race lost), never claim-and-fail.
-        if let Some(st) = art.get("status").and_then(|s| s.as_str()) {
-            if st != "todo" {
-                dlog(
-                    tid,
-                    &format!("claim race lost (status now {st}) — skipping"),
-                );
-                snap_activity(
-                    snap,
-                    "info",
-                    &format!("{tid} claim race lost (now {st}) — skipped"),
-                );
-                continue;
-            }
-        }
-        let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        // BR#3845 self-heal: a reference this runner already refused (fatal
-        // clone failure) is skipped WITHOUT claiming — the recorded refusal
-        // stands until the card's repo URL changes, so a ghost reference can't
-        // re-enter the claim → clone-fail → watchdog-stall loop forever. A
-        // changed URL drops the record and dispatch resumes.
-        let candidate_url = source_repo(&body_md, &task_meta);
-        let mut refused = refused_cache_load();
-        if refused_reference(&mut refused, tid, candidate_url.as_deref()) {
-            let reason = refused.get(tid).map(|r| r.reason.clone()).unwrap_or_default();
-            if gated_announced.insert(format!("{tid}:refused")) {
-                dlog(
-                    tid,
-                    &format!(
-                        "skip: refused repo reference {} ({}) — fix the reference on the card to re-arm",
-                        candidate_url.unwrap_or_default(),
-                        reason
-                    ),
-                );
-                snap_activity(snap, "info", &format!("{tid} refused repo reference ({reason}) — skipped until it changes"));
-            }
-            continue;
-        }
-        if let Err(e) = mcp_call_task(
-            cfg,
-            id,
-            "transition",
-            json!({ "id": tid, "to": "in_progress" }),
-            &tid,
-        ) {
-            if is_claim_race_error(&e) {
-                // BR#3337: the lifecycle/ownership gate refused the claim —
-                // another gateway or session owns the card. That is a claim
-                // race: retryable next tick, never a dispatch failure (no
-                // error bookkeeping, no backoff, breaker untouched).
-                dlog(
-                    tid,
-                    &format!("claim raced (rejected: {}) — skipping", truncate(&e, 100)),
-                );
-                snap_activity(
-                    snap,
-                    "info",
-                    &format!("{tid} claim raced — skipped (retryable)"),
-                );
-                continue;
-            }
-            // claim failed for a real reason — don't kill the tick or the whole
-            // claim loop; surface it on stderr too (snap-only failures read as
-            // silence) and back off this candidate
-            dlog(tid, &format!("error: claim failed: {e}"));
-            attempts.insert(tid.to_string(), Instant::now());
-            snap_activity(snap, "error", &format!("claim {tid} failed: {e}"));
-            continue;
-        }
+        gave_up.remove(tid);
+        finished_no_pr.remove(tid);
+        let title = art["title"].as_str().ok_or("reserved task is missing title")?;
+        let body_md = art["body_md"].as_str().unwrap_or("");
+        let mut task_meta = art["meta"].clone();
+        task_meta["execution_project"] = art["project"].clone();
+        let resume_sess = None; // a new reservation is a fresh executor session; WIP remains in the registered worktree
         let _ = mcp_call_task(
             cfg,
             id,
             "log_progress",
-            json!({ "id": tid, "note": format!("runner: claimed — dispatching to opencode"), "sentiment": "going_well" }),
+            json!({ "id": tid, "note": "runner: claimed — preparing verified worker launch", "sentiment": "going_well" }),
             &tid,
         );
         let msg = match &resume_sess {
             Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
-            None => format!("claimed {tid} — dispatched to opencode"),
+            None => format!("claimed {tid} — worker launch requested"),
         };
-        let (role_work, role_type) = task.get("tags").and_then(|v| v.as_array()).map(|a| {
-            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
+        let (role_work, role_type) = art.get("roles").and_then(|v| v.as_array()).map(|a| {
+            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| matches!(*s, "review" | "analysis" | "unblock")).map(str::to_string);
             (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
         }).unwrap_or((false, "task".to_string()));
-        spawn_opencode(cfg, snap, tid, &title, &body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight);
+        let before_launch = in_flight.len();
+        spawn_opencode(cfg, snap, tid, title, body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight, worker_credential, readiness_observed);
         attempts.insert(tid.to_string(), Instant::now());
-        snap_activity(snap, "dispatch", &msg);
-        msgs.push(msg);
-    }
-    if malformed_candidates > 0 {
-        msgs.push(format!(
-            "WARN: {malformed_candidates} unclaimed_work item(s) missing id/title — hub contract drift (BR#2844, packages/contracts)"
-        ));
+        if in_flight.len() > before_launch {
+            snap_activity(snap, "dispatch", &msg);
+            msgs.push(msg);
+        } else {
+            snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
+            // A task-specific pre-spawn interruption must not leave every
+            // other slot idle for another poll interval. Continue only after
+            // authoritative no-writer proof; schedule rechecks gateway readiness
+            // and capacity for EVERY next reservation. Unknown effects stay held.
+            match execution_call(cfg, tid, json!({ "kind": "inspect" })) {
+                Ok(state) if failed_launch_has_no_writer(&state) && reserved_this_tick.len() < cfg.max_sessions + 8 => {
+                    dlog(tid, "no writer after startup reconciliation; continuing capacity refill");
+                }
+                _ => break,
+            }
+        }
     }
 
     Ok(msgs)
@@ -4116,7 +5101,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // reports, then stands down LOUDLY from merge legs (BR#3181). Lease
     // renewals carry proof-of-progress; MERGE_TRAIN_ENABLED=0 disables
     // (deploy.md §7).
-    crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), stop.clone());
+    let mut train_stop = Arc::new(AtomicBool::new(update_request().is_some()));
+    let mut train_handle = if update_request().is_none() {
+        crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone())
+    } else { None };
     // BR#4489 `role: "train"`: a dedicated merge-train node is a normal
     // gateway in a named mode — the daemon legs (train thread above, WS
     // connection/transport, epoch self-heal, liveness) keep running; the
@@ -4159,7 +5147,9 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         s.agent = cfg.agent.clone();
         s.workdir = Some(cfg.workdir.clone());
         s.max_sessions = cfg.max_sessions;
+        s.in_flight.clear();
     }
+    dispatch_stage(&snap, DispatchStage::Starting);
     // Self-healing law (BR#2840, BR#3787, BR#4113): a hub-rejected token gets
     // a repair LADDER — keychain reload (another process may have re-vended),
     // agent-plane principal repair (headless-safe), then desktop
@@ -4176,9 +5166,45 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // auth failures park instead of exiting.)
     let mut heal = AuthHeal::new();
     let mut cfg = cfg;
+    let readiness = dispatch_enabled.then(|| {
+        dispatch_stage(&snap, DispatchStage::Readiness);
+        GatewayReadiness::start(&cfg)
+    });
+    // Separate from admission and per-writer leases: replay survives a stopped
+    // worker, a blocked dispatch tick and daemon replacement. Use the readiness
+    // producer's current credential/config; never keep a rotated token alive.
+    let stopped_delivery = readiness.as_ref().map(|readiness| {
+        let config = readiness.data.clone();
+        let delivery = LeaseMaintenance::start(Duration::from_secs(20), move || {
+            let cfg = config.lock().expect("gateway readiness poisoned").cfg.clone();
+            if let (Some(root), Some(host)) = (stopped_outbox_root(), cfg.label.as_deref()) {
+                for message in stopped_outbox::flush(&root, host, &cfg.url, now_ms(), |r| send_stopped_receipt(&cfg, r)) {
+                    dlog("gateway", &message);
+                }
+            }
+            true
+        });
+        delivery.wake();
+        delivery
+    });
     loop {
+        if let Some(request) = update_request() {
+            // Natural completion only: do not signal worker stop, discard
+            // receivers, infer quiescence from a lease or kill a live writer.
+            match update_train_barrier(in_flight.len(), &train_stop, &mut train_handle) {
+                Ok(UpdateTrainBarrier::DrainingWorkers) => dlog("", "managed update: worker drain in progress; train stop deferred to final restart barrier"),
+                Ok(UpdateTrainBarrier::Quiescent) => update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"})),
+                Err(reason) => { dlog("", reason); return; }
+            }
+        } else if train_stop.load(Ordering::SeqCst) {
+            train_stop = Arc::new(AtomicBool::new(false));
+            train_handle = crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone());
+        }
         if stop.load(Ordering::Relaxed) {
-            break;
+            if in_flight.is_empty() { break; }
+            // Stop is a bounded checkpoint/quiesce drain, not dropping the
+            // result receivers while detached writer threads keep running.
+            for inf in &in_flight { inf.execution.control.stop.store(true, Ordering::SeqCst); }
         }
         // BR#3787 — negotiated catch-up at the tick boundary: the hub's epoch
         // header moved past the epoch we vended (another login/repair rotated
@@ -4222,8 +5248,11 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         // BR#4489 role:"train" — skip ONLY the dispatch tick; the tail of the
         // loop (runner-state sync + responsive stop) still runs every pass.
         if dispatch_enabled {
+            let readiness = readiness.as_ref().expect("dispatch has a readiness producer");
+            readiness.update_config(&cfg);
             match tick(
                 &cfg,
+                readiness,
                 &mut id,
                 &mut in_flight,
                 &mut attempts,
@@ -4236,8 +5265,12 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 &mut breaker,
                 &mut live_notes,
                 &mut gated_announced,
+                &stop,
             ) {
             Ok(msgs) => {
+                if update_request().is_some() && !avail.is_empty() && readiness.proof(&cfg).is_ok() && snap.lock().map(|s| s.needs_attention.is_none()).unwrap_or(false) {
+                    update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
+                }
                 for msg in msgs {
                     dlog("", &msg);
                 }
@@ -4324,18 +5357,29 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             }
             }
         }
+        // Admission and completion handling always precede optional hygiene.
+        // Never restart a backlog of status reads before filling free slots.
+        if dispatch_enabled && !stop.load(Ordering::Relaxed) && update_request().is_none()
+            && SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
+            dispatch_stage(&snap, DispatchStage::Hygiene);
+            let mut messages = Vec::new();
+            sweep_stale_worktrees(&cfg, &mut id, &in_flight, &mut messages);
+            for message in messages { dlog("", &message); }
+        }
         // ephemeral flat-file state: keep ~/.bridge/dispatch/runner.json in sync
         write_runner_state(&snap);
-        // sleep in small slices so stop is responsive
-        let wake = std::time::Instant::now() + Duration::from_secs(cfg.poll_secs);
-        while std::time::Instant::now() < wake {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        if update_request().is_some() { std::thread::sleep(Duration::from_secs(2)); }
+        dispatch_stage(&snap, DispatchStage::Waiting);
+        // A returned/disconnected worker is new capacity: do not spend the
+        // whole fallback poll interval leaving its result and slot undrained.
+        wait_for_dispatch_wake(Duration::from_secs(cfg.poll_secs), ||
+            stop.load(Ordering::Relaxed) || update_request().is_some()
+                || in_flight.iter().any(|inf| inf.completed.load(Ordering::SeqCst)));
     }
+    if let Some(delivery) = stopped_delivery { delivery.stop(); }
     running.store(false, Ordering::Relaxed);
+    train_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = train_handle { let _ = handle.join(); }
     if let Ok(mut s) = snap.lock() {
         s.running = false;
         s.in_flight = Vec::new();
@@ -4435,15 +5479,24 @@ pub fn reconnect(state: &DispatchState) -> Result<serde_json::Value, String> {
 ///    token at startup — the local copy is provably useless; delete it and
 ///    await the next login to re-vend.
 fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedSnapshot, clear_credential: bool) {
+    if !clear_credential {
+        write_runner_state(snap);
+        dlog("", "human session ended; gateway and its writer leases keep running");
+        return;
+    }
     stop.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
     if clear_credential {
         if let Err(e) = crate::store::TokenStore::open().clear_token() {
             dlog("", &format!("warning: credential clear failed: {e}"));
         }
-        if let Some(dir) = dispatch_dir() {
-            // vendored per-agent credentials — re-provisioned after the next login
-            let _ = std::fs::remove_file(dir.join("agent-tokens.json"));
+        // vendored per-agent credentials — re-provisioned after the next login.
+        // BR#6682: clear the CANONICAL cache — the fixed path provision_agent_token
+        // writes. The dispatch-dir resolution honors BRIDGE_DISPATCH_DIR, which
+        // would delete an isolated rollout runner's report-dir copy while the
+        // real shared cache survives the credential clear.
+        if let Some(cache_path) = agent_token_cache_path() {
+            let _ = std::fs::remove_file(&cache_path);
         }
     }
     if let Ok(mut s) = snap.lock() {
@@ -4466,7 +5519,7 @@ fn logout_core(stop: &Arc<AtomicBool>, running: &Arc<AtomicBool>, snap: &SharedS
     );
 }
 
-/// Log out (Settings): stop the runner and end the human session — but the
+/// Log out (Settings): end the human session — the runner continues and the
 /// gateway token STAYS in the keychain (credential-class ADR: the gateway
 /// survives UI logout, dispatched agents keep running, admin revoke is the
 /// kill switch). The next login re-vends, replacing in place.
@@ -4483,7 +5536,432 @@ pub fn logout(state: &DispatchState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_launch_refill_requires_conclusive_no_writer_not_expiry_or_transport_failure() {
+        assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":null})));
+        assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":{"phase":"quiesced"}})));
+        for phase in ["running", "restoring", "stopping"] {
+            assert!(!super::failed_launch_has_no_writer(&serde_json::json!({"attempt":{"phase":phase,"lease_until":0}})));
+        }
+        assert!(!super::failed_launch_has_no_writer(&serde_json::json!({"error":"503"})));
+    }
     use super::*;
+    #[test]
+    fn update_drain_keeps_train_ticks_live_until_workers_finish_then_joins_before_idle() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mut handle = Some(std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                sent.send("tick").unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sent.send("train_stopped").unwrap();
+        }));
+        assert_eq!(update_train_barrier(12, &stop, &mut handle), Ok(UpdateTrainBarrier::DrainingWorkers));
+        assert!(!stop.load(Ordering::SeqCst));
+        assert!(handle.is_some());
+        for _ in 0..2 { assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "tick"); }
+        assert_eq!(update_train_barrier(0, &stop, &mut handle), Ok(UpdateTrainBarrier::Quiescent));
+        assert!(handle.is_none());
+        assert_eq!(received.try_iter().last(), Some("train_stopped"), "idle is impossible before the live train has actually joined");
+    }
+    #[test]
+    fn update_train_join_failure_never_confirms_idle() {
+        let stop = AtomicBool::new(false);
+        let mut handle = Some(std::thread::spawn(|| panic!("train failed during finalization")));
+        assert!(update_train_barrier(0, &stop, &mut handle).is_err());
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn readiness_probe_kills_its_own_hung_process_group_within_budget() {
+        let mut command = Command::new("sh"); command.args(["-c", "sleep 10 & wait"]);
+        let started = Instant::now();
+        assert!(probe_command(command, Duration::from_millis(100)).unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut quick = Command::new("sh"); quick.args(["-c", "exit 0"]);
+        assert!(probe_command(quick, Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn worker_completion_wakes_refill_without_consuming_its_result() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let signal = CompletionSignal(completed.clone());
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _signal = signal;
+            std::thread::sleep(Duration::from_millis(20));
+            send.send("real completed result").unwrap();
+        });
+        let started = Instant::now();
+        wait_for_dispatch_wake(Duration::from_secs(5), || completed.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_secs(2), "refill waited for the fallback poll");
+        assert_eq!(receive.try_recv().unwrap(), "real completed result");
+        worker.join().unwrap();
+        let started = Instant::now();
+        wait_for_dispatch_wake(Duration::from_millis(50), || false);
+        assert!(started.elapsed() >= Duration::from_millis(50), "idle gateways must not busy-poll");
+    }
+
+    #[test]
+    fn filling_slots_reuses_fresh_inventory_but_refresh_failure_never_begins() {
+        let mut observed = Instant::now();
+        for _ in 0..12 {
+            assert_eq!(begin_with_fresh_readiness(&mut observed, false,
+                || panic!("fresh batch should not advertise once per slot"), || Ok("begun")).unwrap(), "begun");
+        }
+        observed = Instant::now() - Duration::from_secs(61);
+        let refreshed = std::cell::Cell::new(false);
+        begin_with_fresh_readiness(&mut observed, false,
+            || { refreshed.set(true); Ok(()) }, || { assert!(refreshed.get()); Ok(()) }).unwrap();
+        assert!(observed.elapsed() < Duration::from_secs(1));
+        let error = begin_with_fresh_readiness(&mut observed, true,
+            || Err("readiness unavailable".into()), || -> Result<(), String> { panic!("failed refresh must not launch a writer") }).unwrap_err();
+        assert_eq!(error, "readiness unavailable");
+        assert_eq!(begin_with_fresh_readiness(&mut observed, false, || Ok(()),
+            || -> Result<(), String> { Err("hub selection/scope gate refused".into()) }).unwrap_err(), "hub selection/scope gate refused");
+    }
+
+    #[test]
+    fn worker_panic_also_wakes_disconnected_result_handling() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let signal = CompletionSignal(completed.clone());
+        let worker = std::thread::spawn(move || { let _signal = signal; panic!("fixture worker panic"); });
+        let started = Instant::now();
+        wait_for_dispatch_wake(Duration::from_secs(5), || completed.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(worker.join().is_err());
+    }
+
+    fn retained_sweep_candidates(n: usize) -> Vec<WorktreeCandidate> {
+        (0..n).map(|i| WorktreeCandidate {
+            slug: format!("BR-{i}"), path: PathBuf::from(format!("/fixture/BR-{i}")),
+            mtime: std::time::SystemTime::now(),
+        }).collect()
+    }
+
+    #[test]
+    fn retained_sweep_backlog_is_bounded_and_fair_across_restarts() {
+        let mut cursor = WorktreeSweepCursor::default();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(11), &mut cursor,
+                Duration::from_secs(1), |candidate, _| { seen.push(candidate.slug.clone()); Some("in_progress".into()) },
+                |_, _, _| panic!("retained work must not be removed"));
+            assert!(inspected <= WORKTREE_SWEEP_CAP);
+            assert_eq!(swept, 0);
+            cursor = serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
+        }
+        assert_eq!(seen.len(), 11);
+        seen.sort(); seen.dedup();
+        assert_eq!(seen.len(), 11, "restarts must not keep probing just the oldest retained trees");
+    }
+
+    #[test]
+    fn slow_sweep_reads_exhaust_the_probe_budget_without_losing_the_cursor() {
+        let mut cursor = WorktreeSweepCursor::default();
+        let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(20), &mut cursor,
+            Duration::from_millis(20), |_, limit| { std::thread::sleep(limit); None },
+            |_, _, _| panic!("a failed status probe cannot delete fresh work"));
+        assert_eq!((inspected, swept), (1, 0));
+        assert_eq!(cursor.remaining.len(), 19);
+    }
+
+    #[test]
+    fn hygiene_status_probe_has_a_real_short_http_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || { let (_socket, _) = listener.accept().unwrap(); let _ = wait.recv_timeout(Duration::from_secs(3)); });
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"hygiene-test", "token":"fixture-only" })).unwrap();
+        let started = Instant::now();
+        let error = mcp_call_session_with_timeout(&cfg, &mut 0, "get_artefact", json!({"id":"BR#1"}), None, Duration::from_millis(100)).unwrap_err();
+        let _ = done.send(()); server.join().unwrap();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn resume_retry_keeps_the_original_command_id_and_does_not_repeat_a_new_effect() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut ids = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap(); socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = Vec::new(); let mut buffer = [0u8; 1024];
+                let (offset, length) = loop {
+                    let n = socket.read(&mut buffer).unwrap(); assert!(n > 0); request.extend_from_slice(&buffer[..n]);
+                    if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..offset]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap();
+                        if request.len() >= offset + 4 + length { break (offset + 4, length); }
+                    }
+                };
+                let body: serde_json::Value = serde_json::from_slice(&request[offset..offset + length]).unwrap();
+                ids.push(body["params"]["arguments"]["command_id"].as_str().unwrap().to_string());
+                let response = if attempt == 0 { "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string() }
+                    else {
+                        let body = json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[{"type":"text","text":"{\"kind\":\"claims_resumed\"}"}]}}).to_string();
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+            ids
+        });
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"control-test", "token":"fixture-only" })).unwrap();
+        assert_eq!(execution_claims(&cfg, false).unwrap()["kind"], "claims_resumed");
+        let ids = server.join().unwrap(); assert!(!ids[0].is_empty()); assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn operator_rpc_has_a_short_real_timeout_instead_of_a_silent_thirty_second_wait() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || { let (_socket, _) = listener.accept().unwrap(); let _ = wait.recv_timeout(Duration::from_secs(12)); });
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"timeout-test", "token":"fixture-only" })).unwrap();
+        let started = Instant::now(); let mut id = 0;
+        let error = mcp_call_session(&cfg, &mut id, "execution", json!({"id":"gateway","command_id":"same-receipt","command":{"kind":"resume_claims"}}), None).unwrap_err();
+        let _ = done.send(()); server.join().unwrap();
+        assert!(error.contains("timed out after 8s"), "{error}");
+        assert!(error.contains("same-receipt"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(12));
+    }
+    #[test]
+    fn managed_update_hold_cannot_advertise_usable_spare_models() {
+        let supply = json!({"tier":"large","model":"large-model","availability":{"kind":"usable"},
+            "alternatives":[{"tier":"small","model":"small-model","availability":{"kind":"usable"}},
+                {"tier":"medium","model":"medium-model","availability":{"kind":"usable"}}]});
+        let held = inventory_dispatch_hold(supply.clone(), true);
+        assert_eq!(held["availability"]["kind"], "unavailable");
+        assert!(held["availability"]["reason"].as_str().unwrap().contains("Managed update"));
+        assert!(held["alternatives"].as_array().unwrap().iter().all(|m| m["availability"]["kind"] == "unavailable"));
+        assert_eq!(held["model"], supply["model"]);
+        assert_eq!(inventory_dispatch_hold(supply.clone(), false), supply, "fresh inventory resumes without changing model identity");
+    }
+    #[test]
+    fn lease_maintenance_keeps_polling_while_dispatch_is_blocked_and_joins_before_finalization() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polled = count.clone();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            polled.fetch_add(1, Ordering::SeqCst);
+            observed.send(()).unwrap();
+            true
+        });
+        // No tick calls: simulate a blocked worktree preparation/publication.
+        for _ in 0..4 { polls.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        pump.stop();
+        let at_barrier = count.load(Ordering::SeqCst);
+        assert!(at_barrier >= 4);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(count.load(Ordering::SeqCst), at_barrier, "no renewal after quiescence barrier");
+        pump.stop(); // finalization and Drop can both cancel safely
+    }
+
+    fn readiness_fixture() -> DispatchConfig {
+        serde_json::from_value(json!({"url":"http://fixture.invalid","label":"fixture-gateway","token":"fixture-only"})).unwrap()
+    }
+
+    fn wait_for_readiness_test(mut condition: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(Instant::now() < until, "readiness transition did not happen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn gateway_readiness_stays_fresh_without_any_dispatch_ticks_and_stops_at_join() {
+        let cfg = readiness_fixture();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes = count.clone();
+        let (observed, events) = std::sync::mpsc::channel();
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(10), move |_| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            let _ = observed.send(());
+            Ok(WorkerCredential { label:"fixture-gateway/worker".into(), secret:"fixture-only".into() })
+        });
+        // No tick/prepare/launch calls for several simulated capability TTLs.
+        for _ in 0..35 { events.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        assert!(readiness.proof_with_max_age(&cfg, Duration::from_millis(100)).is_ok());
+        readiness.maintenance.stop();
+        let at_join = count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(count.load(Ordering::SeqCst), at_join, "dead gateway must not keep advertising");
+        assert!(readiness.proof_with_max_age(&cfg, Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn gateway_readiness_failure_withdraws_local_admission_and_recovers_from_a_real_probe() {
+        let cfg = readiness_fixture();
+        let failing = Arc::new(AtomicBool::new(false));
+        let fail = failing.clone();
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(10), move |_| {
+            if fail.load(Ordering::SeqCst) { Err("backend unavailable".into()) }
+            else { Ok(WorkerCredential {label:"fixture/worker".into(),secret:"fixture-only".into()}) }
+        });
+        assert!(readiness.proof(&cfg).is_ok());
+        failing.store(true, Ordering::SeqCst);
+        readiness.maintenance.wake();
+        wait_for_readiness_test(|| readiness.proof(&cfg).is_err());
+        assert!(readiness.proof(&cfg).err().unwrap().contains("backend unavailable"));
+        failing.store(false, Ordering::SeqCst);
+        readiness.maintenance.wake();
+        wait_for_readiness_test(|| readiness.proof(&cfg).is_ok());
+        readiness.maintenance.stop();
+    }
+
+    #[test]
+    fn gateway_config_change_rejects_an_in_flight_obsolete_readiness_proof() {
+        for credential_only in [false, true] {
+        let cfg = readiness_fixture();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (fresh_entered, fresh_started) = std::sync::mpsc::channel();
+        let (fresh_release, fresh_wait) = std::sync::mpsc::channel();
+        let mut round = 0;
+        let readiness = GatewayReadiness::with_probe(&cfg, Duration::from_millis(5), move |cfg| {
+            round += 1;
+            if round == 2 { entered.send(()).unwrap(); wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            if round == 3 { fresh_entered.send(()).unwrap(); fresh_wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            Ok(WorkerCredential {label:cfg.label.clone().unwrap(),secret:cfg.token.clone()})
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut changed = cfg.clone();
+        if credential_only { changed.token = "rotated-fixture".into(); }
+        else { changed.label = Some("renamed-gateway".into()); }
+        readiness.update_config(&changed);
+        assert!(readiness.proof(&changed).is_err());
+        release.send(()).unwrap();
+        fresh_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(readiness.proof(&changed).is_err(), "obsolete result won the config/credential race");
+        fresh_release.send(()).unwrap();
+        wait_for_readiness_test(|| readiness.proof(&changed).is_ok());
+        let proof = readiness.proof(&changed).unwrap();
+        assert_eq!(proof.worker.label, changed.label.clone().unwrap());
+        assert_eq!(proof.worker.secret, changed.token);
+        if !credential_only { assert!(readiness.proof(&cfg).is_err()); }
+        readiness.maintenance.stop();
+        }
+    }
+
+    #[test]
+    fn stopping_gateway_readiness_joins_an_in_flight_publication() {
+        let cfg = readiness_fixture();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut round = 0;
+        let readiness = Arc::new(GatewayReadiness::with_probe(&cfg, Duration::from_millis(5), move |_| {
+            round += 1;
+            if round == 2 { entered.send(()).unwrap(); wait.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            Ok(WorkerCredential {label:"fixture/worker".into(),secret:"fixture-only".into()})
+        }));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (joined, done) = std::sync::mpsc::channel();
+        let stopping = readiness.clone();
+        let stopper = std::thread::spawn(move || { stopping.maintenance.stop(); joined.send(()).unwrap(); });
+        assert!(done.recv_timeout(Duration::from_millis(30)).is_err(), "stop must wait for the pending bounded publication");
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        stopper.join().unwrap();
+    }
+
+    #[test]
+    fn lease_maintenance_terminal_poll_failure_is_not_retried() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            observed.send(()).unwrap();
+            false
+        });
+        polls.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(polls.recv_timeout(Duration::from_secs(2)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        pump.stop();
+    }
+
+    #[test]
+    fn lease_maintenance_stop_waits_for_in_flight_poll_before_quiescence() {
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            true
+        });
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (stopped, stopping) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || { pump.stop(); stopped.send(()).unwrap(); });
+        assert!(matches!(stopping.recv_timeout(Duration::from_millis(25)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release.send(()).unwrap();
+        stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn lease_renewal_requires_exact_active_attempt_and_no_pending_mailbox_delivery() {
+        let base = json!({ "policy_version": 1, "attempt": { "generation": 7, "attempt_id": "attempt", "phase": "running" }, "messages": [] });
+        let state = RemoteExecution::parse(base.clone()).unwrap();
+        assert!(state.permits_renewal(7, "attempt"));
+        assert!(!state.permits_renewal(8, "attempt"));
+        assert!(!state.permits_renewal(7, "other"));
+        let mut restoring = base.clone();
+        restoring["attempt"]["phase"] = json!("restoring");
+        restoring["attempt"]["checkpoint"] = json!({ "repo": "repo", "remote_ref": "refs/heads/checkpoint", "commit": "commit", "tree": "tree", "base": "base", "environment": [], "next": "restore", "tests": [] });
+        assert!(RemoteExecution::parse(restoring).unwrap().permits_renewal(7, "attempt"));
+        for phase in ["stopping", "quiesced"] {
+            let mut value = base.clone(); value["attempt"]["phase"] = json!(phase);
+            assert!(!RemoteExecution::parse(value).unwrap().permits_renewal(7, "attempt"));
+        }
+        let mut missing = base.clone(); missing["attempt"] = serde_json::Value::Null;
+        assert!(!RemoteExecution::parse(missing).unwrap().permits_renewal(7, "attempt"));
+        let mut delivered = base; delivered["messages"] = json!([{ "state": "delivered" }]);
+        assert!(!RemoteExecution::parse(delivered).unwrap().permits_renewal(7, "attempt"));
+    }
+
+    #[test]
+    fn quiescence_can_resume_only_the_same_hosts_unchanged_claim_without_a_local_handoff() {
+        let task = json!({ "status": "in_progress", "meta": { "session": "dispatch-BR-1" } });
+        let mut state = json!({ "attempt": { "phase": "running", "host": "host", "session": "dispatch-BR-1" }, "handoff": { "phase": "none" } });
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+        state["attempt"]["phase"] = json!("quiesced");
+        assert!(quiesced_claim_can_resume(&state, &task, Some("host")));
+        state["capacity_handoff"] = json!({"phase":"slot_available","recovery_id":"BR#2"});
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")), "a verifier cannot steal its yielded slot back before priority dispatch");
+        state.as_object_mut().unwrap().remove("capacity_handoff");
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("other")));
+        assert!(!quiesced_claim_can_resume(&state, &json!({ "status": "in_progress", "meta": { "session": "local-owner" } }), Some("host")));
+        state["handoff"]["phase"] = json!("waiting");
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+    }
+
+    #[test]
+    fn multi_model_selection_respects_global_requirement_and_scope() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "backends": { "opencode": {
+            "projects": ["bridge"], "models": { "medium": "glm-5.3", "large": "provider/sol" }
+        } } })).unwrap();
+        let task = json!({ "execution_project": "bridge", "execution_scheduling_requirements": { "tier": "medium" } });
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &task), Some((ReasoningTier::Medium, "glm-5.3".into())));
+        let mut large = task.clone(); large["execution_scheduling_requirements"]["tier"] = json!("large");
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &large), Some((ReasoningTier::Large, "provider/sol".into())));
+        large["execution_project"] = json!("other");
+        assert!(!backend_satisfies(&cfg, opencode::Backend::OpenCode, &large));
+        let inventory = capability_inventory(&cfg, &[opencode::Backend::OpenCode], None, "opencode");
+        assert_eq!(inventory["model"], "provider/sol");
+        assert_eq!(inventory["alternatives"][0]["model"], "glm-5.3");
+        assert_eq!(inventory["availability"]["kind"], "usable");
+    }
+
+    #[test]
+    fn explicit_models_replace_legacy_pin_and_never_fall_back_below_minimum() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "model": "legacy-large", "backends": { "opencode": {
+            "reasoning_tier": "large", "models": { "medium": "glm-5.3" }
+        } } })).unwrap();
+        assert!(selected_model(&cfg, opencode::Backend::OpenCode, &json!({ "execution_requirements": { "tier": "large" } })).is_none());
+        assert!(serde_json::from_value::<BackendConfig>(json!({"models": {"huge": "not-a-tier"}})).is_err());
+    }
 
     #[test]
     fn orient_gate_matches_the_checked_in_production_fixture() {
@@ -4699,16 +6177,74 @@ mod tests {
         std::fs::create_dir_all(home.join(".bridge").join("worktrees").join("hotfix-ext")).unwrap();
         let mut active = HashSet::new();
         active.insert("BR-2".to_string()); // in-flight on this host — excluded from BOTH roots
-        let found = collect_worktree_candidates(&workdir, Some(&home), &active);
+        // 2026-11-02: the runner's own trees root <workdir>/worktrees/<slug>
+        std::fs::create_dir_all(workdir.join("worktrees").join("BR-4")).unwrap();
+        let found = collect_worktree_candidates(&workdir, Some(&home), &active, &[]);
         let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
         slugs.sort();
-        assert_eq!(slugs, vec!["BR-1", "BR-3", "hotfix-ext"], "active excluded from both roots, the rest collected");
+        assert_eq!(slugs, vec!["BR-1", "BR-3", "BR-4", "hotfix-ext"], "active excluded from every root, the rest collected (incl. <workdir>/worktrees)");
         // the BR#3633 regression: a missing legacy root used to early-return
         // and discard the nested candidates — now it is a scoped skip
-        let found = collect_worktree_candidates(&workdir, Some(&base.join("no-such-home")), &HashSet::new());
+        let found = collect_worktree_candidates(&workdir, Some(&base.join("no-such-home")), &HashSet::new(), &[]);
         let mut slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
         slugs.sort();
-        assert_eq!(slugs, vec!["BR-1", "BR-2"], "nested candidates survive a missing legacy root");
+        assert_eq!(slugs, vec!["BR-1", "BR-2", "BR-4"], "nested candidates survive a missing legacy root");
+
+        // 2026-11-02: REGISTERED enumeration — a real git repo root (the shared
+        // checkout class) with worktrees registered at arbitrary paths via
+        // `git worktree add` is enumerated by `git worktree list`, its own
+        // main worktree skipped. The dir scans alone never saw these — this
+        // is the 30+ GB checkout leak class.
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git").args(args).current_dir(cwd).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success()
+        };
+        assert!(git(&["init", "-q", "."], &checkout));
+        git(&["config", "user.email", "t@t"], &checkout);
+        git(&["config", "user.name", "t"], &checkout);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"], &checkout);
+        let leaked = base.join("elsewhere").join("BR-9001");
+        assert!(git(&["worktree", "add", "-q", leaked.to_str().unwrap()], &checkout), "register a worktree at an arbitrary path");
+        let found = collect_worktree_candidates(&workdir, Some(&home), &HashSet::new(), &[checkout.to_string_lossy().to_string()]);
+        let slugs: Vec<String> = found.iter().map(|c| c.slug.clone()).collect();
+        assert!(slugs.contains(&"BR-9001".to_string()), "registered tree at an arbitrary path is enumerated via sweep_repos");
+        assert!(!found.iter().any(|c| c.path == checkout), "the repo's own main worktree is never a candidate");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_registry_roundtrip_active_protected_dead_pruned() {
+        // 2026-11-02: the registry is the mechanical record of every worktree
+        // the system directed a session to create. Roundtrip: register →
+        // enumerate (live) → protect (active slug) → prune (dead line) →
+        // deregister (teardown).
+        let base = std::env::temp_dir().join(format!("bridge-wtreg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let live = base.join("trees").join("BR-7001");
+        std::fs::create_dir_all(&live).unwrap();
+        let dead = base.join("trees").join("BR-7002");
+
+        worktree_registry_append(Some(&home), &live, "state-vector/bridge", "BR-7001");
+        worktree_registry_append(Some(&home), &dead, "state-vector/bridge", "BR-7002");
+        assert_eq!(worktree_registry_load(&home).len(), 2);
+
+        // enumeration: the live registered path is a candidate wherever it
+        // lives; the dead line is not — and prunes on read
+        let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &HashSet::new(), &[]);
+        assert!(found.iter().any(|c| c.path == live), "registered live path enumerated");
+        assert_eq!(worktree_registry_load(&home).len(), 1, "dead line pruned on read");
+
+        // an in-flight slug is protected even though registered
+        let mut active = HashSet::new();
+        active.insert("BR-7001".to_string());
+        let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &active, &[]);
+        assert!(found.iter().all(|c| c.path != live), "active slug protected from the sweep");
+
+        // teardown deregisters: the registry must not outlive the tree
+        worktree_registry_remove(Some(&home), &live);
+        assert!(worktree_registry_load(&home).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4802,24 +6338,15 @@ mod tests {
     }
 
     #[test]
-    fn refused_reference_skips_until_the_reference_changes() {
-        let mut cache = HashMap::new();
-        // fresh task: not refused
-        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/o/r")));
-        // record a refusal (as the clone-failure path does), then the SAME
-        // reference is skipped...
-        cache.insert(
-            "BR#1".into(),
-            RefusedRef { url: "https://github.com/state-vector/super".into(), reason: "repository not found".into(), ts: 0 },
-        );
-        assert!(refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/super")));
-        // ...but a FIXED reference re-arms dispatch and drops the record
-        assert!(!refused_reference(&mut cache, "BR#1", Some("https://github.com/state-vector/superpositional")));
-        assert!(!cache.contains_key("BR#1"), "stale refusal must not pin the card forever");
-        // repo-less after a refusal (reference removed) also re-arms
-        cache.insert("BR#2".into(), RefusedRef { url: "https://github.com/o/r".into(), reason: "x".into(), ts: 0 });
-        assert!(!refused_reference(&mut cache, "BR#2", None));
-        assert!(!cache.contains_key("BR#2"));
+    fn scheduling_requires_a_complete_reservation_and_preserves_hub_session_identity() {
+        assert!(serde_json::from_value::<SchedulingOutcome>(json!({"kind":"reserved","task_id":"BR#1"})).is_err());
+        assert!(serde_json::from_value::<SchedulingOutcome>(json!({"kind":"unknown"})).is_err());
+        let result = serde_json::from_value::<SchedulingOutcome>(json!({"kind":"reserved","task_id":"BR#1","session":"dispatch-BR-1-fresh"})).unwrap();
+        let SchedulingOutcome::Reserved { task_id, session } = result else { panic!("not reserved") };
+        let mut cfg = default_config();
+        cfg.label = Some("scheduling-test".into());
+        remember_claim_session(&cfg, &task_id, &session);
+        assert_eq!(claim_session(&cfg, &task_id), session);
     }
 
     #[test]
@@ -4849,6 +6376,8 @@ mod tests {
             report_minutes: None,
             isolate: true,
             worktree_exempt_repos: vec![],
+            sweep_repos: vec![],
+            auto_update: None,
             backends: std::collections::BTreeMap::from([
                 ("opencode".to_string(), Default::default()),
             ]),
@@ -4951,6 +6480,41 @@ mod tests {
     }
 
     #[test]
+    fn credential_clear_targets_the_canonical_token_cache_not_dispatch_dir() {
+        // BR#6682 (BR#6663 audit F1): provision_agent_token caches the worker
+        // credential at the FIXED path $HOME/.bridge/dispatch/agent-tokens.json
+        // (562f394 — side-by-side runners share one credential). logout_core's
+        // credential clear must hit that same file: resolving via
+        // dispatch_dir() honors BRIDGE_DISPATCH_DIR, so a rollout runner would
+        // delete only its isolated report-dir copy while the real shared cache
+        // survives logout. One shared helper is the single resolution for both
+        // sites — separate resolutions are exactly how this drifted.
+        let src = include_str!("dispatch.rs");
+        let helper = format!("agent_{}_{}_path()", "token", "cache");
+        // one definition + exactly two callers (provision + credential clear)
+        assert_eq!(
+            src.matches(&helper).count(),
+            3,
+            "the canonical cache-path helper must be defined once and used by provision_agent_token AND logout_core"
+        );
+        let start = src
+            .find(&format!("fn {}_core", "logout"))
+            .expect("logout_core present");
+        let body = &src[start..src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .unwrap_or(src.len())];
+        assert!(
+            !body.contains(&format!("{}_dir()", "dispatch")),
+            "logout_core's credential clear must not resolve via dispatch_dir() — under BRIDGE_DISPATCH_DIR it deletes the isolated copy while the shared cache survives"
+        );
+        assert!(
+            body.contains(&helper),
+            "the credential clear must go through the canonical cache-path helper"
+        );
+    }
+
+    #[test]
     fn classify_hub_error_sorts_auth_from_transient() {
         // BR#4113: 401/403 (revoked/expired/rotated/refused) are the
         // repairable auth class; unreachable hubs, 5xx, 429 and MCP-level
@@ -4966,6 +6530,20 @@ mod tests {
         assert_eq!(classify_hub_error("mcp error -32000: board busy"), HubErrClass::Transient);
         // a task id that merely CONTAINS 401 must not classify as auth
         assert_eq!(classify_hub_error("task BR#4011 rejected"), HubErrClass::Transient);
+        // BR#4754 — the train executor's JSON-RPC shape: mcp() wraps the hub's
+        // error TEXT ("hub rpc error (tool): <message>"), and a rotted token
+        // carries no HTTP status anywhere in the string. The Oct-29 incident:
+        // 1,684 consecutive ticks of exactly the first line, acted on by
+        // nothing because the old patterns never matched it.
+        assert_eq!(classify_hub_error("hub rpc error (train_status): unknown auth token"), HubErrClass::Auth);
+        assert_eq!(classify_hub_error("hub rpc error (train_lease): invalid auth token"), HubErrClass::Auth);
+        // lease contention / hub-side refusals are NOT auth — the token is fine
+        assert_eq!(
+            classify_hub_error(
+                "hub rpc error (train_lease): lane lease held live by merge-train@other until 2026-10-28T00:00:00Z — stand down this tick"
+            ),
+            HubErrClass::Transient
+        );
     }
 
     #[test]
@@ -5510,33 +7088,45 @@ mod tests {
 }
 
 /// Provision (or reuse) the per-agent hub token for `agent_label` via the
-/// gateway's own credentials. Secret cached in ~/.bridge/agent-tokens.json
-/// (0600 dir); hub dedupes by label. When our local cache is empty but the
-/// hub token already exists, the hub cannot re-show the secret (vended
+/// gateway's own credentials. Secret cached in ~/.bridge/dispatch/
+/// agent-tokens.json — the FIXED canonical path shared with logout_core's
+/// credential clear (562f394, BR#6682); hub dedupes by label. When our local cache
+/// is empty but the hub token already exists, the hub cannot re-show the secret (vended
 /// once) — the only recovery is a rotate re-vend, so we retry exactly once
 /// with rotate (old token revoked, fresh secret issued, cached). Without
 /// this the runner dead-ends forever — the 2026-10-24 churn engine (38
 /// fake in-flight cards, 38–58 watchdog releases each).
-fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<String, String> {
-    if !cfg.token.is_empty() && agent_label == "gateway" {
-        return Ok(cfg.token.clone());
-    }
-    let cache_dir = dispatch_dir().ok_or("no dispatch dir")?;
-    let cache_path = cache_dir.join("agent-tokens.json");
+#[derive(Clone)]
+struct WorkerCredential { label: String, secret: String }
+fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<WorkerCredential, String> {
+    // Credentials belong to the gateway, not an individual runner's ephemeral
+    // report directory. Side-by-side processes must reuse the same credential;
+    // separate caches would revoke each other's active workers on every tick.
+    let cache_path = agent_token_cache_path().ok_or("no home directory")?;
+    std::fs::create_dir_all(cache_path.parent().ok_or("no cache directory")?).map_err(|e| e.to_string())?;
     let mut cache: HashMap<String, String> = std::fs::read_to_string(&cache_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    if let Some(secret) = cache.get(agent_label) {
-        if !secret.is_empty() {
-            return Ok(secret.clone());
-        }
-    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let hub = cfg.url.trim_end_matches('/').to_string();
+    if let Some(secret) = cache.get(agent_label).filter(|s| !s.is_empty()).cloned() {
+        let response = client.post(format!("{hub}/api/kb-machine/provision"))
+            .header("Authorization", format!("Bearer {}", cfg.token)).json(&json!({ "label": agent_label, "cached_secret": secret })).send().map_err(|e| e.to_string())?;
+        let status = response.status();
+        let proof: serde_json::Value = response.json().map_err(|e| e.to_string())?;
+        if status.is_success() && proof["cached"] == true {
+            return Ok(WorkerCredential { label: proof["label"].as_str().filter(|s| !s.is_empty()).ok_or("worker proof missing canonical label")?.into(), secret });
+        }
+        if status.as_u16() != 401 && status.as_u16() != 403 {
+            return Err(format!("worker credential proof not ready ({status}); keep cache and wait — never rotate on infrastructure/deploy errors"));
+        }
+        cache.remove(agent_label); // explicit revoked/wrong-class prerequisite
+        dlog(agent_label, "cached worker credential invalid/wrong class; re-provisioning under the gateway's own namespace");
+    }
     // attempt 1: plain provision; attempt 2 (only when the hub has no secret
     // to re-show): rotate re-vend. Revoking-then-minting is safe here — the
     // old secret is provably not in our cache, and by label-namespace rules
@@ -5552,6 +7142,10 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         let body: serde_json::Value = resp.json().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("hub {}: worker provisioning refused: {}", status.as_u16(),
+                body.get("error").and_then(|e| e.as_str()).unwrap_or("no error detail")));
+        }
         if provision_response_needs_rotate(status.is_success(), &body) {
             last_err = format!(
                 "hub {status}: {}",
@@ -5572,17 +7166,18 @@ fn provision_agent_token(cfg: &DispatchConfig, agent_label: &str) -> Result<Stri
                 "agent token re-vended by rotate (cache was empty)",
             );
         }
-        return Ok(secret.to_string());
+        let label = body.get("label").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("worker provision response missing canonical label")?;
+        return Ok(WorkerCredential { label: label.into(), secret: secret.into() });
     }
     Err(format!(
         "agent token provisioning for '{agent_label}' failed after rotate retry — {last_err}"
     ))
 }
 
-/// The provisioning retry decision, extracted for the regression test: a
-/// response that carries no USABLE vended secret (exists:true, an empty
-/// secret, or any error — including the revoked-token error that also
-/// demands rotate) is only recoverable by a rotate re-vend.
+/// The vended-secret check for the bounded re-show/rotate path. The caller
+/// rejects HTTP failures first (auth must reach the repair ladder, and an
+/// infrastructure failure must never revoke a worker). A successful response
+/// without a usable secret is the existing-token re-show case.
 fn provision_response_needs_rotate(status_ok: bool, body: &serde_json::Value) -> bool {
     let usable_secret = body
         .get("secret")

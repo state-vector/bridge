@@ -121,7 +121,9 @@ describe("POST /api/kb/supersede — the one-click human supersede (BR#3910)", (
     // the documented two-step is visible in history (blocked → todo → superseded)
     const h = await api(`/api/kb/history?id=${encodeURIComponent(card)}`).then((x) => x.json() as any);
     const transitions = (h.versions ?? []).filter((v: any) => v.action === "transition").map((v: any) => v.summary);
-    expect(transitions.some((s: string) => s.includes("blocked → todo"))).toBe(true);
+    // Responsibility transfers atomically; the source is never exposed as
+    // claimable todo between the human disposition and retirement.
+    expect(transitions.some((s: string) => s.includes("blocked → todo"))).toBe(false);
     expect(transitions.some((s: string) => s.includes("→ superseded"))).toBe(true);
   });
 

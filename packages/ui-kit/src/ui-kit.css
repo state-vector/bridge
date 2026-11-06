@@ -6,6 +6,13 @@
    → surface css.
    ============================================================ */
 
+/* ---------- quick card lookup ---------- */
+
+.k-card-lookup { flex: 0 1 230px; min-width: 160px; max-width: 100%; }
+.k-card-lookup-controls { display: flex; align-items: center; gap: 6px; }
+.k-card-lookup-controls .k-input { width: 100%; min-width: 0; }
+.k-card-lookup-error { display: block; margin-top: 4px; color: var(--red); font-size: 11px; }
+
 /* ---------- buttons ---------- */
 
 .k-btn {
