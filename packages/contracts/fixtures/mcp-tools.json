@@ -173,8 +173,7 @@
     {
       "name": "train_queue_facts",
       "required": [
-        "repo",
-        "entries"
+        "repo"
       ]
     },
     {

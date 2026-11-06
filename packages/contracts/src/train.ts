@@ -7,6 +7,7 @@
  */
 import { z } from "zod";
 import { RecoveryCauseSchema } from "./train-recovery.ts";
+import { ExecutionBlockerSchema } from "./execution.ts";
 
 export const TrainEntryClassSchema = z.enum([
   "ready",
@@ -44,6 +45,7 @@ export const TrainFixCardSchema = z.object({
   executor_session: z.string().optional(),
   active_agent: z.boolean().optional(),
   blocked_reason: z.string().optional(),
+  execution_blockers: z.array(ExecutionBlockerSchema).optional(),
   last_progress: TrainFixCardProgressSchema.nullable().optional(),
   pr: z.number().int().positive().optional(),
   pr_url: z.string().optional(),

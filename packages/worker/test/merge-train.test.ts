@@ -956,15 +956,10 @@ describe("decideTrainGate blocked/behind (BR#3727 clock + BR#4633 L4.2 approval 
     if (d.kind === "note") expect(d.reason).toContain("head check RED");
   });
 
-  it("BR#4633 L4.2: blocked + GREEN head checks + covered verdict MERGES — the BR verdict is the approval of record (supersedes BR#3727's bounce)", () => {
+  it("BR#6776: a substance verdict cannot overrule GitHub's still-BLOCKED admission", () => {
     const d = gate();
-    expect(d.kind).toBe("merge");
-    if (d.kind === "merge") {
-      // the receipt names WHY the blocked state was pre-cleared
-      expect(d.receipt).toContain("blocked pre-cleared");
-      expect(d.receipt).toContain("approval of record");
-      expect(d.receipt).toContain("BR#4633 L4.2");
-    }
+    expect(d.kind).toBe("note");
+    if (d.kind === "note") expect(d.reason).toContain("GitHub branch policy remains BLOCKED");
   });
 
   it("the shared law keeps the anchor: decideMergeAction's blocked bounce names the BR verdict, not a re-approve leg", () => {
@@ -1473,13 +1468,10 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     // red checks on blocked → note, never bounce — the linked session owns it
     // (the shared law's own non-in_review row, taken early by the blocked arm)
     expect(mk(red, "BLOCKED").kind).toBe("note");
-    // green checks + blocked → the BR verify verdict IS the approval of
-    // record (BR#4633 L4.2, superseding the BR#3727 "blocked+green bounce
-    // stands" posture this row originally pinned): the merge leg pre-clears
-    // the state and lands the carried verdict.
+    // A carried substance verdict does not override GitHub admission.
     const landed = mk(green, "BLOCKED");
-    expect(landed.kind).toBe("merge");
-    if (landed.kind === "merge") expect(landed.receipt).toContain("blocked pre-cleared");
+    expect(landed.kind).toBe("note");
+    if (landed.kind === "note") expect(landed.reason).toContain("no merge attempted");
   });
 
   // BR#4687 (L1.2): the merge receipt must name the provenance-qualified

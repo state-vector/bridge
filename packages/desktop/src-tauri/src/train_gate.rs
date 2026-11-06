@@ -31,9 +31,18 @@ const MERGE_EXEMPT_CHECK_PATTERNS: [&str; 7] = [
     "superpositional",
 ];
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckSource {
+    Unknown,
+    CheckRun { suite_id: i64, app_id: i64 },
+    WorkflowRun { workflow_id: i64, run_attempt: u64 },
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MainCheckRun {
     pub id: i64,
+    pub source: CheckSource,
     pub name: String,
     pub status: Option<String>,
     pub conclusion: Option<String>,
@@ -119,12 +128,21 @@ pub fn is_exempt_check_name(name: &str) -> bool {
 fn parse_runs(runs: &[MainCheckRun]) -> Vec<(String, Vec<&MainCheckRun>)> {
     let mut by_name: Vec<(String, Vec<&MainCheckRun>)> = Vec::new();
     for r in runs {
-        match by_name.iter_mut().find(|(n, _)| *n == r.name) {
+        match by_name.iter_mut().find(|(n, list)| *n == r.name && same_check_obligation(&list[0].source, &r.source)) {
             Some((_, list)) => list.push(r),
             None => by_name.push((r.name.clone(), vec![r])),
         }
     }
     by_name
+}
+
+fn same_check_obligation(a: &CheckSource, b: &CheckSource) -> bool {
+    match (a, b) {
+        (CheckSource::Unknown, CheckSource::Unknown) => true,
+        (CheckSource::CheckRun { suite_id: a, app_id: aa }, CheckSource::CheckRun { suite_id: b, app_id: ba }) => a == b && aa == ba,
+        (CheckSource::WorkflowRun { workflow_id: a, .. }, CheckSource::WorkflowRun { workflow_id: b, .. }) => a == b,
+        _ => false,
+    }
 }
 
 /// core.ts classifyMainCheckRuns (764): newest non-cancelled run per name
@@ -287,6 +305,9 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
 /// with exempt-external failures pulled OUT of red into `external`
 /// (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
+    if runs.is_empty() {
+        return finish_verdict(vec![], vec!["head checks have not started or could not be read".into()], vec![], 0);
+    }
     let mut red = Vec::new();
     let mut unsettled = Vec::new();
     let mut external = Vec::new();
@@ -1133,6 +1154,9 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                     }
                 }
                 CandidateHeadCheckState::Green => {
+                    if blocked {
+                        return MergeAction::Note { reason: format!("PR #{} GitHub branch policy remains BLOCKED despite observed green head checks — reconcile required checks and policy; no merge attempted", i.pr_number) };
+                    }
                     if behind && !i.train_owned_branch {
                         return MergeAction::Bounce {
                             defect: format!("PR #{} mergeStateStatus=behind against base on a protected (non-worker-authored) branch — the train does not move human branches. Rebase, re-sign, re-push and re-enter the queue", i.pr_number),
@@ -1914,12 +1938,29 @@ pub fn reconcile_base_verdict_with_deploy_coverage(
 
 #[cfg(test)]
 fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
-    MainCheckRun { id, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
+    MainCheckRun { id, source: CheckSource::Unknown, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_name_different_suites_remain_independent_obligations() {
+        let mut original = run(126988470498, "Deploy health (merge gate)", Some("failure"));
+        original.source = CheckSource::CheckRun { suite_id: 10, app_id: 1 };
+        let mut republished = run(127642055356, "Deploy health (merge gate)", Some("success"));
+        republished.source = CheckSource::CheckRun { suite_id: 20, app_id: 1 };
+        let mut runs = vec![original.clone(), republished];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        assert_eq!(classify_main_check_runs(&runs).verdict, MainVerdict::Red);
+        assert_eq!(latest_red_deploy_health_runs(&runs)[0].id, original.id);
+        original.id = 127653739994;
+        original.conclusion = Some("success".into());
+        runs.push(original);
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Green);
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
 
     #[test]
     fn decisive_failed_deploy_overrules_scoped_green_and_never_borrows_old_receipt() {
@@ -2553,10 +2594,8 @@ mod tests {
     }
 
     #[test]
-    fn blocked_green_verdict_anchor_merges_br4633_l4_2() {
-        // mirrored from merge-train.test.ts: blocked + GREEN head checks +
-        // covered verdict MERGES — the BR verify verdict is the approval of
-        // record (supersedes BR#3727's "blocked+green bounce stands" posture)
+    fn blocked_green_verdict_does_not_override_github_admission_br6776() {
+        // Substance approval is not evidence of GitHub branch admission.
         let meta = serde_json::json!({ "pr": { "repo": "state-vector/bridge", "number": 4700, "head_sha_at_acceptance": "ccccccccc" } });
         let head = "c".repeat(40);
         let checks = [run(1, "ci", Some("success"))];
@@ -2577,12 +2616,8 @@ mod tests {
             train_owned_branch: false,
         });
         match gate {
-            MergeAction::Merge { receipt } => {
-                assert!(receipt.contains("blocked pre-cleared"), "receipt: {receipt}");
-                assert!(receipt.contains("approval of record"), "receipt: {receipt}");
-                assert!(receipt.contains("BR#4633 L4.2"), "receipt: {receipt}");
-            }
-            other => panic!("expected merge, got {other:?}"),
+            MergeAction::Note { reason } => assert!(reason.contains("GitHub branch policy remains BLOCKED")),
+            other => panic!("expected policy reconciliation, got {other:?}"),
         }
     }
 
@@ -2770,7 +2805,7 @@ mod tests {
     fn train_gate_behind_worker_authored_preclears_to_merge() {
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
-        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], true));
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], true));
         match gate {
             MergeAction::Merge { receipt } => {
                 assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}");
@@ -2973,7 +3008,7 @@ mod tests {
     fn train_gate_behind_human_branch_still_bounces() {
         let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": head } ] });
-        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], false));
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], false));
         match gate {
             MergeAction::Bounce { defect, bounce_kind } => {
                 assert!(defect.contains("behind"), "defect must name the state: {defect}");
@@ -3473,6 +3508,7 @@ mod tests {
         let unsettled_verdict = classify_base_check_runs(
             &[MainCheckRun {
                 id: 1,
+                source: CheckSource::Unknown,
                 name: "deploy / Deploy to dev".into(),
                 status: Some("in_progress".into()),
                 conclusion: None,
@@ -3505,6 +3541,7 @@ mod tests {
         let spot_build_verdict = classify_base_check_runs(
             &[MainCheckRun {
                 id: 126859440408,
+                source: CheckSource::Unknown,
                 name: "deploy / Prepare deploy to dev (build on spot)".into(),
                 status: Some("in_progress".into()),
                 conclusion: None,
@@ -3602,7 +3639,7 @@ mod tests {
         let head = "cccccccccccccccccccccccccccccccccccccccc";
         let carry = serde_json::json!([{ "from_head": stamp, "to_head": head, "prior_verdict_id": null, "carried_ts": 0, "via": "update-branch" }]);
         let meta = serde_json::json!({ "prs": [ { "repo": "r", "number": 7, "head_sha_at_acceptance": stamp, "carry": carry } ] });
-        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[], &[(head.to_string(), true)], true));
+        let gate = decide_train_gate(gate_input_provenance(head, &meta, Some("in_review"), Some("behind"), &[run(1, "ci", Some("success"))], &[(head.to_string(), true)], true));
         match gate {
             MergeAction::Merge { receipt } => assert!(receipt.contains("behind pre-cleared"), "receipt: {receipt}"),
             other => panic!("expected carried verdict to pre-clear a second behind, got {other:?}"),

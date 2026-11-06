@@ -52,6 +52,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
       return <span className="train-banner-line">Recovery: {action.url
         ? <a href={action.url} target="_blank" rel="noreferrer">{action.text}</a> : action.text}</span>;
     case "agent":
+    case "blocked":
     case "queued": {
       const task = action.task;
       return <>
@@ -60,6 +61,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
           <summary>Repair details · {task.id}</summary>
           <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.title}</TaskLink>
           {task.owner && <div>Owner: {task.owner}</div>}
+          {task.execution_blockers?.map(b => <div key={b.episode_id}>Blocked: {b.text}</div>)}
           {task.last_progress?.note && <div>{task.last_progress.note}</div>}
         {task.last_progress && <div>
           Last update {age(task.last_progress.ts, now)} ago

@@ -8,7 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
-import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask } from "@bridge/contracts";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask, checkObligationKey } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -967,11 +967,25 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
 
 export type MainCheckRun = {
   id: number;
+  source?: import("@bridge/contracts").CheckSource;
   name: string;
   status?: string | null;
   conclusion?: string | null;
   html_url?: string | null;
 };
+
+/** Newest attempt wins only inside one enforcing obligation. A separately
+ * published green check with the same name cannot erase another suite's red. */
+function checkObligations(runs: MainCheckRun[]): MainCheckRun[][] {
+  const groups = new Map<string, MainCheckRun[]>();
+  for (const run of runs) {
+    const key = checkObligationKey(run);
+    const list = groups.get(key) ?? [];
+    list.push(run);
+    groups.set(key, list);
+  }
+  return [...groups.values()];
+}
 
 export type MainRedCheck = { name: string; conclusion: string; url: string };
 
@@ -1008,16 +1022,11 @@ export const MAIN_RED_CONCLUSIONS = new Set([
 
 export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
   if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
-  const byName = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const list = byName.get(r.name ?? "") ?? [];
-    list.push(r);
-    byName.set(r.name ?? "", list);
-  }
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   let green = 0;
-  for (const [name, list] of byName) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     // the newest non-cancelled run judges; cancelled runs say nothing
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge || judge.conclusion == null) {
@@ -1051,15 +1060,9 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   // in `required`. Include any non-exempt workflow whose newest non-cancelled
   // run is `startup_failure` in `scoped` so the base verdict immediately speaks
   // RED instead of Empty.
-  const byNameAll = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const n = r.name ?? "";
-    const list = byNameAll.get(n) ?? [];
-    list.push(r);
-    byNameAll.set(n, list);
-  }
   const startupFailedNames = new Set<string>();
-  for (const [name, list] of byNameAll) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     if (!name || isExemptCheckName(name)) continue;
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (judge?.conclusion === "startup_failure") {
@@ -1169,18 +1172,13 @@ export type HeadCheckVerdict = {
  *  and recorded as `external` — they are collected into the class ask, never
  *  bounce a PR. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
-  const byName = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const name = r.name ?? "";
-    const list = byName.get(name) ?? [];
-    list.push(r);
-    byName.set(name, list);
-  }
+  if (!runs.length) return { verdict: "unsettled", red: [], unsettled: ["head checks have not started or could not be read"], external: [], green: 0 };
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
-  for (const [name, list] of byName) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge) {
       if (!isExemptCheckName(name)) unsettled.push(`${name} (only cancelled runs)`);
@@ -2716,18 +2714,16 @@ export function classifyRequiredRuns(
   const missing: string[] = [];
   const pending: string[] = [];
   for (const name of judgeNames) {
-    const list = byName.get(name) ?? [];
-    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
-    if (!judge || judge.conclusion == null) {
-      // unconfigured mode: a cancelled-only run (or in-flight with no
-      // conclusion) is UNSETTLED — the commit has not finished proving itself
-      (list.length || !required.length ? pending : missing).push(name);
-      continue;
-    }
-    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
-      failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
-    } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
-      pending.push(name);
+    const named = byName.get(name) ?? [];
+    if (!named.length) { missing.push(name); continue; }
+    for (const list of checkObligations(named)) {
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (!judge || judge.conclusion == null) { pending.push(name); continue; }
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+        failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
+        pending.push(name);
+      }
     }
   }
   if (required.length) {
@@ -2735,7 +2731,8 @@ export function classifyRequiredRuns(
     // GitHub creates 0 job check-runs, so none of the job names in `required`
     // ever appear. Fold any non-exempt workflow-level `startup_failure` into
     // `failing` immediately instead of waiting 60m on missing required jobs.
-    for (const [name, list] of byName) {
+    for (const list of checkObligations(runs)) {
+      const name = list[0].name;
       if (!name || required.includes(name) || isExemptCheckName(name)) continue;
       const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
       if (judge?.conclusion === "startup_failure") {
@@ -3028,6 +3025,7 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
       // named state. Fail-closed: an input that does not say
       // worker-authored is human-treated.
       const behindPrecleared = behind && i.trainOwnedBranch === true;
+      if (blocked) return { kind: "note", reason: `PR #${i.prNumber} GitHub branch policy remains BLOCKED despite observed green head checks — reconcile required checks and policy; no merge attempted` };
       if (behind && !behindPrecleared) {
         return {
           kind: "bounce",

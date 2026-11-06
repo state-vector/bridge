@@ -1,6 +1,12 @@
 /** Startup is not execution: these waits never consume the task churn budget. */
 import { z } from "zod";
 
+/** Server bootstrap policy is part of readiness. A real authorization repair
+ * changes the proof without pretending the gateway changed its configuration. */
+export function executorStartupFingerprint(workerId: string, configRevision: string): string {
+  return JSON.stringify([workerId, configRevision, "reservation-bootstrap-v2"]);
+}
+
 const fields = {
   host: z.string().min(1),
   fingerprint: z.string().min(1),

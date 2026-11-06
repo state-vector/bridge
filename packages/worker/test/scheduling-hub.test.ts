@@ -40,6 +40,20 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("bootstraps from the authenticated reservation without caller-supplied worker attribution, never from a peer or stale session", async () => {
+    const project = "bootstrap", g = await gateway(project), peer = await gateway(project);
+    const id = await task(project), reservation = await reserve(g);
+    if (reservation.kind !== "reserved") throw new Error("no reservation");
+    const begin = { id, session: reservation.session, command_id: "bootstrap-begin", command: {
+      kind: "begin", attempt_id: "bootstrap", worker: g.auth.agent, action_budget_ms: 60_000,
+    } };
+    expect((await post("execution", { ...peer.auth, ...begin })).error).toMatch(/authority/);
+    expect((await post("execution", { ...g.auth, ...begin, agent: undefined, session: "wrong-session" })).error).toMatch(/authority|claim/);
+    const result = await post("execution", { ...g.auth, ...begin, agent: undefined });
+    expect(result.error).toBeUndefined();
+    expect(result).toMatchObject({ generation: 1, attempt: { attempt_id: "bootstrap", host: g.host } });
+    expect(await post("execution", { ...g.auth, ...begin, agent: undefined })).toEqual(result);
+  });
   it("never hides compatible work behind more than ten boosted host-pinned tasks", async () => {
     const project = "starvation", mac = await gateway(project, 32), ec2 = await gateway(project, 12);
     for (let i = 0; i < 15; i++) await task(project, { boosted: 1, execution_requirements: { host: mac.host } });

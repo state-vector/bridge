@@ -103,6 +103,54 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
   return (await queueViaAcceptBoth(opts)).implId;
 }
 
+describe("BR#6776 durable check recovery", () => {
+  it("reserves one retry per head/obligation across lease takeover, including unknown effects", async () => {
+    const repo = "state-vector/retry-6776", actor = "gw-retry6776", head = "a".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 1, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const reserve = { kind: "reserve", task_id: id, head_sha: head, name: "Deploy health (merge gate)",
+      source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 }, target: { kind: "workflow_run", id: 41734497120 } };
+    const command = (check_retry: object, who = actor) => kbJson("/train.queue_facts", { repo, actor: who, check_retry });
+    const first = await command(reserve);
+    expect(first.body, JSON.stringify(first.body)).toMatchObject({ kind: "reserved" });
+    expect((await command(reserve)).body).toMatchObject({ kind: "held", state: "prepared" });
+    const result = { kind: "result", key: first.body.key, outcome: "outcome_unknown", receipt: "Response lost after POST" };
+    expect((await command(result)).body.kind).toBe("recorded");
+    expect((await command(result)).body.kind).toBe("recorded");
+    expect((await command({ ...result, outcome: "dispatched" })).body.error).toMatch(/contradicts/);
+    await kbJson("/train.lease", { repo, action: "release", actor });
+    await acquire(repo, "gw-replacement6776");
+    expect((await command(reserve, "gw-replacement6776")).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    expect((await command({ ...reserve, head_sha: "b".repeat(40) }, "gw-replacement6776")).body.kind).toBe("reserved");
+    expect((await command(reserve)).body.error).toMatch(/lease/);
+    await kbJson("/train.lease", { repo, action: "release", actor: "gw-replacement6776" });
+  });
+  it("gives an ownerless queued red head exactly one repair duty and projects its actual startup blocker", async () => {
+    const repo = "state-vector/candidate-6776", actor = "gw-candidate6776", head = "c".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 2, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const stamp = () => kbJson("/train.queue_facts", { repo, actor, entries: [{ id, pr: 2, cls: "blocked",
+      repair: { kind: "head_checks", head_sha: head, checks: [{ name: "Test", url: "https://github.com/run/failure" }] } }],
+      base_state: { verdict: "green", tip_sha: "d".repeat(40), red: [], unsettled: [] },
+      stalled: { batch: [2], ticks: 3, since: 1, last_error: "Required candidate check failed" } });
+    expect((await stamp()).body.error).toBeUndefined();
+    const lane = await laneSnap(repo), duty = lane.queue_facts.entries[0].repair_task;
+    expect(duty).toMatch(/^BR#/);
+    expect(lane.line.remediation).toMatchObject({ task: { id: duty } });
+    await stamp();
+    expect((await laneSnap(repo)).queue_facts.entries[0].repair_task).toBe(duty);
+    const repair = (await kbJson("/get", { id: duty })).body;
+    expect(repair.meta.machine_duty).toMatchObject({ subject: id, reason: "head_checks" });
+    // No live capabilities support this typed repair: a todo card is blocked,
+    // not advertised as an available-agent wait by the line projection.
+    await kbJson("/update", { id: duty, meta: { execution_requirements: { host: "missing-host", tier: "large" } } });
+    const blocked = await laneSnap(repo);
+    expect(blocked.line.remediation).toMatchObject({ kind: "blocked", task: { id: duty,
+      execution_blockers: expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable" })]) } });
+    await kbJson("/train.lease", { repo, action: "release", actor });
+  });
+});
+
 describe("merge train DO drill (real bundled worker)", () => {
   it("out-of-band repair merge observations require the accepted PR/head and do not certify live recovery", async () => {
     const repo = "state-vector/repair-delivery-6522", baseline = "7".repeat(40), acceptedHead = "9".repeat(40);

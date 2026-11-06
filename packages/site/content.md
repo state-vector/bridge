@@ -299,6 +299,19 @@ Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action
 reports. Missing next actions are shown explicitly rather than invented.
 
+**Structural recovery admission (BR#6776).** GitHub checks retain their app/suite
+or workflow identity. A green publisher cannot conceal a failed same-name check
+from another workflow. Retry routing uses the actual job or workflow-run ID,
+with a durable reservation before dispatch and one attempt per candidate head
+and obligation; uncertain calls are not blindly repeated after restart. Failed
+queued heads receive a deduplicated repair duty even when their parent has no
+active owner. Candidates integrate current base and run fresh CI before merging;
+clean machine updates carry substance review, never stale test evidence. This
+is rechecked between batch members to catch semantic cross-file integration
+breaks. Initial worker launch is authorized by the exact authenticated scheduler
+reservation. Recovery banners show actual startup/capability/handoff blockers,
+rather than describing an unlaunchable `todo` task as waiting for an agent.
+
 The train status, message and recovery banner consume the hub's shared typed
 `line` projection. A failed decisive deployment overrides green job subsets;
 when a ready cure needs a human bypass merge, the line says **Fix ready — your
