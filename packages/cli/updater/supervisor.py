@@ -23,6 +23,10 @@ import urllib.error
 import uuid
 
 MAX_ARCHIVE = 64 * 1024 * 1024
+# Publications may arrive seconds apart. Preserve an hour of useful work after
+# releasing each drain, regardless of candidate SHA or supervisor restarts.
+USEFUL_WORK_SECONDS = 3600
+DRAIN_SECONDS = 900
 
 
 def fetch(url, timeout):
@@ -105,9 +109,16 @@ class Supervisor:
         return read(self.home / ".bridge/config.json", {})
 
     def record(self, phase, **fields):
-        self.state = {**self.state, **fields, "phase": phase.value, "at": int(time.time() * 1000)}
+        now = int(time.time() * 1000)
+        if phase in (Phase.CONFIRMED, Phase.ROLLED_BACK, Phase.DEFERRED):
+            fields["next_attempt_at"] = now + USEFUL_WORK_SECONDS * 1000
+        self.state = {**self.state, **fields, "phase": phase.value, "at": now}
         atomic(self.state_path, self.state)
         print(json.dumps(self.state), flush=True)
+
+    def next_check_delay(self):
+        remaining = (self.state.get("next_attempt_at", 0) - time.time() * 1000) / 1000
+        return min(3600, remaining) if remaining > 0 else 3600
 
     def run(self, args, timeout=60):
         return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
@@ -188,6 +199,13 @@ class Supervisor:
         self.notify(message)
 
     def recover(self):
+        # Called under the supervisor lock. Reload/migrate only after acquiring
+        # it, so a second process cannot overwrite an active installation.
+        self.state = read(self.state_path, {})
+        if "next_attempt_at" not in self.state and self.state.get("phase") in (
+                Phase.CONFIRMED, Phase.ROLLED_BACK, Phase.DEFERRED):
+            self.state["next_attempt_at"] = self.state.get("at", 0) + USEFUL_WORK_SECONDS * 1000
+            atomic(self.state_path, self.state)
         # Never clear an installation hold merely because the supervisor died.
         phase = self.state.get("phase")
         if phase in (Phase.INSTALLING, Phase.CHECKING, Phase.ROLLING_BACK):
@@ -205,6 +223,8 @@ class Supervisor:
         config = self.config()
         if not opted_in(config):
             return
+        if time.time() * 1000 < self.state.get("next_attempt_at", 0):
+            return  # no downloads, doctor, drain, or service changes in cooldown
         channel = config["auto_update"]["channel"]
         target = {"x86_64": "x86_64", "aarch64": "aarch64"}[os.uname().machine] + "-unknown-linux-gnu"
         url = config["url"].rstrip("/") + "/api/runner-updates/manifest?channel=" + channel
@@ -241,7 +261,7 @@ class Supervisor:
             nonce = uuid.uuid4().hex
             self.record(Phase.DRAINING, nonce=nonce)
             atomic(self.request, {"nonce": nonce})
-            until = time.monotonic() + 900
+            until = time.monotonic() + DRAIN_SECONDS
             while not self.idle(nonce, pid):
                 if not opted_in(self.config()) or self.pid() != pid or time.monotonic() > until:
                     self.request.unlink(missing_ok=True)
@@ -275,16 +295,16 @@ class Supervisor:
 
     def serve(self):
         self.recover()
-        last_check = 0
+        next_check = 0
         backoff = 5
         seen = {}
         while True:
             try:
                 # Reconnect snapshots carry persisted channel revisions. No
                 # manifest polling on the hub's bounded SSE reconnect cadence.
-                if last_check == 0 or time.monotonic() - last_check >= 3600:
-                    last_check = time.monotonic()
+                if time.monotonic() >= next_check:
                     self.reconcile()
+                    next_check = time.monotonic() + self.next_check_delay()
                 config = self.config()
                 if not opted_in(config):
                     time.sleep(30)  # local config only; no network/downloads
@@ -300,11 +320,11 @@ class Supervisor:
                             channel = self.config()["auto_update"]["channel"]
                             if event.get("type") == "runner.update.available" and event.get("channel") == channel and seen.get(channel) != event.get("commit"):
                                 seen[channel] = event.get("commit")
-                                last_check = time.monotonic()
                                 self.reconcile()
-                        if time.monotonic() - last_check >= 3600:
-                            last_check = time.monotonic()
+                                next_check = time.monotonic() + self.next_check_delay()
+                        if time.monotonic() >= next_check:
                             self.reconcile()
+                            next_check = time.monotonic() + self.next_check_delay()
             except Exception as error:
                 print(f"update supervisor: {error}", flush=True)
                 if self.request.exists():

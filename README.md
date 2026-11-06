@@ -61,6 +61,28 @@ single config writer with `bridge update enable main`, `bridge update enable
 stable`, or `bridge update disable`. `bridge update status` shows config and the
 last durable update result; `bridge build-info` prints the embedded source SHA.
 
+**Updates cannot continuously drain the fleet.** After a confirmed update,
+rollback, deferred drain, or recovery of an interrupted drain, the supervisor
+leaves **one hour for useful work** before another drain attempt. The durable
+`next_attempt_at` in `bridge update status` survives supervisor restarts and
+applies to every candidate, not just the previous SHA. Publications during this
+window do not download, run doctor, or pause claims. At expiry the supervisor
+fetches the **latest** channel manifest, coalescing intermediate builds, even if
+no new publication event arrives. Drain attempts still wait at most 15 minutes;
+they never kill active writers. During the work window normal capacity rules apply.
+
+The updater is an independently installed Python script: replacing the runner
+binary alone does **not** refresh it. To adopt an updater fix on an existing
+host, run `bridge update disable`, wait until `~/.bridge/update/request.json`
+is absent (check `bridge update status`; let an in-progress install/rollback
+finish), then refresh the script using `bridge update install` from the corrected
+binary, or download `packages/cli/updater/supervisor.py` from the exact published
+fix commit into `~/.bridge/update/supervisor.py` using an atomic file replacement.
+Run `systemctl --user daemon-reload` and `systemctl --user restart bridge-update`,
+then `bridge update enable main` (or `stable`). **Restart only the updater**, not
+`bridge.service`; existing workers can continue. Old terminal update receipts
+inherit the same one-hour window when the corrected supervisor first starts.
+
 One-time bootstrap on the remote, **as the runner's Unix user**:
 
 1. Install a current `dev` binary once (`install.sh dev`), after safely draining

@@ -101,6 +101,114 @@ class UpdateTests(unittest.TestCase):
             self.u.recover()
         self.assertFalse(self.u.request.exists())
 
+    def test_every_drain_outcome_preserves_work_window_across_restart(self):
+        config = {"auto_update": {"enabled": True, "channel": "main"}}
+        for phase in (m.Phase.CONFIRMED, m.Phase.DEFERRED, m.Phase.ROLLED_BACK):
+            with self.subTest(phase=phase), patch.object(m.time, "time", return_value=10000):
+                self.u.record(phase)
+                restarted = m.Supervisor(self.bin, self.home)
+                restarted.recover()
+                self.assertEqual(restarted.state["next_attempt_at"], 13600000)
+                with patch.object(restarted, "config", return_value=config), \
+                     patch.object(m, "fetch", side_effect=AssertionError("publication bypassed work window")), \
+                     patch.object(restarted, "service") as service:
+                    for _ in range(20):
+                        restarted.reconcile()
+                    service.assert_not_called()
+                self.assertFalse(restarted.request.exists())
+                self.assertEqual(restarted.next_check_delay(), 3600)
+
+    def test_legacy_receipt_and_interrupted_drain_do_not_bypass_cooldown(self):
+        m.atomic(self.u.state_path, {"phase": "confirmed", "at": 10000000})
+        with patch.object(m.time, "time", return_value=10030):
+            restarted = m.Supervisor(self.bin, self.home)
+            # Construction alone must never mutate state outside the lock.
+            self.assertNotIn("next_attempt_at", m.read(restarted.state_path))
+            restarted.recover()
+            self.assertEqual(restarted.next_check_delay(), 3570)
+            self.assertEqual(m.read(restarted.state_path)["next_attempt_at"], 13600000)
+            restarted.record(m.Phase.DRAINING)
+            m.atomic(restarted.request, {"nonce": "old"})
+            restarted.recover()
+            self.assertFalse(restarted.request.exists())
+            self.assertEqual(restarted.state["phase"], "deferred")
+            self.assertEqual(restarted.state["next_attempt_at"], 13630000)
+
+    def test_cooldown_coalesces_publications_and_installs_latest_at_deadline(self):
+        # Real archive/digest/install path: a deferred drain must not immediately
+        # re-drain for a new SHA, but the latest manifest must install when due.
+        machine = type("Uname", (), {"machine": "aarch64", "nodename": "test-host"})()
+        target = "aarch64-unknown-linux-gnu"
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            member = tarfile.TarInfo("bridge")
+            member.size = 3
+            tar.addfile(member, io.BytesIO(b"new"))
+        data = archive.getvalue()
+        latest = ["a" * 40]
+        fetched = []
+        def fetch(url, timeout):
+            fetched.append(url)
+            sha = latest[0]
+            manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
+                "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
+                "sha256": m.hashlib.sha256(data).hexdigest()}}}
+            return io.BytesIO(data if url.endswith("tar.gz") else json.dumps(manifest).encode())
+        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
+        with patch.object(m.time, "time", return_value=10000) as clock, \
+             patch.object(m.os, "uname", return_value=machine), \
+             patch.object(self.u, "config", return_value=config), patch.object(m, "fetch", side_effect=fetch), \
+             patch.object(self.u, "pid", return_value=123), patch.object(m.Path, "resolve", return_value=self.bin), \
+             patch.object(self.u, "build", side_effect=lambda p: "old" if p == self.bin else latest[0]), \
+             patch.object(self.u, "idle", return_value=True), patch.object(self.u, "run", return_value=""), \
+             patch.object(self.u, "health", return_value=True), patch.object(self.u, "notify"), \
+             patch.object(self.u, "service") as service:
+            self.u.record(m.Phase.DEFERRED)
+            for seconds, sha in ((1, "a"), (8, "b"), (3599, "c")):
+                clock.return_value = 10000 + seconds
+                latest[0] = sha * 40
+                self.u.reconcile()
+                self.assertFalse(self.u.request.exists())
+            self.assertEqual(fetched, [])
+            service.assert_not_called()
+            self.assertEqual(self.u.next_check_delay(), 1)
+            clock.return_value = 13600
+            self.u.reconcile()
+            self.assertEqual(self.u.state["to_commit"], "c" * 40)
+            self.assertEqual(self.u.state["phase"], "confirmed")
+            self.assertEqual(self.u.state["next_attempt_at"], 17200000)
+            self.assertEqual([c.args[0] for c in service.call_args_list], ["stop", "start"])
+            self.assertFalse(self.u.request.exists())
+
+    def test_pending_candidate_reconciles_at_cooldown_expiry_without_new_event(self):
+        # Exercise serve's timer with only stream heartbeats, no publication.
+        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
+        class Stream:
+            def __enter__(stream):
+                return stream
+            def __exit__(stream, *args):
+                pass
+            def __iter__(stream):
+                clock.return_value = 13599
+                mono.return_value = 3599
+                yield b": heartbeat\n"
+                clock.return_value = 13600
+                mono.return_value = 3600
+                yield b": heartbeat\n"
+                raise KeyboardInterrupt()
+        with patch.object(m.time, "time", return_value=10000) as clock, \
+             patch.object(m.time, "monotonic", return_value=0) as mono, \
+             patch.object(m.time, "sleep"), patch.object(self.u, "config", return_value=config), \
+             patch.object(m, "fetch", return_value=Stream()), patch.object(self.u, "notify"):
+            self.u.record(m.Phase.DEFERRED)
+            checked = []
+            def reconcile():
+                checked.append(clock.return_value)
+            with patch.object(self.u, "reconcile", side_effect=reconcile):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.u.serve()
+            self.assertEqual(checked, [10000, 13600])
+
     def test_full_install_and_failed_candidate_rollback_keep_writers_held(self):
         for fail_health in (False, True):
             with self.subTest(fail_health=fail_health):
