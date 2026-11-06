@@ -1,169 +1,224 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  AskEntries,
+  Card,
+  Chip,
+  DashboardSummary,
+  TrainPanel,
+  TopView,
+  TaskDetail,
+  useHumanAsks,
+  useKb,
+} from "@bridge/ui-kit";
 import { Voice } from "./Voice";
 import { SignInButton } from "./SignIn";
 
-const LS = { url: "bridge.url" };
+const LS = { url: "bridge.url", token: "bridge.mcp.token" };
 /** Shared hub (README) — persisted as the default when no hub url is set yet
- *  (BR#5581); the Connect input still shows it editable so a self-hosted hub
+ *  (BR#5581); the Connect card still shows it editable so a self-hosted hub
  *  can replace it. */
 const DEFAULT_HUB = "https://hub.fleetbridge.run";
 
-/** Board shape from /api/kb/board (subset the mobile view needs). */
-interface Task {
-  id: string;
-  title: string;
-  status: string;
-  owner?: string;
-  tags?: string[];
-  updated_ts: number;
-  meta?: Record<string, unknown>;
-}
-interface Board {
-  tasks: Task[];
-  agents?: Array<{ label: string; score: number; grade: string; hints: string[] }>;
-}
-interface Decision {
-  id: string;
-  status: "open" | "resolved";
-  title: string;
-  reason?: string;
-  asker?: string | null;
-  task_id?: string | null;
-  opened_ts: number;
-}
+type Tab = "overview" | "asks" | "trains" | "top" | "voice";
 
-function rel(ts: number): string {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  return `${Math.floor(h / 24)}d`;
-}
+const TABS: Array<{ id: Tab; label: string }> = [
+  { id: "overview", label: "Overview" },
+  { id: "asks", label: "Asks" },
+  { id: "trains", label: "Trains" },
+  { id: "top", label: "Top" },
+  { id: "voice", label: "Voice" },
+];
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const base = localStorage.getItem(LS.url)?.replace(/\/$/, "") || window.location.origin;
-  const r = await fetch(`${base}${path}`, { credentials: "include", ...init });
-  if (!r.ok) throw new Error(`${r.status}`);
-  return (await r.json()) as T;
-}
-
-export function App() {
-  const [tab, setTab] = useState<"fleet" | "forme" | "voice">("fleet");
-  const [board, setBoard] = useState<Board | null>(null);
-  const [decisions, setDecisions] = useState<Decision[] | null>(null);
-  const [proposed, setProposed] = useState<Array<{ id: string; title: string; created_ts: number }> | null>(null);
-  const [url, setUrl] = useState(() => {
+function useHub() {
+  const [url, setUrlState] = useState(() => {
     const v = localStorage.getItem(LS.url)?.trim() ?? "";
     if (v) return v;
     try { localStorage.setItem(LS.url, DEFAULT_HUB); } catch { /* private mode */ }
     return DEFAULT_HUB;
   });
+  const [token, setTokenState] = useState(() => localStorage.getItem(LS.token) ?? "");
+  const conn = useKb((s) => s.conn);
+  const setUrl = (v: string) => {
+    setUrlState(v.replace(/\/$/, ""));
+    localStorage.setItem(LS.url, v.replace(/\/$/, ""));
+  };
+  const setToken = (v: string) => {
+    setTokenState(v);
+    localStorage.setItem(LS.token, v);
+  };
+  return { url, token, setUrl, setToken, conn };
+}
+
+function ConnectCard({ hub, onClose }: { hub: ReturnType<typeof useHub>; onClose: () => void }) {
+  const [draftUrl, setDraftUrl] = useState(hub.url);
+  const [draftToken, setDraftToken] = useState(hub.token);
+  const [saving, setSaving] = useState(false);
+  const refresh = useKb((s) => s.refresh);
+  const save = () => {
+    setSaving(true);
+    hub.setUrl(draftUrl);
+    hub.setToken(draftToken);
+    // re-read the config from storage on the next tick — the store's start()
+    // call reads getKbHubConfig() at dial time.
+    setTimeout(() => {
+      useKb.getState().stop();
+      useKb.getState().start();
+      void refresh();
+      setSaving(false);
+      onClose();
+    }, 50);
+  };
+  return (
+    <Card className="mb-connect-card">
+      <h2>Connect</h2>
+      <label className="mb-field">
+        <span>hub url</span>
+        <input
+          value={draftUrl}
+          placeholder="https://bridge…workers.dev"
+          onChange={(e) => setDraftUrl(e.target.value)}
+          inputMode="url"
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+      </label>
+      <label className="mb-field">
+        <span>mcp token (voice)</span>
+        <input
+          value={draftToken}
+          placeholder="token for bridge MCP"
+          onChange={(e) => setDraftToken(e.target.value)}
+          type="password"
+        />
+      </label>
+      <p className="mb-note">
+        The hub url feeds every tab. The MCP token is only used by the Voice tab
+        (bridge MCP tool calls); without it Voice stays read-only.
+      </p>
+      <div className="mb-row-actions">
+        <button className="mb-btn primary" onClick={save} disabled={saving}>
+          {saving ? "connecting…" : "save & connect"}
+        </button>
+        <button className="mb-btn" onClick={onClose}>close</button>
+      </div>
+    </Card>
+  );
+}
+
+function OverviewTab() {
+  const tasks = useKb((s) => s.tasks);
+  const agents = useKb((s) => s.agents);
+  const events = useKb((s) => s.events);
+  const counts = useMemo(() => {
+    const c = { todo: 0, progress: 0, review: 0, blocked: 0, done: 0 };
+    for (const t of tasks) {
+      if (t.status === "todo") c.todo++;
+      else if (t.status === "in_progress") c.progress++;
+      else if (t.status === "in_review") c.review++;
+      else if (t.status === "blocked") c.blocked++;
+      else if (t.status === "done") c.done++;
+    }
+    return c;
+  }, [tasks]);
+
+  const inFlight = useMemo(
+    () => tasks.filter((t) => t.status === "in_progress").slice(0, 12),
+    [tasks],
+  );
+  const blockedWithAsks = useMemo(
+    () => tasks.filter((t) => t.status === "blocked" && t.meta?.awaiting_ask).slice(0, 6),
+    [tasks],
+  );
+  const openAsks = blockedWithAsks.length;
+
+  return (
+    <div className="mb-tab">
+      <div className="mb-counts">
+        <div className="mb-count mb-todo"><b>{counts.todo}</b><span>todo</span></div>
+        <div className="mb-count mb-progress"><b>{counts.progress}</b><span>active</span></div>
+        <div className="mb-count mb-review"><b>{counts.review}</b><span>review</span></div>
+        <div className="mb-count mb-blocked"><b>{counts.blocked}</b><span>blocked</span></div>
+        {openAsks > 0 && (
+          <div className="mb-count mb-ask"><b>{openAsks}</b><span>asks</span></div>
+        )}
+      </div>
+      <DashboardSummary tasks={tasks} events={events} />
+      {agents && agents.length > 0 && (
+        <Card>
+          <h2>Agents</h2>
+          <div className="mb-fleet">
+            {agents.slice(0, 8).map((a) => (
+              <div key={a.label} className="mb-frow">
+                <Chip tone={a.score >= 80 ? "ok" : a.score >= 50 ? "warn" : "urgent"}>{a.label}</Chip>
+                <span className="mb-fnote">score {a.score} · {a.grade}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+      <Card>
+        <h2>In flight</h2>
+        <div className="mb-fleet">
+          {inFlight.map((t) => (
+            <div key={t.id} className="mb-frow">
+              <Chip tone="scope">{t.id}</Chip>
+              <span className="mb-fnote">{t.title}</span>
+            </div>
+          ))}
+          {inFlight.length === 0 && <span className="mb-empty">nothing running</span>}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function AsksTab() {
+  const refresh = useKb((s) => s.refresh);
+  // empty visible-set = the full inbox lands in `residual` (BR#5448: the
+  // Asks tab is the human inbox, not per-row nesting — that's Top's job).
+  const visible = useMemo(() => new Set<string>(), []);
+  const asks = useHumanAsks(visible);
+  return (
+    <div className="mb-tab">
+      {asks.ready && asks.total > 0 && (
+        <p className="mb-hint">{asks.total} {asks.total === 1 ? "ask" : "asks"} need you</p>
+      )}
+      <AskEntries entries={asks.residual} onDone={() => void refresh()} />
+      {!asks.ready && <p className="mb-empty">loading asks…</p>}
+      {asks.ready && asks.total === 0 && <p className="mb-empty">nothing needs you right now.</p>}
+    </div>
+  );
+}
+
+function TrainsTab({ openTask }: { openTask: (id: string) => void }) {
+  return (
+    <div className="mb-tab">
+      <TrainPanel openTask={openTask} />
+    </div>
+  );
+}
+
+function TopTab({ openTask }: { openTask: (id: string) => void }) {
+  return (
+    <div className="mb-tab">
+      <TopView openTask={openTask} />
+    </div>
+  );
+}
+
+export function App() {
+  const hub = useHub();
+  const [tab, setTab] = useState<Tab>("overview");
   const [connectOpen, setConnectOpen] = useState(false);
-  const [msg, setMsg] = useState("");
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const conn = useKb((s) => s.conn);
+  const lastError = useKb((s) => s.lastError);
 
-  const load = async () => {
-    try {
-      const [b, evs] = await Promise.all([
-        api<Board>("/api/kb/board"),
-        api<{ decisions: Decision[] }>("/api/state"),
-      ]);
-      setBoard(b);
-      setDecisions((evs.decisions ?? []).filter((d) => d.status === "open"));
-    } catch {
-      setMsg("hub unreachable");
-    }
-    try {
-      const p = await api<{ artefacts: Array<{ id: string; title: string; created_ts: number }> }>("/api/kb/artefacts?type=decision&status=proposed");
-      setProposed(p.artefacts ?? []);
-    } catch {
-      setProposed([]);
-    }
-  };
-
-  useEffect(() => {
-    const lastLoad = { at: Date.now() };
-    void load();
-    // BR#4362: push, not poll — the socket carries board state (kb.board
-    // snapshots) + events. BR#5581 reload governor (Ray device feedback: the
-    // 1.5s decisions debounce was a fetch storm on a busy hub): at most one
-    // reload per 5s, bursts collapsed to a single trailing reload, and
-    // nothing at all while document.hidden (a visible-change re-fires).
-    // Falls back to nothing: if the socket dies, reconnect-with-backoff
-    // rehydrates.
-    const RELOAD_MIN_MS = 5000;
-    let reloadQueued = false;
-    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-    const runReload = () => {
-      reloadTimer = null;
-      reloadQueued = false;
-      if (document.hidden) return;
-      lastLoad.at = Date.now();
-      void load();
-    };
-    const scheduleReload = () => {
-      if (reloadQueued) return;
-      reloadQueued = true;
-      reloadTimer = setTimeout(runReload, Math.max(0, lastLoad.at + RELOAD_MIN_MS - Date.now()));
-    };
-    const onVisible = () => { if (!document.hidden) scheduleReload(); };
-    document.addEventListener("visibilitychange", onVisible);
-
-    const base = (localStorage.getItem(LS.url)?.replace(/\/$/, "") || window.location.origin).replace(/^http/, "ws");
-    let stopped = false;
-    let backoff = 2000;
-    const dial = () => {
-      if (stopped) return;
-      let ws: WebSocket;
-      try {
-        ws = new WebSocket(`${base}/kb-ws?since=0`);
-      } catch { setTimeout(dial, backoff); backoff = Math.min(backoff * 2, 30000); return; }
-      ws.onopen = () => { backoff = 2000; };
-      ws.onmessage = (e) => {
-        try {
-          const f = JSON.parse(e.data);
-          if (f.type === "kb.board" && f.board) {
-            if (!document.hidden) setBoard(f.board as Board);
-            scheduleReload();
-          }
-        } catch { /* ignore */ }
-      };
-      ws.onclose = () => {
-        if (stopped) return;
-        setTimeout(dial, backoff);
-        backoff = Math.min(backoff * 2, 30000);
-      };
-      ws.onerror = () => ws.close();
-    };
-    dial();
-    return () => {
-      stopped = true;
-      document.removeEventListener("visibilitychange", onVisible);
-      if (reloadTimer) clearTimeout(reloadTimer);
-    };
-  }, []);
-
-  const act = async (d: Decision, action: "unblocked" | "completed") => {
-    try {
-      const base = localStorage.getItem(LS.url)?.replace(/\/$/, "") || window.location.origin;
-      await fetch(`${base}/ingest`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ events: [{ kind: action, task_id: d.task_id ?? d.id.replace(/^dec:[a-z]+:/, ""), note: `${action} via mobile` }] }),
-      });
-      setMsg(action === "completed" ? "done" : "unblocked");
-      setTimeout(() => setMsg(""), 1500);
-      await load();
-    } catch (e) {
-      setMsg(`failed: ${(e as Error).message}`);
-    }
-  };
+  const openTask = useCallback((id: string) => setDetailId(id), []);
 
   const signIn = () => {
     const w = window as unknown as { __bridgeShell?: unknown; __TAURI_INTERNALS__?: unknown };
-    if ((w.__bridgeShell || w.__TAURI_INTERNALS__) && url) {
+    if ((w.__bridgeShell || w.__TAURI_INTERNALS__) && hub.url) {
       // Shell with a hub url: the INIT_SCRIPT owns the flow (shell_sign_in
       // invoke + navigation to <hub>/login?shell=1).
       document.dispatchEvent(new Event("bridge:sign-in"));
@@ -172,21 +227,14 @@ export function App() {
     }
   };
 
-  const tasks = board?.tasks ?? [];
-  const counts = {
-    todo: tasks.filter((t) => t.status === "todo").length,
-    progress: tasks.filter((t) => t.status === "in_progress").length,
-    review: tasks.filter((t) => t.status === "in_review").length,
-    blocked: tasks.filter((t) => t.status === "blocked").length,
-  };
-
-  const agentActivity = (board?.agents ?? []).map((a) => {
-    const mine = tasks.filter((t) => t.owner === a.label && (t.status === "in_progress" || t.status === "blocked"));
-    const last = mine[0];
-    return { label: a.label, active: mine.length, note: last?.meta?.last_progress ? String((last.meta.last_progress as any).note ?? "") : "" };
-  });
-
-  const forMeCount = (decisions?.length ?? 0) + (proposed?.length ?? 0);
+  useEffect(() => {
+    if (!hub.url) {
+      setConnectOpen(true);
+      return;
+    }
+    useKb.getState().start();
+    return () => useKb.getState().stop();
+  }, [hub.url]);
 
   return (
     <div className="mb">
@@ -194,108 +242,42 @@ export function App() {
         <span className="mb-brand">Bridge</span>
         <SignInButton onSignIn={signIn} />
         <button
-          className={`mb-conn ${board ? "mb-conn-open" : "mb-conn-closed"}`}
-          onClick={() => setConnectOpen((v) => !v)}
-          aria-label="hub connection — show Connect"
-        >●</button>
+          className={`mb-connect-btn ${conn === "open" ? "mb-conn-open" : "mb-conn-closed"}`}
+          onClick={() => setConnectOpen(true)}
+          title="Connect — hub url + MCP token"
+        >
+          <span className="mb-conn-dot">{conn === "open" ? "●" : "○"}</span>
+          {conn === "open" ? "connected" : "connect"}
+        </button>
       </header>
 
       <nav className="mb-tabs">
-        <button className={tab === "fleet" ? "active" : ""} onClick={() => setTab("fleet")}>Fleet</button>
-        <button className={tab === "forme" ? "active" : ""} onClick={() => setTab("forme")}>
-          For You{forMeCount > 0 ? ` (${forMeCount})` : ""}
-        </button>
-        <button className={tab === "voice" ? "active" : ""} onClick={() => setTab("voice")}>Voice</button>
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            className={tab === t.id ? "active" : ""}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
       </nav>
 
       <main className="mb-main">
-        {tab === "fleet" && (
-          <>
-            <div className="mb-counts">
-              <div className="mb-count mb-todo"><b>{counts.todo}</b><span>todo</span></div>
-              <div className="mb-count mb-progress"><b>{counts.progress}</b><span>active</span></div>
-              <div className="mb-count mb-review"><b>{counts.review}</b><span>review</span></div>
-              <div className="mb-count mb-blocked"><b>{counts.blocked}</b><span>blocked</span></div>
-            </div>
-            <div className="mb-card">
-              <h2>Agents</h2>
-              <div className="mb-fleet">
-                {agentActivity.map((a) => (
-                  <div key={a.label} className="mb-frow">
-                    <span className="mb-dot" style={{ background: a.active > 0 ? "var(--green)" : "var(--text-faint)" }} />
-                    <span className="mb-fname">{a.label}</span>
-                    <span className="mb-fnote">{a.note || (a.active > 0 ? `${a.active} in flight` : "idle")}</span>
-                    {a.active > 0 && <span className="mb-fcount">{a.active}</span>}
-                  </div>
-                ))}
-                {agentActivity.length === 0 && <span className="mb-empty">no agents seen yet</span>}
-              </div>
-            </div>
-            <div className="mb-card">
-              <h2>In flight</h2>
-              <div className="mb-fleet">
-                {tasks.filter((t) => t.status === "in_progress").slice(0, 12).map((t) => (
-                  <div key={t.id} className="mb-frow">
-                    <span className="mb-dot" style={{ background: "var(--accent)" }} />
-                    <span className="mb-fname">{t.id}</span>
-                    <span className="mb-fnote">{t.title}</span>
-                  </div>
-                ))}
-                {counts.progress === 0 && <span className="mb-empty">nothing running</span>}
-              </div>
-            </div>
-          </>
-        )}
-
-        {tab === "forme" && (
-          <>
-            {(decisions ?? []).map((d) => (
-              <div key={d.id} className="mb-item urgent">
-                <div className="mb-chips">
-                  <span className="mb-chip mb-chip-urgent">DECISION</span>
-                  <span className="mb-why">{d.asker ?? "agent"} · {rel(d.opened_ts)}</span>
-                </div>
-                <h3>{d.title}</h3>
-                {d.reason && <p className="mb-reason">{d.reason}</p>}
-                <div className="mb-actions">
-                  <button className="mb-btn primary" onClick={() => void act(d, "unblocked")}>Unblock</button>
-                  <button className="mb-btn danger" onClick={() => void act(d, "completed")}>Done</button>
-                </div>
-              </div>
-            ))}
-            {(proposed ?? []).map((d) => (
-              <div key={d.id} className="mb-item">
-                <div className="mb-chips">
-                  <span className="mb-chip mb-chip-needs">PROPOSAL</span>
-                  <span className="mb-why">{rel(d.created_ts)} ago</span>
-                </div>
-                <h3>{d.title}</h3>
-                <span className="mb-note">accept/reject in the web UI</span>
-              </div>
-            ))}
-            {(decisions ?? []).length === 0 && (proposed ?? []).length === 0 && (
-              <p className="mb-empty">Nothing needs you right now.</p>
-            )}
-          </>
-        )}
-
-        {tab === "voice" && <Voice />}
-
-        {(connectOpen || !url) && (
-          <div className="mb-card">
-            <h2>Connect</h2>
-            <input
-              style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 10, color: "var(--text)", padding: "12px", font: "inherit", width: "100%" }}
-              value={url}
-              placeholder="https://bridge…workers.dev"
-              onChange={(e) => setUrl(e.target.value)}
-              onBlur={() => { localStorage.setItem(LS.url, url); void load(); }}
-            />
-            <span className="mb-note">hub url — shared hub pre-filled; sign-in happens in the web view</span>
+        {connectOpen && <ConnectCard hub={hub} onClose={() => setConnectOpen(false)} />}
+        {lastError && (
+          <div className="mb-error-card">
+            <b>hub error</b> <span>{lastError.message}</span>
           </div>
         )}
-        {msg && <span className="mb-ok">{msg}</span>}
+        {tab === "overview" && <OverviewTab />}
+        {tab === "asks" && <AsksTab />}
+        {tab === "trains" && <TrainsTab openTask={openTask} />}
+        {tab === "top" && <TopTab openTask={openTask} />}
+        {tab === "voice" && <Voice />}
       </main>
+
+      {detailId && <TaskDetail taskId={detailId} onClose={() => setDetailId(null)} />}
     </div>
   );
 }
