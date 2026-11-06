@@ -6,6 +6,14 @@
 
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
+## Quick card lookup
+
+The web and desktop headers include **Go to BR#…** on every signed-in view.
+Enter `BR#6690`, `BR-6690`, `#6690`, or `6690`, then press Enter or **Go** to
+open the card directly, regardless of board filters or whether it is loaded in
+the current list. **⌘K / Ctrl+K** focuses the lookup; Escape clears it. The web
+app opens the existing URL-synced card detail; desktop opens its task window.
+
 ## Opt-in runner auto-updates (Linux/systemd)
 
 Automatic binary replacement is **off by default**. Installing from `dev` does
@@ -249,8 +257,11 @@ removing or changing the scope does not restore legacy write access.
   checkpoint and verified commit/tree restoration. Newer local WIP is retained,
   not reset to an older checkpoint. Dirty or unpublished worktrees are retained
   by cleanup if the preservation barrier cannot be proved.
-- **Independent clocks:** a two-minute execution lease is renewed by control
-  polls; the configured task action budget (at most one hour) is independent of
+- **Independent clocks:** a two-minute execution lease is renewed by a dedicated
+  per-attempt control poller every 20 seconds, independently of worker preparation,
+  checkpoint publication and the dispatch tick. The poller is joined before
+  quiescence/transfer; refused polls stop the writer and retain WIP. The configured
+  task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
   diagnosis. Quiet ACP actions can run within their action budget. Unproven
   process-tree isolation retains host affinity; agents must not detach writers
@@ -265,9 +276,9 @@ removing or changing the scope does not restore legacy write access.
   and receipts. A timed-out effect becomes `outcome_unknown`; inspect GitHub/AWS
   before reporting its result. Pending unknown effects prevent transfer or
   another attempt, rather than authorising a duplicate push/deployment.
-- **Explicit capability escalation:** set each backend's `reasoning_tier` to
-  `small`, `medium` or `large` in runner config (omitted means `small`; model
-  names are never guessed into tiers). Task `meta.execution_requirements`
+- **Explicit capability escalation:** configure each backend's `models` supply
+  by `small`, `medium` or `large` (legacy `model` + `reasoning_tier` is still
+  accepted; names are never guessed into tiers). Task `meta.execution_requirements`
   persists minimum tier, tools, environment and optional host constraints.
   Gateways advertise expiring scoped facts; begin/claim gates check them and
   execution records retain the actual backend/model/config observation.
@@ -345,12 +356,118 @@ Once a gateway adopts scoped inventory revision 2, an older GUI sharing its
 credential may drain existing work but cannot overwrite that inventory or borrow
 it to make new claims. Other gateways can roll forward independently.
 
-Backend configuration adds `enabled` (default true) and `projects` (default
-`["*"]`) alongside explicit `reasoning_tier` and `model`. For example:
+### Global model policy and gateway supply
+
+Gateways describe **supply**, not lane policy. In `~/.bridge/config.json`:
 
 ```json
-{"opencode":{"enabled":true,"model":"provider/actual-model-id","reasoning_tier":"large","projects":["bridge"]}}
+{
+  "backends": {
+    "opencode": {
+      "enabled": true,
+      "projects": ["bridge"],
+      "models": {
+        "medium": "provider/glm-5.3",
+        "large": "provider/your-solver-model"
+      }
+    }
+  }
+}
 ```
+
+Use exact IDs accepted by your agent CLI; the IDs above are examples. Omit tiers
+this gateway cannot supply. A nonempty `models` map replaces the backend's legacy
+single-model pin; the desktop Providers form exposes the same three fields and
+`bridge doctor` reports them. All configured tiers remain advertised while a
+smaller model is running. The hub verifies the selected backend/model/tier against
+that live inventory at begin and retains the actual selection in the attempt and
+delivery receipt.
+
+**Upgrade existing gateway configurations with doctor:**
+
+```sh
+bridge doctor                                      # show the migration plan
+bridge doctor --fix                                # preserve existing tier declarations
+bridge doctor --fix --tier opencode=medium          # explicitly classify a legacy model
+```
+
+Doctor migrates legacy flat `models`/`agents` maps, backend arrays, backend
+single-model pins and the global model fallback into backend tier maps. Model IDs,
+agent profiles, scope, disabled backends, transport, binary paths, and config
+extensions are preserved. Existing tier maps are authoritative and never replaced.
+Without an explicit old tier, migration retains the historical **small** default
+and says so; it never guesses from the model name. Use repeated `--tier backend=tier`
+options to choose tiers explicitly during migration. Missing model IDs are reported,
+not invented. Merely planning does not rewrite the config.
+
+`--fix` saves through the atomic config store and keeps the exact previous file at
+`~/.bridge/config.pre-model-tiers.json`, with both files private (0600). Legacy
+credentials are preserved through their existing stores before removal from the
+config; failed preservation leaves the original config intact. Invalid or newer
+configs are refused without rewriting, and successful migration is idempotent.
+Doctor migrates the saved file, not environment overrides, and does not restart
+running gateways; the saved supply is advertised after their next safe restart.
+
+**Workspace-wide defaults:** analysis chooses the largest live usable tier;
+implementation chooses the smallest; verification chooses the smallest at least
+as large as the implementation delivery. Busy gateways still count as available
+supply. With medium GLM and large Sol, implementation starts medium, analysis
+large, and a large implementation must be reviewed at large. Defaults apply to
+managed workspaces once gateway inventory exists; legacy manual-only workspaces
+retain their manual workflow. Explicit minimum requirements always apply.
+
+Operators may override the workspace `model_policy` through the existing
+authenticated settings API (`admin.settings_set`, settings key `model_policy`):
+
+```json
+{
+  "analysis": { "kind": "largest_available" },
+  "impl": { "kind": "smallest_available" },
+  "verify": { "kind": "smallest_available" }
+}
+```
+
+A lane can instead use `{ "kind": "minimum", "tier": "medium" }`. Overrides
+never weaken an explicit task minimum or the verification floor. The settings
+read returns validated effective defaults; invalid policy changes are rejected.
+Task reads expose computed `meta.execution_scheduling_requirements` separately
+from persistent `meta.execution_requirements`; the former is a read-only projection,
+not another configuration knob.
+
+**Escalation:** an executor inspects `execution` command `availability`, which
+reports `next_available_tier` (or null). It explicitly calls `escalate` with its
+generation/attempt, concrete limitation, and a stronger tier. It stops working;
+the runner checkpoints, quiesces and yields. The next session is fresh when
+backend/model/tier changes. Explicit unavailable minima block rather than fall
+back, and capability restoration clears only that blocker.
+
+**Verification:** ordinary `review_result: {kind:"findings",summary:"..."}` does
+not bump implementation. For a genuine model limitation, the review duty can close
+with `{kind:"stronger_implementation_required",task_id:"BR#123",summary:"..."}`.
+The hub validates the subject and idle writer, chooses the next actually available
+larger tier, and atomically commits the verdict and parent requeue. If none is
+available, it rejects that optional bump with a precise error rather than inventing
+a capability or asking a human to staff an agent. The implementation may still
+explicitly declare a hard unmet requirement and wait for capability restoration.
+Low confidence/risk gauges are evidence, not automatic tier or human escalations.
+**Model visibility and history:** Top shows the recorded model size beneath each
+agent, with the exact model ID/backend/host/session in its tooltip. A separate
+`→ large requested` indicator is a pending minimum, never a claim that large is
+already running. Restoring, stopping, paused, expired and previous/quiesced
+attempts are labelled explicitly; older agents without a receipt say **size
+unreported**. Task details show the same observation and the full model ID.
+Both board snapshots and task reads derive this typed view from canonical
+execution state, not model names or gateway defaults.
+
+The task's normal History records model selection per attempt, agent/reviewer
+escalations with from/to tiers and full reasons, checkpointed yields, and local
+handoff request/accept/return. Structured events commit alongside their state
+changes, and replayed commands/acceptances do not duplicate history. Routine polls
+and checkpoint heartbeats stay out of this readable history. Bound human asks
+retain their ordinary blocked/resume transitions and linked decision context.
+Human asks must name a concrete missing decision/authority/information; local
+handoffs must name the precise local-only action. Use them sparingly, not for CI
+waits, review iteration or routine mechanical repairs.
 
 Paired operators can inspect the same facts without claiming or resuming work:
 

@@ -11,6 +11,8 @@ import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
 import { SupersedeBtn } from "./supersede";
+import { ExecutionModel } from "./ExecutionModel";
+import { ExecutionHistoryEventSchema, executionHistorySummary } from "@bridge/contracts";
 import { StartupWaitNotice } from "./StartupWaitNotice";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
@@ -23,6 +25,7 @@ export const SENTIMENT_CHIP: Record<string, ChipTone> = {
 
 /** Unified history: one log holds progress notes AND state changes, typed. */
 export const HISTORY_CHIP: Record<string, ChipTone> = {
+  execution: "scope",
   progress: "scope",
   transition: "warn",
   create: "done",
@@ -30,6 +33,7 @@ export const HISTORY_CHIP: Record<string, ChipTone> = {
   reassign: "urgent",
 };
 export const HISTORY_LABEL: Record<string, string> = {
+  execution: "execution",
   progress: "log",
   transition: "state",
   create: "created",
@@ -172,16 +176,29 @@ export function MdRef({ text, onOpen, repo }: { text: string | undefined; onOpen
 
 
 /** Long-form markdown that starts collapsed at its kernel. */
-function MdLong({ text, limit = 260 }: { text: string | undefined; limit?: number }) {
+function MdLong({ text, limit = 260, onOpen, repo }: { text: string | undefined; limit?: number; onOpen?: (id: string) => void; repo?: string }) {
   const s = (text ?? "").trim();
   if (!s) return null;
-  if (s.length <= limit) return <div className="md-body"><MdRef text={s} /></div>;
+  if (s.length <= limit) return <div className="md-body"><MdRef text={s} onOpen={onOpen} repo={repo} /></div>;
   return (
     <details className="longtext">
       <summary>{s.slice(0, limit).trimEnd()}… <span className="lt-toggle">more</span></summary>
-      <div className="md-body lt-full"><MdRef text={s} /></div>
+      <div className="md-body lt-full"><MdRef text={s} onOpen={onOpen} repo={repo} /></div>
     </details>
   );
+}
+
+/** Typed execution events retain their full reason even when ledger summaries are bounded. */
+export function TaskHistoryLine({ version: v, onOpen, repo }: { version: KbVersion; onOpen?: (id: string) => void; repo?: string }) {
+  const event = v.action === "execution" ? ExecutionHistoryEventSchema.safeParse(v.data) : null;
+  const label = event?.success ? event.data.kind === "model_escalated" ? "escalation" : event.data.kind === "model_started" ? "model" : "handoff"
+    : HISTORY_LABEL[v.action] ?? v.action;
+  const summary = event?.success ? executionHistorySummary(event.data) : v.summary;
+  return <div className="progress-line">
+    <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={label}>{label}</Chip>
+    <div className="progress-note md-body"><MdLong text={summary} limit={400} onOpen={onOpen} repo={repo} /></div>
+    <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
+  </div>;
 }
 
 interface TaskMeta {
@@ -306,6 +323,8 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
     ["status", task.status],
     ["owner", task.owner || undefined],
     ["session", m.session],
+    ["model", task.execution?.current.kind !== "unreported" ? task.execution?.current.model ?? undefined : undefined],
+    ["minimum model tier", task.execution?.minimum_tier ?? undefined],
     ["kind", m.kind],
     ["project", (task as any).project || undefined],
     ["created by", (task as any).created_by || undefined],
@@ -315,6 +334,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
   ];
   return (
     <div className="task-state-card">
+      {task.type === "task" && <div className="task-model-facts"><b>Execution model</b><ExecutionModel value={task.execution} /></div>}
       {hasGauges && (
         <div className="gauge-row">
           {gauges.filter(([, v]) => v !== undefined).map(([k, v]) => (
@@ -798,15 +818,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
               // drop machine announcements: dispatch/heartbeat/relay noise the
               // board already shows — history is for humans reading what happened
               .filter((v) => !/^(runner:|opencode finished in ~|grace declared|watchdog\.)/i.test(v.summary ?? ""))
-              .map((v) => (
-                <div key={v.seq} className="progress-line">
-                  <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={HISTORY_LABEL[v.action] ?? v.action}>
-                    {HISTORY_LABEL[v.action] ?? v.action}
-                  </Chip>
-                  <span className="progress-note md-body"><MdRef text={v.summary} onOpen={nav} repo={(task?.meta as any)?.provenance?.repo} /></span>
-                  <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
-                </div>
-              ))}
+              .map((v) => <TaskHistoryLine key={v.seq} version={v} onOpen={nav} repo={task?.meta?.provenance && typeof task.meta.provenance === "object" && "repo" in task.meta.provenance ? String(task.meta.provenance.repo) : undefined} />)}
           </div>
         </div>
 

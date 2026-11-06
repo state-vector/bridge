@@ -23,6 +23,7 @@ body {
 
 .gw-head {
   display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap;
   padding: 10px 14px; border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
@@ -34,7 +35,7 @@ body {
 }
 @keyframes gw-blink { 50% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .gw-brand .cursor { animation: none; } }
-.gw-nav { display: flex; gap: 2px; }
+.gw-nav { display: flex; gap: 2px; flex-wrap: wrap; }
 .gw-nav button {
   background: none; border: none; color: var(--text-dim); font: inherit; font-size: 12.5px;
   padding: 4px 10px; border-radius: 6px; cursor: pointer;

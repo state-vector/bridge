@@ -83,6 +83,9 @@ describe("eligibility-first scheduling on real SQLite", () => {
     await post("admin.execution_sweep", { now: Date.now() + 600_000 });
     expect(await reserve(g)).toMatchObject({ kind: "at_capacity", active: 1 });
     expect((await g.cmd({ kind: "quiesce", generation: 1, attempt_id: "writer", writers: "process_group_empty" }, "quiet", winner.task_id, winner.session)).error).toBeUndefined();
+    // The future-time sweep also expires gateway capability observations and
+    // parks default-tier tasks. Fresh inventory is the capability-restored event.
+    await g.cmd({ kind: "advertise", capabilities: g.capabilities });
     // Quiescent attempts must not continue to consume their old start claim.
     expect((await reserve(g)).kind).toBe("reserved");
   });

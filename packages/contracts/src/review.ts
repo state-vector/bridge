@@ -11,6 +11,8 @@ export const ReviewResultSchema = z.discriminatedUnion("kind", [
     ci_run_url: z.string().regex(/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/actions\/runs\/\d+$/),
   }),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1) }),
+  z.object({ kind: z.literal("stronger_implementation_required"), summary: z.string().min(1),
+    task_id: z.string().regex(/^BR#\d+$/) }),
 ]);
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 

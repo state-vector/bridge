@@ -8,6 +8,8 @@ import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
+import { ExecutionModel } from "./ExecutionModel";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -63,6 +65,7 @@ const STATUS_DOT_TITLE: Record<string, string> = {
 };
 
 interface TopRow {
+  execution?: ExecutionModelView;
   key: string;
   agent: string;
   session?: string;
@@ -139,6 +142,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       const unblock: string | undefined = meta.blocked?.unblock_condition;
       const askPending: string | undefined = meta.awaiting_ask?.ask_id;
       return {
+        execution: t.execution,
         key: t.id,
         agent,
         session: meta.session ?? p?.session,
@@ -288,7 +292,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
           </span>
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
-            {r.agent}
+            <span className="top-agent-name">{r.agent}</span>
+            <ExecutionModel value={r.execution} now={now} />
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>

@@ -177,6 +177,9 @@ pub struct BackendConfig {
     /// Explicit capability declaration; never inferred from a model-name regex.
     #[serde(default)]
     pub reasoning_tier: ReasoningTier,
+    /// Explicit tier supply. Lane policy is global in Bridge, never per host.
+    #[serde(default, deserialize_with = "tier_models_de", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<ReasoningTier, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,   // CLI binary override (default: "opencode" / "kiro")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,17 +191,39 @@ pub struct BackendConfig {
 }
 fn default_projects() -> Vec<String> { vec!["*".into()] }
 impl Default for BackendConfig {
-    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, bin: None, agent: None, model: None, mode: None } }
+    fn default() -> Self { Self { enabled: true, projects: default_projects(), reasoning_tier: ReasoningTier::Small, models: Default::default(), bin: None, agent: None, model: None, mode: None } }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningTier { #[default] Small, Medium, Large }
 
+fn tier_models_de<'de, D: serde::Deserializer<'de>>(de: D) -> Result<std::collections::BTreeMap<ReasoningTier, String>, D::Error> {
+    let models = std::collections::BTreeMap::<ReasoningTier, String>::deserialize(de)?;
+    if models.values().any(|m| m.trim().is_empty()) { return Err(serde::de::Error::custom("tier models must contain non-empty CLI model IDs")); }
+    Ok(models.into_iter().map(|(tier, model)| (tier, model.trim().to_string())).collect())
+}
+
 fn backend_satisfies(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> bool {
-    let required = meta.pointer("/execution_requirements/tier").and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
+    selected_model(cfg, backend, meta).is_some()
+}
+
+fn configured_models(cfg: &DispatchConfig, bc: &BackendConfig) -> Vec<(ReasoningTier, String)> {
+    if !bc.models.is_empty() {
+        return bc.models.iter().filter(|(_, model)| !model.trim().is_empty()).map(|(tier, model)| (*tier, model.clone())).collect();
+    }
+    bc.model.clone().or_else(|| cfg.model.clone()).filter(|model| !model.trim().is_empty())
+        .map(|model| vec![(bc.reasoning_tier, model)]).unwrap_or_default()
+}
+
+fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde_json::Value) -> Option<(ReasoningTier, String)> {
+    let required = meta.pointer("/execution_scheduling_requirements/tier").or_else(|| meta.pointer("/execution_requirements/tier"))
+        .and_then(|v| serde_json::from_value::<ReasoningTier>(v.clone()).ok()).unwrap_or_default();
     let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
-    cfg.backends.get(name).map(|b| b.enabled && b.reasoning_tier >= required && b.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str())).unwrap_or(false)
+    let bc = cfg.backends.get(name)?;
+    if !bc.enabled || !bc.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str()) { return None; }
+    let initial_selection = meta.get("execution_scheduling_requirements").is_some() && meta.get("execution_last_model").is_none();
+    configured_models(cfg, bc).into_iter().filter(|(tier, _)| if initial_selection { *tier == required } else { *tier >= required }).min_by_key(|(tier, _)| *tier)
 }
 
 fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
@@ -236,11 +261,7 @@ fn prepare_worker(cfg: &DispatchConfig, avail: &[opencode::Backend]) -> Result<(
     }).ok_or("no configured backend is available")?;
     let name = if *backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
-    let mut capabilities = backend_capabilities(cfg, name, true, Some(&worker));
-    capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| other.as_str() != name).map(|other| {
-        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(other)) == *b);
-        backend_capabilities(cfg, other, runnable, Some(&worker))
-    }).collect::<Vec<_>>());
+    let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
     if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
         return Err(format!("executor readiness held: {}", reply["readiness"]));
@@ -308,9 +329,10 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
 enum ModelAvailability { Usable, Unavailable { reason: String }, Disabled }
 fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker: Option<&WorkerCredential>) -> serde_json::Value {
     let bc = cfg.backends.get(name).cloned().unwrap_or_default();
-    let model = bc.model.clone().or_else(|| cfg.model.clone());
-    let mut facts = worker.map(|worker| executor_capabilities(bc.reasoning_tier, worker))
-        .unwrap_or_else(|| json!({ "tier": bc.reasoning_tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
+    let (tier, model) = configured_models(cfg, &bc).into_iter().max_by_key(|(tier, _)| *tier)
+        .map(|(tier, model)| (tier, Some(model))).unwrap_or((bc.reasoning_tier, None));
+    let mut facts = worker.map(|worker| executor_capabilities(tier, worker))
+        .unwrap_or_else(|| json!({ "tier": tier, "tools": [], "environment": [], "worker": { "kind": "unprovisioned" } }));
     let availability = if !bc.enabled { ModelAvailability::Disabled }
         else if !runnable { ModelAvailability::Unavailable { reason: "Configured agent CLI is unavailable or its circuit breaker is open".into() } }
         else if model.as_deref().unwrap_or("").is_empty() { ModelAvailability::Unavailable { reason: "Actual configured model identity is unreported; configure it explicitly".into() } }
@@ -322,15 +344,42 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
     facts
 }
 
+/// Advertise the complete supply even when a task selects a smaller model.
+/// Otherwise running medium temporarily erases this host's large capability.
+fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
+    let mut inventory = Vec::new();
+    for (name, bc) in &cfg.backends {
+        let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(name)) == *b);
+        let base = backend_capabilities(cfg, name, runnable, worker);
+        let models = configured_models(cfg, bc);
+        if models.is_empty() { inventory.push(base); }
+        else { for (tier, model) in models {
+            let mut facts = base.clone(); facts["tier"] = json!(tier); facts["model"] = json!(model);
+            inventory.push(facts);
+        } }
+    }
+    let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
+    if inventory.is_empty() { return backend_capabilities(cfg, primary, false, worker); }
+    let mut main = inventory.remove(index); main["alternatives"] = json!(inventory); main
+}
+
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
 
 fn execution_call(cfg: &DispatchConfig, tid: &str, command: serde_json::Value) -> Result<serde_json::Value, String> {
+    execution_call_session(cfg, tid, command, None)
+}
+
+fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::Value, session: Option<&str>) -> Result<serde_json::Value, String> {
     let kind = command.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
     let mut id = 0;
     let args = json!({ "id": tid, "command_id": format!("{kind}-{}-{nonce}", std::process::id()), "command": command });
     for retry in 0..3 {
-        match mcp_call_task(cfg, &mut id, "execution", args.clone(), tid) {
+        let result = match session {
+            Some(session) => mcp_call_session(cfg, &mut id, "execution", args.clone(), Some(session)),
+            None => mcp_call_task(cfg, &mut id, "execution", args.clone(), tid),
+        };
+        match result {
             Ok(result) => return Ok(result),
             Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => std::thread::sleep(Duration::from_millis(250 * (retry + 1))),
             Err(e) => return Err(e), // named semantic gates are terminal
@@ -364,8 +413,37 @@ struct ExecutionRuntime {
     generation: u64,
     attempt_id: String,
     control: Arc<crate::transport::RunControl>,
-    last_poll: Instant,
+    maintenance: Option<Arc<LeaseMaintenance>>,
     last_checkpoint: Instant,
+}
+
+/// One clock per attempt: preparing other workers, Git publication and the
+/// dispatch cadence must never starve a running writer's lease or inbox.
+/// Cancellation joins the poller before quiesce/transfer, so no late poll can
+/// renew an attempt after its finalization barrier.
+struct LeaseMaintenance {
+    cancel: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl LeaseMaintenance {
+    fn start(interval: Duration, mut poll: impl FnMut() -> bool + Send + 'static) -> Self {
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while matches!(cancelled.recv_timeout(interval), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                if !poll() { break; }
+            }
+        });
+        Self { cancel, thread: Mutex::new(Some(thread)) }
+    }
+    fn stop(&self) {
+        let _ = self.cancel.send(());
+        if let Ok(mut thread) = self.thread.lock() {
+            if let Some(thread) = thread.take() { let _ = thread.join(); }
+        }
+    }
+}
+impl Drop for LeaseMaintenance {
+    fn drop(&mut self) { self.stop(); }
 }
 
 #[derive(Deserialize)]
@@ -400,6 +478,10 @@ struct RemoteExecution {
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
 impl RemoteExecution {
+    fn permits_renewal(&self, generation: u64, attempt_id: &str) -> bool {
+        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring { .. }))
+            && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered))
+    }
     fn parse(value: serde_json::Value) -> Result<Self, String> {
         let state: Self = serde_json::from_value(value).map_err(|e| format!("durable execution contract drift: {e}"))?;
         if state.policy_version != 1 { return Err("unsupported execution policy version".into()); }
@@ -407,6 +489,33 @@ impl RemoteExecution {
     }
 }
 impl ExecutionRuntime {
+    fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str) {
+        let cfg = cfg.clone();
+        let session = claim_session(&cfg, tid);
+        let tid = tid.to_string();
+        let generation = self.generation;
+        let attempt_id = self.attempt_id.clone();
+        let command = self.command("poll");
+        let control = self.control.clone();
+        self.maintenance = Some(Arc::new(LeaseMaintenance::start(Duration::from_secs(20), move || {
+            if control.stop.load(Ordering::SeqCst) { return false; }
+            let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
+            match state {
+                Ok(state) => {
+                    if state.permits_renewal(generation, &attempt_id) {
+                        control.grant_lease();
+                        return true;
+                    }
+                }
+                Err(error) => dlog(&tid, &format!("execution lease/inbox unavailable: {error}; stopping writer and retaining WIP")),
+            }
+            control.stop.store(true, Ordering::SeqCst);
+            false
+        })));
+    }
+    fn stop_maintenance(&self) {
+        if let Some(maintenance) = &self.maintenance { maintenance.stop(); }
+    }
     fn command(&self, kind: &str) -> serde_json::Value {
         json!({ "kind": kind, "generation": self.generation, "attempt_id": self.attempt_id })
     }
@@ -439,7 +548,7 @@ where D: serde::Deserializer<'de> {
         serde_json::Value::Object(o) => {
             let mut m = std::collections::BTreeMap::new();
             for (name, section) in o {
-                let cfg = serde_json::from_value(section).unwrap_or_default();
+                let cfg = serde_json::from_value(section).map_err(serde::de::Error::custom)?;
                 m.insert(name, cfg);
             }
             Ok(m)
@@ -3157,7 +3266,8 @@ fn spawn_opencode(
         failed_start(cfg, tid, StartStage::Begin, "gate: selected capability no longer available on this host", None, None);
         return;
     }
-    let backend = pick_backend(&eligible);
+    let backend = *eligible.iter().min_by_key(|b| selected_model(cfg, **b, task_meta).map(|(tier, _)| tier)).unwrap();
+    let (model_tier, model_id) = selected_model(cfg, backend, task_meta).expect("eligible backend has a configured model");
 
     // BR#2460: provisioning is a best-effort optimization; capability belongs
     // to the agent. A resolvable repo reference (meta.repo or the task body)
@@ -3182,9 +3292,14 @@ fn spawn_opencode(
     let bc = cfg.backends.get(backend_name).cloned().unwrap_or_default();
     let bc_mode = bc.mode.clone();
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
-    let model = bc.model.or_else(|| cfg.model.clone());
+    let model = Some(model_id);
     let model_str = model.clone().unwrap_or_default();
-    let resume_session = if resume_session.is_none() && backend == opencode::Backend::Kiro {
+    // A different model gets a fresh session, preserving the checkpoint/WIP.
+    let previous = task_meta.get("execution_last_model");
+    let model_changed = previous.and_then(|p| p["model"].as_str()) != model.as_deref()
+        || previous.and_then(|p| serde_json::from_value::<ReasoningTier>(p["tier"].clone()).ok()) != Some(model_tier)
+        || previous.and_then(|p| p["backend"].as_str()) != Some(backend_name);
+    let resume_session = if model_changed { None } else if resume_session.is_none() && backend == opencode::Backend::Kiro {
         load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
     } else {
         resume_session
@@ -3446,11 +3561,12 @@ fn spawn_opencode(
         Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
         _ => {}
     }
-    let capabilities = backend_capabilities(cfg, backend_name, true, Some(worker));
+    let capabilities = capability_inventory(cfg, avail, Some(worker), backend_name);
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
     let begin = execution_call(cfg, tid, json!({ "kind": "advertise", "capabilities": capabilities })).and_then(|ready| {
         if ready["ok"] != true { return Err(format!("executor readiness held: {}", ready["readiness"])); }
-        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000) }))
+        execution_call(cfg, tid, json!({ "kind": "begin", "attempt_id": expected_attempt, "worker": agent_label, "action_budget_ms": (cfg.timeout_mins * 60_000).clamp(10_000, 3_600_000),
+            "selection": { "backend": backend_name, "model": model_str, "tier": model_tier } }))
     });
     let state = match begin {
         Ok(s) => s,
@@ -3462,10 +3578,12 @@ fn spawn_opencode(
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
-    let execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), last_poll: Instant::now(), last_checkpoint: Instant::now() };
+    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), maintenance: None, last_checkpoint: Instant::now() };
     execution.control.grant_lease();
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
+    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
+    execution.start_maintenance(cfg, tid);
     if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
         let restored = (|| -> Result<(), String> {
             let path = worktree.as_deref().ok_or("portable checkpoint requires an isolated Git worktree")?;
@@ -3475,6 +3593,7 @@ fn spawn_opencode(
             Ok(())
         })();
         if let Err(e) = restored {
+            execution.stop_maintenance();
             dlog(tid, &format!("checkpoint restore held: {e}; no agent spawned"));
             // This attempt has never spawned a child. Preserve checkpoint/WIP;
             // don't leave an imaginary writer lease blocking reconciliation.
@@ -3485,14 +3604,15 @@ fn spawn_opencode(
     }
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
-        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
+        Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
     };
     prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", safe_point["messages"]));
     for message in safe_point["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
         let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
         if execution_call(cfg, tid, cmd).is_err() { return; }
     }
-    if !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+    if execution.control.stop.load(Ordering::SeqCst) || !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+        execution.stop_maintenance();
         let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
         let _ = execution_call(cfg, tid, cmd);
         dlog(tid, "safe-point interruption before spawn; no writer launched");
@@ -3650,8 +3770,7 @@ fn tick(
     let avail_ok = !avail.is_empty();
     if !avail_ok {
         if let Some(name) = cfg.backends.keys().next() {
-            let mut capabilities = backend_capabilities(cfg, name, false, None);
-            capabilities["alternatives"] = json!(cfg.backends.keys().filter(|other| *other != name).map(|other| backend_capabilities(cfg, other, false, None)).collect::<Vec<_>>());
+            let capabilities = capability_inventory(cfg, &[], None, name);
             let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
         }
         let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
@@ -3677,22 +3796,6 @@ fn tick(
     // expired action budget stops the process group; it never buys more work
     // merely because the model keeps printing. No hot interrupt API is assumed.
     for inf in in_flight.iter_mut() {
-        if inf.execution.last_poll.elapsed() >= Duration::from_secs(20) {
-            match execution_call(cfg, &inf.task_id, inf.execution.command("poll")).and_then(RemoteExecution::parse) {
-                Ok(state) => {
-                    inf.execution.control.grant_lease();
-                    let needs_delivery = state.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered));
-                    if matches!(state.attempt.map(|a| a.state), Some(RemoteAttemptState::Stopping)) || needs_delivery {
-                        inf.execution.control.stop.store(true, Ordering::SeqCst);
-                    }
-                    inf.execution.last_poll = Instant::now();
-                }
-                Err(e) => {
-                    dlog(&inf.task_id, &format!("execution lease/inbox unavailable: {e}; stopping writer and retaining WIP"));
-                    inf.execution.control.stop.store(true, Ordering::SeqCst);
-                }
-            }
-        }
         if !inf.execution.control.stop.load(Ordering::SeqCst) && inf.execution.last_checkpoint.elapsed() >= Duration::from_secs(300) {
             if let Some(path) = inf.worktree.as_deref() {
                 if let Err(e) = inf.execution.checkpoint(cfg, &inf.task_id, path) {
@@ -3809,6 +3912,7 @@ fn tick(
         // Transfer/cleanup barrier: a terminal subprocess is not evidence its
         // children stopped, and a local path is not a portable checkpoint.
         let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
+        inf.execution.stop_maintenance();
         let stopped = inf.execution.control.quiesced.load(Ordering::SeqCst);
         if let Err(e) = &published { dlog(&inf.task_id, &format!("final checkpoint failed: {e}; worktree retained")); }
         let quiesced = if stopped {
@@ -5048,6 +5152,77 @@ pub fn logout(state: &DispatchState) {
 mod tests {
     use super::*;
     #[test]
+    fn lease_maintenance_keeps_polling_while_dispatch_is_blocked_and_joins_before_finalization() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polled = count.clone();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            polled.fetch_add(1, Ordering::SeqCst);
+            observed.send(()).unwrap();
+            true
+        });
+        // No tick calls: simulate a blocked worktree preparation/publication.
+        for _ in 0..4 { polls.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        pump.stop();
+        let at_barrier = count.load(Ordering::SeqCst);
+        assert!(at_barrier >= 4);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(count.load(Ordering::SeqCst), at_barrier, "no renewal after quiescence barrier");
+        pump.stop(); // finalization and Drop can both cancel safely
+    }
+
+    #[test]
+    fn lease_maintenance_terminal_poll_failure_is_not_retried() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            observed.send(()).unwrap();
+            false
+        });
+        polls.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(polls.recv_timeout(Duration::from_secs(2)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        pump.stop();
+    }
+
+    #[test]
+    fn lease_maintenance_stop_waits_for_in_flight_poll_before_quiescence() {
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            true
+        });
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (stopped, stopping) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || { pump.stop(); stopped.send(()).unwrap(); });
+        assert!(matches!(stopping.recv_timeout(Duration::from_millis(25)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release.send(()).unwrap();
+        stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn lease_renewal_requires_exact_active_attempt_and_no_pending_mailbox_delivery() {
+        let base = json!({ "policy_version": 1, "attempt": { "generation": 7, "attempt_id": "attempt", "phase": "running" }, "messages": [] });
+        let state = RemoteExecution::parse(base.clone()).unwrap();
+        assert!(state.permits_renewal(7, "attempt"));
+        assert!(!state.permits_renewal(8, "attempt"));
+        assert!(!state.permits_renewal(7, "other"));
+        let mut restoring = base.clone();
+        restoring["attempt"]["phase"] = json!("restoring");
+        restoring["attempt"]["checkpoint"] = json!({ "repo": "repo", "remote_ref": "refs/heads/checkpoint", "commit": "commit", "tree": "tree", "base": "base", "environment": [], "next": "restore", "tests": [] });
+        assert!(RemoteExecution::parse(restoring).unwrap().permits_renewal(7, "attempt"));
+        for phase in ["stopping", "quiesced"] {
+            let mut value = base.clone(); value["attempt"]["phase"] = json!(phase);
+            assert!(!RemoteExecution::parse(value).unwrap().permits_renewal(7, "attempt"));
+        }
+        let mut missing = base.clone(); missing["attempt"] = serde_json::Value::Null;
+        assert!(!RemoteExecution::parse(missing).unwrap().permits_renewal(7, "attempt"));
+        let mut delivered = base; delivered["messages"] = json!([{ "state": "delivered" }]);
+        assert!(!RemoteExecution::parse(delivered).unwrap().permits_renewal(7, "attempt"));
+    }
+
+    #[test]
     fn quiescence_can_resume_only_the_same_hosts_unchanged_claim_without_a_local_handoff() {
         let task = json!({ "status": "in_progress", "meta": { "session": "dispatch-BR-1" } });
         let mut state = json!({ "attempt": { "phase": "running", "host": "host", "session": "dispatch-BR-1" }, "handoff": { "phase": "none" } });
@@ -5058,6 +5233,32 @@ mod tests {
         assert!(!quiesced_claim_can_resume(&state, &json!({ "status": "in_progress", "meta": { "session": "local-owner" } }), Some("host")));
         state["handoff"]["phase"] = json!("waiting");
         assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
+    }
+
+    #[test]
+    fn multi_model_selection_respects_global_requirement_and_scope() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "backends": { "opencode": {
+            "projects": ["bridge"], "models": { "medium": "glm-5.3", "large": "provider/sol" }
+        } } })).unwrap();
+        let task = json!({ "execution_project": "bridge", "execution_scheduling_requirements": { "tier": "medium" } });
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &task), Some((ReasoningTier::Medium, "glm-5.3".into())));
+        let mut large = task.clone(); large["execution_scheduling_requirements"]["tier"] = json!("large");
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &large), Some((ReasoningTier::Large, "provider/sol".into())));
+        large["execution_project"] = json!("other");
+        assert!(!backend_satisfies(&cfg, opencode::Backend::OpenCode, &large));
+        let inventory = capability_inventory(&cfg, &[opencode::Backend::OpenCode], None, "opencode");
+        assert_eq!(inventory["model"], "provider/sol");
+        assert_eq!(inventory["alternatives"][0]["model"], "glm-5.3");
+        assert_eq!(inventory["availability"]["kind"], "usable");
+    }
+
+    #[test]
+    fn explicit_models_replace_legacy_pin_and_never_fall_back_below_minimum() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({ "url": "https://hub.test", "model": "legacy-large", "backends": { "opencode": {
+            "reasoning_tier": "large", "models": { "medium": "glm-5.3" }
+        } } })).unwrap();
+        assert!(selected_model(&cfg, opencode::Backend::OpenCode, &json!({ "execution_requirements": { "tier": "large" } })).is_none());
+        assert!(serde_json::from_value::<BackendConfig>(json!({"models": {"huge": "not-a-tier"}})).is_err());
     }
 
     #[test]

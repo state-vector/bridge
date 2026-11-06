@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { TopView, BacklogView, CompletedView, StatusLights, useKb, setKbHubConfig, setKbAuthEscalator, kbApi, notifyExecutionAttention, type ExecutionNotice } from "@bridge/ui-kit";
 import { ExecutionAttentionSchema, type ReasoningTier } from "@bridge/contracts";
 import { openDetailWindow } from "./detailWindow";
-import { Btn, Card, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
+import { Btn, Card, CardLookup, Chip, ConnDot, TextInput } from "@bridge/ui-kit";
 import { Chat } from "./Chat";
 import { listen } from "@tauri-apps/api/event";
 
@@ -44,7 +44,7 @@ interface Snapshot {
   needs_attention_ts?: number | null;
 }
 /** Mirrors dispatch.rs DispatchConfig (serde). */
-interface BackendSection { bin?: string | null; agent?: string | null; model?: string | null; mode?: string | null; enabled?: boolean; reasoning_tier?: ReasoningTier; projects?: string[] }
+interface BackendSection { bin?: string | null; agent?: string | null; model?: string | null; models?: Partial<Record<ReasoningTier, string>>; mode?: string | null; enabled?: boolean; reasoning_tier?: ReasoningTier; projects?: string[] }
 interface Cfg {
   url: string;
   token: string;
@@ -124,6 +124,7 @@ export function App() {
   const [backendModels, setBackendModels] = useState<Record<string, string>>({});
   const [backendAgents, setBackendAgents] = useState<Record<string, string>>({});
   const [backendTiers, setBackendTiers] = useState<Record<string, ReasoningTier>>({});
+  const [tierModels, setTierModels] = useState<Record<string, Partial<Record<ReasoningTier, string>>>>({});
   const [backendProjects, setBackendProjects] = useState<Record<string, string>>({});
   const [hubUrl, setHubUrl] = useState("");
   const [applyMsg, setApplyMsg] = useState("");
@@ -253,6 +254,7 @@ export function App() {
         setBackendModels(Object.fromEntries(enabled.map((b) => [b, sections[b]?.model ?? ""])));
         setBackendAgents(Object.fromEntries(enabled.map((b) => [b, sections[b]?.agent ?? ""])));
         setBackendTiers(Object.fromEntries(enabled.map(b => [b, sections[b]?.reasoning_tier ?? "small"])));
+        setTierModels(Object.fromEntries(enabled.map(b => [b, sections[b]?.models ?? {}])));
         setBackendProjects(Object.fromEntries(enabled.map(b => [b, (sections[b]?.projects ?? ["*"]).join(", ")])));
         setHubUrl(c.url);
       }
@@ -394,7 +396,7 @@ export function App() {
       return;
     }
     const ordered = BACKENDS.filter((b) => backends.includes(b));
-    const missing = ordered.filter((b) => BACKEND_META[b]?.modelRequired && !(backendModels[b] ?? "").trim());
+    const missing = ordered.filter((b) => BACKEND_META[b]?.modelRequired && !(backendModels[b] ?? "").trim() && !Object.values(tierModels[b] ?? {}).some(m => m?.trim()));
     if (missing.length) {
       setApplyMsg(`model required for: ${missing.join(", ")}`);
       return;
@@ -408,6 +410,7 @@ export function App() {
       ordered.map((b) => [b, {
         ...(prevBackends[b] ?? {}),
         enabled: true,
+        models: Object.fromEntries(Object.entries(tierModels[b] ?? {}).filter(([, model]) => model?.trim()).map(([tier, model]) => [tier, model!.trim()])),
         reasoning_tier: backendTiers[b] ?? "small",
         projects: (backendProjects[b] ?? "*").split(",").map(p => p.trim()).filter(Boolean),
         model: (backendModels[b] ?? "").trim() || null,
@@ -452,6 +455,7 @@ export function App() {
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>Settings</button>
           <StatusLights />
         </nav>
+        <CardLookup onOpen={(id) => openDetailWindow("task", id)} />
         <span className="gw-user">{snap?.label ?? ""}</span>
       </header>
 
@@ -571,15 +575,22 @@ export function App() {
                 </Btn>
               ))}
             </div>
-            <span className="gw-note">tasks rotate across the enabled provider CLIs</span>
+            <span className="gw-note">Gateways supply models. Global policy starts analysis on the largest available tier, implementation on the smallest, and verification at least as large as implementation.</span>
             {backends.map((b) => {
               const meta = BACKEND_META[b] ?? { label: b, note: "", modelRequired: true, modelPlaceholder: "model" };
               return (
                 <div key={b} className="gw-provider">
                   <h3 className="gw-provider-head">{meta.label}</h3>
+                  {(["small", "medium", "large"] as const).map(tier => <label key={tier} className="gw-row">
+                    {tier} model <TextInput style={{ flex: 1 }} value={tierModels[b]?.[tier] ?? ""}
+                      placeholder={tier === "medium" ? "provider/glm-5.3" : "CLI model ID (leave empty if not supplied)"}
+                      onChange={e => setTierModels(models => ({ ...models, [b]: { ...models[b], [tier]: e.target.value } }))} />
+                  </label>)}
+                  <span className="gw-note">Configure any tiers this gateway can supply. Tier entries replace the legacy single-model pin below; blank tiers are not advertised.</span>
                   <div className="gw-row">
                     <TextInput style={{ flex: 1 }} value={backendModels[b] ?? ""}
-                      placeholder={meta.modelPlaceholder}
+                      aria-label={`${meta.label} legacy single model`}
+                      placeholder={`Legacy single model: ${meta.modelPlaceholder}`}
                       onChange={(e) => setBackendModels((m) => ({ ...m, [b]: e.target.value }))} />
                   </div>
                   <div className="gw-row">
@@ -589,7 +600,7 @@ export function App() {
                   </div>
                   <span className="gw-note">{meta.note}</span>
                   <div className="gw-row">
-                    <label>Actual model reasoning tier <select value={backendTiers[b] ?? "small"} onChange={e => {
+                    <label>Legacy single-model tier <select value={backendTiers[b] ?? "small"} onChange={e => {
                       const tier = e.target.value;
                       if (tier === "small" || tier === "medium" || tier === "large") setBackendTiers(m => ({ ...m, [b]: tier }));
                     }}><option>small</option><option>medium</option><option>large</option></select></label>

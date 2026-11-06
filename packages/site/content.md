@@ -1,5 +1,12 @@
 # bridge
 
+### Jump straight to a card
+
+Use **Go to BR#…** in the web or desktop header to open a card by number from
+any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press
+Enter or **Go**. **⌘K / Ctrl+K** focuses the lookup, and Escape clears it.
+Lookup works independently of board filters and the currently loaded list.
+
 ### Opt-in server updates
 
 Linux runners can explicitly opt into automatic updates in config:
@@ -135,12 +142,17 @@ publication, newer local WIP or unproven writer isolation retains the work and
 host affinity. A dead host cannot guarantee preservation of changes since its
 last published checkpoint.
 
-Action budgets are independent of stdout activity. Task-addressed coordination
+Action budgets are independent of stdout activity. Coordination mailboxes
+and execution leases are polled every 20 seconds by a dedicated per-attempt
+thread, so slow worker preparation, checkpoints and dispatch ticks cannot starve
+active writers. Pollers stop and join before quiescence/transfer; a refused poll
+stops its writer and preserves WIP.
+Task-addressed coordination
 is delivered through a durable queued/delivered/acknowledged/acted mailbox;
 non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
 operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution
 MCP tool exposes exact state and availability, including expired supporting
-gateways versus busy capacity. Backend `reasoning_tier` declarations and task
+gateways versus busy capacity. Backend `models` tier maps and task
 minimum requirements are explicit, persistent and checked by the hub—there is
 no model-name guessing or silent downgrade. Explicit model escalation yields
 only after work is portable and the old writer is quiescent; it does not ask a
@@ -170,8 +182,51 @@ enabled state, project scope and explicit reasoning tiers. Unconfigured, expired
 unavailable and merely busy hosts produce different facts. Queued unsupported
 work waits on capability restoration without generating a human approval request;
 restoration clears only its matching blocker. Task requirements survive releases
-and cannot silently weaken. Use backend `enabled`, `projects`, `model` and
-`reasoning_tier` settings to declare actual capacity.
+and cannot silently weaken. Use backend `enabled`, `projects` and
+`models: {"medium":"provider/glm-5.3","large":"provider/solver"}` settings to
+declare actual capacity (example IDs; use your CLI's exact IDs). Legacy single
+`model` + `reasoning_tier` configuration remains supported. Desktop Providers
+exposes all three tier slots, and doctor reports the configured supply.
+For old configs, `bridge doctor` previews conversion; `bridge doctor --fix`
+migrates legacy model pins and flat maps into backend tier maps, preserving IDs
+and existing tier declarations. Use `--tier opencode=medium` (repeat per backend)
+to classify a legacy model explicitly. Unclassified legacy pins retain the old
+small default; model names are never used to infer capability. Existing tier maps
+are untouched. Migration is idempotent, keeps a private original-file backup,
+preserves other config fields and credentials, and refuses invalid/future configs.
+Running gateways adopt the saved supply after a safe restart, not mid-attempt.
+
+**Model policy is global, not per gateway.** Built-in defaults run analysis on
+the largest live usable model tier, implementation on the smallest, and
+verification on the smallest at least as large as the implementation delivery.
+Busy gateways count as supply, so policy does not change just because a slot is
+occupied. Workspace `model_policy` settings can override lane selection with
+`smallest_available`, `largest_available`, or an explicit `minimum` tier; these
+preferences never override a task's persistent minimum or the verification floor.
+Execution receipts record the selected model rather than the gateway's strongest
+model. All tiers remain advertised while a smaller model runs.
+
+Agents explicitly self-escalate through the fenced execution protocol; availability
+reports the next actually available larger tier. Normal review findings do not
+bump implementation. A typed `stronger_implementation_required` review outcome
+raises the idle parent to the next available tier and requeues it atomically with
+the verdict. Missing large capability blocks explicit large requirements; restored
+capability clears only its own blocker. A changed backend/model/tier starts a fresh
+session with the preserved checkpoint. Confidence/risk gauges prompt judgement,
+not automatic bumps or human asks. Human blocking is reserved for precise missing
+decisions/authority/information or concrete local-only actions, not mechanical
+repairs or ordinary review iteration.
+
+**Top displays observed model size.** Each active agent row shows its actual
+recorded tier; the tooltip identifies model/backend/host/session. A larger pending
+minimum appears separately as requested, while expired, paused, stopping and
+previous attempts are explicitly labelled. Missing observations say size
+unreported, never an inferred tier. Task details use the same canonical projection.
+Task History includes model starts, agent/reviewer escalation reasons and tier
+changes, checkpointed yields and local handoff request/accept/return. Typed history
+events commit with state and remain once-only across command retries; routine
+polls do not flood the timeline. Human questions keep their linked decision and
+blocked/resume history.
 After scoped-inventory adoption, obsolete producers sharing that gateway's
 credential can finish active work but cannot overwrite or borrow newer readiness.
 
