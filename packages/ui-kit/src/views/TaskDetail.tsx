@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, Chip, type ChipTone, TextArea, TextInput } from "./index-kit";
 import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
-import { md, AskOptions, askKernel } from "./decide";
+import { md, AskOptions, askOptionVariant } from "./decide";
+import { AskContext } from "./AskContext";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -10,6 +11,10 @@ import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
 import { SupersedeBtn } from "./supersede";
+import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
+import { ExecutionHistoryEventSchema, executionHistorySummary } from "@bridge/contracts";
+import { StartupWaitNotice } from "./StartupWaitNotice";
+import { LaneDetail, isLaneCard } from "./LaneDetail";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -21,6 +26,7 @@ export const SENTIMENT_CHIP: Record<string, ChipTone> = {
 
 /** Unified history: one log holds progress notes AND state changes, typed. */
 export const HISTORY_CHIP: Record<string, ChipTone> = {
+  execution: "scope",
   progress: "scope",
   transition: "warn",
   create: "done",
@@ -28,6 +34,7 @@ export const HISTORY_CHIP: Record<string, ChipTone> = {
   reassign: "urgent",
 };
 export const HISTORY_LABEL: Record<string, string> = {
+  execution: "execution",
   progress: "log",
   transition: "state",
   create: "created",
@@ -170,16 +177,29 @@ export function MdRef({ text, onOpen, repo }: { text: string | undefined; onOpen
 
 
 /** Long-form markdown that starts collapsed at its kernel. */
-function MdLong({ text, limit = 260 }: { text: string | undefined; limit?: number }) {
+function MdLong({ text, limit = 260, onOpen, repo }: { text: string | undefined; limit?: number; onOpen?: (id: string) => void; repo?: string }) {
   const s = (text ?? "").trim();
   if (!s) return null;
-  if (s.length <= limit) return <div className="md-body"><MdRef text={s} /></div>;
+  if (s.length <= limit) return <div className="md-body"><MdRef text={s} onOpen={onOpen} repo={repo} /></div>;
   return (
     <details className="longtext">
       <summary>{s.slice(0, limit).trimEnd()}… <span className="lt-toggle">more</span></summary>
-      <div className="md-body lt-full"><MdRef text={s} /></div>
+      <div className="md-body lt-full"><MdRef text={s} onOpen={onOpen} repo={repo} /></div>
     </details>
   );
+}
+
+/** Typed execution events retain their full reason even when ledger summaries are bounded. */
+export function TaskHistoryLine({ version: v, onOpen, repo }: { version: KbVersion; onOpen?: (id: string) => void; repo?: string }) {
+  const event = v.action === "execution" ? ExecutionHistoryEventSchema.safeParse(v.data) : null;
+  const label = event?.success ? event.data.kind === "model_escalated" ? "escalation" : event.data.kind === "model_started" ? "model" : "handoff"
+    : HISTORY_LABEL[v.action] ?? v.action;
+  const summary = event?.success ? executionHistorySummary(event.data) : v.summary;
+  return <div className="progress-line">
+    <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={label}>{label}</Chip>
+    <div className="progress-note md-body"><MdLong text={summary} limit={400} onOpen={onOpen} repo={repo} /></div>
+    <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
+  </div>;
 }
 
 interface TaskMeta {
@@ -264,6 +284,18 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#6135: the takeover click — the same in_progress door with takeover:true;
+  // the server verifies the web-session human anchor, flips holder+owner atomically.
+  const takeover = async () => {
+    setBusy(true);
+    try {
+      await kbApi.transition(task.id, "in_progress", { takeover: true, note: "interactive takeover — human took the live claim" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "takeover failed"); useKb.getState().reportError("claim takeover", e); } finally {
+      setBusy(false);
+    }
+  };
   // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
   // force-review — approve re-anchors the verdict at the parked head and
   // re-queues the train; request_changes bounces impl. No ask was filed;
@@ -292,6 +324,8 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
     ["status", task.status],
     ["owner", task.owner || undefined],
     ["session", m.session],
+    ["model", task.execution?.current.kind === "managed" ? task.execution.current.model ?? undefined : undefined],
+    ["automation minimum tier", task.execution?.minimum_tier ?? undefined],
     ["kind", m.kind],
     ["project", (task as any).project || undefined],
     ["created by", (task as any).created_by || undefined],
@@ -301,6 +335,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
   ];
   return (
     <div className="task-state-card">
+      {task.type === "task" && <div className="task-model-facts"><b>Model size</b><ExecutionModel value={task.execution} /><b>Execution state</b><ExecutionStatus value={task.execution} /></div>}
       {hasGauges && (
         <div className="gauge-row">
           {gauges.filter(([, v]) => v !== undefined).map(([k, v]) => (
@@ -365,6 +400,27 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
           <SupersedeBtn task={task as any} onChanged={onChanged} />
         </div>
       )}
+      {/* BR#6135: interactive claim takeover — a runner-held in_progress claim can
+          be flipped to the human in ONE atomic write (holder + owner move together,
+          no pool pass, the ex-holder is stood down by the next gate it hits). The
+          affordance targets the interactive loop's runner-held claims (BR#6159);
+          authority is still server-verified on click (owner/web anchor, BR#2673)
+          and any refusal renders inline — never a silent no-op. */}
+      {!m.blocked && task.type === "task" && task.status === "in_progress" && /^dispatch-/.test(String(m.session ?? "")) && (
+        <div className="task-blocked-info" style={{ marginBottom: 6 }}>
+          <div className="row" style={{ marginTop: 0 }}>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title="Take over the live claim: you become the holder and owner in one atomic write — the runner session is stood down (its next state change is refused). For interactive steering: the agent keeps its worktree and WIP; you drive the card from here."
+              onClick={() => void takeover()}
+            >Take over claim</Btn>
+            <span className="muted-note">
+              held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
+            </span>
+            {cardErr && <span className="k-err">{cardErr}</span>}
+          </div>
+        </div>
+      )}
       {((task.meta as TaskMeta | undefined)?.superseded_by || (task.meta as TaskMeta | undefined)?.superseded_reason) && (
         <div className="progress-note" title="supersede lineage (BR#3910) — the replacement link opens the successor card">
           <b>superseded</b>
@@ -385,7 +441,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
           {ask.options.length > 0 && (
             <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 4 }}>
               {ask.options.map((o) => (
-                <Btn key={o} size="sm" variant="accept" disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
+                <Btn key={o} size="sm" variant={askOptionVariant(o)} disabled={busy} title={`answer: ${o} — the task auto-resumes`} onClick={() => void answerAsk(o)}>{o}</Btn>
               ))}
             </div>
           )}
@@ -494,7 +550,7 @@ function QuestionHoldBand({ task, onChanged }: { task: KbArtefact & { meta?: any
 /** The answering surface when the viewed task IS a question node:
  *  question rendered for reading, options as one-click buttons, free-text
  *  refinement, subject context. Common to any task — this is the detail view. */
-function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
+function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; onChanged?: () => void; onOpen?: (id: string) => void }) {
   const ask = task.meta?.ask ?? {};
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -523,12 +579,9 @@ function AskSelfCard({ task, onChanged, onOpen }: { task: KbArtefact & { meta?: 
         <span className="gw-mono ab-id">{task.id}</span>
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
-      {ask.reason && (
-        <div className="progress-note ask-reason"><b>why escalated:</b> {ask.reason}</div>
-      )}
-      <div className="progress-note md-body"><MdRef text={task.body_md || task.title} onOpen={onOpen} repo={task.meta?.provenance?.repo} /></div>
+      <AskContext body={task.body_md} ask={ask} />
       {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
+        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />
@@ -674,6 +727,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
     }
   };
 
+  if (task?.id === taskId && isLaneCard(task)) {
+    return <LaneDetail key={taskId} task={task} onClose={onClose} onOpen={onOpen} />;
+  }
+
   return (
     <>
       <div className="panel-backdrop" onClick={onClose} />
@@ -689,7 +746,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
 
         <h2 className="detail-question">
           {task && (task.meta as any)?.ask
-            ? <RefText text={askKernel(task.title)} onOpen={nav} />
+            ? <RefText text={task.title} onOpen={nav} />
             : <RefText text={task?.title ?? taskId} onOpen={nav} />}
         </h2>
 
@@ -714,6 +771,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         )}
 
         {task && <TaskStateCard task={task as any} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />}
+        {task && <StartupWaitNotice wait={task.meta?.startup_wait} />}
 
         {task && !!(task.meta as TaskMeta)?.ask && !["done", "superseded"].includes(task.status) && (
           <AskSelfCard task={{ ...(task as any), meta: (task.meta ?? {}) as any }} onChanged={() => setReloadKey((x) => x + 1)} onOpen={nav} />
@@ -765,15 +823,7 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
               // drop machine announcements: dispatch/heartbeat/relay noise the
               // board already shows — history is for humans reading what happened
               .filter((v) => !/^(runner:|opencode finished in ~|grace declared|watchdog\.)/i.test(v.summary ?? ""))
-              .map((v) => (
-                <div key={v.seq} className="progress-line">
-                  <Chip tone={HISTORY_CHIP[v.action] ?? "muted"} title={HISTORY_LABEL[v.action] ?? v.action}>
-                    {HISTORY_LABEL[v.action] ?? v.action}
-                  </Chip>
-                  <span className="progress-note md-body"><MdRef text={v.summary} onOpen={nav} repo={(task?.meta as any)?.provenance?.repo} /></span>
-                  <span className="step-ts">{v.actor} · {rel(v.ts)}</span>
-                </div>
-              ))}
+              .map((v) => <TaskHistoryLine key={v.seq} version={v} onOpen={nav} repo={task?.meta?.provenance && typeof task.meta.provenance === "object" && "repo" in task.meta.provenance ? String(task.meta.provenance.repo) : undefined} />)}
           </div>
         </div>
 
@@ -902,4 +952,3 @@ function DepGraph({ selfId, selfTitle, relations, related, onOpen }: {
     </div>
   );
 }
-

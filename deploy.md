@@ -168,7 +168,19 @@ Optional env (both modes): `MERGE_TRAIN_ENABLED=0` (kill switch for the daemon l
 allowlist; default every lane the hub reports), `MERGE_TRAIN_WORKDIR` (fixed clone;
 default managed clone cache `~/.bridge/train/<owner>/<repo>`), `MERGE_TRAIN_METHOD`
 (`merge | squash | rebase`, default `merge`), `MERGE_TRAIN_WORKER_IDENTITIES`
-(worker-class gh logins, default `detached-cody`).
+(worker-class gh logins, default `detached-cody`), `MERGE_TRAIN_STALL_TICKS`
+(consecutive land-0 ticks before the executor fires its ONE-per-episode STALL alarm
+`train.event kind:"stalled"` — default 3, clamped to ≥2 so a single transient gh blip
+never pages a human; BR#5376). A stalled batch also carries `stalled` in the walk's
+`queue_facts` stamp: the hub renders the lane `merge-train: STALLED — <batch>
+selected to merge, 0 landed in Xm (K tick(s)) — last error: <raw gh refusal> — likely
+executor breakage; restart the gateway onto the current build`, files the numberless
+per-episode alarm ask (`MERGE TRAIN STALLED: <repo>@<base> …`), and serves
+`stalled_resolution` to the trains panel (amber banner under the red blocked banner).
+A merge-method refusal ("…not allowed on this repository") never stalls anything: the
+executor falls back to an allowed method — squash first, then rebase, then merge —
+remembering the working method per repo, and lands the member via the normal
+merged-event path (BR#5376).
 
 Lane config (required workflows + typical CI minutes) lives in admin settings
 (`train_lane`, a JSON map keyed `"repo@base"`; the executor/operator refreshes it in

@@ -3,9 +3,11 @@ import { kbApi } from "../server/kb";
 import type { KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
 import { useKb } from "../server/kbStore";
-import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions, askKernel } from "./decide";
+import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
 import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
+import { isHumanDecisionAsk } from "@bridge/contracts";
+import { AskContext } from "./AskContext";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -31,12 +33,24 @@ export interface HumanAsks {
   total: number;
 }
 
+/** Only a live human-directed request can put a task in the human ask plane. */
+export function isOpenHumanAsk(t: KbArtefact): boolean {
+  return t.type === "question" && ["todo", "in_progress", "blocked"].includes(t.status)
+    && isHumanDecisionAsk(t.meta?.ask ?? {});
+}
+
+export function humanAskSubject(t: KbArtefact): string | null {
+  const ask = t.meta?.ask;
+  const bound = ask && typeof ask === "object" && "artefact_id" in ask ? ask.artefact_id : null;
+  return t.part_of ?? (typeof bound === "string" ? bound : null);
+}
+
 export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
   const tasks = useKb((s) => s.tasks);
   const nodeAsks = useMemo(
     () => (tasks as any[])
-      .filter((t) => t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status))
+      .filter(isOpenHumanAsk)
       .sort((x, y) => y.created_ts - x.created_ts),
     [tasks],
   );
@@ -70,22 +84,15 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
       put(String((latest.meta as any)?.task ?? (latest.meta as any)?.verify_target ?? ""), { kind: "verdict", latest, prior });
     }
     for (const d of generic) put(null, { kind: "decision", d });
-    // question-node asks: BR#-numbered, child_of their subject (part_of on the
-    // board payload) — surfaced by the same exactly-once rule. Self-asks
-    // (agent → itself) are coordination, not a human decision: excluded.
-    // the human band: asks NOT session-scoped to another agent. Ray-gates
-    // address bare labels (rayh, human, opencode-ray — dispatch sessions ask
-    // under the coordinator's label). Session-qualified addresses
-    // ('<agent>@<session>') are agent-to-agent coordination: not human mail.
+    // Audience comes from the shared request contract. Agent names, session
+    // syntax and presence never turn coordination into a human decision.
     const seenAsk = new Set<string>();
     for (const nodeAsk of nodeAsks) {
-      const am = (nodeAsk.meta ?? {}).ask ?? {};
-      if (String(am.to ?? "").includes("@")) continue;
       // identical re-asked asks collapse to the newest
-      const key = `${nodeAsk.part_of ?? ""}:${nodeAsk.title}`;
+      const key = `${humanAskSubject(nodeAsk) ?? ""}:${nodeAsk.title}`;
       if (seenAsk.has(key)) continue;
       seenAsk.add(key);
-      put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
+      put(humanAskSubject(nodeAsk), { kind: "nodeAsk", nodeAsk });
     }
 
     // within a target: verdict → decision → ask; newest first within a rank
@@ -99,31 +106,33 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
 const rankOf = (e: AskEntry) => (e.kind === "nodeAsk" ? 2 : e.kind === "decision" ? 1 : 0);
 const ts = (e: AskEntry) => (e.latest ?? e.d ?? e.nodeAsk)?.created_ts ?? 0;
 
-function BandVerdictRow({ latest, prior, onDone, openDecision, nested, pending, onPending }: {
+function BandVerdictRow({ latest, prior, onDone, openDecision, nested, pending, onPending, answered }: {
   latest: KbArtefact; prior: KbArtefact[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
-  pending?: boolean; onPending?: (on: boolean) => void;
+  pending?: boolean; onPending?: (on: boolean) => void; answered?: boolean;
 }) {
   const [showPrior, setShowPrior] = useState(false);
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(latest, onDone);
   const f = decisionFrame(latest);
   const isBounce = f.verdict === "bounce";
+  const dead = busy || !!answered;
   const go = (v: "accepted" | "rejected") => {
     onPending?.(true);
     act(v).catch(() => {}).finally(() => onPending?.(false));
   };
   return (
     <>
-      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""} ${answered ? "ask-answered" : ""}`}>
         <div className="ab-head">
           <Chip tone="urgent">VERDICT</Chip>
+          {answered && <Chip tone="done">ANSWERED</Chip>}
           {/* the verdict's own id — which BR# you are acting on (BR#3462 leg 2) */}
           <span className="gw-mono ab-id">{latest.id}</span>
           <span className="why-line">{f.target ?? "task"} · {rel(latest.created_ts)}</span>
           <span className="ab-actions">
             {pending && <span className="ask-spinner" title="sending…" />}
-            <Btn size="sm" variant="accept" disabled={busy} onClick={() => go("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
-            <Btn size="sm" variant="reject" disabled={busy} onClick={() => go("rejected")}>Reject</Btn>
+            <Btn size="sm" variant="accept" disabled={dead} onClick={() => go("accepted")}>{isBounce ? "Bounce it" : "Accept"}</Btn>
+            <Btn size="sm" variant="reject" disabled={dead} onClick={() => go("rejected")}>Reject</Btn>
             <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(latest.id) : setOpen(true))}>Details</Btn>
             {err && <span className="k-err">{err}</span>}
           </span>
@@ -145,27 +154,28 @@ function BandVerdictRow({ latest, prior, onDone, openDecision, nested, pending, 
   );
 }
 
-function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending }: {
+function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending, answered }: {
   d: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
-  pending?: boolean; onPending?: (on: boolean) => void;
+  pending?: boolean; onPending?: (on: boolean) => void; answered?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const { busy, err, act } = useDecisionAct(d, onDone);
   const f = decisionFrame(d);
+  const dead = busy || !!answered;
   const go = (v: "accepted" | "rejected") => {
     onPending?.(true);
     act(v).catch(() => {}).finally(() => onPending?.(false));
   };
   return (
     <>
-      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
-        <span className="ab-kind"><Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip></span>
+      <div className={`ask-band-row ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""} ${answered ? "ask-answered" : ""}`}>
+        <span className="ab-kind"><Chip tone="urgent">{f.kind === "verify" ? "VERDICT" : "DECISION"}</Chip>{answered && <Chip tone="done">ANSWERED</Chip>}</span>
         <span className="ab-main"><span className="ab-title" title={d.title}>{d.title}</span></span>
         <span className="ab-meta"><span className="gw-mono ab-id">{d.id}</span> · {rel(d.created_ts)}</span>
         <span className="ab-actions">
           {pending && <span className="ask-spinner" title="sending…" />}
-          <Btn size="sm" variant="accept" disabled={busy} onClick={() => go("accepted")}>Accept</Btn>
-          <Btn size="sm" variant="reject" disabled={busy} onClick={() => go("rejected")}>Reject</Btn>
+          <Btn size="sm" variant="accept" disabled={dead} onClick={() => go("accepted")}>Accept</Btn>
+          <Btn size="sm" variant="reject" disabled={dead} onClick={() => go("rejected")}>Reject</Btn>
           <Btn size="sm" quiet onClick={() => (openDecision ? openDecision(d.id) : setOpen(true))}>Details</Btn>
           {err && <span className="k-err">{err}</span>}
         </span>
@@ -175,13 +185,14 @@ function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending }
   );
 }
 
-function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPending }: {
+export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPending, answered }: {
   nodeAsk: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
-  pending?: boolean; onPending?: (on: boolean) => void;
+  pending?: boolean; onPending?: (on: boolean) => void; answered?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [custom, setCustom] = useState("");
+  const [error, setError] = useState("");
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
 
@@ -191,14 +202,22 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
   // no typing); the last row is "type your own" — a free-text answer recorded
   // with the ask exactly like a click (BR#3912: "RE-SCOPE — I'll rewrite the
   // card myself" must not be click-only, the rewrite starts in the answer)
+  // BR#6390: on SUCCESS the row stays grayed (pending) until the refreshed
+  // board drops it — clearing pending early re-slotted the row under the
+  // pointer (the jump-back defect). A 20s failsafe un-grays if the ask
+  // somehow survives the answer.
   const answer = async (a: string) => {
+    if (answered || busy || !a.trim()) return;
+    setError("");
     onPending?.(true);
     setBusy(true);
     try {
       await kbApi.askAnswer(nodeAsk.id, a.trim());
       await useKb.getState().refresh();
       onDone();
+      window.setTimeout(() => onPending?.(false), 20_000);
     } catch (e) {
+      setError((e as Error).message || "answer failed");
       useKb.getState().reportError("answer ask", e);
       onPending?.(false);
     } finally {
@@ -206,17 +225,19 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
     }
   };
   return (
-    <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""}`}>
-      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
-        {ask.escalated && <Chip tone="urgent" title={ask.escalated.reason}>ESCALATED — addressee offline</Chip>}</span>
-      <span className="ab-main">
-        <span className="ab-title" title={nodeAsk.title}>{askKernel(nodeAsk.title)}</span>
-        {m.ask?.reason && <span className="ab-reason" title={m.ask.reason}>why escalated: {m.ask.reason.length > 120 ? `${m.ask.reason.slice(0, 120)}…` : m.ask.reason}</span>}
+    <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""} ${answered ? "ask-answered" : ""}`}>
+      <div className="ab-question-head">
+        <span className="ab-kind"><Chip tone="needs">awaiting you</Chip>{answered && <Chip tone="done">ANSWERED</Chip>}{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
+        <span className="ab-title">{nodeAsk.title}</span>
+        <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} · {rel(nodeAsk.created_ts)}</span>
+      </div>
+      <div className="ab-question-content">
+        <AskContext body={nodeAsk.body_md} ask={ask} />
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
           {/* BR#3942 — addressee presence: a stalled card shows WHO the ask is
               waiting on and whether that identity is even alive */}
-          {nodeAsk.ask_target && !nodeAsk.ask_target.online && (
+          {!isHumanDecisionAsk(ask) && nodeAsk.ask_target && !nodeAsk.ask_target.online && (
             <span className="ab-offline" title={`addressee presence (10-min window, source: ${nodeAsk.ask_target.source})`}>
               {" · "}offline{nodeAsk.ask_target.last_seen_ts ? ` · last seen ${rel(nodeAsk.ask_target.last_seen_ts)}` : " · never seen"}
             </span>
@@ -225,7 +246,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
           {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}
         </span>
         {(ask.options ?? []).length > 0 && (
-          <AskOptions options={ask.options as string[]} busy={busy} onPick={(o) => void answer(o)} />
+          <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} onPick={(o) => void answer(o)} />
         )}
         {customOpen ? (
           <div className="ask-opt-row">
@@ -233,29 +254,30 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
               autoFocus
               value={custom}
               placeholder="or answer in your own words…"
+              disabled={answered}
               onChange={(e) => setCustom(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && custom.trim() && !busy) void answer(custom); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && custom.trim() && !busy && !answered) void answer(custom); }}
             />
-            <Btn size="sm" variant="accept" disabled={busy || !custom.trim()} onClick={() => void answer(custom)}>Answer</Btn>
+            <Btn size="sm" variant="accept" disabled={busy || answered || !custom.trim()} onClick={() => void answer(custom)}>Answer</Btn>
           </div>
         ) : (
-          <div className={`ask-opt-row ${busy ? "disabled" : ""}`}
+          <div className={`ask-opt-row ${busy || answered ? "disabled" : ""}`}
             title="answer in your own words — recorded with the ask, same as a click"
-            onClick={() => !busy && setCustomOpen(true)}>
-            <Btn size="sm" disabled={busy}>✎</Btn>
+            onClick={() => !busy && !answered && setCustomOpen(true)}>
+            <Btn size="sm" disabled={busy || answered}>✎</Btn>
             <span className="ask-opt-text">type your own answer…</span>
           </div>
         )}
-      </span>
-      <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
+      </div>
       <span className="ab-actions">
+        {error && <span className="k-err" role="alert">{error}</span>}
         {ask.reframe
           ? <span className="muted-note">reframed — awaiting re-ask</span>
-          : <Btn size="sm" variant="reject" disabled={busy} title="kick back to the asker: restructure per the ask contract (add feedback in the detail view)"
+          : <Btn size="sm" variant="reject" disabled={busy || answered} title="kick back to the asker: restructure per the ask contract (add feedback in the detail view)"
               onClick={() => { setBusy(true); kbApi.askReframe(nodeAsk.id).catch((e) => useKb.getState().reportError("reframe ask", e)).finally(() => { setBusy(false); void useKb.getState().refresh(); }); }}>Reframe</Btn>}
         <ClaimLocallyBtn task={nodeAsk} ask={{ reason: m.ask?.reason, options: ask.options as string[] | undefined, to: m.ask?.to, from: m.ask?.from }} />
-        <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
-          onClick={() => openDecision?.(nodeAsk.id)}>Details</Btn>
+        {openDecision && <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
+          onClick={() => openDecision(nodeAsk.id)}>Details</Btn>}
       </span>
     </div>
   );
@@ -267,11 +289,19 @@ const entryId = (e: AskEntry): string =>
 export function AskEntries({ entries, onDone, openDecision, nested }: {
   entries: AskEntry[]; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
 }) {
-  // Optimistic answering (Ray, 2026-10-24): the click INSTANTLY moves the row
-  // to the bottom of the list, grays it out with a spinner, and it stays that
-  // way until the server confirms (refresh drops it) or the call fails (the
-  // row returns to place with the error shown). Never a silent no-op.
+  // BR#6390 (Ray 2026-11-05: "when clicking a response, the cards jump
+  // around and sometimes jump back under my pointer"): NO re-sort on click —
+  // the answered row stays in its EXACT slot, grayed with a spinner
+  // (ask-pending), until the refreshed board drops it; on failure it
+  // un-grays in place with the error shown. The old pending-sort moved the
+  // row to the bottom (every card below shifted up) and then re-slotted it
+  // back when pending cleared before the refetch — both jumps are gone.
   const [pending, setPending] = useState<Set<string>>(new Set());
+  // BR#6390 no-jump: a row the human answered STAYS in its exact slot — grayed
+  // (ask-answered + ANSWERED chip + dead actions) — until the refreshed board
+  // drops it (the prune below removes the id only once the entry is gone).
+  // No click-time re-sort; the row never jumps back under the pointer.
+  const [answered, setAnswered] = useState<Set<string>>(new Set());
   const markPending = (id: string, on: boolean) =>
     setPending((prev) => {
       if (on === prev.has(id)) return prev;
@@ -279,21 +309,33 @@ export function AskEntries({ entries, onDone, openDecision, nested }: {
       if (on) next.add(id); else next.delete(id);
       return next;
     });
-  const ordered = useMemo(
-    () => [...entries].sort((a, b) => Number(pending.has(entryId(a))) - Number(pending.has(entryId(b)))),
-    [entries, pending],
-  );
+  const markAnswered = (id: string) =>
+    setAnswered((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  useEffect(() => {
+    const live = new Set(entries.map(entryId));
+    setAnswered((prev) => {
+      const next = new Set([...prev].filter((id) => live.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [entries]);
   const rowProps = (e: AskEntry) => ({
     pending: pending.has(entryId(e)),
     onPending: (on: boolean) => markPending(entryId(e), on),
+    answered: answered.has(entryId(e)),
+    onDone: () => { markAnswered(entryId(e)); onDone(); },
   });
   return (
     <>
-      {ordered.map((e) => e.kind === "verdict"
-        ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />
+      {entries.map((e) => e.kind === "verdict"
+        ? <BandVerdictRow key={e.latest!.id} latest={e.latest!} prior={e.prior ?? []} openDecision={openDecision} nested={nested} {...rowProps(e)} />
         : e.kind === "decision"
-        ? <BandDecisionRow key={e.d!.id} d={e.d!} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />
-        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} onDone={onDone} openDecision={openDecision} nested={nested} {...rowProps(e)} />)}
+        ? <BandDecisionRow key={e.d!.id} d={e.d!} openDecision={openDecision} nested={nested} {...rowProps(e)} />
+        : <BandNodeAskRow key={e.nodeAsk!.id} nodeAsk={e.nodeAsk!} openDecision={openDecision} nested={nested} {...rowProps(e)} />)}
     </>
   );
 }

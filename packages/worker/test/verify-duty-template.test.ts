@@ -27,6 +27,23 @@ describe("verifyDutyBody — the merge-train park carries its typed leg (BR#4425
     expect(body).toContain("carry the conjunction as plain prose in unblock_condition");
   });
 
+  // BR#6343 residual (answered ask BR#6354): the parser dedupes duplicate
+  // PR citations (BR#6349), but the ACCEPT step must still TEACH the
+  // convention — one citation per PR, head adjacent, /commit/<sha> receipts
+  // — so a hand-written note cannot re-arm the livelock on a pre-dedupe hub.
+  it("teaches the close-note citation convention (BR#6343): one citation per PR, /commit/<sha> receipts, never a /pull/N/commits deep-link", () => {
+    const body = verifyDutyBody(
+      "BR#1",
+      "some impl",
+      "https://github.com/state-vector/bridge/pull/287",
+      { repo: "state-vector/bridge", n: 287 },
+    );
+    expect(body).toContain("Cite each PR exactly ONCE");
+    expect(body).toContain("never /pull/N/commits/");
+    expect(body).toContain("BR#6343");
+    expect(body).not.toContain("undefined");
+  });
+
   it("falls back to the generic form when the stamp is unresolvable (repo-less dispatch)", () => {
     const body = verifyDutyBody("BR#1", "some impl", "see note");
     expect(body).toContain('{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}');

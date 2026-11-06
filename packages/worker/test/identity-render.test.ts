@@ -173,13 +173,30 @@ describe("principal vend shape (real DO)", () => {
 });
 
 describe("render-time join (real DO)", () => {
+  it("never attributes unclaimed work to a revoked token with an empty principal", async () => {
+    // Legacy provisioning accepted an empty string principal. Revocation keeps
+    // that row for audit; an empty owner must not join to it as an identity.
+    const retired = await kbJson("/agent.provision", { provisioned_by: "guard-gw", label: "mac-modem", principal: "" });
+    expect(retired.body.id).toBeTruthy();
+    expect((await kbJson("/admin.revoke", { id: retired.body.id })).body.revoked).toBe(true);
+    const task = await kbJson("/create", { type: "task", title: "Unclaimed work is not mac-modem", actor: "test" });
+    expect(task.body.id).toBeTruthy();
+
+    const got = await kbJson("/get", { id: task.body.id });
+    expect(got.body.owner).toBe("");
+    const board = await boardJson();
+    expect(board.tasks.find((row: any) => row.id === task.body.id).owner).toBe("");
+    const orient = await kbJson("/orient", { label: "test", tags: [] });
+    expect(orient.body.open_artefacts.find((row: any) => row.id === task.body.id).owner).toBe("");
+  });
+
   it("board + get render the LABEL for a principal-owned row; legacy/system rows render verbatim", async () => {
     // hand-set (legacy-shape) principal on a real row: the join is shape-agnostic
     const dev = await kbJson("/admin.mint", { label: "render-host", tags: [], principal: "p_render_test_00000000000000000" });
     expect(dev.body.id).toBeTruthy();
     const t = await kbJson("/create", { type: "task", title: "render join — principal row", actor: "test" });
     expect(t.body.error).toBeUndefined();
-    const claim = await kbJson("/transition", { id: t.body.id, to: "in_progress", actor: "render-host", token_id: dev.body.id });
+    const claim = await kbJson("/transition", { id: t.body.id, to: "in_progress", actor: "render-host", token_id: dev.body.id, session: "render-principal-claim" });
     expect(claim.body.error).toBeUndefined();
 
     // owner AT REST is the principal — matching reads prove it (orient by principal)

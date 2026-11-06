@@ -8,6 +8,27 @@
  */
 
 import type { AwaitEvent } from "./closure";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask, checkObligationKey } from "@bridge/contracts";
+import type {
+  BaseRedPhase,
+  BaseRedResolution,
+  DeployCoveragePhase,
+  DeployCoverageState,
+  DeployObservation,
+  LaneOperationalState,
+  TrainEntryClass,
+  TrainFixCard,
+} from "@bridge/contracts";
+
+export type {
+  BaseRedPhase,
+  BaseRedResolution,
+  DeployCoveragePhase,
+  DeployCoverageState,
+  LaneOperationalState,
+  TrainEntryClass,
+  TrainFixCard,
+};
 
 export const ARTEFACT_TYPES = [
   "steering",
@@ -22,6 +43,19 @@ export type ArtefactType = (typeof ARTEFACT_TYPES)[number];
 
 export function isArtefactType(t: unknown): t is ArtefactType {
   return typeof t === "string" && (ARTEFACT_TYPES as readonly string[]).includes(t);
+}
+
+/** Standing merge-lane card (BR#5151): a meta.lane card or anything tagged
+ *  "infrastructure" IS a live subsystem. Reconcile never closes one, verify
+ *  duties never parent onto one, and the settle path (train:merged) is the
+ *  only writer that may touch it. Pure — callers parse tags defensively via
+ *  parseTags before handing them here. */
+export function isStandingCard(meta: unknown, tags: unknown): boolean {
+  const m = (meta ?? {}) as Record<string, unknown>;
+  if (m.lane) return true;
+  if (m.pr || (Array.isArray(m.prs) && m.prs.length > 0) || m.merge_train) return false;
+  const t = Array.isArray(tags) ? tags.map(String) : [];
+  return t.includes("infrastructure");
 }
 
 /** Task kinds — one task type, distinguished by TYPE + ROLES (phase-3
@@ -322,6 +356,47 @@ export function tagsSayGateway(tags: unknown): boolean {
 }
 
 /**
+ * The reap decision for one auth_tokens row — roster hygiene (BR#4684,
+ * train-defence L0.5). Pure and fixture-testable like graceActive: the
+ * alarm sweep pre-filters candidates in SQL and re-judges each row here.
+ *   - "never_seen": provisioned past the cutoff with zero authentications —
+ *     registration debris of any class (pairing churn minted
+ *     `<hostname>/<variant>` labels nobody ever authenticated as);
+ *   - "gateway_stale": gateway-class infrastructure with no auth signal
+ *     past the cutoff — the roster's dead-machine half;
+ *   - "keep": everything else — once-seen agent identities keep their board
+ *     history regardless of silence, fresh rows are not yet the sweep's
+ *     business, and `_`-prefixed system namespaces are plumbing, not roster.
+ * A row of unknown provenance (never seen, no created_ts) keeps — the reap
+ * archives, it never guesses.
+ */
+export function rosterReapVerdict(
+  row: { label: unknown; tags: unknown; created_ts?: number | null; last_seen_ts?: number | null },
+  cutoff: number,
+): "never_seen" | "gateway_stale" | "keep" {
+  if (String(row.label ?? "").startsWith("_")) return "keep";
+  const seen = Number(row.last_seen_ts ?? 0);
+  const created = Number(row.created_ts ?? 0);
+  if (seen) return seen < cutoff && tagsSayGateway(row.tags) ? "gateway_stale" : "keep";
+  return created > 0 && created < cutoff ? "never_seen" : "keep";
+}
+
+/**
+ * The roster reap's pacing decision (BR#4684): `roster_reap_hours` gates the
+ * sweep leg off the 60s alarm tick — 0 explicitly disables, garbage falls
+ * back to the 6h default (an explicit 0 must never fold into the fallback:
+ * `parseInt(x) || 6` would), the window clamps to a week. Pure like the
+ * verdict so the disable knob is fixture-locked.
+ */
+export function rosterReapPace(hoursRaw: unknown, lastTs: unknown, now: number): "disabled" | "skip" | "run" {
+  const n = parseInt(String(hoursRaw ?? "").trim(), 10);
+  const hours = Math.max(0, Math.min(168, Number.isFinite(n) ? n : 6));
+  if (hours === 0) return "disabled";
+  if (now - (Number(lastTs) || 0) < hours * 3_600_000) return "skip";
+  return "run";
+}
+
+/**
  * Deterministic gateway label for a self-provisioned desktop (credential-class
  * ADR, desktop gateway leg): <host-slug>, derived from the hostname per the
  * BR#899 identity convention — NO class prefix: gateway-ness is a TAG on the
@@ -383,7 +458,7 @@ export function isValidAskTarget(to: string): boolean {
   if (!to || to.length > 120) return false;
   if (to === "any") return true;
   if (to.startsWith("tag:")) return /^[a-z0-9:_-]{1,100}$/.test(to.slice(4));
-  return /^[a-zA-Z0-9._@-]{1,100}$/.test(to);
+  return /^[a-zA-Z0-9._-]+(?:\/[a-zA-Z0-9._-]+)*(?:@[a-zA-Z0-9._-]+)?$/.test(to);
 }
 
 export const ASK_OPEN = "open";
@@ -423,16 +498,22 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `5b. SEPARATION OF DUTIES: analysis, impl, and review happen in different sessions — every agent can do all three, never in one session. A session that completed the analysis on a task cannot claim it for impl (the gate also auto-releases the parent if you try); a session that implemented cannot produce the review. Verification is a double-check by a fresh session: check the actual state (PR, findings) and cite receipts in the note — a review without receipts is rejected. If a gate rejects you, end the session and start a new one.`,
     `5c. VERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident). Verification agents: BEFORE any substance check, confirm the PR is mechanically mergeable — gh pr view --json mergeable,mergeStateStatus,reviewDecision AND every commit signature isValid=true. mergeable=false / CONFLICTING / any unsigned or NO_USER commit → STOP: zero substance checks, and bounce the parent to in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push"). Never file a human ask for a mechanical defect, never report "verified, awaiting merge" for an unmergeable PR (false report — it has zero verified legs), and never treat "accept the unsigned commit" as an option (the ruleset forbids it by construction). The ONLY escalation to a human: a broken signing environment (key unavailable / NO_USER) — one ask describing the environment covers the whole class, never one per PR.`,
     `5d. ONE EXECUTOR PER TASK: every in_progress task is owned by exactly one session (orient exposes executor_session on open cards — check it before you touch a card). If your claim transition loses the claim race (rejected: another session holds in_progress), you are NOT the executor — do not execute the work anyway, do not contribute state changes "in parallel", stand down and end your run. Concurrent executor sessions doing the same legs are how duplicate PRs and double closes happen (the BR#3348 class); the hub audits a state-changing op by a non-holder while the holder is alive (duplicate_executor), and repeated audited breaches are scored as divergent work.`,
+    `5e. INTERACTIVE CLAIM TAKEOVER (BR#6135): the card's owner agent, a human via the web, or an authenticated FULL-AGENT credential (BR#6436: your token's LIVE tags say full agent — gateway and cron credentials are excluded, and the class is never body-declared) may claim_takeover (or transition {to:"in_progress", takeover:true}) an in_progress task whose claim a dispatched runner holds — across owners, no ownership anchor required for a full-agent token: ONE atomic write flips the holder session to the taker, no pool pass, no race window. Authority is server-verified from your token (owner label/principal, the web plane, or full-agent credential tags) — never declared. Refused on verify/unblock duty cards (separation of duties is not transferable) and on cards holding a typed wait (train slot / await_event / bound ask). If your session WAS taken over: your next state change is gate-rejected with a stand-down order — checkpoint last_will via log_progress (still open to you: worktree, branch, done/next), push nothing, end your run; your WIP survives in your registered worktree. INTERACTIVE PAUSE LAW (the BR#6068 lesson): a session about to wait on the human must BIND AN ASK to the task (ask_agent, artefact_id) — an open ask pauses the watchdog; a bare silent pause is fair abandonment and the claim is fairly lost to the pool.`,
     `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
     `6c. ASK QUALITY BAR — an ask must be answerable on plain reading. (a) If you recommend an option, put it FIRST in options and prefix it "(Recommended)" — the first button IS the recommendation. (b) Human-directed asks REQUIRE details: a self-contained brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected by the hub. (c) Split the fields: question ≤240 chars, details carries the full story, reason is the one-line WHY escalated. Never cram the narrative into reason or reference cards the reader hasn't read.`,
+    `6d. REQUEST ROUTING: use route {kind:"executor_coordination",task_id:"BR#N"} to ask the current executor of work — the recipient follows claim changes. Use route {kind:"independent_review",task_id:"BR#N"} for review: Bridge schedules/reuses a fresh review agent, no human staffing question. Agent delivery failures return to the agent pool, never become human decisions merely because a recipient is offline. Human decisions use route {kind:"human_decision"}, to:"human", only for a specific choice/authority Bridge lacks. Write the complete question in plain English: explain the user-visible issue before task/commit evidence; each option names who acts and what happens. Answer coordination via answer_ask (even "No overlap"), never log_progress: progress is commentary, not an answer.`,
+    `6e. EXPLICIT EFFECTS: human_decision requests require decision {kind:authority|information|preference,task_id,context,why_human,choices:[{label,executor:bridge|human,consequence,action:resume|hold|release}]}. Diagnostics are machine recovery work, not a human choice. Operational/post-deploy tasks declare meta.completion {kind:"execution",outcome}; prerequisite delivery only resumes them. Record actual execution_result {outcome,receipts}, submit to independent outcome review, and accept with review_result {kind:"accepted_execution",task_id,receipts}. Never mark prerequisite arrival as completed execution.`,
+    `6f. RECOVERY EXECUTION: a task's meta.recovery_links identifies its cause-specific recovery journals. Use train_recovery_event with that repo/base/head_sha/cause, a unique event_id, and event {kind:"diagnosed",task_id,diagnosis,next}, then {kind:"attempt_started",task_id,attempt_id,attempt_kind:"repair"|"retry"|"verification",action,next} before the action and {kind:"attempt_finished",task_id,attempt_id,outcome:"failed"|"delivered"|"inconclusive",summary,receipts,next} after the real result. A denied/replayed retry is not authorization to execute again. Report structured did/next via log_progress; a heartbeat or stdout fragment is not a repair result. Code delivery only starts verification; never claim live recovery without the matched deployment evidence and acceptance bar.`,
     `7. Findings belong in Knowledge, not session memory. Open questions become question tasks; conclusions become decisions.`,
     `7b. DOCS RIDE WITH THE CHANGE: if your work alters user-visible behaviour (UI, config, protocol, gates), update README.md and packages/site/content.md in the same branch — the docs are the interface, stale docs are a defect.`,
     `8. Accepted decisions are settled. Steering constrains you. Supersede, never contradict.`,
+    `8b. HUMAN-DIRECTED INTERACTIVE CLAIMS (BR#6788): a live full-agent credential and named session may claim todo, capability-blocked or fully prepared local-pickup work directly via transition {to:"in_progress",session,note}; no second human-web grant is needed. Credential class is server-verified; gateway/cron/provisioned workers cannot impersonate it. Original writers must be quiescent, preparation complete and unknown effects reconciled; human decisions, qualification and review separation still apply. Owner progress refreshes heartbeat/gauges even after an old runner quiesced. To release, stop writers, preserve/publish work and transition to todo with a done/next/location note; capability requirements remain for automation.`,
+    `8c. RECOVERY CAPACITY (BR#6835): concrete repair/root-fix work outranks routine verification. A scheduler recovery-preemption interrupt means safely checkpoint, stop, confirm quiescence and yield; it is a temporary pause, NOT a review finding or acceptance. The managed verifier returns to todo with preserved work and resumes after priority dispatch. Never overbook, fabricate stopped-writer proof or fight the slot handoff by re-claiming the verifier before recovery. Interactive/human holds and unknown external effects remain protected.`,
     `9. Real progress or let go: if you cannot advance a claimed task this run, transition it → todo (retry) — that releases the claim so any matching agent can pick it up fresh. Squatting on untouched work starves the pool.`,
-    `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited.`,
+    `Runner-claimed cards: you cannot release to the pool — the runner identity holds the claim (releases are owner/web/human-only). Your rule-9 exits are done-with-findings, blocked with an unblock condition, or staying paused on a bound ask — a todo release will be rejected and audited. The owner may instead claim_takeover the card (rule 5e) — if that happens your next transition is refused with a stand-down order: checkpoint and exit.`,
     `DELEGATION: if you spawn subagents, copy the PROTOCOL CARD below verbatim to the top of each subagent's prompt.`,
-`PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes, or subprocess-block with a budget (never on verify/unblock duties: they cannot block — grace_minutes only, and "cannot proceed" is itself the verdict: render it and close done). 5. UNCERTAIN: ask_agent first — recommended option first ("(Recommended)" prefix), details self-contained (rule 6c). 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them. 9. RETRY LAW: only a 5xx / infra_storage_fault is retryable (same transition, backoff, heartbeat). A SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child") is TERMINAL — never retry it; read what it names, resolve the named precondition or take a lifecycle-legal edge. Every retry of a gate-rejected transition is an audited breach event.`,
+`PROTOCOL CARD: 1. START: orient (session: "<unique-name>"). 2. CLAIM: transition {id, to: "in_progress", session} before coding. 3. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. 4. LONG OP: declare silence — grace_minutes, or subprocess-block with a budget (never on verify/unblock duties: they cannot block — grace_minutes only, and "cannot proceed" is itself the verdict: render it and close done). 5. UNCERTAIN: ask_agent first — recommended option first ("(Recommended)" prefix), details self-contained (rule 6c). Verdict duties ask the authority, not the identity — if the authority may be human, ask "human" at file time (BR#3942). 6. FINISH: PR, then transition {to: "in_review", note: "PR <link>"} — a Verify task auto-spawns into the pool; a fresh-session verifier closes or bounces. Verification is a double-check with receipts — mergeability first (2026-10-23 rule). 7. LOST CLAIM = STAND DOWN: if your in_progress transition loses the race, another session is the executor — you are not; end your run, never execute a task you don't own. 8. DECISIONS: a proposed decision collects agent feedback via its auto-spawned consensus round (orient: decisions_awaiting_consensus) — read it and contribute agree/disagree with reasons via log_progress on the round before the human decides. Contribution is expected, not exceptional; the round informs the human, it does not gate them. 9. RETRY LAW: only a 5xx / infra_storage_fault is retryable (same transition, backoff, heartbeat). A SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child") is TERMINAL — never retry it; read what it names, resolve the named precondition or take a lifecycle-legal edge. Every retry of a gate-rejected transition is an audited breach event.`,
     `Scoring: orient returns my_score — it measures heartbeats, gauge completeness, answered asks, zero abandonments. Raise it by following rules 1–8.`,
   ];
   if (board.mode === "external") {
@@ -590,29 +671,68 @@ export function checkLimits(title: string, body: string, meta?: unknown): string
 
 // ---------- verify-verdict decision statement ----------
 
-/** Human-facing ask for verify-verdict decisions, prepended to body_md at
- *  creation (do.ts). Verifiers file receipts-dense cards whose title/body
- *  never say what the human is deciding or why it lands on them — BR#2453
- *  taught us that. The statement mirrors the accept-side effect EXACTLY
- *  (do.ts transition: accept + verdict=bounce → target in_progress, else
- *  target done) so the card never overpromises. Pure: meta in, markdown out. */
+/** BR#5377 F3 — the canonical human-readable verify-verdict title, minted by
+ *  the hub from meta at create (do.ts). Verifier-authored titles are
+ *  internals-dense (BOUNCE_NARROW classes, head SHAs, mergeCommit prose) and
+ *  render as the card title on EVERY surface; the canonical form is plain
+ *  language and says what the verdict does: "Verify verdict — ACCEPT — PR
+ *  owner/repo#N → card BR#X". The authored title rides at the top of the
+ *  body instead (nothing is lost). Tolerant: meta.pr arrives as a number, a
+ *  /pull/ URL, or {repo, number}; meta.repo + numeric meta.pr also resolves.
+ *  Returns null when neither a PR nor a target resolves — the authored title
+ *  stands (a title that says nothing is worse than the jargon). Pure. */
+export function canonicalVerdictTitle(meta: unknown): string | null {
+  const m = (meta ?? {}) as Record<string, unknown>;
+  const target = String(m.task ?? m.verify_target ?? "").trim();
+  const rawVerdict = String(m.verdict ?? "").trim();
+  if (!rawVerdict && !target) return null;
+  // Same strict test the accept-side hook (do.ts) uses to route the effect —
+  // the title describes what WILL happen to the target, never the jargon.
+  const head = rawVerdict.toLowerCase() === "bounce" ? "BOUNCE" : "ACCEPT";
+  let pr = "";
+  const prv = m.pr;
+  const repo = typeof m.repo === "string" ? m.repo.trim() : "";
+  if (typeof prv === "number" && Number.isInteger(prv) && prv > 0) {
+    pr = repo ? `${repo}#${prv}` : `#${prv}`;
+  } else if (typeof prv === "string" && prv.trim()) {
+    const u = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/.exec(prv.trim());
+    if (u) pr = `${u[1]}/${u[2]}#${u[3]}`;
+    else if (/^\d+$/.test(prv.trim())) pr = repo ? `${repo}#${prv.trim()}` : `#${prv.trim()}`;
+  } else if (prv && typeof prv === "object") {
+    const o = prv as { repo?: unknown; number?: unknown };
+    if (typeof o.repo === "string" && o.repo.trim() && Number(o.number) > 0) pr = `${o.repo.trim()}#${Number(o.number)}`;
+  }
+  let title = `Verify verdict — ${head}`;
+  if (pr) title += ` — PR ${pr}`;
+  else if (target) title += ` — ${target}`;
+  else return null;
+  if (pr && target) title += ` → ${target}`;
+  return title;
+}
+
+/** Human-facing banner for verify-verdict decisions, prepended to body_md at
+ *  creation (do.ts). Verifiers file receipts-dense cards whose body never
+ *  says what the verdict does or who applied it — BR#2453 taught us that.
+ *  BR#5377 F4: verdicts are MACHINE verdicts now — they accept on filing
+ *  (actor system:verifier) and the accept-side hook applies them to their
+ *  target; the human is not a per-merge GO/NO-GO gate. The statement states
+ *  machine-application reality (and the one remaining human leg: supersede).
+ *  Pure: meta in, markdown out. */
 export function verifyVerdictStatement(meta: unknown): string {
   const m = (meta ?? {}) as Record<string, unknown>;
   const target = String(m.task ?? m.verify_target ?? "").trim() || "the task";
+  // Same strict test the accept-side hook (do.ts) uses to route the effect.
   const isBounce = String(m.verdict ?? "").toLowerCase() === "bounce";
   const session = String(m.session ?? "").trim();
-  const roundRaw = m.round ?? m.verify_round;
-  const round = roundRaw == null || roundRaw === "" ? null : Number(roundRaw);
   const effect = isBounce
-    ? `bounces **${target}** back to \`in_progress\` with the findings`
-    : `closes **${target}** as **done**`;
-  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}${round ? ` (round ${round})` : ""}`;
+    ? `bounced **${target}** back to \`in_progress\` with the findings`
+    : `accepted **${target}** — impl work queues on the merge train (the train owns delivery); verify duties close done`;
+  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}`;
   return [
-    `> ⚖️ **What you are deciding** — *auto-added, not part of the verifier's receipts*`,
+    `> ⚖️ **Verify verdict — machine-applied** — *auto-added, not part of the verifier's receipts*`,
     `>`,
-    `> You are the acceptance gate: agents propose, only a human accepts. Your click settles the verdict.`,
-    `> - **Accept** = ratify it — the verdict ${effect}.`,
-    `> - **Supersede** = the verdict doesn't hold; record why.`,
+    `> This is a machine verdict (BR#5377): it accepted on filing (actor \`system:verifier\`) — no human GO/NO-GO step. The verdict ${effect}.`,
+    `> - Doesn't hold? **Supersede** it (decisions panel) — superseding records why; the target re-enters the normal flow.`,
     `> You are NOT being asked to re-verify — ${checked}.`,
   ].join("\n");
 }
@@ -784,6 +904,10 @@ export interface AgentSignals {
   artefacts_created: number;
   /** role:review agents only: unclaimed verify tasks blocking a parent's owner */
   verify_duty_backlog: number;
+  /** BR#5517: stop-the-line episodes blamed on this agent's cards — the impl
+   *  and verify sessions that executed the culprit card each eat one
+   *  train_red incident per episode (dedupe by stop sha, capped in scoreAgent). */
+  train_red: number;
 }
 
 export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
@@ -822,6 +946,14 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
     score -= Math.min(20, s.verify_duty_backlog * 10);
     hints.push(`${s.verify_duty_backlog} stalled verify task(s) are unclaimed and blocking their parent's owner — pick one up: check receipts, close or bounce the parent`);
   }
+  // BR#5517 train-red blame: a stop-the-line episode whose culprit card this
+  // agent's sessions executed (impl or verify leg) costs each of those
+  // sessions a penalty — the signal is computed hub-side with the receipts
+  // already on the card, capped so one bad night cannot zero an agent.
+  if (s.train_red > 0) {
+    score -= Math.min(15, s.train_red * 5);
+    hints.push(`${s.train_red} stop-the-line episode(s) were blamed on a card your sessions executed (impl/verify) — a train_red ding: fix the culprit card and the train_red signal stays until the episode is exonerated`);
+  }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
   const grade = score >= 80 ? "excellent" : score >= 60 ? "good" : score >= 40 ? "fair" : "poor";
@@ -837,11 +969,25 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
 
 export type MainCheckRun = {
   id: number;
+  source?: import("@bridge/contracts").CheckSource;
   name: string;
   status?: string | null;
   conclusion?: string | null;
   html_url?: string | null;
 };
+
+/** Newest attempt wins only inside one enforcing obligation. A separately
+ * published green check with the same name cannot erase another suite's red. */
+function checkObligations(runs: MainCheckRun[]): MainCheckRun[][] {
+  const groups = new Map<string, MainCheckRun[]>();
+  for (const run of runs) {
+    const key = checkObligationKey(run);
+    const list = groups.get(key) ?? [];
+    list.push(run);
+    groups.set(key, list);
+  }
+  return [...groups.values()];
+}
 
 export type MainRedCheck = { name: string; conclusion: string; url: string };
 
@@ -854,6 +1000,16 @@ export type MainCheckVerdict = {
   unsettled: string[];
   /** settled-green check count (receipt line) */
   green: number;
+  /** BR#5674 P1 (empty-is-loud): explains why verdict === "empty" */
+  alarm?: string;
+  /** BR#5883 (gate-consumed qualifier): set ONLY when the lane-scoped
+   *  verdict is Green while the repo's own merge gate (`main-green gate`,
+   *  scripts/main-green-gate.sh — it judges main's WHOLE tip, the exact
+   *  classifyMainCheckRuns predicate) would judge that same tip non-green.
+   *  The verdict stays Green (BR#5265's law: non-required reds never park
+   *  the train); the qualifier is what the hub escalates at P1. Mirror of
+   *  train_gate.rs CheckVerdict.gate. */
+  gate?: { verdict: MainCheckVerdict["verdict"]; red: MainRedCheck[]; unsettled: string[] };
 };
 
 /** Conclusions that mean the line is stopped. `cancelled` and null are NOT
@@ -867,17 +1023,12 @@ export const MAIN_RED_CONCLUSIONS = new Set([
 ]);
 
 export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
-  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0 };
-  const byName = new Map<string, MainCheckRun[]>();
-  for (const r of runs) {
-    const list = byName.get(r.name ?? "") ?? [];
-    list.push(r);
-    byName.set(r.name ?? "", list);
-  }
+  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   let green = 0;
-  for (const [name, list] of byName) {
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
     // the newest non-cancelled run judges; cancelled runs say nothing
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge || judge.conclusion == null) {
@@ -895,6 +1046,72 @@ export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
   if (red.length) return { verdict: "red", red, unsettled, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
   return { verdict: "green", red, unsettled, green };
+}
+
+/** BR#5265 Fix B + BR#5674 P1 (empty-is-loud) + BR#5883 (gate-consumed
+ *  qualifier): TypeScript mirror of train_gate.rs classify_base_check_runs. */
+export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]): MainCheckVerdict {
+  if (!runs.length) {
+    return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
+  }
+  if (!required.length) {
+    return classifyMainCheckRuns(runs);
+  }
+  // BR#6142: a workflow-level `startup_failure` (e.g. "Deploy Dev") creates 0
+  // job check-runs, so its name is the workflow name rather than the job names
+  // in `required`. Include any non-exempt workflow whose newest non-cancelled
+  // run is `startup_failure` in `scoped` so the base verdict immediately speaks
+  // RED instead of Empty.
+  const startupFailedNames = new Set<string>();
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
+    if (!name || isExemptCheckName(name)) continue;
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (judge?.conclusion === "startup_failure") {
+      startupFailedNames.add(name);
+    }
+  }
+  const scoped = runs.filter((r) => required.includes(r.name ?? "") || startupFailedNames.has(r.name ?? ""));
+  const gateRuns = runs.filter((r) => !required.includes(r.name ?? "") && isBaseHealthGateName(r.name ?? ""));
+  const gateVerdict = gateRuns.length ? classifyMainCheckRuns(gateRuns) : null;
+  if (!scoped.length) {
+    if (gateVerdict && gateVerdict.verdict === "red") {
+      return gateVerdict;
+    }
+    return {
+      verdict: "empty",
+      red: [],
+      unsettled: [],
+      green: 0,
+      alarm: `${runs.length} runs read, none matched required set — check names/pagination`,
+    };
+  }
+  // Never mask a red base_state mid-burst: when the required-set read is not
+  // itself fully green, a red base-health gate folds in — the verdict speaks
+  // red instead of a mid-burst green.
+  const res = classifyMainCheckRuns(scoped);
+  if (gateVerdict && gateVerdict.verdict === "red" && !(res.verdict === "green" && res.green >= required.length)) {
+    return {
+      ...res,
+      verdict: "red",
+      red: [...res.red, ...gateVerdict.red],
+    };
+  }
+  // BR#5883: a required-set GREEN no longer certifies a plain green when the
+  // repo's own merge gate would judge the same tip non-green (the 2026-11-03
+  // starve: `Deploy drift alarm` red on a merge-commit tip — the required
+  // `main-green gate` run is vacuous there, BR#5847 — certified green while
+  // every car's gate failed). Mirror of the train_gate.rs composition. The
+  // two arms compose: the fold above speaks for mid-burst states; this
+  // qualifier speaks for the fully-green lane read the fold deliberately
+  // leaves untouched.
+  if (res.verdict === "green") {
+    const gate = classifyMainCheckRuns(runs);
+    if (gate.verdict !== "green") {
+      return { ...res, gate: { verdict: gate.verdict, red: gate.red, unsettled: gate.unsettled } };
+    }
+  }
+  return res;
 }
 
 /** Deterministic ask title for one red episode — the sha makes the title
@@ -920,7 +1137,12 @@ export function stopLineAskTitle(sha: string, names: string[]): string {
 
 /** BR#2267 externals — CI checks that never gate a merge (external Cloudflare
  *  workers-builds mirrors, deploy previews). Matched as substrings, case
- *  insensitively, against the check NAME. */
+ *  insensitively, against the check NAME.
+ *  BR#6001 (implements accepted BR#3177): 'superpositional' joins the list —
+ *  the 'Superpositional' external check is posted by the superpositional-sync
+ *  GitHub App, NOT a repo workflow, and a failing SP review pipeline (process
+ *  error — e.g. the IndexingFailed/States.Timeout that held PRs #387/#390 out
+ *  of the lane >60m) is a Superpositional quality issue, never a merge gate. */
 export const MERGE_EXEMPT_CHECK_PATTERNS = [
   "workers builds",
   "workers-builds",
@@ -928,6 +1150,7 @@ export const MERGE_EXEMPT_CHECK_PATTERNS = [
   "cloudflare workers",
   "deploy preview",
   "codeql",
+  "superpositional",
 ] as const;
 
 export function isExemptCheckName(name: string): boolean {
@@ -945,28 +1168,37 @@ export type HeadCheckVerdict = {
 };
 
 /** The HEAD side of the 5c mechanical gate: same decision rule as
- *  classifyMainCheckRuns, but exempt-external failures (BR#2267) are pulled
- *  OUT of red and recorded as `external` — they are collected into the class
- *  ask, never bounce a PR. */
+ *  classifyMainCheckRuns (newest non-cancelled run per check name wins, by
+ *  highest id — so a re-run that succeeded supersedes an earlier failure of
+ *  the same check), with exempt-external failures (BR#2267) pulled OUT of red
+ *  and recorded as `external` — they are collected into the class ask, never
+ *  bounce a PR. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
+  if (!runs.length) return { verdict: "unsettled", red: [], unsettled: ["head checks have not started or could not be read"], external: [], green: 0 };
   const red: MainRedCheck[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
-  for (const r of runs) {
-    if (r.conclusion == null) {
-      if (isExemptCheckName(r.name ?? "")) continue; // exempt externals in flight say nothing
-      unsettled.push(r.name ?? "");
+  for (const list of checkObligations(runs)) {
+    const name = list[0].name;
+    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+    if (!judge) {
+      if (!isExemptCheckName(name)) unsettled.push(`${name} (only cancelled runs)`);
       continue;
     }
-    if (isExemptCheckName(r.name ?? "")) {
-      if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) external.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-      else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
+    if (judge.conclusion == null) {
+      if (isExemptCheckName(name)) continue; // exempt externals in flight say nothing
+      unsettled.push(name);
       continue;
     }
-    if (MAIN_RED_CONCLUSIONS.has(r.conclusion)) red.push({ name: r.name ?? "", conclusion: r.conclusion, url: r.html_url ?? "" });
-    else if (r.conclusion === "success" || r.conclusion === "skipped" || r.conclusion === "neutral") green += 1;
-    else unsettled.push(r.name ?? "");
+    if (isExemptCheckName(name)) {
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) external.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+      continue;
+    }
+    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) red.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+    else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
+    else unsettled.push(name);
   }
   if (red.length) return { verdict: "red", red, unsettled, external, green };
   if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
@@ -1022,6 +1254,7 @@ export type MergeAction =
   | { kind: "close_superseded"; reason: string }
   | { kind: "bounce"; defect: string; bounceKind: TrainBounceKind }
   | { kind: "note"; reason: string }
+  | { kind: "rerun_gate"; reason: string }
   | { kind: "skip"; reason: string }
   | { kind: "human_leg"; reason: string }
   /** BR#4689 L1.4: the head moved MECHANICALLY (same patch-ids) — stamp the
@@ -1460,6 +1693,55 @@ export function leaseDecide(
   return { ok: true, lease: null, note: "lease released" };
 }
 
+// ---- BR#5385 mid-walk merged receipt ----
+// The 2026-11-01 11:18Z incident: a lane ran TWO walkers (the hand-installed
+// daemon units + the runner gateway's in-process train leg) under ONE actor
+// (one gateway token), so the CAS read every peer release as "already mine".
+// The peer released the lease MID-WALK and the winner's `merged` event died
+// at the gate — a real landing lost its provenance, the batch aborted, and
+// the lane ping-ponged (meta.currently null ⇒ release_if_idle legitimately
+// releases). A merged event is a receipt of an already-done GitHub fact, not
+// a lane write: the hub re-admits it from the LOST holder when the ledger
+// proves the lease was lost mid-walk (within the TTL) to the same
+// authenticated identity — "the signer is the recorded holder". Fail-closed
+// everywhere else: a live holder on the lane, an actor that never held the
+// lease, or a loss older than the TTL ⇒ the original gate error stands.
+
+/** One lease-LOSS transition as the DO reads it from the ledger (BR#5385).
+ *  `holder` is resolved per row shape: `train:lease_release` rows carry the
+ *  releaser in `actor` (leaseDecide: only the holder releases);
+ *  `lease_lapsed` / `train:lease_evicted` rows carry it in the data payload
+ *  (the watch sweep / zombie eviction stamps). */
+export type LeaseLossTransition = { ts: number; action: string; actor: string; holder: string | null };
+
+export function leaseLossHolder(t: LeaseLossTransition): string | null {
+  if (t.action === "train:lease_release") return t.actor || null; // only the holder releases (leaseDecide)
+  if (t.action === "train:lease_evicted") return t.holder || null; // the zombie stamp carries the evicted holder
+  if (t.action === "lease_lapsed") return t.holder || null; // the watch sweep carries the lapsed holder
+  return null;
+}
+
+/** THE mid-walk receipt decision (BR#5385) — pure so the incident replay is
+ *  unit-testable: the lane's last lease-loss transition + the presenting
+ *  actor ⇒ admit the merged receipt or name the refusal. The window is the
+ *  lease TTL itself: the holder renewed within it throughout the walk, so a
+ *  loss younger than the TTL is by construction "mid-walk", not history. */
+export function midWalkReceiptDecide(
+  loss: LeaseLossTransition | null | undefined,
+  actor: string,
+  now: number,
+): { ok: true } | { ok: false; reason: string } {
+  const holder = loss ? leaseLossHolder(loss) : null;
+  if (!loss || !holder)
+    return { ok: false, reason: "the ledger shows no lease loss on this lane — nothing anchors a mid-walk receipt" };
+  if (holder !== actor)
+    return { ok: false, reason: `the lane's last lease was held by ${holder}, not by you — only the recorded holder may report a mid-walk merge` };
+  const age = now - loss.ts;
+  if (age > TRAIN_LEASE_TTL_MS)
+    return { ok: false, reason: `the lane's lease was lost ${Math.round(age / 1000)}s ago — past the lease TTL (${TRAIN_LEASE_TTL_MS / 60_000}m); too stale to be mid-walk` };
+  return { ok: true };
+}
+
 // ---- zombie eviction (BR#4129 — the hub half of proof-of-progress) ----
 // The 2026-10-28 incident: a live holder renewed the lease for hours, took
 // zero actions, and the queue starved behind it (the CAS did its job — too
@@ -1579,6 +1861,114 @@ export function firstRedIndex(reds: boolean[]): number | null {
   return i === -1 ? null : i;
 }
 
+/** BR#4996 batch inputs: one candidate head's changed-file set (`git diff
+ *  --name-only merge-base(origin/base, head)..head`), keyed by file path. */
+export type FileSet = Set<string>;
+
+/** BR#4996: conflict pairs among batch candidates, from their changed-file
+ *  sets — two heads are pair-candidates when their sets INTERSECT. A pure
+ *  set law, testable without git; the executor's plumbing that PRODUCES the
+ *  sets fails closed per BR#3935 (train.rs), and each intersecting pair is
+ *  merge-tree-confirmed before it gates a landing. Mirror of train_gate.rs
+ *  conflicts_from_file_sets — one law, two implementations, fixture-locked. */
+export function conflictsFromFileSets(fileSets: FileSet[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < fileSets.length; i++) {
+    for (let j = i + 1; j < fileSets.length; j++) {
+      for (const f of fileSets[i]) {
+        if (fileSets[j].has(f)) {
+          out.push([i, j]);
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** The batch-merge law (BR#4996, Ray ruling 2026-10-29, amending the
+ *  BR#4934 burst-drain): select the maximal set of MUTUALLY non-conflicting
+ *  heads from the gate-clean queue, in queue order — which is landing order
+ *  (oldest-first). Greedy: a head joins the batch unless it conflicts
+ *  (either pair orientation) with an already-selected head; clean[i] ===
+ *  false excludes just that member (fail-closed: only KNOWN-clean heads are
+ *  eligible — an exclusion never poisons its neighbours, so a chain A↔B↔C
+ *  lands [A, C] and skips only B); cap > 0 binds when the batch reaches it,
+ *  cap === 0 is unlimited. Mirror of train_gate.rs select_batch. */
+export function selectBatch(clean: boolean[], conflictPairs: [number, number][], cap: number): number[] {
+  const selected: number[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    if (!clean[i]) continue;
+    if (cap > 0 && selected.length >= cap) break;
+    const clashing = selected.some((s) => conflictPairs.some(([a, b]) => (a === i && b === s) || (a === s && b === i)));
+    if (!clashing) selected.push(i);
+  }
+  return selected;
+}
+
+/** BR#5658 (Ray 2026-11-03): one verifying or ready PR car in a merge batch.
+ *  `state` drives the verification colour law:
+ *  - "ready"     → green solid (.tb-ready): verified & ready to merge
+ *  - "verifying" → orange pulsing (.tb-verifying): actively being verified now
+ *  - "waiting"   → orange solid (.tb-wait): waiting to be verified */
+export interface TrainBatchCar {
+  id: string;
+  pr?: number;
+  state: "ready" | "verifying" | "waiting";
+  detail?: string;
+}
+
+/** BR#5658 (Ray 2026-11-03): partition all verifying + ready PRs on a lane into
+ *  sequential merge batches (`Batch 1 | Batch 2 | …`) by running `selectBatch`
+ *  iteratively until every car is assigned to a pass.
+ *  `conflictPairsByPr` are pairs of PR numbers `[prA, prB]` whose changed-file
+ *  sets conflict (executor-stamped on `queue_facts.conflict_pairs`); `cap` is
+ *  `lane.burst_max` (0 = unlimited). Cars that conflict with an earlier member
+ *  in Batch k or exceed `cap` defer to Batch k+1 while non-conflicting later
+ *  cars still join Batch k (the greedy A↔B↔C → [A, C] then [B] law). */
+export function partitionMergeBatches<T extends { id: string; pr?: number; state?: string }>(
+  cars: T[],
+  conflictPairsByPr: [number, number][] = [],
+  cap: number = DEFAULT_BURST_MAX,
+): T[][] {
+  if (!cars.length) return [];
+  const stateRank = (s: string | undefined): number => (s === "ready" ? 0 : s === "verifying" ? 1 : 2);
+  const ordered = cars
+    .map((c, idx) => ({ c, idx }))
+    .sort((a, b) => stateRank(a.c.state) - stateRank(b.c.state) || a.idx - b.idx)
+    .map((x) => x.c);
+  const remaining: number[] = ordered.map((_, i) => i);
+  const batches: T[][] = [];
+  const prConflict = (i: number, j: number): boolean => {
+    const pa = Number(ordered[i]?.pr ?? 0);
+    const pb = Number(ordered[j]?.pr ?? 0);
+    if (!pa || !pb) return false;
+    if (pa === pb && ordered[i].id !== ordered[j].id) return true;
+    return conflictPairsByPr.some(([a, b]) => (a === pa && b === pb) || (a === pb && b === pa));
+  };
+  while (remaining.length > 0) {
+    const clean = remaining.map(() => true);
+    const subPairs: [number, number][] = [];
+    for (let a = 0; a < remaining.length; a++) {
+      for (let b = a + 1; b < remaining.length; b++) {
+        if (prConflict(remaining[a], remaining[b])) subPairs.push([a, b]);
+      }
+    }
+    const chosenSub = selectBatch(clean, subPairs, cap);
+    if (!chosenSub.length) {
+      // safety fallback (clean is all-true so selectBatch always picks >=1)
+      batches.push([ordered[remaining.shift()!]]);
+      continue;
+    }
+    batches.push(chosenSub.map((si) => ordered[remaining[si]]));
+    const chosenSet = new Set(chosenSub);
+    const nextRemaining = remaining.filter((_, idx) => !chosenSet.has(idx));
+    remaining.length = 0;
+    remaining.push(...nextRemaining);
+  }
+  return batches;
+}
+
 /** Parse+validate meta.lane off a lane card. Null when the shape is wrong —
  *  the caller fails loud, a guessed lane config would gate the wrong CI. */
 export function laneOfMeta(meta: any): LaneSpec | null {
@@ -1602,6 +1992,7 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
     `**Required workflows on the merge commit (lane config):** ${lane.required_workflows.length ? lane.required_workflows.map((w) => `\`${w}\``).join(", ") : "_(none configured — BACK-PRESSURE default: every check run on the merge commit (build + deploy) must settle green before the next head enters)_"}`,
     lane.ci_typical_minutes ? `**CI bound:** unknown-past-stop at ~3× typical = ${3 * lane.ci_typical_minutes} min (typical ${lane.ci_typical_minutes} min)` : `**CI bound:** default 3 × ${TRAIN_CI_TYPICAL_MINUTES} min`,
     `**Burst drain (BR#4934):** up to ${lane.burst_max === 0 ? "unlimited" : lane.burst_max} gate-clean heads merge back-to-back per pass, then ONE settle wait on the final merge commit; red anywhere stops the line instantly; a red settle bisects the pass to ONE culprit. Rebase work rides the settle wait.`,
+    `**Batch merges (BR#4996):** each pass lands a maximal set of MUTUALLY non-conflicting gate-clean heads back-to-back (conflict-checked via changed-file sets + merge-tree, fail-closed) and settles ONCE; a head conflicting with a selected member waits for the next pass.`,
     ``,
     `Status lives in this card's blocked reason + meta.lease / meta.currently (the derived queue is computed from blocked \`merge-train:\` cards — never a stored list).`,
     `Alarm sink: ${cfg.alarm_sink}. Lane body is infrastructure — do not claim; run \`bridge train\` on a gateway to work it.`,
@@ -1616,20 +2007,277 @@ export function laneCardBody(lane: LaneSpec, cfg: { alarm_sink: string }): strin
  *  never drift from reality. */
 export const MERGE_TRAIN_REASON_PREFIX = "merge-train:";
 export const MERGE_TRAIN_QUEUED_REASON = "merge-train: queued";
+/** BR#6348 — the conflicting car's park reason prefix. Like the queued
+ *  prefix it ADMITS the car into mergeTrainQueue (the derived queue must
+ *  never go silently empty while its head car is conflicting — the Phase A
+ *  defect), but the executor's walk skips a car already parked conflicting
+ *  (the typed clock + budget alarm own the exit), so admission here means
+ *  VISIBILITY (starvation accounting, panel queue block), not mergeability. */
+export const MERGE_TRAIN_CONFLICTING_REASON = "merge-train: conflicting";
+/** BR#6348 — the bounded budget for a typed conflicting park, knob
+ *  `train.conflicting_budget_min`, clamped 15..1440. Default 120 min: the
+ *  Phase A episode churned 3h46m invisible; the alarm must fire well inside
+ *  that. Past the budget the conflicting sweep alarms ONCE per episode to
+ *  the train alarm sink naming the mechanical rebase leg. */
+export const TRAIN_CONFLICTING_BUDGET_MIN_DEFAULT = 120;
 
-export type TrainCandidate = { id: string; status_ts: number; meta: any };
+export function clampConflictingBudgetMin(...candidates: unknown[]): number {
+  for (const v of candidates) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return Math.min(1440, Math.max(15, n));
+  }
+  return TRAIN_CONFLICTING_BUDGET_MIN_DEFAULT;
+}
 
-/** Queue order: CRITICAL class first, FIFO within class. The board's existing
- *  boost stamp (meta.boosted) is the CRITICAL class; everything else orders by
- *  blocked-since (status_ts ascending). */
-export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "critical" | "normal" }[] {
-  const queued = cards.filter((c) =>
-    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX)),
+/** The conflicting park's blocked.reason — carries MERGE_TRAIN_CONFLICTING_
+ *  REASON (queue admission) + the enumerated conflicts + the demanded
+ *  machine leg, so plain reading names the exit. */
+export function trainConflictingParkReason(
+  pr: number,
+  repo: string,
+  conflictFiles: readonly string[],
+  defect?: string | null,
+): string {
+  const files = conflictFiles.length
+    ? conflictFiles.slice(0, 5).join(", ") + (conflictFiles.length > 5 ? ", …" : "")
+    : "trial-merge failed to enumerate (fail-closed)";
+  const head = `${MERGE_TRAIN_CONFLICTING_REASON} — PR ${repo ? `${repo}#` : "#"}${pr} conflicts with base (${conflictFiles.length} file(s)): ${files}`;
+  return `${head} — the mechanical rebase leg owns the exit: rebase onto origin/main, resolve, signed force-with-lease push, fresh verify, re-queue at the BACK (BR#6348; bounded budget + loud alarm at expiry)${defect ? ` — ${String(defect).slice(0, 160)}` : ""}`;
+}
+
+/** BR#6348 — the conflicting-episode keys a phase write must clear when the
+ *  card LEAVES the conflicting phase (accept → queued, merged → awaiting-ci,
+ *  machine re-queue). Stale keys are inert to readers (every reader gates on
+ *  state === "conflicting") but they are illegal residue under the closed
+ *  union — one helper, called at the phase-write sites. */
+export function clearConflictingEpisode(mt: Record<string, unknown> | undefined): void {
+  if (!mt) return;
+  delete mt.conflicting_at;
+  delete mt.conflicting_alarm;
+}
+// BR#6045: the queue-note matcher binds BOTH the canonical `merge-train:
+// queued` prefix AND the semantically-equivalent re-queue spelling
+// `merge-train: re-queued` (a fresh verify accept after a bounce). The direct
+// re-queue hook used to gate on startsWith(MERGE_TRAIN_QUEUED_REASON) alone,
+// so a re-queued accept note silently skipped trainQueueOnAccept — no stamp
+// fold-forward, no state=queued — and the next drain walk bounced the card
+// for coverage against the STALE stamp (BR#5646 bounce #2, PR
+// superpositional#2555: the same verified head bounced twice, the only delta
+// being the note prefix).
+export const MERGE_TRAIN_QUEUE_NOTE_RX = /^merge-train: (?:re-)?queued/;
+
+export type TrainCandidate = { id: string; status_ts: number; meta: any; tags?: string[] };
+
+// ---- BR#5190 root-fix fast lane: the board half of the main-breakage law ----
+
+/** The root-fix tags — a card is THE main-breakage fix iff it carries both
+ *  AND is bound to a failing main-HEAD run (meta.root_fix, BR#5189 §1). */
+export const ROOT_FIX_TAG = "root_blocker";
+export const MAIN_RED_TAG = "main-red";
+
+/** The deploy-health gate check — matched as a lowercase substring against
+ *  the check NAME ("Deploy health (merge gate)" matches). A head red of this
+ *  class is exactly main's own deploy red: the circular class no machine leg
+ *  can pass — the one-click human merge ask is the fast lane (BR#5189 §5,
+ *  SP #2617 precedent). MUST stay byte-identical to train_gate.rs. */
+export const DEPLOY_HEALTH_PATTERN = "deploy health";
+
+/** BR#5883: the destination-green gate check (BR#3008/BR#3009) — matched as a
+ *  lowercase substring against the check NAME ("main-green gate" matches). A
+ *  head red of this class judges MAIN's tip, not the PR's own code; when the
+ *  tip now classifies fully green under the gate's own predicate the
+ *  conviction is stale by construction and the self-heal re-runs it. MUST
+ *  stay byte-identical to train_gate.rs MAIN_GREEN_GATE_PATTERN. */
+export const MAIN_GREEN_GATE_PATTERN = "main-green gate";
+
+export function isBaseHealthGateName(name: string): boolean {
+  const lower = String(name ?? "").toLowerCase();
+  return lower.includes(DEPLOY_HEALTH_PATTERN) || lower.includes(MAIN_GREEN_GATE_PATTERN);
+}
+
+/** The failing-main binding a root-fix card must carry: the repo + the exact
+ *  failing main-HEAD run sha it cures. */
+export type RootFixBinding = { repo: string; head_sha: string };
+
+/** meta.root_fix read off a card — null unless it names repo + head_sha (or
+ *  an agent-filed root-blocker card carrying main_tip/red_since + a bound PR
+ *  repo, BR#6012; or a BASE-FIX / stop-the-line card stamped `tip_sha` +
+ *  `root_blocker_for_lane` ("<repo>@<base>") by the field — BR#6390, the
+ *  2026-11-04 BR#6378 shape, which hub code never mints but must still
+ *  recognize). */
+export function mainRedBinding(meta: any): RootFixBinding | null {
+  const b = meta?.root_fix;
+  if (b && typeof b === "object") {
+    const repo = typeof b.repo === "string" ? b.repo : "";
+    const sha = typeof b.head_sha === "string" ? b.head_sha : "";
+    if (repo && sha) return { repo, head_sha: sha };
+  }
+  const fallbackSha =
+    typeof meta?.main_tip === "string" && meta.main_tip
+      ? meta.main_tip
+      : typeof meta?.tip_sha === "string" && meta.tip_sha
+        ? meta.tip_sha
+        : typeof meta?.red_since === "string" && meta.red_since
+          ? meta.red_since
+          : "";
+  const fallbackRepo = String(
+    meta?.root_fix?.repo ??
+      meta?.repo ??
+      meta?.pr?.repo ??
+      (Array.isArray(meta?.prs) && meta.prs[0]?.repo ? meta.prs[0].repo : "") ??
+      meta?.merge_train?.repo ??
+      // BR#6390: the field-minted BASE-FIX shape names the lane, not a PR
+      // ("repo@base") — split the repo half out as the binding's repo.
+      (typeof meta?.root_blocker_for_lane === "string" && meta.root_blocker_for_lane.includes("@")
+        ? meta.root_blocker_for_lane.split("@")[0]
+        : "") ??
+      "",
+  ).trim();
+  return fallbackRepo && fallbackSha ? { repo: fallbackRepo, head_sha: fallbackSha } : null;
+}
+
+/** The qualification (Rust is_root_fix_card mirror): tags root_blocker (or
+ *  root-blocker / root-fix / base-fix) + main-red (or main_red /
+ *  stop-the-line) AND a bound failing main-HEAD run. Tags alone never
+ *  qualify — the binding does. BR#6390: a field-minted BASE-FIX card can
+ *  carry NO root-side tag at all — the marker then lives in meta
+ *  (`root_blocker_for_lane` "<repo>@<base>" or a `root_blocker` id string —
+ *  the BR#6378 exemplar), so a meta marker qualifies as the root-side half.
+ *  Neither tags nor meta markers qualify ALONE: the failing-run binding below
+ *  is still required. */
+export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
+  const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
+  const hasRoot =
+    tags.includes(ROOT_FIX_TAG) ||
+    tags.includes("root-blocker") ||
+    tags.includes("root-fix") ||
+    tags.includes("base-fix") ||
+    // BR#6390: meta-borne root-side markers (the BR#6378 exemplar carries no
+    // root-side tag — recognition must not hinge on which tag vocabulary the
+    // field used).
+    (typeof card?.meta?.root_blocker_for_lane === "string" && card.meta.root_blocker_for_lane.includes("@")) ||
+    typeof card?.meta?.root_blocker === "string";
+  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red") || tags.includes("stop-the-line");
+  if (!hasRoot || !hasMainRed) return false;
+  return mainRedBinding(card?.meta) !== null;
+}
+
+/** BR#6390: the LANE BASE-FIX card shape — an agent-filed stop-the-line fix
+ *  card that never carries the root_blocker tag pair (the 2026-11-04 BR#6378
+ *  episode: tags [main-red, merge-train, stop-the-line, cortex, p0], meta
+ *  {repo, tip_sha, root_blocker_for_lane}) and so was invisible to step 1 of
+ *  trainOpenRootFix — the episode resolution fell back to a stale fix_card
+ *  and the human gate flapped. A card is the lane's base-fix iff it names
+ *  this lane's repo in meta.root_blocker_for_lane, is main-red-tagged, and
+ *  reads as a base/CI fix (stop-the-line | base-fix | p0 tags). */
+export function isLaneBaseFixCard(card: { tags?: unknown; meta?: any }, repo: string): boolean {
+  if (!repo) return false;
+  const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
+  if (!tags.includes(MAIN_RED_TAG) && !tags.includes("main_red")) return false;
+  if (!(tags.includes("stop-the-line") || tags.includes("base-fix") || tags.includes("base_fix") || tags.includes("p0"))) return false;
+  const lane = String(card?.meta?.root_blocker_for_lane ?? "");
+  return lane.split("@")[0] === repo && mainRedBinding(card?.meta)?.repo === repo;
+}
+
+/** BR#6012: true iff a queued card's title explicitly names a base-red /
+ *  CI / deploy-health / merge-gate / stop-the-line fix — NEVER a generic
+ *  product bugfix (`fix(chat): ...`, `fix(web): ...`), which previously
+ *  matched bare `/\bfix\b/` and grafted unrelated product PRs (#2555) onto
+ *  the root-fix card as a fake bypass-merge cure. */
+export function isBaseCureCardTitle(title: string): boolean {
+  const t = String(title ?? "");
+  return /\bfix\s*\(\s*(?:ci|deploy|gate|train|build|infra|runner|smoke|actions)\s*\)|main[- ]green|main[- ]red|stop[- ]the[- ]line|deploy[- ]health|root[-_ ]blocker|root[-_ ]fix/i.test(t);
+}
+
+/** The deterministic one-click human merge ask title for the circular
+ *  deploy-health class. BYTE-IDENTICAL to root_fix_fast_lane_title in
+ *  train_gate.rs (ask-dedupe keys on exact wording; hub + executor must
+ *  produce the same string). ≤240 chars, ends "?" per the ask contract. */
+export function rootFixFastLaneTitle(repo: string, pr: number | string): string {
+  return `Root-fix fast lane (BR#5189): merge ${repo} PR #${pr} now? Main is red on the exact red this PR cures — the train cannot merge it while the line it fixes is stopped; one click merges the cure?`;
+}
+
+/** The auto-spawned root-fix card title (BR#5189 §3): deterministic per red
+ *  episode — the failing checks name the red, the sha pins the run. ≤240
+ *  chars so ask/title guards never trip on it. */
+export function rootFixCardTitle(repo: string, sha: string, failing: string[]): string {
+  const prefix = `ROOT-FIX (BR#5189 p0): fix main — ${repo} red at ${sha.slice(0, 9)} (`;
+  const suffix = `)`;
+  let text = failing.join(", ");
+  if (prefix.length + text.length + suffix.length > 240) text = text.slice(0, Math.max(0, 240 - prefix.length - suffix.length - 1)).trimEnd() + "…";
+  return prefix + text + suffix;
+}
+
+/** The auto-spawned root-fix card body: what is red, the exact failing
+ *  main-HEAD checks, and the fast-lane law the card rides (BR#5189). */
+export function rootFixCardBody(repo: string, sha: string, failing: { name: string; conclusion?: string | null; url?: string | null }[]): string {
+  const lines = [
+    `Main is RED — stop-the-line (BR#5189). This card is THE main-breakage fix.`,
+    ``,
+    `Failing main-HEAD checks at \`${sha.slice(0, 9)}\`:`,
+    ...failing.map((f) => `- ${f.name}${f.conclusion ? ` (${f.conclusion})` : ""}${f.url ? ` — ${f.url}` : ""}`),
+    ``,
+    `Bound to the failing main-HEAD run (meta.root_fix: repo ${repo}, head_sha ${sha.slice(0, 9)}), tags \`root_blocker\` + \`main-red\`.`,
+    ``,
+    `While the line is stopped, the merge train parks every other head for ${repo} — this card gets the first gate slot and its PR fast-tracks: base red + head green merges onto the red base (receipt stamps \`root_fix_fast_tracked\`); if the base red is the circular deploy-health class (the gate red because main itself is red), the one-click human merge ask is the fast lane.`,
+    ``,
+    `Deliver the fix PR through the normal train (verify → queue). Tags and the binding ride the card — they are the qualification, don't strip them.`,
+  ];
+  return lines.join("\n");
+}
+
+/** Queue order: a FOUR-tier priority ladder (BR#5189 §2):
+ *  tier 0 "root_fix" — THE bound main-breakage fix (isRootFixCard), above
+ *      every other card including boosts;
+ *  tier 1 "boosted" — the human/starvation boost stamp (meta.boosted), the
+ *      old CRITICAL class under its own honest label;
+ *  tier 2 "critical" — cards explicitly marked critical (meta.priority ===
+ *      "critical"), the manual rung;
+ *  tier 3 "normal" — everything else.
+ *  FIFO within tier by blocked-since (status_ts ascending). NO stop/base-red
+ *  filter (BR#5753): the hub's derived queue keeps EVERY held car visible —
+ *  root_fix still sorts to rank 0 unconditionally — because the stop-arm
+ *  consumers (base_red_resolution.held, the alarm ask's cure-PR fallback,
+ *  trainOpenRootFix) read this list and would go blind mid-episode if
+ *  non-root_fix cars were filtered out. The stopped-lane fast lane (only the
+ *  bound root-fix card merges; BR#5190) is the WALK's law — train.rs
+ *  is_root_fix_card + the merge gate — enforced where merges happen, not a
+ *  hub-side queue filter. (The pre-5753 opts.baseRed option was dead in
+ *  production: its one caller looked the stop facts up with
+ *  `WHERE id = laneKey(repo, base)`, and a lane key is never an
+ *  artefacts.id, so the filter never fired once.) */
+export function mergeTrainQueue(cards: TrainCandidate[]): { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true }[] {
+  const queued = cards.filter((c) => mergeCompletesTask(c.meta ?? {}) && (
+    [c.meta?.blocked?.reason, c.meta?.blocked_reason].some((r: unknown) => typeof r === "string" && r.startsWith(MERGE_TRAIN_REASON_PREFIX))
+    // BR#5750 — legacy watchdog hold-parks predate the prefix; a queued car
+    // the silence-release parked unprefixed must not stay invisible to the
+    // train (the BR#4995 silent drop)
+    || isWatchdogTrainHoldPark(c.meta)
+    // BR#6330 — typed-phase admission: the closed merge_train phase is the
+    // single classification; a car stamped queued/awaiting-ci is a queue
+    // candidate even if its prose reason lost the prefix. Admission is
+    // deliberately FAIL-OPEN (prefix OR stamp — a stray admit gets gate-
+    // checked by the executor; a silent drop starves a lane).
+    || isAwaitingMerge(c.meta)
+    // BR#6348 — a typed conflicting park is a queue VISIBILITY slot, not a
+    // merge candidate: the walk skips it (the typed clock + budget alarm own
+    // the exit), but it must never silently leave the derived queue — the
+    // Phase A empty-queue starvation happened precisely because a conflicting
+    // car was invisible to every alarm.
+    || mergePhaseOf(c.meta) === "conflicting"),
   );
-  const rank = (c: TrainCandidate) => (c.meta?.boosted ? 0 : 1);
+  const rank = (c: TrainCandidate) => (isRootFixCard(c) ? 0 : c.meta?.boosted ? 1 : c.meta?.priority === "critical" ? 2 : 3);
   return [...queued]
     .sort((a, b) => rank(a) - rank(b) || (a.status_ts ?? 0) - (b.status_ts ?? 0))
-    .map((c) => ({ id: c.id, priority: rank(c) === 0 ? ("critical" as const) : ("normal" as const) }));
+    .map((c) => {
+      const r = rank(c);
+      const e: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true } = {
+        id: c.id,
+        priority: r === 0 ? "root_fix" : r === 1 ? "boosted" : r === 2 ? "critical" : "normal",
+      };
+      if (r === 0) e.root_fix = true;
+      return e;
+    });
 }
 
 // ---- typed-proxy preservation (BR#4067) ----
@@ -1665,7 +2313,7 @@ export function trainProxyEvent(meta: any): AwaitEvent | null {
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const repo = String((m.pr as any)?.repo ?? mt.repo ?? "");
   const n = trainPrLeg(meta);
-  return /^[\w.-]+\/[\w.-]+$/.test(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
+  return isValidGitHubRepo(repo) && n > 0 ? { event: "pr_merged", repo, n } : null;
 }
 
 /** BR#4282 — the card's OWN merge-train stamp proving its pr_merged leg has
@@ -1701,6 +2349,39 @@ export function trainMergeReceipt(
   return legRepo === repo ? hit : null;
 }
 
+/** BR#6432 — card-id references in prose: the receipt scope of a batch
+ *  SUPERSEDE authorization. Parses the board's card-id grammar out of an
+ *  artefact body: `BR#1234` / `BR-1234` (case-insensitive), slash chains
+ *  (`BR#4689/#4834/#4692` — the census style the authorization asks use),
+ *  and legacy `TASK-001` ids. Bare `#1234` / `repo#1234` PR references and
+ *  PR URLs are NEVER card ids and never match — the scope stays exactly the
+ *  cards the authorizer named, deduplicated in first-appearance order. */
+export function parseCardIdRefs(text: string): string[] {
+  const hits: Array<{ at: number; id: string }> = [];
+  for (const m of text.matchAll(/\bBR[#-](\d+(?:\/#\d+)*)/gi)) {
+    // slash chains: the first number carries the match position, the
+    // continuations follow in order after it
+    let at = m.index + m[0].length - m[1].length;
+    for (const part of m[1].split("/")) {
+      hits.push({ at, id: `BR#${part.replace(/^#/, "")}` });
+      at += part.length + 1;
+    }
+  }
+  for (const m of text.matchAll(/\b(TASK-\d+)\b/gi)) {
+    hits.push({ at: m.index, id: m[1].toUpperCase() });
+  }
+  hits.sort((a, b) => a.at - b.at);
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const { id } of hits) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
 /** BR#4067 — does a release path need to HOLD? Returns the hold description
  *  when the card carries machine-wait state — a merge-train queue slot
  *  (queued/awaiting-ci/bounced/awaiting on a live PR leg), a typed
@@ -1714,7 +2395,10 @@ export function releaseHold(meta: any): string | null {
   const m = meta ?? {};
   const mt = (m.merge_train ?? {}) as Record<string, unknown>;
   const st = String(mt.state ?? "");
-  if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") {
+  // BR#6330 — the phase set is closed (contracts MergeTrainPhaseSchema);
+  // unbound/landed/base-red-park hold nothing: the train no longer owns the
+  // exit. Semantics unchanged from the pre-6330 literal set.
+  if (st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "conflicting" || st === "awaiting") {
     const pr = trainPrLeg(meta);
     if (pr) {
       const repo = String((m.pr as any)?.repo ?? mt.repo ?? "repo");
@@ -1725,6 +2409,117 @@ export function releaseHold(meta: any): string | null {
     return `a typed await_event (${String((m.blocked.await_event as any).event ?? "unknown")}) — the proxy watch owns the exit`;
   if (m.awaiting_ask)
     return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
+  return null;
+}
+
+/** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE
+ *  mergeTrainQueue. The queue derives candidates from the `merge-train:`
+ *  reason prefix alone, so a watchdog hold-park whose note lacks the prefix
+ *  silently drops a live queued/awaiting-ci car out of the train queue
+ *  forever — the BR#4995 class, root-caused from the BR#5674 Mission 2
+ *  audit. The live-slot states ride the state-named prefix (queued /
+ *  awaiting-ci / conflicting — BR#6348: a conflicting car must stay in the
+ *  derived queue, the silent-empty-queue state is the Phase A defect); every
+ *  other hold (bounced/awaiting/typed waits) is NOT a queue slot and must
+ *  stay unprefixed — those legs re-enter through the board, never the queue. */
+export function mergeTrainHoldPrefix(meta: any): string | null {
+  const mt = ((meta ?? {}).merge_train ?? {}) as Record<string, unknown>;
+  const st = String(mt.state ?? "");
+  if (st === "queued") return `${MERGE_TRAIN_REASON_PREFIX} queued — `;
+  if (st === "awaiting-ci") return `${MERGE_TRAIN_REASON_PREFIX} awaiting-ci — `;
+  if (st === "conflicting") return `${MERGE_TRAIN_CONFLICTING_REASON} — `;
+  return null;
+}
+
+/** The park-note fingerprints a watchdog releaseHold hold-park writes (the
+ *  holdParkBody silence note and the lapsed-subprocess hold note, BR#4067). */
+export const WATCHDOG_HOLD_PARK_REASON_RE =
+  /silence-release held \(watchdog\)|release held \(BR#4067\)/i;
+
+/** BR#5750 — a blocked card that a watchdog releaseHold hold-park created
+ *  BEFORE the merge-train prefix existed (the already-dropped BR#4995 cars
+ *  still sitting unprefixed on the board). Read from the park's own facts:
+ *  the reason matches the hold-park fingerprint AND the card still carries a
+ *  live `queued` slot. `queued` only — awaiting-ci parks advance via train
+ *  events (train:merged → awaiting-ci), not queue admission, and
+ *  bounced/awaiting re-enter through the board, never the queue. */
+export function isWatchdogTrainHoldPark(meta: any): boolean {
+  const m = meta ?? {};
+  const mt = ((m.merge_train ?? {}) as Record<string, unknown>);
+  if (String(mt.state ?? "") !== "queued") return false;
+  return [m.blocked?.reason, m.blocked_reason].some(
+    (r: unknown) => typeof r === "string" && WATCHDOG_HOLD_PARK_REASON_RE.test(r),
+  );
+}
+
+// ---- strand law (BR#6163: bounce-release strands train-parked cars) ----
+
+/** The await events ONLY the merge train can fire: `pr_merged` and
+ *  `pr_checks_green` are satisfied by lane train_events (merged / settle),
+ *  never by anything a pool executor can do. A card out of the queue while
+ *  carrying one of these waits for a merge event no queue will ever deliver
+ *  — the strand the BR#6163 sweep re-boards or alarms on. */
+export const TRAIN_ONLY_AWAIT_EVENTS = ["pr_merged", "pr_checks_green"] as const;
+
+/** The card's live train-only await. Reads meta.blocked.await_event (the
+ *  typed-wait park shape, closure.ts's closed grammar) and falls back to the
+ *  bounce-release evidence stamp (meta.bounce_released.train_only_await —
+ *  the release transitions delete meta.blocked, so the evidence must ride
+ *  the release stamp). Normalised {event, repo, n}; null otherwise. */
+export function trainOnlyAwait(
+  meta: any,
+): { event: string; repo: string; n: number } | null {
+  const m = meta ?? {};
+  const candidates = [m.blocked?.await_event, m.bounce_released?.train_only_await];
+  for (const ev of candidates) {
+    if (!ev || typeof ev !== "object") continue;
+    const event = String((ev as any).event ?? "");
+    const repo = (ev as any).repo;
+    const n = Number((ev as any).n ?? (ev as any).number ?? 0);
+    if (
+      (TRAIN_ONLY_AWAIT_EVENTS as readonly string[]).includes(event) &&
+      typeof repo === "string" && repo.includes("/") &&
+      Number.isFinite(n) && n > 0
+    ) {
+      return { event, repo: repo.trim(), n };
+    }
+  }
+  return null;
+}
+
+export type TrainStrandClass =
+  | "out_of_queue_await"  // train-only await, card no longer a queue candidate
+  | "queued_out_of_queue" // card SAYS merge-train queued, queue dropped it
+  | "unbound_in_queue";   // admitted queue park whose legs never bound (alarm only)
+
+/** Which strand class (if any) is this card in? `admitted` = the card is a
+ *  queue candidate (blocked + merge_train.pr>0 + the merge-train prefix or a
+ *  watchdog hold-park — mergeTrainQueue's admit test, regardless of legs).
+ *  Excludes the states other law owns: Awaiting parks (the BR#5633 sweep),
+ *  bounced re-entry (the BR#4494 demote), and cards holding a bound ask
+ *  (awaiting_ask — the ask pause is deliberate, not a strand). */
+export function trainStrandClass(meta: any, admitted: boolean): TrainStrandClass | null {
+  const m = meta ?? {};
+  const mt = ((m.merge_train ?? {}) as Record<string, unknown>);
+  if (m.awaiting_ask) return null;
+  const state = String(mt.state ?? "");
+  if (state === "awaiting") return null; // BR#5633 sweep owns Awaiting parks
+  if (state === "bounced") return null;  // BR#4494 demote owns bounce re-entry
+  if (state === "conflicting") return null; // BR#6348 budget sweep owns conflicting parks
+  if (state === "unbound" && admitted) return "unbound_in_queue";
+  // BR#6395: only a card that actually bears train-car provenance (a merge_train
+  // stamp, a bounce_released.train_only_await stamp, or a bound review/impl PR
+  // stamp) can be a stranded train car. A card with NO train provenance that
+  // awaits pr_merged / pr_checks_green is waiting on an UPSTREAM PR dependency
+  // (e.g. an epic parent or post-merge follow-up) and must never be overwritten
+  // with "merge-train: queued — strand re-board".
+  // A review_pr only proves a PR was submitted, not that it was accepted
+  // onto the train. In particular it may differ from the upstream await.
+  const hasTrainCarEvidence =
+    state === "queued" || state === "awaiting-ci" ||
+    Boolean(m.bounce_released?.train_only_await);
+  if (trainOnlyAwait(m) && !admitted && hasTrainCarEvidence) return "out_of_queue_await";
+  if (state === "queued" && !admitted) return "queued_out_of_queue";
   return null;
 }
 
@@ -1820,6 +2615,18 @@ export type TrainLeg = {
   base?: string;
   carry?: CarryRecord[];
 };
+
+/** The only valid append point for a machine-clean carry. */
+export function trainCarryChainEnd(leg: Pick<TrainLeg, "head_sha_at_acceptance" | "carry">): string {
+  let end = String(leg.head_sha_at_acceptance ?? "").toLowerCase();
+  for (const link of Array.isArray(leg.carry) ? leg.carry : []) {
+    const from = String(link.from_head ?? "").toLowerCase();
+    const to = String(link.to_head ?? "").toLowerCase();
+    if (from !== end || !/^[0-9a-f]{7,40}$/.test(to)) break;
+    end = to;
+  }
+  return end;
+}
 
 /** The card's legs: meta.prs when stamped (multi-PR), else the legacy
  *  meta.pr single leg. Empty when neither exists. */
@@ -1951,18 +2758,30 @@ export function classifyRequiredRuns(
   const missing: string[] = [];
   const pending: string[] = [];
   for (const name of judgeNames) {
-    const list = byName.get(name) ?? [];
-    const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
-    if (!judge || judge.conclusion == null) {
-      // unconfigured mode: a cancelled-only run (or in-flight with no
-      // conclusion) is UNSETTLED — the commit has not finished proving itself
-      (list.length || !required.length ? pending : missing).push(name);
-      continue;
+    const named = byName.get(name) ?? [];
+    if (!named.length) { missing.push(name); continue; }
+    for (const list of checkObligations(named)) {
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (!judge || judge.conclusion == null) { pending.push(name); continue; }
+      if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
+        failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
+        pending.push(name);
+      }
     }
-    if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
-      failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
-    } else if (!["success", "skipped", "neutral"].includes(judge.conclusion)) {
-      pending.push(name);
+  }
+  if (required.length) {
+    // BR#6142: when a workflow fails at startup (`conclusion: "startup_failure"`),
+    // GitHub creates 0 job check-runs, so none of the job names in `required`
+    // ever appear. Fold any non-exempt workflow-level `startup_failure` into
+    // `failing` immediately instead of waiting 60m on missing required jobs.
+    for (const list of checkObligations(runs)) {
+      const name = list[0].name;
+      if (!name || required.includes(name) || isExemptCheckName(name)) continue;
+      const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
+      if (judge?.conclusion === "startup_failure") {
+        failing.push({ name, conclusion: judge.conclusion, url: judge.html_url ?? "" });
+      }
     }
   }
   if (!required.length) {
@@ -1993,6 +2812,11 @@ export type TrainGateInput = {
   mergeStateStatus: string | null;
   /** commits of the PR: REST verification (verified=true = signed+valid) */
   commits: { sha: string; verified: boolean }[];
+  /** BR#4687 (L1.2): the branch is worker-authored — every commit's GitHub
+   *  author login sits on the worker allowlist. The behind pre-clear below
+   *  is provenance-gated on this: the train machine-updates its OWN
+   *  branches; a protected human branch still bounces to its owner. */
+  trainOwnedBranch?: boolean;
   headChecks: MainCheckRun[];
   /** BR#3659: which leg of the card's PR list this gate drives (1-based
    *  position in meta.prs) — the gate checks THAT leg's stamp, and the
@@ -2003,6 +2827,12 @@ export type TrainGateInput = {
    *  executor could prove the move content-preserving. Absent → the
    *  coverage bounce stands (fail-closed unchanged). */
   mechanicalMove?: MechanicalMove | null;
+  /** BR#5883: main's tip judges fully green under the gate's own predicate
+   *  (classifyMainCheckRuns over the WHOLE tip — the exact main-green-gate
+   *  script rule), i.e. the walk-start scoped verdict is Green with no gate
+   *  qualifier attached. Gates the stale main-green-gate self-heal. Mirror
+   *  of train_gate.rs TrainGateInput.base_gate_green. */
+  baseGateGreen?: boolean;
 };
 
 // ---- the executor's fact boundary (BR#3714) ----
@@ -2052,96 +2882,246 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  means GitHub is still computing — the executor backoff-polls
  *  (15/30/60s, lease-bounded) before this gate and the shared law waits on
  *  it: never a bounce, never a merge on an unconfirmed state. */
-export function decideTrainGate(i: TrainGateInput): MergeAction {
-  if (i.cardStatus === "superseded")
-    return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
-  if (i.cardStatus === "done")
-    return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+export type CandidateHeadCheckState =
+  | { kind: "green" }
+  | { kind: "pending"; unsettled: string[] }
+  | { kind: "red_circular_deploy_gate"; names: string[] }
+  | { kind: "red_circular_main_green_gate"; names: string[] }
+  | { kind: "red_circular_mixed_gates"; names: string[] }
+  | { kind: "red_substantive"; names: string[] };
+
+export type CandidateGatePhase =
+  | { phase: "card_superseded" }
+  | { phase: "card_done" }
+  | { phase: "head_uncovered"; legNumber: number; stamped: string }
+  | { phase: "mergeability_computing"; reason: string }
+  | { phase: "conflicting" }
+  | { phase: "unverified_commits"; count: number }
+  | { phase: "unhandled_merge_state"; state: string }
+  | {
+      phase: "mechanically_sound";
+      legNumber: number;
+      legsTotal: number;
+      mergeState: "clean" | "unstable" | "behind" | "blocked";
+      headState: CandidateHeadCheckState;
+    };
+
+/** BR#6012 defense-in-depth state machine: classifies a train candidate into an
+ *  exhaustive, mutually-exclusive phase BEFORE any transition rule runs, so
+ *  impossible states (e.g. a conflicting PR reaching `rerun_gate` or `blocked`
+ *  pre-clear, or an unverified-commit PR fast-tracking) are unrepresentable.
+ *  BR#4689 L1.4: an uncovered head is HEAD-UNCOVERED, never decided here —
+ *  the gate's case offers the mechanical-carry row (range-diff all-'=' proof
+ *  extends the chain); only substantive content still bounces. */
+export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhase {
+  if (i.cardStatus === "superseded") return { phase: "card_superseded" };
+  if (i.cardStatus === "done") return { phase: "card_done" };
   const legs = trainLegs(i.cardMeta);
   const legNumber = Math.max(1, Math.floor(i.legNumber ?? 1));
   const leg = legs.length ? legs[legNumber - 1] : undefined;
   if (!verdictCoversHeadLeg(leg, i.headSha)) {
-    // BR#4689 L1.4: carry is the DEFAULT path for a mechanical head move.
-    // The executor proved the live head is the stamped head rebased — same
-    // patch-ids, no content delta (git range-diff all-'=' pairs). The carry
-    // must extend the leg's chain tip exactly (contiguity re-checked here;
-    // the hub re-checks it again server-side when stamping `carried`). A
-    // substantive change (different patch-ids), an unprovable move, or a
-    // broken chain still bounces — fail-closed, unchanged.
-    const tip = carryChainTip(String(leg?.head_sha_at_acceptance ?? ""), leg?.carry);
-    const mv = i.mechanicalMove;
-    if (
-      mv &&
-      tip !== null &&
-      tip === mv.fromHead.toLowerCase() &&
-      /^[0-9a-f]{7,40}$/.test(mv.toHead.toLowerCase()) &&
-      mv.toHead.toLowerCase() === i.headSha.toLowerCase()
-    ) {
+    const stamped = String(leg?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
+    return { phase: "head_uncovered", legNumber, stamped };
+  }
+  const rawState = typeof i.mergeStateStatus === "string" ? i.mergeStateStatus.trim().toLowerCase() : "";
+  if (!rawState || rawState === "unknown") {
+    return {
+      phase: "mergeability_computing",
+      reason: `PR #${i.prNumber} mergeStateStatus not yet computed (null/UNKNOWN) — GitHub is computing mergeability; poll, never a defect (BR#4685)`,
+    };
+  }
+  if (i.mergeable !== true) {
+    if (i.mergeable === null) {
       return {
-        kind: "carry",
-        fromHead: tip,
-        toHead: i.headSha,
-        evidence: String(mv.evidence ?? "").slice(0, 300),
-        receipt: `PR #${i.prNumber} head moved mechanically ${tip.slice(0, 9)}→${i.headSha.slice(0, 9)} (same patch-ids, no content delta) — verdict carries as a new chain leg (BR#4689 L1.4); no bounce, no re-verify duty; merge re-gated next tick`,
+        phase: "mergeability_computing",
+        reason: "GitHub still computing mergeability — not yet, skip this tick",
       };
     }
-    const stamped = String(leg?.head_sha_at_acceptance ?? "").slice(0, 9) || "(no stamp)";
-    return {
-      kind: "bounce",
-      defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${legNumber} stamped ${stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
-      bounceKind: "coverage",
-    };
+    return { phase: "conflicting" };
   }
-  // BR#3727: mergeStateStatus=behind IS the state the carry law (BR#3516 §5)
-  // was written for — base advanced, branch still mergeable. The shared law
-  // stays clean/unstable and bounces behind: the SWEEP has no update-branch
-  // authority. The TRAIN does — its merge leg owns trial-merge →
-  // update-branch → verdict carries — so the train gate pre-clears behind
-  // here. Without it, the exact PRs the carry law was written for
-  // bounce-loop (bounce → re-verify → re-queue → behind again — nothing in
-  // the bounce flow updates the branch). Coverage is already settled above:
-  // an uncovered head bounced before this line, so behind reaching the
-  // compose is always a §5-carryable head.
-  const behind = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "behind";
-  // BR#3727: blocked with head checks merely PENDING is a clock, not a
-  // defect — strict branch protection re-runs the required checks on the
-  // head right after every machine-clean update-branch, so the tick after
-  // the carry reads blocked. Pending checks wait a tick; red checks note
-  // (the shared law's own non-in_review row). BR#4633 L4.2 (the approval
-  // anchor): blocked with GREEN checks no longer bounces — the BR verify
-  // verdict IS the approval of record, and the head move that dismissed the
-  // stale GitHub review is exactly the event L4.2 refuses to count as a
-  // lost approval. Coverage is settled above (an uncovered head bounced
-  // before this line), so blocked+green reaching the compose is a verified,
-  // covered head — the merge leg pre-clears the state (supersedes the
-  // BR#3727 "blocked+green bounce stands" posture).
-  const blocked = typeof i.mergeStateStatus === "string" && i.mergeStateStatus.toLowerCase() === "blocked";
-  if (blocked) {
-    const head = classifyHeadChecks(i.headChecks);
-    if (head.verdict === "unsettled")
-      return { kind: "skip", reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${head.unsettled.join(", ")}) — pending, not a defect; next tick` };
-    if (head.verdict === "red")
-      return { kind: "note", reason: `PR #${i.prNumber} head check RED: ${head.red.map((r) => r.name).join(", ")} — card queued (not in_review), no bounce; the linked session owns it` };
+  if (rawState !== "clean" && rawState !== "unstable" && rawState !== "behind" && rawState !== "blocked") {
+    return { phase: "unhandled_merge_state", state: rawState };
   }
-  const gate = decideMergeAction({
-    prNumber: i.prNumber,
-    prTitle: "",
-    headSha: i.headSha,
-    baseVerdict: i.baseVerdict,
-    mergeable: i.mergeable,
-    mergeStateStatus: behind || blocked ? "clean" : i.mergeStateStatus,
-    commits: i.commits,
-    headChecks: i.headChecks,
-    cardStatus: i.cardStatus,
-    verifyAcceptedOnHead: true,
-    verifyAcceptedAny: true,
-  });
-  if (gate.kind === "merge")
-    return {
-      kind: "merge",
-      receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legs.length || 1}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behind ? "behind pre-cleared — the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
-    };
-  return gate;
+  const unverified = i.commits.filter((c) => !c.verified).length;
+  if (unverified > 0) {
+    return { phase: "unverified_commits", count: unverified };
+  }
+  const head = classifyHeadChecks(i.headChecks);
+  let headState: CandidateHeadCheckState;
+  if (head.verdict === "green") {
+    headState = { kind: "green" };
+  } else if (head.verdict === "unsettled") {
+    headState = { kind: "pending", unsettled: head.unsettled };
+  } else {
+    const names = head.red.map((r) => r.name);
+    const allBaseHealth = names.length > 0 && names.every((n) => isBaseHealthGateName(n));
+    const allMainGreen = names.length > 0 && names.every((n) => n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
+    const noneMainGreen = names.every((n) => !n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
+    if (allBaseHealth && noneMainGreen) {
+      headState = { kind: "red_circular_deploy_gate", names };
+    } else if (allMainGreen) {
+      headState = { kind: "red_circular_main_green_gate", names };
+    } else if (allBaseHealth) {
+      headState = { kind: "red_circular_mixed_gates", names };
+    } else {
+      headState = { kind: "red_substantive", names };
+    }
+  }
+  return {
+    phase: "mechanically_sound",
+    legNumber,
+    legsTotal: legs.length || 1,
+    mergeState: rawState,
+    headState,
+  };
+}
+
+export function decideTrainGate(i: TrainGateInput): MergeAction {
+  const phase = classifyCandidateGatePhase(i);
+  switch (phase.phase) {
+    case "card_superseded":
+      return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
+    case "card_done":
+      return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
+    case "head_uncovered": {
+      // BR#4689 L1.4: carry is the DEFAULT path for a mechanical head move.
+      // The executor proved the live head is the stamped head rebased — same
+      // patch-ids, no content delta (git range-diff all-'=' pairs). The carry
+      // must extend the leg's chain tip exactly (contiguity re-checked here;
+      // the hub re-checks it again server-side when stamping `carried`). A
+      // substantive change (different patch-ids), an unprovable move, or a
+      // broken chain still bounces — fail-closed, unchanged.
+      const legs = trainLegs(i.cardMeta);
+      const leg = legs.length ? legs[phase.legNumber - 1] : undefined;
+      const tip = carryChainTip(String(leg?.head_sha_at_acceptance ?? ""), leg?.carry);
+      const mv = i.mechanicalMove;
+      if (
+        mv &&
+        tip !== null &&
+        tip === mv.fromHead.toLowerCase() &&
+        /^[0-9a-f]{7,40}$/.test(mv.toHead.toLowerCase()) &&
+        mv.toHead.toLowerCase() === i.headSha.toLowerCase()
+      ) {
+        return {
+          kind: "carry",
+          fromHead: tip,
+          toHead: i.headSha,
+          evidence: String(mv.evidence ?? "").slice(0, 300),
+          receipt: `PR #${i.prNumber} head moved mechanically ${tip.slice(0, 9)}→${i.headSha.slice(0, 9)} (same patch-ids, no content delta) — verdict carries as a new chain leg (BR#4689 L1.4); no bounce, no re-verify duty; merge re-gated next tick`,
+        };
+      }
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${phase.legNumber} stamped ${phase.stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
+        bounceKind: "coverage",
+      };
+    }
+    case "mergeability_computing":
+      return { kind: "skip", reason: phase.reason };
+    case "conflicting":
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} unmergeable — CONFLICTING against base. Rebase, resolve, re-push, re-enter the queue`,
+        bounceKind: "conflict",
+      };
+    case "unhandled_merge_state":
+      return {
+        kind: "bounce",
+        defect: `PR #${i.prNumber} mergeStateStatus=${phase.state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg`,
+        bounceKind: "gate",
+      };
+    case "unverified_commits":
+      return {
+        kind: "human_leg",
+        reason: `PR #${i.prNumber} has ${phase.count} commit(s) not GitHub-verified — signing-environment class, never per-PR`,
+      };
+    case "mechanically_sound": {
+      const { legNumber, legsTotal, mergeState, headState } = phase;
+      const behind = mergeState === "behind";
+      const blocked = mergeState === "blocked";
+      // (1) Stale base-health gate self-heal on a GREEN base
+      if (i.baseVerdict === "green") {
+        if (headState.kind === "red_circular_deploy_gate") {
+          return {
+            kind: "rerun_gate",
+            reason: `PR #${i.prNumber} head red is entirely the deploy-health class (${headState.names.join(", ")}) while the base is GREEN — a stale verdict stamped against a superseded main deploy; re-running the failed gate jobs, the red clears or re-convicts on the fresh run`,
+          };
+        }
+        if (i.baseGateGreen !== false && headState.kind === "red_circular_main_green_gate") {
+          return {
+            kind: "rerun_gate",
+            reason: `PR #${i.prNumber} head red is entirely the main-green gate class (${headState.names.join(", ")}) while main's tip now judges fully green under the gate's own predicate — a stale conviction stamped against a transiently-unsettled or since-settled tip (BR#5883); re-running the gate job, the red clears or re-convicts on the fresh run`,
+          };
+        }
+      }
+      // (2) Blocked with pending or red head checks
+      if (blocked) {
+        if (headState.kind === "pending") {
+          return {
+            kind: "skip",
+            reason: `PR #${i.prNumber} mergeStateStatus=blocked — required checks re-running on head ${i.headSha.slice(0, 9)} (${headState.unsettled.join(", ")}) — pending, not a defect; next tick`,
+          };
+        }
+        // BR#6012: when the base is non-green and the PR's ONLY failing head
+        // check is a circular base-health gate (`Deploy health (merge gate)` /
+        // `main-green gate`), the PR is held on the base, not broken on its own
+        // code — fall through to (3) so it returns `skip` ("base main RED / not
+        // green") and classifies as `waiting`/`ready` instead of `blocked`.
+        const onlyCircularBaseGate =
+          i.baseVerdict !== "green" &&
+          (headState.kind === "red_circular_deploy_gate" ||
+            headState.kind === "red_circular_main_green_gate" ||
+            headState.kind === "red_circular_mixed_gates");
+        if (headState.kind !== "green" && !onlyCircularBaseGate) {
+          return {
+            kind: "note",
+            reason: `PR #${i.prNumber} head check RED: ${headState.names.join(", ")} — card queued (not in_review), no bounce; the linked session owns it`,
+          };
+        }
+      }
+      // (3) Non-green base
+      if (i.baseVerdict !== "green") {
+        const w = i.baseVerdict === "red" ? "RED" : "not green";
+        return {
+          kind: "skip",
+          reason: `base main ${w} — the standing order never merges onto a non-green destination; the stop-the-line sweep owns the alert`,
+        };
+      }
+      // (4) Green base, non-blocked head check states
+      if (headState.kind === "pending") {
+        return {
+          kind: "skip",
+          reason: `head checks unsettled (${headState.unsettled.join(", ")}) — not yet, skip this tick`,
+        };
+      }
+      if (headState.kind !== "green") {
+        const names = headState.names.join(", ");
+        return i.cardStatus === "in_review"
+          ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
+          : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
+      }
+      // (5) Mechanically sound + base green + head green -> Merge.
+      // BR#4687 (L1.2): the behind pre-clear is PROVENANCE-GATED. The train
+      // machine-updates branches its own fleet authored (every commit's
+      // GitHub author on the worker allowlist); a protected human branch is
+      // not the train's to move — it still bounces to its owner with the
+      // named state. Fail-closed: an input that does not say
+      // worker-authored is human-treated.
+      const behindPrecleared = behind && i.trainOwnedBranch === true;
+      if (blocked) return { kind: "note", reason: `PR #${i.prNumber} GitHub branch policy remains BLOCKED despite observed green head checks — reconcile required checks and policy; no merge attempted` };
+      if (behind && !behindPrecleared) {
+        return {
+          kind: "bounce",
+          defect: `PR #${i.prNumber} mergeStateStatus=behind against base on a protected (non-worker-authored) branch — the train does not move human branches. Rebase, re-sign, re-push and re-enter the queue`,
+          bounceKind: "gate",
+        };
+      }
+      return {
+        kind: "merge",
+        receipt: `PR #${i.prNumber} merged by the serialized merge train (BR#3516) leg ${legNumber}/${legsTotal}: head ${i.headSha.slice(0, 9)} — verdict covers head (stamp/carry), 5c gate pass (mergeable, ${behindPrecleared ? "behind pre-cleared — worker-authored branch, the merge leg's machine-clean update-branch carries the verdict (BR#3516 §5, BR#4687)" : blocked ? "blocked pre-cleared — the BR verify verdict is the approval of record (BR#4633 L4.2)" : "clean"}, ${i.commits.length} verified commits), base green, head checks green`,
+      };
+    }
+  }
 }
 
 // ---- train event copy (titles/briefs — the ask contract: ≤240, ends "?") ----
@@ -2178,6 +3158,25 @@ export function resolveTrainBounceKind(input: {
  *  defect. The prior brief rendered EVERY bounce as "conflicts with its base
  *  … (no file list supplied)", which sent impl hunting for conflicts that
  *  were never there. */
+/** BR#5349 (Ray directive 2026-11-01): the base-red gate-bounce class — the
+ *  PR is mechanically clean (mergeable, signed) and its RED is MAIN's own,
+ *  not the PR's. Two shapes name it: the executor's head-check defect where
+ *  a red name is the circular deploy-health gate (DEPLOY_HEALTH_PATTERN —
+ *  the check exists to judge main), and any defect that names main red
+ *  directly. Telling impl "rebase / re-sign / re-approve" for this class is
+ *  the BR#5193 circular-park waste (verify sessions re-prove clean PRs while
+ *  main stays red). Returns the red check names the defect carries (possibly
+ *  empty), or null when the bounce is genuinely the PR's to fix. */
+export function trainBaseRedDefect(defect: string | null | undefined): string[] | null {
+  const d = String(defect ?? "");
+  if (!d) return null;
+  const names = (d.match(/head check RED: ([^.;]+)/i)?.[1] ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  if (names.some((n) => n.toLowerCase().includes(DEPLOY_HEALTH_PATTERN))) return names;
+  if (/\bmain\b[^.;]{0,60}\bRED\b/i.test(d) || /\bbase[-_ ]?red\b/i.test(d)) return names;
+  return null;
+}
+
 export function trainBounceBrief(input: {
   prNumber: number;
   repo: string;
@@ -2190,6 +3189,11 @@ export function trainBounceBrief(input: {
   mergeStateStatus?: string | null;
   /** the gate's defect text (the train_event's reason) */
   defect?: string | null;
+  /** BR#5349: the lane's active fix-forward card (OPEN task tagged
+   *  hotfix+main-red in the lane's project) — named by the base-red plain
+   *  brief so impl knows WHERE the cure lives instead of re-proving a clean
+   *  PR. Absent → the brief says so honestly. */
+  fixCard?: { id: string; url?: string; title?: string; status?: string } | null;
 }): string {
   const kind = resolveTrainBounceKind(input);
   const at = input.headSha ? ` at head ${input.headSha.slice(0, 9)}` : "";
@@ -2205,6 +3209,23 @@ export function trainBounceBrief(input: {
   }
   if (kind === "gate") {
     const defect = (input.defect ?? "").trim();
+    // BR#5349: base-red class — the PR is fine, MAIN is red. Plain words,
+    // zero jargon (Ray: "loud and clear and direct with no jargon") — never
+    // the mechanical rebase/re-sign loop on a clean PR.
+    const baseRed = trainBaseRedDefect(defect);
+    if (baseRed) {
+      const names = baseRed.join(", ") || "the required checks";
+      const fix = input.fixCard
+        ? `${input.fixCard.id}${input.fixCard.status === "in_progress" ? " (in progress)" : input.fixCard.status === "in_review" ? " (in review)" : input.fixCard.status === "todo" ? " (not started)" : input.fixCard.status === "blocked" ? " (parked)" : ""}`
+        : "the base-fix card (none open yet — the episode's MERGE TRAIN BLOCKED ask names the cure)";
+      return [
+        `Merge-train bounce (base-red): PR #${input.prNumber} (${input.repo}) is mechanically clean${at} — MAIN is red (${names}), and this PR's merge-gate red inherits it.`,
+        ``,
+        `**Your PR is fine — nothing to do on this PR.** It is held until main clears: the fix lives on ${fix} · or re-run the flaky check · or bypass-merge a cure PR.`,
+        ``,
+        `Once main is green the train re-queues this PR at the back${verdict} and a fresh verify accepts it (BR#3516 §5).`,
+      ].join("\n");
+    }
     return [
       `Merge-train bounce (gate): PR #${input.prNumber} (${input.repo}) failed the mechanical merge gate${at}.${input.mergeStateStatus ? ` mergeStateStatus=${String(input.mergeStateStatus).toUpperCase()}.` : ""}`,
       ``,
@@ -2243,6 +3264,42 @@ export function trainAwaitingReason(verdictId: string | null, headSha: string | 
   return `Awaiting review (verdict ${verdictId ?? "unrecorded"}, anchored at head ${String(headSha ?? "").slice(0, 9) || "unknown"})`;
 }
 
+/** BR#5226: the coverage-bounce classes that genuinely need a HUMAN leg — the
+ *  only Awaiting parks (BR#4960: a human is involved only where a machine
+ *  verdict cannot be). A machine-clean lapse (the head moved, no files, the
+ *  verdict merely lapsed) is the verify pool's business and bounces to impl
+ *  instead. These classes invalidated the verdict by HUMAN action or name a
+ *  human-only environment defect:
+ *  - human-resolved conflicts (the event carries conflict files — resolution
+ *    is authored code, the verdict is dead at the new head);
+ *  - a dismissed external review with no machine replacement;
+ *  - the signing-environment class (key unavailable / NO_USER — the verify
+ *    gate's only human escalation). */
+export const TRAIN_HUMAN_LEG_DISMISS_RE =
+  /\bdismiss\w*[\s\S]{0,60}\b(?:review|approval)s?\b|\b(?:review|approval)s?\b[\s\S]{0,60}\bdismiss\w*\b/i;
+export const TRAIN_HUMAN_LEG_SIGNING_RE = /\bsigning environment\b|\bkey unavailable\b|\bNO_USER\b/i;
+
+export function trainAwaitingHumanLeg(defect: string | null | undefined, conflictFiles: readonly string[]): boolean {
+  if (conflictFiles.length) return true;
+  const d = String(defect ?? "");
+  return TRAIN_HUMAN_LEG_DISMISS_RE.test(d) || TRAIN_HUMAN_LEG_SIGNING_RE.test(d);
+}
+
+/** BR#5226: the in-place re-queue swap every machine re-entry shares —
+ *  blocked→blocked is an illegal edge, so the parked reason refreshes under
+ *  the card: merge_train back to `queued`, the awaiting stamp cleared, the
+ *  BR#4068 boost decayed (re-entry rejoins the normal ranks), the typed
+ *  pr_merged await_event and every stamp untouched. */
+export function trainRequeueSwap(meta: any): any {
+  const m = meta && typeof meta === "object" ? { ...meta } : {};
+  m.merge_train = { ...(m.merge_train ?? {}), state: "queued" };
+  delete m.merge_train.awaiting;
+  clearConflictingEpisode(m.merge_train); // BR#6348: re-queue ends the conflicting episode
+  delete m.boosted;
+  m.blocked = { ...(m.blocked ?? {}), reason: MERGE_TRAIN_QUEUED_REASON };
+  return m;
+}
+
 /** The Awaiting park's visible-age window — knob `train.awaiting_ttl_h`
  *  (legacy `train.review_ask_ttl_h` falls back), clamped 1..720, default 24.
  *  The park NEVER expires itself (BR#4960: visibility without interruption —
@@ -2272,6 +3329,1096 @@ export function trainStopAskTitle(lane: { repo: string; base: string }, sha: str
   let names = failing.join(", ");
   if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
   return prefix + names + suffix;
+}
+
+/** Deterministic base-red alarm ask title (BR#5265 Fix A — ONE per red
+ *  episode; the red-name set makes it unique per episode, askCreate's
+ *  identical-open-ask guard dedupes the per-tick repeats). ≤240 chars,
+ *  ends "?" — the ask contract. */
+export function trainBaseRedAskTitle(lane: { repo: string; base: string }, reds: string[]): string {
+  const prefix = `MERGE TRAIN BLOCKED: base ${lane.repo}@${lane.base} RED (`;
+  const suffix = `) — the queue is held until it clears. Fix it?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let names = reds.join(", ") || "unknown check";
+  if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + names + suffix;
+}
+
+/** Deterministic gate-blocked alarm ask title (BR#5883 — ONE per gate-blocked
+ *  episode; the gate-red-name set makes it unique per episode, askCreate's
+ *  identical-open-ask guard dedupes the per-tick repeats). ≤240 chars, ends
+ *  "?" — the ask contract. */
+export function trainGateBlockedAskTitle(lane: { repo: string; base: string }, gateReds: string[]): string {
+  const prefix = `MERGE TRAIN GATE-BLOCKED: ${lane.repo}@${lane.base} passes its required workflows but the repo merge gate judges main RED (`;
+  const suffix = `) — merges fail until it clears. Fix it?`;
+  const budget = 240 - prefix.length - suffix.length;
+  let names = gateReds.join(", ") || "unknown check";
+  if (names.length > budget) names = names.slice(0, Math.max(0, budget - 1)).trimEnd() + "…";
+  return prefix + names + suffix;
+}
+
+/** The gate-blocked ask's live brief (BR#5883): the lane's required
+ *  workflows are green — the P1 base alarm reads NONE — while the repo's own
+ *  merge gate (`main-green gate`, which judges main's WHOLE tip) fails every
+ *  open PR. This is the exact 2026-11-03 starve shape that stayed silent for
+ *  3.5h+ because the required-scoped verdict certified green. The brief is
+ *  self-contained: what the gate sees, what is held, and the ways it clears. */
+export function trainGateBlockedAskBrief(
+  lane: { repo: string; base: string },
+  gateReds: { name: string; url?: string }[],
+  gateUnsettled: string[],
+  held: number,
+): { details: string; options: string[] } {
+  const broken = gateReds.length
+    ? gateReds.map((r) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")
+    : "- (no failing checks — the gate is waiting on checks that have not finished)";
+  const unsettled = gateUnsettled.length ? gateUnsettled.map((n) => `- ${n}`).join("\n") : "";
+  const details = [
+    `The merge train on **${lane.repo}** (${lane.base}) is gate-blocked: the lane's required workflows are ALL green — the usual red alarm reads none — but the repo's own merge gate check (\`main-green gate\`, which judges the WHOLE tip of ${lane.base}, not just the required list) is failing on these checks:`,
+    broken,
+    ...(unsettled ? [``, `Still running / inconclusive (the gate refuses these too):`, unsettled] : []),
+    ``,
+    `Every open PR's \`main-green gate\` run re-judges main's tip and fails while these are red, so ${held} queued change(s) cannot merge — the train looks idle-but-green while it is actually stopped. This exact shape starved the 2026-11-03 queue for 3.5h+ with no alarm (the required-scoped verdict certified green).`,
+    ``,
+    `Ways it clears: fix forward (land the cure for the named check), re-run a transient failure once its premise settled, or the check self-heals on the next tip it judges green. A stale \`main-green gate\` red on a PR re-runs automatically now (BR#5883 self-heal) when main's tip judges fully green.`,
+  ].join("\n");
+  return {
+    details,
+    options: ["(Recommended) Investigate the named checks now", "Re-run the named checks (if transient)", "Hold — I'll handle it myself"],
+  };
+}
+
+/** Plain status words for a human ask/banner (BR#5349: no jargon) — the
+ *  hub-side mirror of TrainPanel's plainStatus. */
+export function trainPlainStatus(s: string | undefined): string {
+  return s === "in_progress" ? "in progress"
+    : s === "in_review" ? "in review"
+    : s === "todo" ? "not started"
+    : s === "blocked" ? "parked"
+    : s ?? "";
+}
+
+/** The base-red alarm ask's LIVE brief (2026-11-02 Ray directive): the ask
+ *  is a triage view, not a one-shot alarm. What is broken (links), what is
+ *  held, where the fix work lives (the episode's root-fix card BR#5190 +
+ *  its cure PR once one binds), the PR that broke main, and the four ways
+ *  the red clears — transient/retry, bypass-merge the cure, manual steps,
+ *  no-resolution-yet (keep digging). Plain words only (BR#5349): no "car",
+ *  no "lane", no "verdict", no "episode". The options carry the cure PR's
+ *  NUMBER when one exists — never again "Bypass-merge a cure PR (I'll
+ *  reply with the number)", an option that demanded a number the one-shot
+ *  ask could never learn: the executor refreshes the open ask in place
+ *  every tick while the base is red, so the number surfaces the moment it
+ *  binds to the fix card. */
+export function trainBaseRedAskBrief(
+  lane: { repo: string; base: string },
+  reds: { name: string; url?: string }[],
+  held: number,
+  fix: {
+    card: { id: string; title?: string; status?: string; exhausted?: boolean; blocked_reason?: string } | null;
+    curePr: { repo: string; number: number } | null;
+    culpritPr: number | null;
+  },
+): { details: string; options: string[] } {
+  const broken = reds.length
+    ? reds.map((r) => `- ${r.name}${r.url ? ` — ${r.url}` : ""}`).join("\n")
+    : "- (the failing check names were not available this tick)";
+  // BR#5516: triage-before-menu — the ask carries a first-hand READ of each
+  // red check (name-shape classification; the hub has no logs, so this is
+  // honest about what is knowable hub-side) so the human never answers the
+  // template default blind. The 2026-11-02 episode: "Transient — re-run" was
+  // answered on a structurally self-failing gate run, burning a cycle and
+  // re-arming the ask.
+  const readOf = reds.map((r) => {
+    const n = r.name.toLowerCase();
+    if (/\bgate\b|main[- ]green/.test(n))
+      return `- ${r.name}: the gate itself is the failing check — almost always self-referential or destination-state, and a re-run fails IDENTICALLY. Read the gate log, then fix forward or bypass-merge the cure. Do not answer RETRY blind.`;
+    if (/deploy|smoke|health/.test(n))
+      return `- ${r.name}: a deploy-side check — the deployed state is failing, not the merge diff. Check the deploy logs before re-running anything.`;
+    return `- ${r.name}: diagnosis pending — a session must read the failing job log before RETRY is safe; re-running a structural failure burns a cycle and re-arms this ask.`;
+  });
+  const details = [
+    `Main on **${lane.repo}** is broken: these required checks are failing on its latest commit (${lane.base}):`,
+    broken,
+    ``,
+    `**Read of the red (triage before you answer):**`,
+    ...(readOf.length ? readOf : ["- (no check names this tick — hold the line)"]),
+    ``,
+    `**${held} PR${held === 1 ? "" : "s"} held.** Nothing merges until main is green again — that is deliberate: no change lands on top of a broken main. The queue drains by itself the moment main recovers; nothing further is needed from you then.`,
+    ``,
+    `**Where the fix work lives:**`,
+    fix.card
+      ? `- Fix card ${fix.card.id}${fix.card.status ? ` (${trainPlainStatus(fix.card.status)})` : ""}${fix.card.title ? ` — ${fix.card.title}` : ""}`
+      : `- No fix card is open yet — the red has not been diagnosed; the next agent session picks it up from the queue.`,
+    fix.curePr
+      ? `- A fix PR is open: ${fix.curePr.repo}#${fix.curePr.number} — https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`
+      : `- No fix PR is open yet — it appears here automatically the moment one binds to the fix card.`,
+    fix.culpritPr ? `- The PR that broke main: #${fix.culpritPr}` : ``,
+    // BR#6390 (Ray 2026-11-05): a bound cure PR turns the ask into a HUMAN
+    // GATE — "do this thing and click DONE when done to unblock". The act is
+    // YOURS (out-of-turn bypass merge is human authority, BR#4122/BR#5450:
+    // "I am the bypass actor — do not try and automate bypass merges, you
+    // MUST escalate to me"); the options say whether it is done, nothing else.
+    ...(fix.curePr
+      ? [
+          ``,
+          `# HUMAN GATE — your one action`,
+          `Merge fix PR **${fix.curePr.repo}#${fix.curePr.number}** yourself, then click **DONE** below:`,
+          ``,
+          `1. Open the PR: https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`,
+          `2. Merge it (Squash and merge — you hold the bypass) or run:`,
+          `   \`\`\``,
+          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+          `   \`\`\``,
+          `3. Come back here and click **DONE — PR #${fix.curePr.number} merged**.`,
+          ``,
+          `Why you: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`. Bridge's gateway cannot bypass branch protection (no admin). When you click DONE, the train picks up the merge, waits out main's deploy, and the ${held} held PR${held === 1 ? "" : "s"} drain automatically.`,
+          ``,
+          `If you **DECLINE**: the line holds — nothing merges until main is green again, and agent sessions keep fixing on ${fix.card ? fix.card.id : "the fix card"}. The queue drains by itself the moment main recovers.`,
+        ]
+      : fix.card?.exhausted
+        ? [
+            ``,
+            `**Why this needs you (automatic fix work is stuck):**`,
+            `- Fix card **${fix.card.id}** stopped progressing after repeated attempts${fix.card.blocked_reason ? ` (${fix.card.blocked_reason})` : ""} without producing a mergeable fix PR, and no agent is currently working on it.`,
+            `- Choose **Re-arm** to reset and re-queue ${fix.card.id} at top priority for a fresh agent session, **Transient** to re-run the failing check on GitHub, or **Other** to describe manual steps.`,
+          ]
+        : []),
+    ``,
+    fix.curePr
+      ? `**Other ways this clears:** the fix lands through the line itself once main recovers (no action from you), a transient check clears on re-run, or you answer in your own words with manual steps.`
+      : `**The four ways this clears:** (1) transient — internet weather or a flaky check: answer RETRY and the check re-runs; (2) manual steps on your side: answer OTHER and describe them; (3) no resolution found yet: the fix card stays open and agent sessions keep digging — the queue still drains itself once main is green; (4) if a fix PR binds later, this ask becomes a HUMAN GATE (you merge it, click DONE).`,
+  ].filter((l) => l !== undefined).join("\n");
+  // BR#6390 (Ray 2026-11-05): the cure-bound ask is ACCEPT/DECLINE shape —
+  // "just to say if it is done or not". DONE records the human's merge
+  // (trainAlarmAnswerDispatch stamps lane.bypass_merge so the executor's next
+  // tick observes/lands it); DECLINE holds the line and suppresses re-asks
+  // for this episode+PR. Free text remains available for anything else.
+  const options = fix.curePr
+    ? [
+        `DONE — PR #${fix.curePr.number} merged`,
+        `DECLINE — hold the line`,
+      ]
+    : fix.card?.exhausted
+      ? [
+          `Other — manual steps (I'll reply)`,
+          `Re-arm — re-issue the fix card with fresh direction`,
+          `Hold the line — the queue drains itself once main is green`,
+        ]
+      : [
+          `Hold the line — the fix work continues${fix.card ? ` on ${fix.card.id}` : ""}`,
+          `Transient — re-run the failing check`,
+          `Other — manual steps (I'll reply)`,
+          `No resolution yet — keep digging on the fix card`,
+        ];
+  return { details, options };
+}
+
+/** 2026-11-03 Ray ruling (BR#5631, from the BR#5626 escalation): the
+ *  base-red alarm asks the human ONLY when the episode has a
+ *  human-actionable act on the table —
+ *  - a cure PR is bound to the fix work (the out-of-turn bypass merge is
+ *    human authority, BR#4122: "Give me the PR url and ask to bypass"), or
+ *  - the fix path is EXHAUSTED (the fix card churned out of attempts or is
+ *    escalated — manual steps / a fresh human direction are the only
+ *    levers left).
+ *  Everything else is agent-workable and fully automatic: root-fix card at
+ *  absolute p0 (BR#5190), lane BLOCKED reason + banner (what's broken, PRs
+ *  held, fix card link — informational, ask:null), queue self-drains the
+ *  moment main is green (BR#4692). An ask there would only demand a
+ *  pointless "keep going" click. */
+/** BR#6012 closed state machine for a base-red episode's resolution phase.
+ *  Makes illegal states unrepresentable:
+ *  - `diagnosing` / `fix_in_progress` / `cure_pr_conflicting` NEVER warrant a
+ *    human ask (`warrantAsk: false`) and NEVER carry a `curePr`.
+ *  - `cure_pr_awaiting_force_merge` ALWAYS carries a non-conflicting `curePr`
+ *    owned by `card` and the exact `--admin` command.
+ *  - `fix_exhausted` warrants a manual-intervention ask with `curePr: null`. */
+export type BaseRedEpisodeState =
+  | {
+      phase: "diagnosing";
+      warrantAsk: false;
+      card: null;
+      curePr: null;
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "fix_in_progress";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted: false };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_conflicting";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: null;
+      conflictPr: { repo: string; number: number };
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_merged_awaiting_ci";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: { repo: string; number: number; merge_sha: string };
+      culpritPr: number | null;
+    }
+  | {
+      phase: "cure_pr_awaiting_force_merge";
+      warrantAsk: true;
+      card: { id: string; title: string; status: string; exhausted?: boolean };
+      curePr: { repo: string; number: number };
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+      command: string;
+    }
+  | {
+      phase: "fix_exhausted";
+      warrantAsk: true;
+      card: { id: string; title: string; status: string; exhausted: true };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+    };
+
+export function classifyBaseRedEpisodeState(fix: {
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
+  curePr?: { repo: string; number: number } | null;
+  conflictPr?: { repo: string; number: number } | null;
+  mergedPr?: { repo: string; number: number; merge_sha: string } | null;
+  culpritPr?: number | null;
+}): BaseRedEpisodeState {
+  const culpritPr = fix?.culpritPr ?? null;
+  const rawCard = fix?.card && fix.card.id
+    ? {
+        id: String(fix.card.id),
+        title: String(fix.card.title ?? ""),
+        status: String(fix.card.status ?? ""),
+        exhausted: !!fix.card.exhausted,
+      }
+    : null;
+  if (fix?.curePr && Number.isInteger(fix.curePr.number) && fix.curePr.number > 0 && !fix.conflictPr && !fix.mergedPr) {
+    const card = rawCard ?? {
+      id: `PR#${fix.curePr.number}`,
+      title: "",
+      status: "blocked",
+      exhausted: false,
+    };
+    return {
+      phase: "cure_pr_awaiting_force_merge",
+      warrantAsk: true,
+      card,
+      curePr: { repo: fix.curePr.repo, number: fix.curePr.number },
+      conflictPr: null,
+      mergedPr: null,
+      culpritPr,
+      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+    };
+  }
+  if (fix?.mergedPr && Number.isInteger(fix.mergedPr.number) && fix.mergedPr.number > 0) {
+    const card = rawCard ?? {
+      id: `PR#${fix.mergedPr.number}`,
+      title: "",
+      status: "in_progress",
+      exhausted: false,
+    };
+    return {
+      phase: "cure_pr_merged_awaiting_ci",
+      warrantAsk: false,
+      card,
+      curePr: null,
+      conflictPr: null,
+      mergedPr: { repo: fix.mergedPr.repo, number: fix.mergedPr.number, merge_sha: String(fix.mergedPr.merge_sha ?? "") },
+      culpritPr,
+    };
+  }
+  if (fix?.conflictPr && Number.isInteger(fix.conflictPr.number) && fix.conflictPr.number > 0 && rawCard) {
+    return {
+      phase: "cure_pr_conflicting",
+      warrantAsk: false,
+      card: rawCard,
+      curePr: null,
+      conflictPr: { repo: fix.conflictPr.repo, number: fix.conflictPr.number },
+      mergedPr: null,
+      culpritPr,
+    };
+  }
+  if (!rawCard) {
+    return { phase: "diagnosing", warrantAsk: false, card: null, curePr: null, conflictPr: null, mergedPr: null, culpritPr };
+  }
+  if (rawCard.exhausted) {
+    return {
+      phase: "fix_exhausted",
+      warrantAsk: true,
+      card: { ...rawCard, exhausted: true },
+      curePr: null,
+      conflictPr: null,
+      mergedPr: null,
+      culpritPr,
+    };
+  }
+  return {
+    phase: "fix_in_progress",
+    warrantAsk: false,
+    card: { ...rawCard, exhausted: false },
+    curePr: null,
+    conflictPr: null,
+    mergedPr: null,
+    culpritPr,
+  };
+}
+
+export function trainBaseRedAskWarranted(fix: {
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
+  curePr?: unknown;
+  conflictPr?: unknown;
+  mergedPr?: unknown;
+}): boolean {
+  const curePr =
+    fix?.curePr && typeof fix.curePr === "object" && Number.isInteger((fix.curePr as any).number) && (fix.curePr as any).number > 0
+      ? { repo: String((fix.curePr as any).repo ?? ""), number: Number((fix.curePr as any).number) }
+      : fix?.curePr != null
+        ? { repo: "repo", number: 1 }
+        : null;
+  const conflictPr =
+    fix?.conflictPr && typeof fix.conflictPr === "object" && Number.isInteger((fix.conflictPr as any).number) && (fix.conflictPr as any).number > 0
+      ? { repo: String((fix.conflictPr as any).repo ?? ""), number: Number((fix.conflictPr as any).number) }
+      : null;
+  const mergedPr =
+    fix?.mergedPr && typeof fix.mergedPr === "object" && Number.isInteger((fix.mergedPr as any).number) && (fix.mergedPr as any).number > 0
+      ? { repo: String((fix.mergedPr as any).repo ?? ""), number: Number((fix.mergedPr as any).number), merge_sha: String((fix.mergedPr as any).merge_sha ?? "") }
+      : null;
+  const card = fix?.card
+    ? { id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted }
+    : null;
+  return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
+}
+
+/** BR#6012 canonical 4-state operational state machine for a merge lane.
+ *  Resolves `stop`, `currently`, and `base_red_resolution` into a single
+ *  mutually-exclusive `LaneOperationalState` (`idle` | `draining_batch` |
+ *  `settling_ci` | `stopped_red`), persisted atomically in the `lane_state`
+ *  SQLite table so the hub and UI never reconstruct state from contradictory
+ *  fragments. */
+export function resolveLaneOperationalState(input: {
+  baseState?: { verdict?: string; tip_sha?: string; red?: { name: string; url?: string }[] } | null;
+  stop?: {
+    sha?: string;
+    reason?: string;
+    failing?: { name: string; url?: string }[];
+    culprit_task?: string;
+  } | null;
+  currently?: {
+    phase?: string;
+    pr?: number;
+    merge_sha?: string;
+    task_id?: string;
+    merged_at?: number;
+    burst_merged?: number;
+    burst_cap?: number;
+  } | null;
+  episodeState?: BaseRedEpisodeState | null;
+  fixCard?: TrainFixCard | null;
+  now: number;
+}): LaneOperationalState {
+  const { currently, episodeState, fixCard, now } = input;
+  const stop = input.baseState?.verdict === "red" && input.baseState.tip_sha
+    ? { sha: input.baseState.tip_sha, failing: input.baseState.red ?? [], culprit_task: input.stop?.culprit_task }
+    : input.stop;
+  if (stop && stop.sha) {
+    const failingChecks = Array.isArray(stop.failing)
+      ? stop.failing.map((f) => ({ name: String(f.name ?? ""), ...(f.url ? { url: String(f.url) } : {}) })).filter((f) => f.name)
+      : [];
+    return {
+      phase: "stopped_red",
+      failing_sha: String(stop.sha),
+      failing_checks: failingChecks,
+      culprit_task: stop.culprit_task ? String(stop.culprit_task) : null,
+      episode_phase: episodeState?.phase ?? "diagnosing",
+      fix_card: fixCard ?? null,
+      updated_ts: now,
+    };
+  }
+  if (currently && Number(currently.pr) > 0 && currently.merge_sha) {
+    if (currently.phase === "bursting") {
+      return {
+        phase: "draining_batch",
+        pr: Number(currently.pr),
+        merge_sha: String(currently.merge_sha),
+        task_id: currently.task_id ? String(currently.task_id) : null,
+        burst_merged: Math.max(0, Math.floor(Number(currently.burst_merged ?? 1))),
+        burst_cap: Math.max(0, Math.floor(Number(currently.burst_cap ?? DEFAULT_BURST_MAX))),
+        updated_ts: now,
+      };
+    }
+    if (currently.phase === "awaiting-ci") {
+      return {
+        phase: "settling_ci",
+        pr: Number(currently.pr),
+        merge_sha: String(currently.merge_sha),
+        task_id: currently.task_id ? String(currently.task_id) : null,
+        merged_at: Number(currently.merged_at ?? now),
+        updated_ts: now,
+      };
+    }
+  }
+  return {
+    phase: "idle",
+    updated_ts: now,
+  };
+}
+
+/** BR#5376: the deterministic batch-stall alarm ask title — ONE per stall
+ *  episode. Unlike the base-red title it carries NO varying names (the
+ *  episode's identity IS the lane): askCreate's identical-open-ask guard
+ *  dedupes the per-tick repeats on the exact string, so the title must
+ *  contain no tick counts, no ages, no PR lists. ≤240 chars, ends "?" —
+ *  the ask contract. */
+export function trainStallAskTitle(lane: { repo: string; base: string }): string {
+  return `MERGE TRAIN STALLED: ${lane.repo}@${lane.base} — PRs selected to merge are not landing. Restart the executor?`;
+}
+
+/** BR#5674 P4: merge-starvation threshold — when a lane holds cars (derived
+ *  queue OR awaiting set) with zero merges for >1h and no stop-the-line
+ *  episode is active, the hub fires ONE human ask + spawns ONE diagnostic
+ *  duty per episode. */
+export const TRAIN_MERGE_STARVE_MS = 60 * 60_000;
+
+/** Deterministic merge-starvation ask title (BR#5674 P4 — ONE per starvation
+ *  episode; askCreate's identical-open-ask guard dedupes on exact title, so
+ *  the title carries no changing minute/car counts). ≤240 chars, ends "?". */
+export function trainStarvationAskTitle(lane: { repo: string; base: string }): string {
+  const prefix = `MERGE TRAIN STARVED: ${lane.repo}@${lane.base} — `;
+  const suffix = `>1h with zero merges while holding cars. Diagnose or bypass?`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "?" : suffix);
+}
+
+export type TrainStarvationDiagnosisInput = {
+  lane: { repo: string; base: string };
+  laneId: string;
+  blockedReason: string;
+  baseVerdict: string;
+  requiredWorkflows: string[];
+  redNames: string[];
+  unsettledNames: string[];
+  baseAlarm: string | null;
+  /** BR#5883: the gate-consumed qualifier's names — what the repo's own
+   *  merge gate judges red/unsettled on the tip while the scoped verdict
+   *  reads green (empty when no qualifier rode the stamp). */
+  gateRedNames?: string[];
+  gateUnsettledNames?: string[];
+  queue: { id: string; pr?: number }[];
+  awaiting: { task: string; pr?: number }[];
+  lastMergeTs: number | null;
+  mins: number;
+  dutyId?: string | null;
+};
+
+export function trainStarvationAskDetails(i: TrainStarvationDiagnosisInput): string {
+  const qList = i.queue.length
+    ? i.queue.map((q) => `${q.id}${q.pr ? ` (PR #${q.pr} on ${i.lane.repo})` : ""}`).join(", ")
+    : "none";
+  const aList = i.awaiting.length
+    ? i.awaiting.map((a) => `${a.task}${a.pr ? ` (PR #${a.pr} on ${i.lane.repo})` : ""}`).join(", ")
+    : "none";
+  const lastMergeLine = i.lastMergeTs
+    ? `${new Date(i.lastMergeTs).toISOString()} (epoch ${i.lastMergeTs} — ${i.mins}m ago)`
+    : `none recorded (${i.mins}m without a merge)`;
+  const namesLine = i.redNames.length
+    ? `red: ${i.redNames.join(", ")}`
+    : i.unsettledNames.length
+      ? `unsettled: ${i.unsettledNames.join(", ")}`
+      : i.requiredWorkflows.length
+        ? `required: ${i.requiredWorkflows.join(", ")}`
+        : "none";
+  return [
+    `Merge lane **${i.lane.repo}@${i.lane.base}** (standing lane card ${i.laneId}) has held cars for **${i.mins}m (>1h)** with **zero merges** and no active stop-the-line episode.`,
+    ``,
+    `**Full diagnosis snapshot:**`,
+    `- **Blocked reason:** ${i.blockedReason || "(none)"}`,
+    `- **Base verdict:** \`${i.baseVerdict}\` (${namesLine})`,
+    ...(i.baseAlarm ? [`- **Base alarm (P1 empty-is-loud):** ${i.baseAlarm}`] : []),
+    `- **Queue + awaiting counts:** ${i.queue.length} queued (${qList}) · ${i.awaiting.length} awaiting (${aList})`,
+    `- **Last merge timestamp:** ${lastMergeLine}`,
+    ...(i.dutyId ? [`- **Auto-spawned diagnostic duty:** ${i.dutyId} (agent-executable task card, tags \`merge-train\`, \`diagnostic\`)`] : []),
+    ``,
+    `**Why this needs attention:** the lane is holding cars without merging and without a stop-the-line halt (the 2026-11-02/03 10.6h silent-outage class). An agent diagnostic duty has been spawned automatically at top priority to inspect pagination/naming of required workflows, base check-run counts, verify pool depth, and parked card exits. Any merge on this lane clears the episode automatically.`,
+  ].join("\n");
+}
+
+export function trainStarvationDutyTitle(lane: { repo: string; base: string }, queueCount: number, awaitingCount: number): string {
+  const prefix = `Diagnose starved merge train: ${lane.repo}@${lane.base} — `;
+  const suffix = `>1h with 0 merges (${queueCount} queued, ${awaitingCount} awaiting)`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "…" : suffix);
+}
+
+export function trainStarvationDutyBody(i: TrainStarvationDiagnosisInput): string {
+  return [
+    `# Merge-train starvation diagnostic duty — ${i.lane.repo}@${i.lane.base}`,
+    ``,
+    `Auto-spawned by the P4 starvation alarm (decision BR#5674) because lane **${i.lane.repo}@${i.lane.base}** (card ${i.laneId}) has held cars with **0 merges for ${i.mins}m (>1h)** while no stop-the-line episode is active.`,
+    ``,
+    `## Diagnosis snapshot at alarm time`,
+    `- **Lane:** \`${i.lane.repo}@${i.lane.base}\` (${i.laneId})`,
+    `- **Blocked reason:** ${i.blockedReason || "(none)"}`,
+    `- **Base verdict:** \`${i.baseVerdict}\``,
+    `- **Required workflows:** ${i.requiredWorkflows.length ? i.requiredWorkflows.map((w) => `\`${w}\``).join(", ") : "(unconfigured — whole tip)"}`,
+    `- **Failing base checks:** ${i.redNames.length ? i.redNames.join(", ") : "none"}`,
+    `- **Unsettled base checks:** ${i.unsettledNames.length ? i.unsettledNames.join(", ") : "none"}`,
+    `- **Base alarm (P1):** ${i.baseAlarm ?? "none"}`,
+    ...(i.gateRedNames?.length || i.gateUnsettledNames?.length
+      ? [
+          `- **Gate-blocked (BR#5883):** the scoped verdict reads \`${i.baseVerdict}\` but the repo's own merge gate judges the tip ${i.gateRedNames?.length ? `RED on: ${i.gateRedNames.join(", ")}` : ""}${i.gateUnsettledNames?.length ? `${i.gateRedNames?.length ? "; " : ""}unsettled: ${i.gateUnsettledNames.join(", ")}` : ""} — every queued PR's \`main-green gate\` run fails on these until they settle`,
+        ]
+      : []),
+    `- **Queue count:** ${i.queue.length} (${i.queue.map((q) => `${q.id}${q.pr ? `#${q.pr}` : ""}`).join(", ") || "none"})`,
+    `- **Awaiting count:** ${i.awaiting.length} (${i.awaiting.map((a) => `${a.task}${a.pr ? `#${a.pr}` : ""}`).join(", ") || "none"})`,
+    `- **Last merge ts:** ${i.lastMergeTs ? `${new Date(i.lastMergeTs).toISOString()} (${i.lastMergeTs}, ${i.mins}m ago)` : `none (${i.mins}m starved)`}`,
+    ``,
+    `## What to check (agent checklist)`,
+    `1. **\`per_page\` / pagination and naming of \`required_workflows\`**: run \`gh api "repos/${i.lane.repo}/commits/${i.lane.base}/check-runs?per_page=100"\` and compare actual check-run names against \`required_workflows\`. Did required runs fall past page 1 or change workflow/job names?`,
+    `2. **Base runs count on tip**: verify total check-runs count on \`${i.lane.base}\` tip vs matched required runs (\`base_state.alarm\`). If a required check failed transiently, re-run it (\`gh run rerun\`) or open/bind the root-fix cure PR.`,
+    `3. **Verify pool depth**: check \`queue_awaiting_review\` and open \`Verify:\` tasks — are verify duties backed up or bouncing in a coverage loop?`,
+    `4. **Park exits (\`awaiting\` / \`blocked\` cards)**: inspect every card in \`awaiting\` and \`queue\` — confirm each has a valid \`head_sha_at_acceptance\` covering its live PR head and a live machine exit (\`awaiting_sweep\` / \`pr_merged\` proxy).`,
+  ].join("\n");
+}
+
+// ---------- BR#6179 level-based deploy reconciliation (dark-tip self-heal) ----------
+
+/** Default grace window (5 minutes) before an uncovered tip triggers automatic
+ *  `workflow_dispatch` and fast-page escalation (BR#6179). */
+export const DEPLOY_RECONCILE_GRACE_SECS = 300;
+
+export type DeployWorkflowRun = {
+  id: number;
+  name: string;
+  path?: string | null;
+  head_sha: string;
+  event?: string | null;
+  status?: string | null;
+  conclusion?: string | null;
+  html_url?: string | null;
+};
+
+export type DeployReconcilePlan = {
+  coverage: DeployCoverageState;
+  /** Workflow filename (e.g. `deploy-dev.yml`) to dispatch via `gh workflow run`
+   *  when the tip is uncovered past the grace window and not yet dispatched. */
+  dispatch_workflow: string | null;
+  /** Redundant queued/waiting/pending workflow run IDs to cancel via `gh run cancel`
+   *  because the same `head_sha` is already covered by an `in_progress` or
+   *  `completed/success` deploy run (or a newer duplicate queued run). */
+  cancel_run_ids: number[];
+  /** SHA covered by the newest decisive green deploy run on the branch (if any). */
+  covered_by_sha: string | null;
+  /** Age of the uncovered tip in seconds (0 when `coverage.phase === "covered"`). */
+  coverage_age_secs: number;
+};
+
+/** Parse an ISO-8601 timestamp (e.g. `"2026-11-04T08:01:57Z"`) to epoch ms, or null. */
+export function parseIso8601EpochMs(s: string | null | undefined): number | null {
+  if (!s || typeof s !== "string") return null;
+  const trimmed = s.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+/** True when a workflow run represents the lane's primary deploy workflow
+ *  (e.g. `Deploy Dev` / `.github/workflows/deploy-dev.yml`) rather than a
+ *  secondary observer/gate (`Deploy Health Record`, `Deploy drift alarm`,
+ *  `Deploy health (merge gate)`). Mirrored in `train_gate.rs` `is_deploy_workflow_run`. */
+export function isDeployWorkflowRun(r: DeployWorkflowRun, required: string[]): boolean {
+  const nameLower = (r.name ?? "").trim().toLowerCase();
+  const pathLower = (r.path ?? "").trim().toLowerCase();
+  if (
+    nameLower.includes("health record") ||
+    nameLower.includes("drift alarm") ||
+    nameLower.includes("merge gate") ||
+    pathLower.endsWith("deploy-health.yml") ||
+    pathLower.endsWith("deploy-drift.yml")
+  ) {
+    return false;
+  }
+  if (pathLower.endsWith("/deploy-dev.yml") || pathLower === "deploy-dev.yml" || pathLower.endsWith("/deploy.yml") || pathLower === "deploy.yml") {
+    return true;
+  }
+  if (nameLower === "deploy dev" || nameLower === "deploy" || nameLower.startsWith("deploy to ")) {
+    return true;
+  }
+  for (const req of required) {
+    const reqLower = req.trim().toLowerCase();
+    const slashIdx = reqLower.indexOf(" / ");
+    const prefix = slashIdx >= 0 ? reqLower.slice(0, slashIdx).trim() : reqLower;
+    if (prefix && (nameLower === prefix || nameLower === `${prefix} dev`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Infer the dispatchable workflow filename (e.g. `"deploy-dev.yml"`) from
+ *  observed workflow runs and the lane's `required_workflows`. Mirrored in
+ *  `train_gate.rs` `infer_deploy_workflow`. */
+export function inferDeployWorkflow(required: string[], workflowRuns: DeployWorkflowRun[]): string | null {
+  const sorted = [...workflowRuns].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+  for (const r of sorted) {
+    if (!isDeployWorkflowRun(r, required)) continue;
+    const rawPath = (r.path ?? "").trim();
+    if (rawPath) {
+      const file = rawPath.split("/").pop() ?? "";
+      if ((file.endsWith(".yml") || file.endsWith(".yaml")) && file !== "deploy.yml") {
+        return file;
+      }
+    }
+  }
+  for (const r of sorted) {
+    if (!isDeployWorkflowRun(r, required)) continue;
+    const rawPath = (r.path ?? "").trim();
+    if (rawPath) {
+      const file = rawPath.split("/").pop() ?? "";
+      if (file.endsWith(".yml") || file.endsWith(".yaml")) {
+        return file;
+      }
+    }
+    if ((r.name ?? "").trim().toLowerCase() === "deploy dev") {
+      return "deploy-dev.yml";
+    }
+  }
+  const hasDeployReq = required.some((w) => {
+    const lw = w.trim().toLowerCase();
+    return lw.startsWith("deploy /") || lw.startsWith("post-deploy /") || lw === "deploy dev";
+  });
+  if (hasDeployReq) return "deploy-dev.yml";
+  return null;
+}
+
+function isQueuedWorkflowStatus(status: string | null | undefined): boolean {
+  const s = (status ?? "").trim().toLowerCase();
+  return s === "queued" || s === "waiting" || s === "pending" || s === "requested";
+}
+
+function isInProgressWorkflowStatus(status: string | null | undefined): boolean {
+  return (status ?? "").trim().toLowerCase() === "in_progress";
+}
+
+/** Pure level-based deploy coverage & reconciliation state machine (BR#6179):
+ *  - Computes `DeployCoverageState` (closed 6-state union on `phase`).
+ *  - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
+ *    per `tipSha` when the tip is uncovered past `graceSecs` with no active run.
+ *  - Identifies redundant queued deploy runs (`cancel_run_ids`) when the same
+ *    `head_sha` already has an `in_progress` or `completed/success` deploy run
+ *    (or duplicate queued runs for the same `head_sha`).
+ *  Mirrored in `train_gate.rs` `reconcile_deploy_coverage`. */
+export function reconcileDeployCoverage(input: {
+  tipSha: string;
+  tipAgeSecs: number;
+  graceSecs?: number;
+  baseVerdict: MainCheckVerdict;
+  required: string[];
+  workflowRuns: DeployWorkflowRun[];
+  alreadyDispatchedAt?: number | null;
+}): DeployReconcilePlan {
+  const tipSha = (input.tipSha ?? "").trim();
+  const tipAgeSecs = Math.max(0, Math.floor(Number(input.tipAgeSecs ?? 0) || 0));
+  const graceSecs = Math.max(1, Math.floor(Number(input.graceSecs ?? DEPLOY_RECONCILE_GRACE_SECS) || DEPLOY_RECONCILE_GRACE_SECS));
+  const deployRuns = input.workflowRuns
+    .filter((r) => isDeployWorkflowRun(r, input.required))
+    .sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+
+  const newestGreen = deployRuns.find(
+    (r) => (r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success",
+  );
+  const lastGreenSha = newestGreen?.head_sha ? newestGreen.head_sha : null;
+  const lastGreenRunId = newestGreen?.id ?? null;
+
+  // (D) Redundant queued runs per head_sha:
+  // If a head_sha already has an in_progress or completed/success deploy run,
+  // any queued/waiting/pending/requested deploy run for that same head_sha is redundant.
+  // If a head_sha has multiple queued runs, all but the newest queued run are redundant.
+  const bySha = new Map<string, DeployWorkflowRun[]>();
+  for (const r of deployRuns) {
+    const sha = (r.head_sha ?? "").trim();
+    if (!sha) continue;
+    const list = bySha.get(sha) ?? [];
+    list.push(r);
+    bySha.set(sha, list);
+  }
+  const cancelRunIds: number[] = [];
+  for (const [, list] of bySha) {
+    const hasActiveOrGreen = list.some(
+      (r) =>
+        isInProgressWorkflowStatus(r.status) ||
+        ((r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success"),
+    );
+    const queued = list.filter((r) => isQueuedWorkflowStatus(r.status));
+    if (hasActiveOrGreen) {
+      for (const q of queued) {
+        if (q.id > 0 && !cancelRunIds.includes(q.id)) cancelRunIds.push(q.id);
+      }
+    } else if (queued.length > 1) {
+      for (const q of queued.slice(1)) {
+        if (q.id > 0 && !cancelRunIds.includes(q.id)) cancelRunIds.push(q.id);
+      }
+    }
+  }
+
+  const tipRuns = deployRuns.filter((r) => r.head_sha === tipSha);
+  const tipActive = tipRuns.find(
+    (r) => (isInProgressWorkflowStatus(r.status) || isQueuedWorkflowStatus(r.status)) && !cancelRunIds.includes(r.id),
+  );
+  const tipGreen = tipRuns.find(
+    (r) => (r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success",
+  );
+  const tipRed = tipRuns.find(
+    (r) =>
+      (r.status ?? "").toLowerCase() === "completed" &&
+      r.conclusion != null &&
+      r.conclusion !== "cancelled" &&
+      MAIN_RED_CONCLUSIONS.has(r.conclusion),
+  );
+
+  const newestTip = tipRuns.find((r) => !["cancelled", "skipped"].includes(r.conclusion ?? ""));
+  const decisiveFailure = newestTip?.status === "completed" && MAIN_RED_CONCLUSIONS.has(newestTip.conclusion ?? "");
+  if (input.baseVerdict.verdict === "green" && !decisiveFailure && !tipActive &&
+      (tipGreen || !inferDeployWorkflow(input.required, input.workflowRuns))) {
+    return {
+      coverage: {
+        phase: "covered",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        covered_by_sha: tipSha,
+        covered_by_run_id: tipGreen?.id ?? null,
+        covered_by_url: tipGreen?.html_url ?? null,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: tipSha,
+      coverage_age_secs: 0,
+    };
+  }
+
+  if (input.baseVerdict.verdict === "red" || decisiveFailure) {
+    return {
+      coverage: {
+        phase: "failed",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        failing_run_id: tipRed?.id ?? null,
+        failing_run_url: tipRed?.html_url ?? null,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  if (input.baseVerdict.verdict === "unsettled" || tipActive) {
+    return {
+      coverage: {
+        phase: "settling",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        active_run_id: tipActive?.id ?? null,
+        active_run_url: tipActive?.html_url ?? null,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  // Uncovered tip (`baseVerdict.verdict === "empty"` and no active deploy workflow run on `tipSha`)
+  const workflow = inferDeployWorkflow(input.required, input.workflowRuns);
+  if (input.alreadyDispatchedAt != null && input.alreadyDispatchedAt > 0) {
+    return {
+      coverage: {
+        phase: "uncovered_dispatched",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        workflow: workflow ?? "deploy-dev.yml",
+        dispatched_at: Math.floor(input.alreadyDispatchedAt),
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  if (tipAgeSecs < graceSecs) {
+    return {
+      coverage: {
+        phase: "uncovered_grace",
+        tip_sha: tipSha,
+        tip_age_secs: tipAgeSecs,
+        grace_secs: graceSecs,
+        workflow,
+        last_green_sha: lastGreenSha,
+        last_green_run_id: lastGreenRunId,
+      },
+      dispatch_workflow: null,
+      cancel_run_ids: cancelRunIds,
+      covered_by_sha: lastGreenSha,
+      coverage_age_secs: tipAgeSecs,
+    };
+  }
+
+  const onlyCancelledOrSkipped =
+    tipRuns.length > 0 &&
+    tipRuns.every((r) => {
+      const c = (r.conclusion ?? "").toLowerCase();
+      return c === "cancelled" || c === "skipped";
+    });
+  const reason = onlyCancelledOrSkipped
+    ? "all deploy runs on tip were cancelled/skipped"
+    : "no deploy workflow run fired on tip (push trigger suppressed or run deleted)";
+
+  return {
+    coverage: {
+      phase: "uncovered_dark",
+      tip_sha: tipSha,
+      tip_age_secs: tipAgeSecs,
+      grace_secs: graceSecs,
+      workflow,
+      last_green_sha: lastGreenSha,
+      last_green_run_id: lastGreenRunId,
+      reason,
+    },
+    dispatch_workflow: tipSha ? workflow : null,
+    cancel_run_ids: cancelRunIds,
+    covered_by_sha: lastGreenSha,
+    coverage_age_secs: tipAgeSecs,
+  };
+}
+
+function formatCoverageAgeShort(secs: number): string {
+  const s = Math.max(0, Math.floor(Number(secs) || 0));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m`;
+}
+
+/** Human-readable single-line deploy coverage summary for lane reasons and
+ *  TrainPanel banners (BR#6179 B). Mirrored in `train_gate.rs` `format_deploy_coverage_summary`. */
+export function formatDeployCoverageSummary(cov: DeployCoverageState): string {
+  const shortTip = (cov.tip_sha ?? "").slice(0, 8) || "unknown";
+  const ageStr = formatCoverageAgeShort(cov.tip_age_secs);
+  switch (cov.phase) {
+    case "covered":
+      return `tip ${shortTip} covered by deploy${cov.covered_by_run_id ? ` (run #${cov.covered_by_run_id})` : ""}`;
+    case "settling":
+      return `tip ${shortTip} deploy in flight (age ${ageStr}${cov.active_run_id ? `, run #${cov.active_run_id}` : ""})`;
+    case "uncovered_grace":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}, grace ${Math.max(1, Math.floor(cov.grace_secs / 60))}m)`;
+    case "uncovered_dispatched":
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr}) — auto-dispatched ${cov.workflow}`;
+    case "uncovered_dark": {
+      const prev = cov.last_green_sha ? ` — last green deploy ${cov.last_green_sha.slice(0, 8)}` : "";
+      return `tip ${shortTip} not covered by any deploy (age ${ageStr})${prev}`;
+    }
+    case "failed":
+      return `tip ${shortTip} deploy failed (age ${ageStr})`;
+  }
+}
+
+/** Reconciles `MainCheckVerdict` (computed from commit check-runs) with
+ *  `DeployCoverageState` (computed from deploy workflow runs) into a single
+ *  cohesive base verdict (BR#6389):
+ *  - When `baseVerdict.verdict === "empty"` because a multi-stage deploy
+ *    workflow (e.g. `Deploy Dev` in `Prepare deploy to dev (build on spot)`)
+ *    has not created downstream `required_workflows` check-runs yet, but
+ *    `coverage.phase === "settling"`, the effective verdict is `"unsettled"`
+ *    (with `alarm` cleared), NEVER `"empty"` ("dark tip").
+ *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "failed"`,
+ *    the effective verdict is `"red"` naming `Deploy Dev`.
+ *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "covered"`,
+ *    keep waiting for required check evidence; coverage alone cannot prove green.
+ *  Mirrored in `train_gate.rs` `reconcile_base_verdict_with_deploy_coverage`. */
+export function reconcileBaseVerdictWithDeployCoverage(
+  baseVerdict: MainCheckVerdict,
+  coverage: DeployCoverageState,
+): MainCheckVerdict {
+  if (baseVerdict.verdict === "red") return baseVerdict;
+  if (coverage.phase === "settling") {
+    const label = coverage.active_run_id
+      ? `Deploy Dev (run #${coverage.active_run_id} in flight)`
+      : "Deploy Dev (in flight)";
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "unsettled",
+      unsettled: baseVerdict.unsettled.length > 0 ? baseVerdict.unsettled : [label],
+    };
+  }
+  if (coverage.phase === "failed") {
+    const name = coverage.failing_run_id
+      ? `Deploy Dev (run #${coverage.failing_run_id})`
+      : "Deploy Dev";
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "red",
+      red:
+        baseVerdict.red.length > 0
+          ? baseVerdict.red
+          : [
+              {
+                name,
+                conclusion: "failure",
+                url: coverage.failing_run_url ?? "",
+              },
+            ],
+    };
+  }
+  if (coverage.phase === "covered") {
+    if (baseVerdict.verdict !== "empty") return baseVerdict;
+    const { alarm: _alarm, ...rest } = baseVerdict;
+    return {
+      ...rest,
+      verdict: "unsettled",
+      unsettled: ["Deployment finished; waiting for required checks"],
+    };
+  }
+  if (coverage.phase === "uncovered_grace" || coverage.phase === "uncovered_dispatched") {
+    return { ...baseVerdict, verdict: "unsettled", unsettled: ["Waiting for a covering deployment to start"] };
+  }
+  if (coverage.phase === "uncovered_dark") {
+    return { ...baseVerdict, verdict: "empty", alarm: coverage.reason };
+  }
+  return baseVerdict;
+}
+
+/** Normalizes a raw `queue_facts.base_state` object on the hub (BR#6389) so
+ *  even if a gateway binary stamps `verdict: "empty"` alongside
+ *  `deploy_coverage: { phase: "settling" | "covered" | "failed" }`, the hub
+ *  immediately reconciles `verdict`, `red`, `unsettled`, and `alarm` into one
+ *  consistent state. */
+export function normalizeBaseStateWithCoverage(baseState: Record<string, unknown> | null | undefined): Record<string, unknown> | null | undefined {
+  if (!baseState || typeof baseState !== "object") return baseState;
+  if (!baseState.deploy_coverage) return baseState;
+  const parsed = DeployCoverageStateSchema.safeParse(baseState.deploy_coverage);
+  if (!parsed.success) return baseState;
+  const effective = reconcileBaseVerdictWithDeployCoverage({
+    verdict: baseState.verdict === "green" ? "green" : baseState.verdict === "red" ? "red" : baseState.verdict === "unsettled" ? "unsettled" : "empty",
+    red: Array.isArray(baseState.red) ? baseState.red : [], green: Number(baseState.green ?? 0),
+    unsettled: Array.isArray(baseState.unsettled) ? baseState.unsettled.map(String) : [],
+  }, parsed.data);
+  if (effective.verdict === "empty") return baseState;
+  const next: Record<string, unknown> = { ...baseState, verdict: effective.verdict, unsettled: effective.unsettled,
+    ...(effective.red.length ? { red: effective.red } : {}) };
+  delete next.alarm;
+  return next;
+}
+
+/** Durable deployment observations are folded on EVERY ingress/read. A
+ * lease-holder's older scoped-green snapshot cannot overwrite known failed
+ * deployment evidence. Facts for another commit never apply to this tip. */
+export function applyDeployObservation(
+  baseState: Record<string, unknown> | null | undefined,
+  observation: DeployObservation | undefined,
+  required: string[],
+  checksObservedAt?: number,
+): Record<string, unknown> | null | undefined {
+  if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
+  const raw: Record<string, unknown> & { check_observed_at: number } = { ...(baseState ?? { verdict: "empty", red: [], unsettled: [] }),
+    check_observed_at: checksObservedAt ?? Number(baseState?.check_observed_at ?? 0) };
+  const knownRun = Math.max(...observation.runs.filter((r) => r.head_sha === observation.tip_sha).map((r) => r.id));
+  const newerCoverage = DeployCoverageStateSchema.safeParse(raw.deploy_coverage);
+  if (raw.check_observed_at > observation.observed_at && newerCoverage.success && newerCoverage.data.tip_sha === observation.tip_sha) {
+    const cov = newerCoverage.data;
+    const receipt = cov.phase === "covered" ? cov.covered_by_run_id : cov.phase === "failed" ? cov.failing_run_id : null;
+    // A newer, matching terminal receipt supersedes an older observation.
+    // This lets an ordinary gateway publish recovery after a watched rerun;
+    // a borrowed older green run cannot clear the failure or pending state.
+    if (receipt != null && receipt >= knownRun) return normalizeBaseStateWithCoverage(raw);
+  }
+  const verdict: MainCheckVerdict = {
+    verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",
+    red: Array.isArray(raw.red) ? raw.red : [], unsettled: Array.isArray(raw.unsettled) ? raw.unsettled.map(String) : [], green: Number(raw.green ?? 0),
+  };
+  const plan = reconcileDeployCoverage({ tipSha: observation.tip_sha, tipAgeSecs: Number(raw.tip_age_secs ?? 0),
+    baseVerdict: verdict, required, workflowRuns: observation.runs });
+  const normalized = normalizeBaseStateWithCoverage({ ...raw, tip_sha: observation.tip_sha,
+    deploy_coverage: plan.coverage, covered_by: plan.covered_by_sha, coverage_age_secs: plan.coverage_age_secs });
+  if (plan.coverage.phase === "failed") {
+    const failedRunId = plan.coverage.failing_run_id;
+    const failures = (observation.failures ?? []).filter((f) => f.run_id === failedRunId)
+      .map((f) => ({ name: f.name, url: f.url, conclusion: "failure" }));
+    if (failures.length) return { ...normalized, red: failures };
+  }
+  return normalized;
+}
+
+/** BR#6179 (C) Fast-page deterministic ask title for a dark/uncovered tip past
+ *  the grace window — keyed on `(repo, base, tipSha.slice(0, 8))` so at most
+ *  ONE ask fires per dark tip SHA. ≤240 chars, ends in "?". */
+export function trainDarkTipAskTitle(lane: { repo: string; base: string }, tipSha: string): string {
+  const shortTip = (tipSha ?? "").slice(0, 8) || "unknown";
+  const prefix = `MERGE TRAIN DARK TIP: ${lane.repo}@${lane.base} — `;
+  const suffix = `tip ${shortTip} not covered by any deploy run. Remedy?`;
+  const budget = 240 - prefix.length;
+  return prefix + (suffix.length > budget ? suffix.slice(0, Math.max(0, budget - 1)).trimEnd() + "?" : suffix);
+}
+
+/** BR#6179 (C) Self-contained plain-reading brief + one-click options for a
+ *  dark-tip alarm ask (satisfies Rule 6c ask quality bar). */
+export function trainDarkTipAskBrief(input: {
+  lane: { repo: string; base: string };
+  held: number;
+  alarm?: string | null;
+  coverage: DeployCoverageState;
+}): { details: string; options: string[] } {
+  const { lane, held, alarm, coverage } = input;
+  const shortTip = (coverage.tip_sha ?? "").slice(0, 8) || "unknown";
+  const ageStr = formatCoverageAgeShort(coverage.tip_age_secs);
+  const wf =
+    coverage.phase === "uncovered_dispatched"
+      ? coverage.workflow
+      : coverage.phase === "uncovered_dark" || coverage.phase === "uncovered_grace"
+        ? coverage.workflow ?? "deploy-dev.yml"
+        : "deploy-dev.yml";
+  const lastGreen =
+    "last_green_sha" in coverage && coverage.last_green_sha
+      ? `${coverage.last_green_sha.slice(0, 8)}${coverage.last_green_run_id ? ` (run #${coverage.last_green_run_id})` : ""}`
+      : "none recorded in recent workflow history";
+  const dispatched = coverage.phase === "uncovered_dispatched";
+  const details = [
+    `What this is: merge lane ${lane.repo}@${lane.base} is holding ${held} verified change(s) because the current ${lane.base} tip commit (${shortTip}, age ${ageStr}) is not covered by any decisive deploy workflow run (${alarm || "tip carries no check runs at all"}).`,
+    `Current state: ${formatDeployCoverageSummary(coverage)}. Last decisive green deploy covered: ${lastGreen}. This happens when a merge push event is suppressed (for example by an app/bot token class) or when the deploy workflow run was cancelled or deleted before creating required check runs.`,
+    dispatched
+      ? `Automatic remedy already taken: the merge-train executor automatically dispatched ${wf} on ${lane.base} for tip ${shortTip} (once per SHA). The lane will resume merging queued changes automatically as soon as that deploy run settles green; human action is only needed if the dispatched run fails to start.`
+      : `Why it needs you: tip ${shortTip} is past the grace window with no deploy run in flight. Choose option 1 to authorize an immediate ${wf} workflow dispatch on ${lane.base}, or run \`gh workflow run ${wf} --repo ${lane.repo} --ref ${lane.base}\`.`,
+  ].join("\n\n");
+  const options = dispatched
+    ? [
+        `(Recommended) Acknowledge — auto-dispatched ${wf} is in flight; hold until it settles`,
+        `Re-dispatch ${wf} on ${lane.base} now`,
+      ]
+    : [
+        `(Recommended) Dispatch ${wf} on ${lane.base} now`,
+        `Acknowledge — investigating workflow trigger suppression`,
+      ];
+  return { details, options };
 }
 
 /** The machine-proxy close note for train:landed — cites the merge commit
@@ -2388,6 +4535,47 @@ export const TRAIN_PR_URL_RE = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Z
  *  #2534 merge" prose stay inert. */
 export const TRAIN_PR_SHORT_RE = /([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)(?!\d)/g;
 
+/** BR#5658 / BR#5324 / BR#5805: validate that `owner/name` is a plausible
+ *  GitHub repository rather than a Bridge/tracker cross-reference token or
+ *  numeric fragment. Prose notes like `BR#5563/BR#5635`, `#1768/BR#4993`, or
+ *  CSS/identifier tokens adjacent to a card ref (`tb-pulse/BR#5658`) previously
+ *  matched `TRAIN_PR_SHORT_RE` with `m[2] === "BR"`, minting ghost merge lanes
+ *  (`4365/BR`, `4728/BR`, `5022/BR`, `5299/BR`, `5563/BR`, `1768/BR`,
+ *  `tb-pulse/BR`) and poisoning cards' `pr_merged` proxies.
+ *  - `owner` must not be all-digits (`5563`, `1768`) and must follow GitHub's
+ *    username/org syntax (`[A-Za-z0-9]` endpoints, `[A-Za-z0-9-]` interior).
+ *  - `name` must not be a reserved tracker/card prefix (`BR`, `GH`, `PR`,
+ *    `TASK`, `ASK`, `ISSUE`, `PULL`, `ISSUES`, `PULLS`). */
+export function isValidGitHubRepo(repo: string): boolean {
+  const parts = String(repo ?? "").trim().split("/");
+  if (parts.length !== 2) return false;
+  const [owner, name] = parts;
+  if (!owner || !name) return false;
+  if (/^\d+$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name === "." || name === "..") return false;
+  if (/^(?:br|gh|pr|issue|issues|pull|pulls|task|ask)$/i.test(name)) return false;
+  return true;
+}
+
+/** BR#5658 / AGENTS.md Rule 7: extract a direct-to-main landing commit receipt
+ *  from a review/verify note when no PR exists (`https://github.com/o/r/commit/<sha>`
+ *  or `commit <sha>` / `landed on main as <sha>`). Returns null when the text
+ *  cites any PR leg (PR legs ride the merge train, never direct-close). */
+export function parseDirectCommitReceipt(text: string): { repo?: string; sha: string } | null {
+  const t = String(text ?? "");
+  if (trainParseNoteLegs(t).length > 0) return null;
+  const urlMatch = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/commit\/([0-9a-f]{7,40})\b/i.exec(t);
+  if (urlMatch && isValidGitHubRepo(urlMatch[1])) {
+    return { repo: urlMatch[1], sha: urlMatch[2].toLowerCase() };
+  }
+  const tokenMatch = /(?:^|[\s(—–-])(?:commit|landed(?:\s+direct(?:ly)?\s+to\s+main)?(?:\s+on\s+main)?(?:\s+as)?|main\s+commit)[\s#:@=/]+([0-9a-f]{7,40})(?=[\s;.,)]|$)/i.exec(t);
+  if (tokenMatch) {
+    return { sha: tokenMatch[1].toLowerCase() };
+  }
+  return null;
+}
+
 export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptance?: string };
 
 /** Parse a verify close note into PR legs. Single-PR notes keep the
@@ -2405,20 +4593,39 @@ export type TrainNoteLeg = { repo: string; number: number; head_sha_at_acceptanc
  *  "- PR n\n  head <sha>" list layout). Anything unpaired stays unbound —
  *  the queue arm fail-closes on it. Never a silent cross-pairing. A PR may
  *  be cited as the full /pull/ URL or the board's `owner/name#N` shorthand
- *  (BR#4648) — the URL form wins when both cite the same PR. */
+ *  (BR#4648) — the URL form wins when both cite the same PR. Duplicate
+ *  citations of the SAME PR (a commits deep-link after the canonical URL,
+ *  URL + shorthand) collapse to one leg (BR#6349): a single cited PR then
+ *  binds its head by the lenient single-PR rule again, instead of degrading
+ *  to strict adjacency pairing across a phantom second leg. */
 export function trainParseNoteLegs(text: string): TrainNoteLeg[] {
   const t = String(text ?? "");
   const prs: { repo: string; number: number; index: number; end: number }[] = [];
   const seen = new Set<string>();
   for (const m of t.matchAll(TRAIN_PR_URL_RE)) {
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
-    seen.add(`${m[1]}/${m[2]}#${m[3]}`);
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    const key = `${repo}#${m[3]}`;
+    // BR#6349: the receipts deep-link (`/pull/N/commits/<sha>`) matches this
+    // regex too — a second citation of an already-cited PR must never mint
+    // a second leg. One PR is ONE leg: the duplicate broke the adjacency
+    // pairing (neither token bound), and the queue arm silently folded the
+    // stamp back to the stale head on re-queue (the BR#4684/PR#309 livelock).
+    if (seen.has(key)) continue;
+    seen.add(key);
+    prs.push({ repo, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
   }
   for (const m of t.matchAll(TRAIN_PR_SHORT_RE)) {
-    const key = `${m[1]}/${m[2]}#${m[3]}`;
+    const idx = m.index ?? 0;
+    const before = idx > 0 ? t[idx - 1] : "";
+    // Reject if preceded by `#` or `/` (e.g. `BR#5563/BR#5635` or URL path tails)
+    if (before === "#" || before === "/") continue;
+    const repo = `${m[1]}/${m[2]}`;
+    if (!isValidGitHubRepo(repo)) continue;
+    const key = `${repo}#${m[3]}`;
     if (seen.has(key)) continue; // the same PR already cited by its URL
     seen.add(key);
-    prs.push({ repo: `${m[1]}/${m[2]}`, number: Number(m[3]), index: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+    prs.push({ repo, number: Number(m[3]), index: idx, end: idx + m[0].length });
   }
   prs.sort((a, b) => a.index - b.index);
   if (!prs.length) return [];

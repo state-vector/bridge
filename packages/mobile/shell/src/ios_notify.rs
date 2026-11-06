@@ -106,7 +106,10 @@ impl Delegate {
     }
 }
 
-/// Ask for notification permission at launch so the dialog precedes any ask.
+/// Ask for notification permission on the first ask (BR#5449: never at
+/// launch — launch-time system alerts can leak invisibly and block every
+/// touch on the app). The ask itself also surfaces in-app (For You), so a
+/// first-ask prompt costs at most one delayed notification.
 pub fn ensure_authorized() {
     if AUTH_REQUESTED.swap(true, Ordering::Relaxed) {
         return;
@@ -140,6 +143,8 @@ thread_local! {
 /// Options (when present) become notification action buttons, one category
 /// per ask, exactly like the desktop core.
 pub fn send_ask_main_thread(ask_id: &str, title: &str, body: &str, options: &[AskOptionDto]) {
+    // First ask arms the (previously launch-time) permission prompt. BR#5449.
+    ensure_authorized();
     let center = UNUserNotificationCenter::currentNotificationCenter();
 
     if !options.is_empty() {

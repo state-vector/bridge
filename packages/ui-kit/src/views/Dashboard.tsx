@@ -1,123 +1,117 @@
 import { useEffect, useMemo, useState } from "react";
 import type { KbArtefact, KbThroughput } from "../server/kb";
 import { kbApi } from "../server/kb";
-import { useKb } from "../server/kbStore";
 
 const SENTIMENTS = ["going_well", "converging", "neutral", "diverging", "struggling"] as const;
+const SENTIMENT_LABELS = { going_well: "Going well", converging: "Converging", neutral: "Neutral", diverging: "Diverging", struggling: "Struggling" };
+type ActivityEvent = { ts: number; actor?: string };
 
-/** Task-done throughput (BR#2937): bars per bucket + cumulative line, from
- *  /api/kb/metrics/throughput. Refetches when the ledger ticks (a done
- *  transition is a ledger mutation) and on the day/week toggle. */
-function ThroughputCell() {
-  const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
-  const [bucket, setBucket] = useState<"day" | "week">("day");
-  const [tp, setTp] = useState<KbThroughput | null>(null);
-
-  useEffect(() => {
-    let on = true;
-    kbApi.throughput({ bucket, range: "30d" })
-      .then((r) => { if (on) setTp(r); })
-      .catch(() => { if (on) setTp(null); });
-    return () => { on = false; };
-  }, [bucket, evSeq]);
-
-  const max = useMemo(
-    () => Math.max(1, ...((tp?.buckets ?? []).map((b) => b.n))),
-    [tp],
-  );
-  const maxCum = tp?.buckets?.length ? Math.max(1, tp.buckets[tp.buckets.length - 1].cumulative) : 1;
-
-  return (
-    <div className="dash-cell" title="tasks completed (verified) over time — done transitions per bucket">
-      <div className="row" style={{ alignItems: "center", gap: 6 }}>
-        <span className="fc fc-done" style={{ fontSize: 10.5 }}>THROUGHPUT</span>
-        <span className="tp-toggle">
-          {(["day", "week"] as const).map((b) => (
-            <button key={b} className={bucket === b ? "tp-on" : ""} onClick={() => setBucket(b)}>{b}</button>
-          ))}
-        </span>
-      </div>
-      {tp && tp.buckets.length > 0 ? (
-        <svg viewBox={`0 0 ${tp.buckets.length * 4} 28`} className="chart-svg" preserveAspectRatio="none">
-          {tp.buckets.map((b, i) => (
-            <rect key={i} x={i * 4} y={28 - (b.n / max) * 26} width={3}
-              height={Math.max(b.n ? 2 : 0.5, (b.n / max) * 26)}
-              className={b.n ? "chart-bar hot" : "chart-bar"}>
-              <title>{`${new Date(b.t).toISOString().slice(0, 10)} — ${b.n} done (cumulative ${b.cumulative})`}</title>
-            </rect>
-          ))}
-          <polyline className="tp-line"
-            points={tp.buckets.map((b, i) => `${i * 4 + 1.5},${28 - (b.cumulative / maxCum) * 26}`).join(" ")} />
-        </svg>
-      ) : (
-        <svg className="chart-svg" preserveAspectRatio="none" />
-      )}
-      <span className="muted-note">
-        {tp ? `${tp.total} done · last ${tp.range_days}d${tp.total ? ` · peak ${max}/${tp.bucket}` : " — none yet"}` : "throughput unavailable"}
-      </span>
-    </div>
-  );
+/** Fresh bins on every calculation: rerendering must never accumulate counts
+ * into a memoised array, or count old/future events as current activity. */
+export function activityBuckets(events: ActivityEvent[], now: number) {
+  const buckets = Array.from({ length: 60 }, (_, i) => ({ t: now - (59 - i) * 60_000, n: 0 }));
+  for (const event of events) {
+    const age = now - event.ts;
+    if (age < 0 || age >= 3_600_000) continue;
+    buckets[59 - Math.floor(age / 60_000)].n++;
+  }
+  return buckets;
 }
 
+/** One scale per chart. Axis labels stay in HTML so resizing the SVG does not
+ * stretch text; there is no unrelated cumulative series on a second scale. */
+export function BarTrend({ buckets, label, start, end, unit }: {
+  buckets: { t: number; n: number }[]; label: string; start: string; end: string; unit: string;
+}) {
+  const peak = Math.max(1, ...buckets.map((b) => b.n));
+  const step = 320 / Math.max(1, buckets.length);
+  return <div className="dash-trend">
+    <div className="dash-chart-scale"><span>{unit}</span><span>peak {Math.max(0, ...buckets.map((b) => b.n))}</span></div>
+    <svg viewBox="0 0 320 64" className="dash-chart" preserveAspectRatio="none" role="img" aria-label={label}>
+      <path d="M0 8H320 M0 34H320 M0 60H320" className="dash-chart-grid" />
+      {buckets.map((b, i) => <rect key={b.t} x={i * step + 1} y={60 - b.n / peak * 52}
+        width={Math.max(1, step - 2)} height={b.n / peak * 52} className="chart-bar hot">
+        <title>{`${new Date(b.t).toISOString().slice(0, 16).replace("T", " ")} UTC · ${b.n} ${unit}`}</title>
+      </rect>)}
+    </svg>
+    <div className="dash-chart-axis"><span>{start}</span><span>{end}</span></div>
+  </div>;
+}
 
-/** Top-of-board dashboard: activity chart + sentiment distribution + flow counters. */
-export function DashboardSummary({ tasks, events }: { tasks: KbArtefact[]; events: any[] }) {
-  const inFlight = tasks.filter((t) => ["todo", "in_progress", "in_review", "blocked"].includes(t.status));
+const dateLabel = (ts: number) => new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
 
-  const counts: Record<string, number> = {};
-  for (const t of inFlight) {
-    const s = (t.meta as any)?.last_progress?.sentiment;
-    if (s) counts[s] = (counts[s] ?? 0) + 1;
+export function ThroughputSummary({ tp, bucket, onBucket, failed = false }: {
+  tp: KbThroughput | null; bucket: "day" | "week"; onBucket: (bucket: "day" | "week") => void; failed?: boolean;
+}) {
+  const bins = tp?.buckets ?? [];
+  return <section className="dash-cell" aria-label="Completed tasks">
+    <div className="dash-cell-head"><h3>Completed tasks</h3><span className="tp-toggle" aria-label="Completion chart interval">
+      {(["day", "week"] as const).map((b) => <button key={b} aria-pressed={bucket === b} className={bucket === b ? "tp-on" : ""} onClick={() => onBucket(b)}>{b}</button>)}
+    </span></div>
+    <div className="dash-metric">{tp ? tp.total.toLocaleString() : "—"}<span>last {tp?.range_days ?? 30} days</span></div>
+    {bins.length ? <BarTrend buckets={bins} label={`Tasks completed per ${bucket} over the last ${tp?.range_days} days`}
+      start={dateLabel(bins[0].t)} end={dateLabel(bins[bins.length - 1].t)} unit={`tasks/${bucket}`} />
+      : <div className="dash-empty">{tp ? "No completed tasks in this period" : failed ? "Completion history unavailable" : "Loading completion history…"}</div>}
+    {failed && tp && <span className="dash-caption" role="status">Last result · refresh unavailable</span>}
+  </section>;
+}
+
+function ThroughputCell() {
+  const [bucket, setBucket] = useState<"day" | "week">("day");
+  const [tp, setTp] = useState<KbThroughput | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let on = true;
+    setTp(null);
+    setFailed(false);
+    const load = () => kbApi.throughput({ bucket, range: "30d" })
+      .then((r) => { if (on) { setTp(r); setFailed(false); } })
+      .catch(() => { if (on) setFailed(true); });
+    void load();
+    const poll = setInterval(load, 30_000);
+    return () => { on = false; clearInterval(poll); };
+  }, [bucket]);
+  return <ThroughputSummary tp={tp} bucket={bucket} onBucket={setBucket} failed={failed} />;
+}
+
+export function DashboardSummary({ tasks, events, children }: { tasks: KbArtefact[]; events: ActivityEvent[]; children?: React.ReactNode }) {
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const buckets = useMemo(() => activityBuckets(events, now), [events, now]);
+  const recent = events.filter((e) => e.ts <= now && now - e.ts < 3_600_000);
+  const last5 = recent.filter((e) => now - e.ts < 300_000).length;
+  const sources = new Set(recent.filter((e) => now - e.ts < 600_000 && e.actor).map((e) => e.actor));
+  const openTasks = tasks.filter((t) => ["todo", "in_progress", "in_review", "blocked"].includes(t.status));
+  const counts = new Map<string, number>();
+  for (const task of openTasks) {
+    const report = task.meta?.last_progress as { sentiment?: unknown } | undefined;
+    const sentiment = SENTIMENTS.find((s) => s === report?.sentiment);
+    if (sentiment) counts.set(sentiment, (counts.get(sentiment) ?? 0) + 1);
   }
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  const dominant = SENTIMENTS.slice().sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0))[0];
-
-  // events/min, last 60 min
-  const buckets = useMemo(() => {
-    const now = Date.now();
-    return Array.from({ length: 60 }, (_, i) => ({ t: now - (59 - i) * 60_000, n: 0 }));
-  }, [events]);
-  for (const e of events) {
-    const idx = 59 - Math.floor((Date.now() - e.ts) / 60_000);
-    if (idx >= 0 && idx < 60) buckets[idx].n++;
-  }
-  const max = Math.max(1, ...buckets.map((b) => b.n));
-  const last5 = events.filter((e) => Date.now() - e.ts < 300_000).length;
-
-  // live agents (signal < 10 min)
-  const agents = new Set(events.filter((e) => Date.now() - e.ts < 600_000 && e.actor).map((e) => e.actor));
-
-  return (
-    <div className="dashboard">
-      <div className="dash-cell chart-box" title="events per minute, last hour">
-        <svg viewBox={`0 0 ${60 * 4} 28`} className="chart-svg" preserveAspectRatio="none">
-          {buckets.map((b, i) => (
-            <rect key={i} x={i * 4} y={28 - (b.n / max) * 26} width={3} height={Math.max(b.n ? 2 : 0.5, (b.n / max) * 26)}
-              className={b.n ? "chart-bar hot" : "chart-bar"} />
-          ))}
-        </svg>
-        <span className="muted-note">{events.length} events/hr · {last5} last 5m · {agents.size} agents active</span>
+  const reported = [...counts.values()].reduce((a, b) => a + b, 0);
+  const dominant = SENTIMENTS.slice().sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0))[0];
+  return <div className="dashboard" aria-label="Fleet overview">
+    <section className="dash-cell" aria-label="Recent activity">
+      <div className="dash-cell-head"><h3>Activity</h3><span className="muted-note">last hour</span></div>
+      <div className="dash-metric">{recent.length.toLocaleString()}<span>observed events</span></div>
+      <BarTrend buckets={buckets} label="Observed events per minute over the last hour" start="60 min ago" end="Now" unit="events/min" />
+      <p className="dash-caption">{last5} in the last 5 min · {sources.size} active sources</p>
+    </section>
+    <section className="dash-cell" aria-label="Work outlook">
+      <div className="dash-cell-head"><h3>Work outlook</h3><span className="muted-note">reported sentiment</span></div>
+      <div className="dash-metric dash-metric-word">{reported ? SENTIMENT_LABELS[dominant] : "No reports"}</div>
+      <div className="sentiment-bar" role="img" aria-label={reported ? SENTIMENTS.filter((s) => counts.has(s)).map((s) => `${SENTIMENT_LABELS[s]}: ${counts.get(s)}`).join(", ") : "No sentiment reported"}>
+        {SENTIMENTS.map((s) => counts.has(s) && <span key={s} className={`sb-seg sb-${s}`} style={{ width: `${counts.get(s)! / reported * 100}%` }} />)}
       </div>
-      <div className="dash-cell" title="aggregate sentiment, in-flight tasks">
-        <div className="sentiment-bar">
-          {total === 0 && <div className="sb-seg sb-neutral" style={{ width: "100%" }} />}
-          {SENTIMENTS.map((s) => counts[s] ? (
-            <div key={s} className={`sb-seg sb-${s}`} style={{ width: `${(counts[s] / total) * 100}%` }} title={`${s}: ${counts[s]}`} />
-          ) : null)}
-        </div>
-        <span className="muted-note">
-          {total} in flight{total > 0 && <> · leaning <b className="sentiment-word">{dominant.replace("_", " ")}</b></>}
-          {counts.struggling ? <span className="st-err"> · {counts.struggling} struggling</span> : ""}
-        </span>
-      </div>
-      <div className="dash-cell" title="task flow">
-        <div className="flow-counts">
-          {["todo", "in_progress", "in_review", "blocked", "done"].map((st) => (
-            <span key={st} className={`fc fc-${st}`}>{tasks.filter((t) => t.status === st).length} {st.replace("_", " ")}</span>
-          ))}
-        </div>
-      </div>
-      <ThroughputCell />
-    </div>
-  );
+      <div className="dash-legend">{SENTIMENTS.filter((s) => counts.has(s)).map((s) => <span key={s}><i className={`sb-${s}`} />{SENTIMENT_LABELS[s]} {counts.get(s)}</span>)}</div>
+      <p className="dash-caption">{reported} of {openTasks.length} open tasks have reported sentiment</p>
+    </section>
+    <section className="dash-cell" aria-label="Board task counts">
+      <div className="dash-cell-head"><h3>Board tasks</h3><span className="muted-note">current snapshot</span></div>
+      <dl className="dash-task-counts">{([['in_progress', 'In progress'], ['in_review', 'In review'], ['blocked', 'Blocked'], ['todo', 'To do'], ['done', 'Done']] as const).map(([status, label]) => <div key={status}>
+        <dt>{label}</dt><dd className={status === 'blocked' ? 'bad' : ''}>{tasks.filter((t) => t.status === status).length}</dd>
+      </div>)}</dl>
+      <p className="dash-caption">Counts shown for tasks loaded on this board</p>
+    </section>
+    {children ?? <ThroughputCell />}
+  </div>;
 }

@@ -28,6 +28,7 @@
 
 export interface ProxyAtom {
   kind:
+    | "lane_health"
     | "pr_merged"
     | "br_pr_merged"
     | "issue_closed"
@@ -45,6 +46,7 @@ export interface ProxyAtom {
   /** repo slug "owner/name"; null = no repo resolvable from the text (the
    *  atom is then unresolvable — the condition can never auto-flip) */
   repo: string | null;
+  base?: string;
   number?: number;
   brId?: string;
   runId?: string;
@@ -176,8 +178,9 @@ function atomKey(a: Omit<ProxyAtom, "raw">): string {
  *  evaluates those first-class, board-locally); the prose parser still needs
  *  their atom shape so `typed await_event ask/time` conditions parse
  *  (BR#4062). */
-function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
+function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> | null {
   switch (e.event) {
+    case "lane_health": return { kind: "lane_health", repo: e.repo, base: e.base, head: e.head };
     case "pr_merged": return { kind: "pr_merged", repo: e.repo, number: e.n };
     case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id };
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n };
@@ -188,6 +191,7 @@ function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> {
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
     case "ask": return { kind: "ask", repo: null, askId: e.ask_id };
     case "time": return { kind: "time", repo: null, untilTs: e.until_ts };
+    case "local_handoff": case "executor_capability": return null;
   }
 }
 
@@ -324,7 +328,7 @@ export function parseProxyCondition(text: string): ParsedCondition {
         } else cand[k] = v;
       }
       const ev = validateAwaitEvent(cand);
-      if (ev) pushAtom(atomOfAwait(ev));
+      if (ev) { const atom = atomOfAwait(ev); if (atom) pushAtom(atom); else unparseable = true; }
       // else: the line names the grammar but nothing valid parsed —
       // LOOKS_MACHINE (which knows the marker) stamps it unparseable.
     }
@@ -560,6 +564,9 @@ export function legLabel(leg: CloseLeg): string {
 // human-friendly annotation, DERIVED from the structured event when absent.
 
 export type AwaitEvent =
+  | { event: "lane_health"; repo: string; base: string; head?: string }
+  | { event: "local_handoff"; handoff_id: string; version: number }
+  | { event: "executor_capability"; id: string }
   | { event: "pr_merged"; repo: string; n: number }
   | { event: "br_pr_merged"; id: string }
   | { event: "issue_closed"; repo: string; n: number }
@@ -572,6 +579,8 @@ export type AwaitEvent =
   | { event: "time"; until_ts: number };
 
 export const AWAIT_EVENT_KINDS = [
+  "lane_health",
+  "local_handoff", "executor_capability",
   "pr_merged", "br_pr_merged", "issue_closed", "br_done",
   "br_answered", "run_success", "pr_checks_green", "deployed", "ask", "time",
 ] as const;
@@ -584,10 +593,24 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
   if (typeof v !== "object" || v === null) return null;
   const e = v as Record<string, unknown>;
   const kind = String(e.event ?? "");
-  const repo = typeof e.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(e.repo) ? e.repo : null;
+  const isValidRepo = (r: unknown): r is string => {
+    if (typeof r !== "string") return false;
+    const parts = r.trim().split("/");
+    if (parts.length !== 2) return false;
+    const [owner, name] = parts;
+    if (!owner || !name || /^\d+$/.test(owner)) return false;
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return false;
+    if (!/^[A-Za-z0-9._-]+$/.test(name) || name === "." || name === "..") return false;
+    if (/^(?:br|gh|pr|issue|issues|pull|pulls|task|ask)$/i.test(name)) return false;
+    return true;
+  };
+  const repo = isValidRepo(e.repo) ? e.repo : null;
   const num = (x: unknown) => typeof x === "number" && Number.isInteger(x) && x > 0;
   const id = (x: unknown) => typeof x === "string" && /^BR#\d+$/.test(x) ? x : null;
   switch (kind) {
+    case "lane_health": return repo && typeof e.base === "string" && e.base.trim() && (e.head === undefined || typeof e.head === "string" && /^[a-f0-9]{40}$/i.test(e.head)) ? { event: "lane_health", repo, base: e.base, ...(e.head ? { head: String(e.head) } : {}) } : null;
+    case "local_handoff": return typeof e.handoff_id === "string" && e.handoff_id.length > 0 && num(e.version) ? { event: "local_handoff", handoff_id: e.handoff_id, version: Number(e.version) } : null;
+    case "executor_capability": return id(e.id) ? { event: "executor_capability", id: String(e.id) } : null;
     case "pr_merged":
     case "issue_closed":
     case "pr_checks_green":
@@ -628,6 +651,7 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
 /** Typed event → the sweep's ProxyAtom (ask/time evaluate on their own). */
 export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
   switch (e.event) {
+    case "lane_health": return { kind: "lane_health", repo: e.repo, base: e.base, head: e.head, raw: describeAwaitEvent(e) };
     case "pr_merged": return { kind: "pr_merged", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "br_pr_merged": return { kind: "br_pr_merged", repo: null, brId: e.id, raw: describeAwaitEvent(e) };
     case "issue_closed": return { kind: "issue_closed", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
@@ -636,13 +660,14 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id, newerThan: e.newer_than, head: e.head, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
-    case "ask": case "time": return null;
+    case "ask": case "time": case "local_handoff": case "executor_capability": return null;
   }
 }
 
 /** Human-friendly condition text, derived from the structured event. */
 export function describeAwaitEvent(e: AwaitEvent): string {
   switch (e.event) {
+    case "lane_health": return `Observed deployment health green for ${e.repo}@${e.base}${e.head ? ` at ${e.head}` : " at current tip"}`;
     case "pr_merged": return `PR ${e.repo}#${e.n} merged (mergeCommit non-null)`;
     case "br_pr_merged": return `${e.id}'s fix PR (head branch bridge/${e.id.slice(3)}) merged`;
     case "issue_closed": return `GH issue ${e.repo}#${e.n} closed`;
@@ -656,6 +681,8 @@ export function describeAwaitEvent(e: AwaitEvent): string {
     case "deployed": return `the hub worker is deployed at commit ${e.commit} (prefix match against its own version stamp)`;
     case "ask": return `ask ${e.ask_id} answered`;
     case "time": return `timer elapsed (until_ts ${e.until_ts})`;
+    case "local_handoff": return `Explicit authorised local acceptance of ${e.handoff_id} version ${e.version}`;
+    case "executor_capability": return `A live eligible capability becomes usable for ${e.id}, with all other blockers resolved`;
   }
 }
 
@@ -666,6 +693,7 @@ export function awaitEventFromAtoms(atoms: ProxyAtom[]): AwaitEvent | null {
   if (atoms.length !== 1) return null;
   const a = atoms[0];
   switch (a.kind) {
+    case "lane_health": return a.repo && a.base ? { event: "lane_health", repo: a.repo, base: a.base, head: a.head } : null;
     case "pr_merged": return a.repo && a.number ? { event: "pr_merged", repo: a.repo, n: a.number } : null;
     case "br_pr_merged": return a.brId ? { event: "br_pr_merged", id: a.brId } : null;
     case "issue_closed": return a.repo && a.number ? { event: "issue_closed", repo: a.repo, n: a.number } : null;

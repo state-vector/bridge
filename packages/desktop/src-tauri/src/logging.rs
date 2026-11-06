@@ -39,7 +39,9 @@ pub fn now_ms() -> u64 {
 }
 
 /// UTC ISO-8601 log timestamps without a chrono dependency (civil-from-days).
-fn iso(ts_ms: u64) -> String {
+/// `pub(crate)` so sibling vendored modules (train.rs token-rot notes, BR#4754)
+/// stamp window-start times with the same formatter — one mechanism, no copies.
+pub(crate) fn iso(ts_ms: u64) -> String {
     let secs = (ts_ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);

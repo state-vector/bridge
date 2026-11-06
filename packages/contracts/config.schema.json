@@ -109,6 +109,17 @@
       "additionalProperties": {
         "type": "object",
         "properties": {
+          "enabled": { "type": "boolean" },
+          "projects": { "type": "array", "items": { "type": "string" } },
+          "reasoning_tier": {
+            "type": "string",
+            "enum": ["small", "medium", "large"]
+          },
+          "models": {
+            "type": "object",
+            "propertyNames": { "type": "string", "enum": ["small", "medium", "large"] },
+            "additionalProperties": { "type": "string", "minLength": 1 }
+          },
           "bin": {
             "type": "string"
           },
@@ -130,6 +141,26 @@
       "items": {
         "type": "string"
       }
+    },
+    "sweep_repos": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "auto_update": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "channel": { "type": "string", "enum": ["main", "stable", "pinned"] }
+          },
+          "required": ["enabled", "channel"],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
     },
     "models": {
       "type": "object",
@@ -169,7 +200,9 @@
     "report_minutes",
     "isolate",
     "backends",
-    "worktree_exempt_repos"
+    "worktree_exempt_repos",
+    "sweep_repos",
+    "auto_update"
   ],
   "additionalProperties": {}
 }

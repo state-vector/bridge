@@ -1,7 +1,11 @@
 {
   "recorded": "2026-10-26",
-  "note": "the MCP tool registry contract — name + required args per tool. The dispatch must implement every name here and vice versa (the ask_answer/answer_ask incident). CI compares a generated table against this.",
+  "note": "the MCP tool registry contract \u2014 name + required args per tool. The dispatch must implement every name here and vice versa (the ask_answer/answer_ask incident). CI compares a generated table against this.",
   "tools": [
+    { "name": "handoffs", "required": [] },
+    { "name": "handoff_accept", "required": ["id", "handoff_id", "version", "session"] },
+    { "name": "handoff_checkpoint", "required": ["id", "handoff_id", "version", "session", "checkpoint"] },
+    { "name": "execution", "required": ["id", "command_id", "command"] },
     {
       "name": "answer_ask",
       "required": [
@@ -11,15 +15,17 @@
     },
     {
       "name": "ask_agent",
-      "required": [
-        "question",
-        "options",
-        "reason"
-      ]
+      "required": []
     },
     {
       "name": "asks",
       "required": []
+    },
+    {
+      "name": "claim_takeover",
+      "required": [
+        "id"
+      ]
     },
     {
       "name": "create_artefact",
@@ -120,6 +126,21 @@
       "required": []
     },
     {
+      "name": "train_bisect",
+      "required": [
+        "repo"
+      ]
+    },
+    {
+      "name": "train_carry",
+      "required": [
+        "repo",
+        "pr",
+        "from_head",
+        "to_head"
+      ]
+    },
+    {
       "name": "train_ci",
       "required": [
         "repo"
@@ -150,23 +171,22 @@
       ]
     },
     {
-      "name": "train_status",
-      "required": []
-    },
-    {
-      "name": "train_bisect",
+      "name": "train_queue_facts",
       "required": [
         "repo"
       ]
     },
     {
-      "name": "train_carry",
-      "required": [
-        "repo",
-        "pr",
-        "from_head",
-        "to_head"
-      ]
+      "name": "train_status",
+      "required": []
+    },
+    {
+      "name": "train_observe_deploy",
+      "required": ["repo", "observation"]
+    },
+    {
+      "name": "train_recovery_event",
+      "required": ["repo", "base", "head_sha", "cause", "event_id", "event"]
     },
     {
       "name": "transition",

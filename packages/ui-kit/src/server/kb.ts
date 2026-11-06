@@ -1,4 +1,5 @@
 import { getKbHubConfig } from "./config";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
  *  Auth: the human session cookie — browser (webapp) sends it same-origin via
@@ -20,6 +21,8 @@ export interface KbArtefact {
   owner?: string;
   body_md?: string;
   meta?: Record<string, unknown>;
+  /** Read-only model observation projected from the canonical execution attempt. */
+  execution?: ExecutionModelView;
   created_ts: number;
   updated_ts: number;
   status_ts?: number;
@@ -164,6 +167,7 @@ export interface KbAsk {
 }
 
 export interface KbBoard {
+  workers?: import("@bridge/contracts").WorkerStatus[];
   tasks: KbArtefact[];
   sessions: KbSession[];
   progress: KbProgress[];
@@ -179,7 +183,108 @@ export interface KbTrainLease {
   expires_ts: number;
 }
 
+export type KbTrainEntryClass = "ready" | "waiting" | "conflict" | "needs-review" | "blocked";
+export type KbBaseRedPhase =
+  | "diagnosing"
+  | "fix_in_progress"
+  | "cure_pr_conflicting"
+  | "cure_pr_merged_awaiting_ci"
+  | "cure_pr_awaiting_force_merge"
+  | "fix_exhausted";
+
+export interface KbTrainFixCardProgress {
+  note: string;
+  will?: string;
+  completion_pct?: number;
+  ts: number;
+}
+
+export interface KbTrainFixCard {
+  id: string;
+  url: string;
+  title: string;
+  status: string;
+  owner?: string;
+  executor_session?: string;
+  active_agent?: boolean;
+  blocked_reason?: string;
+  last_progress?: KbTrainFixCardProgress | null;
+  pr?: number;
+  pr_url?: string;
+  conflict?: boolean;
+  merged?: boolean;
+  merge_sha?: string;
+}
+
+/** BR#6179 closed 6-state deploy coverage union on `phase`. */
+export type KbDeployCoverageState =
+  | {
+      phase: "covered";
+      tip_sha: string;
+      tip_age_secs: number;
+      covered_by_sha: string;
+      covered_by_run_id?: number | null;
+      covered_by_url?: string | null;
+    }
+  | {
+      phase: "settling";
+      tip_sha: string;
+      tip_age_secs: number;
+      active_run_id?: number | null;
+      active_run_url?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_grace";
+      tip_sha: string;
+      tip_age_secs: number;
+      grace_secs: number;
+      workflow?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_dispatched";
+      tip_sha: string;
+      tip_age_secs: number;
+      workflow: string;
+      dispatched_at: number;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    }
+  | {
+      phase: "uncovered_dark";
+      tip_sha: string;
+      tip_age_secs: number;
+      grace_secs: number;
+      workflow?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+      reason: string;
+    }
+  | {
+      phase: "failed";
+      tip_sha: string;
+      tip_age_secs: number;
+      failing_run_id?: number | null;
+      failing_run_url?: string | null;
+      last_green_sha?: string | null;
+      last_green_run_id?: number | null;
+    };
+
+export interface KbBaseRedResolution {
+  verdict: "red" | "unsettled" | "empty";
+  phase?: KbBaseRedPhase;
+  whats_broken: { name: string; url?: string }[];
+  held: number;
+  ask: { id: string; url: string; question: string; options: string[] } | null;
+  fix_card: KbTrainFixCard | null;
+  deploy_coverage?: KbDeployCoverageState | null;
+}
+
 export interface KbTrainLane {
+  line?: import("@bridge/contracts").TrainLineProjection;
   lane: string;
   card: string;
   lease: KbTrainLease | null;
@@ -200,23 +305,113 @@ export interface KbTrainLane {
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
   now_action?: { note: string; holder: string; at: number } | null;
+  /** 2026-11-02: the answer-derived authorization stamps — a BYPASS answer on
+   *  the base-red alarm ask / root-fix fast-lane ask stamps bypass_merge
+   *  (the executor merges that PR out of turn), a RETRY answer stamps
+   *  rerun_failed (the executor re-runs the failing checks). Consumed +
+   *  acked through the per-tick queue_facts stamp. */
+  bypass_merge?: { repo: string; base: string; pr: number; ask_id?: string; answer?: string; by?: string; at: number } | null;
+  rerun_failed?: { repo: string; base: string; ask_id?: string; answer?: string; by?: string; at: number } | null;
   /** BR#5114 round 2 (Ray: "remove jargon — make it clear"): the current
    *  attempt in plain words — which card the train is on and WHY it is or
    *  isn't moving. hold: "awaiting-review" = the PR branch changed after
    *  its last review (a fresh review unblocks it); "merge-checks" = review,
    *  signatures and CI being checked before the merge. */
-  attempt?: { card: string; hold: "awaiting-review" | "merge-checks"; note: string } | null;
+  attempt?: { card: string; hold: "awaiting-review" | "merge-checks" | "waiting-checks" | "held-checks"; note: string } | null;
   /** how many queued cards are waiting on a fresh review (the honest
    *  explanation behind a "0/h" rate with a full queue). */
   queue_awaiting_review?: number;
-  queue: { id: string; priority: "critical" | "normal"; pr?: number }[];
+  /** P4 starvation episode (BR#5674): no merges while holding queued cars —
+   *  since/mins name the episode window, fired_at the one-per-episode alarm,
+   *  ask_id/duty_id the fired ask + spawned diagnostic duty. Cleared on any
+   *  merge. Served by train.status; the panel renders the ⚠ starved chip. */
+  starved?: { since: number; mins: number; fired_at?: number; ask_id?: string; duty_id?: string; kind?: string } | null;
+  /** BR#5190 four-tier ladder: root_fix (the bound main-breakage fix, tier 0)
+   *  > boosted (the human/starvation boost stamp) > critical (manual
+   *  meta.priority rung) > normal; under a stopped lane only root_fix rides. */
+  queue: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true; pr?: number }[];
   /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
    *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
    *  gone: zero asks ride the lanes): one chip per parked card — amber
    *  (aging) at the awaiting TTL, red (lapsed) past TTL + grace; a lapsed
    *  park still lists (visibility without interruption). Force-review from
    *  the backlog acts on them; the TTL stays hub-side (train.awaiting_ttl_h). */
-  awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean }[];
+  awaiting?: { task: string; pr?: number; at: number; head_sha: string | null; verdict: string | null; age_ms: number; aging: boolean; lapsed: boolean; in_flight?: boolean }[];
+  burst_max?: number;
+  /** BR#5658 (Ray 2026-11-03, v2): true 3-bucket per-lane PR stats covering
+   *  ALL open PRs on the lane:
+   *  - in_progress: active implementation or bounced back to in_progress
+   *  - verifying: in verification (being verified + waiting to be verified)
+   *  - ready: verified (ACCEPT) and ready to merge */
+  pr_stats?: { in_progress: number; verifying: number; ready: number };
+  /** BR#5658 (Ray 2026-11-03, v2): all verifying + ready PRs on the lane
+   *  partitioned into sequential merge batches (Batch 1 | Batch 2 | …) via
+   *  iterative selectBatch (conflict_pairs + burst_max). Inside each batch,
+   *  state drives the block colour: "ready" (green solid), "verifying"
+   *  (orange pulsing), "waiting" (orange solid). */
+  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string }[][];
+  /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
+   *  (rank) order — the queue block row. cls: ready (merges this pass) |
+   *  waiting (checks/mergeability pending) | conflict | needs-review |
+   *  blocked. null until the first executor tick stamps them.
+   *  BR#5265 Fix A: base_state rides the same stamp — the walk's base
+   *  verdict (scoped to the lane's required workflows, Fix B); non-green
+   *  holding cars renders the lane BLOCKED (laneStatus + laneSyncReason). */
+  queue_facts?: {
+    at: number;
+    entries: { id: string; pr?: number; cls: KbTrainEntryClass | string;
+      repair?: { kind: string; checks?: { name: string; url?: string }[] };
+      repair_task?: string;
+    }[];
+    conflict_pairs?: [number, number][];
+    base_state?: {
+      verdict: "green" | "red" | "unsettled" | "empty";
+      scoped_to_required?: boolean;
+      red?: { name: string; url?: string }[];
+      unsettled?: string[];
+      alarm?: string;
+      tip_sha?: string;
+      tip_age_secs?: number;
+      covered_by?: string | null;
+      coverage_age_secs?: number | null;
+      deploy_coverage?: KbDeployCoverageState | null;
+      cancelled_redundant_runs?: number[];
+      /** BR#5883: the gate-consumed qualifier — the scoped verdict IS green
+       *  but the repo's own merge gate (`main-green gate`, judging main's
+       *  WHOLE tip) reports non-green. The lane reads GATE-BLOCKED while
+       *  cars are held; escalated at P1 hub-side. */
+      gate_blocked?: boolean;
+      gate_verdict?: "green" | "red" | "unsettled" | "empty";
+      gate_red?: { name: string; url?: string }[];
+      gate_unsettled?: string[];
+    };
+    /** BR#5376: the ACTIVE batch-stall episode — members were selected,
+     *  merges attempted, NOTHING landed for K consecutive ticks. The next
+     *  stamp after a landing omits it (clears by itself). */
+    stalled?: {
+      batch: number[];
+      ticks: number;
+      since: number;
+      for_ms?: number;
+      last_error?: string;
+    };
+  } | null;
+  /** BR#5349 + BR#6012: strongly-typed base-red resolution state machine output. */
+  base_red_resolution?: KbBaseRedResolution;
+  /** BR#5376: served while a fresh stall episode rides the stamp — the
+   *  batch, how long nothing has landed (ticks + wall-clock), WHY (the
+   *  executor's last error), the episode's OPEN alarm ask, and the unblock
+   *  (restart the executor). Suppressed while base-red owns the lane;
+   *  absent the moment anything lands. */
+  stalled_resolution?: {
+    batch: number[];
+    ticks: number;
+    since: number | null;
+    for_ms: number;
+    last_error: string | null;
+    ask: { id: string; url: string; question: string; options: string[] } | null;
+    unblock: string;
+  };
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;
@@ -258,6 +453,8 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const kbApi = {
+  executionAttention: () => j<unknown>("/api/kb/execution_attention"),
+  handoffControl: (body: import("@bridge/contracts").HandoffControl) => j<{ kind: string; prerequisites?: unknown[] }>("/api/kb/handoff_control", { method: "POST", body: JSON.stringify(body) }),
   board: () => j<KbBoard>("/api/kb/board"),
   throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));
@@ -300,7 +497,9 @@ export const kbApi = {
     j<{ id: string }>("/api/kb/create", { method: "POST", body: JSON.stringify(body) }),
   boost: (id: string, on = true) =>
     j<{ id: string; boosted: string[]; on: boolean }>("/api/kb/boost", { method: "POST", body: JSON.stringify({ id, boost: on }) }),
-  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string }) =>
+  // BR#6135: `takeover` rides the same door — the server routes it through the
+  // claim-takeover op (in_progress → in_progress, holder flip, owner transfer)
+  transition: (id: string, to: string, extra?: { note?: string; unblock_condition?: string; sentiment?: string; takeover?: boolean }) =>
     j<{ id: string; status: string }>(`/api/kb/transition`, { method: "POST", body: JSON.stringify({ id, to, ...extra }) }),
   // BR#3910: one-click human supersede — the server composes the two-step
   // (blocked → release → todo → superseded) and enforces the web-session-only
@@ -348,7 +547,7 @@ export function wsPushAvailable(): boolean {
 }
 export function connectKbWs(
   onEvent: (e: KbEvent) => void,
-  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[] }) => void,
+  onBoard: (b: { tasks: any[]; sessions: any[]; progress?: any[]; series?: any[]; agents?: any[]; workers?: import("@bridge/contracts").WorkerStatus[] }) => void,
   onStatus: (s: "open" | "closed") => void,
   sinceRef: () => number,
 ) {

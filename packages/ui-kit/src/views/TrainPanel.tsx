@@ -1,277 +1,187 @@
 import { useEffect, useState } from "react";
+import type { LineRemediation, TrainLineProjection } from "@bridge/contracts";
+import { recoveryCauseLabel, recoveryIsOpen } from "@bridge/contracts";
 import { kbApi, type KbTrainLane } from "../server/kb";
 import { Chip, type ChipTone } from "./index-kit";
 
-/** Ticking clock — re-renders every second so lock ages stay live. */
-function useClock() {
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setTick((x) => x + 1), 1000);
-    return () => clearInterval(t);
-  }, []);
-}
-
 function age(ts: number | undefined, now: number): string {
-  if (!ts) return "—";
+  if (!ts) return "unknown";
   const s = Math.max(0, Math.floor((now - ts) / 1000));
   if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60), r = s % 60;
-  if (m < 60) return `${m}m${r ? ` ${String(r).padStart(2, "0")}s` : ""}`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
 }
 
-/** CAS-lock liveness: the lease TTL is 5 minutes — a heartbeat younger than
- *  2 ticks (~90s) is a live holder, anything older is lapsing/zombie. */
-function lockTone(lane: KbTrainLane, now: number): "ok" | "warn" | "err" | "muted" {
-  if (!lane.lease?.heartbeat_ts) return "muted";
-  const s = (now - lane.lease.heartbeat_ts) / 1000;
-  if (s > 300) return "err";
-  if (s > 90) return "warn";
-  return "ok";
+const tones: Record<TrainLineProjection["phase"], ChipTone> = {
+  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "err", retired: "muted",
+};
+const unavailable: TrainLineProjection = {
+  phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
+  blocker: "stale_observation", evidence: [], held: 0, observed_at: 0,
+  remediation: { kind: "attention", text: "Waiting for a current status from the hub. Work has not been confirmed healthy." },
+};
+
+function TaskLink({ id, url, children, openTask }: {
+  id: string; url: string; children: React.ReactNode; openTask?: (id: string) => void;
+}) {
+  return <a className="train-banner-card" href={url} onClick={(e) => {
+    if (openTask) { e.preventDefault(); openTask(id); }
+  }}>{children}</a>;
 }
 
-/** Left-edge lock dot (same visual grammar as Top's status dot): green =
- *  a machine is ON the lane — lock held by a live holder, or a merge-capable
- *  gateway actively ticking it unlocked; amber = lock lapsing; red = zombie
- *  holder; grey = nobody is on the lane. Mouseover names the machine and
- *  distinguishes locked from ticking-unlocked — the "which machine is online
- *  and on this lane" answer lives in the tooltip. */
-function lockDot(l: KbTrainLane, now: number): { sd: "live" | "lapse" | "dead" | "free"; title: string } {
-  if (l.lease?.holder) {
-    const base = `CAS lane lease held by ${l.lease.holder} — heartbeat ${age(l.lease.heartbeat_ts, now)} ago, expires in ${age(l.lease.expires_ts, now)}`;
-    const t = lockTone(l, now);
-    if (t === "ok") return { sd: "live", title: `locked · ${base}` };
-    if (t === "warn") return { sd: "lapse", title: `lock lapsing · ${base}` };
-    return { sd: "dead", title: `lock zombie (heartbeat past TTL) · ${base}` };
+function Recovery({ action, now, openTask }: { action: LineRemediation; now: number; openTask?: (id: string) => void }) {
+  switch (action.kind) {
+    case "merge":
+      return <>
+        <span className="train-banner-line"><strong>Your action: </strong>{action.text}</span>
+        <span className="train-banner-line"><a className="train-banner-card" href={action.url} target="_blank" rel="noreferrer">
+          <strong>Open fix PR #{action.pr} — bypass-merge on GitHub</strong>
+        </a></span>
+        {action.request && <span className="train-banner-line"><TaskLink id={action.request.id} url={action.request.url} openTask={openTask}>
+          Confirm merged or hold the line
+        </TaskLink></span>}
+      </>;
+    case "human":
+      return <>
+        <span className="train-banner-line"><strong>Your action: </strong>{action.text}</span>
+        <span className="train-banner-line"><TaskLink id={action.action.id} url={action.action.url} openTask={openTask}>
+          Open the action request — choose an answer
+        </TaskLink></span>
+      </>;
+    case "machine":
+      return <span className="train-banner-line">Recovery: {action.url
+        ? <a href={action.url} target="_blank" rel="noreferrer">{action.text}</a> : action.text}</span>;
+    case "agent":
+    case "blocked":
+    case "queued": {
+      const task = action.task;
+      return <>
+        <span className="train-banner-line">{action.text}</span>
+        <details className="train-banner-line">
+          <summary>Repair details · {task.id}</summary>
+          <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.title}</TaskLink>
+          {task.owner && <div>Owner: {task.owner}</div>}
+          {task.execution_blockers?.map(b => <div key={b.episode_id}>Blocked: {b.text}</div>)}
+          {task.last_progress?.note && <div>{task.last_progress.note}</div>}
+        {task.last_progress && <div>
+          Last update {age(task.last_progress.ts, now)} ago
+          {task.last_progress.completion_pct != null ? ` · ${task.last_progress.completion_pct}%` : ""}
+          {task.last_progress.will ? ` · NEXT: ${task.last_progress.will}` : action.kind === "agent" ? " · Next action not yet reported" : ""}
+        </div>}
+        </details>
+      </>;
+    }
+    case "attention":
+      return <span className="train-banner-line"><strong>Recovery needs attention: </strong>{action.text}</span>;
   }
-  if (l.capable?.ready)
-    return {
-      sd: "live",
-      title: `ticking, unlocked — merge-capable gateway ${l.capable.holder} ticked this lane ${age(l.capable.at, now)} ago and acquires the lock on its next tick (every ~45s) once work is queued`,
-    };
-  return { sd: "free", title: "no machine on this lane — no merge-capable gateway has ticked inside the 15-minute window; merges wait until one runs (start a gateway / bridge train)" };
 }
 
-/** The STATUS cell — the lane's current activity IN ONE LINE, combining
- *  what + who on (Ray, 2026-10-30: "Status repeats what's in current —
- *  maybe combine: Checking BR#1234 (PR #1234)"). "Checking" = the merge
- *  machine evaluating that PR's review coverage, signatures, CI and
- *  mergeability before merging it; a not-ready PR does NOT hold the queue
- *  (the walk continues to the next ready PR). */
-function laneStatus(l: KbTrainLane, now: number): { tone: ChipTone; label: string; title: string; card?: string; pr?: number } {
-  const reason = l.reason ?? "";
-  const curPr = l.currently?.pr ?? l.queue[0]?.pr ?? undefined;
-  const curCard = l.currently?.task_id ?? l.attempt?.card ?? undefined;
-  if (l.stop)
-    return {
-      tone: "err", card: curCard, pr: curPr,
-      label: `⛔ stopped — main is red${l.stop.culprit_task ? ` (${l.stop.culprit_task})` : ""}`,
-      title: `merges are halted: ${l.stop.reason ?? ""}${l.stop.culprit_task ? ` — culprit ${l.stop.culprit_task}` : ""}, since ${age(l.stop.at, now)} ago. Merges resume automatically when main is green again.`,
-    };
-  if (reason.startsWith("merge-train: retired"))
-    return { tone: "muted", label: "retired", title: "this lane was retired — nothing runs on it" };
-  if (reason.startsWith("merge-train: awaiting bypass merge") || l.bypass_wait) {
-    const bpm = l.bypass_wait ?? { pr: 0, task_id: undefined };
-    return {
-      tone: "warn", card: bpm.task_id, pr: bpm.pr,
-      label: `needs a human merge${bpm.pr ? ` — PR #${bpm.pr}` : ""}`,
-      title: "this PR is blocked by branch protection (a required review/check a machine cannot satisfy) — a human merge is the unblock; it clears itself once merged",
-    };
-  }
-  if (l.currently) {
-    const settling = l.currently.phase !== "bursting";
-    return {
-      tone: l.currently.phase === "stopped" ? "err" : "live", card: l.currently.task_id, pr: l.currently.pr,
-      label: l.currently.phase === "bursting"
-        ? `merging several in a row${l.currently.pr ? ` — at PR #${l.currently.pr}` : ""}`
-        : `merged PR #${l.currently.pr ?? "?"} — waiting on CI`,
-      title: settling
-        ? `PR #${l.currently.pr ?? "?"} is merged; the train waits for main's build+deploy to finish green before the next merge — this is the settle that keeps main deployable. Next: ${l.attempt?.card ?? "—"}.`
-        : `a batch is landing back-to-back; main settles when the batch finishes`,
-    };
-  }
-  if (l.attempt) {
-    return l.attempt.hold === "awaiting-review"
-      ? { tone: "warn", card: l.attempt.card, pr: curPr, label: `waiting on review — ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note}. The queue is NOT held — the train works the next ready PR meanwhile.` }
-      : { tone: "live", card: l.attempt.card, pr: curPr, label: `checking ${l.attempt.card}${curPr ? ` (PR #${curPr})` : ""}`, title: `${l.attempt.note} — the merge machine is evaluating this PR's review coverage, commit signatures, CI and mergeability. A not-ready PR never holds the queue: the walk continues to the next ready PR in the same pass.` };
-  }
-  if (l.lease?.holder) {
-    const t = lockTone(l, now);
-    return {
-      tone: t === "ok" ? "scope" : t === "warn" || t === "err" ? "warn" : "muted",
-      label: "idle — nothing to merge",
-      title: `a machine (${l.lease.holder}) is on this lane — heartbeat ${age(l.lease.heartbeat_ts, now)} ago; it takes work the moment a PR is ready`,
-    };
-  }
-  if (l.capable?.ready)
-    return {
-      tone: "ok",
-      label: "ready",
-      title: `a merge machine (${l.capable.holder}) checked this lane ${age(l.capable.at, now)} ago — it takes the next card the moment one is queued`,
-    };
-  return {
-    tone: "muted",
-    label: "no machine",
-    title: "no merge-capable machine has checked this lane inside the 15-minute window — merges wait until one runs (start a gateway / bridge train)",
-  };
+/** A single renderer for every interruption. All classification and precedence
+ * come from the hub's typed `line` projection, shared with its row and message. */
+export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
+  const line = lane.line ?? unavailable;
+  return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
+    <div className="train-banner-cause">
+    <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
+    <span className="train-banner-line">{line.reason}</span>
+    {line.evidence.length > 0 && <span className="train-banner-line train-banner-checks">Checks: {line.evidence.map((e, i) =>
+      <span key={`${e.name}-${i}`}>{i > 0 ? " · " : ""}{e.url
+        ? <a href={e.url} target="_blank" rel="noreferrer">{e.name}</a> : e.name}</span>)}</span>}
+    {line.observed_at > 0 && <span className="train-banner-line train-banner-dim">Main last checked {age(line.observed_at, now)} ago</span>}
+    </div>
+    {(line.remediation || !!line.recoveries?.length) && <div className="train-banner-recovery">
+    {line.remediation && <Recovery action={line.remediation} now={now} openTask={openTask} />}
+    {lane.stalled_resolution?.last_error && <details className="train-banner-line"><summary>Merge rejection details</summary>{lane.stalled_resolution.last_error}</details>}
+    <LaneRecoveryHistory line={line} now={now} openTask={openTask} />
+    </div>}
+  </div>;
 }
 
-/** The NOW column (Ray, 2026-10-30: "I want to know WHAT is being done right
- *  now and progress"): status pill + PR + phase age (the lane-level state)
- *  PLUS the holder's live last action (BR#5114 now_action — the executor's
- *  own tick log via the BR#4104 proof-of-progress seam), which says WHY a
- *  held head is held ("PR #2588: head check RED: Meta-review nightly").
- *  The note is shown only while fresh (lease TTL = 5 min) — a stale one is
- *  history, not now, and rendering it would be the same lie as before. */
-function nowAction(l: KbTrainLane, now: number): { text: string; title: string } | null {
-  const na = l.now_action;
-  if (!na?.note) return null;
-  const ageSec = (now - na.at) / 1000;
-  if (ageSec > 300) return null; // older than the lease TTL — not "now"
-  return {
-    text: na.note.length > 90 ? `${na.note.slice(0, 88)}…` : na.note,
-    title: `${na.holder} · ${age(na.at, now)} ago — ${na.note}`,
-  };
+export function LaneRecoveryHistory({ line, now, openTask }: { line: TrainLineProjection; now: number; openTask?: (id: string) => void }) {
+  const recoveries = line.recoveries?.filter((r) => r.episode.stage.phase !== "superseded") ?? [];
+  const active = recoveries.filter((r) => recoveryIsOpen(r.episode)).length;
+  return recoveries.length > 0 ? <details className="train-banner-line">
+    <summary>Recovery history · {active} active · {recoveries.length - active} resolved</summary>
+    {recoveries.map(({ episode, task }) => (
+      <div key={episode.id} className="train-banner-line">
+        <strong>{recoveryCauseLabel(episode.cause)}</strong> — {episode.stage.phase}
+        {task && <> · <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.id}</TaskLink>{task.owner ? ` · ${task.owner}` : ""}</>}
+        <div>Next: {episode.stage.next}</div>
+        {episode.attempts.map((attempt) => <div key={attempt.id}>
+          Action: {attempt.action} — {attempt.status === "running" ? "execution in progress; no result yet" : `${attempt.outcome}: ${attempt.summary}`}
+          {attempt.status === "finished" && attempt.receipts.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer"> · receipt</a>)}
+        </div>)}
+        <details><summary>Recovery history · {episode.sources.length} observed run attempt(s)</summary>
+          {episode.history.map((event) => <div key={event.event_id}>{age(event.at, now)} ago · {event.kind}: {event.summary}</div>)}
+        </details>
+      </div>
+    ))}
+    </details> : null;
 }
 
 const REFRESH_MS = 30_000;
-
-/** Merge-train table (Ray 2026-10-30 restructure): the lane row is THREE
- *  labeled time-frames — NOW (what is being done right now + progress),
- *  NEXT (the first queued head the train takes after the current work),
- *  QUEUE (everything remaining, depth + clickable cards with their PRs) —
- *  plus the lock dot, the line, and the throughput rate. A held head says
- *  WHY it is held (the now_action note), the last ledger event rides the
- *  rate column with its age, and "head"/"gate"/"bounced" are never the
- *  only words on screen. The QUEUE column also renders the lane's Awaiting
- *  parks (BR#4962, per BR#4960): cards parked blocked under the typed
- *  Awaiting stamp — the human force-review queue, ◉-chip per card (amber at
- *  the TTL, red past TTL+grace), oldest park first. Data: GET
- *  /api/kb/train (the DO's train.status snapshot — lease/now_action are
- *  executor-fed, queue is hub-computed, oldest first). Polls every 30s (the
- *  tick is 45s); errors surface in-panel, never silent. */
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
-  useClock();
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-
+  const [now, setNow] = useState(Date.now());
   useEffect(() => {
     let dead = false;
     const load = async () => {
       try {
         const r = await kbApi.train();
         if (!dead) { setLanes(r.lanes ?? []); setError(null); }
-      } catch (e) {
-        if (!dead) setError(e instanceof Error ? e.message : String(e));
-      }
+      } catch (e) { if (!dead) setError(e instanceof Error ? e.message : String(e)); }
     };
     void load();
-    const t = setInterval(load, REFRESH_MS);
-    return () => { dead = true; clearInterval(t); };
+    const poll = setInterval(load, REFRESH_MS);
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    return () => { dead = true; clearInterval(poll); clearInterval(clock); };
   }, []);
+  return <TrainPanelView lanes={lanes} error={error} now={now} openTask={openTask} />;
+}
 
-  const now = Date.now();
-  const hasSignal = (l: KbTrainLane) => l.lease || l.queue.length > 0 || l.stop || l.currently || (l.awaiting?.length ?? 0) > 0;
-
-  return (
-    <div className="train-panel">
-      <div className="train-head">
-        <h2>merge trains</h2>
-        <span className="muted-note">per-lane CAS lock + derived queue · 45s tick, 30s poll</span>
+export function TrainPanelView({ lanes, error, now, openTask }: {
+  lanes: KbTrainLane[] | null; error: string | null; now: number; openTask?: (id: string) => void;
+}) {
+  const activeLanes = lanes?.filter(lane => !lane.retired && lane.line?.phase !== "retired");
+  return <div className="train-panel">
+    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span></div>
+    {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
+    {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
+    {!!activeLanes?.length && <div className="ktable-head train-head-cols">
+      <span title="Executor heartbeat" aria-label="Executor heartbeat">●</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
+    </div>}
+    {(activeLanes ?? []).map((l) => {
+      const line = l.line ?? unavailable;
+      const needsAttention = line.phase === "stopped" || line.phase === "unknown";
+      const live = !!l.lease && now - l.lease.heartbeat_ts < 300_000;
+      const machine = l.lease?.holder ?? l.capable?.holder;
+      const repo = l.lane.split("@")[0];
+      const stats = l.pr_stats ?? { in_progress: 0, verifying: 0, ready: 0 };
+      const progress = l.currently?.phase === "bursting"
+        ? `${l.currently.burst_merged ?? 0} merged this batch`
+        : l.currently ? "Merged — checking deployment" : `${line.held} changes queued`;
+      return <section key={l.lane} className={`train-lane-group${needsAttention ? " train-lane-interrupted" : ""}`} aria-label={l.lane}>
+      <div className="ktable-row train-row">
+        <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
+          ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
+        <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
+        <span className="trainc-status"><Chip pill tone={tones[line.phase]} title={line.reason}>{line.label}</Chip>
+          {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
+        </span>
+        <span className="trainc-prog top-num">{progress}</span>
+        <span className="trainc-msg">{line.remediation?.text ?? line.reason}</span>
+        <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
+        <span className="trainc-backlog"><span className="train-stats">
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} ready</span>
+        </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
+          {bi > 0 && <span className="train-block-gap" />}
+          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}`}
+            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}`} onClick={() => openTask?.(q.id)} />)}
+        </span>)}</span></span>
       </div>
-      {error && <div className="train-lane train-lane-err" title={error}>⚠ train status unavailable — {error.slice(0, 120)}</div>}
-      {!error && lanes?.length === 0 && (
-        <div className="train-lane train-lane-idle">no merge-train lanes configured — a lane appears when a card enters the train</div>
-      )}
-      {(lanes ?? []).length > 0 && (
-        <div className="ktable-head train-head-cols">
-          <span title="machine-on-lane — green a machine is on it · amber busy/lapsing · red stuck · grey nobody; hover names the machine">mach</span>
-          <span>line</span>
-          <span title="what the train is doing right now and to WHICH PR — e.g. 'checking BR#123 (PR #456)' = the merge machine evaluating that PR's review, signatures, CI and mergeability; the card opens the board, the PR number opens GitHub">status</span>
-          <span title="x of y PRs merged in the current batch (a batch lands back-to-back, then main settles before the next batch)">progress</span>
-          <span title="the latest status message — what the machine did or hit most recently, and when">msg</span>
-          <span title="PRs merged over the last hour / 24 hours">rate</span>
-          <span title="how many cards are waiting to merge, and how many of those waiting cards are blocked on a fresh review">backlog</span>
-        </div>
-      )}
-      {(lanes ?? []).map((l) => {
-        const dot = lockDot(l, now);
-        const repo = l.lane.split("@")[0];
-        const st = laneStatus(l, now);
-        const na = nowAction(l, now);
-        // PROGRESS: x of y in the current batch (burst passes merge several
-        // back-to-back; a single merge is a batch of 1)
-        const prog =
-          l.currently?.phase === "bursting"
-            ? `${Number(l.currently.burst_merged ?? 0)} of ${l.currently.burst_cap === 0 ? "∞" : Number(l.currently.burst_cap ?? 0)} merged this batch`
-            : l.currently
-              ? "1 of 1 merged — settling"
-              : l.queue.length > 0
-                ? "0 of 1 — batch not started"
-                : "—";
-        // MSG: the freshest true message — the machine's live note first,
-        // else the current attempt sentence, else the last ledger action
-        const msg = na
-          ? { text: na.text, title: na.title }
-          : l.attempt
-            ? { text: l.attempt.note, title: l.attempt.note }
-            : l.activity?.last_event
-              ? { text: `${l.activity.last_event.kind}${l.activity.last_event.pr ? ` PR #${l.activity.last_event.pr}` : ""} ${age(l.activity.last_event.ts, now)} ago`, title: `${l.activity.last_event.kind} by ${l.activity.last_event.gateway ?? "?"} ${age(l.activity.last_event.ts, now)} ago (history — no live machine note yet)` }
-              : null;
-        const stalled = l.queue.length > 0 && (l.activity?.merged_24h ?? 0) === 0;
-        return (
-          <div key={l.lane} className={`ktable-row train-row ${hasSignal(l) ? "" : "train-row-idle"}`}>
-            <span className="trainc-dot">
-              <span className={`train-dot td-${dot.sd}`} title={dot.title} />
-            </span>
-            <span
-              className={`trainc-line ${l.card && openTask ? "trainc-open" : ""}`}
-              title={`${l.lane} — lane card ${l.card}${l.reason ? ` · ${l.reason}` : ""}${l.card && openTask ? " — click to open" : ""}`}
-              onClick={() => l.card && openTask?.(l.card)}
-            >
-              {l.lane}
-            </span>
-            <span className="trainc-status">
-              <Chip pill tone={st.tone} title={st.title}>{st.label}</Chip>
-              {st.card && st.pr ? (
-                <a className="train-pr" href={`https://github.com/${repo}/pull/${st.pr}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} title={`open PR #${st.pr} on GitHub`}>#{st.pr}</a>
-              ) : null}
-            </span>
-            <span className="trainc-prog top-num" title={prog}>{prog}</span>
-            <span className="trainc-msg">
-              {msg ? <span className="train-now-note" title={msg.title}>{msg.text}</span> : <span className="muted-note">—</span>}
-              {stalled && (
-                <span className="train-stall" title={`nothing has merged on this lane in 24 hours while ${l.queue.length} card(s) wait${l.queue_awaiting_review ? ` — ${l.queue_awaiting_review} are blocked on a fresh review (their PR branches changed after their last review)` : ""}`}>
-                  ⚠ nothing merged in 24h
-                </span>
-              )}
-              {(l.awaiting ?? []).length > 0 && (
-                <span className="train-awaiting" title="parked Awaiting review — the human force-review queue (BR#4962, per BR#4960); no ask was filed, the human acts from the backlog">
-                  {(l.awaiting ?? []).map((a) => (
-                    <Chip
-                      key={a.task}
-                      tone={a.lapsed ? "urgent" : a.aging ? "warn" : "scope"}
-                      className="train-awaiting-card"
-                      onClick={() => openTask?.(a.task)}
-                      title={`${a.task}${a.pr ? ` (PR #${a.pr})` : ""} parked Awaiting review — ${a.verdict ?? "verdict unrecorded"} anchored at head ${String(a.head_sha ?? "").slice(0, 9) || "?"} · parked ${age(Date.now() - a.age_ms, Date.now())} ago${a.lapsed ? ", PAST the awaiting window + grace (red) — still listed: visibility without interruption (BR#4960)" : a.aging ? ", past the awaiting window (amber)" : ""} — force-review from the backlog: approve re-queues, changes requested bounce impl (no ask was filed — BR#4960)`}
-                    >
-                      ◉ awaiting {age(Date.now() - a.age_ms, Date.now())}
-                    </Chip>
-                  ))}
-                </span>
-              )}
-            </span>
-            <span className="trainc-rate top-num" title={`PRs merged: last hour ${l.activity?.merged_1h ?? 0} · last 24h ${l.activity?.merged_24h ?? 0}`}>{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
-            <span className="trainc-backlog top-num" title={`${l.queue.length} card(s) waiting to merge (oldest first: ${l.queue.slice(0, 6).map((q) => q.id + (q.pr ? ` ·#${q.pr}` : "")).join(", ")}${l.queue.length > 6 ? " …" : ""})${l.queue_awaiting_review ? `\n${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}`}>
-              {l.queue.length} queued{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
-            </span>
-          </div>
-        );
-      })}
-      {!error && lanes && lanes.length > 0 && lanes.every((l) => !hasSignal(l)) && (
-        <div className="muted-note train-all-idle">all lanes idle — queues empty; a ready lane names the machine that takes the next head</div>
-      )}
-    </div>
-  );
+      {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
+      </section>;
+    })}
+  </div>;
 }

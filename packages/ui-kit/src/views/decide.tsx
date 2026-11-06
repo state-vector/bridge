@@ -51,51 +51,54 @@ export interface HistoryEntry {
 }
 
 
-/** Ask options, two shapes (Ray, 2026-10-23):
- *  - binary + short → one line: [ APPROVE ] [ DENY ]
+/** BR#6390: option button variant — a decline-shaped option renders REJECT
+ * (red), everything else ACCEPT (green). Shared by AskOptions and the task
+ * detail's inline ask buttons so the ACCEPT/DECLINE pair reads as one shape
+ * everywhere. */
+export function askOptionVariant(o: string): "accept" | "reject" {
+  const declineLike = /\bdecline\b|\bdeny\b|\breject\b|\bno-?go\b|\bhold\b|\bstop\b|\bwait\b/i.test(o);
+  const acceptLike = /\bdone\b|\baccept\b|\bapprove\b|\bgo\b|\byes\b|\bmerged?\b/i.test(o);
+  return declineLike && !acceptLike ? "reject" : "accept";
+}
+
+/** Ask options, two shapes (Ray, 2026-10-23 + BR#6390 2026-11-05):
+ *  - 2 options, each ≤64 chars → one line: [ DONE — MERGED PR #N ] [ DECLINE — HOLD THE LINE ]
+ *    (accept green + decline red, full label visible — never letter-keys)
  *  - everything else → vertical list, text VISIBLE next to the key:
  *      [ A ] - Provision x
  *      [ B ] - Reword y
  *  Never letter-keys alone — an option without its text is not an option. */
-export function AskOptions({ options: raw, onPick, busy }: {
-  options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean;
+export function AskOptions({ options: raw, onPick, busy, choices }: {
+  options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean; choices?: import("@bridge/contracts").HumanDecision["choices"];
 }) {
+  if (choices) return <div className="ask-opt-list">{choices.map((choice) => <div key={choice.label} className="ask-choice">
+    <Btn disabled={busy} onClick={() => onPick(choice.label)}>{choice.label}</Btn>
+    <p className="ask-opt-text"><b>{choice.executor === "human" ? "You" : "Bridge"}:</b> {choice.consequence}</p>
+  </div>)}</div>;
   const options = raw
     .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))
     .filter((o) => o && !/\[object\s*object\]/i.test(o));
   if (options.length === 0) return null;
-  const short = options.every((o) => o.length <= 34);
-  if (options.length === 2 && short) {
+  if (options.length === 2 && options.every((o) => o.length <= 64)) {
     return (
       <ActionRow>
         {options.map((o) => (
-          <Btn key={o} variant="accept" disabled={busy} onClick={() => onPick(o)}>{o.toUpperCase()}</Btn>
+          <Btn key={o} variant={askOptionVariant(o)} disabled={busy} onClick={() => onPick(o)}>{o}</Btn>
         ))}
       </ActionRow>
     );
   }
   return (
     <div className="ask-opt-list">
-      {options.map((o, i) => (
+      {options.map((o) => (
         <div key={o} className={`ask-opt-row ${busy ? "disabled" : ""}`} onClick={() => !busy && onPick(o)}>
-          <Btn size="sm" disabled={busy}>{String.fromCharCode(65 + i)}</Btn>
-          <span className="ask-opt-text">{o}</span>
+          <Btn size="sm" disabled={busy}>{o}</Btn>
         </div>
       ))}
     </div>
   );
 }
 
-
-/** The readable kernel of an ask: first sentence, cut on a word boundary. */
-export function askKernel(text: string | undefined, limit = 160): string {
-  const t = (text ?? "").replace(/\s+/g, " ").trim();
-  if (!t) return "";
-  const cut = t.slice(0, limit);
-  const sentence = cut.match(/^[^.?!]*[.?!]/)?.[0];
-  if (sentence && sentence.length > 24) return sentence.trim();
-  return (cut.length < t.length ? cut.slice(0, cut.lastIndexOf(" ")).trimEnd() + "…" : cut);
-}
 
 export function Comment({ v }: { v: HistoryEntry }) {
   const note = (v.data?.note as string | undefined) ?? v.summary;

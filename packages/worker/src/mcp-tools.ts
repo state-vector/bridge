@@ -16,13 +16,15 @@ import {
   TOOL_ARG_SCHEMAS,
   defineToolTable,
   mcpToolsList,
+  StartupWaitSchema,
+  startupWaitReason,
   type ToolCtx,
   type ToolName,
   type ToolTable,
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.7.0";
+export const BUILD = "0.8.0";
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -81,13 +83,33 @@ async function seeAlso(a: any, rel: any, identity: ToolCtx["identity"], call: To
  * this row are what tools/list ADVERTISES and what the fixture test pins.
  */
 export const TOOL_TABLE: ToolTable = defineToolTable({
+  handoffs: {
+    description: "Read pending local handoffs without claiming, acknowledging or resuming work. Paginated, project/recipient scoped. Includes continuation prompt, all current blockers, can_accept/prerequisites and explicit acceptance reference.",
+    schema: TOOL_ARG_SCHEMAS.handoffs,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.read", { ...args, session: ctx.sessionName }))),
+  },
+  handoff_accept: {
+    description: "Explicit episode/version-bound local acceptance. Requires a live full interactive credential (never a provisioned worker/gateway/cron) and a matching human-web authorised session/capability grant. Returns accepted/already_accepted/stale_episode/unauthorized/unmet_prerequisites. Copying a prompt or answering an ask is not acceptance.",
+    schema: TOOL_ARG_SCHEMAS.handoff_accept,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.accept", args))),
+  },
+  handoff_checkpoint: {
+    description: "Record the winning local session's newly published checkpoint before explicit human-authorised return to autonomous execution. Increments the handoff version; never requeues work by itself.",
+    schema: TOOL_ARG_SCHEMAS.handoff_checkpoint,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
+  },
+  execution: {
+    description: "Durable executor protocol v1: eligibility-first schedule (inspect/reserve/request_capacity), read-only schedule_status, full-agent gateway_control (draining/enabled), inspect/advertise, fenced begin/poll, checkpoint/restore/quiesce, mailbox, escalation and effect receipts. request_capacity arranges safe recovery preemption without reserving work. Reservations count against gateway capacity; lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
+    schema: TOOL_ARG_SCHEMAS.execution,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("execution", { ...args, session: args.session ?? ctx.sessionName }))),
+  },
   orient: {
     description: "Session bootstrap + project overview. Always pass session: \"<unique-name>\". Returns goals, open work, pending asks for you, project flags. Every artefact row carries url — its stable deep link (/card/BR-NNNN), pasteable in a browser.",
     schema: TOOL_ARG_SCHEMAS.orient,
     handler: async (args, ctx) => {
       // session self-naming: unique per auth token, required-ish (auto-named with a note if omitted)
       const session = await ctx.call("session.touch", { token_id: ctx.identity.token_id, session: args.session ?? ctx.sessionName });
-      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags });
+      const o = await ctx.call("orient", { label: ctx.identity.label, tags: ctx.identity.tags, session: args.session ?? ctx.sessionName });
       const named = args.session ?? ctx.sessionName;
       const required: string[] = Array.isArray(o.action_required) ? o.action_required : [];
       return text(JSON.stringify(
@@ -127,11 +149,12 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       const m: any = a.meta ?? {};
       const isQuestion = aTags.includes("question");
       const gated = m.operator_gated;
+      const startup = StartupWaitSchema.safeParse(m.startup_wait);
       const traits = isTask
         ? {
             is_question: isQuestion,
-            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated,
-            claim_reason: isQuestion
+            is_claimable: isTask && ["todo", "blocked"].includes(a.status ?? "") && !isQuestion && !gated && !startup.success,
+            claim_reason: startup.success ? startupWaitReason(startup.data) : isQuestion
               ? "question — answered, not claimed (contribute via log_progress {id, did})"
               : gated
                 ? `operator gated: ${gated} — a human clears the gate`
@@ -159,20 +182,29 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       }, null, 1));
     },
   },
+  claim_takeover: {
+    description:
+      "Interactive claim takeover (BR#2997/BR#6135, amended BR#6436): the card's OWNER agent, a human via the web plane, or an authenticated FULL-AGENT credential — your token's LIVE tags classify you as a full agent (gateway and cron credentials excluded; the class is server-derived, never declared) — atomically re-takes an in_progress task whose claim is held by a dispatched runner session, across owners. ONE write flips the holder session to you (status stays in_progress): no release→pool→re-claim, so no dispatcher can win the card in between. The ex-holder's next state change is gate-rejected with a stand-down order (checkpoint last_will via log_progress — still open to it — then exit); its WIP survives in its registered worktree. Refused (terminal, named rules) on: verify/unblock duty cards (separation of duties is not transferable), cards holding a typed wait (train slot / await_event / bound ask — the wait owns the exit), and credentials with no authority anchor (server-verified from your token, never declared — BR#2673). Pause law (BR#6068 lesson): an interactive session about to wait on the human should bind an ask to the task — an open ask pauses the watchdog; a bare pause is abandonment and the claim is fairly lost.",
+    schema: TOOL_ARG_SCHEMAS.claim_takeover,
+    handler: async (args, ctx) => text(JSON.stringify(
+      await ctx.call("claim.takeover", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
+      null, 1,
+    )),
+  },
   create_artefact: {
     description: `Create an artefact. Types: ${ARTEFACT_TYPES.join(", ")}.`,
     schema: TOOL_ARG_SCHEMAS.create_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("create", { ...args, session: args.session, token_id: ctx.identity.token_id }))),
   },
   update_artefact: {
-    description: "Edit title/body/meta/tags/roles. Does not change status — use transition.",
+    description: "Edit title/body/meta/tags/roles. meta MERGES per top-level key: keys you pass replace wholesale (nested objects must be complete), keys you omit are PRESERVED — meta is infrastructure on lane cards (lane/lease/currently/stop) and parked cards (blocked.await_event); never re-send a partial meta expecting replace (BR#5807). Remove keys explicitly with meta_delete: [\"key\"] — null values store as null, not deletes; lane/park infrastructure keys refuse meta_delete from agent sessions (route through an answered ask or the web). Does not change status — use transition.",
     schema: TOOL_ARG_SCHEMAS.update_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("update", args))),
   },
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned. BR#6432 batch disposition: an agent cannot supersede directly (BR#2480), but when a human has ANSWERED a batch-authorization ask ("SUPERSEDE all N …", receipts in the ask body), you may apply it per target: transition {id: "<target>", to: "superseded", batch_auth: {ask: "BR#N"}} — the hub verifies the human answer server-side, checks the target is named in the ask's census and still an open park, executes the drop as system:question(<answered_by>), and stamps meta.batch_auth provenance. Recheck each target's live state FIRST — the old ruling only applies while its predicate still holds.`,
     schema: TOOL_ARG_SCHEMAS.transition,
     handler: async (args, ctx) => text(JSON.stringify({
       ...await ctx.call("transition", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
@@ -239,13 +271,13 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("get_history", { id: args.id, limit: args.limit }), null, 1)),
   },
   ask_agent: {
-    description: "Ask another agent or the human for insight/help/decisions. to: agent label, label@session, tag:<capability> (e.g. tag:datadog-access), 'human', or any. BLOCKED ON A DECISION? pass artefact_id (your task) — the task goes blocked-on-decision, the watchdog pauses for it, and the ask is published in the Bridge app; you resume automatically when it's answered. OPTIONS ARE REQUIRED: give the human 2-8 one-click answers (e.g. [\"GO — merge now\", \"NO-GO — hold\"]) — they answer by clicking, and the ask is rejected without them. ASK QUALITY BAR (enforced): (1) if you recommend an option, make it FIRST and prefix it \"(Recommended)\" — the first button IS the recommendation; (2) human-directed asks REQUIRE details: a self-contained plain-reading brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected; (3) never cram the narrative into reason — question ≤240 chars, details carries the story, reason is the one-line why.",
+    description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
     schema: TOOL_ARG_SCHEMAS.ask_agent,
     handler: async (args, ctx) => {
-      const a = await ctx.call("ask.create", { to: args.to ?? "any", question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id });
+      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
       return text(JSON.stringify({
         ...a,
-        note: a.task_status === "blocked"
+        note: a.kind === "independent_review" ? a.message : a.task_status === "blocked"
           ? "your task is now blocked-on-decision (watchdog paused for it) and the ask is published in the Bridge app. check asks for the answer."
           : "they will see it on their next orient. check yours too.",
       }));
@@ -272,7 +304,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lease", args), null, 1)),
   },
   train_event: {
-    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), carried (a MECHANICAL head move — same patch-ids, executor-proved via git range-diff — carries the accepted verdict as a new chain leg; no bounce, no re-verify; BR#4689 L1.4), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue). Requires the lane lease.",
+    description: "Record a train event (kind) on a lane and let the hub act: merged (PR merged into base — stamps provenance, carry-verdicts clean updates, card → awaiting-CI), carried (a MECHANICAL head move — same patch-ids, executor-proved via git range-diff — carries the accepted verdict as a new chain leg; no bounce, no re-verify; BR#4689 L1.4), bounced (conflict with base — card → in_progress with the fix-up brief; verdict invalidated, re-verify then re-queue at the back), stopped (stop-the-line — lane halts, culprit card bounced with failing runs, ONE ask per class to the alarm sink), landed (REQUIRED inline checks proving main green — hub classifies, executor never self-certifies; closes the impl card and advances the queue), updated (BR#4687: machine update-branch on a behind worker-authored branch — stamps the carry chain, the verdict carries, the card silently re-enters the queue). Requires the lane lease.",
     schema: TOOL_ARG_SCHEMAS.train_event,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.event", args), null, 1)),
   },
@@ -291,13 +323,18 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.train_bisect,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.bisect", args), null, 1)),
   },
+  train_queue_facts: {
+    description: "Feed the executor's per-tick per-entry gate verdicts for the whole derived queue, in walk (rank) order — stored on the lane and served to the trains panel (queue blocks). Classes: ready | waiting | conflict | needs-review | blocked. Requires the lane lease.",
+    schema: TOOL_ARG_SCHEMAS.train_queue_facts,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.queue_facts", args), null, 1)),
+  },
   train_carry: {
     description: "Feed one machine-clean carry (BR#4934 settle-window rebase): after gh pr update-branch moved a verdict-covered head from_head→to_head content-preserving, the hub appends the carry record so the accepted verdict covers the new head (BR#3516 §5 shape). The hub appends via the carry law; the executor never writes card meta. Requires the lane lease.",
     schema: TOOL_ARG_SCHEMAS.train_carry,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.carry", args), null, 1)),
   },
   train_history: {
-    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed with provenance (sha → PR → task → verdict → session).",
+    description: "The train_events ledger for a lane — the audit chain of merged/bounced/stopped/landed/updated with provenance (sha → PR → task → verdict → session).",
     schema: TOOL_ARG_SCHEMAS.train_history,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.history", args), null, 1)),
   },
@@ -305,6 +342,16 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Find-or-create the standing lane card for repo@base, seeding config from the train_lane setting (or the spec arg). Call once per lane before leasing.",
     schema: TOOL_ARG_SCHEMAS.train_lane,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.lane", args), null, 1)),
+  },
+  train_observe_deploy: {
+    description: "Report first-hand read-only GitHub deployment observations independently of the merger lease. The hub validates commit/run receipts and decides line health and recovery. Does not authorize merges or bypass checks.",
+    schema: TOOL_ARG_SCHEMAS.train_observe_deploy,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.observe_deploy", args), null, 1)),
+  },
+  train_recovery_event: {
+    description: "Record cause-specific recovery diagnosis, action attempt, outcome and next step. Repeated event IDs are idempotent; retry budgets survive executor restarts. Code submission never marks live recovery. Only a matched successful decisive deployment closes an episode.",
+    schema: TOOL_ARG_SCHEMAS.train_recovery_event,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("train.recovery_event", args), null, 1)),
   },
   reconcile_schedule: {
     description: "View (no spec) or set the board↔GitHub reconcile schedule: enabled, interval_secs (300..21600), repos (CSV), verify_age_h, disposition_age_h. The gateway daemon reads this cadence.",

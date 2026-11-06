@@ -4,10 +4,14 @@ import { handleMcp, KnowledgeHub } from "./mcp.ts";
 import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
 
 export { KnowledgeHub };
+export { RunnerUpdates } from "./runner-updates.ts";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/runner-updates/")) {
+      return env.RUNNER_UPDATES.get(env.RUNNER_UPDATES.idFromName("channels")).fetch(request);
+    }
 
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);
@@ -126,6 +130,10 @@ export default {
       // the label is free-form, so class is read from the tag
       const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
       if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
+      if (typeof body.cached_secret === "string") return kbGuard("kb.worker.resolve", kbId.fetch("https://kb/worker.resolve", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret: body.cached_secret, token_id: ident.token_id, actor: ident.label }),
+      }));
       return kbGuard("kb.agent.provision", kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),
@@ -203,6 +211,12 @@ export default {
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const sub = url.pathname.slice("/api/kb/".length);
       if (request.method === "GET") {
+        if (sub === "execution_attention") {
+          return kbCors(await kbGuard("kb.execution.attention", env.KB.get(kbId).fetch("https://kb/execution.attention", {
+            method: "POST", headers: { "content-type": "application/json", ...(auth.bearer ? {} : { "x-kb-admin": "1" }) },
+            body: JSON.stringify({ limit: 100, project: url.searchParams.get("project") || undefined, actor: auth.bearer ? "gateway" : `web:${auth.login}` }),
+          })));
+        }
         const kbUrl = sub === "board" ? "https://kb/board"
           : sub === "events" ? "https://kb/events"
           : sub === "artefacts" ? "https://kb/artefacts"
@@ -252,6 +266,13 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
       }
+      if (sub === "handoff_control" && request.method === "POST") {
+        if (auth.bearer) return kbCors(json({ error: "local authorisation/return requires a human session" }, 403));
+        const body = await request.json().catch(() => ({}));
+        return kbCors(await kbGuard("kb.handoff.control", env.KB.get(kbId).fetch("https://kb/handoff.control", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify({ ...body, actor: `web:${auth.login}` }),
+        })));
+      }
       if (sub === "supersede" && request.method === "POST") {
         // BR#3910: one-click human supersede (the action next to Reframe /
         // Claim locally). Web/human-only per BR#2480 — a gateway bearer is an
@@ -285,6 +306,12 @@ export default {
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = await request.json().catch(() => ({}));
         body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        // BR#6135: a web-plane takeover names its holder — the taker's
+        // session is its web:<login> actor, so the holder flip (and with it
+        // the ex-holder stand-down and the idempotent re-click) engages on
+        // the DO (claim takeover is owner/web-anchored, BR#2673). Machine
+        // (bearer) transitions keep their own session semantics.
+        if (!auth.bearer && body.takeover === true && !body.session) body.session = body.actor;
         // do ops are dot-namespaced (ask.answer); the web plane uses snake_case.
         // web `progress` is DO `progress.log` (BR#3462 leg 1): the bare name has
         // no underscore so the dot-mapping passed it through and the DO 404'd

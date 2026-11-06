@@ -45,24 +45,35 @@ export function useTagTheme(countsFrom: any[]): TagTheme {
 
 export function TagThemeBar({ theme, label = "themes" }: { theme: TagTheme; label?: string }) {
   if (!theme.cloud.length) return null;
-  const open = theme.selected.length > 0;
+  const active = theme.selected.length > 0;
   return (
-    <div className={`tag-theme-bar${open ? " tag-theme-open" : ""}`} title="user/agent-defined tag categories — click to filter this view (AND)">
-      <span className="tag-theme-label muted-note">{label}</span>
+    <div className="tag-theme-filter">
+    <details className="tag-theme-panel">
+      <summary>Filter by {label}{active && <span className="tag-theme-selected-count">{theme.selected.length}</span>}</summary>
+      <div className="tag-theme-options">
+      <span className="muted-note">Match all selected themes</span>
+      <div className="tag-theme-bar">
       {theme.cloud.map(([tag, n]) => (
-        <Chip
+        <button
           key={tag}
-          tone={theme.selected.includes(tag) ? "live" : "muted"}
-          className="tag-theme-chip"
+          type="button"
+          aria-pressed={theme.selected.includes(tag)}
+          className={`tag-theme-chip${theme.selected.includes(tag) ? " tag-theme-selected" : ""}`}
           onClick={(e) => { e.stopPropagation(); theme.toggle(tag); }}
         >
           {tag}<span className="tag-theme-n"> ×{n}</span>
-        </Chip>
-      ))}
-      {open && (
-        <button className="tag-theme-clear" onClick={(e) => { e.stopPropagation(); theme.clear(); }}>
-          clear
         </button>
+      ))}
+      </div>
+      </div>
+    </details>
+      {active && (
+        <>
+        <span className="tag-theme-active" title={theme.selected.join(", ")}>{theme.selected.join(", ")}</span>
+        <button className="tag-theme-clear" onClick={(e) => { e.stopPropagation(); theme.clear(); }}>
+          Clear filters
+        </button>
+        </>
       )}
     </div>
   );

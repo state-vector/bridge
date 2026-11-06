@@ -134,9 +134,11 @@ fn emit_error(app: &AppHandle, stage: &str, message: &str) {
 }
 
 /// Request mic + speech permissions (fire-and-forget prompts; status polled
-/// by voice_permissions). The AVAudioSession record API is deprecated in
-/// favour of AVAudioApplication (iOS 17+ SDK-gated in objc2-avf-audio);
-/// deprecated still works everywhere and avoids splitting the path.
+/// by voice_permissions). Called from listen_start — on first use, never at
+/// launch (BR#5449: launch-time system alerts are a touch-blocker risk).
+/// The AVAudioSession record API is deprecated in favour of AVAudioApplication
+/// (iOS 17+ SDK-gated in objc2-avf-audio); deprecated still works everywhere
+/// and avoids splitting the path.
 #[allow(deprecated)]
 pub fn request_permissions() {
     unsafe {
@@ -165,6 +167,12 @@ pub fn listen_start(app: AppHandle) -> Result<(), String> {
         return Err("already listening".into());
     }
 
+    // BR#5449: permission prompts fire on first use, never at launch — system
+    // alerts raised during the launch animation can leak invisibly and block
+    // every touch on the app (device repro: renders fine, taps dead). The
+    // first attempt after granting may still fail; voice_permissions (which
+    // the Voice tab polls) reflects the answer and the next tap succeeds.
+    request_permissions();
     unsafe {
         let session = AVAudioSession::sharedInstance();
         session

@@ -15,14 +15,16 @@ import {
  *  - the pure classifier (the same decision rule as
  *    scripts/main-green-gate.sh) pinned case by case;
  *  - the merge train's stop-the-line drills against the REAL bundled worker —
- *    no canned GitHub and no hub-side VCS credentials (BR#3516 §8 deleted the
- *    hub sweeps): the executor feeds CI facts through train.ci / train.event,
- *    and the HUB stops the line — ONE time-sensitive ask per red episode bound
- *    to the alarm sink (deduped per sha), the culprit card bounced with the
- *    failing runs, a line_green release re-opening the lane, green landing
- *    only through the machine-proxy close, a lying train:landed rejected
- *    fail-closed, and every train op demanding the lane lease.
- */
+  *    no canned GitHub and no hub-side VCS credentials (BR#3516 §8 deleted the
+  *    hub sweeps): the executor feeds CI facts through train.ci / train.event,
+  *    and the HUB stops the line — machine state only (BR#5631, 2026-11-03:
+  *    NO stop-time human ask; the root-fix card spawns at p0, the culprit
+  *    card bounces with the failing runs, a line_green release re-opens the
+  *    lane, and the human bypass/manual decision files LATER through the
+  *    warranted base-red ask — queue_facts drills in train-hub), green
+  *    landing only through the machine-proxy close, a lying train:landed
+  *    rejected fail-closed, and every train op demanding the lane lease.
+  */
 
 // ---------- tier 1: the decision rule (pure) ----------
 
@@ -201,7 +203,7 @@ async function stopAsks(sha9: string): Promise<any[]> {
 }
 
 describe("train stop-the-line (real DO — executor-fed red, hub decides)", () => {
-  it("red required runs on the merged commit stop the line: ONE time-sensitive ask to the sink (deduped per episode) + the culprit bounced with the failing runs", async () => {
+  it("red required runs on the merged commit stop the line: NO stop-time human ask (BR#5631) — the root-fix card spawns at p0 with the blame edge, the culprit bounces with the failing runs", async () => {
     const repo = "state-vector/superpositional";
     const culprit = await parkQueued("IMPL: stop-line drill — culprit");
     const got = await acquire(repo, "gw-red", { required_workflows: ["Test"] });
@@ -225,19 +227,22 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(String(snap.reason)).toContain("STOPPED");
     expect(snap.currently.phase).toBe("stopped");
 
-    // ONE ask, bound to the drill sink, time-sensitive, honest about the culprit
-    const asks = await stopAsks("fffffffff");
-    expect(asks.length).toBe(1);
-    const ask = (await kbJson("/get", { id: asks[0].id })).body;
-    expect(ask.meta?.ask?.urgency).toBe("time-sensitive");
-    expect(ask.meta?.ask?.to).toBe("human");
-    expect(ask.meta?.ask?.artefact_id).toBe(sinkId);
-    expect(String(ask.title)).toContain("superpositional@main");
-    expect(String(ask.title)).toContain("fffffffff");
-    expect(String(ask.title)).toContain("Test");
-    expect(String(ask.title).endsWith("?")).toBe(true);
-    expect(String(ask.meta?.ask?.reason)).toContain("merges halt");
-    expect(String(ask.body_md ?? ask.meta?.ask?.details ?? "")).toContain("Culprit card");
+    // 2026-11-03 (BR#5631, from the BR#5626 escalation): NO ask at stop time —
+    // the stop is machine state, not a human decision. The culprit bounces
+    // (below), the root-fix card spawns at absolute p0 (BR#5190), the lane
+    // banner carries what's broken, and the line auto-resumes on green. The
+    // human-actionable bypass decision surfaces LATER via the warranted
+    // base-red ask once a cure PR binds (queue_facts drills in train-hub).
+    expect((await stopAsks("fffffffff")).length).toBe(0);
+
+    // the root-fix card spawned at absolute p0 and carries the blame edge to
+    // the culprit (BR#5517 — the ask is gone, the card is the blame source)
+    const rf = (await kbJson("/search", { q: "fffffffff", type: "task", limit: 20 })).body.artefacts
+      .find((x: any) => String(x.title ?? "").startsWith("ROOT-FIX (BR#5189 p0):"));
+    expect(rf, "expected the auto-spawned ROOT-FIX card").toBeTruthy();
+    const rfRels = (await kbJson("/relations", { id: rf.id })).body.relations ?? [];
+    const blameLink = (rfRels as any[]).find((r) => r.relation === "derived_from" && String(r.artefact_id) === culprit);
+    expect(blameLink, `expected a derived_from blame link root-fix → ${culprit}, got ${JSON.stringify(rfRels)}`).toBeTruthy();
 
     // the culprit: bounced out of the queue with the failing runs in the brief
     const card = (await kbJson("/get", { id: culprit })).body;
@@ -248,15 +253,89 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(String(card.body_md)).toContain("no auto-revert");
     expect(card.meta?.merge_train?.state).toBe("stopped");
 
-    // same red sha again: the ask dedupes, the brief is not re-appended
+    // same red sha again: still no ask (the episode stays agent-workable),
+    // the brief is not re-appended
     const again = await kbJson("/train.ci", {
       repo, base: "main", actor: "gw-red", sha: "f".repeat(40),
       checks: [check(2, "Test", "failure", "https://example/ci/red-test")],
     });
     expect(again.body.decided).toBe("stopped");
-    expect((await stopAsks("fffffffff")).length).toBe(1);
+    expect((await stopAsks("fffffffff")).length).toBe(0);
     const card2 = (await kbJson("/get", { id: culprit })).body;
     expect(String(card2.body_md).split("Merge-train STOP THE LINE").length - 1).toBe(1);
+  });
+
+  it("BR#5517: the stop dings the culprit card's impl/verify sessions — capped train_red on the score board, bystanders untouched, no refund on line_green", async () => {
+    const repo = "state-vector/ding-score";
+    // a culprit card whose version receipts name its impl + verify legs
+    const c = await kbJson("/create", { type: "task", title: "IMPL: ding drill — culprit", actor: "impl-ding-a" });
+    expect(c.status).toBe(200);
+    const culprit = String(c.body.id);
+    const b = await kbJson("/transition", {
+      id: culprit, to: "blocked", note: "merge-train: queued", merge_train: true,
+      unblock_condition: "the merge train advances this card — no agent action needed until it bounces (then fix per the brief)",
+      actor: "verify-ding-a",
+    });
+    expect(b.status, `park failed: ${JSON.stringify(b.body)}`).toBeLessThan(400);
+    // a bystander session: activity on an unrelated card, never on the culprit
+    const side = await kbJson("/create", { type: "task", title: "IMPL: ding drill — bystander card" });
+    expect(side.status).toBe(200);
+    // park the side card (the gate-free merge-train park) so the bystander's
+    // progress lands — progress on an unclaimed todo early-returns unclaimed
+    const parked = await kbJson("/transition", {
+      id: String(side.body.id), to: "blocked", note: "merge-train: queued", merge_train: true,
+      unblock_condition: "the merge train advances this card — bystander filler",
+      actor: "bystander-ding",
+    });
+    expect(parked.status, `park failed: ${JSON.stringify(parked.body)}`).toBeLessThan(400);
+    const prog = await kbJson("/progress.log", {
+      id: String(side.body.id), actor: "bystander-ding",
+      note: "unrelated bystander progress note, well past the thin-note bound",
+      completion_pct: 40, confidence_pct: 80, risk_pct: 10,
+    });
+    expect(prog.status, `progress failed: ${JSON.stringify(prog.body)}`).toBeLessThan(400);
+    expect(String(prog.body.note_postscript ?? ""), `progress must persist: ${JSON.stringify(prog.body)}`).not.toContain("PROGRESS LOGGED BUT TASK NOT CLAIMED");
+
+    await acquire(repo, "gw-ding", { required_workflows: ["Test"] });
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-ding",
+      pr: 5517, merge_sha: "9".repeat(40), head_sha: "8".repeat(40), task_id: culprit,
+    });
+    const red = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-ding", sha: "9".repeat(40),
+      checks: [check(9, "Test", "failure", "https://example/ci/ding-red")],
+    });
+    expect(red.body.decided).toBe("stopped");
+
+    // the board's agent rows show the ding: every leg the culprit's receipts
+    // name (impl + verify + the gateway that bounced it) eats ONE capped
+    // train_red
+    const agents = (await kbJson("/board")).body.agents as any[];
+    const row = (label: string) => agents.find((a: any) => a.label === label);
+    for (const label of ["impl-ding-a", "verify-ding-a", "gw-ding"]) {
+      const r = row(label);
+      expect(r?.train_red, `${label}: ${JSON.stringify(r)}`).toBe(1);
+      expect(r.hints.join(" ")).toMatch(/stop-the-line episode/);
+    }
+    // card legs own nothing: 50 − min(15, 1×5) = 45; the gateway also owns
+    // this lane card (+2 artefact bonus), so its ding lands on 47
+    expect(row("impl-ding-a").score).toBe(45);
+    expect(row("verify-ding-a").score).toBe(45);
+    expect(row("gw-ding").score).toBe(47);
+    // bystander sessions are untouched
+    const by = row("bystander-ding");
+    expect(by?.train_red, `bystander row: ${JSON.stringify(by)}`).toBe(0);
+    expect(by.hints.join(" ")).not.toMatch(/stop-the-line episode/);
+    expect(by.score).toBeGreaterThan(45);
+
+    // clearing the red (line_green release) does NOT refund the ding
+    const green = await kbJson("/train.lease", { repo, base: "main", action: "release", line_green: true, actor: "gw-ding" });
+    expect(green.body.error ?? "").toBe("");
+    const agents2 = (await kbJson("/board")).body.agents as any[];
+    const after = agents2.find((a: any) => a.label === "impl-ding-a");
+    expect(after?.train_red).toBe(1);
+    expect(after?.score).toBe(45);
+    expect(agents2.find((a: any) => a.label === "gw-ding")?.score).toBe(47);
   });
 
   it("only a line_green release re-opens a stopped lane (a plain release never clears the stop)", async () => {
@@ -269,7 +348,8 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     });
     expect(stopped.body.error ?? "").toBe("");
     expect((await laneSnap(repo)).stop?.sha).toBe("e".repeat(40));
-    expect((await stopAsks("eeeeeeeee")).length).toBe(1);
+    // BR#5631: no stop-time ask — the stop is machine state
+    expect((await stopAsks("eeeeeeeee")).length).toBe(0);
 
     // a plain release drops the lease but the line stays stopped
     const plain = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-green" });
@@ -278,7 +358,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(String((await laneSnap(repo)).reason)).toContain("STOPPED");
 
     // the next gateway reconciles and acquires; a NEW red episode (new sha)
-    // files its own ask — per-episode dedupe
+    // still files no ask — every episode is agent-workable until a cure binds
     const back = await acquire(repo, "gw-green");
     expect(back.body.error ?? "").toBe("");
     const again = await kbJson("/train.event", {
@@ -286,7 +366,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
       merge_sha: "d".repeat(40), failing: [{ name: "CLI build", conclusion: "timed_out", url: "https://example/ci/red2" }],
     });
     expect(again.body.error ?? "").toBe("");
-    expect((await stopAsks("ddddddddd")).length).toBe(1);
+    expect((await stopAsks("ddddddddd")).length).toBe(0);
 
     // line_green: the stop clears, the stopped-phase in-flight record drops,
     // and the lane shows the honest idle reason
@@ -405,7 +485,9 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(stopped.body.decided).toBe("stopped_bound");
     const snap = await laneSnap(repo);
     expect(snap.stop.reason).toContain("fail-closed bound");
-    expect((await stopAsks("888888888")).length).toBe(1);
+    // BR#5631: no stop-time ask on the fail-closed class either — the
+    // root-fix card owns the diagnosis (unknowns are agent-workable)
+    expect((await stopAsks("888888888")).length).toBe(0);
     // the culprit bounced like any other stop
     expect((await kbJson("/get", { id: card })).body.status).toBe("in_progress");
   });
@@ -440,5 +522,66 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     const rel = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-1" });
     expect(rel.body.error ?? "").toBe("");
     expect(rel.body.lease).toBeNull();
+  });
+
+  it("BR#5679: a stopped lane serves base_red_resolution (BROKEN + WHAT FIXES IT), preserves queue_facts across rerun_consumed acks, and clears stop via train.ci when required workflows recover green despite a non-required nightly failure", async () => {
+    const repo = "state-vector/lane-br5679";
+    const card = await parkQueued("IMPL: br5679 culprit");
+    const heldCard = await parkQueued("IMPL: br5679 queued behind stop");
+    await acquire(repo, "gw-5679", { required_workflows: ["post-deploy / Post-Deploy Smoke"] });
+    const M = "7".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-5679",
+      pr: 2743, merge_sha: M, head_sha: "5".repeat(40), task_id: card,
+    });
+
+    // Required workflow fails -> stop-the-line
+    const stopped = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-5679", sha: M,
+      checks: [check(10, "post-deploy / Post-Deploy Smoke", "failure", "https://example/runs/41576347395/job/125726311965")],
+    });
+    expect(stopped.body.decided).toBe("stopped");
+
+    // Stamp queue_facts, then send an ack-only rerun_consumed with entries:[] —
+    // stored entries must NOT be clobbered, and rerun_failed is omitted when null.
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-5679",
+      entries: [{ id: heldCard, pr: 2750, cls: "waiting" }],
+    });
+    await kbJson("/train.queue_facts", {
+      repo, base: "main", actor: "gw-5679",
+      entries: [],
+      rerun_consumed: "nothing-red",
+    });
+
+    const snapStopped = await laneSnap(repo);
+    expect("rerun_failed" in snapStopped).toBe(false);
+    expect(snapStopped.queue_facts?.entries?.length).toBe(1);
+    // Stop-mode resolution banner is populated even without queue_facts.base_state
+    expect(snapStopped.base_red_resolution).toBeTruthy();
+    expect(snapStopped.base_red_resolution.verdict).toBe("red");
+    expect(snapStopped.base_red_resolution.whats_broken).toEqual([
+      { name: "post-deploy / Post-Deploy Smoke", url: "https://example/runs/41576347395/job/125726311965" },
+    ]);
+    expect(snapStopped.base_red_resolution.fix_card).toBeTruthy();
+
+    // Post-Deploy Smoke rerun succeeds while a non-required nightly check fails;
+    // train.ci clears the stop even when called by a second actor while gw-5679 holds the lease.
+    const recovered = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-reconcile", sha: M,
+      checks: [
+        check(10, "post-deploy / Post-Deploy Smoke", "failure", "https://example/runs/41576347395/job/125726311965"),
+        check(20, "post-deploy / Post-Deploy Smoke", "success", "https://example/runs/41576347395/job/125733260105"),
+        check(21, "Guard fixtures (3 draws, boundary-classified)", "failure", "https://example/runs/41579155833/job/125729626874"),
+      ],
+    });
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.decided).toBe("line_green");
+    expect(recovered.body.stop).toBeNull();
+
+    const snapGreen = await laneSnap(repo);
+    expect(snapGreen.stop).toBeNull();
+    expect(snapGreen.currently).toBeNull();
+    expect(snapGreen.base_red_resolution ?? null).toBeNull();
   });
 });
