@@ -1540,6 +1540,10 @@ USAGE:
   bridge pair <url>      first use: pair, then guided agent setup (backend, model, workdir)
   bridge status          print current runner state
   bridge doctor          check headless setup (config, models, agent CLIs, git)
+  bridge build-info      embedded source commit and update protocol
+  bridge update install  install independent Linux updater (does not enable it)
+  bridge update enable main|stable|pinned   explicitly opt in via config
+  bridge update disable|status             disable updates or inspect receipts
   bridge logs [opts]     view the hub event log (headless):
                            --limit N    last N events (default 30)
                            -f           follow — poll for new events

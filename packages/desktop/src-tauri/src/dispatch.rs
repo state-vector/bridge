@@ -4509,7 +4509,7 @@ fn tick(
     // New work is selected AND reserved by the hub. Local history is not a
     // second scheduling authority: a human release re-enters this path even
     // when this process previously gave up or cached a refused reference.
-    while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) {
+    while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
         let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
         let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
             Ok(SchedulingOutcome::Reserved { task_id, session, .. }) => (task_id, session),

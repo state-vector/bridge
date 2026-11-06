@@ -153,7 +153,8 @@ class Supervisor:
             if pid > 0 and receipt.get("pid") == pid and receipt.get("commit") == commit and receipt.get("observed_at", 0) >= start:
                 # Check real backend readiness + hub auth with the candidate's doctor.
                 self.run([str(self.binary), "doctor"], timeout=90)
-                if time.monotonic() - stable_since >= 15:
+                if self.pid() == pid and time.monotonic() - stable_since >= 15:
+                    self.run(["systemctl", "--user", "is-active", "bridge.service"])
                     return True
             time.sleep(2)
         return False
