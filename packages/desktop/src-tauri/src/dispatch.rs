@@ -92,6 +92,9 @@ pub struct DispatchConfig {
     /// Env BRIDGE_SWEEP_REPOS (comma-separated paths).
     #[serde(default)]
     pub sweep_repos: Vec<String>,
+    /// Explicit opt-in. Absent/null/disabled never downloads or replaces binaries.
+    #[serde(default)]
+    pub auto_update: Option<AutoUpdateConfig>,
     /// Enabled backends, keyed by provider name. Each section carries that
     /// provider's own config — model, agent profile, CLI binary override.
     /// A dict, not an array: providers differ (opencode has its own default
@@ -108,6 +111,36 @@ pub struct DispatchConfig {
     /// Omitted = the built-in `worker` class (builtin_worker_identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoUpdateConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub channel: UpdateChannel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel { Main, Stable, Pinned }
+
+/// Local request is written only by the separately supervised updater. It is
+/// deliberately fail-closed across crashes: only its owner removes the hold.
+fn update_request() -> Option<serde_json::Value> {
+    if std::env::var("BRIDGE_MANAGED_UPDATES").as_deref() != Ok("1") { return None; }
+    let home = std::env::var("HOME").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(home).join(".bridge/update/request.json")).ok()?).ok()?;
+    value["nonce"].as_str().filter(|s| !s.is_empty())?;
+    Some(value)
+}
+
+fn update_receipt(name: &str, value: &serde_json::Value) {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".bridge/update").join(name);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, value.to_string()).is_ok() { let _ = std::fs::rename(tmp, path); }
+    }
 }
 
 /// Per-provider settings. Everything optional — a provider section can be
@@ -602,6 +635,7 @@ impl DispatchConfig {
             agent_name: None,
             ws: None,
             gateway: None,
+            auto_update: None,
             identity: None,
         })
     }
@@ -818,6 +852,7 @@ pub fn default_config() -> DispatchConfig {
         isolate: default_isolate(),
         worktree_exempt_repos: Vec::new(),
         sweep_repos: Vec::new(),
+        auto_update: None,
         backends: Default::default(),
         models: None,
         agents: None,
@@ -4306,7 +4341,7 @@ fn tick(
     }
 
     // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok || stop.load(Ordering::SeqCst) {
+    if !avail_ok || stop.load(Ordering::SeqCst) || update_request().is_some() {
         return Ok(msgs);
     }
     let Some(worker_credential) = prepared_worker.as_ref() else { return Ok(msgs); };
@@ -4820,7 +4855,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     // reports, then stands down LOUDLY from merge legs (BR#3181). Lease
     // renewals carry proof-of-progress; MERGE_TRAIN_ENABLED=0 disables
     // (deploy.md §7).
-    crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), stop.clone());
+    let mut train_stop = Arc::new(AtomicBool::new(update_request().is_some()));
+    let mut train_handle = if update_request().is_none() {
+        crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone())
+    } else { None };
     // BR#4489 `role: "train"`: a dedicated merge-train node is a normal
     // gateway in a named mode — the daemon legs (train thread above, WS
     // connection/transport, epoch self-heal, liveness) keep running; the
@@ -4881,6 +4919,20 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let mut heal = AuthHeal::new();
     let mut cfg = cfg;
     loop {
+        if let Some(request) = update_request() {
+            // Natural completion only: do not signal worker stop, discard
+            // receivers, infer quiescence from a lease or kill a live writer.
+            train_stop.store(true, Ordering::SeqCst);
+            if in_flight.is_empty() {
+                if let Some(handle) = train_handle.take() {
+                    if handle.join().is_err() { dlog("", "update deferred: train thread panicked; no idle receipt"); return; }
+                }
+                update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
+            }
+        } else if train_stop.load(Ordering::SeqCst) {
+            train_stop = Arc::new(AtomicBool::new(false));
+            train_handle = crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone());
+        }
         if stop.load(Ordering::Relaxed) {
             if in_flight.is_empty() { break; }
             // Stop is a bounded checkpoint/quiesce drain, not dropping the
@@ -4946,6 +4998,9 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
                 &stop,
             ) {
             Ok(msgs) => {
+                if update_request().is_some() && !avail.is_empty() && snap.lock().map(|s| s.needs_attention.is_none()).unwrap_or(false) {
+                    update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
+                }
                 for msg in msgs {
                     dlog("", &msg);
                 }
@@ -5034,16 +5089,19 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         }
         // ephemeral flat-file state: keep ~/.bridge/dispatch/runner.json in sync
         write_runner_state(&snap);
+        if update_request().is_some() { std::thread::sleep(Duration::from_secs(2)); }
         // sleep in small slices so stop is responsive
         let wake = std::time::Instant::now() + Duration::from_secs(cfg.poll_secs);
         while std::time::Instant::now() < wake {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || update_request().is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
     running.store(false, Ordering::Relaxed);
+    train_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = train_handle { let _ = handle.join(); }
     if let Ok(mut s) = snap.lock() {
         s.running = false;
         s.in_flight = Vec::new();
@@ -5637,6 +5695,7 @@ mod tests {
             isolate: true,
             worktree_exempt_repos: vec![],
             sweep_repos: vec![],
+            auto_update: None,
             backends: std::collections::BTreeMap::from([
                 ("opencode".to_string(), Default::default()),
             ]),

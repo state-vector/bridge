@@ -65,6 +65,7 @@ mod canary;
 /// death hook / give-up escalation unit that `bridge service install`
 /// emits. Machine infrastructure notes, session "host-supervisor".
 mod alarm;
+mod update;
 
 use dispatch::DispatchConfig;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,10 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
+        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1})),
+        "update" => {
+            if let Err(error) = update::command(&args[2..]) { eprintln!("update: {error}"); std::process::exit(1); }
+        }
         "pair" => {
             let url = args
                 .get(2)
@@ -390,6 +395,7 @@ fn run(cfg: Option<DispatchConfig>) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
+                    auto_update: None,
                     identity: None, // built-in worker class applies (BR#3185)
                 },
             });

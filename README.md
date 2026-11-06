@@ -6,6 +6,68 @@
 
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
+## Opt-in runner auto-updates (Linux/systemd)
+
+Automatic binary replacement is **off by default**. Installing from `dev` does
+not opt a host in. In `~/.bridge/config.json`, opt in explicitly:
+
+```json
+"auto_update": { "enabled": true, "channel": "main" }
+```
+
+`main` follows a commit-addressed four-platform build **only after CI and the
+build workflow both succeed for the same main SHA**. `stable` requires a
+successful version-tagged release as well. `pinned`, `enabled: false`, or an
+absent/null `auto_update` disables downloads and replacement. Set it through the
+single config writer with `bridge update enable main`, `bridge update enable
+stable`, or `bridge update disable`. `bridge update status` shows config and the
+last durable update result; `bridge build-info` prints the embedded source SHA.
+
+One-time bootstrap on the remote, **as the runner's Unix user**:
+
+1. Install a current `dev` binary once (`install.sh dev`), after safely draining
+   any old/nohup runner. `bridge build-info` must report `update_protocol: 1`.
+2. In the shell where `bridge doctor` is ready, run `bridge service install`
+   (if no `bridge.service` exists), then `bridge update install`. This writes
+   user units/scripts but does **not** enable auto-update or restart anything.
+   Python 3.10+ is required. The runner service must own the installed binary;
+   the updater refuses to stop a bare/nohup process or a different service.
+3. Run `bridge update enable main`, `systemctl --user daemon-reload`, and once
+   existing work is idle, `systemctl --user enable --now bridge bridge-update`.
+   If `bridge.service` was already running, restart it once **after a safe drain**
+   to pick up the managed-update environment drop-in. Never run it alongside the
+   old nohup runner. `loginctl enable-linger "$USER"` keeps user services alive.
+4. Inspect `bridge update status`, `bridge build-info`, `tail -f ~/bridge.log`,
+   and `journalctl --user -u bridge-update -f`.
+
+The independent updater listens to `/api/runner-updates/events` SSE. Publication
+is a wake hint: on startup/reconnect it reconciles the persisted channel manifest;
+an hourly fallback covers lost events. Disabled hosts perform no update-network
+checks. The public publication endpoint accepts **no caller-provided download
+URLs/manifests**: it independently verifies successful GitHub CI/build runs for
+the source commit (and the versioned release gate for stable), fetches that
+commit's release manifest, and advances channel revisions monotonically.
+
+Before installing, the supervisor verifies SHA256, checks the candidate's
+embedded commit and runs doctor. It asks the runner to stop claiming work, lets
+existing tasks finish naturally, and joins the train thread before accepting a
+nonce/PID-bound idle acknowledgement. It never infers quiescence from an expired
+lease or a stale heartbeat, and never kills active work to meet an update
+deadline. After 15 minutes without idle it defers and resumes the old runner.
+Candidates start under the same no-claims hold; confirmation requires the exact
+new process/build's fresh readiness receipt, a stable process, and passing hub/
+backend doctor checks. Failed candidates roll back to the previous verified
+binary while that hold remains. Interrupted installs recover conservatively;
+failed rollback retains the hold for inspection rather than starting writers.
+
+Success, deferral and rollback produce durable local state and a deduplicated
+ops notification through the existing Bridge alarm feed (visible in Log and in
+Slack where the alarm shipper is configured). Failed notification delivery is
+retained locally for retry. The updater itself is separately installed, rather
+than replacing its own recovery executor during a runner update. To stop future
+updates: `bridge update disable`; an installation already in progress is first
+recovered/confirmed safely. Retained binary: `bridge.previous` beside `bridge`.
+
 ## What you need
 
 - A [Cloudflare](https://dash.cloudflare.com) account (free)

@@ -4,10 +4,14 @@ import { handleMcp, KnowledgeHub } from "./mcp.ts";
 import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
 
 export { KnowledgeHub };
+export { RunnerUpdates } from "./runner-updates.ts";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/runner-updates/")) {
+      return env.RUNNER_UPDATES.get(env.RUNNER_UPDATES.idFromName("channels")).fetch(request);
+    }
 
     if (url.pathname === "/ingest") {
       return handleIngest(request, env);

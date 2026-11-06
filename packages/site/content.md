@@ -1,5 +1,21 @@
 # bridge
 
+### Opt-in server updates
+
+Linux runners can explicitly opt into automatic updates in config:
+`"auto_update": { "enabled": true, "channel": "main" }`. Absent/null config,
+`enabled: false`, and `pinned` leave automatic downloads and replacement off.
+`main` follows CI-approved commit-addressed builds; `stable` additionally requires
+a successful versioned release. A separate systemd updater receives build-ready
+push events, reconciles on reconnect, and uses an hourly fallback instead of
+aggressively polling releases. It verifies the download and embedded source SHA,
+waits for active work to finish and the train thread to join, then restarts under
+a no-claims hold. Fresh process/backend/hub health proves adoption; an unhealthy
+candidate rolls back before work resumes. Update/deferral/rollback receipts reach
+Bridge's ops feed and configured Slack shipping. Auto-update is never enabled by
+an installer or pairing flow. See the README's remote bootstrap instructions;
+`bridge update install`, `enable main|stable`, `disable`, and `status` manage it.
+
 **The outer loop that cajoles your agents & humans**
 
 Your agents run the inner loop: prompt, edit, test, repeat. bridge is the outer loop around them. It decides what work happens next, hands each unit to a fresh agent session, tracks live progress with completion, confidence, and risk, verifies results with an independent session, and routes sign-off to a human when it matters.

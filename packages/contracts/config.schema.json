@@ -143,6 +143,20 @@
         "type": "string"
       }
     },
+    "auto_update": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "channel": { "type": "string", "enum": ["main", "stable", "pinned"] }
+          },
+          "required": ["enabled", "channel"],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
+    },
     "models": {
       "type": "object",
       "propertyNames": {
@@ -182,7 +196,8 @@
     "isolate",
     "backends",
     "worktree_exempt_repos",
-    "sweep_repos"
+    "sweep_repos",
+    "auto_update"
   ],
   "additionalProperties": {}
 }

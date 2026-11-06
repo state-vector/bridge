@@ -4008,7 +4008,7 @@ impl DaemonTrainConfig {
 /// seconds — the dispatch loop must not stall behind it), and NEVER kills its
 /// host: panics are caught per tick, auth failures rebuild the pairing, and
 /// errors just log — the 5-minute lease TTL is the designed fail-closed.
-pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::sync::Arc<AtomicBool>) {
+pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::sync::Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
     let cfg = DaemonTrainConfig::from_runner(hub, token, label);
     if !cfg.enabled {
         emit(
@@ -4016,7 +4016,7 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
             "",
             "gateway train leg disabled (MERGE_TRAIN_ENABLED=0) — not spawning",
         );
-        return;
+        return None;
     }
     // BR#4806: the event-driven wake leg (best-effort; spawn failure or
     // MERGE_TRAIN_EVENTS=0 leaves the daemon poll-only — today's behaviour)
@@ -4026,12 +4026,9 @@ pub fn spawn_daemon_leg(hub: &str, token: &str, label: Option<&str>, stop: std::
         emit("train", "", "train wake leg disabled (MERGE_TRAIN_EVENTS=0) — poll cadence only");
     }
     let spawned = std::thread::Builder::new().name("merge-train".into()).spawn(move || daemon_loop(cfg, stop));
-    if let Err(e) = spawned {
-        emit(
-            "train",
-            "",
-            &format!("failed to spawn gateway train leg: {e}"),
-        );
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => { emit("train", "", &format!("failed to spawn gateway train leg: {e}")); None }
     }
 }
 
