@@ -359,7 +359,10 @@ export interface KbTrainLane {
    *  holding cars renders the lane BLOCKED (laneStatus + laneSyncReason). */
   queue_facts?: {
     at: number;
-    entries: { id: string; pr?: number; cls: KbTrainEntryClass | string }[];
+    entries: { id: string; pr?: number; cls: KbTrainEntryClass | string;
+      repair?: { kind: string; checks?: { name: string; url?: string }[] };
+      repair_task?: string;
+    }[];
     conflict_pairs?: [number, number][];
     base_state?: {
       verdict: "green" | "red" | "unsettled" | "empty";

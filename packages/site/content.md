@@ -16,6 +16,12 @@ writer quiescence; a concurrency limit is not a guarantee of sustained occupancy
 Refill batches reuse a fresh worker inventory for at most 60 seconds instead of
 re-advertising it for every launch; live begin authorization still applies.
 
+Open a merge lane for live status, deployment and recovery links, queue blockers
+and repair tasks, executor heartbeat and throughput. The detail view shares the
+train row’s status and refreshes every 30 seconds, with failed/stale reads clearly
+marked. Configuration and recovery history are expandable; permanent lanes no
+longer appear as agent tasks with completion gauges or generic unblock controls.
+
 Use **Go to BR#…** in the web or desktop header to open a card by number from
 any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press
 Enter or **Go**. **⌘K / Ctrl+K** focuses the lookup, and Escape clears it.
