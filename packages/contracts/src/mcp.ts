@@ -238,16 +238,23 @@ export const TOOL_ARG_SCHEMAS = {
     // BR#4687 "updated": the executor's silent machine-rebase carry — the
     // train updates its OWN behind worker-authored branch and stamps the
     // carry the moment the update lands (no bounce, no status change).
-    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated"]),
+    // BR#4689 L1.4 "carried": the executor's PROVEN mechanical head move —
+    // a rebase-only move (same patch-ids, range-diff all-'=') extends the
+    // verdict's carry chain instead of bouncing.
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated", "carried"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
-    from_head: z.string().optional(),
     merge_sha: z.string().optional(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
     run_url: z.string().optional(),
     carry_from: z.string().optional(),
+    /** BR#4687 "updated": the head the machine rebase moved from.
+     *  BR#4689 L1.4 (kind=carried): the chain tip the mechanical move extends */
+    from_head: z.string().optional(),
+    /** BR#4689 L1.4 (kind=carried): the git range-diff proof receipt */
+    evidence: z.string().optional(),
     reason: z.string().optional(),
     conflict_files: z.array(z.string()).optional(),
     failing: z
@@ -423,3 +430,20 @@ export const TOOL_ARG_SCHEMAS = {
     reason: z.string().min(1),
   }),
 } as const satisfies Record<ToolName, z.ZodType>;
+
+/** The executor-proved mechanical head move (BR#4689 L1.4): the live head is
+ *  the stamped head REBASED — `git range-diff old...new` came back all-'='
+ *  pairs (same patch-ids, same order, no content delta). Executor-fed fact
+ *  like mergeable/commits: the gate reasons over it, it never self-certifies.
+ *  Single TS source — the `train_event` schema above carries its wire form
+ *  (kind "carried": from_head + evidence) and core.ts decideTrainGate consumes
+ *  this type; the Rust gate keeps a field-for-field mirror in train_gate.rs
+ *  (cross-language: one literal type cannot serve both). */
+export type MechanicalMove = {
+  /** the chain tip the move extends (must equal carryChainTip of the leg) */
+  fromHead: string;
+  /** the live head the move lands on (must equal headSha) */
+  toHead: string;
+  /** the proof receipt — the range-diff summary riding the carry record */
+  evidence: string;
+};
