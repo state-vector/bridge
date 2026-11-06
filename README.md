@@ -35,6 +35,9 @@ historical acceptances, including standalone reviews of already-done parents,
 can restore delivery on a successor without rewriting historical completion.
 Historical done-parent restoration requires a fresh observed OPEN PR at the
 accepted head; missing, closed or changed-head observations retain a visible hold.
+Historical intake and admission replay are bounded to ten records per pass.
+A durable round-robin cursor keeps held records from starving later admissions;
+overlapping ingress shares one historical reconciliation pass.
 
 `await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
 health at the lane tip. Retiring a `br_done` dependency is not success: a live

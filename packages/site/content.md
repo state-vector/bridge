@@ -14,6 +14,8 @@ not proof of progress. Completed duties are scoped to the observed PR head.
 Independent PR acceptance persists exact repo/PR/head legs and pending queue
 admission in the review-close transaction; interrupted handoffs replay through
 the existing repair mechanism, including historical done-parent cases.
+Historical intake and replay use bounded batches and a durable fair cursor, so
+held work cannot monopolise hub CPU or starve new delivery admissions.
 
 Dependency waits follow replacement outcomes rather than treating supersession
 as success. Deployment-health waits observe the relevant repo/base/tip. Unblock

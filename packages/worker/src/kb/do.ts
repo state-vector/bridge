@@ -759,7 +759,6 @@ export class KnowledgeHub {
     // state. Probe-first: a probe-backable wait gets enqueued with ONE pass
     // of grace before the ladder spends a round.
     try {
-      await this.reconcileCompletedReviews();
       await this.dispositionStrandedTrainWaits(now0);
     } catch (e) {
       this.audit("system:train", "strand_disposition_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -3984,7 +3983,6 @@ export class KnowledgeHub {
             // Exercise their real order rather than a drill that never ran them.
             const now = Number(body.now ?? Date.now());
             await this.sweepStrandedTrainCards(now);
-            await this.reconcileCompletedReviews();
             await this.dispositionStrandedTrainWaits(now);
             return this.json({ ok: true });
           }
@@ -5805,7 +5803,7 @@ export class KnowledgeHub {
   /** Repair the create-duty/attach-source and accepted-receipt/retire-source
    * interruption windows using the existing alarm, never a second close. */
   private async reconcileDeliveryClosures(): Promise<void> {
-    const rows = this.state.storage.sql.exec(`SELECT id,status,meta FROM artefacts WHERE json_extract(meta,'$.machine_duty.kind')='delivery-close'`).toArray();
+    const rows = this.state.storage.sql.exec(`SELECT d.id,d.status,d.meta FROM artefacts d JOIN artefacts p ON p.id=json_extract(d.meta,'$.machine_duty.subject') WHERE json_extract(d.meta,'$.machine_duty.kind')='delivery-close' AND (json_extract(p.meta,'$.delivery_disposition') IS NULL OR json_extract(p.meta,'$.delivery_disposition.closure.phase')='pending') LIMIT 10`).toArray();
     for (const r of rows) {
       const dm = JSON.parse(String(r.meta ?? "{}"));
       const source = this.one(`SELECT * FROM artefacts WHERE id=?`, String(dm.machine_duty.subject));
@@ -7841,7 +7839,12 @@ export class KnowledgeHub {
   }
 
   private async replayDeliveryAdmissions(): Promise<void> {
-    const rows = this.state.storage.sql.exec(`SELECT review_id,record FROM delivery_admissions WHERE json_extract(record,'$.state.phase') IN ('pending','held')`).toArray();
+    // Historical held acceptances can number in the thousands. Bound each
+    // pass and persist a round-robin cursor so a held prefix cannot starve
+    // new admissions or exhaust a Durable Object's CPU budget.
+    const cursor = Number(this.one(`SELECT value FROM settings WHERE key='delivery_admission_cursor'`)?.value ?? 0);
+    const rows = this.state.storage.sql.exec(`SELECT rowid AS cursor,review_id,record FROM delivery_admissions WHERE rowid>? AND json_extract(record,'$.state.phase') IN ('pending','held') ORDER BY rowid LIMIT 10`, cursor).toArray();
+    if (!rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
     for (const row of rows) {
       const a = JSON.parse(String(row.record)) as DeliveryAdmission;
       const save = () => this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
@@ -7887,17 +7890,30 @@ export class KnowledgeHub {
       } catch (e) {
         // Keep the pending row on errors. Audit is diagnostic, NOT the retry queue.
         this.audit("system:delivery", "admission_retry", a.task_id, { review: a.review_id, error: String(e) });
+      } finally {
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
       }
     }
   }
 
   /** Replay only the latest review round, completed after this submission.
    * This repairs interrupted accept hooks without inventing a new verdict. */
+  private reviewReconcileRunning = false;
+
   private async reconcileCompletedReviews(): Promise<void> {
+    // Mutation hooks can yield while repairing an admission. Concurrent
+    // ingress must not start the same historical scan again in that window.
+    if (this.reviewReconcileRunning) return;
+    this.reviewReconcileRunning = true;
+    try { await this.reconcileCompletedReviewsPass(); }
+    finally { this.reviewReconcileRunning = false; }
+  }
+
+  private async reconcileCompletedReviewsPass(): Promise<void> {
     await this.reconcileDeliveryClosures();
     // Backfill explicit historical PR acceptances including already-done
     // parents, then replay the durable outbox on every existing repair pass.
-    const accepted = this.state.storage.sql.exec(`SELECT c.id,c.meta,c.status_ts FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%review%' AND NOT EXISTS(SELECT 1 FROM delivery_admissions a WHERE a.review_id=c.id) AND NOT EXISTS(SELECT 1 FROM delivery_review_backfill b WHERE b.review_id=c.id AND b.status_ts=c.status_ts) LIMIT 100`).toArray();
+    const accepted = this.state.storage.sql.exec(`SELECT c.id,c.meta,c.status_ts FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%review%' AND NOT EXISTS(SELECT 1 FROM delivery_admissions a WHERE a.review_id=c.id) AND NOT EXISTS(SELECT 1 FROM delivery_review_backfill b WHERE b.review_id=c.id AND b.status_ts=c.status_ts) ORDER BY c.rowid LIMIT 10`).toArray();
     for (const r of accepted) {
       const receipt = this.one(`SELECT actor,data FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, r.id);
       if (receipt) this.persistDeliveryAdmission(String(r.id), String(JSON.parse(String(receipt.data ?? "{}")).note ?? ""), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));

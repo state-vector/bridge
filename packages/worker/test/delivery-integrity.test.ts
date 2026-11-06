@@ -123,7 +123,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect((await get(id)).status).toBe("done");
     // Fresh observation AFTER the acceptance seals the historical handoff.
     await call("reconcile.report", { repo, prs: [{ number: 2329, state: "OPEN", headRefOid: head, updatedAt: new Date().toISOString() }] });
-    await call("admin.alarm_sweep");
+    for (let pass = 0; pass < 4; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
     const lane = await call("train.status", { repo });
     expect(lane.status, JSON.stringify(lane.body)).toBe(200);
     const cards = (await call("list", { type: "task", limit: 200 })).body.artefacts;
@@ -166,5 +166,32 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect((await get(parent)).meta.blocked.await_event).toEqual(next);
     expect((await get(parent)).meta.blocked.reason).toBe("Checks failing");
     expect((await get(duty.id)).status).toBe("done");
+  });
+
+  it("bounded replay progresses past a cohort of held acceptances without clearing their blockers", async () => {
+    const held: string[] = [];
+    let fresh = "";
+    for (let i = 0; i < 14; i++) {
+      const number = 1000 + i;
+      const id = await create(number);
+      await call("transition", { id, to: "in_progress", actor: "bulk-impl", session: `impl-${number}` });
+      const submitted = await call("transition", { id, to: "in_review", actor: "bulk-impl", session: `impl-${number}`, note: `PR https://github.com/${repo}/pull/${number}` });
+      expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+      if (i < 13) {
+        held.push(id);
+        await call("transition", { id, to: "blocked", actor: "bulk-impl", session: `impl-${number}`, note: "Independent dependency hold", await_event: { event: "time", until_ts: Date.now() + 86_400_000 } });
+      } else fresh = id;
+      const review = submitted.body.verify_task;
+      await call("transition", { id: review, to: "in_progress", actor: "bulk-reviewer", session: `review-${number}` });
+      const accepted = await call("transition", { id: review, to: "done", actor: "bulk-reviewer", session: `review-${number}`, note: `Verified https://github.com/${repo}/pull/${number} head ${head}`, review_result: { kind: "accepted_pr", task_id: id, legs: [{ repo, number, head_sha_at_acceptance: head }] } });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    }
+    for (let pass = 0; pass < 4; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
+    expect((await get(fresh)).meta.merge_train.state).toBe("queued");
+    for (const id of held) {
+      const source = await get(id);
+      expect(source.status).toBe("blocked");
+      expect(source.meta.blocked.reason).toBe("Independent dependency hold");
+    }
   });
 });
