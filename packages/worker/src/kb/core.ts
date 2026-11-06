@@ -16,6 +16,7 @@ import type {
   DeployCoverageState,
   DeployObservation,
   LaneOperationalState,
+  MechanicalMove,
   TrainEntryClass,
   TrainFixCard,
 } from "@bridge/contracts";
@@ -1243,7 +1244,11 @@ export type MergeAction =
   | { kind: "note"; reason: string }
   | { kind: "rerun_gate"; reason: string }
   | { kind: "skip"; reason: string }
-  | { kind: "human_leg"; reason: string };
+  | { kind: "human_leg"; reason: string }
+  /** BR#4689 L1.4: the head moved MECHANICALLY (same patch-ids) — stamp the
+   *  carry leg (hub event `carried`) and let the next tick merge the covered
+   *  head. Never a bounce, never a re-verify duty, never a review re-ask. */
+  | { kind: "carry"; fromHead: string; toHead: string; evidence: string; receipt: string };
 
 /** The 5c gate + verify lineage, as one decision table.
  *  Order matters: superseded first, then the mechanical gate (mergeable /
@@ -2532,7 +2537,14 @@ export type CarryRecord = {
   to_head: string;
   prior_verdict_id: string | null;
   carried_ts: number;
-  via: "update-branch" | "force-review";
+  /** How the head moved clean: `update-branch` — the train's own server-side
+   *  update during the merge leg (BR#3516 §5); `force-review` — a human's
+   *  force-review approval re-anchors the verdict at the parked head (BR#4962,
+   *  the one human-authored move that carries, because it IS the human leg);
+   *  `rebase` — a mechanical head move proved content-preserving by patch-id
+   *  (git range-diff all-'='), the L1.4 default-carry path (BR#4689). Authored
+   *  content NEVER rides a carry record — it bounces. */
+  via: "update-branch" | "force-review" | "rebase";
 };
 
 /** Does an accepted verdict cover this head? The straight stamp
@@ -2560,6 +2572,24 @@ export function verdictCoversHead(meta: any, headSha: string): boolean {
     pr.carry,
     String(headSha ?? "").toLowerCase(),
   );
+}
+
+/** The head a carry chain currently ends at — the one point a new carry leg
+ *  may extend (BR#4689 L1.4: carry is the DEFAULT path for mechanical head
+ *  moves, but it must extend the chain, never skip a link). Walks stamp →
+ *  … → tip enforcing contiguity; a break anywhere (or a non-sha stamp)
+ *  yields null — a broken chain can never be covered by extension, it can
+ *  only be re-rendered, so the caller bounces instead of carrying. */
+export function carryChainTip(stamped: string, carry: unknown): string | null {
+  if (!/^[0-9a-f]{7,40}$/.test(stamped)) return null;
+  let cur = stamped.toLowerCase();
+  for (const c of Array.isArray(carry) ? carry : []) {
+    const from = String(c?.from_head ?? "").toLowerCase();
+    const to = String(c?.to_head ?? "").toLowerCase();
+    if (from !== cur || !/^[0-9a-f]{7,40}$/.test(to)) return null;
+    cur = to;
+  }
+  return cur;
 }
 
 /** Append a carry link to the chain (pure; the caller persists meta). */
@@ -2801,6 +2831,11 @@ export type TrainGateInput = {
    *  position in meta.prs) — the gate checks THAT leg's stamp, and the
    *  merge receipt cites the leg, not just the PR. */
   legNumber?: number;
+  /** BR#4689 L1.4: the executor's mechanical head-move proof (git range-diff
+   *  all-'='), present only when the live head is an uncovered move AND the
+   *  executor could prove the move content-preserving. Absent → the
+   *  coverage bounce stands (fail-closed unchanged). */
+  mechanicalMove?: MechanicalMove | null;
   /** BR#5883: main's tip judges fully green under the gate's own predicate
    *  (classifyMainCheckRuns over the WHOLE tip — the exact main-green-gate
    *  script rule), i.e. the walk-start scoped verdict is Green with no gate
@@ -2842,16 +2877,20 @@ export function normalizeGhMergeState(v: unknown): string | null {
  *  Composes the standing decideMergeAction; the train layer adds the
  *  carry law the sweep never had. BR#3659: coverage is judged per LEG —
  *  a multi-PR card's legs verify independently, and an uncovered leg
- *  bounces naming ITS stamp. BR#3727: the train layer also pre-clears
- *  mergeStateStatus=behind (the §5 carry's own state — base advanced,
- *  branch still mergeable; the merge leg owns the machine-clean
- *  update-branch) and WAITS on blocked-with-pending-head-checks (strict
- *  branch protection re-runs the required checks on the head after every
- *  carry). decideMergeAction, the shared law, stays clean/unstable.
- *  BR#4685: an unanswered mergeStateStatus (null/UNKNOWN) means GitHub is
- *  still computing — the executor backoff-polls (15/30/60s, lease-bounded)
- *  before this gate and the shared law waits on it: never a bounce, never
- *  a merge on an unconfirmed state. */
+ *  bounces naming ITS stamp. BR#4689 (L1.4): an uncovered leg is first
+ *  offered the mechanical-carry row — the executor's range-diff proof of a
+ *  content-preserving rebase extends the chain (kind "carry") instead of
+ *  bouncing, so a rebase-only head move costs no re-verify duty and no
+ *  review re-ask; only substantive content still bounces. BR#3727: the
+ *  train layer also pre-clears mergeStateStatus=behind (the §5 carry's own
+ *  state — base advanced, branch still mergeable; the merge leg owns the
+ *  machine-clean update-branch) and WAITS on blocked-with-pending-head-
+ *  checks (strict branch protection re-runs the required checks on the
+ *  head after every carry). decideMergeAction, the shared law, stays
+ *  clean/unstable. BR#4685: an unanswered mergeStateStatus (null/UNKNOWN)
+ *  means GitHub is still computing — the executor backoff-polls
+ *  (15/30/60s, lease-bounded) before this gate and the shared law waits on
+ *  it: never a bounce, never a merge on an unconfirmed state. */
 export type CandidateHeadCheckState =
   | { kind: "green" }
   | { kind: "pending"; unsettled: string[] }
@@ -2879,7 +2918,10 @@ export type CandidateGatePhase =
 /** BR#6012 defense-in-depth state machine: classifies a train candidate into an
  *  exhaustive, mutually-exclusive phase BEFORE any transition rule runs, so
  *  impossible states (e.g. a conflicting PR reaching `rerun_gate` or `blocked`
- *  pre-clear, or an unverified-commit PR fast-tracking) are unrepresentable. */
+ *  pre-clear, or an unverified-commit PR fast-tracking) are unrepresentable.
+ *  BR#4689 L1.4: an uncovered head is HEAD-UNCOVERED, never decided here —
+ *  the gate's case offers the mechanical-carry row (range-diff all-'=' proof
+ *  extends the chain); only substantive content still bounces. */
 export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhase {
   if (i.cardStatus === "superseded") return { phase: "card_superseded" };
   if (i.cardStatus === "done") return { phase: "card_done" };
@@ -2950,12 +2992,39 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
       return { kind: "close_superseded", reason: "linked card is superseded — closing PR without review" };
     case "card_done":
       return { kind: "skip", reason: "linked card already done — nothing to merge under it" };
-    case "head_uncovered":
+    case "head_uncovered": {
+      // BR#4689 L1.4: carry is the DEFAULT path for a mechanical head move.
+      // The executor proved the live head is the stamped head rebased — same
+      // patch-ids, no content delta (git range-diff all-'=' pairs). The carry
+      // must extend the leg's chain tip exactly (contiguity re-checked here;
+      // the hub re-checks it again server-side when stamping `carried`). A
+      // substantive change (different patch-ids), an unprovable move, or a
+      // broken chain still bounces — fail-closed, unchanged.
+      const legs = trainLegs(i.cardMeta);
+      const leg = legs.length ? legs[phase.legNumber - 1] : undefined;
+      const tip = carryChainTip(String(leg?.head_sha_at_acceptance ?? ""), leg?.carry);
+      const mv = i.mechanicalMove;
+      if (
+        mv &&
+        tip !== null &&
+        tip === mv.fromHead.toLowerCase() &&
+        /^[0-9a-f]{7,40}$/.test(mv.toHead.toLowerCase()) &&
+        mv.toHead.toLowerCase() === i.headSha.toLowerCase()
+      ) {
+        return {
+          kind: "carry",
+          fromHead: tip,
+          toHead: i.headSha,
+          evidence: String(mv.evidence ?? "").slice(0, 300),
+          receipt: `PR #${i.prNumber} head moved mechanically ${tip.slice(0, 9)}→${i.headSha.slice(0, 9)} (same patch-ids, no content delta) — verdict carries as a new chain leg (BR#4689 L1.4); no bounce, no re-verify duty; merge re-gated next tick`,
+        };
+      }
       return {
         kind: "bounce",
         defect: `PR #${i.prNumber} live head ${i.headSha.slice(0, 9)} is not covered by the accepted verdict (leg ${phase.legNumber} stamped ${phase.stamped}, no contiguous carry chain) — head moved past the verdict without a machine-clean update; re-verify at the new head`,
         bounceKind: "coverage",
       };
+    }
     case "mergeability_computing":
       return { kind: "skip", reason: phase.reason };
     case "conflicting":
