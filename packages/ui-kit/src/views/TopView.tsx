@@ -8,7 +8,7 @@ import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
-import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
+import { ExecutionModel } from "./ExecutionModel";
 import type { ExecutionModelView } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
@@ -342,7 +342,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {r.will && <span className="top-will"> ▸ {r.will.slice(0, 60)}</span>}
           </span>
           <span className="topc-status">
-            <ExecutionStatus value={r.execution} now={now} />
             {r.status === "in_progress" && (
               <Chip tone="live" pill title="in progress — the last log line says what it is running">
                 in progress
