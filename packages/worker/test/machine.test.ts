@@ -1721,6 +1721,28 @@ describe("release-holds-train-queue (BR#4067)", () => {
   // train does NOT own anymore (it handed the leg back; re-entry is a fresh
   // verify/impl round), so the stall sweep may demote the STRANDED re-entry
   // (in_progress, dead executor) to a claimable todo.
+  it("BR#6839: internal train hands bounced work directly to the pool without a phantom claim or churn penalty", async () => {
+    for (const status of ["blocked", "in_progress"]) {
+      const v = await decide(input({ status, to: "todo", actor: "system:merge-train",
+        meta: { merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" }, attempt: { attempts: 99 } } as any,
+        body: { note: "train repair handoff", demote_bounced_reentry: true } }), baseCtx());
+      expect(v.ok).toBe(true);
+      if (v.ok) {
+        expect(v.status).toBe("todo");
+        expect(v.owner_clear).toBe(true);
+        expect(v.meta_patch.attempt).toBeUndefined();
+        expect(v.effects).not.toEqual(expect.arrayContaining([expect.objectContaining({ kind: "release_redirect" })]));
+      }
+    }
+  });
+  it("BR#6839: repair handoffs cannot consume a separate human/dependency wait", async () => {
+    for (const wait of [{ awaiting_ask: { ask_id: "BR#12" } }, { blocked: { await_event: { event: "br_done", id: "BR#12" } } }]) {
+      const v = await decide(input({ status: "blocked", to: "todo", actor: "system:merge-train",
+        meta: { merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" }, ...wait } as any,
+        body: { note: "train repair handoff", demote_bounced_reentry: true } }), baseCtx());
+      expect(v.ok).toBe(false);
+    }
+  });
   it("BR#4494 carve-out: the sweep's demote of a stranded in_progress bounced re-entry passes — flag + in_progress + bounced", async () => {
     const bounced = {
       merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "coverage", bounced_at: 1 },

@@ -713,6 +713,15 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // ---- the law: edge shape first, then the table, first fail wins ----
   const base = validateTransition(i.type as any, i.status, i.to);
   if (base.ok === false) return { ok: false, code: "illegal-edge", rule: "lifecycle", message: base.reason };
+  // A train repair handoff is scheduling, not an agent claim or failed run.
+  // Only the internal train actor can use this edge out of a bounced park.
+  const repairMeta = metaOf(i.meta);
+  const repairAwait = repairMeta.blocked?.await_event;
+  const trainRepairRelease = i.type === "task" && i.to === "todo" &&
+    (i.status === "blocked" || i.status === "in_progress") &&
+    i.actor === "system:merge-train" && i.body?.demote_bounced_reentry === true &&
+    repairMeta.merge_train?.state === "bounced" && !repairMeta.awaiting_ask && !repairMeta.subprocess &&
+    (!repairAwait || ["pr_merged", "pr_checks_green"].includes(String(repairAwait.event)));
   // BR#4067 — queue-slot durability: a MACHINE silence-release (watchdog /
   // system sweeps) must never destroy merge-train state or a typed wait. A
   // card the train owns (meta.merge_train queued/awaiting-ci/bounced/awaiting
@@ -743,9 +752,9 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     // blocked) nor a live stop-park; only the blocked parks stay protected,
     // flag or no flag.
     const demoteReentry =
-      (st === "bounced" || st === "awaiting" || st === "stopped") &&
-      i.status === "in_progress" &&
-      i.body?.demote_bounced_reentry === true;
+      ((st === "bounced" || st === "awaiting" || st === "stopped") &&
+       i.status === "in_progress" &&
+       i.body?.demote_bounced_reentry === true) || trainRepairRelease;
     if ((st === "queued" || st === "awaiting-ci" || st === "bounced" || st === "awaiting") && pr && !demoteReentry) {
       const repo = String((m.pr as any)?.repo ?? mtq.repo ?? "repo");
       return {
@@ -797,7 +806,9 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   let ownerClear = false;
 
   // release to the pool: attempt stamp, churn escalate/redirect — decided, not improvised
-  if (i.to === "todo") {
+  if (trainRepairRelease) {
+    ownerClear = true;
+  } else if (i.to === "todo") {
     // PROVEN-UNBLOCK RELEASE: an unblock duty releasing a parked card with
     // proof is a FRESH START, not a churn attempt — the attempts counter
     // resets so the release never trips escalate/redirect (the card is

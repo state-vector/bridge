@@ -1335,11 +1335,23 @@ export class KnowledgeHub {
         meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
         this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
       );
-      if (now - lastTs <= staleMs) continue;
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
       );
       if (openAsk) continue;
+      // Repair pre-BR#6839 phantom claims even when a train/board write just
+      // refreshed updated_ts. Only the actual worker's signals prove liveness;
+      // another duty's progress and a bounce itself do not start a writer.
+      const workerSignal = Math.max(meta.session_alive_ts ?? 0, this.sessionPing(meta),
+        meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0);
+      if (meta.merge_train?.state === "bounced" && !this.executionState(String(r.id))?.attempt &&
+          !meta.interactive_execution && now - workerSignal > staleMs) {
+        await this.transition({ id: r.id, to: "todo", session: "", demote_bounced_reentry: true,
+          result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
+          note: "train repair handoff: no recorded executor or live worker signal — returned to the claimable pool; PR binding and repair brief preserved" }, "system:merge-train");
+        continue;
+      }
+      if (now - lastTs <= staleMs) continue;
       // BR#4067 — typed-proxy preservation: silence must not destroy a machine
       // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
       // or one parked on a typed await / bound ask is PARKED blocked — the
@@ -11038,6 +11050,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
+      const writer = this.executionState(String(taskId))?.attempt;
+      if (card.status === "in_progress" && ((writer && writer.phase !== "quiesced") || cm.interactive_execution)) {
+        throw new Error("train:bounced repair handoff cannot release a live execution claim — reconcile the writer before rescheduling");
+      }
       // BR#5633 awaiting sweep: a re-assert of a card ALREADY parked
       // Awaiting classifies (and re-stamps) on the card's STORED park facts
       // — the executor's sweep reason is a trigger marker, not the defect.
@@ -11210,7 +11226,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, conflicting_park: true, reason };
       }
       // gate | plain-coverage-lapse (BR#5226 fall-through) — the
-      // impl bounce (BR#3516 §5): blocked → in_progress with the fix-up
+      // repair handoff (BR#6839): blocked → todo with the fix-up
       // brief; resolution invalidates the verdict — the card re-enters the
       // queue only after a fresh verify. NO ask legs here either (BR#4960):
       // the repair leg re-enters review through the normal in_review
@@ -11261,32 +11277,30 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // impl-bounce exit) must not carry its stale awaiting anchor forward —
       // the park is over; the bounce record is the truth now.
       delete nextMeta.merge_train.awaiting;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), now2, taskId);
-      // blocked→in_progress with the fix-up brief; resolution invalidates the
-      // verdict — the card re-enters the queue only after a fresh verify.
-      await this.transition(
+      const nextBody = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), nextBody, now2, taskId);
+      // A bounce schedules the repair; it does not start an executor. Clear
+      // the old owner/session and make the work immediately claimable, without
+      // counting a machine handoff as failed execution. Replayed bounces only
+      // refresh the same brief; todo→todo is not a lifecycle edge.
+      if (card.status !== "todo") await this.transition(
         {
           id: taskId,
-          to: "in_progress",
+          to: "todo",
           // anonymous: the hub acts as the machine, never as the last session
           // on the token — a session-less card must not inherit the closer's
           // session as its implementer (misattribution + a spurious
           // review-separation refusal on a same-session re-verify)
           session: "",
+          demote_bounced_reentry: true,
+          result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
           note: bounceNote,
-          body_md: `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`,
         },
-        actor,
+        "system:merge-train",
       );
-      cm.merge_train = nextMeta.merge_train;
-      // BR#4068 starvation law (leg 1): a bounced card is the most valuable
-      // work on the board — verified once, one mechanical leg from landed.
-      // Stamp the SAME boost the human boost writes; the rank seams already
-      // read it (claim ranking do.ts rank(), train rank core.ts, Backlog ▲).
-      // Decay is the accept hook's job: re-queue deletes it — never
-      // auto-expire mid-repair.
-      cm.boosted = now;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
+      // The starvation boost was persisted with nextMeta above. Never write
+      // the pre-transition cm snapshot back: that would resurrect the old
+      // session and blocked wait which the release just cleared.
       this.audit(actor, "boost", taskId, { root: taskId, via: "train:bounce", pr });
       this.version(taskId, actor, "update", `boosted (priority 0 — train bounce: one mechanical leg from landed; starvation law BR#4068)`, {});
       // BR#4934: the lane forgets the in-flight merge ONLY when the bounced

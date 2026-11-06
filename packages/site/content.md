@@ -259,6 +259,10 @@ execution appears in task details. Top keeps one compact task-status chip withou
 an additional execution-state label. The tooltip
 identifies recorded gateway model/backend/host/session. Automation requirements
 remain strict and independent of these display labels.
+Train repair bounces return work to the claimable pool with its PR binding and
+repair brief intact. They clear historical ownership/session rather than claiming
+an agent is running, and do not penalize agent retry counts. Existing bounced
+cards with no executor or live worker signal are repaired automatically.
 Task History includes model starts, agent/reviewer escalation reasons and tier
 changes, checkpointed yields and local handoff request/accept/return. Typed history
 events commit with state and remain once-only across command retries; routine

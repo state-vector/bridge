@@ -18,10 +18,13 @@ const view = ExecutionModelViewSchema.parse({ minimum_tier: "large", current: { 
 it("gives actual size its own Top column with matching header, parent and child cells", () => {
   const previous = useKb.getState();
   const task = { id: "BR#100", type: "task", title: "Cross-system repair", status: "in_progress", owner: "gateway/worker", created_ts: Date.now(), updated_ts: Date.now(), meta: { session: "working" }, execution: view };
-  useKb.setState({ tasks: [task, { ...task, id: "BR#101", title: "Verify repair", part_of: task.id }], sessions: [], agents: [], events: [] });
+  useKb.setState({ tasks: [task, { ...task, id: "BR#101", title: "Verify repair", part_of: task.id },
+    { ...task, id: "BR#102", title: "Bounced repair waiting for pickup", status: "todo", owner: "", meta: {},
+      execution: { minimum_tier: null, current: { kind: "unreported" } } }], sessions: [], agents: [], events: [] });
   try {
     const html = renderToStaticMarkup(<TopView />);
     expect(html).toContain("gateway/worker");
+    expect(html).not.toContain("Bounced repair waiting for pickup");
     expect(html).toContain("medium =&gt; large");
     expect(html).not.toContain('aria-label="Execution state"');
     expect(html).toContain("provider/glm-5.3");

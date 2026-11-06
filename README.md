@@ -501,6 +501,11 @@ remain in the tooltip. Execution state (running, stopping, lease expired,
 previous execution, etc.) is available in task details. Top retains its original
 single task-status chip, without an additional execution-state label or row wrap.
 The automation minimum remains enforced independently of interactive display.
+Train bounces that need repair return the task directly to the claimable pool,
+clearing its previous owner/session while preserving the PR binding and repair
+brief. A bounce does not start an agent or count as a failed execution. Old
+executor-less bounced claims are repaired using worker liveness, not board-write
+timestamps, so they no longer appear as phantom active agents in Top.
 Both board snapshots and task reads derive this typed view from canonical
 execution state, not model names or gateway defaults.
 
