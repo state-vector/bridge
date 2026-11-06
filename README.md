@@ -2308,7 +2308,24 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
   an unblock child. The train is the unblock path (BR#3516 §2); a spawned child would
   only be superseded by the next bounce, with the re-park after it flood-guarded on
   the stale stamp — one breach card per bounce cycle (specimen BR#3990 → breach
-  BR#4135).
+  BR#4135). The same chain now also extends across rebase-shaped moves — next bullet.
+- **Mechanical head moves carry by default (BR#4689, child of BR#4633)**: a rebase
+  or other content-preserving head update — same patch-ids — no longer bounces for
+  coverage. When the live head is not verdict-covered, the executor first tries to
+  PROVE the move mechanical: `git range-diff <base>..old <base>..new`, with the base
+  excluded on BOTH sides (a merge-base-anchored `old...new` would count base-side
+  advances as added patches after a rebase). One or more all-`=` pairs proves it;
+  any `<`/`>`/`!` line (authored code changed), an unreadable object or a git failure
+  proves nothing — no proof, no carry. With proof, the gate's carry row fires only if
+  the move extends the leg's carry chain tip exactly (`carryChainTip`: the acceptance
+  stamp plus every carry record, tip→next, no gaps — a broken chain yields no tip)
+  and lands on the live head; the hub stamps `train:carried`, appending the chain leg
+  (`via: "rebase"`) only after re-proving the same contiguity server-side — a forged
+  or gap-skipping `from_head` is refused by name. The card never leaves the queue: no
+  bounce brief, no re-verify duty, no review re-ask (the starvation cascade a
+  rebase-only move used to trigger). The ledger row and the card's `train_carry`
+  version note name the leg and the range-diff evidence, and the merge re-gates the
+  new head next tick.
 - **Direct parent train parks queue for real (BR#5751)**: the train's own bounce
   and coverage paths run `trainQueueOnAccept`, but a plain `blocked` transition
   whose note opens with the canonical `merge-train: queued` reason used to bypass
