@@ -66,7 +66,7 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   await post("agent.provision", { actor: label, label: `${label}/worker` });
   const base = { actor: label, token_id: identity.token_id, gateway: true, agent: `${label}/worker`, session: "dispatch-model-test" };
   const models = ["medium", "large"].map(tier => ({ tier, backend: "opencode", model: `test/${tier}`, tools: [], environment: [], config_revision: "models-v1", projects: ["bridge"] }));
-  const advertise = (large: boolean, command_id: string) => post("execution", { ...base, id: "gateway", command_id, command: { kind: "advertise", capabilities: { ...models[0], worker: { kind: "provisioned", label: `${label}/worker` }, alternatives: large ? [models[1]] : [] } } });
+  const advertise = (large: boolean, command_id: string) => post("execution", { ...base, id: "gateway", command_id, command: { kind: "advertise", capabilities: { ...models[0], inventory_revision: 2, worker: { kind: "provisioned", label: `${label}/worker` }, alternatives: large ? [models[1]] : [] } } });
   expect((await advertise(true, "inventory")).ok).toBe(true);
   const make = (title: string, roles: string[], meta = {}) => post("create", { type: "task", title, roles, meta, project: "bridge", qualified: true, actor: "author" });
   const analysis = await make("Scope complex change", ["analysis"]);
@@ -106,9 +106,11 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   expect((await post("transition", { ...auth, to: "in_progress" })).error).toBeUndefined();
   const wrong = await post("execution", { ...auth, command_id: "wrong-model", command: { kind: "begin", attempt_id: "two", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/medium", tier: "medium" } } });
   expect(wrong.error).toMatch(/capability blockers/);
+  const obsolete = await post("execution", { ...auth, inventory_protocol: undefined, command_id: "obsolete-selection", command: { kind: "begin", attempt_id: "two", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/large", tier: "large" } } });
+  expect(obsolete.error).toMatch(/scoped-inventory runner protocol/);
   const next = await post("execution", { ...auth, command_id: "large-begin", command: { kind: "begin", attempt_id: "two", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/large", tier: "large" } } });
   expect(next.error).toBeUndefined();
-  expect(ExecutionStateSchema.parse(next).attempt?.executor).toMatchObject({ model: "test/large", tier: "large" });
+  expect(ExecutionStateSchema.parse(next).attempt?.executor).toMatchObject({ model: "test/large", tier: "large", inventory_revision: 2 });
   expect((await post("get", { id: verify.id })).meta.execution_scheduling_requirements.tier).toBe("large");
   expect((await post("admin.settings_set", { settings: { model_policy: { impl: { kind: "minimum", tier: "large" } } } })).error).toBeUndefined();
   expect((await post("get", { id: (await make("Global override", ["impl"])).id })).meta.execution_scheduling_requirements.tier).toBe("large");

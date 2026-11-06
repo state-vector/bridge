@@ -2428,7 +2428,9 @@ export class KnowledgeHub {
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END ASC, a.updated_ts DESC
        LIMIT 250`,
     ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
-    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (${tasks.map(() => "?").join(",")})`, ...tasks.map(task => String(task.id))).toArray() : [];
+    // One bounded JSON parameter avoids the runtime's SQL variable ceiling on
+    // full (250-card) snapshots without loading every historical execution.
+    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, JSON.stringify(tasks.map(task => String(task.id)))).toArray() : [];
     const executionByTask = new Map(executionRows
       .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
     const executionNow = Date.now();

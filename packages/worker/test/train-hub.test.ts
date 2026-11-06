@@ -2021,7 +2021,9 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-pardon", sha: M2, checks: [check(75, "Test", "failure")] });
     expect(ci.body.decided).toBe("stopped");
     const rowIn = (agents: any[], label: string) => agents.find((a: any) => a.label === label);
-    const afterStop = (await kbJson("/board")).body.agents as any[];
+    const afterStopReply = await kbJson("/board");
+    expect(afterStopReply.status, JSON.stringify(afterStopReply.body)).toBe(200);
+    const afterStop = afterStopReply.body.agents as any[];
     expect(rowIn(afterStop, "impl-stop-ding")?.train_red).toBe(1);
     expect(rowIn(afterStop, "impl-true-ding")?.train_red).toBe(0);
 
