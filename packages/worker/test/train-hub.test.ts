@@ -2471,6 +2471,66 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-st", line_green: true });
   });
 
+  it("BR#5829: the phantom carve-out fires at the settle DWELL, not the bound — and the stamp makes the next settle green outright", async () => {
+    const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — phantom dwell", session: "" });
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
+    const repo = "state-vector/lane-phantom-dwell";
+    await acquire(repo, "gw-pd", { required_workflows: ["Test", "main-green gate"], ci_typical_minutes: 10 });
+    const HEAD = "9".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 58291, head: HEAD, title: "IMPL: phantom dwell drill" });
+    const M = "a".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-pd",
+      pr: 58291, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 5 * 60_000, // past the 2-min dwell, far inside the 30-min bound
+    });
+    // Test green on the commit; main-green gate ABSENT (pull_request-only —
+    // the BR#5829 live shape on state-vector/bridge@main)
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-pd", sha: M, checks: [check(1, "Test", "success")] });
+    expect(ci.body.decided).toBe("landed_phantom_required");
+    expect(ci.body.dropped_required).toEqual(["main-green gate"]);
+    expect((await kbJson("/get", { id: card })).body.status).toBe("done");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    // the phantom stamp is on the live lane card's config
+    const liveCard = (await laneSnap(repo)).card;
+    expect((await kbJson("/get", { id: liveCard })).body.meta.lane.phantom_required).toEqual(["main-green gate"]);
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-pd" });
+
+    // the NEXT merge on the same lane: the stamped phantom never holds —
+    // one observed green required run lands plain, no ask re-fire
+    await acquire(repo, "gw-pd", {});
+    const HEAD2 = "b".repeat(40);
+    const card2 = await queueViaAccept({ repo, pr: 58292, head: HEAD2, title: "IMPL: phantom dwell drill 2" });
+    const M2 = "c".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-pd",
+      pr: 58292, merge_sha: M2, head_sha: HEAD2, task_id: card2,
+      merged_at: Date.now() - 5 * 60_000,
+    });
+    const ci2 = await kbJson("/train.ci", { repo, base: "main", actor: "gw-pd", sha: M2, checks: [check(2, "Test", "success")] });
+    expect(ci2.body.decided).toBe("landed");
+    expect((await kbJson("/get", { id: card2 })).body.status).toBe("done");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-pd" });
+  });
+
+  it("BR#5829: an OBSERVED unsettled required run past the dwell but inside the bound still waits (no early land)", async () => {
+    const repo = "state-vector/lane-dwell-stuck";
+    await acquire(repo, "gw-ds", { required_workflows: ["Test", "Deploy"], ci_typical_minutes: 10 });
+    const HEAD = "d".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 58293, head: HEAD, title: "IMPL: dwell-stuck drill" });
+    const M = "e".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-ds",
+      pr: 58293, merge_sha: M, head_sha: HEAD, task_id: card,
+      merged_at: Date.now() - 5 * 60_000,
+    });
+    // Deploy EXISTS but has not concluded — genuinely unsettled, not phantom:
+    // the carve-out must not swallow it before the bound
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-ds", sha: M, checks: [check(1, "Test", "success"), check(2, "Deploy", null)] });
+    expect(ci.body.decided).toBe("pending");
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ds", line_green: true });
+  });
+
   it("the SAME stop re-reported by a tick loop is ONE ledger episode (no stopped-storm)", async () => {
     const repo = "state-vector/lane-storm";
     await acquire(repo, "gw-sm", {});

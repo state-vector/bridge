@@ -1806,6 +1806,10 @@ export type LaneSpec = {
   ci_typical_minutes?: number;
   /** burst-drain cap per settle pass (BR#4934); 0 = unlimited */
   burst_max: number;
+  /** BR#5829: required names the carve-out proved PR-context-only (they
+   *  never produce a check run on a merge commit) — excluded from the
+   *  settle judge; self-heals if the name observes runs again. */
+  phantom_required?: string[];
 };
 
 export const LANE_TITLE_PREFIX = "Merge lane: ";
@@ -1969,6 +1973,9 @@ export function laneOfMeta(meta: any): LaneSpec | null {
     required_workflows: required,
     ci_typical_minutes: typeof lane.ci_typical_minutes === "number" && lane.ci_typical_minutes > 0 ? lane.ci_typical_minutes : undefined,
     burst_max: parseBurstMax(lane.burst_max),
+    // BR#5829: stamped phantom required names ride the spec (self-heals in
+    // classifyRequiredRuns when the name observes runs on the commit)
+    phantom_required: Array.isArray(lane.phantom_required) ? lane.phantom_required.map((p: unknown) => String(p ?? "").trim()).filter(Boolean) : undefined,
   };
 }
 
@@ -2732,7 +2739,7 @@ export const TRAIN_SETTLE_DWELL_MS = 2 * 60_000;
 export function classifyRequiredRuns(
   runs: MainCheckRun[],
   required: string[],
-  opts: { merged_at: number; now: number; typical_ms?: number },
+  opts: { merged_at: number; now: number; typical_ms?: number; phantom_required?: string[] },
 ): RequiredRunsVerdict {
   const byName = new Map<string, MainCheckRun[]>();
   for (const r of runs) {
@@ -2740,8 +2747,17 @@ export function classifyRequiredRuns(
     list.push(r);
     byName.set(r.name ?? "", list);
   }
+  // BR#5829: required names previously stamped as phantoms (structurally
+  // PR-context-only — they never produce a check run on a push/merge commit)
+  // are excluded from the settle judge, so a green base settles within a
+  // tick instead of holding the full fail-closed bound every merge. Self-
+  // heal: if the name DOES carry runs on this commit it is judged normally —
+  // the stamp dissolves the moment the workflow starts running on pushes.
+  const phantom = new Set((opts.phantom_required ?? []).map(String));
   // back-pressure default: judge every observed check on the merge commit
-  const judgeNames = required.length ? required : [...byName.keys()];
+  const judgeNames = (required.length ? required : [...byName.keys()]).filter(
+    (n) => !(phantom.has(n) && !byName.has(n)),
+  );
   const failing: MainRedCheck[] = [];
   const missing: string[] = [];
   const pending: string[] = [];
