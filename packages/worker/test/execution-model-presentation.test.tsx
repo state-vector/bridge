@@ -23,7 +23,7 @@ it("gives actual size its own Top column with matching header, parent and child 
     const html = renderToStaticMarkup(<TopView />);
     expect(html).toContain("gateway/worker");
     expect(html).toContain("medium =&gt; large");
-    expect(html).toContain('aria-label="Execution state"');
+    expect(html).not.toContain('aria-label="Execution state"');
     expect(html).toContain("provider/glm-5.3");
     expect(html).toContain('class="topc-model" title=');
     expect(html).toContain("model size");
@@ -43,7 +43,10 @@ it("gives actual size its own Top column with matching header, parent and child 
       expect(row).toMatch(/class="topc-agent"[^>]*><span class="top-agent-name">gateway\/worker<\/span><\/span><span class="topc-model"><span class="execution-model"/);
       const modelCell = /class="topc-model">([\s\S]*?)<\/span><\/span><\/span>/.exec(row)![1];
       expect(modelCell).not.toMatch(/stopping|expired|last run|Execution state/);
-      expect(row).toMatch(/class="topc-status">[\s\S]*?stopping/);
+      const statusCell = /class="topc-status">([\s\S]*?)<\/span>/.exec(row)![1];
+      expect(statusCell).toContain('>in progress');
+      expect(statusCell.match(/class="k-chip/g)).toHaveLength(1);
+      expect(statusCell).not.toMatch(/execution-state|stopping|expired|previous execution/);
     }
   } finally { useKb.setState(previous); }
 });
