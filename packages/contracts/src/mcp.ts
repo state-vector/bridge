@@ -401,6 +401,10 @@ export const TOOL_ARG_SCHEMAS = {
         headRefName: z.string().nullish(),
         updatedAt: z.string().nullish(),
         isDraft: z.boolean().nullish(),
+        // BR#6384: the merged feed — MERGED rows ride beside the open feed
+        // with their mergeCommit; null state = the legacy open feed.
+        state: z.string().nullish(),
+        mergeCommit: z.string().nullish(),
       }),
     ),
   }),

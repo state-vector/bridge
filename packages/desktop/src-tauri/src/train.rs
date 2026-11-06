@@ -4621,7 +4621,18 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
             }
             Err(e) => return Err(e),
         };
-        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": pr_payload(&rows) }))?;
+        // BR#6384: the merged feed rides ADDITIVELY beside the open list —
+        // best-effort by construction (a gh failure here shrinks the report
+        // to the open feed alone and can never fail the pass; the observed-
+        // merge close just waits for the next cycle).
+        let merged_rows = ctx
+            .gh_json(&[
+                "pr", "list", "--repo", &repo, "--state", "merged", "--limit", "50",
+                "--json", "number,title,state,mergeCommit,headRefOid,headRefName,updatedAt",
+            ])
+            .unwrap_or(Value::Array(Vec::new()));
+        let payload = concat_pr_rows(&pr_payload(&rows), &merged_rows);
+        let res = ctx.mcp("reconcile_report", json!({ "repo": repo, "prs": payload }))?;
         let line = res.get("line").and_then(|v| v.as_str()).unwrap_or("(no accounting line)");
         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         lines.push(format!("[reconcile] {repo}: {line}{}", if ok { String::new() } else { " — ALARM routed to the sink".to_string() }));
@@ -4636,6 +4647,74 @@ fn pr_payload(rows: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().filter(|r| r.is_object()).cloned().collect()),
         _ => Value::Array(Vec::new()),
     }
+}
+
+/// BR#6384 — the merge-state classifier for a pr_merged probe (pure —
+/// unit-testable). MERGED with a citable mergeCommit is Satisfied (the
+/// mergeCommit rides head_sha — for the merge atom the merge IS the awaited
+/// fact, so the hub's expected-head law is inert: pr_merged probes carry
+/// expected_head NULL by construction); CLOSED is the conclusive no (the
+/// wait can provably never fire — the hub stamps an honest negative,
+/// fail-closed BR#3409); OPEN — and a "MERGED" row with a junk sha, which
+/// names no citable receipt — stays transient.
+fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeVerdict {
+    match state.to_ascii_uppercase().as_str() {
+        "MERGED" => {
+            let sha = merge_commit.trim().to_ascii_lowercase();
+            let citable = sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit());
+            if citable {
+                ProbeVerdict::Satisfied {
+                    receipt: url.to_string(),
+                    head_sha: sha,
+                    conclusion: "merged".into(),
+                }
+            } else {
+                ProbeVerdict::Transient {
+                    error: "PR reads MERGED but carries no citable mergeCommit — no receipt, park stands".into(),
+                }
+            }
+        }
+        "CLOSED" => ProbeVerdict::Conclusive {
+            error: "PR state CLOSED — unmerged; the wait can provably never fire".into(),
+            receipt: url.to_string(),
+            conclusion: "closed".into(),
+        },
+        _ => ProbeVerdict::Transient { error: format!("PR state {state:?} — not merged yet") },
+    }
+}
+
+/// BR#6384 — the merged feed is ADDITIVE: the open list stays the source of
+/// record and the merged rows append beside it (each carrying state MERGED +
+/// mergeCommit), so the hub's observed-merge close sees out-of-band merges
+/// without redefining what an open PR is. Junk drops (non-objects, invalid
+/// numbers, non-MERGED rows — the daemon never ships garbage it can see),
+/// and gh's mergeCommit OBJECT shape flattens to the oid STRING the hub's
+/// row contract names. Pure; best-effort by construction — an upstream
+/// failure leaves the caller feeding the open feed alone.
+fn concat_pr_rows(open: &Value, merged: &Value) -> Value {
+    let mut out: Vec<Value> = match open {
+        Value::Array(a) => a.iter().filter(|r| r.is_object()).cloned().collect(),
+        _ => Vec::new(),
+    };
+    if let Value::Array(a) = merged {
+        for r in a {
+            let number = r.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+            let merged_row = r.is_object()
+                && number > 0
+                && vstr(r, "state").map(|s| s.eq_ignore_ascii_case("MERGED")).unwrap_or(false);
+            if !merged_row {
+                continue;
+            }
+            let mut row = r.clone();
+            // gh emits mergeCommit as {"oid": "<sha>"} — flatten to the
+            // string the hub's normalizePr contract reads.
+            if let Some(oid) = r.pointer("/mergeCommit/oid").and_then(|v| v.as_str()) {
+                row["mergeCommit"] = json!(oid);
+            }
+            out.push(row);
+        }
+    }
+    Value::Array(out)
 }
 
 // ===========================================================================
@@ -4799,6 +4878,21 @@ fn observe_probe(ctx: &Ctx, repo: &str, kind: &str, p: &Value) -> Result<ProbeVe
                 &rollup,
                 vstr(&v, "url").unwrap_or(""),
                 vstr(&v, "headRefOid").unwrap_or(""),
+            ))
+        }
+        "pr_merged" => {
+            // BR#6384: the merge atom is probe-backed — gh pr view answers
+            // state + mergeCommit with one read-only call; the classifier
+            // maps it (Satisfied rides the mergeCommit as the head receipt).
+            let pr = p.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pr <= 0 {
+                return Ok(ProbeVerdict::Transient { error: "probe carries no PR number".into() });
+            }
+            let v = ctx.gh_json(&["pr", "view", &pr.to_string(), "--repo", repo, "--json", "state,mergeCommit,url"])?;
+            Ok(classify_pr_merge_state(
+                vstr(&v, "state").unwrap_or(""),
+                v.get("mergeCommit").and_then(|m| m.get("oid")).and_then(|o| o.as_str()).unwrap_or(""),
+                vstr(&v, "url").unwrap_or(""),
             ))
         }
         other => Ok(ProbeVerdict::Transient { error: format!("unknown probe kind {other}") }),
@@ -5355,6 +5449,78 @@ mod tests {
         for s in ["clean", "CLEAN", "dirty", "behind", "blocked", "unstable"] {
             assert!(mergeability_definitive(&json!({ "mergeStateStatus": s })), "answered: {s}");
         }
+    }
+
+    #[test]
+    fn pr_merged_merged_with_merge_commit_is_satisfied_citing_it_br6384() {
+        let v = classify_pr_merge_state("MERGED", "ABC123DEF4560000000000000000000000000000", "https://github.com/o/r/pull/9");
+        match v {
+            ProbeVerdict::Satisfied { receipt, head_sha, conclusion } => {
+                assert_eq!(head_sha, "abc123def4560000000000000000000000000000"); // the mergeCommit IS the head receipt
+                assert_eq!(conclusion, "merged");
+                assert_eq!(receipt, "https://github.com/o/r/pull/9");
+            }
+            other => panic!("expected Satisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_merged_closed_unmerged_is_conclusive_br6384() {
+        let v = classify_pr_merge_state("CLOSED", "", "https://github.com/o/r/pull/10");
+        match v {
+            ProbeVerdict::Conclusive { error, conclusion, .. } => {
+                assert!(error.contains("CLOSED"), "{error}");
+                assert_eq!(conclusion, "closed");
+            }
+            other => panic!("expected Conclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_merged_open_and_sha_drift_stay_transient_br6384() {
+        // OPEN: a future merge can still satisfy — transient
+        match classify_pr_merge_state("OPEN", "", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for OPEN, got {other:?}"),
+        }
+        // junk sha on a MERGED row: no citable receipt — transient, never satisfied
+        match classify_pr_merge_state("MERGED", "nope", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for junk sha, got {other:?}"),
+        }
+        match classify_pr_merge_state("MERGED", "", "") {
+            ProbeVerdict::Transient { .. } => {}
+            other => panic!("expected Transient for missing sha, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concat_pr_rows_appends_merged_rows_and_drops_junk_br6384() {
+        let open = json!([
+            { "number": 1, "title": "open pr", "state": "OPEN" },
+            "junk-string",
+            { "noNumber": true }
+        ]);
+        let merged = json!([
+            { "number": 2, "title": "merged pr", "state": "MERGED", "mergeCommit": { "oid": "f".repeat(40) } },
+            { "number": 0, "title": "bad number", "state": "MERGED" },
+            { "number": 3, "title": "closed pr", "state": "CLOSED" },
+            { "number": "seven", "title": "string number", "state": "MERGED" }
+        ]);
+        let out = concat_pr_rows(&open, &merged);
+        let rows = out.as_array().expect("array");
+        // the daemon drops non-OBJECTS only (both sides) — number-level junk
+        // is the hub's normalizePr contract; the merged side additionally
+        // keeps MERGED rows with a positive number
+        assert_eq!(rows.len(), 3, "2 open objects + 1 valid merged row");
+        assert_eq!(rows[0]["number"], 1);
+        assert_eq!(rows[2]["number"], 2);
+        assert_eq!(rows[2]["state"], "MERGED");
+        // the gh object shape flattens to the string the hub contract reads
+        assert_eq!(rows[2]["mergeCommit"], json!("f".repeat(40)));
+        // a broken merged feed degrades to the open feed alone
+        let open_only = concat_pr_rows(&pr_payload(&json!([{ "number": 5 }])), &json!(null));
+        assert_eq!(open_only.as_array().unwrap().len(), 1);
     }
 
     #[test]

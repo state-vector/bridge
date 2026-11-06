@@ -117,11 +117,11 @@ afterAll(async () => {
 // ---------- (a) the unblock-proxy watch ----------
 
 describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
-  it("GitHub-state atoms stamp UNRESOLVABLE (BR#3516 — the hub holds no VCS creds) and spawn nothing; unparseable stays honest", async () => {
+  it("PR merge atoms enqueue executor verification without hub VCS reads or premature closure", async () => {
     // P1 parks on BR#3129's REAL condition ("PR #2327 mergeCommit non-null" —
     // a pr_merged atom with a repo). The park-time machine round spawns as
     // always (transition law, unchanged); the SWEEP, though, can no longer
-    // read the PR — unresolvable, never a flip, never a duty.
+    // read the PR — queue an executor probe, never a flip or a duty.
     const p1 = await kbJson("/create", { type: "task", title: "IMPL: re-close GH #2274 (drill)", qualified: true, session: "drill-exec-p1" });
     expect(p1.status).toBe(200);
     const p1id = String(p1.body.id);
@@ -166,28 +166,30 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     expect(sweep1.status, `sweep1 failed: ${JSON.stringify(sweep1.body)}`).toBeLessThan(500);
     expect(sweep1.body.error).toBeUndefined();
 
-    // P1/P3: unresolvable with the BR#3516 receipt — stamped, never flipped,
+    // P1/P3: executor probes pending — stamped, never flipped,
     // nothing spawned from the sweep
     for (const id of [p1id, p3id]) {
       const now = await taskById(id);
-      expect(now.meta?.proxy_check?.verdict, `${id}`).toBe("unresolvable");
-      expect(String(now.meta?.proxy_check?.atoms?.[0]?.receipt)).toContain("BR#3516");
+      expect(now.meta?.proxy_check?.verdict, `${id}`).toBe("probe_pending");
+      expect(now.status).toBe("blocked");
       expect(now.meta?.proxy_check?.spawned).toBeUndefined();
     }
 
     // P2: the typed await is stored (annotation rides along); the sweep
-    // stamps it unresolvable like every other GitHub-state atom
+    // queues the same executor probe as a prose PR-merge atom
     const p2Now = await taskById(p2id);
     expect(p2Now.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2400 });
-    expect(p2Now.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p2Now.meta?.proxy_check?.verdict).toBe("probe_pending");
     expect(p2Now.meta?.proxy_check?.spawned).toBeUndefined();
+    const probes = (await kbJson("/proxy.probes", {})).body.probes;
+    expect(probes).toEqual(expect.arrayContaining([expect.objectContaining({ key: "merged:state-vector/superpositional#2400" })]));
 
     // a second sweep re-stamps the same verdicts (per-card pacing, no churn
     // audits, no duties of any kind from the sweep)
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 61 * 60_000 + 17 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const p1After = await taskById(p1id);
-    expect(p1After.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p1After.meta?.proxy_check?.verdict).toBe("probe_pending");
     expect(p1After.meta?.proxy_check?.spawned).toBeUndefined();
     const openDuties = (await unblockDuties()).filter((d: any) =>
       d.title.startsWith("Unblock: IMPL: re-close GH #2274") && ["todo", "in_progress", "blocked"].includes(d.status));
