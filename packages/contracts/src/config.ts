@@ -26,6 +26,7 @@ export const BackendConfigSchema = z.looseObject({
   enabled: z.boolean().optional(),
   projects: z.array(z.string()).optional(),
   reasoning_tier: ReasoningTierSchema.optional(),
+  models: z.partialRecord(ReasoningTierSchema, z.string().trim().min(1)).optional(),
   bin: z.string().optional(),
   agent: z.string().optional(),
   model: z.string().optional(),

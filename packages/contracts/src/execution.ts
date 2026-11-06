@@ -146,11 +146,12 @@ export const ExecutionStateSchema = z.object({
   messages: z.array(MessageSchema),
   operations: z.array(OperationSchema),
   budget_exhaustions: z.number().int().nonnegative().default(0),
+  delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, handoff: { phase: "none" } };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, delivery: null, handoff: { phase: "none" } };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -163,7 +164,8 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("inspect") }),
   z.object({ kind: z.literal("availability") }),
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
-  z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000) }),
+  z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000),
+    selection: z.object({ backend: z.enum(["opencode", "kiro"]), model: text, tier: ReasoningTierSchema }).optional() }),
   z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite"]).default("prerequisite") }),
   z.object({ kind: z.literal("recover_unstarted"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
   z.object({ kind: z.literal("poll"), ...FenceSchema.shape }),
@@ -282,7 +284,8 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     case "escalate": {
       const current = requireAttempt();
       const tiers: ReasoningTier[] = ["small", "medium", "large"];
-      if (tiers.indexOf(command.tier) <= tiers.indexOf(s.requirements.tier)) throw new Error("gate: escalation must increase the persistent minimum reasoning tier");
+      const actualTier = current.executor?.tier ?? s.requirements.tier;
+      if (tiers.indexOf(command.tier) <= Math.max(tiers.indexOf(s.requirements.tier), tiers.indexOf(actualTier))) throw new Error("gate: escalation must increase the persistent minimum reasoning tier and actual execution tier");
       s.requirements.tier = command.tier;
       current.phase = "stopping";
       break;
