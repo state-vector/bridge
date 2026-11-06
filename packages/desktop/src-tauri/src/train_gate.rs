@@ -545,6 +545,11 @@ pub fn carry_chain_tip(stamped: &str, carry: Option<&Value>) -> Option<String> {
 /// the stamped head REBASED — `git range-diff old...new` came back all-'='
 /// pairs (same patch-ids, same order, no content delta). Executor-fed fact
 /// like mergeable/commits: the gate reasons over it, it never self-certifies.
+/// Field-for-field mirror of `MechanicalMove` in `@bridge/contracts`
+/// (packages/contracts/src/mcp.ts) — the single TS source, consumed by core.ts
+/// decideTrainGate; cross-language, one literal type cannot serve both, so
+/// keep the three fields in lockstep by name (from_head/fromHead, to_head/
+/// toHead, evidence).
 #[derive(Clone, Debug, PartialEq)]
 pub struct MechanicalMove {
     /// the chain tip the move extends (must equal carry_chain_tip of the leg)

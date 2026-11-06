@@ -426,3 +426,20 @@ export const TOOL_ARG_SCHEMAS = {
     reason: z.string().min(1),
   }),
 } as const satisfies Record<ToolName, z.ZodType>;
+
+/** The executor-proved mechanical head move (BR#4689 L1.4): the live head is
+ *  the stamped head REBASED — `git range-diff old...new` came back all-'='
+ *  pairs (same patch-ids, same order, no content delta). Executor-fed fact
+ *  like mergeable/commits: the gate reasons over it, it never self-certifies.
+ *  Single TS source — the `train_event` schema above carries its wire form
+ *  (kind "carried": from_head + evidence) and core.ts decideTrainGate consumes
+ *  this type; the Rust gate keeps a field-for-field mirror in train_gate.rs
+ *  (cross-language: one literal type cannot serve both). */
+export type MechanicalMove = {
+  /** the chain tip the move extends (must equal carryChainTip of the leg) */
+  fromHead: string;
+  /** the live head the move lands on (must equal headSha) */
+  toHead: string;
+  /** the proof receipt — the range-diff summary riding the carry record */
+  evidence: string;
+};

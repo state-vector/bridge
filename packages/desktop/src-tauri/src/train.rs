@@ -881,35 +881,28 @@ impl Ctx {
     /// failure is an Err, never a silent "not mechanical" — the caller treats
     /// cannot-prove as NO carry (fail-closed to the coverage bounce).
     fn mechanical_rebase(&self, base_ref: &str, old_head: &str, new_head: &str) -> Result<String, String> {
+        // phase 1 — sync: the base ref rides the branch fetch; a stamped head
+        // orphaned by a force-push is under no fetched ref — GitHub serves
+        // fetch-by-sha, so each missing probe head is fetched by name. A miss
+        // stays an honest cannot-prove (phase 2), never a silent carry.
         self.sh("git", &["fetch", "--quiet", "origin", base_ref.trim_start_matches("origin/")])?;
-        for obj in [format!("{base_ref}^{{commit}}"), old_head.to_string(), new_head.to_string()] {
-            let known = Command::new("git")
-                .args(["cat-file", "-e", &obj])
-                .current_dir(&self.workdir)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !known && obj != format!("{base_ref}^{{commit}}") {
-                // the stamped head of a force-pushed-away rebase is under no
-                // fetched ref — GitHub serves fetch-by-sha; a miss stays an
-                // honest cannot-prove, never a carry
-                self.sh("git", &["fetch", "--quiet", "origin", &obj.trim_end_matches("^commit").to_string()])?;
+        for head in [old_head, new_head] {
+            if !self.commit_object_present(head) {
+                self.sh("git", &["fetch", "--quiet", "origin", head])?;
             }
         }
-        for obj in [format!("{base_ref}^{{commit}}"), old_head.to_string(), new_head.to_string()] {
-            let known = Command::new("git")
-                .args(["cat-file", "-e", &obj])
-                .current_dir(&self.workdir)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !known {
+        // phase 2 — verify: every probe object must be a readable commit;
+        // anything else aborts the proof (BR#3935 posture: fail closed).
+        let base_obj = format!("{base_ref}^{{commit}}");
+        for obj in [&base_obj, old_head, new_head] {
+            if !self.commit_object_present(obj) {
                 return Err(format!(
                     "mechanical check aborted: {obj} is not a commit object in {} — cannot prove the head move content-preserving (BR#3935 posture: fail closed)",
                     self.workdir
                 ));
             }
         }
+        // phase 3 — prove: run the range-diff, let the pure parser answer.
         let out = Command::new("git")
             .args([
                 "range-diff",
@@ -932,6 +925,18 @@ impl Ctx {
             format!("git range-diff shows a NON-mechanical move (added/removed/rewritten patch lines) old {old_head} → new {new_head}")
         })?;
         Ok(format!("git range-diff {base_ref}..{old} {base_ref}..{new} — {pairs} patch-id pair(s), all '=' (content-preserving rebase)", old = &old_head[..old_head.len().min(9)], new = &new_head[..new_head.len().min(9)]))
+    }
+
+    /// One object's local presence (BR#4689 L1.4 probe): `git cat-file -e`
+    /// success is the only truth; a spawn failure reads as ABSENT, never as
+    /// present — a missing object can never be waved through as probeable.
+    fn commit_object_present(&self, obj: &str) -> bool {
+        Command::new("git")
+            .args(["cat-file", "-e", obj])
+            .current_dir(&self.workdir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// Ancestry is a three-valued answer: true / false / CANNOT-READ. Only
@@ -1168,7 +1173,13 @@ fn probe_mechanical_move(
     // fetch the live head explicitly before any local op names it (BR#3935)
     let _ = ctx.fetch_pr_head(pr);
     match ctx.mechanical_rebase(base, &tip, head_sha) {
-        Ok(evidence) => Some(MechanicalMove { from_head: tip, to_head: head_sha.to_string(), evidence }),
+        Ok(evidence) => {
+            // operability: the proof is a log event too — the carry arm logs
+            // the ACTION later; the probe's own outcome belongs in the tick
+            // trail, success and failure alike (re-review round-5 finding).
+            log(None, &format!("mechanical-carry probe (PR #{pr}): PROVED mechanical — {evidence}"));
+            Some(MechanicalMove { from_head: tip, to_head: head_sha.to_string(), evidence })
+        }
         Err(e) => {
             log(None, &format!("mechanical-carry probe (PR #{pr}): cannot prove — {e}; the coverage bounce stands"));
             None
