@@ -702,3 +702,5 @@ An explicit urgency boost orders concrete repairs ahead of older repairs in
 the same class. Task-specific pre-spawn cancellation permits bounded refill of
 other slots only after authoritative no-writer proof; all gateway-readiness,
 capacity and unknown-effect gates remain in force.
+Merge-lane infrastructure is protected from PR-delivery completion: a merged
+PR receipt cannot retire a standing train, including in automatic park cleanup.

@@ -13,7 +13,10 @@ export function completionContract(meta: { completion?: unknown; depends_on?: un
   // prose or infer completion from an incidental PR reference in a review note.
   return meta.depends_on ? { kind: "execution", outcome: "Execute the work after its prerequisites are satisfied." } : { kind: "delivery" };
 }
-export function mergeCompletesTask(meta: { completion?: unknown; depends_on?: unknown }): boolean {
+export function mergeCompletesTask(meta: { completion?: unknown; depends_on?: unknown; lane?: unknown }): boolean {
+  // A standing lane is a subsystem, never a PR delivery. Incidental/stale PR
+  // metadata must not let any provenance-based close path retire the train.
+  if (typeof meta.lane === "object" && meta.lane !== null && "key" in meta.lane && typeof meta.lane.key === "string") return false;
   return completionContract(meta).kind === "delivery";
 }
 

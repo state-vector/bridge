@@ -3160,3 +3160,6 @@ in discovery and atomic reservations. A cancelled pre-spawn launch no longer
 stalls every free slot for a poll interval: refill continues only after the hub
 confirms no writer, with a bounded distinct-task budget and fresh hub admission
 on every reservation.
+Standing merge-lane infrastructure never completes from a PR merge receipt,
+even when an agent accidentally attaches PR-delivery metadata. Provenance
+cleanup may finish delivery cards, but cannot retire the train itself.

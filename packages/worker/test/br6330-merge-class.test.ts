@@ -159,6 +159,21 @@ describe("BR#6330 leg 2 — exitClassOf: one classification, no prose path (sour
 });
 
 describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the provenance receipt", () => {
+  it("never retires a standing lane when an agent has attached a merged PR to it", async () => {
+    const repo = "state-vector/lane-is-not-delivery", head = "a".repeat(40), merge = "b".repeat(40);
+    await stampProvenance(repo, 2706, merge, head, "lane-guard-gateway");
+    const lane = (await kbJson("/train.lane", { repo, base: "main" })).body;
+    const update = await kbJson("/update", { id: lane.id, meta: {
+      pr: { repo, number: 2706, head_sha_at_acceptance: head },
+      merge_train: { state: "queued", repo, pr: 2706 },
+    } });
+    expect(update.status).toBe(200);
+    expect((await kbJson("/admin.alarm_sweep")).body.error).toBeUndefined();
+    const current = (await kbJson("/get", { id: lane.id })).body;
+    expect(current.status).toBe("blocked");
+    expect(current.meta.lane.key).toBe(`${repo}@main`);
+    expect((await kbJson("/train.lane", { repo, base: "main" })).body.id).toBe(lane.id);
+  });
   it("closes a queued car whose PR has a provenance merge receipt (lifecycle-legal, receipt cited)", async () => {
     const REPO = "state-vector/br6330-heal";
     const N = 6330;
