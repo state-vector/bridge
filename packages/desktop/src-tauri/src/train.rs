@@ -7126,6 +7126,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn expired_bounce_budget_escalation_closes_the_pr_br4688() {
         // BR#4688 expiry leg (BR#3312 disposition): an EXPIRED escalation's PR
         // is closed with the hub-composed reason and reported
