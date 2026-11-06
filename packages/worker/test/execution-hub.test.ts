@@ -498,7 +498,10 @@ describe("durable executor on real SQLite", () => {
       expect(task.meta).not.toHaveProperty("startup_wait");
       expect(task.meta).not.toHaveProperty("startup_recovery");
     }
-  });
+    // Five protected scenarios perform dozens of real DO round trips. The CI
+    // host exceeded Vitest's default 5s under suite load; this is a bounded
+    // integration budget, not an executor lease or a relaxed state assertion.
+  }, 15_000);
 
   it("proves a cached worker's canonical identity and refuses gateway or foreign credentials without minting", async () => {
     const gw = (await post<{ secret: string }>("admin.mint", { label: "cache-host", tags: ["gateway"] })).data;
