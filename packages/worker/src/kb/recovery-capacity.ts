@@ -25,6 +25,17 @@ export function schedulingBoost(meta: Meta): number {
   return typeof meta.boosted === "number" && Number.isFinite(meta.boosted) ? meta.boosted : meta.boosted ? 1 : 0;
 }
 
+/** Review is part of the repair's critical path, not routine verification.
+ * Preserve the existing typed duty class/urgency on its independent duty. */
+export function recoveryReviewMeta(taskId: string, meta: Meta, tags: string[]): Meta {
+  const base: Meta = { execution_review_of: taskId };
+  if (schedulingRank(meta, tags, []) > 1) return base;
+  const duty = object(meta.machine_duty);
+  return { ...base, machine_duty: { kind: duty.kind === "line_recovery" ? "line_recovery" : "task-recovery",
+    by: "recovery-review", subject: taskId, reason: typeof duty.reason === "string" ? duty.reason : "head_checks" },
+    ...(meta.boosted ? { boosted: meta.boosted } : {}) };
+}
+
 /** Capacity is never transferred on an interrupt alone. One durable handoff
  * per host survives replays, restarts and concurrent scheduler requests. */
 export class RecoveryCapacity {

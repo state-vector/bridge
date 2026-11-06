@@ -3169,3 +3169,6 @@ is retried; warm lease, inbox and readiness requests do not rerun migrations or
 full-table maintenance. A newly deployed instance still runs its migrations.
 Queued-repair banners report that execution has not started. A queued card
 alone is not evidence of top scheduling priority or unavailable agent capacity.
+Independent reviews of concrete/line recovery inherit the repair's scheduling
+class and urgency. They remain separate review sessions with the same acceptance
+gates, but cannot fall behind unrelated repair backlog as ordinary verification.

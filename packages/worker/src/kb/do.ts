@@ -240,7 +240,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
-import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask } from "./recovery-capacity.ts";
+import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
@@ -6887,7 +6887,7 @@ export class KnowledgeHub {
                 parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
               ),
               roles: ["review"],
-              meta: { execution_review_of: id },
+              meta: recoveryReviewMeta(id, meta, parseTags(row.tags)),
               project: row.project,
             },
             actor,
@@ -8332,7 +8332,7 @@ export class KnowledgeHub {
     const meta = JSON.parse(parent.meta ?? "{}");
     const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
     const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
-    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], project: parent.project, meta: { execution_review_of: taskId }, session: "" }, actor);
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], project: parent.project, meta: recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), session: "" }, actor);
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };

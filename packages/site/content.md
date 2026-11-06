@@ -708,3 +708,5 @@ The hub shares one successful schema initialization per instance/build, retries
 storage failures, and keeps repeated migrations off worker lease/readiness paths.
 Queued repair status does not imply an agent shortage or guaranteed priority;
 the banner distinguishes queued work from an active executor.
+Critical repair priority continues through independent review; review separation
+and acceptance requirements are preserved while the repair's urgency is retained.

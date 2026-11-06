@@ -206,6 +206,21 @@ describe("eligibility-first scheduling on real SQLite", () => {
 });
 
 describe("priority line recovery capacity", () => {
+  it("keeps independent review of an urgent concrete repair ahead of unrelated repair backlog", async () => {
+    const project = "critical-repair-review", g = await gateway(project, 3);
+    const older = await task(project, { machine_duty: { kind: "task-recovery", reason: "queue_binding" } });
+    const repair = await task(project, { boosted: Date.now(), machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const claim = await reserve(g);
+    if (claim.kind !== "reserved" || claim.task_id !== repair) throw new Error("urgent repair not reserved");
+    const handoff = await post("transition", { ...g.auth, id: repair, session: claim.session, to: "in_review",
+      note: "PR https://github.com/state-vector/bridge/pull/6998 — repair delivered, independent review required" });
+    expect(handoff.error).toBeUndefined();
+    const review = await post("get", { id: handoff.verify_task });
+    expect(review.meta).toMatchObject({ execution_review_of: repair,
+      machine_duty: { kind: "task-recovery", by: "recovery-review", subject: repair, reason: "head_checks" } });
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: handoff.verify_task });
+    expect(handoff.verify_task).not.toBe(older);
+  });
   it("honours explicit urgency within concrete repairs in both discovery and atomic reservation", async () => {
     const project = "urgent-repair", g = await gateway(project);
     const older = await task(project, { machine_duty: { kind: "task-recovery", reason: "queue_binding" } });
