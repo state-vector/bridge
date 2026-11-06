@@ -36,7 +36,11 @@ export {
   SENTIMENT_CHIP, HISTORY_CHIP, HISTORY_LABEL,
 } from "./views/TaskDetail";
 export { TopView } from "./views/TopView";
+export { TrainPanel } from "./views/TrainPanel";
+export { AskBand, AskEntries, useHumanAsks, type AskEntry, type HumanAsks } from "./views/AskBand";
 export { ReportsView } from "./views/ReportsView";
+// views helpers for mobile adaptation of the DATA (same store, same shapes)
+export { isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "./server/views";
 export { BacklogView, CompletedView } from "./views/BacklogView";
 export { StatusLights } from "./views/StatusLights";
 export { ForMeView } from "./views/ForMeView";
