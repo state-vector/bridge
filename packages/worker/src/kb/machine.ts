@@ -1166,6 +1166,20 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // the guard refusing is the system working, never a breach.
   "release:held-typed-await": Number.POSITIVE_INFINITY,
   "release:held-train-queue": Number.POSITIVE_INFINITY,
+  // BR#7008/BR#7028 — the durable-execution mutation fence (do.ts
+  // executionMutationGuard): a write from a bound runner token whose
+  // execution attempt is not a live bound running attempt (expired lease,
+  // quiesced/stopping attempt, claim/generation mismatch) is refused with
+  // "gate: execution mutation fenced — stop and checkpoint; runner must
+  // verify restore/quiescence before resuming". The fence refusing a stale
+  // writer is the system working — the BR#4562/BR#6654 pricing law again:
+  // zero state destroyed, and the refusal's own instruction is to stop,
+  // checkpoint and re-establish before resuming. The specimens complied
+  // (3 fence events on BR#5971, 2026-11-06 13:26–13:28Z, folded
+  // "unclassified" and raised BR#7008; sibling BR#3630/BR#7028 same shape —
+  // both runners stopped, checkpointed and delivered). The class is named
+  // so the Log says WHAT fenced; the pricing is never-a-breach.
+  execution_fence: Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1296,6 +1310,15 @@ export function breachClass(reason: string): string {
   // slice; both guards' messages carry exactly one of them.
   if (r.includes("must not destroy the wait") || r.includes("must not destroy the queue slot"))
     return "release_held";
+  // BR#7008/BR#7028: the durable-execution mutation fence refusing a stale
+  // bound writer — expired lease, quiesced/stopping attempt, claim or
+  // generation mismatch. The message's own instruction is stop/checkpoint/
+  // re-establish before resuming; complying runners are the flow working,
+  // so the refusal is priced never-a-breach (thresholds above). Match the
+  // structural fragment "execution mutation fenced", not the whole sentence
+  // (BR#3611/BR#3612 wording-drift lesson); it sits ~15 chars in, far inside
+  // the 300-char audit slice, so the classification survives any tail.
+  if (r.includes("execution mutation fenced")) return "execution_fence";
   return "unclassified";
 }
 
