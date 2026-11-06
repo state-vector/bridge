@@ -1209,7 +1209,20 @@ shorthand — the way every bounce note and brief writes it — parses like the 
 (the URL form wins when both cite the same PR), and a head-bearing close with no
 PR citation at all refreshes a card that has exactly one open leg (multi-leg
 stamps stay fail-closed — a lone head is never guessed onto one of several
-legs). The re-queue note is honest about it: it says *stamp refreshed* only when
+legs). It is convention-tolerant again (BR#5329): the typed machine-leg prose
+`repo=owner/name n=N` — the shape every park note's typed `await_event` leg
+already carries — and the seeded duty brief's JSON-ish `repo:"owner/name", n:N`
+parse like the shorthand, the closing duty's seeded brief (the verdict record)
+is parsed before the legacy card body so a prose-only close still stamps
+(BR#5048 structural follow-up #2), and a bare `PR #N` citation names an
+EXISTING open leg — on a multi-leg stamp the lone `head <sha>` refreshes the
+named leg instead of staying fail-closed. Every parsed row is validated before
+it can become a leg: a repo token that is not a real GitHub repo shape (an
+all-numeric owner — the residue of slash-joined card-reference prose like
+`BR#4365/BR#4875`) never reaches `meta.prs`, so a misread card reference can
+no longer queue a ghost merge lane; stamps polluted before this rule are
+cleaned on the next accept (`queue_ghost_leg_dropped` audit). The re-queue
+note is honest about it: it says *stamp refreshed* only when
 a stamp actually moved, and an accept whose `head <sha>` cannot bind any leg is
 audited loud (`queue_stamp_not_refreshed`) instead of silently re-queuing a
 stale stamp — the silent-stale class that once spun coverage bounces on an
