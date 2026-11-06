@@ -706,3 +706,5 @@ Merge-lane infrastructure is protected from PR-delivery completion: a merged
 PR receipt cannot retire a standing train, including in automatic park cleanup.
 The hub shares one successful schema initialization per instance/build, retries
 storage failures, and keeps repeated migrations off worker lease/readiness paths.
+Queued repair status does not imply an agent shortage or guaranteed priority;
+the banner distinguishes queued work from an active executor.

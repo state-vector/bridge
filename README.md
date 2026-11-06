@@ -3167,3 +3167,5 @@ Hub schema initialization runs once per Durable Object instance/build, sharing
 one initialization across concurrent requests. A failed storage initialization
 is retried; warm lease, inbox and readiness requests do not rerun migrations or
 full-table maintenance. A newly deployed instance still runs its migrations.
+Queued-repair banners report that execution has not started. A queued card
+alone is not evidence of top scheduling priority or unavailable agent capacity.

@@ -148,7 +148,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     if (task?.execution_blockers?.length) return taskRemediation(task);
     if (task?.active_agent) return taskRemediation(task);
     if (task && (task.status === "todo" || task.status === "in_review")) return {
-      kind: "queued", text: task.status === "todo" ? "Repair is queued at top priority; waiting for an available agent." : "The repair is awaiting independent verification.", task,
+      kind: "queued", text: task.status === "todo" ? "Repair queued; no executor has started it yet." : "The repair is awaiting independent verification.", task,
     };
     return { kind: "attention", text: task
       ? `Repair ${task.id} is not actively progressing. ${task.blocked_reason ?? "No recent agent heartbeat."}`
