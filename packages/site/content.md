@@ -211,6 +211,15 @@ The merge train keeps ticking throughout this worker-only drain. It stops and
 joins only at the final restart barrier, after the last worker finishes; only
 then may the gateway acknowledge idle. A failed train join never authorises restart.
 
+Recovery has execution priority, not just a prominent card: concrete repairs and
+main-red fixes outrank line diagnostics, ordinary verification and implementation.
+If an eligible gateway is full, one safe checkpointed managed verification can
+yield its slot through a durable stop/checkpoint/quiescence handoff. The slot stays
+charged until stopped-writer proof; recovery dispatches before that verification
+resumes. Handoffs are deduplicated across scheduler races and restarts, and the
+line names the yielding verification. Interactive/user holds, recovery verification
+and unknown external effects are protected; capability and review gates still apply.
+
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
 unavailable and merely busy hosts produce different facts. Queued unsupported

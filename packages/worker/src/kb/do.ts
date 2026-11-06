@@ -238,6 +238,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
+import { RecoveryCapacity, schedulingRank, taskSchedulingRank, priorityTask } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
@@ -3001,6 +3002,7 @@ export class KnowledgeHub {
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL,
         generation INTEGER NOT NULL, expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS recovery_preemptions (token_id TEXT PRIMARY KEY, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS gateway_dispatch_control (
         token_id TEXT PRIMARY KEY, mode TEXT NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL, updated_ts INTEGER NOT NULL
       );
@@ -4843,12 +4845,7 @@ export class KnowledgeHub {
       if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; return false; }
       return true;
     });
-    const rank = (row: (typeof rows)[number]) => {
-      const meta = JSON.parse(String(row.meta ?? "{}")), tags = parseTags(row.tags), roles = parseTags(row.roles);
-      if (isRootFixCard({ tags, meta }) || (tags.includes("merge-train") && tags.includes("diagnostic"))) return -2;
-      if (meta.boosted) return -1;
-      return roles.includes("review") || roles.includes("unblock") ? 0 : 4;
-    };
+    const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b) || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
     return { eligible, reasons };
   }
@@ -4909,7 +4906,12 @@ export class KnowledgeHub {
     }
   }
 
-  private async scheduleGateway(body: Record<string, unknown>, tokenId: string, host: string, mode: "inspect" | "reserve", commandId: string): Promise<SchedulingOutcome> {
+  private recoveryCapacity() {
+    return new RecoveryCapacity(this.state.storage,
+      (id, meta) => !!this.protectedExecution(id, meta) || releaseHold(meta) !== null || this.startupHasAsk(id),
+      (actor, op, id, data) => this.audit(actor, op, id, data));
+  }
+  private async scheduleGateway(body: Record<string, unknown>, tokenId: string, host: string, mode: "inspect" | "reserve" | "request_capacity", commandId: string): Promise<SchedulingOutcome> {
     this.reconcileDispatchReservations();
     const key = `schedule:${tokenId}`, encoded = JSON.stringify({ mode, host, session: body.session });
     const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, key, commandId);
@@ -4928,7 +4930,14 @@ export class KnowledgeHub {
     const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
     const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
     const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} };
-    const facts = { host, ...occupancy, capacity: capabilities ? gatewayCapacity(capabilities) : 0, eligible: selection.eligible.length, reasons: selection.reasons, observed_at: Date.now() };
+    const recoveryCapacity = this.recoveryCapacity();
+    const pending = recoveryCapacity.prepare(tokenId, selection.eligible.map(priorityTask), mode !== "inspect");
+    if (pending?.phase === "slot_available") {
+      const index = selection.eligible.findIndex(t => String(t.id) === pending.recovery_id);
+      if (index > 0) selection.eligible.unshift(...selection.eligible.splice(index, 1));
+    }
+    const facts = { host, ...occupancy, capacity: capabilities ? gatewayCapacity(capabilities) : 0, eligible: selection.eligible.length, reasons: selection.reasons,
+      preemption: pending ?? undefined, observed_at: Date.now() };
     const record = (outcome: SchedulingOutcome) => {
       const result = SchedulingOutcomeSchema.parse(outcome);
       this.state.storage.sql.exec(`INSERT INTO dispatch_observations(token_id,outcome) VALUES(?,?) ON CONFLICT(token_id) DO UPDATE SET outcome=excluded.outcome`, tokenId, JSON.stringify(result));
@@ -4937,9 +4946,12 @@ export class KnowledgeHub {
     if (!capabilities || Date.now() - Number(observation?.observed_ts) >= 120_000) return record({ kind: "gateway_not_ready", ...facts, reason: "Executor capability observation missing or stale" });
     const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
     if (readiness.kind !== "ready" || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2)) return record({ kind: "gateway_not_ready", ...facts, reason: readiness.kind === "ready" ? "Runner protocol upgrade required" : readiness.reason });
-    if (occupancy.active + occupancy.reserved >= facts.capacity) return record({ kind: "at_capacity", ...facts });
+    if (occupancy.active + occupancy.reserved >= facts.capacity) {
+      if (mode !== "inspect" && selection.eligible[0]) facts.preemption = recoveryCapacity.request(tokenId, host, priorityTask(selection.eligible[0])) ?? undefined;
+      return record({ kind: "at_capacity", ...facts });
+    }
     if (!selection.eligible.length) return record({ kind: "no_eligible_work", ...facts });
-    if (mode === "inspect") return record({ kind: "ready", ...facts, candidates: selection.eligible.map(t => String(t.id)) });
+    if (mode !== "reserve") return record({ kind: "ready", ...facts, candidates: selection.eligible.map(t => String(t.id)) });
     // Persist a pending command before the lifecycle's async evidence checks.
     // Concurrent replay cannot reserve twice; the final claim transaction also
     // rechecks capacity, ownership, readiness and every execution fence.
@@ -4956,6 +4968,7 @@ export class KnowledgeHub {
           const reservation = this.one(`SELECT expires_at FROM dispatch_reservations WHERE task_id=? AND token_id=? AND session=?`, id, tokenId, session);
           if (!reservation) throw new Error("gate: reservation no longer held after claim");
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at) };
+          recoveryCapacity.consume(tokenId, id);
           break;
         } catch (error) {
           const message = String(error);
@@ -5051,6 +5064,8 @@ export class KnowledgeHub {
       }
     }
     if (op === "transition" && body.to === "in_progress") {
+      const handoff = this.recoveryCapacity().forVictim(String(body.id ?? ""));
+      if (handoff && !this.executionWork().isInteractive(String(body.token_id ?? ""))) throw new Error(`gate: priority recovery ${handoff.recovery_id} owns the reclaimed slot; return to the scheduler [rule: recovery-priority]`);
       const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, String(body.id ?? ""));
       const a = this.executionState(String(body.id ?? ""))?.attempt;
       if (row?.status === "todo" && a && a.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — preserve host affinity");
@@ -5176,7 +5191,10 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
-    if (command.kind === "inspect") return current;
+    if (command.kind === "inspect") {
+      const handoff = this.recoveryCapacity().forVictim(req.id);
+      return handoff ? { ...current, capacity_handoff: handoff } : current;
+    }
     if (command.kind === "availability") return this.executionWork().availability(req.id);
     // A released failed-start acknowledgement never authorises a writer or an
     // external operation. Its exact authenticated replay survives owner clear.
@@ -5283,6 +5301,8 @@ export class KnowledgeHub {
     let workerTokenId = String(binding?.worker_token_id ?? "");
     let begunExecutor: ExecutorCapabilities | null = null;
     if (command.kind === "begin") {
+      const handoff = this.recoveryCapacity().forVictim(req.id);
+      if (handoff) throw new Error(`gate: priority recovery ${handoff.recovery_id} owns the reclaimed slot; return to the scheduler [rule: recovery-priority]`);
       if (body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL) throw new Error("gate: begin requires the worker-ready runner protocol");
       if (row.status !== "in_progress" || meta.session !== session) throw new Error("gate: begin requires the current task claim/session");
       const advertised = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
@@ -8710,25 +8730,8 @@ export class KnowledgeHub {
       // duty), then blocked-with-condition, questions, plain todo.
       const rank = (t: any) => {
         const m = JSON.parse(t.meta ?? "{}");
-        // Train health priority #1: root-fix cards (main-red stop-the-line) and
-        // merge-train starvation diagnostic duties outrank all other work on
-        // the board so free sessions auto-diagnose and self-heal the train first.
         const tTagsArr: string[] = Array.isArray(t.tags) ? t.tags : [];
-        if (isRootFixCard({ tags: tTagsArr, meta: m }) || (tTagsArr.includes("merge-train") && tTagsArr.includes("diagnostic"))) return -2;
-        // human boost: priority 0, above unblock duty — the human's explicit
-        // "process this (and its dependencies) first" (BR#911)
-        if (m.boosted) return -1;
-        // release-parked-work levers FIRST, above everything claimable:
-        // verify duty (an in_review task parks its owner until a fresh
-        // session rules) and unblock duty share rank 0. Verify starved below
-        // blocked-with-condition (2026-10-24, Ray): ranks 0-1 filled the
-        // 10-slot slice, verify children never surfaced, impls piled up
-        // in_review while new impl todo kept getting claimed.
-        if (t.roles?.includes("unblock")) return 0;
-        if (verifyParents.has(t.id)) return 0;
-        if (t.status === "blocked" && (m.blocked?.unblock_condition ?? "").trim()) return 1;
-        if (t.type === "question") return 3;
-        return 4;
+        return schedulingRank(m, tTagsArr, verifyParents.has(t.id) ? ["review"] : t.roles ?? []);
       };
       return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
     }).slice(0, 10).map((t: any) => {
@@ -14050,6 +14053,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ...(owner ? { owner } : {}),
       ...(executorSession ? { executor_session: executorSession } : {}),
       active_agent: activeAgent,
+      preemption: this.recoveryCapacity().forRecovery(String(r.id)) ?? undefined,
       execution_blockers: ["todo", "blocked"].includes(status) && m.execution_requirements
         ? this.executionWork().blockers({ id: String(r.id), title: String(r.title ?? ""), project: String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(r.id))?.project ?? ""),
             status, owner: String(r.owner ?? ""), meta: JSON.stringify(m), updated_ts: Number(r.updated_ts ?? 0) }, now)

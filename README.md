@@ -38,6 +38,21 @@ silencing the merge line for a whole worker action budget on every update.
 Retired merge lines are hidden.
 Per-task execution-attention cards are not shown on Top.
 
+**Recovery owns execution priority (BR#6835).** Concrete task-repair duties and
+main-red fixes rank above line recovery, generic diagnostics, boosts, verification
+and ordinary implementation in both discovery and reservation. When a compatible
+gateway is full, the scheduler can checkpoint-preempt one ordinary managed verifier
+on that host. A durable interrupt requests checkpoint, stopped-process proof and
+yield; the verifier returns to todo with its checkpoint preserved. Its slot stays
+charged until real quiescence, then the recovery is pinned ahead of the verifier's
+resume. Concurrent calls/restarts reuse one host handoff, not a cancellation storm.
+Interactive sessions, human/control holds, recovery's own verification, pending
+external effects and uncheckpointed writers are protected. Inspect mode never
+preempts. Full runners use `schedule(request_capacity)` to request a safe handoff
+without reserving additional work. The line reports which verification is yielding, rather than merely
+claiming to wait for an eligible executor. Credential/model/host eligibility and
+review separation remain enforced; priority never fabricates capacity.
+
 The web and desktop headers include **Go to BR#…** on every signed-in view.
 Enter `BR#6690`, `BR-6690`, `#6690`, or `6690`, then press Enter or **Go** to
 open the card directly, regardless of board filters or whether it is loaded in

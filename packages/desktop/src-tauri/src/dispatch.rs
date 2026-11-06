@@ -246,6 +246,7 @@ fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde
 
 fn quiesced_claim_can_resume(state: &serde_json::Value, task: &serde_json::Value, host: Option<&str>) -> bool {
     task["status"] == "in_progress" && state["attempt"]["phase"] == "quiesced"
+        && state.get("capacity_handoff").map(|h| h.is_null()).unwrap_or(true)
         && state["attempt"]["host"].as_str() == host && host.is_some()
         && state["attempt"]["session"].as_str().is_some()
         && state["attempt"]["session"] == task["meta"]["session"]
@@ -4700,6 +4701,14 @@ fn tick(
     // New work is selected AND reserved by the hub. Local history is not a
     // second scheduling authority: a human release re-enters this path even
     // when this process previously gave up or cached a refused reference.
+    // Full runners still ask the hub to arrange safe recovery capacity. This
+    // mode cannot reserve more work if local and hub counts temporarily differ.
+    if in_flight.len() >= cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
+        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "request_capacity" }))?;
+        let outcome = serde_json::from_value::<SchedulingOutcome>(scheduling)
+            .map_err(|error| format!("hub scheduling contract drift: {error}"))?;
+        dlog("", &format!("hub capacity request: {outcome:?}"));
+    }
     while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
         let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
         let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
@@ -5412,6 +5421,9 @@ mod tests {
         assert!(!quiesced_claim_can_resume(&state, &task, Some("host")));
         state["attempt"]["phase"] = json!("quiesced");
         assert!(quiesced_claim_can_resume(&state, &task, Some("host")));
+        state["capacity_handoff"] = json!({"phase":"slot_available","recovery_id":"BR#2"});
+        assert!(!quiesced_claim_can_resume(&state, &task, Some("host")), "a verifier cannot steal its yielded slot back before priority dispatch");
+        state.as_object_mut().unwrap().remove("capacity_handoff");
         assert!(!quiesced_claim_can_resume(&state, &task, Some("other")));
         assert!(!quiesced_claim_can_resume(&state, &json!({ "status": "in_progress", "meta": { "session": "local-owner" } }), Some("host")));
         state["handoff"]["phase"] = json!("waiting");

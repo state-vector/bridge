@@ -30,6 +30,11 @@ export type LineRemediation = z.infer<typeof LineRemediationSchema>;
  * Status=todo does not imply dispatchable; blockers are independently owned. */
 export function taskRemediation(task: TrainFixCard): LineRemediation {
   const blockers = task.execution_blockers ?? [];
+  if (task.status === "todo" && task.preemption && blockers.every(b => b.kind === "capacity_wait")) return {
+    kind: "queued", task, text: task.preemption.phase === "stopping_verification"
+      ? `Priority recovery: verification ${task.preemption.victim_id} is checkpointing and yielding its slot.`
+      : "Priority recovery: its reclaimed slot is available for dispatch.",
+  };
   if (blockers.length) return { kind: "blocked", task, text: blockers.map(b => b.text).join(" ") };
   if (task.active_agent) return { kind: "agent", task, text: repairProgressText(task) };
   if (task.status === "blocked") return { kind: "blocked", task, text: task.blocked_reason ?? "The repair is parked; its recorded wait must resolve before execution." };

@@ -1199,6 +1199,7 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   "takeover-authority": "claim_race",
   "takeover-target": "claim_race",
   "takeover-held": "release_held",
+  "recovery-priority": "release_held",
   "takeover-verdict-duty": "gate:separation",
   "takeover-stale-holder": "claim_race",
 };

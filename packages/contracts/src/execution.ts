@@ -160,7 +160,7 @@ export function initialExecution(requirements: ExecutionRequirements = Execution
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("schedule"), mode: z.enum(["inspect", "reserve"]) }),
+  z.object({ kind: z.literal("schedule"), mode: z.enum(["inspect", "reserve", "request_capacity"]) }),
   z.object({ kind: z.literal("schedule_status"), host: text.optional() }),
   z.object({ kind: z.literal("gateway_control"), host: text, mode: z.enum(["enabled", "draining"]), reason: text }),
   z.object({ kind: z.literal("gateway_failure"), reason: text, cooldown_ms: z.number().int().min(10_000).max(300_000) }),

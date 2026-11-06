@@ -8,6 +8,13 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("shows the actual priority capacity handoff rather than passively waiting for an executor", () => {
+    const repair = { ...task, status: "todo", active_agent: false, execution_blockers: [{ kind: "capacity_wait" as const, episode_id: "capacity", text: "Full" }],
+      preemption: { phase: "stopping_verification" as const, recovery_id: task.id, victim_id: "BR#2", generation: 1, attempt_id: "one", session: "verify", requested_at: now, checkpoint_commit: "a".repeat(40) } };
+    expect(taskRemediation(repair)).toMatchObject({ kind: "queued", text: expect.stringContaining("verification BR#2 is checkpointing and yielding") });
+    expect(taskRemediation({ ...repair, preemption: { ...repair.preemption, phase: "slot_available" } })).toMatchObject({ text: expect.stringContaining("reclaimed slot is available") });
+    expect(taskRemediation({ ...repair, execution_blockers: [{ kind: "human_answer_required", episode_id: "human", ask_id: "BR#3", text: "Needs a human choice" }] }).kind).toBe("blocked");
+  });
   it("a todo repair with a rejected startup is blocked, not queued for an available agent", () => {
     const wait = { host: "runner", fingerprint: "proof", reason: "execution command requires task executor authority", since: now,
       retained_work: false, attention_at: null, phase: "recovery_required" as const, source: "start_failed" as const };
