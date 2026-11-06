@@ -80,8 +80,6 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
  * come from the hub's typed `line` projection, shared with its row and message. */
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
-  const recoveries = line.recoveries?.filter((r) => r.episode.stage.phase !== "superseded") ?? [];
-  const active = recoveries.filter((r) => recoveryIsOpen(r.episode)).length;
   return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
     <div className="train-banner-cause">
     <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
@@ -94,7 +92,15 @@ export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now
     {(line.remediation || !!line.recoveries?.length) && <div className="train-banner-recovery">
     {line.remediation && <Recovery action={line.remediation} now={now} openTask={openTask} />}
     {lane.stalled_resolution?.last_error && <details className="train-banner-line"><summary>Merge rejection details</summary>{lane.stalled_resolution.last_error}</details>}
-    {recoveries.length > 0 && <details className="train-banner-line">
+    <LaneRecoveryHistory line={line} now={now} openTask={openTask} />
+    </div>}
+  </div>;
+}
+
+export function LaneRecoveryHistory({ line, now, openTask }: { line: TrainLineProjection; now: number; openTask?: (id: string) => void }) {
+  const recoveries = line.recoveries?.filter((r) => r.episode.stage.phase !== "superseded") ?? [];
+  const active = recoveries.filter((r) => recoveryIsOpen(r.episode)).length;
+  return recoveries.length > 0 ? <details className="train-banner-line">
     <summary>Recovery history · {active} active · {recoveries.length - active} resolved</summary>
     {recoveries.map(({ episode, task }) => (
       <div key={episode.id} className="train-banner-line">
@@ -110,9 +116,7 @@ export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now
         </details>
       </div>
     ))}
-    </details>}
-    </div>}
-  </div>;
+    </details> : null;
 }
 
 const REFRESH_MS = 30_000;

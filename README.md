@@ -36,6 +36,12 @@ gateway stop and join the train, then acknowledge the nonce/PID-bound idle recei
 for supervised restart. A failed train join cannot certify idle. This avoids
 silencing the merge line for a whole worker action budget on every update.
 Retired merge lines are hidden.
+Opening a merge lane shows its live operational view: the same typed status as
+the train row, deployment/recovery links, queue checks and repair tasks, executor
+heartbeat and merge throughput. It refreshes every 30 seconds and flags failed or
+stale observations. Required checks come from live lane configuration; recovery
+history and executor diagnostics are expandable. Lanes do not show task completion
+gauges, model fields, generic unblock/supersede controls or dependency graphs.
 Per-task execution-attention cards are not shown on Top.
 
 **Recovery owns execution priority (BR#6835).** Concrete task-repair duties and

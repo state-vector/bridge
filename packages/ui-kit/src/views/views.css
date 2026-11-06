@@ -232,6 +232,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    squished above tall forms; forms pin to the visual bottom via margin-top:auto */
 .detail-panel .detail-block.history-block { flex: 1 1 auto; min-height: 160px; }
 .detail-panel .detail-block.form-block { margin-top: auto; }
+.lane-detail { overflow-wrap: anywhere; }
+.lane-detail .detail-question { margin: 0; color: var(--text); }
+.lane-detail-status, .lane-detail-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.lane-detail-stats { font-size: 12px; color: var(--text-dim); }
+.lane-detail .train-blocked-banner { grid-template-columns: minmax(0, 1fr); margin-left: 0; }
+.lane-detail-queue, .lane-detail-events { margin: 8px 0 0; padding-left: 22px; }
+.lane-detail-queue li, .lane-detail-events li { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.lane-detail-queue li > span, .lane-detail-events li > span { display: block; font-size: 12px; margin-top: 4px; }
+.lane-detail-queue .k-chip { margin-left: 8px; }
+.lane-detail summary { cursor: pointer; color: var(--text-dim); }
 @keyframes slide-in { from { transform: translateX(30px); opacity: 0; } }
 
 .detail-head { display: flex; justify-content: space-between; align-items: center; }
