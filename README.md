@@ -2407,6 +2407,9 @@ the status chip, message and recovery banner. Its closed phases are `ready`,
 carry a failure; interrupted states require a cause and a recovery disposition.
 The UI renders this contract instead of reconstructing health from lease,
 starvation, check-subset and latest-log heuristics.
+The overview keeps routine builds, deployments and check waits compact in the
+lane row; expanded recovery banners appear only for stopped or unknown/error
+states. Click the lane to inspect full operational details in its card view.
 
 **Action-first recovery (BR#6667):** a ready, non-conflicting cure blocked by
 main's deployment gate says **Fix ready — your merge is needed**, links directly

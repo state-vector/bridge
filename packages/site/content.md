@@ -436,7 +436,10 @@ reservation. Recovery banners show actual startup/capability/handoff blockers,
 rather than describing an unlaunchable `todo` task as waiting for an agent.
 
 The train status, message and recovery banner consume the hub's shared typed
-`line` projection. A failed decisive deployment overrides green job subsets;
+`line` projection. Routine builds, deployments and check waits stay compact in
+the overview row; expanded banners appear only for stopped or unknown/error
+states. Click the lane for full operational details in its card view.
+A failed decisive deployment overrides green job subsets;
 when a ready cure needs a human bypass merge, the line says **Fix ready — your
 merge is needed** and links directly to the fix PR and its confirmation request.
 Historical recovery episodes and agent logs are expandable details. A current

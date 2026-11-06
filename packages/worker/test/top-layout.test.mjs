@@ -34,6 +34,21 @@ it("the alert is inside the affected lane group after its row, never above an un
   expect(failedGroup).toContain(recovery.task.last_progress.will);
 });
 
+it("routine deployment waits stay compact while stopped and unknown lines retain their alerts", () => {
+  const waiting = { ...ready, line: { ...ready.line, phase: "waiting", label: "Build and deployment running", blocker: "checks_running", held: 2, remediation: { kind: "machine", text: "Watching deployment.", url: null } } };
+  const html = render(h(TrainPanelView, { lanes: [waiting], now, error: null }));
+  expect(html).toContain("Build and deployment running");
+  expect(html).not.toContain('role="alert"');
+  expect(html).not.toContain("train-lane-interrupted");
+  expect(html).not.toContain("Main last checked");
+  const unknown = { ...stopped, line: { ...stopped.line, phase: "unknown", blocker: "stale_observation", label: "Status is out of date" } };
+  for (const lane of [stopped, unknown, { ...ready, line: undefined }]) {
+    const alert = render(h(TrainPanelView, { lanes: [lane], now, error: null }));
+    expect(alert).toContain('role="alert"');
+    expect(alert).toContain("train-lane-interrupted");
+  }
+});
+
 it("theme filters start closed; the subtitle sits in the title block; chart units and periods are explicit", () => {
   const head = render(h(TopSectionHeader, { theme }));
   expect(head).toContain('<details class="tag-theme-panel">');

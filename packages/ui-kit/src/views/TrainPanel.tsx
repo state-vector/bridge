@@ -149,6 +149,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     </div>}
     {(activeLanes ?? []).map((l) => {
       const line = l.line ?? unavailable;
+      const needsAttention = line.phase === "stopped" || line.phase === "unknown";
       const live = !!l.lease && now - l.lease.heartbeat_ts < 300_000;
       const machine = l.lease?.holder ?? l.capable?.holder;
       const repo = l.lane.split("@")[0];
@@ -156,7 +157,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
       const progress = l.currently?.phase === "bursting"
         ? `${l.currently.burst_merged ?? 0} merged this batch`
         : l.currently ? "Merged — checking deployment" : `${line.held} changes queued`;
-      return <section key={l.lane} className={`train-lane-group${line.blocker ? " train-lane-interrupted" : ""}`} aria-label={l.lane}>
+      return <section key={l.lane} className={`train-lane-group${needsAttention ? " train-lane-interrupted" : ""}`} aria-label={l.lane}>
       <div className="ktable-row train-row">
         <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
@@ -175,7 +176,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
             title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
       </div>
-      {line.blocker && <LineStopBanner lane={l} now={now} openTask={openTask} />}
+      {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
       </section>;
     })}
   </div>;
