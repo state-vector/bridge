@@ -30,7 +30,16 @@ body {
   flex-shrink: 0;
 }
 .mb-brand { font-weight: 700; font-size: 16px; }
-.mb-conn { font-size: 11px; }
+.mb-signin {
+  background: var(--accent); border: none; border-radius: 999px; color: #fff;
+  padding: 5px 13px; font: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; min-height: 30px;
+}
+.mb-conn {
+  font-size: 11px; line-height: 1; margin-left: auto;
+  background: none; border: none; cursor: pointer; padding: 8px 6px;
+  font-family: inherit; color: inherit;
+}
 .mb-conn-open { color: var(--green); }
 .mb-conn-closed { color: var(--red); }
 

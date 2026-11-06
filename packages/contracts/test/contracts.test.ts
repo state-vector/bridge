@@ -14,6 +14,7 @@ import {
 } from "../src/pairing.ts";
 import { AskAnswerPayloadSchema, AskCreatePayloadSchema } from "../src/ask.ts";
 import { OrientResponseSchema } from "../src/orient.ts";
+import { DeployObservationSchema } from "../src/train.ts";
 import { z } from "zod";
 
 const FIX = (p: string) =>
@@ -127,6 +128,33 @@ describe("orient contract", () => {
       expect(names).toContain("my_tasks");
       expect(names).toContain("unclaimed_work");
     }
+  });
+});
+
+describe("deploy observation contract (2026-11-05 incident)", () => {
+  const inFlightRun = {
+    id: 41948784626, name: "Deploy Dev", head_sha: "7".repeat(40),
+    status: "in_progress", // queued/in_progress runs have NO conclusion at GitHub
+    html_url: "https://github.com/state-vector/superpositional/actions/runs/1",
+  };
+  const observation = (run: object) => ({
+    tip_sha: "7".repeat(40), observed_at: Date.now(), runs: [run],
+  });
+
+  it("a run with the conclusion key ABSENT parses and normalizes to null (the Rust runner omits it via skip_serializing_if)", () => {
+    const parsed = DeployObservationSchema.parse(observation(inFlightRun));
+    expect(parsed.runs[0].conclusion).toBeNull();
+  });
+
+  it("an explicit null conclusion parses (the runner now serializes null)", () => {
+    const parsed = DeployObservationSchema.parse(observation({ ...inFlightRun, conclusion: null }));
+    expect(parsed.runs[0].conclusion).toBeNull();
+  });
+
+  it("the enum stays closed — an off-enum string conclusion is still rejected", () => {
+    expect(() =>
+      DeployObservationSchema.parse(observation({ ...inFlightRun, status: "completed", conclusion: "definitely_not_real" })),
+    ).toThrow();
   });
 });
 

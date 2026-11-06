@@ -232,6 +232,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    squished above tall forms; forms pin to the visual bottom via margin-top:auto */
 .detail-panel .detail-block.history-block { flex: 1 1 auto; min-height: 160px; }
 .detail-panel .detail-block.form-block { margin-top: auto; }
+.lane-detail { overflow-wrap: anywhere; }
+.lane-detail .detail-question { margin: 0; color: var(--text); }
+.lane-detail-status, .lane-detail-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.lane-detail-stats { font-size: 12px; color: var(--text-dim); }
+.lane-detail .train-blocked-banner { grid-template-columns: minmax(0, 1fr); margin-left: 0; }
+.lane-detail-queue, .lane-detail-events { margin: 8px 0 0; padding-left: 22px; }
+.lane-detail-queue li, .lane-detail-events li { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.lane-detail-queue li > span, .lane-detail-events li > span { display: block; font-size: 12px; margin-top: 4px; }
+.lane-detail-queue .k-chip { margin-left: 8px; }
+.lane-detail summary { cursor: pointer; color: var(--text-dim); }
 @keyframes slide-in { from { transform: translateX(30px); opacity: 0; } }
 
 .detail-head { display: flex; justify-content: space-between; align-items: center; }
@@ -472,7 +482,44 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    in the --cols templates in the ktable block below. This block is visual
    identity + the error/empty strips. */
 .train-panel { margin-bottom: 14px; }
-.train-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+/* BR#5349: the blocked-lane resolution banner — pinned at the very top of the
+   trains panel, above the lane table, plain words, red tone. The hub serves
+   base_red_resolution only while a non-green base holds cars, so it vanishes
+   the moment main goes green. */
+.train-blocked-banner {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 24px; min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--red) 55%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--text-dim);
+  padding: 12px 14px; margin: 0 0 8px 26px;
+  font-size: 12px; line-height: 1.45;
+}
+.train-blocked-banner-amber {
+  border-color: color-mix(in srgb, var(--amber) 55%, var(--line));
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+}
+.train-lane-group { min-width: 0; }
+.train-lane-interrupted > .train-row { border-bottom-color: transparent; }
+.train-banner-cause, .train-banner-recovery { display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.train-banner-cause > .train-banner-line:first-child { color: var(--red); }
+.train-blocked-banner-amber .train-banner-cause > .train-banner-line:first-child { color: var(--amber); }
+.train-banner-checks { font-size: 11px; }
+.train-banner-recovery details { font-size: 11px; }
+.train-banner-recovery details div { max-height: 160px; overflow: auto; white-space: pre-wrap; }
+.train-blocked-banner a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.train-blocked-banner .train-banner-line { min-width: 0; }
+.train-blocked-banner .train-banner-dim { opacity: 0.75; }
+/* BR#5376: the stalled banner rides the amber blocked-banner base; the
+   executor's raw error line renders mono + breaks so a long gh refusal
+   ("Merge commits are not allowed on this repository.") stays readable. */
+.train-blocked-banner .train-banner-mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  word-break: break-word;
+  opacity: 0.95;
+}
+.train-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 12px; margin-bottom: 10px; }
 .train-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
 .train-lane {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -513,26 +560,111 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-now-note::before { content: "▸ "; color: var(--accent); }
 .train-stall { color: var(--amber, #d29a4b); font-weight: 600; white-space: nowrap; cursor: help; }
 .trainc-rate { white-space: nowrap; }
-.trainc-backlog { min-width: 0; overflow: hidden; display: flex; align-items: center; gap: 8px; }
-.train-depth { flex: none; cursor: help; }
-.train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; }
+/* BR#5412: the backlog cell = plain counts above the batch blocks — X in
+   queue, Y waiting on review (muted, own tooltip); the blocks show only the
+   batch that merges this pass (Ray: the mergeable set, not the audit trail).
+   The awaiting band + divider are gone — parks render nowhere (not train
+   cars), the audit-trail block classes are removed with them.
+   BR#5106: the honest depth line (`queue N · open M`) rides the same cell
+   via .train-depth — the derived queue is the actionable subset, open is
+   every open PR the repo's last reconcile pass listed. */
+.trainc-backlog { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; overflow: hidden; }
+.train-backlog-count { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; cursor: default; }
+.train-queued-count { font-weight: 600; color: var(--text, #d7dce6); }
+.train-await-count { color: var(--text-faint, #8b94a7); cursor: help; }
+.train-count-label { font-weight: 400; color: var(--text-faint, #8b94a7); }
+.train-depth { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; cursor: help; }
+.train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; max-width: 100%; overflow: hidden; }
 .train-block { width: 11px; height: 16px; border-radius: 3px; cursor: pointer; flex: none; border: 1px solid transparent; }
 .train-block:hover { filter: brightness(1.2); }
+/* 2026-11-02: the block classes RESTORED — BR#5412's CSS half deleted them
+   ("audit-trail classes removed") but the TSX half still emits every one
+   (tb-waiting, tb-conflict, tb-needs-review, tb-blocked, tb-unknown,
+   tb-awaiting, plus the gap divider), so every non-ready car rendered as
+   .train-block's transparent+transparent shell: INVISIBLE cars (Ray:
+   "cars transparent/empty"). Markup is the contract — style what it
+   emits. */
 .tb-ready { background: var(--green, #3fb26a); }
 .tb-waiting { background: var(--amber, #d29a4b); }
 .tb-conflict { background: var(--red, #d9534f); }
 .tb-needs-review { background: var(--text-faint, #8b94a7); }
 .tb-blocked { background: repeating-linear-gradient(45deg, var(--text-faint, #8b94a7), var(--text-faint, #8b94a7) 3px, transparent 3px, transparent 6px); }
-.tb-unknown { background: transparent; border: 1px solid var(--text-faint, #8b94a7); }
-.tb-head { box-shadow: 0 0 0 2px var(--accent, #6ea8fe); }
+/* unknown = no machine verdict yet — a faint DASHED placeholder reads as
+   "pending", never as a broken/empty box (Ray, 2026-11-02) */
+.tb-unknown { background: repeating-linear-gradient(45deg, transparent, transparent 3px, color-mix(in srgb, var(--text-faint, #8b94a7) 18%, transparent) 3px, color-mix(in srgb, var(--text-faint, #8b94a7) 18%, transparent) 6px); border: 1px dashed var(--text-faint, #8b94a7); }
+/* head of the queue — an INSIDE accent border on the block itself, never
+   the 2px box-shadow ring that bled onto the right/bottom neighbours and
+   read as a rendering glitch (Ray, 2026-11-02) */
+.tb-head { border: 1.5px solid var(--accent, #6ea8fe); }
 .tb-awaiting { background: var(--text-faint, #8b94a7); opacity: 0.55; }
 .tb-awaiting-aging { background: var(--amber, #d29a4b); opacity: 0.8; }
 .tb-awaiting-lapsed { background: var(--red, #d9534f); opacity: 0.9; }
 .train-block-gap { width: 1px; height: 16px; background: var(--text-faint, #8b94a7); opacity: 0.4; margin: 0 3px; flex: none; }
 
+/* ---------- BR#5658 (Ray 2026-11-03, v2): the verification colour law ----------
+   1. Per-lane PR stats: in progress (muted) · verifying (amber) · ready (green).
+   2. Backlog train: groups of verifying/ready PRs partitioned into sequential
+      merge batches (Batch 1 | Batch 2 | …), separated by .train-block-gap.
+   3. Block colour strictly denotes verification state (no red on awaiting per
+      BR#5476, no diagonal stripes):
+      - green solid (.tb-ready)     = ready (verified, mergeable)
+      - orange pulsing (.tb-verifying) = being verified right now
+      - orange solid (.tb-wait)     = waiting to be verified */
+.train-block-group { display: inline-flex; align-items: center; gap: 3px; }
+.tb-verifying { background: var(--amber, #d29a4b); animation: tb-pulse 1.6s ease-in-out infinite; }
+.tb-wait { background: var(--amber, #d29a4b); }
+@keyframes tb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.train-stats { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; max-width: 100%; overflow: hidden; font-size: 11.5px; }
+.train-stat { font-weight: 600; }
+.train-stat.ts-ip { color: var(--text-faint, #8b94a7); }
+.train-stat.ts-verifying { color: var(--amber, #d29a4b); }
+.train-stat.ts-ready { color: var(--green, #3fb26a); }
+.train-stat-sep { color: var(--text-faint, #8b94a7); opacity: 0.7; }
+
 /* ---------- dashboard ---------- */
-.dashboard { display: flex; gap: 12px; margin-bottom: 14px; align-items: stretch; flex-wrap: wrap; }
-.dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
+.dashboard { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0 22px; align-items: stretch; }
+.dash-cell { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.dash-cell-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-height: 18px; }
+.dash-cell-head h3 { margin: 0; color: var(--text-dim); font-size: 11px; font-weight: 600; }
+.dash-cell-head .muted-note { font-size: 10px; }
+.dash-metric { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; color: var(--text); font-size: 24px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.dash-metric > span { color: var(--text-faint); font-size: 11px; font-weight: 400; }
+.dash-metric-word { font-size: 21px; }
+.dash-trend { min-width: 0; }
+.dash-chart { width: 100%; height: 64px; display: block; overflow: visible; }
+.dash-chart-grid { fill: none; stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.dash-chart-scale, .dash-chart-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--text-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.dash-chart-axis { margin-top: 3px; }
+.dash-caption { margin: auto 0 0; color: var(--text-faint); font-size: 10.5px; line-height: 1.5; }
+.dash-empty { min-height: 88px; display: flex; align-items: center; color: var(--text-faint); font-size: 11px; }
+.dashboard .sentiment-bar { height: 8px; width: 100%; max-width: none; flex: none; margin: 12px 0 4px; }
+.dash-legend { display: flex; flex-wrap: wrap; gap: 7px 12px; font-size: 10.5px; color: var(--text-dim); }
+.dash-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.dash-legend i { width: 6px; height: 6px; border-radius: 50%; }
+.dash-task-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 10px; margin: 0; }
+.dash-task-counts dt { color: var(--text-faint); font-size: 10.5px; }
+.dash-task-counts dd { margin: 4px 0 0; color: var(--text); font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dash-task-counts dd.bad { color: var(--red); }
+.top-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.top-section-title { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.top-section-title h2 { margin: 0; }
+.top-section-title .muted-note { line-height: 1.5; }
+@media (max-width: 1100px) {
+  .dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .train-blocked-banner { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 560px) {
+  .dashboard { grid-template-columns: minmax(0, 1fr); }
+  .train-blocked-banner { margin-left: 0; }
+}
+@media (max-width: 760px) {
+  .train-panel .train-head-cols { display: none; }
+  .train-panel .train-row { --cols: 18px minmax(0, 1fr); padding: 10px 4px; gap: 6px 8px; }
+  .train-panel .train-row > span { grid-column: 2; }
+  .train-panel .train-row > .trainc-dot { grid-column: 1; grid-row: 1; }
+  .train-panel .trainc-msg { white-space: normal; }
+  .train-panel .trainc-status { overflow: visible; }
+}
 .chart-svg { width: 100%; height: 28px; }
 .chart-bar.hot { fill: var(--accent); }
 .sentiment-word { text-transform: capitalize; }
@@ -737,12 +869,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---- Top view: compressed fleet process list ---- */
 .top-wrap { display: flex; flex-direction: column; gap: 8px; padding: 12px; height: 100%; overflow-y: auto; }
-.top-head, .top-row {
-  display: grid;
-  grid-template-columns: 118px 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(90px, 1fr) 64px 64px;
-  gap: 8px; align-items: center;
-  font-size: 12px; padding: 6px 10px; border-radius: 8px;
-}
 .wt-row:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .wt-dot { width: 8px; height: 8px; border-radius: 50%; }
 .wt-dot.wt-active { background: var(--green); animation: wt-pulse 1.6s ease-in-out infinite; }
@@ -785,10 +911,24 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-band-row:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 .ab-kind { display: flex; gap: 4px; align-items: center; }
 .ab-main { display: flex; flex-direction: column; min-width: 0; }
-.ab-title { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* BR#6390 (Ray 2026-11-05: "not small truncated text"): the ask title WRAPS
+   at a readable size — never nowrap/ellipsis. The full question is the UI. */
+.ab-title { font-size: 13px; font-weight: 650; line-height: 1.4; white-space: normal; overflow: visible; }
 .ab-prior { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 10px; margin-left: 8px; padding: 0; }
 .ab-prior:hover { color: var(--accent); }
 .ab-prior-line { font-size: 10px; color: var(--text-faint); margin-left: 2px; }
+/* BR#6390: the ask's full body_md rendered INLINE in the band row — readable
+   markdown (links, code blocks for merge commands), bounded so a huge brief
+   scrolls instead of eating the board. */
+.ask-band-body {
+  margin: 4px 0 2px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg-raised, #161d2b) 65%, transparent);
+  border: 1px solid var(--border, #232b3b);
+  border-radius: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
 /* BR#3942 — ask addressee presence: the dead-addressee warning reads at a glance */
 .ab-offline { color: var(--amber, #c77700); font-weight: 600; }
 .ab-meta { font-size: 10.5px; color: var(--text-faint); text-align: right; }
@@ -796,20 +936,19 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* title-bar status lights: hub / kb / gateways, click for details */
 .status-lights { position: relative; margin-right: 8px; }
-.lights-btn { display: inline-flex; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+.lights-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font: inherit; font-size: 11px; background: none; border: none; cursor: pointer; padding: 5px 7px; border-radius: 4px; }
 .lights-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .lights-count { font-size: 10px; color: var(--text-faint); margin-left: 3px; }
 /* (superseded by the fixed-position .lights-pop block at the end) */
 .light-row { display: flex; align-items: center; gap: 6px; }
-.light-meta { color: var(--text-faint); margin-left: auto; font-size: 10px; }
+.light-meta { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); margin-left: auto; font-size: 11px; }
 
 /* lights popover: fixed overlay — never grows the title bar, never themed light */
 .lights-pop {
   position: fixed;
-  top: 34px;
-  right: 12px;
+  box-sizing: border-box;
   z-index: 1000;
-  min-width: 280px; max-width: 380px;
+  width: min(340px, calc(100vw - 32px));
   background: #10151f;
   color: var(--text, #dbe2ee);
   border: 1px solid #232b3b;
@@ -821,6 +960,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   max-height: 60vh; overflow-y: auto;
 }
 .lights-pop .light-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.lights-pop h3 { margin: 6px 0 2px; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+.light-worker { padding: 6px 0; border-top: 1px solid var(--line); }
+.light-worker-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.light-worker-state { margin-left: auto; color: var(--amber); }
+.worker-ready, .worker-busy { color: var(--green); }
+.worker-offline { color: var(--red); }
+.light-worker-detail { margin-top: 3px; color: var(--text-dim); overflow-wrap: anywhere; }
+.light-error { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--line); padding-top: 8px; color: var(--red); overflow-wrap: anywhere; }
+.worker-warning { padding: 10px 12px; border: 1px solid var(--amber); border-radius: 7px; color: var(--amber); background: color-mix(in srgb, var(--amber) 8%, transparent); }
 
 /* detail OS windows: the overlay components render full-bleed */
 .task-window { height: 100vh; background: var(--bg, #0d1117); }
@@ -868,8 +1016,8 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* band rows hosting a vertical option list: let the row grow naturally */
 /* (column-fold hack removed — rows are column-flex, any content fits) */
 
-/* the why-escalated line: muted, italic, always second */
-.ab-reason { font-size: 11px; color: var(--text, #dbe2ee); }
+/* the why-escalated line: muted, italic, always second — BR#6390: full text, no truncation */
+.ab-reason { font-size: 11px; color: var(--text, #dbe2ee); white-space: normal; }
 
 .ab-id { font-family: var(--mono, ui-monospace, monospace); font-size: 10px; color: var(--text-faint, #8b94a7); }
 
@@ -903,14 +1051,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .steer-box { max-width: 640px; }
 .steer-box input, .steer-box .kit-input { flex: 1 1 180px; min-width: 0; width: auto; }
 
-/* age/agent tracks size to content at wide widths (no clipped "4h 12m") */
-.top-head, .top-row {
-  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 44px 44px 44px 44px minmax(120px, 1fr) 84px 84px;
-}
-
-/* compact template LAST so it actually overrides (cascade order): the visible
-   columns at ≤1280 are agent, goal, status, score, bar, ages */
-
 /* rows are ONE line, dense — wrap fixes overcorrected into tall rows.
    Overflow ellipsizes (full text on hover); tracks + min-width keep cells
    from ever escaping the viewport (the actual wide-width bug). */
@@ -923,35 +1063,6 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 /* THE unblock/exit cell rule: one line, ellipsis — the wrap variant made
    every blocked row 3 lines tall (vertically fat rows) */
 .top-unblock { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; display: inline-block; vertical-align: bottom; }
-
-/* ============================================================
-   TOP TABLE — the whole table layout in two rules (+1 compact).
-   Rows are one line; EVERY cell clips (ellipsis); columns align
-   because tracks are fixed. Full text on hover via title attr.
-   ============================================================ */
-.top-head, .top-row {
-  display: grid;
-  grid-template-columns: 150px 118px minmax(160px, 1.4fr) 110px 48px 48px 48px 48px minmax(120px, 1fr) 84px 84px;
-  gap: 8px;
-  align-items: center;
-  font-size: 12px;
-  padding: 5px 10px;
-}
-.top-head > span, .top-row > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.top-row-child { margin-left: 22px; }
-
-/* compact: hide session + gauges; template matches the visible cells */
-@media (max-width: 1280px) {
-  .topc-session, .topc-gauge, .top-sent { display: none; }
-  .top-head, .top-row {
-    grid-template-columns: 150px minmax(160px, 1.4fr) 110px 48px minmax(120px, 1fr) 84px 84px;
-  }
-}
 
 /* goal cell: a flex row — single line BY CONSTRUCTION (flex never wraps
    without flex-wrap), immune to any surviving line-box rule */
@@ -993,14 +1104,24 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ktable-child { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent, #5b9dff) 40%, transparent); padding-left: 20px; }
 
 /* per-table column templates — layout lives ONLY here, as --cols */
-.top-head, .top-row { --cols: 92px 140px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
+.top-table { overflow-x: auto; flex-shrink: 0; }
+.top-table-body { min-width: 1420px; }
+.top-head, .top-row { --cols: 92px 140px 180px 112px minmax(160px, 1.4fr) 104px 44px 44px 44px 44px minmax(110px, 1fr) 78px 78px; }
+/* Nest in the task cell; never shift all child-row columns off the header. */
+.top-row.ktable-child { padding-left: 10px; }
 .backlog-row { --cols: 34px 88px minmax(200px, 1fr) minmax(180px, auto) 92px; }
-.train-head-cols, .train-row { --cols: 26px minmax(170px, 0.8fr) minmax(230px, 1.1fr) 120px minmax(200px, 1.1fr) 86px minmax(210px, auto); }
+/* 2026-11-02 rebalance (Ray: "column width still disproportionate") — the
+   BR#5412 swing overshot: status crushed to 0.7fr/150px while its chips
+   ("⛔ blocked — base is red (…)") are the longest strings on the row, and
+   msg bloated to 1.6fr/280px for content that is often just "—". Closer
+   ratios, floors matched to real content, backlog flexible for the queue. */
+.train-head-cols, .train-row { --cols: 26px minmax(150px, 0.9fr) minmax(210px, 1.1fr) 112px minmax(220px, 1.3fr) 86px minmax(190px, 1fr); }
 @media (max-width: 1280px) {
   .topc-session, .topc-gauge, .top-sent { display: none; }
-  .top-head, .top-row { --cols: 92px 140px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
+  .top-table-body { min-width: 1170px; }
+  .top-head, .top-row { --cols: 92px 140px 180px minmax(160px, 1.4fr) 104px 44px minmax(110px, 1fr) 78px 78px; }
   /* narrow: PROGRESS and RATE fold away; STATUS/CURRENT/MSG/BACKLOG stay */
-  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(200px, 1fr) minmax(170px, 1fr) 130px; }
+  .train-head-cols, .train-row { --cols: 26px minmax(140px, 0.9fr) minmax(190px, 1fr) minmax(200px, 1.2fr) minmax(160px, 0.9fr); }
   .trainc-prog, .trainc-rate { display: none; }
 }
 
@@ -1030,16 +1151,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-sdot.sd-in_review { background: var(--amber); }
 .top-sdot.sd-none { background: var(--text-faint, #8b94a7); }
 
-/* synthetic child for blocked rows whose ask isn't renderable (e.g. an
-   answered GO awaiting execution) — no blocked row stands alone */
-.top-await-note {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px 4px 30px; font-size: 11.5px;
-  color: var(--amber); cursor: pointer;
+/* Real questions use the compact amber strip; machine waits never impersonate asks. */
+.ask-band-node {
+  padding: 5px 10px;
+  gap: 3px;
+  border-left: 2px solid color-mix(in srgb, var(--amber) 45%, transparent);
   border-bottom: 1px solid color-mix(in srgb, var(--line, #232b3b) 55%, transparent);
+  background: color-mix(in srgb, var(--amber) 3%, transparent);
 }
-.top-await-note:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
-.top-await-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-band-node:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
+.ab-question-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.ab-question-head .ab-title { flex: 1 1 260px; color: var(--amber); }
+.ab-question-head .ab-meta { margin-left: auto; }
+.ab-question-content { min-width: 0; overflow-wrap: anywhere; }
+.ab-question-content .ask-reason { margin: 2px 0; font-size: 12px; }
+.ab-question-content .ask-opt-list { margin: 4px 0 0; gap: 1px; }
+.ask-band-node .ab-actions { flex-wrap: wrap; gap: 4px; }
 
 /* backlog sections: same ktable rows, grouped heads */
 .backlog-group { margin-bottom: 14px; }
@@ -1051,6 +1178,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    release button moved to Backlog's timeout group (keeps its class) */
 .sinbin-release { font-size: 11px; }
 .topc-agent { font-weight: 600; }
+.top-agent-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-model { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; font-size: 10px; font-weight: 500; line-height: 1.5; white-space: normal; }
+.execution-model-size { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.topc-model .execution-model { flex-wrap: nowrap; font-size: 11px; }
+.topc-model .execution-model-size { flex: 0 0 auto; }
+.task-model-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.execution-state { display: block; font-size: 10px; font-weight: 500; color: var(--muted); white-space: normal; }
 .topc-session { font-size: 11px; }
 .top-will { color: var(--accent); opacity: .8; }
 .top-sent { display: none; }
@@ -1112,13 +1246,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 
 /* ---- tag themes (BR#2983): tags are user-defined labels; the theme bar is
    the general-themes view (counts) + an AND filter shared by Top/Backlog ---- */
+.tag-theme-filter { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; flex-wrap: wrap; font-size: 11px; }
+.tag-theme-panel { position: relative; }
+.tag-theme-panel > summary { cursor: pointer; color: var(--text-dim); padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; user-select: none; }
+.tag-theme-options { position: absolute; z-index: 15; left: 0; top: calc(100% + 5px); width: min(380px, 85vw); box-sizing: border-box; padding: 12px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px #0005; }
+.top-section-head .tag-theme-options { left: auto; right: 0; }
+@media (max-width: 560px) { .top-section-head .tag-theme-options { left: 0; right: auto; } }
+.tag-theme-options > .muted-note { display: block; margin-bottom: 8px; }
+.tag-theme-selected-count { margin-left: 7px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.tag-theme-active { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
 .tag-theme-bar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
   padding: 4px 0 2px; margin-bottom: 6px;
-  border-bottom: 1px dashed var(--line);
 }
 .tag-theme-bar .tag-theme-label { margin-right: 4px; text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
-.tag-theme-chip { cursor: pointer; user-select: none; font-size: 11px; }
+.tag-theme-chip { cursor: pointer; user-select: none; font: inherit; font-size: 11px; border: 1px solid var(--line); border-radius: 5px; background: transparent; color: var(--text-dim); padding: 4px 7px; }
+.tag-theme-chip.tag-theme-selected { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .tag-theme-chip:hover { filter: brightness(1.2); }
 .tag-theme-n { opacity: .65; font-size: 10px; }
 .tag-theme-clear {
@@ -1134,12 +1277,18 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .tag-chip { font-size: 10px; flex: none; }
 .tag-chip-more { font-size: 10px; flex: none; }
 
-/* optimistic answering (2026-10-24, Ray): a clicked accept/reject/option
-   INSTANTLY sinks the row to the bottom of its list, grays it out, and spins
-   until the server confirms (refresh drops it) or the call fails (the row
-   returns to place with the error). Never a silent no-op. */
+/* answering feedback (2026-10-24, Ray; revised BR#6390): a clicked
+   accept/reject/option grays the row IN PLACE — it never sinks to the bottom
+   (any click-time re-order was the "cards jump around / jump back under my
+   pointer" defect). It spins while in flight (ask-pending), then holds an
+   ANSWERED gray (ask-answered) until the refreshed board drops it. */
 .ask-band-row.ask-pending { opacity: .45; }
 .ask-band-row.ask-pending .ab-actions { pointer-events: none; }
+.ask-band-row.ask-answered { opacity: .5; }
+.ask-band-row.ask-answered .ab-actions { pointer-events: none; }
+/* For Me rows: same in-place law — ACTIONING gray while in flight, ANSWERED
+   gray after the call settles, both until the refetch confirms. */
+.forme-item.forme-answered { opacity: .5; }
 .ask-spinner {
   display: inline-block; width: 11px; height: 11px; border-radius: 50%;
   border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
@@ -1148,7 +1297,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 }
 @keyframes ask-spin { to { transform: rotate(360deg); } }
 
-/* BR#3457 actioning affordance: a held card grays out while its decision is
-   in flight — pin-to-bottom comes from holdOrder, this is the visual half
-   (spinner chip + dead buttons ship in ForMeView). */
+/* BR#3457 actioning affordance (BR#6390: in-place, never pinned): a held
+   card grays out in its exact slot while its decision is in flight — the
+   spinner chip + dead buttons ship in ForMeView. */
 .forme-actioning { opacity: .6; transition: opacity .15s ease; }

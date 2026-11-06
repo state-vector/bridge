@@ -3,10 +3,13 @@ import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { TrainPanel } from "./TrainPanel";
-import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
-import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
+import { WorkerAvailabilityBanner } from "./WorkerAvailability";
+import { AskBand, useHumanAsks, AskEntries, isOpenHumanAsk, humanAskSubject, type AskEntry } from "./AskBand";
+import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
+import { ExecutionModel } from "./ExecutionModel";
+import type { ExecutionModelView } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -62,6 +65,7 @@ const STATUS_DOT_TITLE: Record<string, string> = {
 };
 
 interface TopRow {
+  execution?: ExecutionModelView;
   key: string;
   agent: string;
   session?: string;
@@ -114,15 +118,16 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
     // top = what is RUNNING right now, plus ONLY the blocked rows a human or
     // an active duty can move (2026-10-24 spec, Ray): in_progress always;
-    // blocked only with a pending human ask (meta.awaiting_ask) or a live
+    // blocked only with an actual open human-directed question or a live
     // "Unblock:" twin. Churn/rework machine parks and blocked-with-no-lever
     // rows live in Backlog (TIMEOUT / blocked groups), not here.
     const twinIdx = unblockTwinIndex(tasks as any[]);
+    const humanAskSubjects = new Set(tasks.filter(isOpenHumanAsk).map(humanAskSubject));
     const admitted = (tasks as any[]).filter((t) =>
       t.status === "in_progress"
       || (t.status === "blocked"
         && !isTimeoutBlock(t)
-        && (t.meta?.awaiting_ask?.ask_id || activeUnblockTwinOf(t, twinIdx))),
+        && (humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx))),
     );
     const taskRows: TopRow[] = admitted.map((t) => {
       const meta = (t.meta ?? {}) as any;
@@ -138,6 +143,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       const unblock: string | undefined = meta.blocked?.unblock_condition;
       const askPending: string | undefined = meta.awaiting_ask?.ask_id;
       return {
+        execution: t.execution,
         key: t.id,
         agent,
         session: meta.session ?? p?.session,
@@ -243,18 +249,18 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   return (
     <div className="top-wrap">
+      <WorkerAvailabilityBanner />
       <TrainPanel openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
-      <div className="view-head">
-        <h2>Top</h2>
-        <span className="muted-note">fleet processes — status dot · agent · gauges · ages. actionable work only; every parked card files in Backlog under its exit condition (awaiting you · PR verification · PR merge · CI · …).</span>
-      </div>
-      <TagThemeBar theme={tagTheme} />
+      <TopSectionHeader theme={tagTheme} />
 
+      <div className="top-table" role="region" aria-label="Active fleet tasks" tabIndex={0}>
+      <div className="top-table-body">
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
         <span className="topc-agent">machine / agent</span>
+        <span className="topc-model" title="Model size; a => b means a larger model is requested. Interactive sessions use custom.">model size</span>
         <span className="topc-session">session</span>
         <span className="topc-goal">task</span>
         <span className="topc-status">status</span>
@@ -269,17 +275,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
       {treeRows.flatMap(({ row: r, depth }) => {
         const asks: AskEntry[] = humanAsks.byTask.get(r.taskId ?? r.key) ?? [];
-        // every blocked row carries a child: its live unblock twin (nested via
-        // partOf), the human question (nested ask rows below), or — when the
-        // ask node isn't renderable (e.g. an answered GO awaiting execution) —
-        // a synthetic "awaiting you" child. No blocked row stands alone.
-        const needsAwaitChild = depth === 0 && r.status === "blocked"
-          && asks.length === 0 && !treeRows.some((x) => x.row.partOf === (r.taskId ?? r.key));
         return [
         <div
           key={r.key}
           className={`ktable-row top-row ${r.taskId ? "top-click" : ""} ${depth > 0 ? "ktable-child" : ""}`}
-          style={depth > 0 ? { borderLeft: "2px solid var(--line)", borderRadius: "0 8px 8px 0" } : undefined}
           onClick={() => r.taskId && openDetails(r.taskId)}
         >
           <span className="topc-task" title={r.taskId ?? ""}>
@@ -290,7 +289,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             {r.taskId && <span className="task-id top-task-id">{r.taskId}</span>}
           </span>
           <span className="topc-agent" title={r.will ? `will: ${r.will}` : r.agent}>
-            {r.agent}
+            <span className="top-agent-name">{r.agent}</span>
+          </span>
+          <span className="topc-model">
+            <ExecutionModel value={r.execution} now={now} />
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
@@ -378,16 +380,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             <AskEntries entries={asks} onDone={bumpAsks} openDecision={openAskDetails} nested />
           </div>
         ),
-        needsAwaitChild && (
-          <div key={`${r.key}-await`} className="ktable-child top-await-note" onClick={() => r.taskId && openDetails(r.taskId)}>
-            <Chip tone="needs">awaiting you</Chip>
-            <span className="top-await-text" title={r.unblock ?? r.askPending ?? ""}>
-              {r.unblock || r.askPending || "human input required — open the card"}
-            </span>
-          </div>
-        ),
         ];
       })}
+      </div>
+      </div>
 
       {treeRows.length === 0 && (
         <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Parked cards file in Backlog under their exit condition."}</p>
@@ -396,4 +392,12 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
     </div>
   );
+}
+
+export function TopSectionHeader({ theme }: { theme: TagTheme }) {
+  return <div className="view-head top-section-head">
+    <div className="top-section-title"><h2>Top</h2>
+      <span className="muted-note">Active work across your fleet. Parked tasks are in Backlog.</span></div>
+    <TagThemeBar theme={theme} />
+  </div>;
 }

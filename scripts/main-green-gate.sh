@@ -9,8 +9,10 @@
 # latest check-run state on main's HEAD commit has any failure.
 #
 # Decision rule:
-#   - Resolve main's HEAD commit sha (live tip; MAIN_GREEN_SHA overrides for
-#     drills/tests only — CI never sets it).
+#   - Resolve main's HEAD commit sha (live tip on pull_request events;
+#     MAIN_GREEN_SHA overrides it — tests, and dispatch drills, which CI
+#     REQUIRES to name a historic sha so the drill never judges its own
+#     in-flight check-run: BR#5487).
 #   - List the check runs on that commit
 #     (`gh api repos/<repo>/commits/<sha>/check-runs` — the reference
 #     implementation named in BR#3009).

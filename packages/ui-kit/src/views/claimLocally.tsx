@@ -24,7 +24,7 @@ const TAKEOVER_PROTOCOL = `TAKEOVER PROTOCOL (Superpositional bridge — follow 
 2. VERIFY STATE FIRST-HAND: this card may be partially done — check the artefact (get_artefact), any linked PR, and the live repo before claiming. Never trust this prompt's summary over live state.
 3. CLAIM: transition {id, to: "in_progress", session} before working.
 4. HEARTBEAT: log_progress {id, did, will, session} every ≤10 min. Declared silence (grace_minutes / subprocess block) before any long quiet op — undeclared silence = abandoned.
-5. SHARED-CHECKOUT DISCIPLINE: work in a git worktree off fresh origin/main (git worktree add .worktrees/<branch> -b <branch> origin/main); stage explicit paths only, never git add -A; never touch global git config.
+5. SHARED-CHECKOUT DISCIPLINE: work in a git worktree off fresh origin/main (git worktree add .worktrees/<branch> -b <branch> origin/main), REGISTER it (mkdir -p ~/.bridge && printf '%s\n' '{"path":"<ABS worktree path>","repo":"<owner/name>","task":"<this BR#N>","ts":<epoch-ms>}' >> ~/.bridge/worktree-registry.jsonl — the gateway's hygiene sweep enumerates REGISTERED trees only; an unregistered tree is never swept), stage explicit paths only, never git add -A, never touch global git config.
 6. SIGN AS DETACHED-CODY (BR#3181 ruling): every commit via
    git -c user.name=detached-cody -c user.email=297316395+detached-cody@users.noreply.github.com -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/sv-agents-signing.pub -c gpg.ssh.program=/usr/bin/ssh-keygen commit
    (unsigned commits are rejected by the 5c verify gate — do not bypass).
@@ -34,6 +34,15 @@ const TAKEOVER_PROTOCOL = `TAKEOVER PROTOCOL (Superpositional bridge — follow 
 
 export function buildClaimLocallyPrompt({ task, ask }: ClaimLocallyInput): string {
   const lines: string[] = [];
+  if (task.type === "question" && task.meta?.ask) {
+    const a = task.meta.ask;
+    lines.push(`Help resolve Bridge question ${task.id}: "${task.title}"`);
+    lines.push(`Asked by ${ask?.from ?? a.from ?? "an agent"}; addressed to ${ask?.to ?? a.to ?? "the agent pool"}.`);
+    lines.push("This is a question, not an implementation claim. Read its current state and linked work first. Do not claim the question or create a PR just to answer it. If it requests independent review, use the existing review task or request route {kind: 'independent_review', task_id: '<parent task>'}; Bridge owns assigning reviewers. Do not ask the human to arrange another agent.");
+    if (task.body_md) lines.push(task.body_md);
+    lines.push(`Card: https://hub.fleetbridge.run/card/${task.id.replace("#", "-")}`);
+    return lines.join("\n\n");
+  }
   lines.push(`Take over this bridge task locally: ${task.id} — "${task.title}"`);
   lines.push("");
   lines.push(`Card state: ${task.type} · status ${task.status}${task.owner ? ` · owner ${task.owner}` : " · unclaimed"}${task.part_of ? ` · part of ${task.part_of}` : ""}${task.tags?.length ? ` · tags: ${task.tags.join(", ")}` : ""}`);
@@ -89,6 +98,8 @@ export async function copyText(text: string): Promise<boolean> {
  *  new window so the agent-prompt is never lost. */
 export function ClaimLocallyBtn({ task, ask, size = "sm" }: ClaimLocallyInput & { size?: "sm" | "md" }) {
   const [copied, setCopied] = useState(false);
+  const wait = task.meta?.blocked?.await_event?.event;
+  if (wait === "local_handoff" || wait === "executor_capability" || task.meta?.local_execution) return <span>Use Execution attention for explicit authorised pickup.</span>;
   const prompt = buildClaimLocallyPrompt({ task, ask });
   const onClick = async () => {
     const ok = await copyText(prompt);

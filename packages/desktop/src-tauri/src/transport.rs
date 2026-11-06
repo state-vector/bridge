@@ -21,6 +21,7 @@
 use std::io::{BufRead, BufWriter, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct RunOutcome {
@@ -30,6 +31,26 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub session_id: Option<String>, // for resume (kiro stream / ACP sessionId)
+}
+
+#[derive(Default)]
+pub struct RunControl {
+    pub stop: AtomicBool,
+    /// Set only after the process group was killed AND observed empty.
+    pub quiesced: AtomicBool,
+    lease_deadline: Mutex<Option<Instant>>,
+}
+impl RunControl {
+    pub fn grant_lease(&self) {
+        if let Ok(mut deadline) = self.lease_deadline.lock() { *deadline = Some(Instant::now() + Duration::from_secs(90)); }
+    }
+    fn should_stop(&self) -> bool {
+        // Local monotonic enforcement keeps working while the gateway tick is
+        // blocked on a network operation or another task's checkpoint.
+        let expired = self.lease_deadline.lock().map(|d| d.map(|until| Instant::now() >= until).unwrap_or(false)).unwrap_or(true);
+        if expired { self.stop.store(true, Ordering::SeqCst); }
+        self.stop.load(Ordering::SeqCst)
+    }
 }
 
 /// Everything a transport needs to run one task.
@@ -44,6 +65,7 @@ pub struct RunRequest<'a> {
     /// Extra opencode config (JSON) merged per-key over the host config —
     /// e.g. bridge MCP provisioning. The caller decides the lane.
     pub extra_config: Option<&'a str>,
+    pub control: Option<&'a Arc<RunControl>>,
 }
 
 /// The abstraction Ray asked for: backends hide their protocol specifics
@@ -89,19 +111,52 @@ fn sanitized(cmd: &mut Command) {
 }
 
 /// Shared kill/wait helper: poll for exit up to `timeout`, then kill.
-fn wait_or_kill(child: &mut Child, timeout: Duration) -> (Option<std::process::ExitStatus>, bool) {
+fn process_group(cmd: &mut Command) {
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+fn kill_group(child: &mut Child, control: Option<&Arc<RunControl>>) {
+    #[cfg(unix)] {
+        let group = -(child.id() as i32);
+        // SAFETY: the child was spawned into its own process group. Negative
+        // pid targets that group, never the gateway's group or a positive pid.
+        unsafe { libc::kill(group, libc::SIGKILL); }
+        let _ = child.wait();
+        // Reap before observing; never infer quiescence from child exit alone.
+        let mut empty = false;
+        for _ in 0..20 {
+            // EPERM/other probe failures are NOT evidence of an empty group.
+            let result = unsafe { libc::kill(group, 0) };
+            empty = result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if empty { break; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(c) = control { c.quiesced.store(empty, Ordering::SeqCst); }
+    }
+    #[cfg(not(unix))] {
+        let _ = child.kill();
+        let _ = child.wait();
+        // No proven process-tree boundary on this platform: retain affinity.
+        let _ = control;
+    }
+}
+
+fn wait_or_kill(child: &mut Child, timeout: Duration, control: Option<&Arc<RunControl>>) -> (Option<std::process::ExitStatus>, bool) {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => return (Some(st), false),
+            Ok(Some(st)) => { kill_group(child, control); return (Some(st), false); },
             Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
+                if Instant::now() >= deadline || control.map(|c| c.should_stop()).unwrap_or(false) {
+                    kill_group(child, control);
                     return (child.wait().ok(), true);
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err(_) => return (None, false),
+            Err(_) => { kill_group(child, control); return (None, false); },
         }
     }
 }
@@ -112,6 +167,40 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> (Option<std::process::E
 
 pub struct OpencodeRun;
 
+#[cfg(test)]
+#[test]
+fn local_monotonic_lease_fences_a_writer_while_gateway_tick_is_stalled() {
+    let control = RunControl::default();
+    control.grant_lease();
+    assert!(!control.should_stop());
+    *control.lease_deadline.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+    assert!(control.should_stop());
+    assert!(control.stop.load(Ordering::SeqCst));
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn cancellation_stops_descendant_writers_before_acknowledging_quiescence() {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("bridge-process-test-{nonce}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("run"), "sleep 30 &\nwait\n").unwrap();
+    let control = Arc::new(RunControl::default());
+    let stop = control.clone();
+    let started = Instant::now();
+    let dir2 = dir.clone();
+    let handle = std::thread::spawn(move || {
+        OpencodeRun.dispatch(&RunRequest { workdir: dir2.to_str().unwrap(), bin: "/bin/sh", agent: None, model: None, prompt: "", title: None, resume: None, extra_config: None, control: Some(&control) }, Duration::from_secs(30), None)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    stop.stop.store(true, Ordering::SeqCst);
+    let out = handle.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!out.ok);
+    assert!(stop.quiesced.load(Ordering::SeqCst));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 impl AgentTransport for OpencodeRun {
     fn dispatch(&self, req: &RunRequest, timeout: Duration, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
         let mut cmd = Command::new(req.bin);
@@ -121,7 +210,8 @@ impl AgentTransport for OpencodeRun {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         sanitized(&mut cmd);
-        cmd.arg("run");
+        process_group(&mut cmd);
+        if let Some(cfg_json) = req.extra_config { cmd.env("OPENCODE_CONFIG_CONTENT", cfg_json); }
         if let Some(model) = req.model {
             cmd.arg("--model").arg(model);
         }
@@ -209,7 +299,7 @@ impl AgentTransport for OpencodeRun {
             })
         });
 
-        let (status, timed_out) = wait_or_kill(&mut child, timeout);
+        let (status, timed_out) = wait_or_kill(&mut child, timeout, req.control);
         let drain = |h: Option<std::thread::JoinHandle<String>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
         let stdout_tail = tail(drain(stdout), 4000);
         let stderr_tail = tail(drain(stderr), 2000);
@@ -251,6 +341,7 @@ impl AgentTransport for OpencodeAcp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         sanitized(&mut cmd);
+        process_group(&mut cmd);
         if let Some(cfg_json) = req.extra_config {
             cmd.env("OPENCODE_CONFIG_CONTENT", cfg_json);
         }
@@ -303,33 +394,39 @@ impl AgentTransport for OpencodeAcp {
                         on_line: &mut dyn FnMut(&str),
                         deadline: Instant|
          -> Result<serde_json::Value, String> {
-            let req = serde_json::json!({
+            let frame = serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params
             });
             stdin
-                .write_all(serde_json::to_string(&req).unwrap_or_default().as_bytes())
+                .write_all(serde_json::to_string(&frame).unwrap_or_default().as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
                 .and_then(|_| stdin.flush())
                 .map_err(|e| format!("acp stdin write failed: {e}"))?;
             let mut last_line = Instant::now();
             loop {
+                if req.control.map(|c| c.should_stop()).unwrap_or(false) {
+                    return Err("acp interrupted — checkpoint and resume".into());
+                }
                 // wait until whichever comes first: the stall window closing
                 // (no output for 5m — hung) or the hard ceiling (budget +
                 // one stall window of post-budget grace for live sessions)
                 let now = Instant::now();
-                let stall_end = last_line + ACP_STALL;
-                let hard_end = deadline + ACP_STALL;
+                let stall_end = if req.control.is_some() { deadline } else { last_line + ACP_STALL };
+                let hard_end = if req.control.is_some() { deadline } else { deadline + ACP_STALL };
                 let left = hard_end
                     .checked_duration_since(now)
                     .unwrap_or(Duration::ZERO)
                     .min(stall_end.checked_duration_since(now).unwrap_or(Duration::ZERO));
-                let line = rx.recv_timeout(left).map_err(|_| {
+                let line = match rx.recv_timeout(left.min(Duration::from_millis(500))) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if left > Duration::from_millis(500) => continue,
+                    result => result.map_err(|_| {
                     if now >= stall_end {
                         "acp timed out — stalled: no output for 5m".to_string()
                     } else {
                         "acp timed out (budget + grace exhausted)".to_string()
                     }
-                })?;
+                    })?,
+                };
                 last_line = Instant::now();
                 on_line(&line);
                 let v: serde_json::Value = match serde_json::from_str(&line) {
@@ -448,7 +545,8 @@ impl AgentTransport for OpencodeAcp {
         // prompt returned (turn complete) — close stdin so the agent exits
         let _ = stdin.flush();
         drop(stdin);
-        let (status, timed_out) = wait_or_kill(&mut child, Duration::from_secs(30));
+        if prompt_res.is_err() { kill_group(&mut child, req.control); }
+        let (status, timed_out) = wait_or_kill(&mut child, Duration::from_secs(30), req.control);
         let _ = reader.join();
 
         match prompt_res {
@@ -488,8 +586,7 @@ impl AgentTransport for OpencodeAcp {
 }
 
 fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_group(&mut child, None);
     RunOutcome {
         ok: false,
         stdout_tail: String::new(),
@@ -616,6 +713,8 @@ impl AgentTransport for KiroChat {
         }
         cmd.arg(req.prompt);
 
+        process_group(&mut cmd);
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -643,7 +742,7 @@ impl AgentTransport for KiroChat {
                 String::from_utf8_lossy(&bytes).into_owned()
             })
         });
-        let (status, timed_out) = wait_or_kill(&mut child, timeout);
+        let (status, timed_out) = wait_or_kill(&mut child, timeout, req.control);
         let stdout_full = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
         let session_id = find_session_id(&stdout_full);
         RunOutcome {

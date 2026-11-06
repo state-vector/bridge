@@ -41,6 +41,7 @@ pub fn run_task(
     extra_config: Option<&str>,
     mode: Option<&str>,
     live: Option<Arc<Mutex<String>>>,
+    control: Option<Arc<crate::transport::RunControl>>,
 ) -> crate::transport::RunOutcome {
     let req = crate::transport::RunRequest {
         workdir,
@@ -51,6 +52,7 @@ pub fn run_task(
         title,
         resume,
         extra_config,
+        control: control.as_ref(),
     };
     let t = crate::transport::transport_for(backend, mode);
     t.dispatch(&req, timeout, live)

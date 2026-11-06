@@ -7,9 +7,22 @@ import {
   laneCardBody,
   laneOfMeta,
   parseBurstMax,
+  // BR#5385 mid-walk merged receipt
+  leaseLossHolder,
+  midWalkReceiptDecide,
+  type LeaseLossTransition,
   carryAppend,
   carryAppendLeg,
   classifyRequiredRuns,
+  classifyHeadChecks,
+  classifyCandidateGatePhase,
+  classifyBaseRedEpisodeState,
+  isBaseCureCardTitle,
+  isRootFixCard,
+  isLaneBaseFixCard,
+  mainRedBinding,
+  trainBaseRedAskBrief,
+  trainBaseRedAskWarranted,
   decideMergeAction,
   decideTrainGate,
   leaseDecide,
@@ -19,6 +32,9 @@ import {
   progressVerdict,
   renewProgressDecide,
   selectBatch,
+  partitionMergeBatches,
+  isValidGitHubRepo,
+  parseDirectCommitReceipt,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -33,6 +49,12 @@ import {
   trainParseNoteLegs,
   trainQueueRemainingReason,
   trainStopAskTitle,
+  trainStarvationAskTitle,
+  trainStarvationAskDetails,
+  trainStarvationDutyTitle,
+  trainStarvationDutyBody,
+  TRAIN_MERGE_STARVE_MS,
+  classifyBaseCheckRuns,
   trainAwaitingReason,
   trainAwaitingHumanLeg,
   trainRequeueSwap,
@@ -47,6 +69,15 @@ import {
   TRAIN_HEAD_STAMP_RE,
   TRAIN_LEASE_TTL_MS,
   TRAIN_PROGRESS_STALE_MS,
+  DEPLOY_RECONCILE_GRACE_SECS,
+  formatDeployCoverageSummary,
+  inferDeployWorkflow,
+  isDeployWorkflowRun,
+  parseIso8601EpochMs,
+  reconcileDeployCoverage,
+  trainDarkTipAskBrief,
+  trainDarkTipAskTitle,
+  type DeployWorkflowRun,
   type MainCheckRun,
   type TrainLease,
 } from "../src/kb/core.ts";
@@ -132,6 +163,50 @@ describe("leaseDecide (the CAS check — read-check-write is atomic in the DO)",
   });
 });
 
+// ---------- the mid-walk merged receipt (BR#5385) ----------
+
+describe("midWalkReceiptDecide (a lease lost mid-walk does not destroy a real landing's receipt)", () => {
+  const NOW = 1_000_000_000;
+  const loss = (action: string, ageMs: number, holder: string | null = "gw-1", actor = "gw-1"): LeaseLossTransition =>
+    ({ ts: NOW - ageMs, action, actor, holder });
+
+  it("accepts: the holder itself released mid-walk (the incident shape — a same-actor peer release)", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_release", 2_000), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("accepts: the watch sweep lapsed the holder's lease mid-walk (holder rides the sweep stamp)", () => {
+    expect(midWalkReceiptDecide(loss("lease_lapsed", 30_000, "gw-1"), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("accepts: the zombie eviction removed the holder mid-walk (holder rides the zombie stamp)", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_evicted", 60_000, "gw-1"), "gw-1", NOW)).toEqual({ ok: true });
+  });
+  it("refuses: an actor that never held the lease cannot report a mid-walk merge", () => {
+    const d = midWalkReceiptDecide(loss("train:lease_release", 2_000), "gw-rogue", NOW);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) expect(d.reason).toContain("held by gw-1");
+  });
+  it("refuses: the loss is older than the lease TTL — history, not mid-walk", () => {
+    const d = midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS + 1), "gw-1", NOW);
+    expect(d.ok).toBe(false);
+    if (d.ok === false) expect(d.reason).toContain("past the lease TTL");
+  });
+  it("refuses: no lease-loss record at all (a fresh lane — the original gate error stands)", () => {
+    expect(midWalkReceiptDecide(null, "gw-1", NOW).ok).toBe(false);
+    expect(midWalkReceiptDecide(undefined, "gw-1", NOW).ok).toBe(false);
+  });
+  it("leaseLossHolder: release rows resolve from the actor; lapsed/evicted rows from the payload; anything else resolves nothing", () => {
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_release", actor: "gw-1", holder: null })).toBe("gw-1");
+    expect(leaseLossHolder({ ts: 0, action: "lease_lapsed", actor: "system:merge-train", holder: "gw-2" })).toBe("gw-2");
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_evicted", actor: "gw-3", holder: "gw-2" })).toBe("gw-2");
+    expect(leaseLossHolder({ ts: 0, action: "lease_lapsed", actor: "system:merge-train", holder: null })).toBeNull();
+    expect(leaseLossHolder({ ts: 0, action: "train:lease_acquire", actor: "gw-1", holder: null })).toBeNull();
+  });
+  it("the TTL boundary is exact: lost at TTL-1ms admits; at TTL+1ms refuses", () => {
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS - 1), "gw-1", NOW).ok).toBe(true);
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS), "gw-1", NOW).ok).toBe(true);
+    expect(midWalkReceiptDecide(loss("train:lease_release", TRAIN_LEASE_TTL_MS + 1), "gw-1", NOW).ok).toBe(false);
+  });
+});
+
 // ---------- the renew-arm zombie check (proof-of-progress, BR#4129) ----------
 
 describe("renewProgressDecide (the hub half of proof-of-progress — deny renewal on a frozen note)", () => {
@@ -212,6 +287,30 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.map((x) => x.id)).toEqual(["A"]);
   });
 
+  // BR#5750 — a watchdog silence-release hold-park of a QUEUED car must keep
+  // its queue slot even when the park note predates the merge-train: prefix
+  // (the BR#4995 silent drop). awaiting is NOT a queue slot — it re-enters
+  // through the board.
+  it("BR#5750: a legacy unprefixed watchdog hold-park of a queued car still queues; awaiting parks never do", () => {
+    const legacy = {
+      id: "H1",
+      status_ts: 7,
+      meta: {
+        merge_train: { state: "queued", pr: 259, repo: "state-vector/bridge" },
+        blocked: { reason: "silence-release held (watchdog): no update for >10m, but the card carries merge-train queued on PR state-vector/bridge#259 — parked on the typed proxy, not released (BR#4067)" },
+      },
+    };
+    const awaiting = {
+      ...legacy,
+      id: "H2",
+      status_ts: 8,
+      meta: { ...legacy.meta, merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge" } },
+    };
+    const q = mergeTrainQueue([card("B", 2, "needs review"), legacy, awaiting]);
+    expect(q.map((x) => x.id)).toEqual(["H1"]);
+    expect(q[0].priority).toBe("normal");
+  });
+
   it("BOOSTED (meta.boosted) first among mortals, FIFO within class by blocked-since (BR#5190 renamed the old CRITICAL label)", () => {
     const q = mergeTrainQueue([
       card("N1", 10, "merge-train: queued"),
@@ -256,14 +355,24 @@ describe("mergeTrainQueue (computed from the board — never a stored list)", ()
     expect(q.every((x) => x.priority !== "root_fix")).toBe(true);
   });
 
-  it("baseRed (a stopped lane) parks EVERYTHING except the root-fix card — the base-red law, BR#4365 precedent", () => {
-    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)], { baseRed: true });
-    expect(q.map((x) => x.id)).toEqual(["R1"]);
+  // ---- BR#5753: the hub queue NEVER hides held cars ----
+  // The pre-5753 baseRed option (a STOPPED lane offering only tier 0) was
+  // dead in production — its one caller looked the lane's stop facts up with
+  // `WHERE id = laneKey(repo, base)`, and a lane key is never an
+  // artefacts.id — and it must stay gone: base_red_resolution.held, the
+  // alarm ask's cure-PR fallback and trainOpenRootFix all read the derived
+  // queue and would go blind mid-episode if non-root_fix cars were filtered
+  // out. The stop fast-lane is the WALK's law (train.rs gate), not a
+  // hub-side queue filter.
+
+  it("BR#5753: no baseRed filter — a stopped lane's queue keeps EVERY held car visible, root_fix still at rank 0", () => {
+    const q = mergeTrainQueue([card("N1", 10, "merge-train: queued"), card("B1", 5, "merge-train: queued", true), rootFix("R1", 50)]);
+    expect(q.map((x) => x.id)).toEqual(["R1", "B1", "N1"]);
     expect(q[0].priority).toBe("root_fix");
   });
 
-  it("baseRed with NO root-fix card → an empty queue: every head stays parked until the fix is bound or the line greens", () => {
-    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")], { baseRed: true })).toEqual([]);
+  it("BR#5753: with NO root-fix card the queue still lists the held cars (root_fix absent, tiers intact)", () => {
+    expect(mergeTrainQueue([card("B1", 5, "merge-train: queued", true), card("N1", 10, "merge-train: queued")]).map((x) => x.id)).toEqual(["B1", "N1"]);
   });
 
   it("empty input → empty queue (vacuity)", () => {
@@ -489,6 +598,66 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     expect(d.kind).not.toBe("merge");
   });
 
+  it("STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02): head red entirely the deploy-health class on a GREEN base → rerun_gate (re-run the failed gate jobs), never bounce, never a human leg — even BLOCKED (the failed required check's own state)", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "Deploy health (merge gate)"), green(2, "Test")],
+    }));
+    expect(d.kind).toBe("rerun_gate");
+    if (d.kind === "rerun_gate") {
+      expect(d.reason).toContain("deploy-health");
+      expect(d.reason).toContain("Deploy health (merge gate)");
+      expect(d.reason).toContain("GREEN");
+      expect(d.reason).toContain("stale");
+    }
+  });
+
+  it("STALE MAIN-GREEN-GATE SELF-HEAL (BR#5883): head red entirely the main-green gate class while the tip judges fully green under the gate's own predicate (baseGateGreen) → rerun_gate — the 2026-11-03 pinned-head-car shape; an HONEST gate conviction (baseGateGreen false — a real tip red) is NOT healed", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    // stale conviction: the gate judged a transiently-unsettled tip that has
+    // since settled — re-run it
+    const healed = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "main-green gate"), green(2, "Test")],
+      baseGateGreen: true,
+    }));
+    expect(healed.kind).toBe("rerun_gate");
+    if (healed.kind === "rerun_gate") {
+      expect(healed.reason).toContain("main-green gate class");
+      expect(healed.reason).toContain("BR#5883");
+      expect(healed.reason).toContain("stale conviction");
+    }
+    // honest conviction: a real tip red exists — re-running would just
+    // re-convict; the standing rows own the entry (blocked+red → note)
+    const honest = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "main-green gate"), green(2, "Test")],
+      baseGateGreen: false,
+    }));
+    expect(honest.kind).not.toBe("rerun_gate");
+  });
+
+  it("SELF-HEAL control: a REAL red beside the gate red is not healed — the standing law owns the defect the PR carries", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      mergeStateStatus: "blocked",
+      headChecks: [fail(1, "Deploy health (merge gate)"), fail(2, "Rust Tests")],
+    }));
+    expect(d.kind).not.toBe("rerun_gate");
+    // queued card → the standing note row
+    expect(d.kind).toBe("note");
+  });
+
+  it("SELF-HEAL control: a red base keeps the circular law — no premise has evaporated", () => {
+    const fail = (id: number, name: string): MainCheckRun => ({ id, name, status: "completed", conclusion: "failure", html_url: `https://example/${id}` });
+    const d = decideTrainGate(clean({
+      baseVerdict: "red",
+      headChecks: [fail(1, "Deploy health (merge gate)")],
+    }));
+    expect(d.kind).not.toBe("rerun_gate");
+  });
+
   it("BR#4685: UNKNOWN × N polls → no bounce event — the compose waits on an unanswered state", () => {
     // the acceptance pin: poll the gate N times over UNKNOWN/null states and
     // no bounce ever fires; the mergeable field riding the same recomputation
@@ -589,6 +758,39 @@ describe("train event copy", () => {
     expect(g).not.toContain("conflicts with its base");
     expect(g).not.toContain("Conflicting files");
     expect(g).not.toContain("no file list supplied");
+  });
+
+  it("trainBounceBrief BASE-RED class (BR#5349, Ray directive): a gate bounce whose red is MAIN's own — the circular deploy-health merge gate, or a defect naming main red — renders the PLAIN brief (your PR is fine, nothing to do on this PR, the fix card named), never the rebase/re-sign/re-approve loop on a clean PR", () => {
+    // the circular class: the red check named by the executor's head-check
+    // defect is the deploy-health gate, which only judges MAIN
+    const b = trainBounceBrief({
+      prNumber: 2623, repo: "state-vector/superpositional", headSha: "9".repeat(40),
+      conflictFiles: [], verdictId: "BR#5103", bounceKind: "gate",
+      defect: "PR #2623 head check RED: Deploy health (merge gate). Fix or bounce to impl",
+      fixCard: { id: "BR#5346", status: "in_progress" },
+    });
+    expect(b).toContain("Merge-train bounce (base-red): PR #2623 (state-vector/superpositional)");
+    expect(b).toContain("MAIN is red (Deploy health (merge gate))");
+    expect(b).toContain("**Your PR is fine — nothing to do on this PR.**");
+    expect(b).toContain("the fix lives on BR#5346 (in progress)");
+    expect(b).toContain("or re-run the flaky check");
+    expect(b).toContain("or bypass-merge a cure PR");
+    // the BR#5193 circular-park lie is gone: a clean PR is never told to
+    // rebase/re-sign/re-approve
+    expect(b).not.toContain("rebase");
+    expect(b).not.toContain("re-sign");
+    expect(b).not.toContain("re-approve");
+    // no fix card open → the brief says so honestly (plain, still no loop)
+    const noFix = trainBounceBrief({ prNumber: 1, repo: "o/r", headSha: null, conflictFiles: [], verdictId: null, bounceKind: "gate", defect: "base main RED — the standing order never merges onto a non-green destination" });
+    expect(noFix).toContain("MAIN is red");
+    expect(noFix).toContain("none open yet");
+    expect(noFix).toContain("nothing to do on this PR");
+    // a genuinely PR-owned red keeps the mechanical brief (impl fixes the
+    // named defect) — the base-red class must not swallow real failures
+    const prOwned = trainBounceBrief({ prNumber: 1, repo: "o/r", headSha: null, conflictFiles: [], verdictId: null, bounceKind: "gate", defect: "PR #1 head check RED: TypeScript Tests. Fix or bounce to impl" });
+    expect(prOwned).toContain("Merge-train bounce (gate): PR #1 (o/r)");
+    expect(prOwned).toContain("**Next owner: impl**");
+    expect(prOwned).not.toContain("Your PR is fine");
   });
 
   it("resolveTrainBounceKind: explicit kind wins; legacy events infer from files then defect text; a kindless file-less event is an honest GATE bounce, never a manufactured conflict", () => {
@@ -754,15 +956,10 @@ describe("decideTrainGate blocked/behind (BR#3727 clock + BR#4633 L4.2 approval 
     if (d.kind === "note") expect(d.reason).toContain("head check RED");
   });
 
-  it("BR#4633 L4.2: blocked + GREEN head checks + covered verdict MERGES — the BR verdict is the approval of record (supersedes BR#3727's bounce)", () => {
+  it("BR#6776: a substance verdict cannot overrule GitHub's still-BLOCKED admission", () => {
     const d = gate();
-    expect(d.kind).toBe("merge");
-    if (d.kind === "merge") {
-      // the receipt names WHY the blocked state was pre-cleared
-      expect(d.receipt).toContain("blocked pre-cleared");
-      expect(d.receipt).toContain("approval of record");
-      expect(d.receipt).toContain("BR#4633 L4.2");
-    }
+    expect(d.kind).toBe("note");
+    if (d.kind === "note") expect(d.reason).toContain("GitHub branch policy remains BLOCKED");
   });
 
   it("the shared law keeps the anchor: decideMergeAction's blocked bounce names the BR verdict, not a re-approve leg", () => {
@@ -808,6 +1005,27 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
     expect(trainParseNoteLegs(`verified head ${h.slice(0, 9)}; PR ${u(R, 7)}`)).toEqual([
       { repo: R, number: 7, head_sha_at_acceptance: h.slice(0, 9) },
     ]);
+  });
+  it("BR#6349: a receipts deep-link re-citing an already-cited PR collapses to ONE leg — never a phantom second citation", () => {
+    const R = "state-vector/bridge";
+    const h = "d401a35bbe2faaa6cc8c9060a2b3413b039b9344";
+    // the BR#4684/PR#309 incident note: canonical /pull/ URL + the
+    // /pull/N/commits/<sha> receipt deep-link, which TRAIN_PR_URL_RE also
+    // matches. Before the fix this parsed TWO legs for one PR, broke the
+    // adjacency pairing, and the queue arm silently re-stamped the STALE head.
+    expect(trainParseNoteLegs(
+      `Verify ACCEPT — PR ${u(R, 309)} head ${h}\nreceipts: ${u(R, 309)}/commits/${h}`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
+    // with ONE cited leg the lenient single-PR binding applies again: even a
+    // clause break between the head and its citation still binds (the incident
+    // died exactly here — two legs forced strict adjacency and bound neither)
+    expect(trainParseNoteLegs(
+      `Verify ACCEPT (duty drill). head ${h}\nPR ${u(R, 309)}; receipts: ${u(R, 309)}/commits/${h}`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
+    // URL + owner/name#N shorthand citing the same PR also stays ONE leg
+    expect(trainParseNoteLegs(
+      `PR ${u(R, 309)} head ${h} (${R}#309, merged)`,
+    )).toEqual([{ repo: R, number: 309, head_sha_at_acceptance: h }]);
   });
   it("multi-PR notes pair each PR with its NEAREST head (line by line — either order binds)", () => {
     const R = "state-vector/bridge";
@@ -875,6 +1093,53 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
     // `#N` without an owner/name prefix is inert — BR#NNNN card refs and
     // "the unrelated #2534 merge" prose never become legs
     expect(trainParseNoteLegs(`rebased over the unrelated #2534 merge; BR#4648 spins no more; head ${h}`)).toEqual([]);
+  });
+  it("BR#5658 / BR#5324 / BR#5805: rejects /BR#N cross-references, CSS tokens, and numeric-owner fragments (never mints ghost lanes like tb-pulse/BR or 5563/BR)", () => {
+    const h = "a".repeat(40);
+    expect(isValidGitHubRepo("state-vector/bridge")).toBe(true);
+    expect(isValidGitHubRepo("o/r")).toBe(true);
+    expect(isValidGitHubRepo("tb-pulse/BR")).toBe(false);
+    expect(isValidGitHubRepo("5563/BR")).toBe(false);
+    expect(isValidGitHubRepo("1768/BR")).toBe(false);
+    expect(isValidGitHubRepo("5022/BR")).toBe(false);
+    expect(isValidGitHubRepo("foo/GH")).toBe(false);
+    expect(trainParseNoteLegs(`added @keyframes tb-pulse/BR#5658 and BR#5563/BR#5635; (#1768/BR#4993) head ${h}`)).toEqual([]);
+    expect(parseDirectCommitReceipt(`Landed direct to main — https://github.com/state-vector/bridge/commit/${h}`)).toEqual({
+      repo: "state-vector/bridge",
+      sha: h,
+    });
+    expect(parseDirectCommitReceipt(`PR https://github.com/state-vector/bridge/pull/350 head ${h}`)).toBeNull();
+  });
+  it("BR#5658: partitionMergeBatches partitions verifying + ready PRs into sequential non-conflicting merge passes", () => {
+    const cars = [
+      { id: "BR#1", pr: 101, state: "ready" as const },
+      { id: "BR#2", pr: 102, state: "verifying" as const },
+      { id: "BR#3", pr: 103, state: "waiting" as const },
+      { id: "BR#4", pr: 104, state: "ready" as const },
+    ];
+    // PR 101 and PR 104 conflict → Batch 1 takes [101, 102, 103], Batch 2 takes [104]
+    const batches = partitionMergeBatches(cars, [[101, 104]], 10);
+    expect(batches.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 102, 103],
+      [104],
+    ]);
+    // burst_max cap = 2 with no conflicts → ready cars [101, 104] first in Batch 1, then [102, 103] in Batch 2
+    const capped = partitionMergeBatches(cars, [], 2);
+    expect(capped.map((b) => b.map((c) => c.pr))).toEqual([
+      [101, 104],
+      [102, 103],
+    ]);
+  });
+  it("BR#5897: classifyHeadChecks deduplicates by check name (newest non-cancelled run wins over stale failure)", () => {
+    const v = classifyHeadChecks([
+      { id: 100, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old1" },
+      { id: 101, name: "Deploy health (merge gate)", conclusion: "failure", html_url: "https://example/old2" },
+      { id: 200, name: "Deploy health (merge gate)", conclusion: "success", html_url: "https://example/new" },
+      { id: 201, name: "Rust Tests", conclusion: "success", html_url: "https://example/rust" },
+    ]);
+    expect(v.verdict).toBe("green");
+    expect(v.red).toEqual([]);
+    expect(v.green).toBe(2);
   });
 });
 
@@ -1155,13 +1420,79 @@ describe("normalizeGhMergeable / normalizeGhMergeState (BR#3714 — gh enums →
     }
     // UNKNOWN → null → skip this tick (never a bounce)
     expect(decideTrainGate(gh("UNKNOWN", "UNKNOWN")).kind).toBe("skip");
-    // uppercase behind PRE-CLEARS at the train gate (BR#3727 — the §5 carry
-    // is reachable; supersedes this block's original "BEHIND bounces naming
-    // behind" pin: the shared decideMergeAction still bounces behind, and
-    // the BR#3727 describe below pins that).
-    expect(decideTrainGate(gh("MERGEABLE", "BEHIND")).kind).toBe("merge");
+    // uppercase behind PRE-CLEARS at the train gate for a WORKER-AUTHORED
+    // branch (BR#3727 pre-clear, provenance-gated by BR#4687 L1.2 — the §5
+    // carry is reachable; supersedes this block's original "BEHIND bounces
+    // naming behind" pin: the shared decideMergeAction still bounces behind,
+    // and the BR#3727 describe below pins that).
+    expect(decideTrainGate({ ...gh("MERGEABLE", "BEHIND"), trainOwnedBranch: true }).kind).toBe("merge");
+    // BR#4687: the SAME behind state on a branch the train cannot prove is
+    // its own fleet's (a human's commits, or an unknown author) still
+    // bounces naming behind — the train never moves human branches.
+    const humanBehind = decideTrainGate(gh("MERGEABLE", "BEHIND"));
+    expect(humanBehind.kind).toBe("bounce");
+    if (humanBehind.kind === "bounce") {
+      expect(humanBehind.bounceKind).toBe("gate");
+      expect(humanBehind.defect).toContain("mergeStateStatus=behind");
+    }
     // UNSTABLE stays within the gate's allowance (uppercase in, allowed out)
     expect(decideTrainGate(gh("MERGEABLE", "UNSTABLE")).kind).toBe("merge");
+  });
+
+  // BR#4687 (L1.2): the tick AFTER a machine update-branch — strict branch
+  // protection re-runs the required checks on the new head, so mergeStateStatus
+  // reads blocked while the head checks are unsettled. That is a clock, not a
+  // defect: skip, and the carried verdict holds the queue slot silently.
+  it("blocked-with-pending-checks after a machine update waits (never bounces the carry) — BR#3727 executor parity", () => {
+    const HEAD = "c".repeat(40);
+    const green = [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }];
+    const pending = [{ id: 2, name: "Test", status: "in_progress", conclusion: null, html_url: "https://example/2" }];
+    const red = [{ id: 3, name: "Test", status: "completed", conclusion: "failure", html_url: "https://example/3" }];
+    const input = (checks: unknown, status: string): Parameters<typeof decideTrainGate>[0] => ({
+      prNumber: 320,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 320, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: normalizeGhMergeable("MERGEABLE"),
+      mergeStateStatus: normalizeGhMergeState(status),
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: checks as Parameters<typeof decideTrainGate>[0]["headChecks"],
+      trainOwnedBranch: true,
+    });
+    const mk = (checks: unknown, status: string) => decideTrainGate(input(checks, status));
+    // pending checks on blocked → wait this tick, NO bounce
+    const waiting = mk(pending, "BLOCKED");
+    expect(waiting.kind).toBe("skip");
+    if (waiting.kind === "skip") expect(waiting.reason).toContain("required checks re-running");
+    // red checks on blocked → note, never bounce — the linked session owns it
+    // (the shared law's own non-in_review row, taken early by the blocked arm)
+    expect(mk(red, "BLOCKED").kind).toBe("note");
+    // A carried substance verdict does not override GitHub admission.
+    const landed = mk(green, "BLOCKED");
+    expect(landed.kind).toBe("note");
+    if (landed.kind === "note") expect(landed.reason).toContain("no merge attempted");
+  });
+
+  // BR#4687 (L1.2): the merge receipt must name the provenance-qualified
+  // pre-clear, so the ledger and the verify round can tell a machine-updated
+  // worker branch from a plain clean merge.
+  it("behind pre-clear receipt names the worker-authored branch and the update-branch carry", () => {
+    const HEAD = "d".repeat(40);
+    const r = decideTrainGate({
+      prNumber: 311,
+      headSha: HEAD,
+      cardMeta: { pr: { repo: "state-vector/bridge", number: 311, head_sha_at_acceptance: HEAD.slice(0, 9) } },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: normalizeGhMergeable("MERGEABLE"),
+      mergeStateStatus: normalizeGhMergeState("BEHIND"),
+      commits: [{ sha: HEAD, verified: true }],
+      headChecks: [{ id: 1, name: "Test", status: "completed", conclusion: "success", html_url: "https://example/1" }],
+      trainOwnedBranch: true,
+    });
+    expect(r.kind).toBe("merge");
+    if (r.kind === "merge") expect(r.receipt).toContain("behind pre-cleared");
   });
 });
 
@@ -1374,5 +1705,433 @@ describe("batch-merge law (BR#4996)", () => {
     expect(body).toContain("MUTUALLY non-conflicting");
     expect(body).toContain("BR#4996");
     expect(body).toContain("waits for the next pass");
+  });
+});
+
+// ---------- BR#5674 P1 + P4: empty-is-loud + starvation ask/duty copy ----------
+
+describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/duty builders", () => {
+  const run = (id: number, name: string, conclusion: string | null = "success"): MainCheckRun => ({
+    id,
+    name,
+    status: conclusion ? "completed" : "in_progress",
+    conclusion,
+  });
+
+  it("P1 classifyBaseCheckRuns: distinguishes N runs with 0 required matches from 0 total runs", () => {
+    const tip = [run(1, "Product surface canary (dev)"), run(2, "Nightly Release")];
+    const unmatched = classifyBaseCheckRuns(tip, ["deploy / Deploy to dev"]);
+    expect(unmatched.verdict).toBe("empty");
+    expect(unmatched.alarm).toBe("2 runs read, none matched required set — check names/pagination");
+
+    const zero = classifyBaseCheckRuns([], ["deploy / Deploy to dev"]);
+    expect(zero.verdict).toBe("empty");
+    expect(zero.alarm).toBe("tip carries no check runs at all");
+
+    const matched = classifyBaseCheckRuns([...tip, run(3, "deploy / Deploy to dev", "success")], ["deploy / Deploy to dev"]);
+    expect(matched.verdict).toBe("green");
+    expect(matched.alarm).toBeUndefined();
+  });
+
+  it("BR#5883 classifyBaseCheckRuns: a scoped GREEN on a tip the repo gate judges non-green carries the gate qualifier — verdict stays green, the qualifier names what main-green-gate.sh would report", () => {
+    // the 2026-11-03 starve shape: merge-commit tip, required `main-green
+    // gate` vacuous (BR#5847), non-required `Deploy drift alarm` FAILED
+    const tip = [
+      run(1, "Test"),
+      run(2, "CLI build (packages/cli)"),
+      run(3, "Deploy drift alarm", "failure"),
+    ];
+    const required = ["Test", "CLI build (packages/cli)", "main-green gate"];
+    const v = classifyBaseCheckRuns(tip, required);
+    expect(v.verdict).toBe("green");
+    expect(v.gate).toBeTruthy();
+    expect(v.gate?.verdict).toBe("red");
+    expect(v.gate?.red.map((r) => r.name)).toEqual(["Deploy drift alarm"]);
+    // in-flight non-required check → the gate refuses unsettled too
+    const unsettled = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy health (merge gate)", null)], ["Test", "main-green gate"]);
+    expect(unsettled.verdict).toBe("green");
+    expect(unsettled.gate?.verdict).toBe("unsettled");
+    // fully green tip → no qualifier
+    const allGreen = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy drift alarm")], ["Test", "main-green gate"]);
+    expect(allGreen.verdict).toBe("green");
+    expect(allGreen.gate).toBeUndefined();
+    // scoped red → the verdict itself speaks; no qualifier
+    const scopedRed = classifyBaseCheckRuns([run(1, "Test", "failure")], ["Test", "main-green gate"]);
+    expect(scopedRed.verdict).toBe("red");
+    expect(scopedRed.gate).toBeUndefined();
+  });
+
+  it("P4 trainStarvationAskTitle + details + duty builders hold the ask contract and carry full diagnosis", () => {
+    expect(TRAIN_MERGE_STARVE_MS).toBe(60 * MIN);
+    const lane = { repo: "state-vector/superpositional", base: "main" };
+    const title = trainStarvationAskTitle(lane);
+    expect(title.length).toBeLessThanOrEqual(240);
+    expect(title.endsWith("?")).toBe(true);
+    expect(title).toBe(trainStarvationAskTitle(lane));
+
+    const diag = {
+      lane,
+      laneId: "BR#3637",
+      blockedReason: "merge-train: BLOCKED — base main carries none of the lane's required workflow runs (30 runs read, none matched required set — check names/pagination) — 3 car(s) held",
+      baseVerdict: "empty",
+      requiredWorkflows: ["deploy / Deploy to dev", "post-deploy / Post-Deploy Smoke"],
+      redNames: [],
+      unsettledNames: [],
+      baseAlarm: "30 runs read, none matched required set — check names/pagination",
+      queue: [{ id: "BR#5422", pr: 2692 }, { id: "BR#5421", pr: 2693 }],
+      awaiting: [{ task: "BR#4711", pr: 2518 }],
+      lastMergeTs: 1793627633028,
+      mins: 636,
+      dutyId: "BR#5999",
+    };
+    const details = trainStarvationAskDetails(diag);
+    expect(details).toContain("30 runs read, none matched required set — check names/pagination");
+    expect(details).toContain("2 queued");
+    expect(details).toContain("1 awaiting");
+    expect(details).toContain("1793627633028");
+    expect(details).toContain("BR#5999");
+
+    const dutyTitle = trainStarvationDutyTitle(lane, 2, 1);
+    expect(dutyTitle.length).toBeLessThanOrEqual(240);
+    const dutyBody = trainStarvationDutyBody(diag);
+    expect(dutyBody).toContain("per_page");
+    expect(dutyBody).toContain("required_workflows");
+    expect(dutyBody).toContain("Verify pool depth");
+    expect(dutyBody).toContain("Park exits");
+  });
+
+  it("partitionMergeBatches orders ready cars ahead of verifying and waiting cars (non-FIFO readiness priority)", () => {
+    const cars = [
+      { id: "BR#1", pr: 101, state: "verifying" as const },
+      { id: "BR#2", pr: 102, state: "waiting" as const },
+      { id: "BR#3", pr: 103, state: "ready" as const },
+      { id: "BR#4", pr: 104, state: "verifying" as const },
+      { id: "BR#5", pr: 105, state: "ready" as const },
+    ];
+    const batches = partitionMergeBatches(cars, [[103, 101]], 3);
+    // Batch 1 gets both ready cars (103, 105) first, plus non-conflicting verifying car (104)
+    expect(batches[0].map((c) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 103, state: "ready" },
+      { pr: 105, state: "ready" },
+      { pr: 104, state: "verifying" },
+    ]);
+    // Batch 2 gets verifying car 101 (conflicted with 103) and waiting car 102
+    expect(batches[1].map((c) => ({ pr: c.pr, state: c.state }))).toEqual([
+      { pr: 101, state: "verifying" },
+      { pr: 102, state: "waiting" },
+    ]);
+  });
+
+  it("decideTrainGate self-heals stale main-green gate reds on a green base via rerun_gate", () => {
+    const head = "d".repeat(40);
+    const gate = decideTrainGate({
+      prNumber: 377,
+      headSha: head,
+      cardMeta: { prs: [{ repo: "state-vector/bridge", number: 377, head_sha_at_acceptance: head }] },
+      cardStatus: "blocked",
+      baseVerdict: "green",
+      mergeable: true,
+      mergeStateStatus: "behind",
+      commits: [{ sha: head, verified: true }],
+      headChecks: [
+        { id: 10, name: "main-green gate", status: "completed", conclusion: "failure" },
+        { id: 11, name: "Test", status: "completed", conclusion: "success" },
+      ],
+    });
+    expect(gate.kind).toBe("rerun_gate");
+  });
+
+  it("BR#6012 state machine: CandidateGatePhase & BaseRedEpisodeState make illegal transitions unrepresentable", () => {
+    const head = "e".repeat(40);
+    // 1. A conflicting PR (mergeable: false) ALWAYS classifies as phase:'conflicting' -> bounce(conflict),
+    //    even if mergeStateStatus is 'blocked' and baseVerdict is 'green' with a stale deploy-health red
+    const conflictInput = {
+      prNumber: 2800,
+      headSha: head,
+      cardMeta: { prs: [{ repo: "state-vector/superpositional", number: 2800, head_sha_at_acceptance: head }] },
+      cardStatus: "blocked",
+      baseVerdict: "green" as const,
+      mergeable: false,
+      mergeStateStatus: "blocked",
+      commits: [{ sha: head, verified: true }],
+      headChecks: [{ id: 1, name: "Deploy health (merge gate)", status: "completed", conclusion: "failure" }],
+    };
+    expect(classifyCandidateGatePhase(conflictInput)).toEqual({ phase: "conflicting" });
+    const conflictDecision = decideTrainGate(conflictInput);
+    expect(conflictDecision.kind).toBe("bounce");
+    if (conflictDecision.kind === "bounce") {
+      expect(conflictDecision.bounceKind).toBe("conflict");
+    }
+
+    // 2. isBaseCureCardTitle rejects generic product bugfix titles (`fix(chat): ...`) and accepts base/CI/deploy cures
+    expect(isBaseCureCardTitle("Trace: superpositional PR #2555 — fix(chat): classifier propagates total LLM failure (BR#2985)")).toBe(false);
+    expect(isBaseCureCardTitle("fix(web): dashboard crash")).toBe(false);
+    expect(isBaseCureCardTitle("fix(ci): main-green gate structurally self-failing")).toBe(true);
+    expect(isBaseCureCardTitle("fix(deploy): make the mutation-runner ram pin satisfiable (BR#5955)")).toBe(true);
+
+    // 3. Agent-filed root-blocker card (hyphen tag + main_tip + pr.repo) qualifies under isRootFixCard
+    expect(
+      isRootFixCard({
+        tags: ["root-blocker", "main-red"],
+        meta: { main_tip: "8454ae7bb", pr: { repo: "state-vector/superpositional", number: 2800 } },
+      }),
+    ).toBe(true);
+    // 3b. BR#6390: the BASE-FIX card shape (BR#6378) — tip_sha + meta.repo +
+    // root_blocker_for_lane, main-red + stop-the-line tags, NO root_blocker
+    // tag — QUALIFIES under isRootFixCard too (BR#6390: a lane base-fix is a
+    // human-gate carrier exactly like a root-fix card) and isLaneBaseFixCard
+    // additionally binds it to its lane via mainRedBinding
+    expect(
+      isRootFixCard({
+        tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+        meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+      }),
+    ).toBe(true); // the lane's base-fix carries the human gate too
+    // a card WITHOUT any binding marker stays a non-root card
+    expect(
+      isRootFixCard({
+        tags: ["main-red", "merge-train", "stop-the-line", "p0"],
+        meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879" },
+      }),
+    ).toBe(false); // names no root_blocker/root_blocker_for_lane — binding is mandatory
+    expect(
+      isLaneBaseFixCard(
+        {
+          tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+          meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+        },
+        "state-vector/superpositional",
+      ),
+    ).toBe(true);
+    expect(
+      isLaneBaseFixCard(
+        {
+          tags: ["main-red", "merge-train", "stop-the-line", "cortex", "p0"],
+          meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879", root_blocker_for_lane: "state-vector/superpositional@main" },
+        },
+        "state-vector/bridge",
+      ),
+    ).toBe(false); // another repo's lane must not adopt it
+    expect(mainRedBinding({ repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879" })).toEqual({
+      repo: "state-vector/superpositional",
+      head_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879",
+    });
+
+    // 4. BaseRedEpisodeState: conflicting PR never warrants a human ask; valid cure PR produces `--admin` command + why
+    const conflictingEp = classifyBaseRedEpisodeState({
+      card: { id: "BR#5955", title: "ROOT BLOCKER: deploy red", status: "blocked" },
+      curePr: null,
+      conflictPr: { repo: "state-vector/superpositional", number: 2800 },
+    });
+    expect(conflictingEp.phase).toBe("cure_pr_conflicting");
+    expect(conflictingEp.warrantAsk).toBe(false);
+    expect(trainBaseRedAskWarranted({ card: { id: "BR#5955" }, curePr: null, conflictPr: { repo: "state-vector/superpositional", number: 2800 } })).toBe(false);
+
+    const readyEp = classifyBaseRedEpisodeState({
+      card: { id: "BR#5968", title: "ROOT-FIX: deploy red", status: "blocked" },
+      curePr: { repo: "state-vector/superpositional", number: 2800 },
+      conflictPr: null,
+    });
+    expect(readyEp.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(readyEp.warrantAsk).toBe(true);
+    if (readyEp.phase === "cure_pr_awaiting_force_merge") {
+      expect(readyEp.command).toBe("gh pr merge 2800 --repo state-vector/superpositional --admin --squash");
+    }
+    const brief = trainBaseRedAskBrief(
+      { repo: "state-vector/superpositional", base: "main" },
+      [{ name: "deploy / Deploy to dev", url: "https://example.test/run" }],
+      11,
+      { card: { id: "BR#5968", title: "ROOT-FIX", status: "blocked" }, curePr: { repo: "state-vector/superpositional", number: 2800 }, culpritPr: 2612 },
+    );
+    // BR#6390: the cure-bound ask is a HUMAN GATE — do-the-thing + DONE/DECLINE
+    expect(brief.details).toContain("HUMAN GATE");
+    expect(brief.details).toContain("gh pr merge 2800 --repo state-vector/superpositional --admin --squash");
+    expect(brief.details).toContain("https://github.com/state-vector/superpositional/pull/2800");
+    expect(brief.details).toContain("11 held PRs drain automatically");
+    expect(brief.options).toEqual([
+      "DONE — PR #2800 merged",
+      "DECLINE — hold the line",
+    ]);
+  });
+
+  it("BR#6142: workflow-level startup_failure (0 job check-runs) classifies RED in classifyBaseCheckRuns and classifyRequiredRuns", () => {
+    const required = [
+      "deploy / Deploy to dev",
+      "post-deploy / Post-Deploy Smoke",
+      "post-deploy / DNS chain (front doors)",
+      "post-deploy / Lodestar Storage Health",
+    ];
+    const runs = [
+      { id: 1, name: "drift", status: "completed", conclusion: "success", html_url: "https://example.test/drift" },
+      {
+        id: 41783432309,
+        name: "Deploy Dev",
+        status: "completed",
+        conclusion: "startup_failure",
+        html_url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ];
+    const baseV = classifyBaseCheckRuns(runs, required);
+    expect(baseV.verdict).toBe("red");
+    expect(baseV.red).toEqual([
+      {
+        name: "Deploy Dev",
+        conclusion: "startup_failure",
+        url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ]);
+
+    const settleV = classifyRequiredRuns(runs, required, { merged_at: 1000, now: 2000 });
+    expect(settleV.verdict).toBe("red");
+    expect(settleV.failing).toEqual([
+      {
+        name: "Deploy Dev",
+        conclusion: "startup_failure",
+        url: "https://github.com/state-vector/superpositional/actions/runs/41783432309",
+      },
+    ]);
+  });
+
+  it("BR#6179: level-based deploy reconciliation (dark-tip grace, auto-dispatch once per sha, coverage summary, and redundant queued run cancellation)", () => {
+    const required = [
+      "deploy / Deploy to dev",
+      "post-deploy / Post-Deploy Smoke",
+      "post-deploy / DNS chain",
+      "post-deploy / Lodestar Storage Health",
+    ];
+    const darkTip = "7f5efec26cc5b715ef0ff42eb8ebbf2da0fc1a6f";
+    const prevGreenTip = "ebbe182633c5351f5bcbc9cd6d4924659bd604a2";
+    const emptyVerdict = classifyBaseCheckRuns([], required);
+    expect(emptyVerdict.verdict).toBe("empty");
+
+    // 1. Deploy Health Record (2026-11-04 08:19:23Z receipt) is NOT a covering deploy workflow
+    const wfRunsWithDhr: DeployWorkflowRun[] = [
+      {
+        id: 41791923312,
+        name: "Deploy Health Record",
+        path: ".github/workflows/deploy-health.yml",
+        head_sha: darkTip,
+        event: "schedule",
+        status: "completed",
+        conclusion: "success",
+      },
+      {
+        id: 41780000001,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "push",
+        status: "completed",
+        conclusion: "success",
+        html_url: "https://github.com/state-vector/superpositional/actions/runs/41780000001",
+      },
+    ];
+    expect(isDeployWorkflowRun(wfRunsWithDhr[0], required)).toBe(false);
+    expect(isDeployWorkflowRun(wfRunsWithDhr[1], required)).toBe(true);
+    expect(inferDeployWorkflow(required, wfRunsWithDhr)).toBe("deploy-dev.yml");
+    expect(inferDeployWorkflow(required, [])).toBe("deploy-dev.yml");
+
+    // 2. Inside grace window (age 120s < 300s): uncovered_grace, no dispatch yet
+    const planGrace = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 120,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+    });
+    expect(planGrace.dispatch_workflow).toBeNull();
+    expect(planGrace.covered_by_sha).toBe(prevGreenTip);
+    expect(planGrace.coverage.phase).toBe("uncovered_grace");
+    expect(formatDeployCoverageSummary(planGrace.coverage)).toBe("tip 7f5efec2 not covered by any deploy (age 2m, grace 5m)");
+
+    // 3. Past grace window (age 1020s = 17m >= 300s) and not yet dispatched:
+    //    uncovered_dark + dispatch_workflow = "deploy-dev.yml"
+    const planDark = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 1020,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+    });
+    expect(planDark.dispatch_workflow).toBe("deploy-dev.yml");
+    expect(planDark.covered_by_sha).toBe(prevGreenTip);
+    expect(planDark.coverage_age_secs).toBe(1020);
+    expect(planDark.coverage.phase).toBe("uncovered_dark");
+    expect(formatDeployCoverageSummary(planDark.coverage)).toBe(
+      "tip 7f5efec2 not covered by any deploy (age 17m) — last green deploy ebbe1826",
+    );
+
+    // 4. Once dispatched for this SHA (`alreadyDispatchedAt` set):
+    //    uncovered_dispatched + dispatch_workflow = null (idempotent once-per-sha guard)
+    const planDispatched = reconcileDeployCoverage({
+      tipSha: darkTip,
+      tipAgeSecs: 1020,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: emptyVerdict,
+      required,
+      workflowRuns: wfRunsWithDhr,
+      alreadyDispatchedAt: 1793780527000,
+    });
+    expect(planDispatched.dispatch_workflow).toBeNull();
+    expect(planDispatched.coverage.phase).toBe("uncovered_dispatched");
+    expect(formatDeployCoverageSummary(planDispatched.coverage)).toBe(
+      "tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml",
+    );
+
+    // 5. Fast-page ask title + brief contract (Leg C)
+    const askTitle = trainDarkTipAskTitle({ repo: "state-vector/superpositional", base: "main" }, darkTip);
+    expect(askTitle).toBe("MERGE TRAIN DARK TIP: state-vector/superpositional@main — tip 7f5efec2 not covered by any deploy run. Remedy?");
+    expect(askTitle.length).toBeLessThanOrEqual(240);
+    expect(askTitle.endsWith("?")).toBe(true);
+    const brief = trainDarkTipAskBrief({
+      lane: { repo: "state-vector/superpositional", base: "main" },
+      held: 18,
+      alarm: "tip carries no check runs at all",
+      coverage: planDispatched.coverage,
+    });
+    expect(brief.options[0].startsWith("(Recommended)")).toBe(true);
+    expect(brief.details).toContain("tip 7f5efec2 not covered by any deploy (age 17m) — auto-dispatched deploy-dev.yml");
+
+    // 6. Redundant queued run cancellation (Leg D, exact 2026-11-04 08:22 receipt):
+    //    workflow_dispatch 41798951196 is in_progress while push 41798949143 is queued on the same sha
+    const wfRunsRedundant: DeployWorkflowRun[] = [
+      {
+        id: 41798951196,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "workflow_dispatch",
+        status: "in_progress",
+      },
+      {
+        id: 41798949143,
+        name: "Deploy Dev",
+        path: ".github/workflows/deploy-dev.yml",
+        head_sha: prevGreenTip,
+        event: "push",
+        status: "queued",
+      },
+    ];
+    const unsettledVerdict = classifyBaseCheckRuns(
+      [{ id: 1, name: "deploy / Deploy to dev", status: "in_progress", conclusion: null }],
+      required,
+    );
+    const planSettling = reconcileDeployCoverage({
+      tipSha: prevGreenTip,
+      tipAgeSecs: 30,
+      graceSecs: DEPLOY_RECONCILE_GRACE_SECS,
+      baseVerdict: unsettledVerdict,
+      required,
+      workflowRuns: wfRunsRedundant,
+    });
+    expect(planSettling.cancel_run_ids).toEqual([41798949143]);
+    expect(planSettling.dispatch_workflow).toBeNull();
+    expect(planSettling.coverage.phase).toBe("settling");
+
+    // 7. ISO-8601 parser parity with Rust
+    expect(parseIso8601EpochMs("2026-11-04T08:01:57Z")).toBe(1_793_779_317_000);
+    expect(parseIso8601EpochMs("invalid")).toBeNull();
   });
 });

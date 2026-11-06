@@ -29,6 +29,7 @@ function loadPrefs(): BoardPrefs {
 }
 
 interface KbState {
+  workers: import("@bridge/contracts").WorkerStatus[] | null;
   conn: "open" | "closed" | "off";
   tasks: KbArtefact[];
   sessions: KbSession[];
@@ -68,6 +69,7 @@ interface KbState {
 let stopWs: (() => void) | null = null;
 
 export const useKb = create<KbState>((set, get) => ({
+  workers: null,
   conn: "off",
   tasks: [],
   agents: [],
@@ -117,7 +119,7 @@ export const useKb = create<KbState>((set, get) => ({
         set({ events: [ev, ...s.events].slice(0, 500), lastSeq: Math.max(s.lastSeq, ev.seq) });
         if (!wsPushAvailable()) schedulePollRefresh();
       },
-      (board) => set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [] }),
+      (board) => set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [], workers: board.workers ?? null }),
       (conn) => set({ conn }),
       () => get().lastSeq,
     );
@@ -133,13 +135,13 @@ export const useKb = create<KbState>((set, get) => ({
   reset: () => {
     stopWs?.();
     stopWs = null;
-    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], events: [], lastSeq: 0, tokens: [], gatewayAgents: [], settings: {}, initialThread: null, lastError: null });
+    set({ conn: "off", tasks: [], sessions: [], progress: [], series: [], agents: [], workers: null, events: [], lastSeq: 0, tokens: [], gatewayAgents: [], settings: {}, initialThread: null, lastError: null });
   },
 
   refresh: async () => {
     try {
       const board = await kbApi.board();
-      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [] });
+      set({ tasks: board.tasks, sessions: board.sessions, progress: board.progress ?? [], series: board.series ?? [], agents: board.agents ?? [], workers: board.workers ?? null });
       // events are NOT re-pulled here (BR#4362): the stream owns events —
       // WS accept replays since=lastSeq, the poll path tails them. Refresh is
       // hydration + manual only.

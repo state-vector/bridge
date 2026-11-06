@@ -97,6 +97,10 @@ targets:
       base:
         ENABLE_BITCODE: false
         ARCHS: [arm64]
+        # Ray's team (set in Xcode 2026-10-30, preserved here so xcodegen
+        # regens keep device signing).
+        DEVELOPMENT_TEAM: A8G8PC6Q6K
+        CODE_SIGN_STYLE: Automatic
         VALID_ARCHS: arm64 
         LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
@@ -142,10 +146,15 @@ targets:
           cd "$SRCROOT/../.."
           # release builds must match `tauri ios build`: the custom-protocol
           # feature is what embeds the frontend dist into the binary
+          # Always embed the frontend dist (custom-protocol): a Debug run
+          # without it is a dev-server shell that requests localhost — which
+          # is exactly the "tauri://localhost … resolves to the device itself"
+          # failure on a physical device (BR#4782 follow-up). Hot-reload via
+          # `tauri ios dev` is the CLI lane's job; Xcode runs want a working
+          # app in every configuration.
+          cargo build --lib --target "$RUST_TARGET" --features tauri/custom-protocol
           if [ "$PROFILE_DIR" = "release" ]; then
             cargo build --lib --target "$RUST_TARGET" --release --features tauri/custom-protocol
-          else
-            cargo build --lib --target "$RUST_TARGET"
           fi
           OUT="$SRCROOT/Externals/arm64/${CONFIGURATION}"
           mkdir -p "$OUT"
@@ -168,3 +177,6 @@ targets:
         PRODUCT_NAME: bridge-mobile_UITests
         TEST_TARGET_NAME: bridge-mobile_iOS
         GENERATE_INFOPLIST_FILE: YES
+        # Device test runs sign the test bundle too (BR#5449 device lane).
+        DEVELOPMENT_TEAM: A8G8PC6Q6K
+        CODE_SIGN_STYLE: Automatic

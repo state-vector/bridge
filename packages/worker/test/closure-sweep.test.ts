@@ -117,11 +117,11 @@ afterAll(async () => {
 // ---------- (a) the unblock-proxy watch ----------
 
 describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
-  it("GitHub-state atoms stamp UNRESOLVABLE (BR#3516 — the hub holds no VCS creds) and spawn nothing; unparseable stays honest", async () => {
+  it("PR merge atoms enqueue executor verification without hub VCS reads or premature closure", async () => {
     // P1 parks on BR#3129's REAL condition ("PR #2327 mergeCommit non-null" —
     // a pr_merged atom with a repo). The park-time machine round spawns as
     // always (transition law, unchanged); the SWEEP, though, can no longer
-    // read the PR — unresolvable, never a flip, never a duty.
+    // read the PR — queue an executor probe, never a flip or a duty.
     const p1 = await kbJson("/create", { type: "task", title: "IMPL: re-close GH #2274 (drill)", qualified: true, session: "drill-exec-p1" });
     expect(p1.status).toBe(200);
     const p1id = String(p1.body.id);
@@ -166,28 +166,30 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     expect(sweep1.status, `sweep1 failed: ${JSON.stringify(sweep1.body)}`).toBeLessThan(500);
     expect(sweep1.body.error).toBeUndefined();
 
-    // P1/P3: unresolvable with the BR#3516 receipt — stamped, never flipped,
+    // P1/P3: executor probes pending — stamped, never flipped,
     // nothing spawned from the sweep
     for (const id of [p1id, p3id]) {
       const now = await taskById(id);
-      expect(now.meta?.proxy_check?.verdict, `${id}`).toBe("unresolvable");
-      expect(String(now.meta?.proxy_check?.atoms?.[0]?.receipt)).toContain("BR#3516");
+      expect(now.meta?.proxy_check?.verdict, `${id}`).toBe("probe_pending");
+      expect(now.status).toBe("blocked");
       expect(now.meta?.proxy_check?.spawned).toBeUndefined();
     }
 
     // P2: the typed await is stored (annotation rides along); the sweep
-    // stamps it unresolvable like every other GitHub-state atom
+    // queues the same executor probe as a prose PR-merge atom
     const p2Now = await taskById(p2id);
     expect(p2Now.meta?.blocked?.await_event).toEqual({ event: "pr_merged", repo: "state-vector/superpositional", n: 2400 });
-    expect(p2Now.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p2Now.meta?.proxy_check?.verdict).toBe("probe_pending");
     expect(p2Now.meta?.proxy_check?.spawned).toBeUndefined();
+    const probes = (await kbJson("/proxy.probes", {})).body.probes;
+    expect(probes).toEqual(expect.arrayContaining([expect.objectContaining({ key: "merged:state-vector/superpositional#2400" })]));
 
     // a second sweep re-stamps the same verdicts (per-card pacing, no churn
     // audits, no duties of any kind from the sweep)
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 61 * 60_000 + 17 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const p1After = await taskById(p1id);
-    expect(p1After.meta?.proxy_check?.verdict).toBe("unresolvable");
+    expect(p1After.meta?.proxy_check?.verdict).toBe("probe_pending");
     expect(p1After.meta?.proxy_check?.spawned).toBeUndefined();
     const openDuties = (await unblockDuties()).filter((d: any) =>
       d.title.startsWith("Unblock: IMPL: re-close GH #2274") && ["todo", "in_progress", "blocked"].includes(d.status));
@@ -562,18 +564,24 @@ describe("askInbox addressee routing (real DO)", () => {
 
 describe("BR#4062 — ask/time prose parks type at the door and sweep first-class (real DO)", () => {
   it("a timer prose park (the takeover repro) types at the door and the sweep WAITS, honest", async () => {
+    // BR#5623: until_ts must be derived from t0, never a hardcoded wall-clock
+    // instant. The frozen 1793673600000 (= 2026-11-03T02:40Z) made the sweep's
+    // synthetic clock (t0 + 400min) overtake the timer for every run after
+    // 2026-11-02T20:00Z — a calendar time-bomb that turned this test red on
+    // the first CI run to cross it, blocking an unrelated PR.
+    const untilTs = t0 + 800 * 60_000;
     const r = await kbJson("/create", { type: "task", title: "IMPL: 4062 time-prose drill", qualified: true, session: "drill-4062-time" });
     const pid = String(r.body.id);
     await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-time", session: "drill-4062-time" });
     // THE regression: this exact park shape REJECTED from MCP on 2026-10-28
     const blk = await block(pid, "drill-4062-time",
-      "Machine proxy (typed await_event time until_ts=1793673600000): the card re-enters at the timer → then a FRESH session closes it done.",
+      `Machine proxy (typed await_event time until_ts=${untilTs}): the card re-enters at the timer → then a FRESH session closes it done.`,
       "parked on a typed timer (BR#4062 repro)");
     expect(blk.status, JSON.stringify(blk.body)).toBe(200);
     const parked = await taskById(pid);
     expect(parked.status).toBe("blocked");
     // the typed event self-stamped at the door (not just text)
-    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: 1793673600000 });
+    expect(parked.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: untilTs });
 
     const s = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 400 * 60_000 });
     expect(s.body.error).toBeUndefined();
@@ -709,6 +717,24 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
 });
 
 describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () => {
+  it("BR#6839: a fresh gateway session ping cannot revive an executor-less bounce; an actual worker ping can", async () => {
+    for (const gateway of [true, false]) {
+      const session = `br6839-${gateway ? "gateway" : "worker"}`;
+      const token = await kbJson("/admin.mint", { label: session, tags: gateway ? ["gateway"] : ["impl"] });
+      expect(token.body.error).toBeUndefined();
+      const created = await kbJson("/create", { type: "task", title: session, qualified: true });
+      const id = created.body.id;
+      await kbJson("/transition", { id, to: "in_progress", actor: session, session: `${session}-old` });
+      const updated = await kbJson("/update", { id, meta: { session,
+        merge_train: { state: "bounced", pr: 6839, repo: "state-vector/bridge" },
+        last_progress: { session: "another-duty", ts: Date.now(), note: "unrelated task update" } } });
+      expect(updated.body.error).toBeUndefined();
+      const touched = await kbJson("/session.touch", { token_id: token.body.id, session });
+      expect(touched.body.error).toBeUndefined();
+      await kbJson("/admin.stall_sweep", { now: Date.now() + 1_000 });
+      expect((await taskById(id)).status).toBe(gateway ? "todo" : "in_progress");
+    }
+  });
   it("a bounce re-entry stranded in_progress (dead executor) is DEMOTED to a claimable todo by the sweep — never re-parked blocked; train meta + boost survive", async () => {
     // The specimen shape (BR#4198): a train bounce re-opened its card
     // in_progress with the PRIOR session as executor; the session is gone and
@@ -730,6 +756,8 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
       meta: {
         merge_train: { state: "bounced", bounce_kind: "coverage", pr: 2401, repo: "state-vector/superpositional", bounced_at: t0 + 30_000 },
         boosted: t0 + 30_000,
+        // A recent recovery duty update must not revive the old worker.
+        last_progress: { session: "different-recovery-duty", ts: t0 + 10 * 60_000, note: "repair still needs a worker" },
       },
     });
     expect(stamp.status, `stamp failed: ${JSON.stringify(stamp.body)}`).toBe(200);
@@ -744,9 +772,10 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
     // the re-queue seam + the starvation law survive the release
     expect(after.meta?.merge_train?.state).toBe("bounced");
     expect(after.meta?.boosted).toBeTruthy();
-    // the release names the law (BR#4494) — auditable, and the churn stamp
-    // carries the reason
-    expect(String(after.meta?.attempt?.last_reason ?? "")).toContain("BR#4494");
+    // Releasing a machine-created phantom is not an agent failure.
+    expect(after.owner).toBe("");
+    expect(after.meta?.session).toBeUndefined();
+    expect(after.meta?.attempt).toBeUndefined();
   });
 
   it("the hold is NOT loosened: a queued card (flag or not) and a parked blocked bounced card stay held — only the live in_progress re-entry demotes", async () => {
@@ -792,6 +821,69 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
     expect(sweep2.body.error).toBeUndefined();
     const bAfter = await taskById(bid);
     expect(bAfter.status, "a parked blocked bounced card stays parked — the carve-out is in_progress-only").toBe("blocked");
+  });
+});
+
+describe("BR#5750 — awaiting re-park loop + hold-park queue prefix (real DO)", () => {
+  it("the livelock chain is dead end-to-end: a verifier bounce of an Awaiting park flips it to bounced (leaving the park ends it), and the stalled re-entry DEMOTES to claimable todo — never re-parked blocked (the BR#3853/3937/5139 loop)", async () => {
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br5750 awaiting unpark drill", qualified: true, session: "drill-exec-br5750" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    // The specimen shape, exactly what train:bounce_awaiting_park writes: an
+    // Awaiting human-leg park — blocked on the typed pr_merged proxy,
+    // merge_train.state = awaiting on the live leg.
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5750", session: "drill-exec-br5750",
+      note: "coverage bounce needs a human leg",
+      unblock_condition: "PR https://github.com/state-vector/superpositional/pull/2404 merged",
+      await_event: { event: "pr_merged", repo: "state-vector/superpositional", n: 2404 },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    // /update meta REPLACES wholesale — spread the live meta so the park's
+    // blocked record (the typed pr_merged await) survives the stamp, exactly
+    // what train:bounce_awaiting_park writes in place.
+    const stamp = await kbJson("/update", {
+      id, actor: "drill-exec-br5750",
+      meta: {
+        ...((await taskById(id)).meta ?? {}),
+        merge_train: { state: "awaiting", bounce_kind: "coverage", pr: 2404, repo: "state-vector/superpositional", awaiting: { at: t0 + 1000 } },
+      },
+    });
+    expect(stamp.status, `stamp failed: ${JSON.stringify(stamp.body)}`).toBe(200);
+    // The verifier bounce — the exact edge that used to leave `awaiting`
+    // live on an in_progress card (the loop's first half).
+    const bounce = await kbJson("/transition", { id, to: "in_progress", actor: "drill-verify-br5750", session: "drill-verify-br5750", note: "PR CONFLICTING/DIRTY — fix forward" });
+    expect(bounce.status, `bounce failed: ${JSON.stringify(bounce.body)}`).toBe(200);
+    const afterBounce = await taskById(id);
+    expect(afterBounce.status).toBe("in_progress");
+    expect(afterBounce.meta?.merge_train?.state, "leaving the Awaiting park ENDS it — awaiting flips to bounced (BR#5750)").toBe("bounced");
+    expect(afterBounce.meta?.merge_train?.awaiting).toBeUndefined();
+    // The executor then dies — the stalled re-entry must DEMOTE (the loop's
+    // second half), never hold-park straight back into blocked.
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 11 * 60_000 });
+    expect(sweep.status, `stall sweep failed: ${JSON.stringify(sweep.body)}`).toBeLessThan(500);
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "the stalled awaiting re-entry demotes to claimable todo (BR#4494/BR#5750), not blocked").toBe("todo");
+    expect(after.meta?.blocked).toBeUndefined();
+    expect(after.meta?.merge_train?.state).toBe("bounced");
+    expect(after.meta?.attempt).toBeUndefined(); // a phantom claim is not a failed agent run
+  });
+
+  it("a watchdog hold-park of a queued car keeps its queue slot: the blocked reason carries the merge-train prefix, so mergeTrainQueue still sees the car (the BR#4995 drop)", async () => {
+    const q = await kbJson("/create", { type: "task", title: "IMPL: br5750 queued hold-park prefix drill", qualified: true, session: "drill-exec-br5750q" });
+    expect(q.status).toBe(200);
+    const qid = String(q.body.id);
+    const claim = await kbJson("/transition", { id: qid, to: "in_progress", actor: "drill-exec-br5750q", session: "drill-exec-br5750q" });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBe(200);
+    await kbJson("/update", { id: qid, actor: "drill-exec-br5750q", meta: { merge_train: { state: "queued", pr: 2405, repo: "state-vector/superpositional" } } });
+    const sweep = await kbJson("/admin.stall_sweep", { now: t0 + 12 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const qAfter = await taskById(qid);
+    expect(qAfter.status, "queued keeps parks-not-releases (BR#4067 — live queue slot)").toBe("blocked");
+    const reason = String(qAfter.meta?.blocked?.reason ?? "");
+    expect(reason.startsWith("merge-train: queued — "), `the hold-park must keep the queue prefix, got: ${reason}`).toBe(true);
+    expect(reason).toContain("silence-release held (watchdog)");
   });
 });
 // ---------- BR#3620: the stale-ledger flips ----------
@@ -1034,5 +1126,203 @@ describe("BR#4702 — capped re-attempts under a standing escalation are observa
     const breaches = ((await kbJson("/list", { type: "task", tag: "breach", limit: 200 })).body?.artefacts ?? [])
       .filter((a: any) => String(a.meta?.breach_task ?? "") === id);
     expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((b: any) => [b.id, b.meta?.breach_key]))}`).toHaveLength(0);
+  });
+});
+
+// ---------- (h) BR#6518 — a depth-capped card entering in_review gets a DETACHED verify duty, not a stranded review leg ----------
+
+describe("BR#6518 — the depth guard reroutes the verify round instead of dropping it", () => {
+  it("a 3-deep card entering in_review spawns a DETACHED verify duty (no depth-4 child_of edge), stamps the round, folds NO breach card, and a bounce re-entry REUSES the same round", async () => {
+    // 1. build a depth-3 chain: A → B → C → D (D carries 3 child_of ancestors,
+    //    the exact BR#6500 shape: recovery card under a fix under an umbrella)
+    const a = await kbJson("/create", { type: "task", title: "ROOT: br6518 chain A", qualified: true, session: "drill-a" });
+    expect(a.status).toBe(200);
+    const b = await kbJson("/create", { type: "task", title: "IMPL: br6518 chain B", qualified: true, session: "drill-b" });
+    const c3 = await kbJson("/create", { type: "task", title: "IMPL: br6518 chain C", qualified: true, session: "drill-c" });
+    const d = await kbJson("/create", { type: "task", title: "IMPL: br6518 depth-capped D", qualified: true, session: "drill-d" });
+    for (const [src, dst] of [[b.body.id, a.body.id], [c3.body.id, b.body.id], [d.body.id, c3.body.id]]) {
+      const l = await kbJson("/link", { src, relation: "child_of", dst });
+      expect(l.status, `link ${src} → ${dst} failed: ${JSON.stringify(l.body)}`).toBe(200);
+    }
+    // the BR#532 cap holds at the relation layer: a 5th node under D is refused
+    const e = await kbJson("/create", { type: "task", title: "IMPL: br6518 would-be depth-4", qualified: true, session: "drill-e" });
+    expect((await kbJson("/link", { src: e.body.id, relation: "child_of", dst: d.body.id })).status).toBeGreaterThanOrEqual(400);
+
+    // 2. D enters review — pre-BR#6518 this spawned NOTHING (no review leg,
+    //    card stranded believing a verifier existed) and folded a
+    //    spawn-while-open breach card on the guard's own suppression
+    expect((await kbJson("/transition", { id: d.body.id, to: "in_progress", actor: "drill-d", session: "drill-d" })).status).toBe(200);
+    const rv = await kbJson("/transition", { id: d.body.id, to: "in_review", actor: "drill-d", session: "drill-d", note: "execution receipts: https://example.com/br6518-run" });
+    expect(rv.status, `in_review failed: ${JSON.stringify(rv.body)}`).toBe(200);
+
+    // 3. the duty exists, DETACHED: no child_of edge anywhere, the SUBJECT
+    //    binding rides the duty body, the round is stamped on D
+    const verifyDuties = async () => ((await kbJson("/list", { type: "task", limit: 500 })).body?.artefacts ?? [])
+      .filter((x: any) => x.title.startsWith("Verify: IMPL: br6518 depth-capped D"));
+    const duties = await verifyDuties();
+    expect(duties.length, `expected 1 detached duty, got ${JSON.stringify(duties.map((x: any) => x.id))}`).toBe(1);
+    expect(duties[0].roles).toContain("review");
+    expect(String(duties[0].body_md)).toContain(String(d.body.id));
+    const rels = (await kbJson("/relations", { id: duties[0].id })).body?.relations ?? [];
+    expect(rels.filter((r: any) => r.relation === "child_of")).toHaveLength(0);
+    expect((await taskById(d.body.id)).meta?.verify_round?.duty).toBe(duties[0].id);
+
+    // 4. the fold over the audit stream raises NO spawn-while-open card for D
+    const breaches = ((await kbJson("/list", { type: "task", tag: "breach", limit: 200 })).body?.artefacts ?? [])
+      .filter((x: any) => String(x.meta?.breach_task ?? "") === String(d.body.id));
+    expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((x: any) => [x.id, x.meta?.breach_key]))}`).toHaveLength(0);
+
+    // 5. bounce → re-enter review: the SAME round is reused, no duplicate duty
+    expect((await kbJson("/transition", { id: d.body.id, to: "in_progress", actor: "verifier-6518", session: "verifier-6518", note: "bounced — findings: receipt chain incomplete" })).status).toBe(200);
+    const rv2 = await kbJson("/transition", { id: d.body.id, to: "in_review", actor: "drill-d", session: "drill-d", note: "execution receipts re-recorded: https://example.com/br6518-run-2" });
+    expect(rv2.status, `re-entry failed: ${JSON.stringify(rv2.body)}`).toBe(200);
+    expect((await verifyDuties()).length, "bounce re-entry must reuse the stamped round, never stack a second duty").toBe(1);  });
+});
+
+// ---------- (i) BR#5916 — the zombie-park re-arm: unclaimable infra anchors ----------
+
+describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (machine, no breach)", () => {
+  // 24h — mirrors the churn-guard cooldown (BR#5842) that parked the real
+  // BR#3124 sink on a timer in the first place.
+  const REARM_MS = 24 * 60 * 60_000;
+  // the sweep clocks ride past the file's largest existing sweep (t0+533m)
+  const anchorSweepNow = t0 + 560 * 60_000;
+
+  it("an anchor's expired timer re-parks on a fresh typed wait — no flip, no spawn, no escalation, no drift", async () => {
+    // 1. the anchor: meta.infra_anchor = true (do-not-claim/do-not-close),
+    //    parked on a typed time await that has ALREADY expired relative to
+    //    the sweep clock — the BR#3124 zombie shape (expired wait + capped
+    //    spawner + do-not-touch guards = no legal leg left).
+    const c = await kbJson("/create", {
+      type: "task", title: "IMPL: br5916 anchor drill", qualified: true, session: "drill-exec-br5916",
+      meta: { infra_anchor: true },
+    });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br5916", session: "drill-exec-br5916" });
+    const expiredUntil = t0 - 5 * 60_000; // already expired (derived from t0, BR#5623 law)
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5916", session: "drill-exec-br5916",
+      note: "cooldown park (BR#5842 mechanism)",
+      await_event: { event: "time", until_ts: expiredUntil },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    expect((await taskById(id)).status).toBe("blocked");
+    // the carve-out suppresses even the PARK-TIME machine round for the anchor
+    expect((await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br5916 anchor drill"))).toHaveLength(0);
+
+    // 2. sweep past the flood window: the expired timer fires — the machine
+    //    re-arms the park itself (no agent action, no breach event).
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: anchorSweepNow });
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "the anchor stays parked — the timer owns the exit; the sweep re-arms it").toBe("blocked");
+    const rearm = after.meta?.blocked?.await_event;
+    expect(rearm?.event).toBe("time");
+    expect(rearm?.until_ts, "the expired atom is replaced by a fresh wait stamped from the sweep clock").toBe(anchorSweepNow + REARM_MS);
+    expect(after.meta?.proxy_check?.verdict).toBe("waiting");
+    expect(String(after.meta?.proxy_check?.detail)).toContain("BR#5916");
+    // NO unblock duty, NO escalation stamp — the do-not-claim anchor never
+    // burns the shared spawner budget (BR#5916 scope 2)
+    expect((await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br5916 anchor drill"))).toHaveLength(0);
+    expect(after.meta?.unblock_escalated).toBeUndefined();
+    expect(after.meta?.escalate).toBeUndefined();
+
+    // 3. idempotent: a second sweep inside the fresh window re-stamps
+    //    waiting and does NOT drift the timer.
+    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: anchorSweepNow + 30 * 60_000 });
+    expect(sweep2.body.error).toBeUndefined();
+    const after2 = await taskById(id);
+    expect(after2.status).toBe("blocked");
+    expect(after2.meta?.blocked?.await_event?.until_ts).toBe(rearm.until_ts);
+    expect(after2.meta?.proxy_check?.verdict).toBe("waiting");
+  });
+
+  it("the sink route: the configured alarm sink (train_alarm_sink_id) re-arms without any meta flag", async () => {
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br5916 sink-route drill", qualified: true, session: "drill-exec-br5916s" });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br5916s", session: "drill-exec-br5916s" });
+    // point the sink setting at the drill card, park it expired, sweep
+    const set = await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: id } });
+    expect(set.status, `settings_set failed: ${JSON.stringify(set.body)}`).toBeLessThan(500);
+    const expiredUntil = t0 - 3 * 60_000;
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br5916s", session: "drill-exec-br5916s",
+      note: "sink cooldown park", await_event: { event: "time", until_ts: expiredUntil },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 610 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status).toBe("blocked");
+    expect(after.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 610 * 60_000) + REARM_MS });
+    expect(String(after.meta?.proxy_check?.detail)).toContain("BR#5916");
+    // restore the setting so later tests see the default sink
+    await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: "BR#3124" } });
+  });
+
+  it("the cap carve-out: a capped ANCHOR stamps no escalation and burns no budget; a capped non-anchor still escalates (behavior preserved)", async () => {
+    // a closed unblock child linked to the parent — the cap counts rounds
+    // EVER regardless of status, and closing keeps openChild null so the
+    // sweep actually reaches the cap branch
+    const mkChild = async (parent: string, tag: string) => {
+      const cc = await kbJson("/create", { type: "task", title: `Unblock: br5916-cap ${tag}`, qualified: true, session: `duty-${tag}`, roles: ["unblock"] });
+      expect(cc.status, `child create failed: ${JSON.stringify(cc.body)}`).toBe(200);
+      const cid = String(cc.body.id);
+      const lnk = await kbJson("/link", { src: cid, relation: "child_of", dst: parent });
+      expect(lnk.status, `link failed: ${JSON.stringify(lnk.body)}`).toBe(200);
+      await kbJson("/transition", { id: cid, to: "in_progress", actor: `duty-${tag}`, session: `duty-${tag}` });
+      const done = await kbJson("/transition", { id: cid, to: "done", actor: `duty-${tag}`, session: `duty-${tag}`, note: "receipts: https://github.com/a/b/pull/1 re-verified — exit not held; findings recorded" });
+      expect(done.status, `child done failed: ${JSON.stringify(done.body)}`).toBe(200);
+    };
+
+    // --- the non-anchor CONTROL: existing BR#2893 cap behavior intact ---
+    const nc = await kbJson("/create", { type: "task", title: "IMPL: br5916 cap control", qualified: true, session: "drill-exec-br5916c" });
+    expect(nc.status).toBe(200);
+    const nid = String(nc.body.id);
+    await kbJson("/transition", { id: nid, to: "in_progress", actor: "drill-exec-br5916c", session: "drill-exec-br5916c" });
+    for (const tag of ["c1", "c2", "c3"]) await mkChild(nid, tag);
+    const npark = await kbJson("/transition", {
+      id: nid, to: "blocked", actor: "drill-exec-br5916c", session: "drill-exec-br5916c",
+      note: "capped park", await_event: { event: "time", until_ts: t0 - 2 * 60_000 },
+    });
+    expect(npark.status, `control park failed: ${JSON.stringify(npark.body)}`).toBe(200);
+    // the cap fires at PARK time on the normal path: escalation stamped once
+    const nNow = await taskById(nid);
+    expect(nNow.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(nNow.meta?.escalate?.reason)).toContain("spawner stopped");
+
+    // --- the ANCHOR: same 3 done children, same expired timer — carve-out ---
+    const ac = await kbJson("/create", {
+      type: "task", title: "IMPL: br5916 cap anchor", qualified: true, session: "drill-exec-br5916a",
+      meta: { infra_anchor: true },
+    });
+    expect(ac.status).toBe(200);
+    const aid = String(ac.body.id);
+    await kbJson("/transition", { id: aid, to: "in_progress", actor: "drill-exec-br5916a", session: "drill-exec-br5916a" });
+    for (const tag of ["a1", "a2", "a3"]) await mkChild(aid, tag);
+    const apark = await kbJson("/transition", {
+      id: aid, to: "blocked", actor: "drill-exec-br5916a", session: "drill-exec-br5916a",
+      note: "capped anchor park", await_event: { event: "time", until_ts: t0 - 2 * 60_000 },
+    });
+    expect(apark.status, `anchor park failed: ${JSON.stringify(apark.body)}`).toBe(200);
+    const aNow = await taskById(aid);
+    // the carve-out: 3 children ever and STILL no escalation stamp, no budget burn
+    expect(aNow.meta?.unblock_escalated).toBeUndefined();
+    expect(aNow.meta?.escalate).toBeUndefined();
+
+    // the sweep: the anchor's expired timer RE-ARMS (never escalates), and
+    // the control's capped park stays honestly suppressed (spawn_skipped)
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 640 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const aAfter = await taskById(aid);
+    expect(aAfter.status).toBe("blocked");
+    expect(aAfter.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 640 * 60_000) + REARM_MS });
+    expect(aAfter.meta?.unblock_escalated).toBeUndefined();
+    const nAfter = await taskById(nid);
+    expect(nAfter.status).toBe("blocked");
+    expect(nAfter.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(nAfter.meta?.proxy_check?.spawn_skipped)).toContain("unblock spawner cap");
   });
 });

@@ -84,3 +84,43 @@ const orient2 = await rpc("tools/call", { name: "orient", arguments: { session: 
 if ((orient2.decisions_awaiting_consensus ?? []).some((e) => e.decision_id === dec.id))
   throw new Error("FAIL: accepted decision still listed");
 console.log("ALL BR-903 CHECKS PASSED");
+
+// ---- BR#5377: verify verdicts are MACHINE verdicts (same rig, wrangler dev) ----
+// F1: the verdict ACCEPTS at create (actor system:verifier inside the hub; the
+// MCP caller is unprivileged) and the accept-side hook applies it to its
+// target (impl card → the merge-train queue). F2: no consensus round. F3: the
+// hub mints the canonical plain-language title; the authored title rides in
+// the body.
+const task = await rpc("tools/call", { name: "create_artefact", arguments: { type: "task", title: "BR5377 e2e: machine-verdict target", qualified: true, session: "br5377-verify" } });
+if (!/^BR#\d+$/.test(task.id)) throw new Error("FAIL: no task id");
+await rpc("tools/call", { name: "transition", arguments: { id: task.id, to: "in_progress", note: "claim", session: "br5377-verify" } });
+
+const HEAD = "b".repeat(40);
+const verdict = await rpc("tools/call", { name: "create_artefact", arguments: {
+  type: "decision",
+  title: "BR#5377 verify verdict (2026-11-01): SUBSTANCE_VERIFIED — ACCEPT — e2e leg",
+  meta: { decision_class: "verify-verdict", task: task.id, verdict: "verified", pr: 53771, repo: "state-vector/bridge", pr_state: "MERGED" },
+  body_md: `verified head ${HEAD} — https://github.com/state-vector/bridge/pull/53771`,
+  session: "br5377-verify",
+} });
+console.log("verdict created:", verdict.id, "status:", verdict.status, "machine_applied:", verdict.machine_applied, "feedback_round:", verdict.feedback_round);
+if (verdict.status !== "accepted") throw new Error("FAIL: machine verdict did not accept on filing");
+if (verdict.machine_applied !== true) throw new Error("FAIL: machine_applied flag missing");
+if (verdict.feedback_round) throw new Error("FAIL: machine verdict spawned a consensus round (F2)");
+
+const vgot = await rpc("tools/call", { name: "get_artefact", arguments: { id: verdict.id, session: "br5377-verify" } });
+console.log("verdict title:", vgot.title);
+if (vgot.title !== `Verify verdict — ACCEPT — PR state-vector/bridge#53771 → ${task.id}`)
+  throw new Error("FAIL: canonical title not minted (F3): " + vgot.title);
+if (!String(vgot.body_md ?? "").includes("> **Verifier's title:** BR#5377 verify verdict"))
+  throw new Error("FAIL: authored title not demoted into the body (F3)");
+const vrel = (vgot.relations ?? []).find((r) => r.dir === "out" && r.relation === "supports" && r.artefact_id === task.id);
+if (!vrel) throw new Error("FAIL: verdict did not auto-link supports to its target");
+
+const tNow = await rpc("tools/call", { name: "get_artefact", arguments: { id: task.id, session: "br5377-verify" } });
+console.log("target after machine apply:", tNow.status, "| train:", tNow.meta?.merge_train?.state, "| pr:", tNow.meta?.pr?.number);
+if (tNow.status !== "blocked" || tNow.meta?.merge_train?.state !== "queued")
+  throw new Error("FAIL: impl card not queued on the train by the machine verdict (F1)");
+if (tNow.meta?.pr?.number !== 53771 || tNow.meta?.pr?.head_sha_at_acceptance !== HEAD)
+  throw new Error("FAIL: PR/head stamp missing after machine apply");
+console.log("ALL BR-5377 CHECKS PASSED");

@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { Voice } from "./Voice";
+import { SignInButton } from "./SignIn";
 
 const LS = { url: "bridge.url" };
+/** Shared hub (README) — persisted as the default when no hub url is set yet
+ *  (BR#5581); the Connect input still shows it editable so a self-hosted hub
+ *  can replace it. */
+const DEFAULT_HUB = "https://hub.fleetbridge.run";
 
 /** Board shape from /api/kb/board (subset the mobile view needs). */
 interface Task {
@@ -49,7 +54,13 @@ export function App() {
   const [board, setBoard] = useState<Board | null>(null);
   const [decisions, setDecisions] = useState<Decision[] | null>(null);
   const [proposed, setProposed] = useState<Array<{ id: string; title: string; created_ts: number }> | null>(null);
-  const [url, setUrl] = useState(localStorage.getItem(LS.url) ?? "");
+  const [url, setUrl] = useState(() => {
+    const v = localStorage.getItem(LS.url)?.trim() ?? "";
+    if (v) return v;
+    try { localStorage.setItem(LS.url, DEFAULT_HUB); } catch { /* private mode */ }
+    return DEFAULT_HUB;
+  });
+  const [connectOpen, setConnectOpen] = useState(false);
   const [msg, setMsg] = useState("");
 
   const load = async () => {
@@ -72,14 +83,36 @@ export function App() {
   };
 
   useEffect(() => {
+    const lastLoad = { at: Date.now() };
     void load();
     // BR#4362: push, not poll — the socket carries board state (kb.board
-    // snapshots) + events; decisions reload is debounced per burst. Falls
-    // back to nothing: if the socket dies, reconnect-with-backoff rehydrates.
+    // snapshots) + events. BR#5581 reload governor (Ray device feedback: the
+    // 1.5s decisions debounce was a fetch storm on a busy hub): at most one
+    // reload per 5s, bursts collapsed to a single trailing reload, and
+    // nothing at all while document.hidden (a visible-change re-fires).
+    // Falls back to nothing: if the socket dies, reconnect-with-backoff
+    // rehydrates.
+    const RELOAD_MIN_MS = 5000;
+    let reloadQueued = false;
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const runReload = () => {
+      reloadTimer = null;
+      reloadQueued = false;
+      if (document.hidden) return;
+      lastLoad.at = Date.now();
+      void load();
+    };
+    const scheduleReload = () => {
+      if (reloadQueued) return;
+      reloadQueued = true;
+      reloadTimer = setTimeout(runReload, Math.max(0, lastLoad.at + RELOAD_MIN_MS - Date.now()));
+    };
+    const onVisible = () => { if (!document.hidden) scheduleReload(); };
+    document.addEventListener("visibilitychange", onVisible);
+
     const base = (localStorage.getItem(LS.url)?.replace(/\/$/, "") || window.location.origin).replace(/^http/, "ws");
     let stopped = false;
     let backoff = 2000;
-    let decisionsTimer: ReturnType<typeof setTimeout> | null = null;
     const dial = () => {
       if (stopped) return;
       let ws: WebSocket;
@@ -91,13 +124,8 @@ export function App() {
         try {
           const f = JSON.parse(e.data);
           if (f.type === "kb.board" && f.board) {
-            setBoard(f.board as Board);
-            if (!decisionsTimer) {
-              decisionsTimer = setTimeout(() => {
-                decisionsTimer = null;
-                void load();
-              }, 1500);
-            }
+            if (!document.hidden) setBoard(f.board as Board);
+            scheduleReload();
           }
         } catch { /* ignore */ }
       };
@@ -111,6 +139,8 @@ export function App() {
     dial();
     return () => {
       stopped = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      if (reloadTimer) clearTimeout(reloadTimer);
     };
   }, []);
 
@@ -128,6 +158,17 @@ export function App() {
       await load();
     } catch (e) {
       setMsg(`failed: ${(e as Error).message}`);
+    }
+  };
+
+  const signIn = () => {
+    const w = window as unknown as { __bridgeShell?: unknown; __TAURI_INTERNALS__?: unknown };
+    if ((w.__bridgeShell || w.__TAURI_INTERNALS__) && url) {
+      // Shell with a hub url: the INIT_SCRIPT owns the flow (shell_sign_in
+      // invoke + navigation to <hub>/login?shell=1).
+      document.dispatchEvent(new Event("bridge:sign-in"));
+    } else {
+      setConnectOpen(true);
     }
   };
 
@@ -151,7 +192,12 @@ export function App() {
     <div className="mb">
       <header className="mb-head">
         <span className="mb-brand">Bridge</span>
-        <span className={`mb-conn ${board ? "mb-conn-open" : "mb-conn-closed"}`}>●</span>
+        <SignInButton onSignIn={signIn} />
+        <button
+          className={`mb-conn ${board ? "mb-conn-open" : "mb-conn-closed"}`}
+          onClick={() => setConnectOpen((v) => !v)}
+          aria-label="hub connection — show Connect"
+        >●</button>
       </header>
 
       <nav className="mb-tabs">
@@ -235,7 +281,7 @@ export function App() {
 
         {tab === "voice" && <Voice />}
 
-        {!url && (
+        {(connectOpen || !url) && (
           <div className="mb-card">
             <h2>Connect</h2>
             <input
@@ -245,7 +291,7 @@ export function App() {
               onChange={(e) => setUrl(e.target.value)}
               onBlur={() => { localStorage.setItem(LS.url, url); void load(); }}
             />
-            <span className="mb-note">hub url — sign-in happens in the web view</span>
+            <span className="mb-note">hub url — shared hub pre-filled; sign-in happens in the web view</span>
           </div>
         )}
         {msg && <span className="mb-ok">{msg}</span>}

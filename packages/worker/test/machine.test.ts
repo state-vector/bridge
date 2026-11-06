@@ -8,6 +8,7 @@ import {
   invariants,
   detectBreaches,
   breachClass,
+  BREACH_THRESHOLDS,
   silentCycles,
   replayStatus,
   CHURN_COOLDOWN_MS,
@@ -17,6 +18,8 @@ import {
   SILENT_REDIRECT_CYCLES,
   blockedParkVerdict,
   UNBLOCK_SPAWN_CAP,
+  prTargetsOf,
+  prTargetMatch,
   type RuleCtx,
   type RuleInput,
   type Applied,
@@ -43,8 +46,10 @@ const baseCtx = (): RuleCtx => ({
   parent: () => null,
   openChildren: () => 0,
   openChildIds: () => [],
+  openChildDetails: () => [],
   spawnGuard: () => null,
   openVerifyChild: () => null,
+  openVerifyRound: () => null,
   openUnblockChild: () => null,
   cardBody: () => "",
   closeLegChildClosed: () => false,
@@ -177,11 +182,16 @@ describe("transition matrix (task: role × from × to)", () => {
     expect(await check(input({ status: "in_review", to: "done" }), ok)).toBeNull();
   });
 
-  it("open children fence the parent's done", async () => {
+  it("open children fence the parent's done — and the refusal NAMES them (ids + statuses, BR#5370)", async () => {
     const c = baseCtx();
     c.openChildren = () => 2;
+    c.openChildDetails = () => [{ id: "BR#21", status: "in_progress" }, { id: "BR#22", status: "todo" }];
     const msg = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), c);
     expect(msg).toContain("still has 2 open child task(s)");
+    // BR#5370 finding B: the rejection carries child ids + statuses so
+    // attempt 1 points at the right action (the BR#5349 duty session
+    // misattributed its blocker and retried a terminal rejection 3x)
+    expect(msg).toContain("Open child: BR#21 (in_progress), BR#22 (todo)");
   });
 
   it("BR#3819: force-close passes only when EVERY open child is named, with a reason", async () => {
@@ -218,6 +228,36 @@ describe("transition matrix (task: role × from × to)", () => {
     ).toContain("human-authoritative");
     expect(
       await check(input({ type: "decision", status: "proposed", to: "accepted", actor: "web:ray" }), baseCtx()),
+    ).toBeNull();
+  });
+
+  it("BR#5377 F1: machine verdicts accept as system:verifier — the narrow decision-acceptance exception", async () => {
+    // the exemption: verify-verdict + system:verifier → the hub applies the
+    // verdict at create; no human GO/NO-GO leg
+    expect(
+      await check(input({
+        type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+        meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "SUBSTANCE_VERIFIED_ACCEPT" },
+      }), baseCtx()),
+    ).toBeNull();
+    // narrow by actor: an agent session filing the same verdict cannot accept it
+    const agent = await check(input({
+      type: "decision", status: "proposed", to: "accepted", actor: "agent-x",
+      meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "SUBSTANCE_VERIFIED_ACCEPT" },
+    }), baseCtx());
+    expect(agent).toContain("human-authoritative");
+    // narrow by class: system:verifier accepting any OTHER decision class is refused
+    const otherClass = await check(input({
+      type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+      meta: { decision_class: "policy", topic: "not a verdict" },
+    }), baseCtx());
+    expect(otherClass).toContain("human-authoritative");
+    // a bounced verdict shape applies under the same narrow pair
+    expect(
+      await check(input({
+        type: "decision", status: "proposed", to: "accepted", actor: "system:verifier",
+        meta: { decision_class: "verify-verdict", task: "BR#500", verdict: "bounce" },
+      }), baseCtx()),
     ).toBeNull();
   });
 
@@ -445,6 +485,7 @@ describe("loop regressions", () => {
         "review-needs-pr",
         "review-separation-of-duties",
         "supersede-authority",
+        "takeover-stale-holder",
         "unblock-needs-resolution",
         "verdict-done-needs-receipts",
         "verdict-no-blocked",
@@ -467,6 +508,34 @@ describe("loop regressions", () => {
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "agent-x" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "web:ray" }), baseCtx())).ok).toBe(true);
     expect((await decide(input({ status: "in_progress", to: "todo", owner: "agent-x", actor: "system:watchdog" }), baseCtx())).ok).toBe(true);
+  });
+
+  it("BR#6135: a taken-over (superseded) holder is refused on its next state change — stand down, not race", async () => {
+    const takenOver = {
+      status: "in_progress" as const,
+      to: "in_review" as const,
+      owner: "opencode-ray",
+      actor: "opencode-ray",
+      meta: {
+        session: "ray-local-1",
+        taken_over: { from_session: "bridge-task-BR-1", to_session: "ray-local-1", by: "opencode-ray", at: 1, reason: "test" },
+      },
+      body: { session: "bridge-task-BR-1", note: "PR https://example.com/1" },
+    };
+    const v = await decide(input(takenOver), baseCtx());
+    expect(v.ok).toBe(false);
+    if (v.ok === false) {
+      expect(v.code).toBe("guard-failed");
+      expect(v.rule).toBe("takeover-stale-holder");
+      expect(v.message).toContain("STAND DOWN");
+    }
+    // the NEW holder is unaffected
+    expect((await decide(input({ ...takenOver, body: { session: "ray-local-1", note: "PR https://example.com/2" } }), baseCtx())).ok).toBe(true);
+    // a session-less actor (watchdog/web) is structurally exempt — the
+    // watchdog must keep its release path through a takeover
+    expect((await decide(input({ ...takenOver, to: "todo", actor: "system:watchdog", body: {} }), baseCtx())).ok).toBe(true);
+    // the refusal dies once the card is pooled (todo → claim restamps session)
+    expect((await decide(input({ ...takenOver, status: "todo", to: "in_progress", body: { session: "bridge-task-BR-1" } }), baseCtx())).ok).toBe(true);
   });
 
   it("BR#5151: infrastructure close-protection no longer exempts the owner's own actor", async () => {
@@ -764,11 +833,27 @@ describe("effects decided executor-side (F4)", () => {
     expect(v.effects).toEqual([{ kind: "reuse_verify", parent: "BR#1", verify: "BR#99" }]);
   });
 
-  it("verify-of-verify / nesting guards SKIP the spawn — and the skip becomes a breach event", async () => {
+  it("verify-of-verify / nesting guards DETACH the verify round instead of dropping the review leg (BR#6518)", async () => {
     const c = baseCtx();
     c.spawnGuard = () => "ancestor BR#5 is a review task — verify-of-verify is blocked";
-    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "PR https://x/pull/1" } }), c));
-    expect(v.effects).toEqual([{ kind: "skip_verify_spawn", parent: "BR#1", reason: "ancestor BR#5 is a review task — verify-of-verify is blocked" }]);
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "PR https://github.com/x/y/pull/1" } }), c));
+    expect(v.effects).toEqual([
+      {
+        kind: "spawn_verify",
+        parent: "BR#1",
+        detached: true,
+        reroute: "ancestor BR#5 is a review task — verify-of-verify is blocked",
+        pr: "https://github.com/x/y/pull/1",
+      },
+    ]);
+  });
+
+  it("a depth-capped subject with a stamped round REUSES it — no duplicate detached duty per bounce cycle (BR#6518)", async () => {
+    const c = baseCtx();
+    c.spawnGuard = () => "nesting depth 3 would exceed the child_of cap of 3";
+    c.openVerifyRound = () => ({ id: "BR#77" });
+    const v = ok(await decide(input({ status: "in_progress", to: "in_review", body: { note: "receipts: https://github.com/x/y/pull/1" } }), c));
+    expect(v.effects).toEqual([{ kind: "reuse_verify", parent: "BR#1", verify: "BR#77" }]);
   });
 
   it("blocked spawns an unblock child with the exit condition; cap and flood guard skip it", async () => {
@@ -1359,6 +1444,51 @@ describe("claim-race classification (BR#3337)", () => {
     ]);
   });
 
+  // BR#6135: interactive claim takeover — every takeover refusal is the
+  // ownership machinery working, never a breach. The audited reason ends in
+  // its [rule: takeover-*] tag (do.ts trims messages to keep the tag inside
+  // the 300-char slice, BR#4295 anchoring), and RULE_BREACH_CLASSES folds
+  // each tag: authority/target/stale-holder → claim_race (BR#3429
+  // symmetry), held → release_held (BR#4562 symmetry), verdict-duty →
+  // gate:separation (SoD is not transferable). Message texts mirror
+  // takeover.ts / machine.ts verbatim — wording edits must land together
+  // with these pins (the BR#3611 specimen lesson).
+  it("takeover refusal tags classify without raising breach cards (BR#6135)", () => {
+    expect(breachClass("claim takeover of BR#6135A is owner/web/human-anchored or full-agent-credentialed (BR#2673: authority is server-verified, never self-declared; BR#6436: a full authenticated agent token — not gateway, not cron — may pull rank across owners) — you are random-agent and the card is held by dispatch-BR-1. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane). [rule: takeover-authority]")).toBe("claim_race");
+    expect(breachClass("claim takeover applies to an in_progress task — BR#6135A is a todo task. A todo card is claimed normally (claim = todo → in_progress); a blocked card is released/unblocked through its typed wait; an in_review card is bounced or closed through review. [rule: takeover-target]")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135A was taken over by web:rayh (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder]")).toBe("claim_race");
+    expect(breachClass("BR#6135A is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg. [rule: takeover-held]")).toBe("release_held");
+    expect(breachClass("BR#6135A is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over. [rule: takeover-verdict-duty]")).toBe("gate:separation");
+    // tag-cut variants: the audit slice truncates at 300 chars and the
+    // long takeover messages interpolate ids/actors/principals, so the
+    // ladder must own the structural shape too (BR#4295/BR#3611) — same
+    // families, tag or no tag:
+    expect(breachClass("claim takeover of BR#6135C is owner/web/human-anchored or full-agent-credentialed (BR#2673: authority is server-verified, never self-declared; BR#6436: a full authenticated agent token — not gateway, not cron — may pull rank across owners) — you are a-very-long-actor-label-at-the-limit-of-the-schema-field and the card is held by p_a_long_principal_identifier_from_the_auth_tokens_table. If you are not the owner: coordinate via ask_agent, or raise a human ask (a human can take over via the web plane).")).toBe("claim_race");
+    expect(breachClass("the claim on BR#6135D was taken over by web:rayh (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish. [rule: takeover-stale-holder] (this tail would be cut past 300 chars in a real audit)".slice(0, 300))).toBe("claim_race");
+    expect(breachClass("BR#6135E is held by a bound ask (BR#999) — the wait owns the exit, not the executor. Take it over after the wait resolves (merge lands / await fires / ask answers); a mid-wait flip would strand the typed leg.".padEnd(301, " x"))).toBe("release_held");
+    expect(breachClass("BR#6135F is a verify/unblock duty card — separation of duties is not transferable (BR#2997). The duty session renders its own verdict (or records 'cannot proceed' and closes done); if it is stuck, ask/escalate rather than take over.".padEnd(301, " y"))).toBe("gate:separation");
+    // the audit shape: a refusal storm on one card folds to claim_race and
+    // raises nothing; a genuine gate refusal on the same card is untouched
+    const takeoverEvents = (n: number, task = "BR#6135A") =>
+      Array.from({ length: n }, (_, i) => ({
+        ts: 1_000_000 + i * 60_000,
+        task,
+        op: "transition_rejected",
+        reason: `takeover needs an owner/web/human-anchored or full-agent-credentialed taker — bearer 'random-agent' is neither; the holder keeps the claim. [rule: takeover-authority]`,
+      }));
+    expect(detectBreaches(takeoverEvents(9), new Set())).toHaveLength(0);
+    const genuine = [0, 1, 2].map((n) => ({
+      ts: 1_000_000 + n * 60_000,
+      task: "BR#6135B",
+      op: "transition_rejected",
+      reason: "task BR#6135B cannot be completed unreviewed — complete a verify (review-role) child task first",
+    }));
+    const mixed = [...takeoverEvents(5, "BR#6135B"), ...genuine];
+    expect(detectBreaches(mixed, new Set())).toMatchObject([
+      { klass: "gate:done-unreviewed", count: 3 },
+    ]);
+  });
+
   it("genuine gate storms still raise exactly one breach; races never contaminate the count", () => {
     const genuine = [0, 1, 2].map((n) => ({
       ts: 1_000_000 + n * 60_000,
@@ -1591,6 +1721,28 @@ describe("release-holds-train-queue (BR#4067)", () => {
   // train does NOT own anymore (it handed the leg back; re-entry is a fresh
   // verify/impl round), so the stall sweep may demote the STRANDED re-entry
   // (in_progress, dead executor) to a claimable todo.
+  it("BR#6839: internal train hands bounced work directly to the pool without a phantom claim or churn penalty", async () => {
+    for (const status of ["blocked", "in_progress"]) {
+      const v = await decide(input({ status, to: "todo", actor: "system:merge-train",
+        meta: { merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" }, attempt: { attempts: 99 } } as any,
+        body: { note: "train repair handoff", demote_bounced_reentry: true } }), baseCtx());
+      expect(v.ok).toBe(true);
+      if (v.ok) {
+        expect(v.status).toBe("todo");
+        expect(v.owner_clear).toBe(true);
+        expect(v.meta_patch.attempt).toBeUndefined();
+        expect(v.effects).not.toEqual(expect.arrayContaining([expect.objectContaining({ kind: "release_redirect" })]));
+      }
+    }
+  });
+  it("BR#6839: repair handoffs cannot consume a separate human/dependency wait", async () => {
+    for (const wait of [{ awaiting_ask: { ask_id: "BR#12" } }, { blocked: { await_event: { event: "br_done", id: "BR#12" } } }]) {
+      const v = await decide(input({ status: "blocked", to: "todo", actor: "system:merge-train",
+        meta: { merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge" }, ...wait } as any,
+        body: { note: "train repair handoff", demote_bounced_reentry: true } }), baseCtx());
+      expect(v.ok).toBe(false);
+    }
+  });
   it("BR#4494 carve-out: the sweep's demote of a stranded in_progress bounced re-entry passes — flag + in_progress + bounced", async () => {
     const bounced = {
       merge_train: { state: "bounced", pr: 259, repo: "state-vector/bridge", bounce_kind: "coverage", bounced_at: 1 },
@@ -1628,6 +1780,36 @@ describe("release-holds-train-queue (BR#4067)", () => {
       body: { note: "forged flag", demote_bounced_reentry: true },
     }), baseCtx());
     expect(awaiting).toMatch(/merge-train awaiting-ci/);
+  });
+
+  // BR#5750 — the carve-out widens to awaiting + stopped: an in_progress
+  // card is never a live awaiting park (that park lives on blocked) nor a
+  // live stop-park; the stranded re-entry demotes exactly like bounced. The
+  // BLOCKED parks of both stay protected, flag or no flag.
+  it("BR#5750 carve-out: the sweep's demote of a stranded in_progress awaiting/stopped re-entry passes — flag + in_progress", async () => {
+    for (const state of ["awaiting", "stopped"]) {
+      const reentry = {
+        merge_train: { state, pr: 259, repo: "state-vector/bridge", ...(state === "awaiting" ? { awaiting: { at: 1 } } : {}) },
+        pr: { repo: "state-vector/bridge", number: 259 },
+      };
+      const msg = await check(input({
+        status: "in_progress", to: "todo", actor: "system:watchdog", meta: reentry as any,
+        body: { note: "bounce re-entry demoted (watchdog, BR#4494/BR#5750)", demote_bounced_reentry: true },
+      }), baseCtx());
+      expect(typeof msg === "string" ? msg : "").not.toMatch(/release-holds/);
+    }
+  });
+
+  it("BR#5750 carve-out stays narrow: an AWAITING card parked BLOCKED stays held even with the flag", async () => {
+    const parked = await check(input({
+      status: "blocked", to: "todo", actor: "system:watchdog",
+      meta: {
+        merge_train: { state: "awaiting", pr: 259, repo: "state-vector/bridge", awaiting: { at: 1 } },
+        pr: { repo: "state-vector/bridge", number: 259 },
+      } as any,
+      body: { note: "forged flag", demote_bounced_reentry: true },
+    }), baseCtx());
+    expect(parked).toMatch(/merge-train awaiting/);
   });
 
   it("a typed await_event holds — the proxy watch owns the exit, not the sweep", async () => {
@@ -1738,7 +1920,30 @@ describe("breachClass: release_held (BR#4562)", () => {
       op: "transition_rejected", task: "TASK-001", ts: 1000 + i * 60_000, reason,
     }));
     const out = detectBreaches(events as any, new Set());
-    expect(out.map((b) => b.klass)).not.toContain("release_held");
+    // BR#6654 hardening: the tag classifies this shape as release:held-typed-await,
+    // NOT release_held — the old assertion (not.toContain("release_held")) passed
+    // vacuously while the named class raised at the default threshold 3. The law
+    // is: NO breach at all, under either spelling.
+    expect(out).toEqual([]);
+  });
+
+  it("BR#6654 specimen: a tagged train-queue refusal storm (one per alarm tick, BR#4687 2026-11-05 14:09–14:11Z) raises nothing", () => {
+    const reason = "card is merge-train awaiting-ci (typed await pr_merged state-vector/bridge#322) — the train owns delivery; a machine silence-release must not destroy the queue slot. Wait out the proxy (pr_merged flip closes it) or re-queue explicitly; do not release to the pool. [rule: release-holds-train-queue]";
+    expect(reason.length).toBeLessThanOrEqual(300); // short repo name — the tag survives the audit slice
+    expect(breachClass(reason)).toBe("release:held-train-queue");
+    const events = Array.from({ length: 12 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#4687", ts: 1000 + i * 60_000, reason,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("the named release:held-* classes share release_held's never-a-breach pricing (BREACH_THRESHOLDS pin)", () => {
+    expect(BREACH_THRESHOLDS["release_held"]).toBe(Number.POSITIVE_INFINITY);
+    expect(BREACH_THRESHOLDS["release:held-typed-await"]).toBe(Number.POSITIVE_INFINITY);
+    expect(BREACH_THRESHOLDS["release:held-train-queue"]).toBe(Number.POSITIVE_INFINITY);
+    // the honest names survive: classification is observability, pricing is the law
+    expect(breachClass("x [rule: release-holds-typed-await]")).toBe("release:held-typed-await");
+    expect(breachClass("x [rule: release-holds-train-queue]")).toBe("release:held-train-queue");
   });
 
   it("the contrast holds: an equally persistent unknown refusal still folds unclassified and raises at the threshold", () => {
@@ -2030,5 +2235,64 @@ describe("blockedParkVerdict (BR#2893)", () => {
   it("the spawner cap is a real, exported constant", () => {
     expect(UNBLOCK_SPAWN_CAP).toBeGreaterThanOrEqual(2);
     expect(Number.isInteger(UNBLOCK_SPAWN_CAP)).toBe(true);
+  });
+});
+
+// ---- BR#5874: PR-target resolution + same-round matching -----------------
+// The verify-round supersede must tell the parent's OWN duty (round for the
+// deliverable PR) from a disposition duty covering a DIFFERENT PR. Duties
+// carry no meta.pr — their PR surfaces in the body URL or the title.
+describe("prTargetsOf / prTargetMatch (BR#5874)", () => {
+  it("meta.pr / meta.prs bindings win over body and title", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ pr: { repo: "state-vector/superpositional", number: 2573 }, prs: [{ repo: "state-vector/superpositional", number: 2573 }, { repo: "state-vector/bridge", number: 300 }] }),
+      body_md: "see https://github.com/other/repo/pull/999",
+      title: "Verify: something PR #1",
+    });
+    expect(t).toEqual([
+      { repo: "state-vector/superpositional", number: 2573 },
+      { repo: "state-vector/bridge", number: 300 },
+    ]);
+  });
+
+  it("an unbound duty resolves from the body's canonical pull URL (the auto-spawn prLink)", () => {
+    // BR#5735 shape: no meta.pr; the spawn template wrote the parent's PR URL into the body
+    const t = prTargetsOf({
+      meta: JSON.stringify({ superseded_reason: "x" }),
+      body_md: "Receipts: https://github.com/state-vector/superpositional/pull/2573, merge state...",
+      title: "Verify: Backlog disposition",
+    });
+    expect(t).toEqual([{ repo: "state-vector/superpositional", number: 2573 }]);
+  });
+
+  it("an unbound duty with no body URL resolves from the title's 'slug PR #N' (BR#5746 shape)", () => {
+    const t = prTargetsOf({
+      meta: JSON.stringify({ session: "dispatch-BR-5746" }),
+      body_md: "no urls here",
+      title: "Verify: superpositional PR #2329 — canary: judge chat CONVERSATION answer shape",
+    });
+    expect(t).toEqual([{ repo: "superpositional", number: 2329 }]);
+  });
+
+  it("a bare 'PR #N' title yields a repo-less target; no signal anywhere yields []", () => {
+    expect(prTargetsOf({ title: "Verify: fix the widget (PR #12)" })).toEqual([{ number: 12 }]);
+    expect(prTargetsOf({ meta: "{}", body_md: "nothing", title: "Verify: docs pass" })).toEqual([]);
+    expect(prTargetsOf(null)).toEqual([]);
+  });
+
+  it("garbage meta does not throw", () => {
+    expect(prTargetsOf({ meta: "{not json", title: "PR #7" })).toEqual([{ number: 7 }]);
+  });
+
+  it("prTargetMatch: number decides; slugs compare full or local segment; missing slug matches on number", () => {
+    const full = { repo: "state-vector/superpositional", number: 2573 };
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2573 })).toBe(true);
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2573 })).toBe(true); // bare slug vs full
+    expect(prTargetMatch(full, { repo: "state-vector/bridge", number: 2573 })).toBe(false); // same number, other repo
+    expect(prTargetMatch(full, { repo: "state-vector/superpositional", number: 2329 })).toBe(false);
+    expect(prTargetMatch(full, { number: 2573 })).toBe(true); // repo-less title target
+    expect(prTargetMatch(full, null)).toBe(false);
+    // the incident pair must NOT match: round for #2573 vs disposition for #2329
+    expect(prTargetMatch(full, { repo: "superpositional", number: 2329 })).toBe(false);
   });
 });

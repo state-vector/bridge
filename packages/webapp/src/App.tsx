@@ -10,7 +10,7 @@ import { TopView } from "./components/TopView";
 import { WorkspacePicker } from "./components/WorkspacePicker";
 import type { WsFrame } from "@bridge/specs";
 import { cardIdFromPathSegment, cardPath } from "@bridge/specs";
-import { Btn, Chip, StatusLights, ReportsView, TaskDetail } from "@bridge/ui-kit";
+import { Btn, CardLookup, Chip, StatusLights, ReportsView, TaskDetail } from "@bridge/ui-kit";
 import { connectHub, disconnectHub, useBridge } from "./lib/store";
 import { useKb } from "./store/kb";
 import "@bridge/ui-kit/tokens.css";
@@ -33,7 +33,7 @@ const TABS: Array<{ key: Tab; label: string }> = [
   { key: "connect", label: "Connect" },
 ];
 
-function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
+function TopBar({ tab, setTab, openCard }: { tab: Tab; setTab: (t: Tab) => void; openCard: (id: string) => void }) {
   const conn = useBridge((s) => s.conn);
   const session = useBridge((s) => s.session);
   const signOut = useBridge((s) => s.signOut);
@@ -49,6 +49,7 @@ function TopBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
         ))}
       </nav>
       <div className="topbar-spacer" />
+      <CardLookup onOpen={openCard} />
       <StatusLights bridgeConn={conn === "open" ? "open" : conn === "connecting" ? "connecting" : "closed"} />
       <WorkspacePicker />
       {session && (
@@ -142,7 +143,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <TopBar tab={tab} setTab={setTab} />
+      <TopBar tab={tab} setTab={setTab} openCard={openCard} />
       {conn === "closed" && (
         <div className="conn-banner">
           Hub unreachable — is it deployed / mock hub running (npm run hub)?
