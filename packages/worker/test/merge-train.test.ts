@@ -51,6 +51,7 @@ import {
   trainLegs,
   trainLegsRemaining,
   trainParseNoteLegs,
+  trainStampRefresh,
   trainQueueRemainingReason,
   trainStopAskTitle,
   trainStarvationAskTitle,
@@ -1180,6 +1181,89 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
     expect(v.verdict).toBe("green");
     expect(v.red).toEqual([]);
     expect(v.green).toBe(2);
+  });
+});
+
+// ---------- BR#5329: ghost rows + prose-only accepts ----------
+
+describe("trainParseNoteLegs (BR#5329 — ghost-row validation + machine-leg prose)", () => {
+  const h = "a".repeat(40);
+  it("BR#5329 defect 2: slash-joined card-reference prose never becomes a leg (the ghost meta.prs row defect)", () => {
+    // the exact production specimens (BR#5202 / BR#5304 close notes):
+    // `BR#4365/BR#4875` parsed as repo '4365/BR' #4875 and `BR#4728/BR#5299`
+    // as repo '4728/BR' #5299 — both gh 404, both queued ghost merge lanes
+    expect(trainParseNoteLegs(`parent BR#4365/BR#4875 re-verified; head ${h}`)).toEqual([]);
+    expect(trainParseNoteLegs(`base-owned BR#4728/BR#5299 class, train waits it out; head ${h}`)).toEqual([]);
+    // a card ref '#' glued to a REAL repo name is inert too (the lookbehind
+    // keeps the match from starting mid-token — the misparse could otherwise
+    // surface a WRONG but well-shaped repo)
+    expect(trainParseNoteLegs(`BR#1234/state-vector/bridge#307 head ${h}`)).toEqual([]);
+  });
+  it("BR#5329 defect 2: an all-numeric owner is rejected even when the prose hands the shape to the parser", () => {
+    expect(trainParseNoteLegs(`PR 4365/BR#4875 head ${h}`)).toEqual([]);
+    expect(trainParseNoteLegs(`PR 4728/BR#5299 head ${h}`)).toEqual([]);
+    // real repos with digits in the owner keep parsing (GitHub allows them)
+    expect(trainParseNoteLegs(`PR 4state/r#11 head ${h}`)).toEqual([
+      { repo: "4state/r", number: 11, head_sha_at_acceptance: h },
+    ]);
+  });
+  it("BR#5329 defect 1: the typed machine-leg prose repo=o/r n=N is a PR reference", () => {
+    // the exact BR#5315 close-note shape — the note carried the head token and
+    // this prose only, so the accept stamp stayed at the PRIOR verdict's head
+    // and every re-verify coverage-bounced at an unchanged live head
+    expect(trainParseNoteLegs(`head ${h} — Parent BR#5202 parked with the ONE typed leg await_event pr_merged repo=state-vector/superpositional n=2624 (conjunction as prose, BR#3986)`)).toEqual([
+      { repo: "state-vector/superpositional", number: 2624, head_sha_at_acceptance: h },
+    ]);
+  });
+  it("BR#5329 defect 1: the seeded duty brief's JSON-ish leg repo:\"o/r\", n:N is a PR reference", () => {
+    expect(trainParseNoteLegs(`head ${h}; pass await_event {event:"pr_merged", repo:"state-vector/bridge", n:307}`)).toEqual([
+      { repo: "state-vector/bridge", number: 307, head_sha_at_acceptance: h },
+    ]);
+  });
+  it("BR#5329: a repo=/n= citation without its n= half (or vice versa) never invents a leg", () => {
+    expect(trainParseNoteLegs(`repo=state-vector/superpositional without the number; head ${h}`)).toEqual([]);
+    expect(trainParseNoteLegs(`n=2624 alone names no repo; head ${h}`)).toEqual([]);
+  });
+});
+
+describe("trainStampRefresh (BR#5329 — the no-PR-citation stamp refresh, pure)", () => {
+  const R = "state-vector/superpositional";
+  const old1 = "1".repeat(40), old2 = "2".repeat(40), fresh = "f".repeat(40);
+  const legs2 = [
+    { repo: R, number: 2624, head_sha_at_acceptance: old1 },
+    { repo: R, number: 2633, head_sha_at_acceptance: old2 },
+  ];
+  it("BR#4648 unchanged: lone head + a single open leg refreshes it", () => {
+    const r = trainStampRefresh({ legs: [{ repo: R, number: 2624, head_sha_at_acceptance: old1 }], meta: {}, note: `head ${fresh} — VERIFY ACCEPT` });
+    expect(r.legs[0].head_sha_at_acceptance).toBe(fresh);
+    expect(r.refreshed).toEqual([{ number: 2624, repo: R, head: fresh, via: expect.stringContaining("BR#4648") }]);
+  });
+  it("BR#5329: lone head + a bare `PR #N` citation refreshes the NAMED leg on a multi-leg stamp", () => {
+    const r = trainStampRefresh({ legs: legs2, meta: {}, note: `head ${fresh} — PR #2633 verified, rebase-only, content unchanged` });
+    expect(r.legs[0].head_sha_at_acceptance).toBe(old1);
+    expect(r.legs[1].head_sha_at_acceptance).toBe(fresh);
+    expect(r.refreshed).toEqual([{ number: 2633, repo: R, head: fresh, via: expect.stringContaining("BR#5329") }]);
+  });
+  it("multi-leg stamp, no leg named — fail-closed, no guessing which leg the head names", () => {
+    const r = trainStampRefresh({ legs: legs2, meta: {}, note: `head ${fresh} — VERIFY ACCEPT` });
+    expect(r.legs).toEqual(legs2);
+    expect(r.refreshed).toEqual([]);
+  });
+  it("a landed leg is out of the refresh pool; a no-op head stays a no-op", () => {
+    const meta = { merge_train: { legs: { "2624": { state: "landed" } } } };
+    const r = trainStampRefresh({ legs: legs2, meta, note: `head ${fresh} — PR #2624` });
+    // 2624 landed → the one OPEN leg (2633) is the lone-head target (BR#4648);
+    // the landed leg's stamp never moves
+    expect(r.legs[0].head_sha_at_acceptance).toBe(old1);
+    expect(r.legs[1].head_sha_at_acceptance).toBe(fresh);
+    expect(r.refreshed.map((x) => x.number)).toEqual([2633]);
+    const noop = trainStampRefresh({ legs: [{ repo: R, number: 2624, head_sha_at_acceptance: fresh }], meta: {}, note: `head ${fresh}` });
+    expect(noop.refreshed).toEqual([]);
+  });
+  it("no head token — nothing to do", () => {
+    const r = trainStampRefresh({ legs: legs2, meta: {}, note: `PR #2633 verified, head omitted` });
+    expect(r.legs).toEqual(legs2);
+    expect(r.refreshed).toEqual([]);
   });
 });
 
