@@ -2438,7 +2438,7 @@ export class KnowledgeHub {
       .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
     const executionNow = Date.now();
     for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
-      { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements }, executionNow);
+      { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -4255,7 +4255,7 @@ export class KnowledgeHub {
     const shaped = this.shape(row);
     if (row.type === "task") {
       shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
-      shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements }, Date.now());
+      shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
     }
     return shaped;
   }

@@ -11,7 +11,7 @@ import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
 import { SupersedeBtn } from "./supersede";
-import { ExecutionModel } from "./ExecutionModel";
+import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
 import { ExecutionHistoryEventSchema, executionHistorySummary } from "@bridge/contracts";
 import { StartupWaitNotice } from "./StartupWaitNotice";
 
@@ -323,8 +323,8 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
     ["status", task.status],
     ["owner", task.owner || undefined],
     ["session", m.session],
-    ["model", task.execution?.current.kind !== "unreported" ? task.execution?.current.model ?? undefined : undefined],
-    ["minimum model tier", task.execution?.minimum_tier ?? undefined],
+    ["model", task.execution?.current.kind === "managed" ? task.execution.current.model ?? undefined : undefined],
+    ["automation minimum tier", task.execution?.minimum_tier ?? undefined],
     ["kind", m.kind],
     ["project", (task as any).project || undefined],
     ["created by", (task as any).created_by || undefined],
@@ -334,7 +334,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
   ];
   return (
     <div className="task-state-card">
-      {task.type === "task" && <div className="task-model-facts"><b>Execution model</b><ExecutionModel value={task.execution} /></div>}
+      {task.type === "task" && <div className="task-model-facts"><b>Model size</b><ExecutionModel value={task.execution} /><b>Execution state</b><ExecutionStatus value={task.execution} /></div>}
       {hasGauges && (
         <div className="gauge-row">
           {gauges.filter(([, v]) => v !== undefined).map(([k, v]) => (

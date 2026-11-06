@@ -1124,7 +1124,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    sweep missed — still referenced by TopView markup (task-id column,
    status cell). Visual only, same constraint as the block above. */
 .top-task-id { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px; margin-right: 5px; opacity: .9; }
-.topc-status { display: flex; align-items: center; gap: 5px; overflow: hidden; }
+.topc-status { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; overflow: hidden; }
 .top-row.top-click { cursor: pointer; }
 .top-row.top-click:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 
@@ -1161,13 +1161,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-agent-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .execution-model { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; font-size: 10px; font-weight: 500; line-height: 1.5; white-space: normal; }
 .execution-model-size { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
-.execution-model-size.model-live { color: var(--accent); }
-.execution-model-size.model-recorded { color: var(--muted); }
-.execution-model-request { color: var(--startup); }
 .topc-model .execution-model { flex-wrap: nowrap; font-size: 11px; }
 .topc-model .execution-model-size { flex: 0 0 auto; }
-.topc-model .execution-model-request { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-model-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.execution-state { display: block; font-size: 10px; font-weight: 500; color: var(--muted); white-space: normal; }
+.topc-status .execution-state { flex: 0 0 100%; }
 .topc-session { font-size: 11px; }
 .top-will { color: var(--accent); opacity: .8; }
 .top-sent { display: none; }

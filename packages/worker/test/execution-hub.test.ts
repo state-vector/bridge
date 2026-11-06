@@ -64,6 +64,15 @@ async function interactive(label: string) {
 }
 
 describe("local handoff authority and lifecycle", () => {
+  it("projects direct human-directed sessions as custom without assigning an autonomous tier", async () => {
+    const agent = await interactive("custom-model-session");
+    const task = (await post<{ id: string }>("create", { actor: agent.label, type: "task", title: "Interactive custom model", project: "bridge", qualified: true, meta: { execution_requirements: { tier: "large" } } })).data;
+    const claim = await post("transition", { id: task.id, actor: agent.label, token_id: agent.token_id, session: "human-custom", to: "in_progress", note: "Human-directed local session supplies its own configured model; direct interactive pickup resolves the automation capability wait" });
+    expect(claim.data.error).toBeUndefined();
+    const card = await post<{ execution: { minimum_tier: string; current: { kind: string; session: string } } }>("get", { id: task.id });
+    expect(card.data.execution).toEqual({ minimum_tier: "large", current: { kind: "interactive", session: "human-custom", phase: "active" } });
+    expect(card.data.execution.current).not.toHaveProperty("tier");
+  });
   it("serves scheduler readiness and per-host counts on the public board projection", async () => {
     const r = await runtimeTask();
     const response = await stub.fetch("https://kb/board", { method: "GET" });
@@ -239,7 +248,8 @@ describe("local handoff authority and lifecycle", () => {
     const winner = results[0].data.kind === "accepted" ? { ...a, session: "local-a" } : { ...b, session: "local-b" };
     expect((await post("handoff.accept", { ...request, session: winner.session, token_id: winner.token_id })).data.kind).toBe("already_accepted");
     const model = await post<{ execution: { current: { kind: string; tier: string; session: string } } }>("get", { id: r.id });
-    expect(model.data.execution.current).toMatchObject({ kind: "local", tier: "large", session: winner.session });
+    expect(model.data.execution.current).toMatchObject({ kind: "interactive", session: winner.session });
+    expect(model.data.execution.current).not.toHaveProperty("tier");
     expect((await post("transition", { id: r.id, to: "todo", actor: winner.label, token_id: winner.token_id, session: winner.session })).data.error).toMatch(/explicit human-authorised return/);
     const cp = await post("handoff.checkpoint", { ...request, session: winner.session, token_id: winner.token_id, checkpoint: { ...checkpoint, commit: "d".repeat(40) } });
     expect(cp.data.version).toBe(2);

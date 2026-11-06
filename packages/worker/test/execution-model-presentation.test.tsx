@@ -1,7 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ExecutionModelViewSchema } from "@bridge/contracts";
-import { ExecutionModel } from "../../ui-kit/src/views/ExecutionModel.tsx";
+import { ExecutionModel, ExecutionStatus } from "../../ui-kit/src/views/ExecutionModel.tsx";
 import { TaskHistoryLine } from "../../ui-kit/src/views/TaskDetail.tsx";
 import { TopView } from "../../ui-kit/src/views/TopView.tsx";
 import { useKb } from "../../ui-kit/src/server/kbStore.ts";
@@ -22,11 +22,11 @@ it("gives actual size its own Top column with matching header, parent and child 
   try {
     const html = renderToStaticMarkup(<TopView />);
     expect(html).toContain("gateway/worker");
-    expect(html).toContain("medium · stopping");
-    expect(html).toContain("large requested");
+    expect(html).toContain("medium =&gt; large");
+    expect(html).toContain('aria-label="Execution state"');
     expect(html).toContain("provider/glm-5.3");
     expect(html).toContain('class="topc-model" title=');
-    expect(html).toContain("model / tier");
+    expect(html).toContain("model size");
     // Extract the real header and task rows, not a hand-built approximation.
     const header = /class="ktable-head top-head">([\s\S]*?)<\/div>/.exec(html)![1];
     const rows = [...html.matchAll(/class="ktable-row top-row[^\"]*"[^>]*>([\s\S]*?)<\/div>/g)];
@@ -41,13 +41,25 @@ it("gives actual size its own Top column with matching header, parent and child 
     for (const [, row] of rows) {
       expect(columns(row)).toEqual(columns(header));
       expect(row).toMatch(/class="topc-agent"[^>]*><span class="top-agent-name">gateway\/worker<\/span><\/span><span class="topc-model"><span class="execution-model"/);
+      const modelCell = /class="topc-model">([\s\S]*?)<\/span><\/span><\/span>/.exec(row)![1];
+      expect(modelCell).not.toMatch(/stopping|expired|last run|Execution state/);
+      expect(row).toMatch(/class="topc-status">[\s\S]*?stopping/);
     }
   } finally { useKb.setState(previous); }
 });
 it("renders missing/expired receipts honestly instead of claiming large is running", () => {
-  expect(renderToStaticMarkup(<ExecutionModel value={{ minimum_tier: "large", current: { kind: "unreported" } }} now={1} />)).toContain("size unreported");
+  const unknown = renderToStaticMarkup(<ExecutionModel value={{ minimum_tier: "large", current: { kind: "unreported" } }} now={1} />);
+  expect(unknown).toContain(">unknown<"); expect(unknown).not.toContain("=&gt;");
   const expired = ExecutionModelViewSchema.parse({ ...view, current: { ...view.current, phase: "running", lease_until: 10 } });
-  expect(renderToStaticMarkup(<ExecutionModel value={expired} now={20} />)).toContain("medium · expired");
+  const size = renderToStaticMarkup(<ExecutionModel value={expired} now={20} />);
+  expect(size).toContain("medium =&gt; large"); expect(size).not.toContain("expired");
+  expect(renderToStaticMarkup(<ExecutionStatus value={expired} now={20} />)).toContain("lease expired");
+});
+it("shows interactive sessions as custom without a gateway tier or upgrade comparison", () => {
+  const interactive = ExecutionModelViewSchema.parse({ minimum_tier: "large", current: { kind: "interactive", session: "human-session", phase: "active" } });
+  const html = renderToStaticMarkup(<ExecutionModel value={interactive} now={1} />);
+  expect(html).toContain(">custom<"); expect(html).not.toContain("=&gt;"); expect(html).not.toContain(">large<");
+  expect(renderToStaticMarkup(<ExecutionStatus value={interactive} now={1} />)).toContain(">interactive<");
 });
 it("renders structured escalation history with the complete reason, actor, and source", () => {
   const reason = "This needs a larger reasoning model. ".repeat(30);
