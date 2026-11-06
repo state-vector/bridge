@@ -3163,3 +3163,7 @@ on every reservation.
 Standing merge-lane infrastructure never completes from a PR merge receipt,
 even when an agent accidentally attaches PR-delivery metadata. Provenance
 cleanup may finish delivery cards, but cannot retire the train itself.
+Hub schema initialization runs once per Durable Object instance/build, sharing
+one initialization across concurrent requests. A failed storage initialization
+is retried; warm lease, inbox and readiness requests do not rerun migrations or
+full-table maintenance. A newly deployed instance still runs its migrations.

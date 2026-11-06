@@ -10,6 +10,7 @@
  * Ops: create | get | list | search | update | transition | link | stats
  */
 import { WorkerStatusSchema } from "@bridge/contracts";
+import { SchemaInitialization } from "./schema-init.ts";
 import type { DeliveryAdmission, DeliveryDisposition, AcceptedPrLeg } from "@bridge/contracts";
 import {
   scaffoldBody,
@@ -428,6 +429,7 @@ import {
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
+  private readonly schemaInitialization = new SchemaInitialization();
 
   /** ensureSchema runs once per isolate, not per request — its migration
    *  queries are full-table scans, and the free-tier DO row-read quota
@@ -2935,13 +2937,15 @@ export class KnowledgeHub {
     return { ...a, relations: rel.relations };
   }
 
-  async ensureSchema() {
-    // NO early-return flag: this DO's isolate is long-lived, and a flag set
-    // on first boot meant every migration added later NEVER ran on the warm
-    // singleton — today's schema additions silently broke against production
-    // while working on fresh local DBs. Everything here is idempotent by
-    // construction (IF NOT EXISTS + guarded ALTERs); the per-fetch cost is a
-    // few cheap statements.
+  ensureSchema(): Promise<void> {
+    return this.schemaInitialization.run(() => this.initializeSchema());
+  }
+
+  private async initializeSchema() {
+    // A new DO instance/build runs every idempotent schema/migration step.
+    // Warm requests must not repeat hundreds of SQL statements/full-table
+    // updates on the critical lease, inbox and readiness paths. Storage faults
+    // clear the shared initializer so a partial failure is retried safely.
     this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS artefacts (
         id TEXT PRIMARY KEY,
