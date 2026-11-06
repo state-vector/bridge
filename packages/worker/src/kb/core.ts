@@ -962,10 +962,19 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
 
 // ---------- destination-green stop-the-line (BR#3008) ----------
 // The classifier for main's HEAD check runs, shared by the hub's
-// stopTheLineSweep (the loud half of BR#3009's destination-green rule). Pure
-// by construction: the same decision rule as scripts/main-green-gate.sh (the
-// mechanical half — the required `main-green gate` check), kept in lockstep
-// by both being pinned in tests.
+// stopTheLineSweep (the loud half of BR#3009's destination-green rule).
+//
+// REFERENCE IMPLEMENTATION (BR#5518): the gate is ONE shared definition in
+// state-vector/bridge — scripts/main-green-gate.sh, wrapped by the composite
+// action .github/actions/main-green-gate/action.yml and referenced by every
+// repo through the reusable workflow .github/workflows/main-green-gate.yml
+// (callers pin @vN, never @main — no per-repo script copies). THIS classifier
+// mirrors that decision rule and must stay in lockstep: same
+// MAIN_RED_CONCLUSIONS as the script's RED_CONCLUSIONS, same newest-non-
+// cancelled-run-per-NAME judge, same cancelled-says-nothing rule, same own-
+// run (GITHUB_RUN_ID) exclusion. A change to either side without the other
+// is silent rule drift — both are pinned case-by-case in tests
+// (scripts/tests/main-green-gate.test.sh; packages/worker/test/).
 
 export type MainCheckRun = {
   id: number;

@@ -14,6 +14,13 @@
 #   - all-cancelled and zero-check-runs fail (the vacuity guard);
 #   - the remediation carve-out passes ONLY when the PR head is green on
 #     every red check, and fails when any red check is unremediated;
+#   - the gate's own run (GITHUB_RUN_ID match on html_url/details_url) is
+#     excluded BEFORE the judge — the self-referential class BR#5487 found,
+#     fixed in the shared script so every repo inherits it (BR#5518); a run
+#     from a DIFFERENT run id still judges, and excluding the only run still
+#     trips the vacuity guard;
+#   - unset MAIN_GREEN_REPO fails loudly — the shared definition must be told
+#     which destination it vouches for (BR#5518); and
 #   - a gh API error fails loudly.
 #
 # Runs the REAL script against a stub `gh` on PATH (scripts/tests/fake-gh-
@@ -50,6 +57,16 @@ run() {
   local scenario="$1"; shift
   OUT=$(env "PATH=${SHIM_DIR}:${PATH}" "DHG_SCENARIO=${scenario}" "$@" \
         MAIN_GREEN_REPO="state-vector/bridge" bash "${SCRIPT}" 2>&1)
+  RC=$?
+}
+
+# run_no_repo <scenario> [env...] — same as run(), but MAIN_GREEN_REPO is
+# explicitly UNSET: the shared definition (BR#5518) must refuse to judge a
+# destination it was never told. One env var, no default, fail loudly.
+run_no_repo() {
+  local scenario="$1"; shift
+  OUT=$(env -u MAIN_GREEN_REPO "PATH=${SHIM_DIR}:${PATH}" "DHG_SCENARIO=${scenario}" "$@" \
+        bash "${SCRIPT}" 2>&1)
   RC=$?
 }
 
@@ -123,6 +140,44 @@ expect_rc 1 "no PR sha = no carve-out (red main still fails)"
 
 run red MAIN_GREEN_PR_SHA=prheadcc3
 expect_rc 1 "carve-out against a non-carve-out scenario fails closed"
+
+echo "# own-run exclusion (BR#5518 — the gate never counts itself into the verdict)"
+
+# Every own-run scenario puts the gate's own run (id 555, html_url carrying
+# the test's GITHUB_RUN_ID=424242) on main's HEAD — the self-referential
+# class BR#5487 found. The shared script drops it BEFORE the judge, so the
+# verdict is decided by the remaining checks.
+
+run own-run-pending MAIN_GREEN_SHA=ownruns0ha GITHUB_RUN_ID=424242
+expect_rc 0 "own in-flight run on the judged sha is excluded — the gate passes"
+expect_nogrep "UNSETTLED" "own pending run does not unsettle the gate"
+
+run own-run-pending MAIN_GREEN_SHA=ownruns0ha GITHUB_RUN_ID=999999
+expect_rc 1 "a pending run that is NOT this run's own still unsettles the gate"
+expect_grep "UNSETTLED" "non-own pending run is judged"
+
+run own-run-red MAIN_GREEN_SHA=ownruns0ha GITHUB_RUN_ID=424242
+expect_rc 0 "own FAILED run on the judged sha is excluded — no self-inflicted red"
+
+run own-run-name-red-other-id MAIN_GREEN_SHA=ownruns0ha GITHUB_RUN_ID=424242
+expect_rc 1 "a FAILED gate-named run from a DIFFERENT run id still judges (name match is not enough)"
+expect_grep "https://example/run/stale/gate" "the stale failed gate run is named with its URL"
+
+run own-run-only MAIN_GREEN_SHA=ownruns0ha GITHUB_RUN_ID=424242
+expect_rc 1 "excluding the own run leaves zero checks — the vacuity guard still fires"
+expect_grep "no check runs at all" "vacuity guard message printed"
+
+echo "# carve-out never self-vouches (BR#5518 — the PR leg applies the same exclusion)"
+
+run carve-out-self-vouch MAIN_GREEN_SHA=selfv1sha MAIN_GREEN_PR_SHA=prheadbb2 GITHUB_RUN_ID=424242
+expect_rc 1 "main red on 'main-green gate' + the PR head's own green gate run excluded — carve-out refuses self-vouching"
+expect_grep "carve-out checked but incomplete" "the refusal names the missing remediation"
+
+echo "# no-repo honesty (BR#5518 — the shared definition must be told its destination)"
+
+run_no_repo green
+expect_rc 1 "unset MAIN_GREEN_REPO fails loudly — the gate has no repo default"
+expect_grep "MAIN_GREEN_REPO is required" "the refusal names the missing input"
 
 echo
 echo "${TESTS} tests, ${FAILURES} failures"

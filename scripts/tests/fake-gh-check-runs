@@ -136,6 +136,84 @@ EOF
       echo "missd0sha"
     fi
     ;;
+  own-run-pending)
+    # BR#5518 own-run exclusion: id 555 is the gate's own run — its html_url
+    # carries the test's GITHUB_RUN_ID (424242). Everything else is settled
+    # green, so the verdict hinges on whether the own run is excluded.
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":901,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/own/Test"},
+ {"id":902,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/run/own/CLI"},
+ {"id":555,"name":"main-green gate","status":"in_progress","conclusion":null,"html_url":"https://example/run/424242/gate"}
+]}
+EOF
+    else
+      echo "ownruns0ha"
+    fi
+    ;;
+  own-run-red)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":901,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/own/Test"},
+ {"id":902,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/run/own/CLI"},
+ {"id":555,"name":"main-green gate","status":"completed","conclusion":"failure","html_url":"https://example/run/424242/gate"}
+]}
+EOF
+    else
+      echo "ownruns0ha"
+    fi
+    ;;
+  own-run-name-red-other-id)
+    # A FAILED run NAMED `main-green gate` but from a DIFFERENT run id — the
+    # exclusion must be run-id based, so this one still judges (and reds).
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":3,"check_runs":[
+ {"id":901,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/run/own/Test"},
+ {"id":902,"name":"CLI build (packages/cli)","status":"completed","conclusion":"success","html_url":"https://example/run/own/CLI"},
+ {"id":555,"name":"main-green gate","status":"completed","conclusion":"failure","html_url":"https://example/run/stale/gate"}
+]}
+EOF
+    else
+      echo "ownruns0ha"
+    fi
+    ;;
+  own-run-only)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":1,"check_runs":[
+ {"id":555,"name":"main-green gate","status":"in_progress","conclusion":null,"html_url":"https://example/run/424242/gate"}
+]}
+EOF
+    else
+      echo "ownruns0ha"
+    fi
+    ;;
+  carve-out-self-vouch)
+    # BR#5518 PR leg: main is red on `main-green gate` (the stale drill class);
+    # the PR head's only green gate run IS the executing run (own URL). The
+    # carve-out must refuse self-vouching: the own run is excluded, so no
+    # green judge remains for that name and the carve-out cannot apply.
+    if [[ "${url}" == *"/check-runs"* && -n "${MAIN_GREEN_PR_SHA:-}" && "${url}" == *"${MAIN_GREEN_PR_SHA}"* ]]; then
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":910,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/pr/Test"},
+ {"id":911,"name":"main-green gate","status":"completed","conclusion":"success","html_url":"https://example/pr/424242/gate"}
+]}
+EOF
+    elif [[ "${url}" == *"/check-runs"* ]]; then
+      cat <<'EOF'
+{"total_count":2,"check_runs":[
+ {"id":900,"name":"Test","status":"completed","conclusion":"success","html_url":"https://example/red/Test"},
+ {"id":901,"name":"main-green gate","status":"completed","conclusion":"failure","html_url":"https://example/red/stale-gate"}
+]}
+EOF
+    else
+      echo "selfv1sha"
+    fi
+    ;;
   api-error)
     echo "gh: (API) 502 Bad Request" >&2
     exit 1

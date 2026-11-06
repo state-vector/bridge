@@ -36,12 +36,26 @@
 # Exit codes: 0 = main green (or full remediation carve-out); 1 = everything
 # else, loudly. Any API error fails the gate — never a vacuous pass.
 #
-# Wired as the required check `main-green gate` in
-# .github/workflows/main-green-gate.yml (ruleset "main: main-green gate
+# SHARED DEFINITION (BR#5518): this is the ONE script. It is wrapped by the
+# composite action .github/actions/main-green-gate/action.yml and referenced
+# by every repo through the reusable workflow .github/workflows/main-green-gate.yml
+# (callers pin @vN, never @main). No repo carries its own copy.
+#
+# The hub-side classifier packages/worker/src/kb/core.ts (classifyMainCheckRuns
+# / classifyRequiredRuns) mirrors this decision rule and names it as the
+# reference implementation — keep the two in lockstep.
+#
+# Wired as the required check `main-green gate` (ruleset "main: main-green gate
 # required"). Guarded by scripts/tests/main-green-gate.test.sh.
 set -euo pipefail
 
-REPO="${MAIN_GREEN_REPO:-state-vector/bridge}"
+REPO="${MAIN_GREEN_REPO:-}"
+if [ -z "${REPO}" ]; then
+  echo "FAIL: MAIN_GREEN_REPO is required — the shared gate definition (BR#5518)"
+  echo "      vouches for a named destination and has no repo default. The caller"
+  echo "      (composite action or reusable workflow) must pass the destination repo."
+  exit 1
+fi
 RED_CONCLUSIONS="failure timed_out action_required startup_failure"
 
 sha="${MAIN_GREEN_SHA:-}"
@@ -61,8 +75,21 @@ runs_json="$(gh api "repos/${REPO}/commits/${sha}/check-runs?per_page=100")" || 
 # skipped (they say nothing). Output TSV: name <tab> judge-conclusion <tab>
 # judge-run-url, one line per name. An empty judge column with a `pending`
 # marker means the newest non-cancelled run has not finished (unsettled).
-classifications="$(printf '%s' "${runs_json}" | jq -r '
-  [.check_runs[]]
+#
+# Own-run exclusion (BR#5518, fixing the class BR#5487 found): the run
+# executing this script attaches its own check-run to whatever commit it
+# judges when the two coincide (sha-less workflow_dispatch) — including it
+# makes the gate count itself into the verdict (UNSETTLED while running, and
+# a failed drill then reds a green main as the newest judge). The gate's own
+# run is matched on GITHUB_RUN_ID in html_url/details_url and dropped BEFORE
+# the judge — a run-id match, not a name match, so a genuinely stale failed
+# `main-green gate` run from a DIFFERENT run id still judges. Every repo
+# calling the shared definition inherits this fix at once.
+classifications="$(printf '%s' "${runs_json}" | jq -r --arg own "${GITHUB_RUN_ID:-}" '
+  [.check_runs[]
+    | select($own == ""
+        or (((.html_url // "") | contains($own) | not)
+            and ((.details_url // "") | contains($own) | not)))]
   | if length == 0 then empty
     else
       group_by(.name)[]
@@ -123,8 +150,15 @@ if [ "${#red_names[@]}" -gt 0 ] && [ -n "${MAIN_GREEN_PR_SHA:-}" ]; then
   unremediated=()
   for i in "${!red_names[@]}"; do
     name="${red_names[$i]}"
-    pr_ok_url="$(printf '%s' "${pr_runs_json}" | jq -r --arg n "${name}" '
-      [.check_runs[] | select(.name == $n and .conclusion != "cancelled")]
+    # The carve-out never lets the gate vouch for itself either: the same
+    # own-run exclusion applies to the PR-head enumeration — the run currently
+    # executing is not evidence, whatever its eventual conclusion (BR#5518).
+    pr_ok_url="$(printf '%s' "${pr_runs_json}" | jq -r --arg n "${name}" --arg own "${GITHUB_RUN_ID:-}" '
+      [.check_runs[]
+        | select(.name == $n and .conclusion != "cancelled"
+            and ($own == ""
+              or (((.html_url // "") | contains($own) | not)
+                  and ((.details_url // "") | contains($own) | not))))]
       | sort_by(-.id) | .[0]
       | if . == null then empty
         elif .conclusion == "success" then .html_url

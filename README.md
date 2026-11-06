@@ -1438,21 +1438,29 @@ A blocked card without something it is *awaiting* is structurally impossible. `t
 Merges must not land while the destination branch is red — accepted decision BR#3009 makes
 that law, and BR#3008 makes it mechanical instead of discipline. Three halves, same rule:
 
-- **The block**: every PR runs the required `main-green gate` check
-  (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
-  check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
-  (or a check still running, or no check runs at all) fails the gate and GitHub refuses
-  the merge via the `main: main-green gate + substance checks required` ruleset. The
-  newest run per check judges; a cancelled run says nothing. The one exception is written
-  into the gate: a PR green on the *exact* checks main fails passes with a printed
-  **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
-  receipted, not a loophole.
+- **The block**: every PR runs the required `main-green gate` check — the ONE
+  shared definition in this repo (BR#5518): `scripts/main-green-gate.sh` (the
+  single script), wrapped by the composite action
+  `.github/actions/main-green-gate/action.yml`, and referenced by every repo
+  via the reusable workflow `.github/workflows/main-green-gate.yml` (callers
+  pin `@vN`, never `@main`). It reads the check runs on main's HEAD
+  (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure (or a check
+  still running, or no check runs at all) fails the gate and GitHub refuses
+  the merge via the `main: main-green gate + substance checks required`
+  ruleset. The newest run per check judges; a cancelled run says nothing; the
+  gate's OWN check-run is excluded (a `GITHUB_RUN_ID` match — a drill or
+  re-check run can never count itself into the verdict: the self-referential
+  class BR#5487 found, fixed in the shared script so every repo inherits it).
+  The one exception is written into the gate: a PR green on the *exact* checks
+  main fails passes with a printed **REMEDIATION CARVE-OUT** receipt —
+  BR#3009's remediation-merge path, expressible and receipted, not a loophole.
   Manual gate drills honour the same rule: a `workflow_dispatch` run MUST pass an
-  explicit `main_sha` (BR#5487) — a sha-less dispatch with `--ref main` attaches the
-  drill's own `main-green gate` check-run to main's HEAD, so the script finds itself
-  in flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
-  historic sha instead: the check-run still lands on HEAD, but the judged commit is
-  settled and independent.
+  explicit `main_sha` (BR#5487) — the composite action refuses a sha-less drill
+  loudly, because a sha-less dispatch with `--ref main` attaches the drill's own
+  `main-green gate` check-run to main's HEAD, so the script finds itself in
+  flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
+  historic sha instead: the check-run still lands on HEAD, but the judged commit
+  is settled and independent.
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The same ruleset
@@ -1874,6 +1882,30 @@ Only a window that elapses stale fails loudly — real drift (CF Builds stalled 
 feeding the `main-green gate` and the merge train's base-green leg exactly as before — and so
 does a hub that never answers. A failing main-tip lookup never turns a mismatch green
 (fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
+
+### Wiring a new repo onto the shared gate (BR#5518)
+
+The `main-green gate` is one shared definition owned by this repo (BR#5518) — no
+per-repo script copies (Ray directive 2026-11-02: "every repo cannot have its own
+main-green check script"). The layers:
+
+1.  **The single script** — `scripts/main-green-gate.sh` holds the decision rule
+    (newest non-cancelled run per check NAME judges; own-run `GITHUB_RUN_ID` exclusion;
+    `REPO` is a required input — the shared definition vouches for a named destination).
+2.  **The composite action** — `.github/actions/main-green-gate/action.yml` wraps the
+    script and exposes `repo`, `main-sha`, `pr-sha` inputs (drills must pass `main_sha`;
+    BR#5487 law).
+3.  **The reusable workflow** — `.github/workflows/main-green-gate.yml` exposes
+    `workflow_call` so every other repo references it directly.
+
+To join a new repo, point its workflow at the shared definition (pin the version):
+
+```yaml
+uses: org/bridge/actions/main-green-gate@vN
+```
+
+Never pin `@main` — a bad gate change must not break every repo's merge gate
+simultaneously; bump the `vN` tag deliberately.
 
 ## The merge train: serialized merges, credential-free hub (BR#3516)
 

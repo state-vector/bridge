@@ -1,0 +1,70 @@
+# .github/actions/main-green-gate/action.yml — the composite action wrapping
+# scripts/main-green-gate.sh. THE shared definition of the destination-green
+# stop-the-line gate (BR#3008, decision BR#3009, centralized by BR#5518):
+# one script, one action, one reusable workflow — every repo references them
+# instead of carrying its own copy (Ray directive 2026-11-02).
+#
+# Inputs are explicit and honest: `repo` is REQUIRED — the shared definition
+# vouches for a named destination and has no default (BR#5518). The reusable
+# workflow passes the caller's github.repository; direct-action callers must
+# name theirs.
+#
+# The single script lives at scripts/main-green-gate.sh — this action reaches
+# it relative to its own checkout (github.action_path = <repo>/.github/actions/
+# main-green-gate, so ../../../scripts/main-green-gate.sh is the one script).
+# For cross-repo callers GitHub downloads the whole action repo at the pinned
+# ref, so the script arrives with the action — no copies anywhere.
+name: 'main-green gate'
+description: >-
+  Destination-green stop-the-line gate: refuses to pass while the newest
+  settled check state on the destination main's HEAD has any failure. Per
+  check NAME the newest non-cancelled run judges; an unsettled (in-flight)
+  main does not vouch for main; zero check runs fails (vacuity guard). One
+  written exception: a PR green on the exact checks main fails passes as the
+  receipted REMEDIATION CARVE-OUT (BR#3009's remediation-merge path). The
+  gate's own check-run is excluded (GITHUB_RUN_ID match) so it can never count
+  itself into the verdict, and a sha-less workflow_dispatch drill is refused
+  loudly (BR#5487, fixed in the shared script so every repo inherits it).
+inputs:
+  repo:
+    description: >-
+      Destination repository (owner/name) whose main this gate vouches for.
+      REQUIRED — no default; the shared definition must be told its
+      destination (BR#5518).
+    required: true
+  main-sha:
+    description: >-
+      main HEAD sha to judge. Default: live main of `repo`. Drills/tests only
+      — CI never sets it (BR#5487: a workflow_dispatch drill MUST judge a
+      historic sha, never live HEAD).
+    required: false
+    default: ''
+  pr-sha:
+    description: >-
+      PR head sha for the remediation carve-out. CI sets it from the
+      pull_request event; callers may pass it for drills.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - id: gate
+      name: Assert destination main is green (or this PR remediates it)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MAIN_GREEN_REPO: ${{ inputs.repo }}
+        MAIN_GREEN_SHA: ${{ inputs.main-sha }}
+        MAIN_GREEN_PR_SHA: ${{ inputs.pr-sha }}
+      run: |
+        # BR#5487 guard, inherited by every caller via the shared definition:
+        # a workflow_dispatch drill without an explicit main_sha attaches its
+        # own check-run to main's live HEAD and self-fails (the script would
+        # see itself unsettled). Refuse before judging anything.
+        if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ -z "${MAIN_GREEN_SHA:-}" ]; then
+          echo "FAIL: workflow_dispatch drill without main_sha — a sha-less drill attaches its"
+          echo "      own check-run to main's HEAD and self-fails (BR#5487). Pass an explicit"
+          echo "      main_sha (a historic sha, never live HEAD)."
+          exit 1
+        fi
+        bash "${GITHUB_ACTION_PATH}/../../../scripts/main-green-gate.sh"
