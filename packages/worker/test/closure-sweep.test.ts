@@ -717,6 +717,24 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
 });
 
 describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () => {
+  it("BR#6839: a fresh gateway session ping cannot revive an executor-less bounce; an actual worker ping can", async () => {
+    for (const gateway of [true, false]) {
+      const session = `br6839-${gateway ? "gateway" : "worker"}`;
+      const token = await kbJson("/admin.mint", { label: session, tags: gateway ? ["gateway"] : ["impl"] });
+      expect(token.body.error).toBeUndefined();
+      const created = await kbJson("/create", { type: "task", title: session, qualified: true });
+      const id = created.body.id;
+      await kbJson("/transition", { id, to: "in_progress", actor: session, session: `${session}-old` });
+      const updated = await kbJson("/update", { id, meta: { session,
+        merge_train: { state: "bounced", pr: 6839, repo: "state-vector/bridge" },
+        last_progress: { session: "another-duty", ts: Date.now(), note: "unrelated task update" } } });
+      expect(updated.body.error).toBeUndefined();
+      const touched = await kbJson("/session.touch", { token_id: token.body.id, session });
+      expect(touched.body.error).toBeUndefined();
+      await kbJson("/admin.stall_sweep", { now: Date.now() + 1_000 });
+      expect((await taskById(id)).status).toBe(gateway ? "todo" : "in_progress");
+    }
+  });
   it("a bounce re-entry stranded in_progress (dead executor) is DEMOTED to a claimable todo by the sweep — never re-parked blocked; train meta + boost survive", async () => {
     // The specimen shape (BR#4198): a train bounce re-opened its card
     // in_progress with the PRIOR session as executor; the session is gone and

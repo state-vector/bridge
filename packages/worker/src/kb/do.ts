@@ -1342,7 +1342,7 @@ export class KnowledgeHub {
       // Repair pre-BR#6839 phantom claims even when a train/board write just
       // refreshed updated_ts. Only the actual worker's signals prove liveness;
       // another duty's progress and a bounce itself do not start a writer.
-      const workerSignal = Math.max(meta.session_alive_ts ?? 0, this.sessionPing(meta),
+      const workerSignal = Math.max(meta.session_alive_ts ?? 0, this.sessionPing(meta, true),
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0);
       if (meta.merge_train?.state === "bounced" && !this.executionState(String(r.id))?.attempt &&
           !meta.interactive_execution && now - workerSignal > staleMs) {
@@ -8895,11 +8895,12 @@ export class KnowledgeHub {
    *  quiet, so a fresh ping means the run is plausibly still in flight and
    *  the silence-release must wait it out (grace extension, #205-consistent:
    *  liveness = ANY real signal, never a shorter window). */
-  private sessionPing(meta: any): number {
+  private sessionPing(meta: any, workerOnly = false): number {
     const name = meta?.session ? String(meta.session) : "";
     if (!name) return 0;
     try {
-      return Number(this.one(`SELECT MAX(last_seen_ts) AS ts FROM sessions WHERE name = ?`, name)?.ts ?? 0) || 0;
+      return Number(this.one(`SELECT MAX(last_seen_ts) AS ts FROM sessions WHERE name = ?
+        AND (? = 0 OR COALESCE(kind, '') <> 'gateway')`, name, workerOnly ? 1 : 0)?.ts ?? 0) || 0;
     } catch { return 0; }
   }
 
