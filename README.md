@@ -1520,15 +1520,26 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   the stop arm clearing on green main while the awaiting-CI arm re-fires it — is a
   `train:stopped_deduped` no-op, never a new ledger row every 20 seconds), and the
   **phantom-required carve-out** (Ray ruling 2026-10-30: "if it can't merge, bounce it
-  and move onto the next one — the train goes regardless"): past the fail-closed bound,
-  if every unsettled required workflow is MISSING (no check run ever existed for it on
-  the merge commit — e.g. a PR-context-only gate that only runs on `pull_request`) while
-  at least one required workflow proved green on that very commit, waiting cannot
-  change the verdict — the merge LANDS judged on the workflows that exist, the never-run
-  names are dropped with a loud audit, and ONE config-defect ask per episode goes to the
-   alarm sink (fix `required_workflows`); a genuinely stuck OBSERVED run (or an empty,
-   zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
-   evidence.
+  and move onto the next one — the train goes regardless"): once every unsettled
+  required workflow is MISSING (no check run ever existed for it on the merge commit —
+  e.g. a PR-context-only gate that only runs on `pull_request`) while at least one
+  required workflow proved green on that very commit, waiting cannot change the
+  verdict — the merge LANDS judged on the workflows that exist, the never-run names
+  are dropped with a loud audit, and ONE config-defect ask per episode goes to the
+  alarm sink (fix `required_workflows`); a genuinely stuck OBSERVED run (or an empty,
+  zero-evidence poll) keeps the fail-closed stop — the carve-out never fires on no
+  evidence. The carve-out fires at the **settle dwell** (BR#5829), not at the
+  fail-closed bound: a workflow that has not even registered a check run on the merge
+  commit by the 2-minute dwell (the registration window the BR#4804 dwell already
+  defines) never will — the old bound-gated timing held an already-green base for the
+  whole ~3×-typical bound on every merge (state-vector/bridge PR #371: all 8 tip
+  checks green at 08:06:48Z, `train:landed` only at 08:36:34Z — 30 min of pure lag,
+  the largest single component of the BR#5822 starvation). The dropped names are also
+  **stamped** into the lane config (`meta.lane.phantom_required`, served on
+  `train.status`): the next settle classifies green outright in 1–2 ticks instead of
+  re-discovering the phantom each merge, and the stamp self-heals — if the name ever
+  produces a check run on a merge commit again, it is judged normally (red still
+  stops the line).
 
 ### The stop names the guilty card — and dings its sessions (BR#5517)
 
@@ -2071,7 +2082,16 @@ included) as "unmergeable — CONFLICTING".
   rebind. With NO successor the lane is deliberately retired and the BR#4977
   refusal holds (every op refuses `lane retired`; re-open the card or register
   a reseed to re-arm — BR#5061's spec'd create-fresh is superseded by the
-  accepted BR#4977 decision on that path). `train.status` shows ONE row per
+  accepted BR#4977 decision on that path) — with ONE exception (BR#5186): when
+  EVERY card for the key is terminal and the executor's first-hand probe says
+  the base branch is still LIVE on the remote (the hub holds no VCS
+  credentials), the closure was an erroneous close (the BR#5130 class that
+  killed BR#3648 and BR#5050), not a retirement — the tick asks the hub to
+  auto-reseed `v(N+1)` carrying the predecessor's lane config (supersedes
+  edge, loud `lane_reseeded` audit) and drives the fresh card in the same
+  tick. Without the live-base evidence (a deleted base, a probe with no
+  signal) the refusal stands — no resurrection on a guess. `train.status`
+  shows ONE row per
   lane — a retired card with a live successor is filtered as history, a
   retired card with no successor stays visibly `retired` (BR#4977) — and the
   hub's lane sweeps skip retired cards; the starvation clock never inits from
@@ -2116,7 +2136,14 @@ included) as "unmergeable — CONFLICTING".
   phantom-ready row. The executor honors it from both directions: it skips any lane
   the hub marks retired, and it probes the lane's base branch before acquiring — a
   definitive 404 (base deleted on the remote) skips the lane with no lease and no
-  hub meta writes, while any transient gh failure fails open. **The derived queue is
+  hub meta writes, while any transient gh failure fails open. **BR#5186 splits the
+  retired world in two on that same probe**: a definitive 404 is a real retirement —
+  skip; a LIVE base under a `retired: true` row means the closure was an erroneous
+  close (the BR#5130 class that killed BR#3648 and BR#5050), so the tick asks the
+  hub to auto-reseed `v(N+1)` (`train_lane` with `base_live: true` — the executor's
+  first-hand evidence; the hub holds no VCS credentials) and drives the fresh card
+  in the same tick; a probe with no signal (gh absent, network, auth) is
+  fail-closed — the refusal stands, never a reseed on a guess. **The derived queue is
   base-scoped** (same law): a queued card rides only the lane whose base matches its
   PR stamp (`meta.pr.base`, defaulting to `main`) — a second lane on the same repo
   can never inherit another base's queue (the retired drill lane used to show

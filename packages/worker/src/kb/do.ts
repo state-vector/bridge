@@ -81,6 +81,7 @@ import {
   TRAIN_LEASE_TTL_MS,
   TRAIN_CI_TYPICAL_MINUTES,
   TRAIN_CI_BOUND_MULTIPLIER,
+  TRAIN_SETTLE_DWELL_MS,
   TRAIN_HEAD_STAMP_RE,
   laneKey,
   laneCardTitle,
@@ -3826,7 +3827,11 @@ export class KnowledgeHub {
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
         case "train.carry": return this.json(await this.trainCarry(body, actor));
         case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
-        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        // BR#5186: base_live rides ONLY the executor's reseed ask — the tick
+        // probed the base branch live on the remote first-hand (the hub holds
+        // no VCS credentials, BR#3507). Any caller without the flag keeps the
+        // BR#4977 refusal (fail-closed).
+        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec, { base_live: body.base_live === true }));
         case "train.observe_deploy": return this.json(await this.trainObserveDeploy(body, actor));
         case "train.recovery_event": return this.json(await this.trainRecoveryEvent(body, actor));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
@@ -10466,7 +10471,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  history goes dark. */
   private laneTerminalRows(laneKeyValue: string): any[] {
     return (this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts FROM artefacts
+      `SELECT id, status, title, meta, status_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
        ORDER BY created_ts ASC`,
       laneKeyValue,
@@ -10488,8 +10493,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     *  no re-arm — re-open the card or register a reseed to re-arm. This
     *  supersedes the BR#5061 spec's create-fresh clause on the no-successor
     *  path (an accepted decision outranks the spec; the rebind path — the
-    *  2026-10-29 outage's keystone — is unchanged). */
-  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
+    *  2026-10-29 outage's keystone — is unchanged).
+    *  BR#5186 carves ONE exception out of that refusal: when EVERY card for
+    *  the key is terminal and the executor's first-hand probe says the base
+    *  branch is still LIVE on the remote (opts.base_live — the hub holds no
+    *  VCS credentials to re-check, BR#3507), the closure was an erroneous
+    *  close (the BR#5130 class that killed BR#3648 and BR#5050), not a
+    *  retirement — the lane auto-reseeds v(N+1) and rebinds. Without the
+    *  flag the refusal stands exactly as before. */
+  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>, opts?: { base_live?: boolean }): Promise<any> {
     if (!isValidGitHubRepo(repo)) {
       throw new Error(`invalid lane repo "${repo}" — must be a valid GitHub owner/name (never a BR#/GH# cross-reference or numeric fragment)`);
     }
@@ -10526,13 +10538,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           );
         }
         if (!live) {
-          // BR#4977 lane lifecycle: no successor means deliberately retired —
-          // the single refusal point (the BR#4772 drill-residue class): no
-          // lease/CPO meta writes, no config refresh, no re-arm, and no
-          // create-fresh resurrection (BR#5061's spec clause is superseded
-          // here by the accepted decision). Re-arm is a deliberate lifecycle
-          // act — re-open the lane card or register a reseed.
-          throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          // BR#5186: EVERY card for the key is terminal. The executor just
+          // probed the base branch on the remote first-hand (the hub holds
+          // no VCS credentials, BR#3507 — the tick's probe is the only
+          // liveness evidence):
+          //   base_live=true — the base is LIVE: the closure was an
+          //     erroneous close (the BR#5130 class that killed BR#3648 and
+          //     BR#5050 off stale provenance), not a retirement. A lane
+          //     card is INFRASTRUCTURE: landing a queued PR completes a
+          //     leg, it does not complete the LANE. Auto-reseed v(N+1)
+          //     carrying the predecessor's config and rebind.
+          //   otherwise     — the BR#4977 refusal stands (the BR#4772
+          //     drill-residue class, a deliberate retirement, or a
+          //     no-signal probe): no lease/CPO meta writes, no config
+          //     refresh, no re-arm, no create-fresh resurrection
+          //     (BR#5061's spec clause stays superseded on this path).
+          //     Re-arm is a deliberate lifecycle act — re-open the lane
+          //     card or register a reseed.
+          if (opts?.base_live === true) {
+            live = await this.laneReseed(repo, base, actor, key, terminals);
+          } else {
+            throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          }
         }
         existing = this.one(
           `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts WHERE id = ?`,
@@ -10644,6 +10671,54 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       actor,
     );
     this.audit(actor, "create", created.id, { type: "task", auto: "lane", lane_key: key });
+    return this.laneRow(key);
+  }
+
+  /** BR#5186: the all-terminal auto-reseed — every lane card for the key is
+   *  terminal (done/superseded) while the base branch is LIVE on the remote
+   *  (the executor probed it first-hand and asked with base_live; the hub
+   *  holds no VCS credentials to re-check, BR#3507). A lane card is
+   *  INFRASTRUCTURE: its closure must never kill a live repo's lane, so the
+   *  tick reseeds instead of skipping and every reconcile hiccup stops
+   *  re-killing lanes:
+   *  - v(N+1) parses off the terminal titles' "(vN" convention (the manual
+   *    reseed lineage — BR#5050 was v2, its manual successor v3); a lineage
+   *    with no versioned title starts at v2.
+   *  - config inherits the NEWEST terminal card's meta.lane — the working
+   *    copy is the operator's last word on this lane.
+   *  - the supersedes edge (fresh → newest terminal) keeps the lineage
+   *    machine-readable so BR#5061's rebind finds this card first, and
+   *    train_status folds the retired predecessor as history (one row per
+   *    lane).
+   *  The BR#4977 refusal keeps its teeth everywhere else: reseed only ever
+   *  happens on the tick's live-base claim, loudly audited (lane_reseeded). */
+  private async laneReseed(repo: string, base: string, actor: string, key: string, terminals: any[]): Promise<any> {
+    const newest = terminals[terminals.length - 1];
+    const prev = laneOfMeta(JSON.parse(newest.meta ?? "{}"));
+    let version = 2;
+    for (const t of terminals) {
+      const m = /\bv(\d+)\b/.exec(String(t.title ?? ""));
+      if (m) version = Math.max(version, Number(m[1]) + 1);
+    }
+    const cfg: Partial<LaneSpec> = prev
+      ? {
+          required_workflows: prev.required_workflows,
+          ...(prev.ci_typical_minutes != null ? { ci_typical_minutes: prev.ci_typical_minutes } : {}),
+          burst_max: prev.burst_max,
+        }
+      : {};
+    const fresh = await this.laneCreate(repo, base, actor, key, cfg);
+    const title = `${laneCardTitle(repo, base)} (v${version} — auto-reseed; predecessor ${newest.id} closed ${newest.status}; BR#5186)`;
+    this.state.storage.sql.exec(`UPDATE artefacts SET title = ? WHERE id = ?`, title, fresh.id);
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+      fresh.id, newest.id, Date.now(),
+    );
+    this.audit(actor, "lane_reseeded", fresh.id, {
+      lane: key, version, config_from: newest.id, predecessor_status: newest.status, base_live: true,
+      note: `BR#5186: every lane card for the key was terminal while the base branch stayed live on the remote (executor probe) — an erroneous close (the BR#5130 class) must not kill a live lane; reseeded v${version} with the predecessor's config`,
+    });
+    this.version(fresh.id, actor, "lane_reseeded", `auto-reseeded v${version} — all lane cards terminal while the base stayed live; config inherited from ${newest.id} (BR#5186)`, { from_terminal: newest.id });
     return this.laneRow(key);
   }
 
@@ -12060,7 +12135,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (!mergeSha || Number(meta.currently.pr) !== Number(pr)) throw new Error(`train:landed must cite the lane's in-flight merge (PR #${meta.currently.pr}, ${String(meta.currently.merge_sha).slice(0, 9)})`);
     const checks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
     const laneSpec = laneOfMeta(meta)!;
-    const classified = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
+    // BR#5829: a landed event fed for a merge whose only unsettled required
+    // name is a stamped phantom classifies green on the observed runs
+    const phantomRequired: string[] = Array.isArray(meta.lane?.phantom_required)
+      ? (meta.lane.phantom_required as unknown[]).map(String)
+      : [];
+    const classified = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000, phantom_required: phantomRequired });
     if (classified.verdict !== "green") throw new Error(`train:landed rejected — required runs classify ${classified.verdict} (failing: ${classified.failing.map((f) => f.name).join(", ") || "none"}; pending: ${classified.pending.join(", ") || "none"}); post train.ci instead and let the hub decide`);
     return this.landedFlowGuarded(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
   }
@@ -12484,6 +12564,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
     const sha = String(body.sha ?? "");
+    // BR#5829: phantom required names stamped by earlier carve-outs never
+    // hold a settle (or a stop clearance) again — the classifier excludes
+    // them unless the commit carries observed runs for the name (self-heal).
+    const phantomRequired: string[] = Array.isArray(meta.lane?.phantom_required)
+      ? (meta.lane.phantom_required as unknown[]).map(String)
+      : [];
     // BR#5679: when the lane is STOPPED (meta.stop != null) and check-run
     // facts are fed for the stopped sha, evaluate classifyRequiredRuns
     // against the lane's required_workflows. If all required workflows are
@@ -12498,6 +12584,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         merged_at: Number(meta.currently?.merged_at ?? meta.stop?.at ?? now),
         now,
         typical_ms: (stopSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000,
+        phantom_required: phantomRequired,
       });
       if (stopV.verdict === "green" && stopChecks.length > 0) {
         const clearedSha = String(meta.stop.sha ?? sha);
@@ -12553,7 +12640,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     const checks: MainCheckRun[] = Array.isArray(body.checks) ? body.checks : [];
     const laneSpec = laneOfMeta(meta)!;
-    const v: RequiredRunsVerdict = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000 });
+    const v: RequiredRunsVerdict = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000, phantom_required: phantomRequired });
     const pr = Number(meta.currently.pr);
     const mergeSha = String(meta.currently.merge_sha);
     if (v.verdict === "green") {
@@ -12580,44 +12667,39 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // sink (the halt-class escalation — a human fixes required_workflows).
     // Genuinely unsettled OBSERVED runs (a check that exists and hasn't
     // concluded) keep the fail-closed stop, deduped per episode.
+    // BR#5829: the carve-out no longer waits for the bound. The settle dwell
+    // (BR#4804) IS the registration window — a push-triggered workflow that
+    // has not even REGISTERED a check run on the merge commit by then never
+    // will on any later tick — so a merge whose only unsettled required names
+    // are phantoms lands at the dwell instead of holding an already-green
+    // base for the whole ~3×-typical bound (PR #371: tip green 08:06:48Z,
+    // landed only 08:36:34Z — 30 min of pure lag per merge). The dropped
+    // names are stamped into the lane config so the NEXT settle classifies
+    // green outright.
+    const dwellSatisfied = now - Number(meta.currently.merged_at ?? now) >= TRAIN_SETTLE_DWELL_MS;
+    const observedUnsettled = v.pending.filter((n) => checks.some((c) => (c.name ?? "") === n));
+    // positive evidence first: at least one required workflow PROVED green
+    // on this very commit — the carve-out never fires on an empty/zero
+    // evidence poll (an executor that reports nothing gets the stop, the
+    // honest fail-closed posture the bound exists for)
+    const greenRequired = checks.filter((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success");
+    const phantomShaped = !v.failing.length && v.missing.length && !observedUnsettled.length && greenRequired.length;
+    if (v.verdict === "pending" && dwellSatisfied && phantomShaped) {
+      return this.landPhantomRequired(lane, meta, actor, {
+        repo, base, pr, mergeSha,
+        phantoms: v.missing.filter((n) => n !== "settle-dwell"),
+        greenRunUrl: greenRequired[0]?.html_url ?? body.run_url ?? null,
+        via: "dwell",
+      });
+    }
     if (v.bound_exceeded) {
-      const observedUnsettled = v.pending.filter((n) => checks.some((c) => (c.name ?? "") === n));
-      // positive evidence first: at least one required workflow PROVED green
-      // on this very commit — the carve-out never fires on an empty/zero
-      // evidence poll (an executor that reports nothing gets the stop, the
-      // honest fail-closed posture the bound exists for)
-      const greenRequired = checks.filter((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success");
-      if (!v.failing.length && v.missing.length && !observedUnsettled.length && greenRequired.length) {
-        const phantoms = v.missing.filter((n) => n !== "settle-dwell");
-        this.audit(actor, "train:required_phantom_dropped", lane.id, {
-          lane: laneKey(repo, base), pr, merge_sha: mergeSha.slice(0, 9),
-          missing_required: phantoms,
-          settled_green: greenRequired.map((c) => c.name),
-          note: "BR#5061: required workflow(s) never ran on the merge commit (PR-context-only?) — landing on the workflows that exist; lane config needs a human",
+      if (phantomShaped) {
+        return this.landPhantomRequired(lane, meta, actor, {
+          repo, base, pr, mergeSha,
+          phantoms: v.missing.filter((n) => n !== "settle-dwell"),
+          greenRunUrl: greenRequired.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null,
+          via: "bound",
         });
-        try {
-          await this.askCreate(
-            {
-              to: "human",
-              question: `Lane config defect ${repo}@${base}: required workflow(s) never run on merge commits — remove ${phantoms.join(", ")} from required_workflows?`,
-              reason: "the merge train cannot prove these required workflows on a landed merge commit — every merge past the CI bound lands on the workflows that exist instead of halting (Ray ruling 2026-10-30), but the lane config should be fixed",
-              details: [
-                `Lane ${laneKey(repo, base)} requires: ${laneSpec.required_workflows.join(", ")}.`,
-                `On merge commit ${mergeSha.slice(0, 9)} (PR #${pr}) these required workflows produced NO check run — they look PR-context-only (e.g. a pull_request-triggered gate) and can never appear on a merge commit: ${phantoms.join(", ")}.`,
-                `Effect: merges past the ~${TRAIN_CI_BOUND_MULTIPLIER}× typical CI bound LAND judged on the workflows that exist (observed green: ${greenRequired.map((c) => c.name).join(", ")}) instead of stopping the line.`,
-                `Fix: remove the PR-context-only names from the lane's required_workflows (admin settings key train_lane, or the lane card's config op) — the admission gate already judges base-main health separately.`,
-              ].join("\n\n"),
-              options: ["Fix the lane config (remove PR-context-only workflows)", "Ack — landing on existing workflows is fine", "Investigate — these should run on merge commits"],
-              artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-              urgency: "time-sensitive",
-            },
-            "system:train",
-          );
-        } catch (e) {
-          this.audit(actor, "phantom_ask_suppressed", lane.id, { note: String((e as Error).message ?? e).slice(0, 160) });
-        }
-        const out = await this.landedFlowGuarded(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success")?.html_url ?? body.run_url ?? null });
-        return { ...out, decided: "landed_phantom_required", dropped_required: phantoms };
       }
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)` }, actor);
       return { ...out, decided: "stopped_bound" };
@@ -12625,6 +12707,65 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const reason = this.laneSyncReason(lane.id, { ...meta, currently: { ...meta.currently } }, now);
     this.audit(actor, "train:ci_pending", lane.id, { lane: laneKey(repo, base), pending: v.pending, missing: v.missing });
     return { ok: true, decided: "pending", lane: laneKey(repo, base), pending: v.pending, missing: v.missing, reason };
+  }
+
+  /** BR#5829: land a merge whose only unsettled required workflows are
+   *  phantom PR-context-only names — the BR#5061 carve-out, now shared by
+   *  the dwell-gated fast path and the bound arm. Stamps the dropped names
+   *  into `meta.lane.phantom_required` so the NEXT settle classifies green
+   *  without waiting (self-heals in classifyRequiredRuns if the name ever
+   *  produces runs on a merge commit again), and files the ONE-per-episode
+   *  config-defect ask to the alarm sink (a human fixes required_workflows). */
+  private async landPhantomRequired(
+    lane: any,
+    meta: any,
+    actor: string,
+    args: { repo: string; base: string; pr: number; mergeSha: string; phantoms: string[]; greenRunUrl: string | null; via: "dwell" | "bound" },
+  ): Promise<any> {
+    const now = Date.now();
+    this.audit(actor, "train:required_phantom_dropped", lane.id, {
+      lane: laneKey(args.repo, args.base), pr: args.pr, merge_sha: args.mergeSha.slice(0, 9),
+      missing_required: args.phantoms,
+      via: args.via,
+      note: args.via === "dwell"
+        ? "BR#5829: required workflow(s) never registered a check run past the settle dwell — PR-context-only (cannot run on a merge commit); landing on the workflows that exist WITHOUT waiting out the fail-closed bound; lane config needs a human"
+        : "BR#5061: required workflow(s) never ran on the merge commit (PR-context-only?) — landing on the workflows that exist; lane config needs a human",
+    });
+    // stamp BEFORE the landed close: the next settle on this lane must not
+    // wait on names that can never settle (BR#5829 — the 30-min-per-merge lag)
+    const stamped = [...new Set([
+      ...(Array.isArray(meta.lane?.phantom_required) ? (meta.lane.phantom_required as unknown[]).map(String) : []),
+      ...args.phantoms,
+    ])];
+    meta.lane = { ...(meta.lane ?? {}), phantom_required: stamped };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    this.audit(actor, "train:phantom_required_stamped", lane.id, { lane: laneKey(args.repo, args.base), phantom_required: stamped });
+    try {
+      await this.askCreate(
+        {
+          to: "human",
+          question: `Lane config defect ${args.repo}@${args.base}: required workflow(s) never run on merge commits — remove ${args.phantoms.join(", ")} from required_workflows?`,
+          reason: "the merge train cannot prove these required workflows on a landed merge commit — merges land judged on the workflows that exist (Ray ruling 2026-10-30), but the lane config should be fixed",
+          details: [
+            `Lane ${laneKey(args.repo, args.base)} requires: ${(meta.lane?.required_workflows ?? []).join(", ")}.`,
+            `On merge commit ${args.mergeSha.slice(0, 9)} (PR #${args.pr}) these required workflows produced NO check run — they look PR-context-only (e.g. a pull_request-triggered gate) and can never appear on a merge commit: ${args.phantoms.join(", ")}.`,
+            `Effect: merges LAND judged on the workflows that exist (the phantom names are stamped out of the settle judge, BR#5829) instead of holding the lane for the fail-closed bound.`,
+            `Fix: remove the PR-context-only names from the lane's required_workflows (admin settings key train_lane, or the lane card's config op) — the admission gate already judges base-main health separately.`,
+          ].join("\n\n"),
+          options: ["Fix the lane config (remove PR-context-only workflows)", "Ack — landing on existing workflows is fine", "Investigate — these should run on merge commits"],
+          artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+          urgency: "time-sensitive",
+        },
+        "system:train",
+      );
+    } catch (e) {
+      // an identical ask is already open for this episode — that IS one
+      // per episode. Any other failure (missing sink card) is loud in the
+      // audit, never a raw throw.
+      this.audit(actor, "phantom_ask_suppressed", lane.id, { note: String((e as Error).message ?? e).slice(0, 160) });
+    }
+    const out = await this.landedFlowGuarded(lane, meta, actor, { pr: args.pr, mergeSha: args.mergeSha, greenRunUrl: args.greenRunUrl });
+    return { ...out, decided: "landed_phantom_required", dropped_required: args.phantoms };
   }
 
   /** train.bisect (BR#4934): the red-settle walk while the line is stopped
@@ -15795,6 +15936,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         bypass_wait: meta.bypass_wait ?? null,
         required_workflows: lane.required_workflows,
         burst_max: lane.burst_max,
+        // BR#5829: serve the lane's CI-typical value so the executor's
+        // fail-closed bound countdown reads the SAME number the hub's bound
+        // uses (the bridge lane's 10-min typical logged "~60m" while the
+        // hub fired at 30 min) — and the settle arm can compute its own
+        // dwell-gated expectations from lane config, not the default.
+        ci_typical_minutes: lane.ci_typical_minutes,
+        // BR#5829: phantom required names stamped by the carve-out — the
+        // executor log and the panel can show WHY a required name is not
+        // holding the settle.
+        ...(Array.isArray(lane.phantom_required) && lane.phantom_required.length ? { phantom_required: lane.phantom_required } : {}),
         reason: String(meta.blocked?.reason ?? ""),
         // BR#5114: the holder's live last action (BR#4104 seam) — WHAT the
         // executor is doing right now, verbatim from its own tick log; the

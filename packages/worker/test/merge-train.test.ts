@@ -539,6 +539,40 @@ describe("classifyRequiredRuns (executor-fed runs vs lane config)", () => {
     const typical = classifyRequiredRuns([run(1, "Test", null)], ["Test"], { merged_at: 0, now: 10 * MIN, typical_ms: 2 * MIN });
     expect(typical.bound_exceeded).toBe(true); // 10 min > 3 × 2 min
   });
+
+  it("BR#5829: a stamped phantom required name never holds the settle — unless it observes runs (self-heal)", () => {
+    // the live BR#5829 shape: Test + CLI build green on the merge commit,
+    // main-green gate (pull_request-only) stamped phantom → green NOW
+    const v = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "CLI build (packages/cli)", "success")],
+      ["Test", "CLI build (packages/cli)", "main-green gate"],
+      { ...base, phantom_required: ["main-green gate"] },
+    );
+    expect(v.verdict).toBe("green");
+    expect(v.missing).toEqual([]);
+    // self-heal: a stamped name that DOES carry runs on this commit is
+    // judged normally — green passes, red still stops the line
+    const healed = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "main-green gate", "success")],
+      ["Test", "main-green gate"],
+      { ...base, phantom_required: ["main-green gate"] },
+    );
+    expect(healed.verdict).toBe("green");
+    const healedRed = classifyRequiredRuns(
+      [run(1, "Test", "success"), run(2, "main-green gate", "failure")],
+      ["Test", "main-green gate"],
+      { ...base, phantom_required: ["main-green gate"] },
+    );
+    expect(healedRed.verdict).toBe("red");
+    // not stamped → the old shape: the never-seen required name holds (missing)
+    const unstamped = classifyRequiredRuns(
+      [run(1, "Test", "success")],
+      ["Test", "main-green gate"],
+      base,
+    );
+    expect(unstamped.verdict).toBe("pending");
+    expect(unstamped.missing).toEqual(["main-green gate"]);
+  });
 });
 
 // ---------- the admission gate ----------
