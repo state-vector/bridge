@@ -2378,7 +2378,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         );
         if vstr(&ci, "decided") == Some("pending") {
             let merged_at = cur.get("merged_at").and_then(|v| v.as_u64()).unwrap_or_else(now_ms);
-            let left = (TRAIN_CI_TYPICAL_MINUTES * 3 * 60_000) as i128 - (now_ms() as i128 - merged_at as i128);
+            // BR#5829: the bound countdown reads the LANE's typical-CI value
+            // (served on the train_status row) — the hardcoded 20-min default
+            // logged "~60m" on a lane the hub fail-closes at 30 (10-min
+            // typical): the executor advertised a bound twice as long as the
+            // one that actually fires.
+            let typical_min = lane.get("ci_typical_minutes").and_then(|v| v.as_u64()).unwrap_or(TRAIN_CI_TYPICAL_MINUTES);
+            let left = (typical_min * TRAIN_CI_BOUND_MULTIPLIER * 60_000) as i128 - (now_ms() as i128 - merged_at as i128);
             if left > 0 {
                 log(Some(key), &format!("fail-closed bound in ~{}m", (left / 60_000).max(1)));
             }
