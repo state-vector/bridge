@@ -31,6 +31,7 @@ import {
 
 const NOW = 1_700_000_000_000;
 const H = 3_600_000;
+const PROGRESS = { open_total: 0, queued: 0, repairing: 0, verifying: 0, held: 0, stranded: 0 };
 const CFG: ReconcileConfig = { now: NOW, verify_age_ms: 2 * H, disposition_age_ms: 24 * H };
 
 const iso = (hoursAgo: number) => new Date(NOW - hoursAgo * H).toISOString();
@@ -86,6 +87,25 @@ const join = (args: {
     duties: args.duties ?? [],
     cfg: { ...CFG, ...args.cfg },
   });
+
+describe("all-open delivery progress", () => {
+  it("bounds undecided and draft grace, including dead duties", () => {
+    for (const extra of [{ reviewDecision: null }, { isDraft: true, reviewDecision: null }]) {
+      const aged = join({ prs: [pr(99, { ...extra, updatedAt: iso(50) })] });
+      expect(aged.judgements[0].decision.action).toBe("spawn_disposition");
+      const dead = join({ prs: [pr(99, { ...extra, updatedAt: iso(50) })], duties: [duty(99, { card_status: "done" })] });
+      expect(dead.accounting.ok).toBe(false);
+    }
+  });
+
+  it("an existing card with no executable action is stranded, not accounted", () => {
+    const r = join({ prs: [pr(99, { updatedAt: iso(50), mergeable: "CONFLICTING" })], bindings: [binding(99, { progress: "stranded" })] });
+    expect(r.accounting.stranded).toBe(1);
+    expect(r.accounting.accounted).toBe(0);
+    expect(r.accounting.ok).toBe(false);
+    expect(r.judgements[0].decision).toMatchObject({ action: "repair_binding", reason: "conflict" });
+  });
+});
 
 /** The FORWARD judgement for a PR. A bound PR gets TWO rows by design — the
  *  disposition (forward loop) plus the missing-clock report (reverse loop,
@@ -151,15 +171,17 @@ describe("prAgeMs", () => {
 describe("accountingLine", () => {
   it("renders the canary line with the inflight total (live + this cycle's spawns)", () => {
     const line = accountingLine({
+      ...PROGRESS,
       repo: "r", open_reviewed: 3, bound: 1, ignored: 1, inflight: 0, spawned: 1,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 3, ok: true,
     });
-    expect(line).toBe("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
+    expect(line).toContain("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
   });
 
   it("fails loudly — the ALARM tail rides exactly when ok is false", () => {
     const a = {
+      ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 0, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 0, ok: false,
@@ -170,6 +192,7 @@ describe("accountingLine", () => {
 
   it("carries the informational grace/unreviewed and reverse tails", () => {
     const line = accountingLine({
+      ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,
@@ -180,6 +203,7 @@ describe("accountingLine", () => {
 
   it("BR#5151: lane-exempt bindings render in the reverse tail", () => {
     const line = accountingLine({
+      ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
       grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
       reverse_dutied: 0, reverse_lane_exempt: 2, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,

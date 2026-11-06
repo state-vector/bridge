@@ -1,5 +1,25 @@
 # bridge
 
+### Delivery obligations survive card retirement
+
+PR-bound work keeps a delivery owner until it is delivered, transferred to a
+live successor, or explicitly abandoned with independently accepted GitHub-close
+receipts. Replacement transfers bindings and ownership atomically. A bounded
+hold records its owner, reason, next observation and deadline. Failed repair
+rounds escalate existing recovery; they never silently cancel product work.
+
+Reconciliation includes old undecided-review and draft PRs and distinguishes
+queued, repairing, verifying, held and stranded work. A historical card link is
+not proof of progress. Completed duties are scoped to the observed PR head.
+Independent PR acceptance persists exact repo/PR/head legs and pending queue
+admission in the review-close transaction; interrupted handoffs replay through
+the existing repair mechanism, including historical done-parent cases.
+
+Dependency waits follow replacement outcomes rather than treating supersession
+as success. Deployment-health waits observe the relevant repo/base/tip. Unblock
+duties can atomically replace a consumed wait with the newly discovered blocker;
+deduplication includes the predicate revision and accepted heads.
+
 ### Jump straight to a card
 
 Top has a dedicated **model / tier** column beside machine/agent identity.

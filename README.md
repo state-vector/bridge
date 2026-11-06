@@ -8,6 +8,41 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+### Delivery responsibility
+
+An open PR remains a delivery obligation even when an old card is retired.
+Replacing a PR-bound task requires a live successor; its ownership and PR
+bindings transfer in the retirement transaction. A bare Supersede without a
+replacement is refused for outstanding bindings. The human disposition endpoint
+also accepts `disposition: {kind:"hold", owner, reason, next, deadline}` (epoch
+milliseconds) or `{kind:"abandon", reason}`. Holds retain their owner and review
+deadline. Abandonment schedules an authorised GitHub-close executor task and
+stays pending until independent outcome review accepts actual closure receipts.
+Exhausted repair rounds and closed-unmerged probes retain the obligation and
+escalate through the existing task-recovery mechanism.
+
+Reconciliation covers every open PR, including undecided reviews and drafts
+after bounded grace. The report includes all-open totals and queued, repairing,
+verifying, held and stranded counts. A binding without executable progress is
+stranded, not healthy accounting. Completed reconcile duties cover their observed
+head rather than the lifetime of a PR.
+
+Independent PR acceptance can use `review_result: {kind:"accepted_pr", task_id,
+legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
+queue admission are committed together; the existing repair passes replay the
+handoff until admitted or explicitly held behind a newer blocker. Explicit
+historical acceptances, including standalone reviews of already-done parents,
+can restore delivery on a successor without rewriting historical completion.
+Historical done-parent restoration requires a fresh observed OPEN PR at the
+accepted head; missing, closed or changed-head observations retain a visible hold.
+
+`await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
+health at the lane tip. Retiring a `br_done` dependency is not success: a live
+replacement must reach the required outcome. An unblock duty finding a different
+blocker supplies `unblock_result: {kind:"reblocked", parent_id, reason, next,
+await_event}` so replacement of the parent's wait and completion of the duty
+are atomic. Predicate revisions and accepted heads scope same-receipt deduplication.
+
 Top keeps machine/agent identity and actual **model / tier** in separate aligned
 columns. Parent and child rows share the same tracks; narrower windows scroll
 the task table horizontally rather than folding cells onto a second row.
