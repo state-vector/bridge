@@ -257,8 +257,11 @@ removing or changing the scope does not restore legacy write access.
   checkpoint and verified commit/tree restoration. Newer local WIP is retained,
   not reset to an older checkpoint. Dirty or unpublished worktrees are retained
   by cleanup if the preservation barrier cannot be proved.
-- **Independent clocks:** a two-minute execution lease is renewed by control
-  polls; the configured task action budget (at most one hour) is independent of
+- **Independent clocks:** a two-minute execution lease is renewed by a dedicated
+  per-attempt control poller every 20 seconds, independently of worker preparation,
+  checkpoint publication and the dispatch tick. The poller is joined before
+  quiescence/transfer; refused polls stop the writer and retain WIP. The configured
+  task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
   diagnosis. Quiet ACP actions can run within their action budget. Unproven
   process-tree isolation retains host affinity; agents must not detach writers
@@ -1594,6 +1597,34 @@ side fires first; every other red-head fall-through stays under standing law.
 Verify duty on a qualified root-fix card (tag + a stamped PR) names the fast
 lane in its body, so the reviewer knows the merge path is pre-cleared before
 they accept.
+
+### Structural check and recovery admission (BR#6776)
+
+Checks retain their GitHub source identity: check-run app/suite, or workflow
+run/attempt. Two workflows publishing the same check name are independent
+obligations; one publisher's green cannot erase the other's failure. A rerun
+supersedes earlier attempts only within its own obligation.
+
+Stale-gate recovery resolves the actual Actions job URL or workflow-run identity
+before dispatch. Check-run, job, and workflow-run IDs are never interchangeable.
+The hub durably reserves one retry per candidate head and obligation **before**
+the external call. A lost response or executor restart retains that reservation;
+an uncertain effect is not repeated. Exhausted retries and substantive candidate
+failures produce a concrete, deduplicated repair duty instead of assuming that
+an ownerless queued card has an active executor.
+
+Every merge candidate must include the current base in its tested head. A clean
+worker-authored branch is updated mechanically; its substance verdict carries,
+but CI does not. The train waits for fresh integrated-head checks. Conflicting
+or non-worker-authored branches receive an agent-owned repair. This check runs
+again between batch members: disjoint files alone do not prove semantic
+compatibility. This replaces the older conflict-only proactive-update policy.
+
+A scheduler reservation authorizes initial `begin` through its exact gateway
+token and session, without requiring a caller-supplied agent label. Existing
+readiness, model, session and writer fences still apply. Recovery banners expose
+startup, capability, local-handoff and other execution blockers explicitly;
+`todo` alone never means that recovery can launch.
 
 ### Stale deploy-health reds self-heal (2026-11-02)
 

@@ -16,6 +16,7 @@ export * from "./review.ts";
 export * from "./work.ts";
 export * from "./config.ts";
 export * from "./train.ts";
+export * from "./train-checks.ts";
 export * from "./train-line.ts";
 export * from "./train-recovery.ts";
 export * from "./execution.ts";

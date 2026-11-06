@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText, withRecoveryEpisodes, reduceRecoveryEpisode } from "@bridge/contracts";
+import { TrainLineFactsSchema, TrainLineProjectionSchema, projectTrainLine, repairProgressText, withRecoveryEpisodes, reduceRecoveryEpisode, taskRemediation } from "@bridge/contracts";
 import { applyDeployObservation, normalizeBaseStateWithCoverage, reconcileDeployCoverage, reconcileBaseVerdictWithDeployCoverage, resolveLaneOperationalState, type MainCheckVerdict, type DeployWorkflowRun } from "../src/kb/core";
 
 const now = 2_000_000;
@@ -8,6 +8,18 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("a todo repair with a rejected startup is blocked, not queued for an available agent", () => {
+    const wait = { host: "runner", fingerprint: "proof", reason: "execution command requires task executor authority", since: now,
+      retained_work: false, attention_at: null, phase: "recovery_required" as const, source: "start_failed" as const };
+    const repair = { ...task, status: "todo", active_agent: false,
+      execution_blockers: [{ kind: "startup_wait" as const, episode_id: "start:1", text: "Startup prerequisite requires repair; no work has started.", wait }] };
+    expect(taskRemediation(repair)).toMatchObject({ kind: "blocked", task: repair });
+    const line = projectTrainLine(facts({ stop: { reason: "Deploy failed" }, base_red_resolution: {
+      verdict: "red", phase: "diagnosing", held: 1, whats_broken: [], ask: null, fix_card: repair,
+    } }), now);
+    expect(line.remediation).toMatchObject({ kind: "blocked", text: expect.stringContaining("no work has started") });
+    expect(taskRemediation({ ...repair, execution_blockers: [] }).kind).toBe("queued");
+  });
   it("a bound, non-conflicting cure is an explicit PR merge action, even before the request is published", () => {
     const fix = { ...task, pr: 2916, pr_url: "https://github.com/o/r/pull/2916", merged: false, conflict: false };
     const f = facts({ stop: { reason: "Deployment failed" }, base_red_resolution: {

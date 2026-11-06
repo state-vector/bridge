@@ -225,11 +225,11 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
-import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, type StartupWait } from "@bridge/contracts";
+import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
@@ -237,6 +237,8 @@ import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./executio
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { boundedWakeStream } from "./sse.ts";
+import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
+import { TrainCheckRecovery } from "./train-check-recovery.ts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -2904,6 +2906,14 @@ export class KnowledgeHub {
       CREATE TABLE IF NOT EXISTS executor_start_claims (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS train_check_retries (
+        lane_id TEXT NOT NULL, retry_key TEXT NOT NULL, state TEXT NOT NULL,
+        receipt TEXT NOT NULL, updated_ts INTEGER NOT NULL, PRIMARY KEY(lane_id,retry_key)
+      );
+      CREATE TABLE IF NOT EXISTS train_candidate_repairs (
+        task_id TEXT NOT NULL, head_sha TEXT NOT NULL, duty_id TEXT NOT NULL,
+        PRIMARY KEY(task_id,head_sha)
+      );
       CREATE TABLE IF NOT EXISTS dispatch_reservations (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL,
         generation INTEGER NOT NULL, expires_at INTEGER NOT NULL
@@ -4885,7 +4895,7 @@ export class KnowledgeHub {
     if (worker.kind !== "provisioned" || !worker.label.startsWith(`${host}/`)) return { kind: "unprovisioned", reason: "Provision the gateway's canonical worker credential before claiming work" };
     const child = this.one(`SELECT id, tags FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, worker.label);
     if (!child || tagsSayGateway(parseTags(child.tags))) return { kind: "unprovisioned", reason: "Worker credential is missing, revoked or the wrong class" };
-    const fingerprint = JSON.stringify([String(child.id), capabilities.config_revision]);
+    const fingerprint = executorStartupFingerprint(String(child.id), capabilities.config_revision);
     const pause = this.one(`SELECT until_ts,reason FROM executor_claim_pauses WHERE token_id=?`, tokenId);
     if (pause && pause.until_ts > now) return { kind: "cooldown", until_ts: pause.until_ts, reason: pause.reason };
     const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
@@ -5022,7 +5032,7 @@ export class KnowledgeHub {
       if (!observation) throw new Error("gate: advertise executor facts before reporting failure");
       const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities));
       const child = capabilities.worker.kind === "provisioned" ? this.one(`SELECT id FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, capabilities.worker.label) : null;
-      const barrier = ExecutorStartBarrierSchema.parse({ kind: "cooldown", fingerprint: JSON.stringify([String(child?.id ?? "missing"), capabilities.config_revision]), failures: 2, until_ts: now + command.cooldown_ms, reason: command.reason });
+      const barrier = ExecutorStartBarrierSchema.parse({ kind: "cooldown", fingerprint: executorStartupFingerprint(String(child?.id ?? "missing"), capabilities.config_revision), failures: 2, until_ts: now + command.cooldown_ms, reason: command.reason });
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`INSERT INTO executor_start_barriers(token_id,state) VALUES(?,?) ON CONFLICT(token_id) DO UPDATE SET state=excluded.state`, tokenId, JSON.stringify(barrier));
         this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, effectKey, req.command_id, effectRequest, JSON.stringify(barrier));
@@ -5089,7 +5099,10 @@ export class KnowledgeHub {
     const worker = binding?.worker_token_id === tokenId;
     const attemptHost = current.attempt?.host;
     const startClaim = this.one(`SELECT token_id, session FROM executor_start_claims WHERE task_id = ?`, req.id);
-    const ownsUnstartedClaim = gateway && (command.kind === "start_failed" || command.kind === "recover_unstarted") && startClaim?.token_id === tokenId && startClaim.session === req.session;
+    // Bootstrap authority is the exact authenticated startup reservation, not
+    // caller-supplied body.agent. No attempt/worker binding exists before begin.
+    const ownsUnstartedClaim = gateway && ["begin", "start_failed", "recover_unstarted"].includes(command.kind)
+      && startClaim?.token_id === tokenId && startClaim.session === req.session;
     if (command.kind !== "message" && !(owner === row.owner || worker || ownsUnstartedClaim || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
     const session = req.session ?? "";
     if (!session) throw new Error("gate: durable execution requires an explicit session");
@@ -5116,7 +5129,7 @@ export class KnowledgeHub {
       // Even while cooling down, derive the same prerequisite identity without
       // granting a launch or discarding any work retained on this host.
       const child = capabilities.worker.kind === "provisioned" ? this.one(`SELECT id FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, capabilities.worker.label) : null;
-      const fingerprint = readiness.kind === "ready" ? readiness.fingerprint : JSON.stringify([String(child?.id ?? "missing"), capabilities.config_revision]);
+      const fingerprint = readiness.kind === "ready" ? readiness.fingerprint : executorStartupFingerprint(String(child?.id ?? "missing"), capabilities.config_revision);
       const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
       const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
       const reason = command.kind === "start_failed" ? command.reason : "Canonical worker readiness restored after a legacy pre-begin credential rejection";
@@ -12115,6 +12128,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const meta = JSON.parse(lane.meta ?? "{}");
     const lease: TrainLease | null = meta.lease ?? null;
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    if (body.check_retry) {
+      const command = CheckRetryCommandSchema.parse(body.check_retry);
+      if (command.kind === "reserve") {
+        const subject = this.one(`SELECT meta FROM artefacts WHERE id=? AND type='task'`, command.task_id);
+        const targetMeta = JSON.parse(String(subject?.meta ?? "{}"));
+        if (!prTargetsOf({ meta: targetMeta }).some(p => p.repo === repo)) throw new Error("gate: check retry subject is not bound to this lane repository");
+      }
+      return new TrainCheckRecovery(this.state.storage).command(String(lane.id), command, Date.now());
+    }
     // BR#5633: the entries THIS stamp persists — provided, else the stored
     // ones (the absent-entries preservation above).
     const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
@@ -12198,6 +12220,31 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     this.saveLaneState(lane.id, meta, Date.now());
     this.audit(actor, "train:queue_facts", lane.id, { lane: laneKey(repo, base), n: entriesArr.length, base_verdict: baseState ? String(baseState.verdict ?? "?") : null, ...(sweepStamp ? { awaiting_sweep: Object.keys(sweepStamp).length } : {}) });
+    // A queued red candidate is not owned merely because it has a train slot.
+    // Give its exact head ONE concrete repair duty, preserving any live writer.
+    const checkRecovery = new TrainCheckRecovery(this.state.storage);
+    for (const entry of entriesArr) {
+      const evidence = CandidateRepairSchema.safeParse(entry.repair);
+      if (!evidence.success) continue;
+      const subject = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=? AND type='task'`, String(entry.id));
+      if (!subject || ["done", "superseded", "in_review"].includes(String(subject.status))) continue;
+      const sm = JSON.parse(String(subject.meta ?? "{}"));
+      if (mergePhaseOf(sm) !== "queued" || this.enrichFixCardRow(String(entry.id))?.active_agent) continue;
+      if (!prTargetsOf({ meta: sm }).some(p => p.repo === repo && p.number === Number(entry.pr))) continue;
+      const duty = checkRecovery.candidateDuty(String(entry.id), evidence.data.head_sha)
+        ?? await this.ensureTaskRecovery(String(entry.id), "head_checks");
+      checkRecovery.bindCandidate(String(entry.id), evidence.data.head_sha, duty);
+      entry.repair_task = duty;
+    }
+    // Recovery task creation awaits; re-read before persisting the enriched
+    // projection so a concurrent lease/event mutation is never overwritten.
+    if (entriesArr.some(e => e.repair_task)) {
+      const freshMeta = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id=?`, lane.id)?.meta ?? "{}"));
+      if (freshMeta.lane?.queue_facts?.at === meta.lane.queue_facts.at) {
+        freshMeta.lane.queue_facts.entries = entriesArr;
+        this.saveLaneState(lane.id, freshMeta, Date.now());
+      }
+    }
     if (deployCov?.phase === "uncovered_dispatched" && deployCov.tip_sha !== prevDispatchedSha) {
       this.version(lane.id, actor, "update", `dark-tip self-heal (BR#6179): auto-dispatched ${deployCov.workflow} on ${base} for uncovered tip ${deployCov.tip_sha.slice(0, 8)} (age ${Math.floor(deployCov.tip_age_secs / 60)}m)`, {});
       this.audit(actor, "train:deploy_dispatched", lane.id, {
@@ -13428,7 +13475,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (active) return String(active.id);
     const parent = this.one(`SELECT title, meta FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
-    const description = reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : "Restore delivery tracking";
+    const description = reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
     const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
@@ -13614,14 +13661,25 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const meta = JSON.parse(lane?.meta ?? "{}");
     const cfg = laneOfMeta(meta);
     if (!cfg) return line;
+    if (["no_progress", "merge_failed"].includes(line.blocker)) {
+      const entries: unknown[] = meta.lane?.queue_facts?.entries ?? [];
+      for (const raw of entries) {
+        if (!raw || typeof raw !== "object" || !("repair_task" in raw) || typeof raw.repair_task !== "string") continue;
+        const candidateRepair = this.enrichFixCardRow(raw.repair_task, now);
+        if (!candidateRepair) continue;
+        if (["done", "superseded"].includes(candidateRepair.status)) return { ...line, remediation: {
+          kind: "blocked", task: candidateRepair, text: "The candidate repair duty ended, but the same head still fails. Its outcome requires investigation; no unchanged retry will be dispatched.",
+        } };
+        return { ...line, remediation: taskRemediation(candidateRepair) };
+      }
+    }
     const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo).card;
     const episode = `${line.blocker}:${line.blocker === "merge_failed"
       ? meta.lane?.queue_facts?.stalled?.since ?? "current"
       : meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`;
     const bound = current ? this.enrichFixCardRow(current.id, now) : null;
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
-      ...line, remediation: { kind: bound.active_agent ? "agent" : "queued", task: bound,
-        text: bound.active_agent ? repairProgressText(bound) : "Repair work is queued for an available agent." },
+      ...line, remediation: taskRemediation(bound),
     };
     const duties = this.state.storage.sql.exec(
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
@@ -13635,12 +13693,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
     const task = open ? this.enrichFixCardRow(open.id, now) : null;
     if (task && !this.rootFixExhausted(JSON.parse(String(open!.meta ?? "{}")), task.status)) return {
-      ...line, remediation: task.active_agent
-        ? { kind: "agent", task, text: repairProgressText(task) }
-        : { kind: "queued", task, text: task.status === "blocked"
-            ? `The repair is waiting: ${task.blocked_reason ?? "see the repair task for its next step"}`
-            : task.status === "in_progress" ? "The repair has no recent heartbeat; the watchdog will reassign it if the session remains silent."
-            : "Recovery is queued; waiting for an available agent." },
+      ...line, remediation: taskRemediation(task),
     };
     const exhausted = !!current?.exhausted || duties.length >= 3 || !!(open && this.rootFixExhausted(JSON.parse(String(open.meta ?? "{}")), String(open.status)));
     if (!exhausted) {
@@ -13653,7 +13706,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }, "system:train");
       this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, created.id, laneId, now);
       const assigned = this.enrichFixCardRow(String(created.id), now)!;
-      return { ...line, remediation: { kind: "queued", task: assigned, text: "Recovery assigned at top priority; waiting for an available agent." } };
+      return { ...line, remediation: taskRemediation(assigned) };
     }
     // An exhausted machine retry budget is NOT evidence that a human must
     // act. Only a concrete ask bound to the repair can warrant that claim.
@@ -13718,6 +13771,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ...(owner ? { owner } : {}),
       ...(executorSession ? { executor_session: executorSession } : {}),
       active_agent: activeAgent,
+      execution_blockers: ["todo", "blocked"].includes(status) && m.execution_requirements
+        ? this.executionWork().blockers({ id: String(r.id), title: String(r.title ?? ""), project: String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(r.id))?.project ?? ""),
+            status, owner: String(r.owner ?? ""), meta: JSON.stringify(m), updated_ts: Number(r.updated_ts ?? 0) }, now)
+        : [],
       ...(blockedReason ? { blocked_reason: blockedReason } : {}),
       ...(lastProgress ? { last_progress: lastProgress } : {}),
       ...(prExtra?.pr ? { pr: prExtra.pr } : {}),

@@ -19,11 +19,24 @@ export const LineRemediationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("machine"), text: z.string(), url: z.string().nullable() }),
   z.object({ kind: z.literal("agent"), text: z.string(), task: TrainFixCardSchema }),
   z.object({ kind: z.literal("queued"), text: z.string(), task: TrainFixCardSchema }),
+  z.object({ kind: z.literal("blocked"), text: z.string(), task: TrainFixCardSchema }),
   z.object({ kind: z.literal("human"), text: z.string(), action: ActionSchema }),
   z.object({ kind: z.literal("merge"), text: z.string(), pr: z.number().int().positive(), url: z.string().url(), request: ActionSchema.nullable() }),
   z.object({ kind: z.literal("attention"), text: z.string() }),
 ]);
 export type LineRemediation = z.infer<typeof LineRemediationSchema>;
+
+/** One recovery projection for root repairs, diagnostics and cause journals.
+ * Status=todo does not imply dispatchable; blockers are independently owned. */
+export function taskRemediation(task: TrainFixCard): LineRemediation {
+  const blockers = task.execution_blockers ?? [];
+  if (blockers.length) return { kind: "blocked", task, text: blockers.map(b => b.text).join(" ") };
+  if (task.active_agent) return { kind: "agent", task, text: repairProgressText(task) };
+  if (task.status === "blocked") return { kind: "blocked", task, text: task.blocked_reason ?? "The repair is parked; its recorded wait must resolve before execution." };
+  return { kind: "queued", task, text: task.status === "in_review" ? "The repair is awaiting independent verification."
+    : task.status === "in_progress" ? "The repair has no recent heartbeat; executor recovery is pending."
+    : "Recovery is queued; waiting for an eligible executor." };
+}
 const LineBlockerSchema = z.enum(["main_failed", "deploy_missing", "checks_running", "merge_failed", "no_progress", "human_action", "no_executor", "stale_observation"]);
 const LineFields = z.object({
   label: z.string(),
@@ -55,13 +68,7 @@ export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonN
         || Number(a.episode.cause.kind === "check_failure") - Number(b.episode.cause.kind === "check_failure")
         || b.episode.updated_at - a.episode.updated_at);
     const repair = ranked[0];
-    if (repair?.task) return TrainLineProjectionSchema.parse({ ...line, recoveries, remediation: {
-      kind: repair.task.active_agent ? "agent" : "queued", task: repair.task,
-      text: repair.task.active_agent ? repairProgressText(repair.task)
-        : repair.task.blocked_reason ? `The repair is waiting: ${repair.task.blocked_reason}`
-        : repair.task.status === "in_progress" ? "The cause-bound repair has no recent heartbeat; executor recovery is pending."
-        : "The cause-bound repair is queued for execution or independent verification.",
-    } });
+    if (repair?.task) return TrainLineProjectionSchema.parse({ ...line, recoveries, remediation: taskRemediation(repair.task) });
   }
   if (open.length && line.phase === "ready") return TrainLineProjectionSchema.parse({ ...line, recoveries,
     phase: "waiting", label: "Verifying recovery", blocker: "checks_running",
@@ -125,7 +132,8 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     if (ask) return { kind: "human", text: task?.pr && !task.merged
       ? `Merge repair PR #${task.pr}, then choose DONE in the request. Main's failing checks prevent the automatic merge.`
       : ask.question, action: ask };
-    if (task?.active_agent) return { kind: "agent", text: repairProgressText(task), task };
+    if (task?.execution_blockers?.length) return taskRemediation(task);
+    if (task?.active_agent) return taskRemediation(task);
     if (task && (task.status === "todo" || task.status === "in_review")) return {
       kind: "queued", text: task.status === "todo" ? "Repair is queued at top priority; waiting for an available agent." : "The repair is awaiting independent verification.", task,
     };

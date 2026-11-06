@@ -20,6 +20,7 @@ import { ExecutionResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
 import { RecoveryCommandSchema } from "./train-recovery.ts";
+import { CheckRetryCommandSchema, CandidateRepairSchema, CandidateIntegrationSchema } from "./train-checks.ts";
 import { ExecutionRequestSchema, HandoffReadSchema, HandoffAcceptSchema, HandoffCheckpointSchema } from "./execution.ts";
 
 /** Every tool name the hub has ever advertised, from the recorded fixture. */
@@ -324,7 +325,10 @@ export const TOOL_ARG_SCHEMAS = {
       id: z.string(),
       pr: z.number().int().optional(),
       cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]),
-    })),
+      repair: CandidateRepairSchema.optional(),
+      integration: CandidateIntegrationSchema.optional(),
+    })).optional(),
+    check_retry: CheckRetryCommandSchema.optional(),
     // BR#5376: the ACTIVE batch-stall episode, executor-fed (freshness law:
     // the next stamp after a landing omits it, which clears the state by
     // itself). batch = the members in landing order; ticks = consecutive

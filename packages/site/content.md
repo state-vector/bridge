@@ -142,7 +142,12 @@ publication, newer local WIP or unproven writer isolation retains the work and
 host affinity. A dead host cannot guarantee preservation of changes since its
 last published checkpoint.
 
-Action budgets are independent of stdout activity. Task-addressed coordination
+Action budgets are independent of stdout activity. Coordination mailboxes
+and execution leases are polled every 20 seconds by a dedicated per-attempt
+thread, so slow worker preparation, checkpoints and dispatch ticks cannot starve
+active writers. Pollers stop and join before quiescence/transfer; a refused poll
+stops its writer and preserves WIP.
+Task-addressed coordination
 is delivered through a durable queued/delivered/acknowledged/acted mailbox;
 non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
 operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution
@@ -357,6 +362,19 @@ claiming main failed. Actual red checks and active stop episodes still block.
 Recovery names the agent by its display label. Raw runner transcripts are
 expandable diagnostic details; they are not presented as structured next-action
 reports. Missing next actions are shown explicitly rather than invented.
+
+**Structural recovery admission (BR#6776).** GitHub checks retain their app/suite
+or workflow identity. A green publisher cannot conceal a failed same-name check
+from another workflow. Retry routing uses the actual job or workflow-run ID,
+with a durable reservation before dispatch and one attempt per candidate head
+and obligation; uncertain calls are not blindly repeated after restart. Failed
+queued heads receive a deduplicated repair duty even when their parent has no
+active owner. Candidates integrate current base and run fresh CI before merging;
+clean machine updates carry substance review, never stale test evidence. This
+is rechecked between batch members to catch semantic cross-file integration
+breaks. Initial worker launch is authorized by the exact authenticated scheduler
+reservation. Recovery banners show actual startup/capability/handoff blockers,
+rather than describing an unlaunchable `todo` task as waiting for an agent.
 
 The train status, message and recovery banner consume the hub's shared typed
 `line` projection. A failed decisive deployment overrides green job subsets;
