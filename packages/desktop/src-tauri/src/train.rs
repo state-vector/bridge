@@ -7355,6 +7355,7 @@ mod tests {
         let (hub, calls) = mock_hub(vec![
             ok(json!({ "note": "lease renewed" })),        // sweep: renew before the close
             ok(json!({ "ok": true })),                     // sweep: train_event escalation_closed
+            ok(json!({ "ok": true })),                     // empty-queue main-health publish (BR#5114/BR#5265)
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })), // release_if_idle status
             ok(json!({ "note": "lease released — idle" })), // release
         ]);
@@ -7362,7 +7363,7 @@ mod tests {
         drive_lane_inner(&mut ctx, &lane(99, "BR#99"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000, 10).unwrap();
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
-        assert_eq!(names, vec!["train_lease", "train_event", "train_status", "train_lease"]);
+        assert_eq!(names, vec!["train_lease", "train_event", "train_queue_facts", "train_status", "train_lease"]);
         let ev = call_args(&recorded[1]);
         assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("escalation_closed"));
         assert_eq!(ev.get("pr").and_then(|v| v.as_i64()), Some(99));
@@ -7380,6 +7381,7 @@ mod tests {
         let (hub, calls) = mock_hub(vec![
             ok(json!({ "note": "lease renewed" })),
             ok(json!({ "ok": true })),
+            ok(json!({ "ok": true })), // empty-queue main-health publish (BR#5114/BR#5265)
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })),
             ok(json!({ "note": "lease released — idle" })),
         ]);
@@ -7399,13 +7401,14 @@ mod tests {
         let gh = FakeGh::new(""); // placeholder; the script is rewritten to fail below
         std::fs::write(gh.dir.join("gh"), format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n", gh.log.display())).unwrap();
         let (hub, calls) = mock_hub(vec![
+            ok(json!({ "ok": true })), // empty-queue main-health publish (BR#5114/BR#5265)
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null } ] })),
             ok(json!({ "note": "lease released — idle" })),
         ]);
         let mut ctx = test_ctx(&hub);
         drive_lane_inner(&mut ctx, &lane(97, "BR#97"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000, 10).unwrap();
         let names: Vec<String> = calls.lock().unwrap().iter().map(call_name).collect();
-        assert_eq!(names, vec!["train_status", "train_lease"], "a failed probe defers: no renew, no close, no event");
+        assert_eq!(names, vec!["train_queue_facts", "train_status", "train_lease"], "a failed probe defers: no renew, no close, no event — only the idle publish + release");
         assert!(gh.calls().iter().all(|c| c.contains("pr view 97")), "only the probe ran");
     }
 }
