@@ -559,6 +559,74 @@ describe("merge train DO drill (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-batch" });
   });
 
+  it("BR#4694 train canary: canary events are ledger-tagged, bounce mechanically (no ask for either card — BR#4960 zero-ask law), and are excluded from throughput metrics", async () => {
+    // --- the bounce leg: a canary bounce and a control bounce ride the SAME
+    // mechanical path (BR#4960 zero-ask law — neither files a human ask);
+    // the canary differentiator is the ledger tag, asserted below
+    const repo = "state-vector/lane-canary";
+    const canaryCard = await queueViaAccept({ repo, pr: 2701, head: "e".repeat(40), title: "[train-canary] lane ride drill" });
+    expect((await kbJson("/update", { id: canaryCard, meta: { canary: true } })).status).toBe(200);
+    const plainCard = await queueViaAccept({ repo, pr: 2702, head: "f".repeat(40), title: "IMPL: canary control card" });
+    await acquire(repo, "gw-c", { required_workflows: ["Test"] });
+    const bounce = (pr: number, head: string, task: string, canary: boolean) =>
+      kbJson("/train.event", {
+        repo, base: "main", kind: "bounced", actor: "gw-c", pr, head_sha: head,
+        bounce_kind: "gate", reason: "mergeStateStatus=behind — re-enter", task_id: task,
+        ...(canary ? { canary: true } : {}),
+      });
+    expect((await bounce(2701, "e".repeat(40), canaryCard, true)).body.error ?? "").toBe("");
+    expect((await bounce(2702, "f".repeat(40), plainCard, false)).body.error ?? "").toBe("");
+    const cc = (await kbJson("/get", { id: canaryCard })).body;
+    const pc = (await kbJson("/get", { id: plainCard })).body;
+    expect(cc.meta?.merge_train?.review_ask_id ?? null).toBeNull();
+    expect(cc.meta?.merge_train?.review_ask_deduped ?? null).toBeNull();
+    expect(pc.meta?.merge_train?.review_ask_id ?? null).toBeNull();
+    // both cards bounced mechanically to the impl fix-up path (in_progress)
+    expect(cc.status).toBe("in_progress");
+    expect(pc.status).toBe("in_progress");
+    // the bounce events still carry the tag — provenance is complete
+    // (detail arrives as a JSON string on some event kinds, an object on others)
+    const det = (e: any) => (typeof e.detail === "string" ? JSON.parse(e.detail) : e.detail ?? {});
+    const bounceHist = (await kbJson("/train.history", { repo })).body.events.filter((e: any) => e.kind === "bounced");
+    expect(det(bounceHist.find((e: any) => e.pr === 2701)).canary).toBe(true);
+    expect(det(bounceHist.find((e: any) => e.pr === 2702)).canary).toBeUndefined();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-c" });
+
+    // --- the metrics exclusion: a repo whose ONLY merges are canary merges
+    // reports zero throughput — but the ledger remembers every event
+    const repo2 = "state-vector/lane-canary-metrics";
+    const canaryOnly = await queueViaAccept({ repo: repo2, pr: 2703, head: "9".repeat(40), title: "[train-canary] metrics drill" });
+    await kbJson("/update", { id: canaryOnly, meta: { canary: true } });
+    await acquire(repo2, "gw-m", { required_workflows: ["Test"] });
+    // NO body.canary — the hub must resolve the tag from the card meta alone
+    const M = "c".repeat(40);
+    const merged = await kbJson("/train.event", {
+      repo: repo2, base: "main", kind: "merged", actor: "gw-m",
+      pr: 2703, merge_sha: M, head_sha: "9".repeat(40), task_id: canaryOnly,
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+    const landed = await kbJson("/train.ci", {
+      repo: repo2, base: "main", actor: "gw-m", sha: M,
+      checks: [check(9, "Test", "success", "https://example/ci/canary-green")],
+    });
+    expect(landed.body.decided).toBe("landed");
+    const act = (await laneSnap(repo2)).activity;
+    expect(act.merged_1h).toBe(0);
+    expect(act.merged_24h).toBe(0);
+    // BR#5674: last_merge_ts is lane HEALTH (any merge stamps it, canary
+    // included — a canary merge proves the lane moves); only the throughput
+    // metrics (merges/h, asserted above) exclude canary rows.
+    expect(act.last_merge_ts ?? 0).toBeGreaterThan(0);
+    // the ledger is intact: merged + landed present, both tagged canary
+    const evs = (await kbJson("/train.history", { repo: repo2 })).body.events;
+    expect(evs.map((e: any) => e.kind)).toEqual(expect.arrayContaining(["merged", "landed"]));
+    expect(det(evs.find((e: any) => e.kind === "merged")).canary).toBe(true);
+    expect(det(evs.find((e: any) => e.kind === "landed")).canary).toBe(true);
+    // and the fixture card closed done via the machine proxy, like any card
+    expect((await kbJson("/get", { id: canaryOnly })).body.status).toBe("done");
+    await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-m" });
+  });
+
   it("a merge-tree conflict parks the head card TYPED conflicting (BR#6348) — queue-visible on a bounded budget, the follower queues behind", async () => {
     const repo = "state-vector/lane-bounce";
     const c1 = await queueViaAccept({ repo, pr: 2601, head: "b".repeat(40), title: "IMPL: bounce drill head" });
