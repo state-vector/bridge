@@ -331,7 +331,7 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // the queue count still derives from l.queue.length, the open count
     // from lane.open_prs.
     expect(trainPanelSrc).toMatch(/trainQueueDepthLabel\(l\)/);
-    expect(trainPanelSrc).toMatch(/queue \$\{l\.queue\.length\}/);
+    expect(trainPanelSrc).toMatch(/queue \$\{l\.queue\?\.length \?\? 0\}/);
     expect(trainPanelSrc).toMatch(/open \$\{l\.open_prs\.count\}/);
     // RATE: merges per hour / 24h
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);

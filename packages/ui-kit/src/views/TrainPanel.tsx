@@ -129,7 +129,7 @@ const REFRESH_MS = 30_000;
  *  shows a pile (the "43 open PRs, queue EMPTY" class, BR#5022). No
  *  reconcile data yet → queue alone, never a made-up zero. */
 export function trainQueueDepthLabel(l: Pick<KbTrainLane, "queue" | "open_prs">): string {
-  const depth = `queue ${l.queue.length}`;
+  const depth = `queue ${l.queue?.length ?? 0}`;
   return l.open_prs ? `${depth} · open ${l.open_prs.count}` : depth;
 }
 
@@ -195,7 +195,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         <span className="trainc-msg">{line.remediation?.text ?? line.reason}</span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog">
-          <span className="train-depth top-num" title={`${l.queue.length} card(s) waiting to merge — the derived queue, the actionable subset (verdict-stamped, gate-clean heads)${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed (${age(l.open_prs.ts, now)} ago) — the verification buckets are not the whole truth; the derived queue is only the actionable subset (BR#5106/BR#5022)` : "\nno reconcile data yet — queue alone, never a made-up zero (BR#5106/BR#5022)"}`}>
+          <span className="train-depth top-num" title={`${l.queue?.length ?? 0} card(s) waiting to merge — the derived queue, the actionable subset (verdict-stamped, gate-clean heads)${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed (${age(l.open_prs.ts, now)} ago) — the verification buckets are not the whole truth; the derived queue is only the actionable subset (BR#5106/BR#5022)` : "\nno reconcile data yet — queue alone, never a made-up zero (BR#5106/BR#5022)"}`}>
             {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
           </span>
           <span className="train-stats">
