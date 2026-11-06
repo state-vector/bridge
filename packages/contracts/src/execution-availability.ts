@@ -11,7 +11,7 @@ export const ExecutionAttentionSchema = z.object({
 export type ExecutionAttention = z.infer<typeof ExecutionAttentionSchema>;
 export type ExecutionAttentionItem = ExecutionAttention["items"][number];
 
-export type ExecutorReadiness = { kind: "ready"; worker_id: string; fingerprint: string } | { kind: "unprovisioned" | "repair_required"; reason: string } | { kind: "cooldown"; reason: string; until_ts: number };
+export type ExecutorReadiness = { kind: "ready"; worker_id: string; fingerprint: string } | { kind: "unprovisioned" | "repair_required" | "draining"; reason: string } | { kind: "cooldown"; reason: string; until_ts: number };
 export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number; readiness?: ExecutorReadiness }
 export function usableFor(required: ExecutionRequirements, capability: ExecutorCapabilities | ExecutorCapabilities["alternatives"][number], host: string, project: string): boolean {
   return capability.availability.kind === "usable" && capability.model !== null && capability.projects.some(p => p === "*" || p === project)

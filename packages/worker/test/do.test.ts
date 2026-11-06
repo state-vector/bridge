@@ -1389,7 +1389,7 @@ describe("interactive claim takeover (BR#6135)", () => {
 
   it("verify duty cards refuse (SoD is not transferable) and typed-wait holds refuse", async () => {
     const gw = await kbJson("/admin.mint", { label: "br6135-gw3", tags: ["gateway"] });
-    await readyGateway(kbJson, gw.body.id, "br6135-gw3");
+    await readyGateway(kbJson, gw.body.id, "br6135-gw3", 2);
     // verdict duty
     const { body: duty } = await kbJson("/create", { type: "task", title: "Verify: takeover duty br6135", roles: ["review"] });
     const dc = await kbJson("/transition", {
@@ -1401,9 +1401,10 @@ describe("interactive claim takeover (BR#6135)", () => {
     expect(String(dr.body.error)).toContain("[rule: takeover-verdict-duty]");
     // typed wait: an in_progress card holding awaiting_ask is held by the ask
     const { body: card } = await kbJson("/create", { type: "task", title: "takeover held br6135" });
-    await kbJson("/transition", {
+    const heldClaim = await kbJson("/transition", {
       id: card.id, to: "in_progress", note: "claim", actor: "br6135-gw3", gateway: true, agent: "br6135-agent3", token_id: gw.body.id, session: "dispatch-BR-6135D",
     });
+    expect(heldClaim.status).toBe(200);
     const upd = await kbJson("/update", { id: card.id, meta: { awaiting_ask: { ask_id: "BR#999" } } });
     expect(upd.status).toBe(200);
     const hr = await kbJson("/transition", { id: card.id, to: "in_progress", takeover: true, actor: "web:rayh" });

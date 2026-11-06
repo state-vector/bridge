@@ -352,7 +352,7 @@ describe("durable executor on real SQLite", () => {
     const token_id = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data.token_id;
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const auth = { actor: host, token_id, gateway: true, agent: `${host}/worker`, session: "task-prerequisite" };
-    const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], config_revision: "before-repair", worker: { kind: "provisioned", label: `${host}/worker` } };
+    const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], capacity: 4, config_revision: "before-repair", worker: { kind: "provisioned", label: `${host}/worker` } };
     const advertise = (config_revision: string) => post("execution", { ...auth, id: "gateway", command_id: config_revision, command: { kind: "advertise", capabilities: { ...capabilities, config_revision } } });
     await advertise("before-repair");
     const task = (await post<{ id: string }>("create", { type: "task", title: "Task-specific startup rejection", qualified: true })).data;
@@ -388,7 +388,7 @@ describe("durable executor on real SQLite", () => {
     const token_id = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data.token_id;
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const auth = { actor: host, token_id, gateway: true, agent: `${host}/worker`, session: "protected-startup" };
-    const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], worker: { kind: "provisioned", label: `${host}/worker` } };
+    const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], capacity: 5, worker: { kind: "provisioned", label: `${host}/worker` } };
     await post("execution", { ...auth, id: "gateway", command_id: "protected-ready", command: { kind: "advertise", capabilities } });
     const ids: string[] = [];
     for (const variant of ["ask", "pr", "live", "writer", "unknown-operation"]) {
