@@ -3212,7 +3212,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     ),
                 );
                 release_if_idle(ctx, key, repo, base)?;
-                Ok(())
+                return Ok(());
             }
             MergeAction::Bounce { defect, bounce_kind } => {
                 renew_lease(ctx, repo, base);
