@@ -120,6 +120,7 @@ import {
   trainCarryChainEnd,
   trainQueueRemainingReason,
   trainParseNoteLegs,
+  trainStampRefresh,
   isValidGitHubRepo,
   parseDirectCommitReceipt,
   partitionMergeBatches,
@@ -3823,7 +3824,11 @@ export class KnowledgeHub {
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
         case "train.carry": return this.json(await this.trainCarry(body, actor));
         case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
-        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec));
+        // BR#5186: base_live rides ONLY the executor's reseed ask — the tick
+        // probed the base branch live on the remote first-hand (the hub holds
+        // no VCS credentials, BR#3507). Any caller without the flag keeps the
+        // BR#4977 refusal (fail-closed).
+        case "train.lane": return this.json(await this.laneEnsure(String(body.repo ?? ""), String(body.base ?? "main"), actor, body.spec, { base_live: body.base_live === true }));
         case "train.observe_deploy": return this.json(await this.trainObserveDeploy(body, actor));
         case "train.recovery_event": return this.json(await this.trainRecoveryEvent(body, actor));
         // ---- reconcile (BR#4170): the gateway feeds observations, the hub
@@ -6705,13 +6710,13 @@ export class KnowledgeHub {
               this.audit("system:merge-train", "queue_skipped", parent.id, { reason: trainBounced ? "conflict bounce — impl repair stands until a fresh verify accepts the new head (BR#3659 defect 2)" : "parent is in_progress without a train bounce — a live claim the hub must not hijack (BR#3659 defect 2)" });
               this.version(parent.id, "system:merge-train", "queue_skipped", "verify close on an in_progress card did not re-queue it — the bounce/claim stands", {});
             } else {
-              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), review_result: reviewResult }, actor);
+              await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), dutyBody: String(row.body_md ?? ""), review_result: reviewResult }, actor);
               this.audit("system:merge-train", "requeued_after_bounce", parent.id, { reason: `bounce was ${String(bt.bounce_kind ?? "gate")}-kind with no conflict files — the fresh verify accept re-queues (BR#4067 self-heal)` });
             }
           } else if (parent.status === "blocked" && !parkReason.startsWith(MERGE_TRAIN_REASON_PREFIX)) {
             this.audit("system:merge-train", "queue_skipped", parent.id, { reason: "parent is blocked on a non-train reason — parked deliberately; the verify close did not queue it" });
           } else {
-            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), review_result: reviewResult }, actor);
+            await this.trainQueueOnAccept(parent.id, { note: String(body.note ?? ""), dutyBody: String(row.body_md ?? ""), review_result: reviewResult }, actor);
           }
         }
       } catch (e) {
@@ -10463,7 +10468,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  history goes dark. */
   private laneTerminalRows(laneKeyValue: string): any[] {
     return (this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts FROM artefacts
+      `SELECT id, status, title, meta, status_ts FROM artefacts
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
        ORDER BY created_ts ASC`,
       laneKeyValue,
@@ -10485,8 +10490,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     *  no re-arm — re-open the card or register a reseed to re-arm. This
     *  supersedes the BR#5061 spec's create-fresh clause on the no-successor
     *  path (an accepted decision outranks the spec; the rebind path — the
-    *  2026-10-29 outage's keystone — is unchanged). */
-  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>): Promise<any> {
+    *  2026-10-29 outage's keystone — is unchanged).
+    *  BR#5186 carves ONE exception out of that refusal: when EVERY card for
+    *  the key is terminal and the executor's first-hand probe says the base
+    *  branch is still LIVE on the remote (opts.base_live — the hub holds no
+    *  VCS credentials to re-check, BR#3507), the closure was an erroneous
+    *  close (the BR#5130 class that killed BR#3648 and BR#5050), not a
+    *  retirement — the lane auto-reseeds v(N+1) and rebinds. Without the
+    *  flag the refusal stands exactly as before. */
+  private async laneEnsure(repo: string, base: string, actor: string, cfg?: Partial<LaneSpec>, opts?: { base_live?: boolean }): Promise<any> {
     if (!isValidGitHubRepo(repo)) {
       throw new Error(`invalid lane repo "${repo}" — must be a valid GitHub owner/name (never a BR#/GH# cross-reference or numeric fragment)`);
     }
@@ -10523,13 +10535,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           );
         }
         if (!live) {
-          // BR#4977 lane lifecycle: no successor means deliberately retired —
-          // the single refusal point (the BR#4772 drill-residue class): no
-          // lease/CPO meta writes, no config refresh, no re-arm, and no
-          // create-fresh resurrection (BR#5061's spec clause is superseded
-          // here by the accepted decision). Re-arm is a deliberate lifecycle
-          // act — re-open the lane card or register a reseed.
-          throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          // BR#5186: EVERY card for the key is terminal. The executor just
+          // probed the base branch on the remote first-hand (the hub holds
+          // no VCS credentials, BR#3507 — the tick's probe is the only
+          // liveness evidence):
+          //   base_live=true — the base is LIVE: the closure was an
+          //     erroneous close (the BR#5130 class that killed BR#3648 and
+          //     BR#5050 off stale provenance), not a retirement. A lane
+          //     card is INFRASTRUCTURE: landing a queued PR completes a
+          //     leg, it does not complete the LANE. Auto-reseed v(N+1)
+          //     carrying the predecessor's config and rebind.
+          //   otherwise     — the BR#4977 refusal stands (the BR#4772
+          //     drill-residue class, a deliberate retirement, or a
+          //     no-signal probe): no lease/CPO meta writes, no config
+          //     refresh, no re-arm, no create-fresh resurrection
+          //     (BR#5061's spec clause stays superseded on this path).
+          //     Re-arm is a deliberate lifecycle act — re-open the lane
+          //     card or register a reseed.
+          if (opts?.base_live === true) {
+            live = await this.laneReseed(repo, base, actor, key, terminals);
+          } else {
+            throw new Error(`lane retired — ${key}'s lane card ${terminals[0].id} is ${terminals[0].status}; the tick does not touch a retired lane (BR#4772/BR#4977) — re-open the lane card (or register a reseed successor) to re-arm`);
+          }
         }
         existing = this.one(
           `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts WHERE id = ?`,
@@ -10641,6 +10668,54 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       actor,
     );
     this.audit(actor, "create", created.id, { type: "task", auto: "lane", lane_key: key });
+    return this.laneRow(key);
+  }
+
+  /** BR#5186: the all-terminal auto-reseed — every lane card for the key is
+   *  terminal (done/superseded) while the base branch is LIVE on the remote
+   *  (the executor probed it first-hand and asked with base_live; the hub
+   *  holds no VCS credentials to re-check, BR#3507). A lane card is
+   *  INFRASTRUCTURE: its closure must never kill a live repo's lane, so the
+   *  tick reseeds instead of skipping and every reconcile hiccup stops
+   *  re-killing lanes:
+   *  - v(N+1) parses off the terminal titles' "(vN" convention (the manual
+   *    reseed lineage — BR#5050 was v2, its manual successor v3); a lineage
+   *    with no versioned title starts at v2.
+   *  - config inherits the NEWEST terminal card's meta.lane — the working
+   *    copy is the operator's last word on this lane.
+   *  - the supersedes edge (fresh → newest terminal) keeps the lineage
+   *    machine-readable so BR#5061's rebind finds this card first, and
+   *    train_status folds the retired predecessor as history (one row per
+   *    lane).
+   *  The BR#4977 refusal keeps its teeth everywhere else: reseed only ever
+   *  happens on the tick's live-base claim, loudly audited (lane_reseeded). */
+  private async laneReseed(repo: string, base: string, actor: string, key: string, terminals: any[]): Promise<any> {
+    const newest = terminals[terminals.length - 1];
+    const prev = laneOfMeta(JSON.parse(newest.meta ?? "{}"));
+    let version = 2;
+    for (const t of terminals) {
+      const m = /\bv(\d+)\b/.exec(String(t.title ?? ""));
+      if (m) version = Math.max(version, Number(m[1]) + 1);
+    }
+    const cfg: Partial<LaneSpec> = prev
+      ? {
+          required_workflows: prev.required_workflows,
+          ...(prev.ci_typical_minutes != null ? { ci_typical_minutes: prev.ci_typical_minutes } : {}),
+          burst_max: prev.burst_max,
+        }
+      : {};
+    const fresh = await this.laneCreate(repo, base, actor, key, cfg);
+    const title = `${laneCardTitle(repo, base)} (v${version} — auto-reseed; predecessor ${newest.id} closed ${newest.status}; BR#5186)`;
+    this.state.storage.sql.exec(`UPDATE artefacts SET title = ? WHERE id = ?`, title, fresh.id);
+    this.state.storage.sql.exec(
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'supersedes', ?, ?)`,
+      fresh.id, newest.id, Date.now(),
+    );
+    this.audit(actor, "lane_reseeded", fresh.id, {
+      lane: key, version, config_from: newest.id, predecessor_status: newest.status, base_live: true,
+      note: `BR#5186: every lane card for the key was terminal while the base branch stayed live on the remote (executor probe) — an erroneous close (the BR#5130 class) must not kill a live lane; reseeded v${version} with the predecessor's config`,
+    });
+    this.version(fresh.id, actor, "lane_reseeded", `auto-reseeded v${version} — all lane cards terminal while the base stayed live; config inherited from ${newest.id} (BR#5186)`, { from_terminal: newest.id });
     return this.laneRow(key);
   }
 
@@ -10987,11 +11062,30 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       meta.lane.key = laneKey(repo, base);
     }
     if (action === "release" && body.line_green) {
+      const stop = meta.stop ?? null;
       meta.stop = null;
       // the stopped phase's in-flight record is the BROKEN merge commit —
       // never poll it toward a landing; the culprit card was bounced at stop
       // time, so the lane simply goes idle.
       if (meta.currently?.phase === "stopped") meta.currently = null;
+      // BR#4692: a stop-clear on the green line is LOUD — the lane history
+      // carries a stop_cleared row with the red window (who/when auditable)
+      // and the alarm sink gets the stop set → stop cleared note. Fires only
+      // when a stop actually existed: the executor's idle releases also send
+      // line_green (release_if_idle passes !stop) and must stay silent.
+      if (stop) {
+        const stoppedAt = Number(stop.at ?? now);
+        const redMs = Math.max(0, now - stoppedAt);
+        const redMin = Math.max(1, Math.round(redMs / 60_000));
+        const sha9 = String(stop.sha ?? "").slice(0, 9);
+        const window = `red window ${redMin}m (sha ${sha9}, stopped ${new Date(stoppedAt).toISOString()} → cleared ${new Date(now).toISOString()} by ${actor})`;
+        this.version(lane.id, actor, "train:stop_cleared", `stop auto-cleared on green line — ${window}`, { stop, red_window_ms: redMs, cleared_by: actor });
+        this.audit(actor, "train:stop_cleared", lane.id, { lane: laneKey(repo, base), sha: stop.sha, stopped_at: stoppedAt, cleared_at: now, red_window_ms: redMs });
+        try {
+          const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+          this.version(sinkId, actor, "note", `stop-the-line auto-cleared — ${laneKey(repo, base)} ${window}`, { lane: laneKey(repo, base), stop, red_window_ms: redMs, cleared_by: actor });
+        } catch { /* sink re-issued/missing — the lane rows above carry the audit */ }
+      }
     }
     const reason = this.laneSyncReason(lane.id, meta, now);
     // BR#5114 + BR#6012: laneSyncReason persists only on a reason CHANGE —
@@ -13075,7 +13169,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  one unbound leg fail-closes the queue. Bounce guards (defect 2): a
    *  verify close on an in_progress (bounced) card or a card blocked on a
    *  non-train reason never re-queues it. */
-  private async trainQueueOnAccept(parentId: string, src: { note?: string; review_result?: ReviewResult }, actor: string): Promise<void> {
+  private async trainQueueOnAccept(parentId: string, src: { note?: string; dutyBody?: string; review_result?: ReviewResult }, actor: string): Promise<void> {
     const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
     const meta = JSON.parse(parent.meta ?? "{}");
@@ -13116,9 +13210,23 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }
     // the legs: the note's PR/Head pairs (one head after each PR — the multi-
     // PR convention), folded onto the existing stamp; without a note PR, the
-    // existing stamp re-queues as-is; with neither, the card body is the last
-    // resort (single-PR legacy path, unchanged)
-    const stampLegs = trainLegs(meta);
+    // existing stamp re-queues as-is; with neither, the closing duty's seeded
+    // brief (the verdict record — BR#5329) then the card body are the last
+    // resorts (single-PR legacy path, unchanged)
+    // BR#5329 defect 2 — validate the EXISTING stamp too: stamps written
+    // before any parser validation may carry ghost legs (repo '4365/BR' —
+    // a misread of 'BR#4365/…' card-reference prose, gh 404) that queue
+    // ghost merge lanes. BR#5658's isValidGitHubRepo is the settled strict
+    // law (all-numeric owners AND reserved names like `BR`/`GH` both die —
+    // the `tb-pulse/BR` class). Dropping them here cleans the stamp on the
+    // next accept, and the card stops riding the ghost lane (the derived
+    // queue is computed from the legs, so the ghost lane starves).
+    const stampLegsAll = trainLegs(meta);
+    const stampLegs = stampLegsAll.filter((l) => isValidGitHubRepo(l.repo));
+    const ghostLegs = stampLegsAll.filter((l) => !isValidGitHubRepo(l.repo));
+    if (ghostLegs.length) {
+      this.audit(actor, "queue_ghost_leg_dropped", parentId, { dropped: ghostLegs.map((l) => `${l.repo}#${l.number}`), reason: "stamped legs with non-repo repo tokens (BR#5329 ghost-row class) — dropped before the re-stamp" });
+    }
     const noteLegs = trainParseNoteLegs(note);
     let legs: { repo: string; number: number; head_sha_at_acceptance?: string; base?: string }[];
     if (noteLegs.length && Array.isArray(meta.prs)) {
@@ -13132,21 +13240,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       legs = noteLegs;
     } else if (stampLegs.length) {
       // no parseable PR reference in the note — the existing stamp re-queues
-      // as-is, EXCEPT (BR#4648): a note that still carries a `head <sha>`
-      // token speaks for the card's ONE open leg. A single-unlanded-leg
-      // stamp has nothing to cross-pair, so the lone head refreshes it — a
-      // verifier citing bare receipts (no URL, no `repo#N`) must not strand
-      // the stamp on an old head and spin the coverage bounce. Multi-leg
-      // stamps stay fail-closed (no guessing which leg a lone head names).
-      legs = stampLegs.map((l) => ({ ...l }));
-      const loneHead = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
-      const open = legs.filter((l) => !trainLegLanded(meta, l));
-      if (loneHead && open.length === 1 && open[0].head_sha_at_acceptance !== loneHead) {
-        open[0].head_sha_at_acceptance = loneHead;
-        this.audit(actor, "queue_stamp_refreshed", parentId, { leg: `${open[0].repo}#${open[0].number}`, head: loneHead.slice(0, 9), via: "lone head token — the close note cited no PR reference (BR#4648)" });
+      // as-is, EXCEPT: a note that still carries a `head <sha>` token speaks
+      // for a leg. A single-unlanded-leg stamp has nothing to cross-pair, so
+      // the lone head refreshes it (BR#4648 — a verifier citing bare
+      // receipts must not strand the stamp on an old head and spin the
+      // coverage bounce). On a multi-leg stamp the lone head refreshes a leg
+      // the note EXPLICITLY names — bare `PR #N` (BR#5329) — never by
+      // guessing. (Pure decision: trainStampRefresh.)
+      const r = trainStampRefresh({ legs: stampLegs.map((l) => ({ ...l })), meta, note });
+      legs = r.legs;
+      for (const m of r.refreshed) {
+        this.audit(actor, "queue_stamp_refreshed", parentId, { leg: `${m.repo}#${m.number}`, head: m.head.slice(0, 9), via: m.via });
       }
     } else {
-      legs = trainParseNoteLegs(String(parent.body_md ?? ""));
+      // BR#5329 (BR#5048 structural follow-up #2): the verify VERDICT RECORD
+      // — the closing duty's seeded brief — names the verified PR (/pull/
+      // URL, auto-seeded) even when the verifier's close-note prose does
+      // not; parse it before the legacy parent body. The note's lone head
+      // pairs with a single-PR brief (the documented verifier convention).
+      // BR#5658: the card's own meta.review_pr is the last resort, validated
+      // before it may mint a leg.
+      legs = trainParseNoteLegs(String(src.dutyBody ?? ""));
+      if (!legs.length) legs = trainParseNoteLegs(String(parent.body_md ?? ""));
       if (!legs.length && meta.review_pr?.repo && Number(meta.review_pr?.number) > 0 && isValidGitHubRepo(String(meta.review_pr.repo))) {
         legs = [{ repo: String(meta.review_pr.repo), number: Number(meta.review_pr.number) }];
       }

@@ -1204,7 +1204,20 @@ shorthand — the way every bounce note and brief writes it — parses like the 
 (the URL form wins when both cite the same PR), and a head-bearing close with no
 PR citation at all refreshes a card that has exactly one open leg (multi-leg
 stamps stay fail-closed — a lone head is never guessed onto one of several
-legs). The re-queue note is honest about it: it says *stamp refreshed* only when
+legs). It is convention-tolerant again (BR#5329): the typed machine-leg prose
+`repo=owner/name n=N` — the shape every park note's typed `await_event` leg
+already carries — and the seeded duty brief's JSON-ish `repo:"owner/name", n:N`
+parse like the shorthand, the closing duty's seeded brief (the verdict record)
+is parsed before the legacy card body so a prose-only close still stamps
+(BR#5048 structural follow-up #2), and a bare `PR #N` citation names an
+EXISTING open leg — on a multi-leg stamp the lone `head <sha>` refreshes the
+named leg instead of staying fail-closed. Every parsed row is validated before
+it can become a leg: a repo token that is not a real GitHub repo shape (an
+all-numeric owner — the residue of slash-joined card-reference prose like
+`BR#4365/BR#4875`) never reaches `meta.prs`, so a misread card reference can
+no longer queue a ghost merge lane; stamps polluted before this rule are
+cleaned on the next accept (`queue_ghost_leg_dropped` audit). The re-queue
+note is honest about it: it says *stamp refreshed* only when
 a stamp actually moved, and an accept whose `head <sha>` cannot bind any leg is
 audited loud (`queue_stamp_not_refreshed`) instead of silently re-queuing a
 stale stamp — the silent-stale class that once spun coverage bounces on an
@@ -1486,7 +1499,12 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   card is bounced** to `in_progress` with the failing runs appended (red after merge),
   and the root-fix card auto-spawns at absolute p0 (BR#5190). Green again → the
   executor's next CI poll feeds a green classification (`train:landed`) and the hub
-  releases the stop automatically. v1 stops the line; there is no auto-revert — fix
+  releases the stop automatically. The clear is loud too (BR#4692): releasing the stop
+  on a green line writes a `train:stop_cleared` row to the lane history and a note to
+  the alarm sink, each naming the red window (stop set → stop cleared, who/when
+  auditable). There is no separately "held" stop: every stop auto-clears within one
+  executor tick of green — a human halts the line again by stopping it, not by holding
+  it. v1 stops the line; there is no auto-revert — fix
   forward or revert is the culprit card's job. Work on branches (worktrees) continues —
   only the line stops. **No stop-time human ask** (BR#5631, Ray ruling 2026-11-03 from
   the BR#5626 escalation: "you should only be giving me the solution if it needs me —
@@ -2062,7 +2080,16 @@ included) as "unmergeable — CONFLICTING".
   rebind. With NO successor the lane is deliberately retired and the BR#4977
   refusal holds (every op refuses `lane retired`; re-open the card or register
   a reseed to re-arm — BR#5061's spec'd create-fresh is superseded by the
-  accepted BR#4977 decision on that path). `train.status` shows ONE row per
+  accepted BR#4977 decision on that path) — with ONE exception (BR#5186): when
+  EVERY card for the key is terminal and the executor's first-hand probe says
+  the base branch is still LIVE on the remote (the hub holds no VCS
+  credentials), the closure was an erroneous close (the BR#5130 class that
+  killed BR#3648 and BR#5050), not a retirement — the tick asks the hub to
+  auto-reseed `v(N+1)` carrying the predecessor's lane config (supersedes
+  edge, loud `lane_reseeded` audit) and drives the fresh card in the same
+  tick. Without the live-base evidence (a deleted base, a probe with no
+  signal) the refusal stands — no resurrection on a guess. `train.status`
+  shows ONE row per
   lane — a retired card with a live successor is filtered as history, a
   retired card with no successor stays visibly `retired` (BR#4977) — and the
   hub's lane sweeps skip retired cards; the starvation clock never inits from
@@ -2107,7 +2134,14 @@ included) as "unmergeable — CONFLICTING".
   phantom-ready row. The executor honors it from both directions: it skips any lane
   the hub marks retired, and it probes the lane's base branch before acquiring — a
   definitive 404 (base deleted on the remote) skips the lane with no lease and no
-  hub meta writes, while any transient gh failure fails open. **The derived queue is
+  hub meta writes, while any transient gh failure fails open. **BR#5186 splits the
+  retired world in two on that same probe**: a definitive 404 is a real retirement —
+  skip; a LIVE base under a `retired: true` row means the closure was an erroneous
+  close (the BR#5130 class that killed BR#3648 and BR#5050), so the tick asks the
+  hub to auto-reseed `v(N+1)` (`train_lane` with `base_live: true` — the executor's
+  first-hand evidence; the hub holds no VCS credentials) and drives the fresh card
+  in the same tick; a probe with no signal (gh absent, network, auth) is
+  fail-closed — the refusal stands, never a reseed on a guess. **The derived queue is
   base-scoped** (same law): a queued card rides only the lane whose base matches its
   PR stamp (`meta.pr.base`, defaulting to `main`) — a second lane on the same repo
   can never inherit another base's queue (the retired drill lane used to show
