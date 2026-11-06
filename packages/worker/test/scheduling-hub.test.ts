@@ -40,6 +40,14 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("publishes the actual managed-update hold instead of ready or a generic missing-model explanation", async () => {
+    const g = await gateway("update-hold");
+    const reason = "Managed update is draining active workers before restart; new claims are paused";
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, availability: { kind: "unavailable", reason } } });
+    const response = await stub.fetch("https://kb/board", { method: "GET" });
+    const board = await response.json() as { workers: { host: string; state: string; reason: string }[] };
+    expect(board.workers.find(worker => worker.host === g.host)).toMatchObject({ state: "unavailable", reason });
+  });
   it("keeps released old writers charged but labels them unconfirmed, and frees capacity only after same-host quiescence", async () => {
     const project = "truthful-occupancy", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), r = await reserve(g);

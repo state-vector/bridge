@@ -2557,7 +2557,8 @@ export class KnowledgeHub {
         : occupancy.active + occupancy.reserved >= capabilities.capacity ? "busy" : "ready";
       return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, ...occupancy, capacity: capabilities.capacity,
         reason: state === "offline" ? "Worker heartbeat is stale." : readiness.kind !== "ready" ? readiness.reason
-          : !usable ? "No configured model is usable." : capabilities.capacity <= 0 ? "No worker slots configured."
+          : !usable ? [capabilities, ...capabilities.alternatives].map(c => c.availability.kind === "unavailable" ? c.availability.reason : "").find(Boolean) || "No configured model is usable."
+          : capabilities.capacity <= 0 ? "No worker slots configured."
           : occupancy.occupancy.unconfirmed ? `${occupancy.occupancy.unconfirmed} slot(s) held for unconfirmed executions; the gateway must reconcile stopped process groups.`
           : state === "busy" ? "All worker slots are occupied." : "" });
     });

@@ -27,6 +27,9 @@ The same occupancy facts back scheduler admission, availability and the board;
 lease/inventory renewals push a bounded status refresh so an idle task board does
 not age a healthy worker into a false outage. During rolling deployment, old
 aggregate-only data is labelled unresolved executions, never running workers.
+Managed updater holds also mark every advertised model unavailable with the
+explicit draining-for-update reason; a local no-claims hold cannot advertise
+usable spare capacity. Clearing the hold rebuilds availability from actual config.
 Retired merge lines are hidden.
 Per-task execution-attention cards are not shown on Top.
 

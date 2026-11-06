@@ -346,6 +346,17 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
 
 /// Advertise the complete supply even when a task selects a smaller model.
 /// Otherwise running medium temporarily erases this host's large capability.
+fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_json::Value {
+    if held {
+        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update is draining active workers before restart; new claims are paused".into() });
+        facts["availability"] = availability.clone();
+        if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
+            for model in models { model["availability"] = availability.clone(); }
+        }
+    }
+    facts
+}
+
 fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
     let mut inventory = Vec::new();
     for (name, bc) in &cfg.backends {
@@ -359,8 +370,9 @@ fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worke
         } }
     }
     let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
-    if inventory.is_empty() { return backend_capabilities(cfg, primary, false, worker); }
-    let mut main = inventory.remove(index); main["alternatives"] = json!(inventory); main
+    if inventory.is_empty() { return inventory_dispatch_hold(backend_capabilities(cfg, primary, false, worker), update_request().is_some()); }
+    let mut main = inventory.remove(index); main["alternatives"] = json!(inventory);
+    inventory_dispatch_hold(main, update_request().is_some())
 }
 
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
@@ -5151,6 +5163,18 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_update_hold_cannot_advertise_usable_spare_models() {
+        let supply = json!({"tier":"large","model":"large-model","availability":{"kind":"usable"},
+            "alternatives":[{"tier":"small","model":"small-model","availability":{"kind":"usable"}},
+                {"tier":"medium","model":"medium-model","availability":{"kind":"usable"}}]});
+        let held = inventory_dispatch_hold(supply.clone(), true);
+        assert_eq!(held["availability"]["kind"], "unavailable");
+        assert!(held["availability"]["reason"].as_str().unwrap().contains("Managed update"));
+        assert!(held["alternatives"].as_array().unwrap().iter().all(|m| m["availability"]["kind"] == "unavailable"));
+        assert_eq!(held["model"], supply["model"]);
+        assert_eq!(inventory_dispatch_hold(supply.clone(), false), supply, "fresh inventory resumes without changing model identity");
+    }
     #[test]
     fn lease_maintenance_keeps_polling_while_dispatch_is_blocked_and_joins_before_finalization() {
         let (observed, polls) = std::sync::mpsc::channel();

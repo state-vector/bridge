@@ -203,6 +203,8 @@ its runner an interrupt; capacity stays held until that stop is confirmed.
 The board never labels these held slots as running workers, and heartbeat-only renewals refresh its
 status independently of task edits. Older aggregate-only publishers are labelled
 unresolved executions during rollout.
+While a managed update drains existing workers, its inventory explicitly reports
+new claims paused for the update on every model tier, rather than advertising ready.
 
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
