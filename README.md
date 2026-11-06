@@ -664,6 +664,16 @@ The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal
 
 **The daemon's death is loud** (BR#4682): the unit uses `Restart=always` with exponential restart backoff (5s→60s) and a 0–7s start jitter, so the runner revives from a crash **or** a clean exit without human action. Every restart-causing death fires an ExecStopPost hook that posts one `[daemon-death]` note per distinct cause (result / signal / exit code + last log lines) to the alarm sink card — deduped to one note per 10 minutes per cause, so a crash-loop can't spam the board — and always appends a local receipt to `~/bridge-death-telemetry.log` (the no-silent-deaths guarantee even when the hub itself is unreachable). Deliberate `systemctl stop`/`restart` log locally without alarming. If the supervisor ever truly gives up (`start-limit-hit`, effectively unreachable at 50 starts / 10 min against the 60s backoff cap), a separate give-up escalation unit posts one `[daemon-death ESCALATION]` note naming the manual intervention needed. The unit's `WorkingDirectory` is the user's home — never the directory the installer ran from.
 
+The stop hook classifies systemd's `SERVICE_RESULT`, `EXIT_CODE` and
+`EXIT_STATUS` (there is no systemd `SIGNAL` variable). A successful
+`killed` / `TERM` (or `15`) stop produces a local `successful-stop` receipt,
+not a crash alarm. KILL, SEGV, failed TERM stops and unexpected clean exits
+still alarm. This classifies the exit, not who requested it: use the service
+journal and updater receipt to attribute a restart. Existing installations
+must refresh their installed stop hook; replacing the runner binary alone
+does not replace that script. `bridge service install` from a corrected binary
+refreshes it without restarting the service.
+
 **Runner log format** (BR#4400): every operator-visible line from the runner — dispatch loop, in-process merge-train leg, store/session/keychain, CLI, canary — flows through one mechanism with one shape:
 
 ```

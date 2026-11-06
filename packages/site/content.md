@@ -29,6 +29,12 @@ Lookup works independently of board filters and the currently loaded list.
 
 ### Opt-in server updates
 
+Successful TERM service stops are recorded locally rather than labelled daemon
+crashes. Actual crashes and unexpected exits still raise death telemetry. The
+stop hook uses systemd's exit-code/status fields; its receipt alone does not
+identify the restart initiator. Existing hosts refresh the installed hook with
+`bridge service install` from a corrected binary; no service restart is required.
+
 Linux runners can explicitly opt into automatic updates in config:
 `"auto_update": { "enabled": true, "channel": "main" }`. Absent/null config,
 `enabled: false`, and `pinned` leave automatic downloads and replacement off.
