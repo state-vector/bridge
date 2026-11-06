@@ -28,6 +28,15 @@ candidate rolls back before work resumes. Update/deferral/rollback receipts reac
 Bridge's ops feed and configured Slack shipping. Auto-update is never enabled by
 an installer or pairing flow. See the README's remote bootstrap instructions;
 `bridge update install`, `enable main|stable`, `disable`, and `status` manage it.
+Every completed update, rollback, deferred or interrupted drain is followed by
+a durable **one-hour useful-work window**. New publications cannot pause workers
+again during that window, even after a supervisor restart. When it ends, the
+updater reconciles the latest build without needing another event; intermediate
+builds are coalesced. `bridge update status` exposes `next_attempt_at`. Updating
+the runner binary does not replace the independent updater script: existing
+hosts must refresh that script and restart **only `bridge-update`**, after
+disabling updates and allowing any active update hold to clear. See the README
+for the safe refresh procedure.
 
 **The outer loop that cajoles your agents & humans**
 
@@ -268,6 +277,10 @@ execution appears in task details. Top keeps one compact task-status chip withou
 an additional execution-state label. The tooltip
 identifies recorded gateway model/backend/host/session. Automation requirements
 remain strict and independent of these display labels.
+Train repair bounces return work to the claimable pool with its PR binding and
+repair brief intact. They clear historical ownership/session rather than claiming
+an agent is running, and do not penalize agent retry counts. Existing bounced
+cards with no executor or live worker signal are repaired automatically.
 Task History includes model starts, agent/reviewer escalation reasons and tier
 changes, checkpointed yields and local handoff request/accept/return. Typed history
 events commit with state and remain once-only across command retries; routine

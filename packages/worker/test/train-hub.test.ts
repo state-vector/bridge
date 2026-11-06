@@ -589,6 +589,8 @@ describe("merge train DO drill (real bundled worker)", () => {
     const repo = "state-vector/lane-coverage";
     const H = "e".repeat(40), H2 = "d".repeat(40);
     const c1 = await queueViaAccept({ repo, pr: 2611, head: H, title: "IMPL: coverage bounce drill" });
+    const historical = await kbJson("/update", { id: c1, meta: { session: "historical-impl-session" } });
+    expect(historical.body.error).toBeUndefined();
     await acquire(repo, "gw-c", { required_workflows: ["Test"] });
     // an authored push moved the head past the stamp: no conflicts exist, no
     // human leg — the machine verdict lapses and the verify pool re-verifies
@@ -604,7 +606,10 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.awaiting_park).toBeUndefined();
     expect(bounced.body.machine_requeue).toBeUndefined();
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    expect(card1.status).toBe("todo");
+    expect(card1.owner).toBe("");
+    expect(card1.meta?.session).toBeUndefined();
+    expect(card1.meta?.attempt).toBeUndefined(); // a handoff is not a failed execution
     expect(card1.meta?.merge_train?.state).toBe("bounced");
     expect(card1.meta?.merge_train?.bounce_kind).toBe("coverage");
     expect(card1.meta?.merge_train?.awaiting).toBeUndefined();
@@ -627,6 +632,15 @@ describe("merge train DO drill (real bundled worker)", () => {
     const hist = JSON.stringify(await (await kbJson("/get_history", { id: c1, limit: 8 })).body);
     expect(hist).toContain("merge-train bounce (coverage) — PR #2611 head moved past the accepted verdict");
     expect(hist).not.toContain("parked Awaiting review");
+    const repeated = await kbJson("/train.event", { repo, base: "main", kind: "bounced", actor: "gw-c", pr: 2611,
+      head_sha: H2, task_id: c1, bounce_kind: "coverage", reason: "fresh verify required" });
+    expect(repeated.body.error).toBeUndefined();
+    expect((await kbJson("/get", { id: c1 })).body.meta?.attempt).toBeUndefined();
+    const pickup = await kbJson("/transition", { id: c1, to: "in_progress", actor: "fresh-repair-worker", session: "fresh-repair-session" });
+    expect(pickup.body.error).toBeUndefined();
+    const claimed = (await kbJson("/get", { id: c1 })).body;
+    expect(claimed.owner).toBe("fresh-repair-worker");
+    expect(claimed.meta.session).toBe("fresh-repair-session");
   });
 
   it("a GATE bounce (mechanical defect, BR#4066) renders the named defect + mergeStateStatus — impl owns the fix, no conflict language", async () => {
@@ -641,7 +655,8 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(bounced.body.error ?? "", `gate bounce failed: ${JSON.stringify(bounced.body)}`).toBe("");
     expect(bounced.body.bounce_kind).toBe("gate");
     const card1 = (await kbJson("/get", { id: c1 })).body;
-    expect(card1.status).toBe("in_progress");
+    expect(card1.status).toBe("todo");
+    expect(card1.owner).toBe("");
     const brief = String(card1.body_md);
     expect(brief).toContain("Merge-train bounce (gate): PR #2621");
     expect(brief).toContain("mergeStateStatus=BLOCKED");
@@ -1229,7 +1244,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect(reasserted.body.machine_requeue).toBeUndefined();
     expect(reasserted.body.awaiting_park).toBeUndefined();
     const c = (await kbJson("/get", { id: card })).body;
-    expect(c.status).toBe("in_progress");
+    expect(c.status).toBe("todo");
     expect(c.meta?.merge_train?.state).toBe("bounced");
     expect(c.meta?.merge_train?.awaiting).toBeUndefined();
     // the STORED defect survives on the bounce record — the marker never
@@ -2514,6 +2529,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // the card finishes and closes done — the bounce stamp survives the
     // close (stamps are records, not liveness), but the zombie must not
     // keep counting
+    await kbJson("/transition", { id: card, to: "in_progress", actor: "drill", session: "zombie-close-drill" });
     const closed = await kbJson("/transition", { id: card, to: "done", actor: "drill", note: "drill: landed out-of-band — closing (BR#5677 zombie drill)" });
     expect(closed.status, `zombie close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
     const after = (await kbJson("/get", { id: card })).body;

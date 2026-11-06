@@ -717,6 +717,24 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
 });
 
 describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () => {
+  it("BR#6839: a fresh gateway session ping cannot revive an executor-less bounce; an actual worker ping can", async () => {
+    for (const gateway of [true, false]) {
+      const session = `br6839-${gateway ? "gateway" : "worker"}`;
+      const token = await kbJson("/admin.mint", { label: session, tags: gateway ? ["gateway"] : ["impl"] });
+      expect(token.body.error).toBeUndefined();
+      const created = await kbJson("/create", { type: "task", title: session, qualified: true });
+      const id = created.body.id;
+      await kbJson("/transition", { id, to: "in_progress", actor: session, session: `${session}-old` });
+      const updated = await kbJson("/update", { id, meta: { session,
+        merge_train: { state: "bounced", pr: 6839, repo: "state-vector/bridge" },
+        last_progress: { session: "another-duty", ts: Date.now(), note: "unrelated task update" } } });
+      expect(updated.body.error).toBeUndefined();
+      const touched = await kbJson("/session.touch", { token_id: token.body.id, session });
+      expect(touched.body.error).toBeUndefined();
+      await kbJson("/admin.stall_sweep", { now: Date.now() + 1_000 });
+      expect((await taskById(id)).status).toBe(gateway ? "todo" : "in_progress");
+    }
+  });
   it("a bounce re-entry stranded in_progress (dead executor) is DEMOTED to a claimable todo by the sweep — never re-parked blocked; train meta + boost survive", async () => {
     // The specimen shape (BR#4198): a train bounce re-opened its card
     // in_progress with the PRIOR session as executor; the session is gone and
@@ -738,6 +756,8 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
       meta: {
         merge_train: { state: "bounced", bounce_kind: "coverage", pr: 2401, repo: "state-vector/superpositional", bounced_at: t0 + 30_000 },
         boosted: t0 + 30_000,
+        // A recent recovery duty update must not revive the old worker.
+        last_progress: { session: "different-recovery-duty", ts: t0 + 10 * 60_000, note: "repair still needs a worker" },
       },
     });
     expect(stamp.status, `stamp failed: ${JSON.stringify(stamp.body)}`).toBe(200);
@@ -752,9 +772,10 @@ describe("BR#4494 — bounce re-entry demote on the stall sweep (real DO)", () =
     // the re-queue seam + the starvation law survive the release
     expect(after.meta?.merge_train?.state).toBe("bounced");
     expect(after.meta?.boosted).toBeTruthy();
-    // the release names the law (BR#4494) — auditable, and the churn stamp
-    // carries the reason
-    expect(String(after.meta?.attempt?.last_reason ?? "")).toContain("BR#4494");
+    // Releasing a machine-created phantom is not an agent failure.
+    expect(after.owner).toBe("");
+    expect(after.meta?.session).toBeUndefined();
+    expect(after.meta?.attempt).toBeUndefined();
   });
 
   it("the hold is NOT loosened: a queued card (flag or not) and a parked blocked bounced card stay held — only the live in_progress re-entry demotes", async () => {
@@ -846,7 +867,7 @@ describe("BR#5750 — awaiting re-park loop + hold-park queue prefix (real DO)",
     expect(after.status, "the stalled awaiting re-entry demotes to claimable todo (BR#4494/BR#5750), not blocked").toBe("todo");
     expect(after.meta?.blocked).toBeUndefined();
     expect(after.meta?.merge_train?.state).toBe("bounced");
-    expect(String(after.meta?.attempt?.last_reason ?? "")).toContain("BR#5750");
+    expect(after.meta?.attempt).toBeUndefined(); // a phantom claim is not a failed agent run
   });
 
   it("a watchdog hold-park of a queued car keeps its queue slot: the blocked reason carries the merge-train prefix, so mergeTrainQueue still sees the car (the BR#4995 drop)", async () => {
