@@ -205,6 +205,9 @@ status independently of task edits. Older aggregate-only publishers are labelled
 unresolved executions during rollout.
 While a managed update drains existing workers, its inventory explicitly reports
 new claims paused for the update on every model tier, rather than advertising ready.
+The merge train keeps ticking throughout this worker-only drain. It stops and
+joins only at the final restart barrier, after the last worker finishes; only
+then may the gateway acknowledge idle. A failed train join never authorises restart.
 
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,

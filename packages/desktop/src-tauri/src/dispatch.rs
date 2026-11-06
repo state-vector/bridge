@@ -166,6 +166,24 @@ fn update_receipt(name: &str, value: &serde_json::Value) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateTrainBarrier { DrainingWorkers, Quiescent }
+
+/// Worker draining may take an entire action budget. Keep delivery running
+/// throughout it; only stop/join the train at the actual restart barrier.
+fn update_train_barrier(
+    active_workers: usize,
+    train_stop: &AtomicBool,
+    train_handle: &mut Option<std::thread::JoinHandle<()>>,
+) -> Result<UpdateTrainBarrier, &'static str> {
+    if active_workers > 0 { return Ok(UpdateTrainBarrier::DrainingWorkers); }
+    train_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = train_handle.take() {
+        handle.join().map_err(|_| "update deferred: train thread panicked; no idle receipt")?;
+    }
+    Ok(UpdateTrainBarrier::Quiescent)
+}
+
 /// Per-provider settings. Everything optional — a provider section can be
 /// empty ({}) and the runner just uses that CLI's own defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4883,12 +4901,10 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
         if let Some(request) = update_request() {
             // Natural completion only: do not signal worker stop, discard
             // receivers, infer quiescence from a lease or kill a live writer.
-            train_stop.store(true, Ordering::SeqCst);
-            if in_flight.is_empty() {
-                if let Some(handle) = train_handle.take() {
-                    if handle.join().is_err() { dlog("", "update deferred: train thread panicked; no idle receipt"); return; }
-                }
-                update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
+            match update_train_barrier(in_flight.len(), &train_stop, &mut train_handle) {
+                Ok(UpdateTrainBarrier::DrainingWorkers) => dlog("", "managed update: worker drain in progress; train stop deferred to final restart barrier"),
+                Ok(UpdateTrainBarrier::Quiescent) => update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"})),
+                Err(reason) => { dlog("", reason); return; }
             }
         } else if train_stop.load(Ordering::SeqCst) {
             train_stop = Arc::new(AtomicBool::new(false));
@@ -5220,6 +5236,33 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_drain_keeps_train_ticks_live_until_workers_finish_then_joins_before_idle() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mut handle = Some(std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                sent.send("tick").unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sent.send("train_stopped").unwrap();
+        }));
+        assert_eq!(update_train_barrier(12, &stop, &mut handle), Ok(UpdateTrainBarrier::DrainingWorkers));
+        assert!(!stop.load(Ordering::SeqCst));
+        assert!(handle.is_some());
+        for _ in 0..2 { assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "tick"); }
+        assert_eq!(update_train_barrier(0, &stop, &mut handle), Ok(UpdateTrainBarrier::Quiescent));
+        assert!(handle.is_none());
+        assert_eq!(received.try_iter().last(), Some("train_stopped"), "idle is impossible before the live train has actually joined");
+    }
+    #[test]
+    fn update_train_join_failure_never_confirms_idle() {
+        let stop = AtomicBool::new(false);
+        let mut handle = Some(std::thread::spawn(|| panic!("train failed during finalization")));
+        assert!(update_train_barrier(0, &stop, &mut handle).is_err());
+        assert!(stop.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn readiness_probe_kills_its_own_hung_process_group_within_budget() {

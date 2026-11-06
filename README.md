@@ -30,6 +30,11 @@ aggregate-only data is labelled unresolved executions, never running workers.
 Managed updater holds also mark every advertised model unavailable with the
 explicit draining-for-update reason; a local no-claims hold cannot advertise
 usable spare capacity. Clearing the hold rebuilds availability from actual config.
+**Worker drain does not stop merge delivery.** The merge train continues ticking
+while existing agent workers finish. Only after the last worker stops does the
+gateway stop and join the train, then acknowledge the nonce/PID-bound idle receipt
+for supervised restart. A failed train join cannot certify idle. This avoids
+silencing the merge line for a whole worker action budget on every update.
 Retired merge lines are hidden.
 Per-task execution-attention cards are not shown on Top.
 
