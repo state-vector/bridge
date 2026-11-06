@@ -11661,7 +11661,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // the old owner/session and make the work immediately claimable, without
       // counting a machine handoff as failed execution. Replayed bounces only
       // refresh the same brief; todo→todo is not a lifecycle edge.
-      if (card.status !== "todo") await this.transition(
+      // BR#4688 raw re-fired breach: a blocked card parked on the standing
+      // escalation ask (meta.awaiting_ask) is protected by the machine
+      // release law (release-holds-train-queue; trainRepairRelease demands
+      // !awaiting_ask and the demote carve-out is in_progress-only). The
+      // re-fire must NOT release that card — the breach block below re-parks
+      // it IN PLACE on the SAME ask: the park is the de-queue, so a 7th
+      // serve is unrepresentable. A fresh breach has no ask park yet — the
+      // release below still hands the bounced card to the repair pool and
+      // the fold parks it on the new ask.
+      const escParkHold = bounceBudgetBreached && String(card.status ?? "") === "blocked" && !!cm.awaiting_ask?.ask_id;
+      if (card.status !== "todo" && !escParkHold) await this.transition(
         {
           id: taskId,
           to: "todo",
@@ -11757,7 +11767,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // watchdog releases it and the queue re-admits it (a 7th SERVE). The
         // de-queue invariant is re-asserted here, not assumed. ----
         const parked = String((this.one(`SELECT status FROM artefacts WHERE id = ?`, taskId) as any)?.status ?? "");
-        if (parked === "in_progress" && escAskId) {
+        // BOTH unparked shapes need this fold: an in_progress card that rode
+        // the reused-ask leg (askCreate was skipped) AND — the fresh-breach
+        // case — a todo card, because askCreate only folds in_progress/
+        // blocked subjects and the bounce release above parks the card at
+        // todo. Without the todo fold the de-queued card sits unparked, the
+        // derived queue re-admits it, and the budget buys an 8th, 9th… serve.
+        if ((parked === "in_progress" || parked === "todo") && escAskId) {
           const pm = JSON.parse(String((this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId) as any)?.meta ?? "{}"));
           pm.awaiting_ask = { ...(pm.awaiting_ask ?? {}), ask_id: escAskId, ts: now2 };
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(pm), taskId);
@@ -11766,7 +11782,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               id: taskId,
               to: "blocked",
               session: "",
-              note: `bounce-budget escalation stands (bounce #${bounceNo} ${bounceKind}) — still parked on ask ${escAskId}; the train does not re-serve (BR#4688)`,
+              note: `bounce-budget escalation stands (bounce #${bounceNo} ${bounceKind}) — parked on ask ${escAskId}; the train does not re-serve (BR#4688)`,
               unblock_condition: `answer ask ${escAskId}`,
               await_event: { event: "ask", ask_id: escAskId },
             },
@@ -11829,15 +11845,22 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           this.audit(actor, "train:escalation_closed", lane.id, { ask_settle_error: String((e as Error)?.message ?? e).slice(0, 160), ask: esc.ask_id });
         }
       }
-      await this.transition(
-        {
-          id: closeTaskId,
-          to: "todo",
-          session: "",
-          note: `bounce-budget escalation expired — PR #${pr} closed with reason (disposition per BR#3312); card survives as the record`,
-        },
-        actor,
-      );
+      // the answer's dispatch legs may have already settled the card (the
+      // BR#3819 dead-holder release drops it straight to todo) — todo→todo is
+      // not a lifecycle edge; only release the record when it still sits
+      // parked
+      const postAsk = this.one(`SELECT status FROM artefacts WHERE id = ?`, closeTaskId) as any;
+      if (postAsk && String(postAsk.status ?? "") !== "todo") {
+        await this.transition(
+          {
+            id: closeTaskId,
+            to: "todo",
+            session: "",
+            note: `bounce-budget escalation expired — PR #${pr} closed with reason (disposition per BR#3312); card survives as the record`,
+          },
+          actor,
+        );
+      }
       meta.currently = null;
       const reason = this.laneSyncReason(lane.id, meta, now);
       ev({ task: closeTaskId, bounce_kind: esc.bounce_kind, bounce_no: esc.bounce_no, ask_id: esc.ask_id, reason: closeReason }, closeTaskId);
@@ -13263,6 +13286,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
       const cleared = { ...esc, cleared_at: Date.now(), cleared_via: headMoved ? "head-moved" : "ask-answered" };
       meta.merge_train = { ...(meta.merge_train ?? {}), escalated: cleared };
+      // the episode is over — the ask park is no longer the live leg. A stale
+      // meta.awaiting_ask keeps the machine release law holding the card
+      // (trainRepairRelease demands !awaiting_ask), so the NEXT bounce after
+      // the reset would gate-reject instead of serving budget bounce #1
+      // (BR#4688: an owner action resets the episode — the park must reset
+      // with it).
+      delete meta.awaiting_ask;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
       this.audit("system:merge-train", "bounce_budget_cleared", parentId, { via: cleared.cleared_via, pr: escPr, bounce_no: esc.bounce_no, reason: "owner action on a bounce-budget escalation — episode reset, re-queue proceeds (BR#4688)" });
     }
@@ -13479,9 +13509,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     );
     return entries.map((e) => {
       const pr = Number(metaById.get(e.id)?.merge_train?.pr ?? 0);
-      if (!pr) return e;
-      const bounces = counts.get(pr) ?? 0;
-      return { ...e, pr, bounces, over_budget: bounces > TRAIN_BOUNCE_BUDGET };
+      const bounces = pr ? (counts.get(pr) ?? 0) : 0;
+      // BR#4688: EVERY entry carries the bounce pair (0/false when the card
+      // has no PR leg) — a union return would force every consumer (the
+      // batch-candidate splice, the queue chips) to narrow before reading.
+      return { ...e, ...(pr ? { pr } : {}), bounces, over_budget: bounces > TRAIN_BOUNCE_BUDGET };
     });
   }
 
@@ -15278,6 +15310,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
+              ...(q.bounces != null ? { bounces: q.bounces } : {}),
+              ...(q.over_budget ? { over_budget: true } : {}),
               state: "waiting",
               detail: "waiting to be verified — needs a fresh review",
             });
@@ -15288,6 +15322,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
+              ...(q.bounces != null ? { bounces: q.bounces } : {}),
+              ...(q.over_budget ? { over_budget: true } : {}),
               state: "verifying",
               detail: "being verified — checks/mergeability running",
             });
@@ -15298,6 +15334,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
+              ...(q.bounces != null ? { bounces: q.bounces } : {}),
+              ...(q.over_budget ? { over_budget: true } : {}),
               state: "ready",
               detail: cls === "waiting" ? "verified — ready to merge (waiting on lane/CI)" : "verified — merges this pass (batch)",
             });

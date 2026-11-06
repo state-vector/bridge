@@ -180,7 +180,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
-            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · ${q.bounces} train bounce(s) on this PR (budget 5 same-kind — BR#4688)${q.over_budget ? " — OVER BUDGET (escalated, de-queued)" : ""}` : ""}`} onClick={() => openTask?.(q.id)}>{q.bounces ? <span className={`train-bounce-chip${q.over_budget ? " over-budget" : ""}`}>×{q.bounces}</span> : null}</span>)}
+            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · ${q.bounces} train bounce(s) on this PR (budget 5 same-kind — BR#4688)${q.over_budget ? " — OVER bounce budget (escalated, de-queued)" : ""}` : ""}`} onClick={() => openTask?.(q.id)}>{q.bounces ? <span className={`train-bounce-chip${q.over_budget ? " over-budget" : ""}`}>×{q.bounces}</span> : null}</span>)}
         </span>)}</span></span>
       </div>
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}

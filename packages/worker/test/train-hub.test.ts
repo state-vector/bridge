@@ -3969,6 +3969,16 @@ describe("bounce budget: 6 same-kind bounces escalate once and de-queue (BR#4688
   /** The production storm cycle: the bounced card re-enters review and a
    *  fresh verify accept re-queues it — one bounce per queue admission. */
   const requeue = async (card: string, head: string, n: number, rp = repo, prNum = PR) => {
+    // main's lifecycle law (BR#6839 repair handoff): todo → in_progress → in_review.
+    // The todo hop only applies when the bounce left the card AT todo; the
+    // escalation-clear round's owner leg already resumed the parked card to
+    // in_progress (the answered-ask dispatch shape) — re-firing the hop from
+    // in_progress is an illegal same-status edge.
+    const cur = String((await kbJson("/get", { id: card })).body?.status ?? "");
+    if (cur === "todo") {
+      const ip = await kbJson("/transition", { id: card, to: "in_progress", session: "", note: `drill: repair leg picks up the bounce — PR https://github.com/${rp}/pull/${prNum}` });
+      expect(ip.status, `in_progress failed: ${JSON.stringify(ip.body)}`).toBeLessThan(400);
+    }
     const ir = await kbJson("/transition", { id: card, to: "in_review", session: "", note: `drill: re-verify after bounce — PR https://github.com/${rp}/pull/${prNum}` });
     expect(ir.status, `in_review failed: ${JSON.stringify(ir.body)}`).toBeLessThan(400);
     const verify = await kbJson("/create", { type: "task", title: `VERIFY: budget drill ${card} r${n}`, roles: ["review"], session: `bridge-task-BR-drill-verify-${n}` });

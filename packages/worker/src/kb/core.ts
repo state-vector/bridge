@@ -1899,6 +1899,11 @@ export interface TrainBatchCar {
   pr?: number;
   state: "ready" | "verifying" | "waiting";
   detail?: string;
+  /** BR#4688: ledger bounce count for the PR leg + the over-budget mirror —
+   *  the Top panel's batch blocks render the same bounce chip the queue rows
+   *  carry; the merge walk ignores the extra fields. */
+  bounces?: number;
+  over_budget?: boolean;
 }
 
 /** BR#5658 (Ray 2026-11-03): partition all verifying + ready PRs on a lane into

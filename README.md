@@ -1144,8 +1144,8 @@ executor's expiry leg probes the PR live via `gh`, closes it with the reason as 
 and reports `escalation_closed`; the hub acts only when it can validate an ACTIVE escalation
 of its own (the executor never self-certifies), answers the ask, and leaves the card `todo`
 as the record — the storm ends, the history survives. The trains panel renders the count
-live: a ×N ledger-bounce chip per queued PR (red once over budget) plus the escalation
-clock chips while an episode is open.
+live: a ×N ledger-bounce chip per queued PR (red once over budget) — on the queue rows and
+the merge-batch blocks alike — plus the escalation clock chips while an episode is open.
 The trains panel is honest about capability and activity (BR#4981): a held lock names
 its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
 shows the pill `train ready` (the tooltip names the machine and its last tick age);
