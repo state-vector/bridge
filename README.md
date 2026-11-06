@@ -723,6 +723,10 @@ not migrated), and every label door (`token.rename`, pair approve,
 2026-10-28/29 incident was a token-shaped string pasted as a label that then
 rendered into owner columns.
 
+Unclaimed cards have no owner. Board and orient owner lookups never resolve an
+empty owner through a token's empty principal, including revoked registrations;
+retired machine names cannot appear as fabricated owners of pooled work.
+
 **Machine/agent names are display, not identity — renames alias, never mint
 (2026-10-29)**: a hostname change (macOS local-name rotation, the network's
 `-2` dedup suffix, a VPS's DHCP IP, a lost principal file) used to mint a

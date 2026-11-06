@@ -403,9 +403,11 @@ export const TOKEN_REPAIR_WINDOW_MS = 60 * 60 * 1000;
  *  (legacy `system:*` owners, hand-minted labels, empty owner) render the
  *  stored value verbatim. When several token rows share a principal, the
  *  live, most-recently-seen row's label wins — deterministic, display only.
- *  Requires the outer artefacts table aliased `a`. */
+ *  Empty owners are unclaimed, never identities (legacy token rows may have
+ *  an empty principal, including revoked registrations). Match displayOwner's
+ *  empty-owner guard. Requires the outer artefacts table aliased `a`. */
 const OWNER_DISPLAY_SQL = `COALESCE(
-  (SELECT t.label FROM auth_tokens t WHERE t.principal = a.owner
+  (SELECT t.label FROM auth_tokens t WHERE a.owner <> '' AND t.principal = a.owner
    ORDER BY (t.revoked_ts IS NULL) DESC, COALESCE(t.last_seen_ts, t.created_ts) DESC LIMIT 1),
   a.owner)`;
 
