@@ -51,6 +51,17 @@ for up to 60 seconds, refreshing after slow provisioning instead of repeating
 local probes and a hub advertisement for every slot. Each begin still checks
 the hub's live model selection, scope, credential and capacity fences; a failed
 required refresh never launches a writer.
+Gateway readiness has its own renewal thread, independent of task dispatch,
+checkpointing and completion handoffs. Every 20 seconds it re-probes configured
+backend CLIs/tools, proves the canonical worker credential and advertises the
+current inventory, including managed-update holds. Dispatch consumes that fresh
+proof instead of provisioning a second worker or running a second readiness
+producer. Failed renewal withdraws local admission; authentication failures still
+enter the gateway's existing repair ladder. Config changes invalidate old proofs,
+and stop joins pending renewal before the producer is dropped. This keeps a busy
+gateway from appearing unavailable merely because a synchronous handoff exceeded
+the hub's 120-second observation TTL; the TTL itself is unchanged. Gateway
+readiness does not renew task leases, fabricate worker progress or release slots.
 **Worker drain does not stop merge delivery.** The merge train continues ticking
 while existing agent workers finish. Only after the last worker stops does the
 gateway stop and join the train, then acknowledge the nonce/PID-bound idle receipt
