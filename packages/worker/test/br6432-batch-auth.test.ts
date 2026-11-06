@@ -55,13 +55,14 @@ const task = async (title: string): Promise<string> => {
   return String(r.body.id);
 };
 
-/** A simple open park: claimed, then blocked on a typed pr_merged wait. */
+/** Authority-only fixture, with no outstanding delivery. PR-bound terminal
+ * dispositions have the additional conservation guard (delivery-integrity). */
 const park = async (id: string, repo: string, n: number, actor: string) => {
   expect((await kbJson("/transition", { id, to: "in_progress", actor, note: "impl" })).status).toBe(200);
   const p = await kbJson("/transition", {
     id, to: "blocked", actor,
-    note: `merge-train: queued — drill park. PR ${repo}#${n} head ${"a".repeat(40)}.`,
-    await_event: { event: "pr_merged", repo, n },
+    note: `Authority drill park ${n} for ${repo}; no outstanding PR binding.`,
+    await_event: { event: "time", until_ts: Date.now() + 24 * 3_600_000 },
   });
   expect(p.status, `park failed: ${JSON.stringify(p.body)}`).toBe(200);
 };

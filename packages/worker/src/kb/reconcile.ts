@@ -101,6 +101,8 @@ export function normalizePr(raw: unknown): ReconcilePr | null {
 
 /** One open card bound to this repo via a PR leg (meta.pr or a meta.prs leg). */
 export interface ReconcileBinding {
+  /** Observed executable progress; status alone is never progress. */
+  progress?: "queued" | "repairing" | "verifying" | "held" | "stranded";
   card: string;
   status: string;
   pr: number;
@@ -154,6 +156,7 @@ export interface ReconcileConfig {
 // ---------- decisions ----------
 
 export type ReconcileDecision =
+  | { action: "repair_binding"; card: string; reason: "conflict" | "queue_binding" }
   | { action: "bound"; card: string }
   | { action: "inflight"; duty_id: string; via: "duty" | "verify-children" }
   | { action: "ignored" }
@@ -194,6 +197,12 @@ export interface ReconcileJudgement {
 }
 
 export interface ReconcileAccounting {
+  open_total: number;
+  queued: number;
+  repairing: number;
+  verifying: number;
+  held: number;
+  stranded: number;
   repo: string;
   /** Open PRs with a review decision (drafts excluded). */
   open_reviewed: number;
@@ -249,7 +258,7 @@ export function accountingLine(a: ReconcileAccounting): string {
   const info = a.grace || a.unreviewed ? ` (+${a.grace} in age grace, +${a.unreviewed} unreviewed)` : "";
   const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? `, ${a.reverse_train_exempt} train-owned` : ""}]` : a.reverse_lane_exempt || a.reverse_train_exempt ? ` [reverse:${a.reverse_lane_exempt ? ` ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? ` ${a.reverse_train_exempt} train-owned` : ""}]` : "";
   const observed = a.observed_merged ? ` [observed-merge: ${a.observed_merged} observed-merged closed]` : "";
-  return base + alarm + info + reverse + observed;
+  return base + alarm + info + reverse + observed + ` [all-open: ${a.open_total}; progress: ${a.queued} queued, ${a.repairing} repairing, ${a.verifying} verifying, ${a.held} held, ${a.stranded} stranded]`;
 }
 
 /** Join one repo's observed open PRs against the board projection and emit
@@ -275,6 +284,8 @@ export function reconcileJoin(args: {
 
   const acc: ReconcileAccounting = {
     repo,
+    open_total: 0,
+    queued: 0, repairing: 0, verifying: 0, held: 0, stranded: 0,
     open_reviewed: 0,
     bound: 0,
     ignored: 0,
@@ -299,9 +310,10 @@ export function reconcileJoin(args: {
   // observed-merge loop below; judging them as live PRs would mis-account
   // every merged PR on the repo as board state.
   const openRows = prs.filter(prRowIsOpen);
-  const drafts = openRows.filter((p) => p.isDraft);
-  const reviewed = openRows.filter((p) => !p.isDraft);
+  const reviewed = openRows;
   for (const p of reviewed) {
+    acc.open_total++;
+    if (p.reviewDecision && !p.isDraft) acc.open_reviewed++;
     const age = prAgeMs(p.updatedAt, cfg.now);
     const approved = p.reviewDecision === "APPROVED";
     // verify-eligible = the PR could pass the 5c gate TODAY: mergeable AND a
@@ -330,6 +342,12 @@ export function reconcileJoin(args: {
     //    accounts as bound (queued/lane/in-flight per its stamps).
     const b = bindings.get(p.number);
     if (b) {
+      if (b.progress) acc[b.progress]++;
+      if (b.progress === "stranded" && age > cfg.disposition_age_ms && !b.lane) {
+        acc.unaccounted++;
+        judgements.push({ pr: p.number, decision: { action: "repair_binding", card: b.card, reason: conflicting ? "conflict" : "queue_binding" }, reason: "binding has no live owner/action or bounded hold — existing recovery must restore executable delivery" });
+        continue;
+      }
       if (b.lane) {
         // BR#5151: the bound card is a standing merge-lane lane — the train
         // owns it forever. Account it as bound and never spawn at it (the
@@ -359,12 +377,12 @@ export function reconcileJoin(args: {
     }
     // BR#5677: only GENUINELY-unbound PRs reach the unreviewed bucket — a
     // bound PR above is accounted whatever GitHub says about its reviews.
-    if (!p.reviewDecision) {
+    if ((!p.reviewDecision || p.isDraft) && age <= cfg.disposition_age_ms) {
       acc.unreviewed++;
-      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: "no review decision yet — owner active, out of the invariant's scope" });
+      acc.grace++;
+      judgements.push({ pr: p.number, decision: { action: "grace" }, reason: "unreviewed/draft within bounded delivery grace" });
       continue;
     }
-    acc.open_reviewed++;
     // 2. ignored-with-reason — an explicit human/agent ruling.
     if (ignores.has(p.number)) {
       acc.ignored++;
@@ -384,7 +402,7 @@ export function reconcileJoin(args: {
       continue;
     }
     const dead = ds.find((d) => !isActionableDutyCard(d.card_status));
-    const actionable = (verifyEligible || destinationBlocked || ((changesRequested || conflicting) && age > cfg.disposition_age_ms)) && age > cfg.verify_age_ms;
+    const actionable = (verifyEligible || destinationBlocked || age > cfg.disposition_age_ms) && age > cfg.verify_age_ms;
     if (dead && actionable) {
       acc.unaccounted++;
       judgements.push({ pr: p.number, decision: { action: "alarm_unaccounted", why: `${dead.kind} duty ${dead.duty_id} ended (${dead.card_status ?? "deleted"}) without binding the PR` }, reason: `past the actionable age and none of the three — the prior duty died unbound` });
@@ -403,17 +421,16 @@ export function reconcileJoin(args: {
       judgements.push({ pr: p.number, decision: { action: "spawn_tracking" }, reason: `approved but destination-blocked (${p.mergeStateStatus}) — binding so it is visible; verify comes when the base greens` });
       continue;
     }
-    if ((changesRequested || conflicting) && age > cfg.disposition_age_ms) {
+    if (age > cfg.disposition_age_ms) {
       acc.spawned++;
       acc.accounted++;
-      judgements.push({ pr: p.number, decision: { action: "spawn_disposition" }, reason: `${changesRequested ? "changes requested" : "conflicting"} unbound ${Math.round(age / 3_600_000)}h — spawning a disposition duty (fix, or close-with-reason)` });
+      judgements.push({ pr: p.number, decision: { action: "spawn_disposition" }, reason: `${changesRequested ? "changes requested" : conflicting ? "conflicting" : "no executable delivery"} unbound ${Math.round(age / 3_600_000)}h — restore ownership/action, or obtain authorised closure` });
       continue;
     }
     // 5. inside the grace window.
     acc.grace++;
     judgements.push({ pr: p.number, decision: { action: "grace" }, reason: `unbound but inside the actionable grace (${Math.round(age / 3_600_000)}h old)` });
   }
-  acc.unreviewed += drafts.length; // drafts are informational, outside the invariant
 
   // ---- BR#6384 observation loop: MERGED rows against the bindings ----
   // The feed's MERGED rows are the anti-languish receipt: a binding whose PR

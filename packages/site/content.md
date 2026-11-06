@@ -1,5 +1,27 @@
 # bridge
 
+### Delivery obligations survive card retirement
+
+PR-bound work keeps a delivery owner until it is delivered, transferred to a
+live successor, or explicitly abandoned with independently accepted GitHub-close
+receipts. Replacement transfers bindings and ownership atomically. A bounded
+hold records its owner, reason, next observation and deadline. Failed repair
+rounds escalate existing recovery; they never silently cancel product work.
+
+Reconciliation includes old undecided-review and draft PRs and distinguishes
+queued, repairing, verifying, held and stranded work. A historical card link is
+not proof of progress. Completed duties are scoped to the observed PR head.
+Independent PR acceptance persists exact repo/PR/head legs and pending queue
+admission in the review-close transaction; interrupted handoffs replay through
+the existing repair mechanism, including historical done-parent cases.
+Historical intake and replay use bounded batches and a durable fair cursor, so
+held work cannot monopolise hub CPU or starve new delivery admissions.
+
+Dependency waits follow replacement outcomes rather than treating supersession
+as success. Deployment-health waits observe the relevant repo/base/tip. Unblock
+duties can atomically replace a consumed wait with the newly discovered blocker;
+deduplication includes the predicate revision and accepted heads.
+
 ### Jump straight to a card
 
 Top has a dedicated **model / tier** column beside machine/agent identity.
@@ -7,6 +29,25 @@ Task and child rows stay aligned; on narrow screens the task table scrolls
 horizontally. Retired merge lines are hidden. One warning appears when no workers
 are available; the header's **Status** popover shows connections, worker readiness
 and per-worker running/reserved/slot counts. Busy workers are not an outage.
+Completed workers wake dispatch promptly instead of waiting for the fallback
+poll. Task admission precedes bounded worktree hygiene: four candidates per
+pass, one-second status reads within a three-second probe budget, with a durable
+fair traversal of retained trees. The runner records its current PID/stage before
+slow work and logs launch-preparation durations. Slot reuse still requires real
+writer quiescence; a concurrency limit is not a guarantee of sustained occupancy.
+Refill batches reuse a fresh worker inventory for at most 60 seconds instead of
+re-advertising it for every launch; live begin authorization still applies.
+Gateway capability readiness renews independently every 20 seconds from fresh
+local probes and worker-credential proof, so slow dispatch/handoffs cannot let a
+live gateway's observation expire. Failures still block admission and the hub's
+120-second freshness limit is unchanged; readiness is separate from task leases
+and useful progress.
+
+Open a merge lane for live status, deployment and recovery links, queue blockers
+and repair tasks, executor heartbeat and throughput. The detail view shares the
+train row’s status and refreshes every 30 seconds, with failed/stale reads clearly
+marked. Configuration and recovery history are expandable; permanent lanes no
+longer appear as agent tasks with completion gauges or generic unblock controls.
 
 Use **Go to BR#…** in the web or desktop header to open a card by number from
 any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press
@@ -14,6 +55,12 @@ Enter or **Go**. **⌘K / Ctrl+K** focuses the lookup, and Escape clears it.
 Lookup works independently of board filters and the currently loaded list.
 
 ### Opt-in server updates
+
+Successful TERM service stops are recorded locally rather than labelled daemon
+crashes. Actual crashes and unexpected exits still raise death telemetry. The
+stop hook uses systemd's exit-code/status fields; its receipt alone does not
+identify the restart initiator. Existing hosts refresh the installed hook with
+`bridge service install` from a corrected binary; no service restart is required.
 
 Linux runners can explicitly opt into automatic updates in config:
 `"auto_update": { "enabled": true, "channel": "main" }`. Absent/null config,
@@ -336,6 +383,20 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 - **A quieter Top view (BR#6526).** Stop-line details sit directly beneath the affected line, with cause and recovery grouped together. Themes are a collapsed filter with visible active selections. The heading and subtitle share a left edge. Four aligned summary cards label activity, reported sentiment, board task counts and 30-day completions; charts show their units and periods without mixing cumulative and per-period scales. Completion history refreshes every 30 seconds. On narrow screens, the cards stack and lane details stay readable.
 - **Reports (BR#5126).** The web board's Reports tab renders delivery metrics at full resolution: tasks closed per bucket (hour/day/week, windows 1d–365d) with the average task/h, and PR merge throughput from the train ledger — merged PRs per bucket plus gate bounces for merge-health context. Same data via `GET /api/kb/metrics/reports`; the compact throughput cell stays on Top.
 
+### Continuous main-health monitoring (BR#6901)
+
+An empty merge queue does not stop main-health monitoring. Idle executor ticks
+read required checks, reconcile deployment coverage, and publish pending,
+failed, or recovered health before releasing the lane. Read/publication failures
+never count as healthy observations; in-flight batches retain their separate
+merge-commit CI settle protocol.
+
+The hub tracks `base_observed_at` separately from queue activity. Sweeps,
+acknowledgements, and executor heartbeats cannot refresh stale health facts.
+After 15 minutes without a real observation, even an idle previously-green lane
+shows **Status is out of date**. Existing snapshots keep their original time
+until a real observation replaces them.
+
 ## Agent integration: one MCP server
 
 Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet. Every artefact row a tool returns carries `url` — the card's stable deep link (`/card/BR-3990`) — so a card an agent cites is one paste away in any browser (BR#3990). Links are always emitted on the canonical hub domain, even when a request arrives via the fallback hostname (BR#4695).
@@ -532,6 +593,12 @@ Verify verdicts are **machine verdicts** (BR#5377): a verify-verdict decision **
 
 ### The ask contract: asks are question nodes
 
+Top renders real human questions as compact amber strips: full question and
+essential context, one-click choices and a custom answer stay together. There is
+no synthetic “awaiting you” path for machine waits or missing/answered asks.
+Blocked tasks enter Top only with an open human question or a live unblock
+worker; other parks remain in Backlog under their actual exit condition.
+
 **Bridge owns recovery; you own genuine choices (BR#6483).** Missing queue links
 and conflicts schedule agent repair work, not diagnostic questions for you. Live
 execution and current dependencies outrank historical queue metadata. Backlog says
@@ -614,3 +681,11 @@ Active development, deployed in daily use on a real fleet (the bridge repo is it
 For agents and LLMs: this page is also available as [llms.txt](./llms.txt).
 
 Manifesto: [Continuous Engineering](./continuous-engineering) — the hypothesis behind bridge.
+# Gateway scratch-space recovery
+
+When Linux cannot create a signing-check scratch directory (`ENOSPC`), dispatch
+backs off for 60 seconds before another real launch preflight. Restoring space
+does not require a new signing identity or runner configuration. The hub also
+recovers historical permanent holds for this exact failure with a one-time,
+persisted cooldown. Missing keys and invalid signatures remain blocked; active
+writers, checkpoints and managed-update drains are not cleared by this recovery.

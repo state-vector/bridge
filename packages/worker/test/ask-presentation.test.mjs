@@ -4,6 +4,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useKb } from "../../ui-kit/src/server/kbStore";
 import { ForMeView } from "../../ui-kit/src/views/ForMeView";
 import { buildClaimLocallyPrompt } from "../../ui-kit/src/views/claimLocally";
+import { AskEntries, humanAskSubject, isOpenHumanAsk } from "../../ui-kit/src/views/AskBand";
+import { TopView } from "../../ui-kit/src/views/TopView";
 
 // SSR normally reads Zustand's immutable startup snapshot. Render the actual
 // components against the seeded snapshot, without a browser/network runtime.
@@ -15,6 +17,33 @@ vi.mock("../../ui-kit/src/server/kbStore", async (original) => {
 });
 
 afterEach(() => useKb.setState({ tasks: [] }));
+it("Top excludes phantom asks and machine waits but admits a task with a real human question", () => {
+  const task = (id, title) => ({ id, type: "task", status: "blocked", title, created_ts: 1, updated_ts: 1, meta: { awaiting_ask: { ask_id: "BR#missing" }, blocked: { unblock_condition: "An eligible executor becomes usable" } } });
+  const human = { id: "BR#ask", type: "question", status: "todo", title: "Should we retain the records?", part_of: "BR#human", meta: { ask: { route: { kind: "human_decision" }, to: "human" } } };
+  const peer = { ...human, id: "BR#peer", part_of: "BR#machine", meta: { ask: { route: { kind: "agent_coordination" }, to: "worker" } } };
+  useKb.setState({ tasks: [task("BR#machine", "Machine wait must not appear"), task("BR#human", "Real human decision subject"), human, peer] });
+  const html = renderToStaticMarkup(createElement(TopView, {}));
+  expect(html).toContain("Real human decision subject");
+  expect(html).not.toContain("Machine wait must not appear");
+  expect(html).not.toContain("top-await-note");
+  expect(html).not.toContain("human input required — open the card");
+  expect(isOpenHumanAsk({ ...human, status: "done" })).toBe(false);
+  expect(isOpenHumanAsk(peer)).toBe(false);
+  expect(humanAskSubject({ ...human, part_of: undefined, meta: { ask: { artefact_id: "BR#human" } } })).toBe("BR#human");
+});
+
+it("real ask strips retain complete questions, context, choices and custom-answer controls", () => {
+  const question = { id: "BR#ask", type: "question", status: "todo", title: "Should Bridge retain customer records?", body_md: "The complete essential brief remains readable.", created_ts: 1, meta: { ask: { route: { kind: "human_decision" }, to: "human", options: ["Bridge retains records", "Bridge removes records"] } } };
+  const html = renderToStaticMarkup(createElement(AskEntries, { entries: [{ kind: "nodeAsk", nodeAsk: question }], onDone() {}, nested: true }));
+  expect(html).toContain("ab-question-head");
+  expect(html).toContain("awaiting you");
+  expect(html).toContain(question.title);
+  expect(html).toContain(question.body_md);
+  expect(html).toContain("Bridge retains records");
+  expect(html).toContain("Bridge removes records");
+  expect(html).toContain("type your own answer");
+  expect(html).toContain("Reframe");
+});
 it("actual For Me markup shows the full human question and context, excludes peer mail and duplicate blanket approvals", () => {
   const human = { id: "BR#1", type: "question", status: "todo", title: `Should Bridge retain these records ${"with complete readable context ".repeat(6)}?`, body_md: "The product decision and all essential context are visible here.", created_ts: 1, updated_ts: 1, meta: { ask: { route: { kind: "human_decision" }, to: "human", from: "peer", reason: "Only you can set the retention policy.", options: ["Bridge retains the records", "Bridge deletes the records"] } } };
   const peer = { ...human, id: "BR#2", title: "Find a reviewer for the deployed change?", meta: { ask: { ...human.meta.ask, route: { kind: "agent_coordination" }, to: "macbook-pro-local-2" } } };

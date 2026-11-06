@@ -244,7 +244,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect(String(close.summary)).toContain("e".repeat(40).slice(0, 9));
   });
 
-  it("(b) a conclusive closed-unmerged probe supersedes the car with findings", async () => {
+  it("(b) a closed-unmerged probe retains responsibility and schedules recovery, not abandonment", async () => {
     const REPO = "state-vector/br6384-l2-closed";
     await healthyLane(REPO, "gw-br6384-2b");
     const id = await strandedCard(
@@ -271,14 +271,12 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     // pass 2: leg (b) — supersede with findings
     await alarm();
     const cur = await taskById(id);
-    expect(cur.status).toBe("superseded");
-    const hist = (await kbJson("/get_history", { id })).body;
-    const sup = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("strand disposition (BR#6384 Leg 2)"));
-    expect(sup, "the supersede note must carry the findings").toBeTruthy();
-    expect(String(sup.summary)).toContain("CLOSED unmerged");
+    expect(cur.status).toBe("blocked");
+    expect(cur.meta.recovery.reason).toBe("queue_binding");
+    expect(cur.meta.recovery.task_id).toBeTruthy();
   });
 
-  it("(c)/(d) bounded rounds: fresh-enqueue grace → ONE duty per round → cap → superseded 'ladder exhausted'", async () => {
+  it("(c)/(d) bounded rounds escalate exhausted repair without retiring the delivery obligation", async () => {
     const REPO = "state-vector/br6384-l2-ladder";
     await healthyLane(REPO, "gw-br6384-2c");
     const id = await strandedCard(
@@ -326,11 +324,12 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     // pass 4: rounds 1 >= cap 1 — the ladder exhausts, superseded with findings
     await alarm();
     const done = await taskById(id);
-    expect(done.status).toBe("superseded");
-    const hist = (await kbJson("/get_history", { id })).body;
-    const sup = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("ladder exhausted"));
-    expect(sup, "the exhaustion note must name the cap").toBeTruthy();
-    expect(String(sup.summary)).toContain("BR#6384 Leg 2");
+    expect(done.status).toBe("blocked");
+    expect(done.meta.recovery.reason).toBe("queue_binding");
+    const recovery = done.meta.recovery.task_id;
+    expect(recovery).toBeTruthy();
+    await alarm();
+    expect((await taskById(id)).meta.recovery.task_id).toBe(recovery);
   });
 
   it("guards — a stalled lane and a young park are untouched: no ladder, no re-board, no supersede", async () => {

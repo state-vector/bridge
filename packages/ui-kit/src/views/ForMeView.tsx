@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { isHumanDecisionAsk } from "@bridge/contracts";
-import { AskContext } from "./AskContext";
+import { BandNodeAskRow } from "./AskBand";
 import { useKb } from "../server/kbStore";
 import { kbApi, type KbArtefact } from "../server/kb";
 import { rel } from "../server/views";
-import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
+import { ActionRow, Btn, Card, Chip } from "./index-kit";
 
 /** For Me — the human's inbox. First tab. Surfaces everything awaiting a
  *  human decision or attention:
@@ -21,7 +21,7 @@ import { ActionRow, Btn, Card, Chip, TextInput } from "./index-kit";
  *  Server-side, one actionable verdict per target: the group cannot regrow.
  */
 
-import { decisionFrame, DecisionPopover, useDecisionAct, AskOptions, ConsensusLine } from "./decide";
+import { decisionFrame, DecisionPopover, useDecisionAct, ConsensusLine } from "./decide";
 import {
   beginHold,
   groupBusy,
@@ -172,64 +172,7 @@ function VerdictActions({ d, onDone, held, onAct, onFail, answered }: {
 }
 
 function QuestionNodeRow({ node, onDone, answered }: { node: any; onDone: (id: string) => void; answered?: boolean }) {
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const [text, setText] = useState("");
-  const ask = node.meta?.ask ?? {};
-  const answer = async (a: string) => {
-    if (!a.trim() || answered) return;
-    setBusy(true);
-    setErr("");
-    try {
-      await kbApi.askAnswer(node.id, a.trim());
-      await useKb.getState().refresh();
-      onDone(node.id);
-    } catch (e) {
-      setErr((e as Error).message || "answer failed");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Card className={"forme-item" + (answered ? " forme-answered" : "")}>
-      <div className="ask-chips">
-        <Chip tone="needs">ASK</Chip>
-        {answered && <Chip tone="done">ANSWERED</Chip>}
-        {ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
-        {ask.escalated && <Chip tone="urgent" title={ask.escalated.reason}>ESCALATED — addressee offline</Chip>}
-        <span className="gw-mono ab-id">{node.id}</span>
-        <span className="why-line">
-          {ask.from ?? "agent"} → {ask.to ?? "any"} · {rel(node.created_ts)}
-          {/* BR#3942 — presence: is the addressee even alive? */}
-          {!isHumanDecisionAsk(ask) && node.ask_target && !node.ask_target.online && (
-            <span className="ab-offline">
-              {" · "}offline{node.ask_target.last_seen_ts ? ` · last seen ${rel(node.ask_target.last_seen_ts)}` : " · never seen"}
-            </span>
-          )}
-        </span>
-      </div>
-      <h3 className="ask-question">{node.title}</h3>
-      <AskContext body={node.body_md} ask={ask} />
-      {/* BR#6390 (Ray: "the question/body needs to be clear in the UI, not
-          buried ... not small truncated text"): the ask's full body_md — the
-          human gates (merge command, PR links, why) — renders inline on the
-          card, markdown + linkified, never behind a Details click. */}
-      {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} onPick={(o) => void answer(o)} />
-      )}
-      <div className="steer-box">
-        <TextInput
-          value={text}
-          placeholder="Answer in your own words…"
-          disabled={answered}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && text.trim() && !answered) void answer(text); }}
-        />
-        <Btn disabled={busy || answered || !text.trim()} onClick={() => void answer(text)}>Answer</Btn>
-        {err && <span className="k-err">{err}</span>}
-      </div>
-    </Card>
-  );
+  return <BandNodeAskRow nodeAsk={node} onDone={() => onDone(node.id)} answered={answered} />;
 }
 
 export function ForMeView({ openThread }: { openThread?: (taskId: string) => void }) {

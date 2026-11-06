@@ -4,7 +4,7 @@ import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
 import { TrainPanel } from "./TrainPanel";
 import { WorkerAvailabilityBanner } from "./WorkerAvailability";
-import { AskBand, useHumanAsks, AskEntries, type AskEntry } from "./AskBand";
+import { AskBand, useHumanAsks, AskEntries, isOpenHumanAsk, humanAskSubject, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
@@ -118,15 +118,16 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
     // top = what is RUNNING right now, plus ONLY the blocked rows a human or
     // an active duty can move (2026-10-24 spec, Ray): in_progress always;
-    // blocked only with a pending human ask (meta.awaiting_ask) or a live
+    // blocked only with an actual open human-directed question or a live
     // "Unblock:" twin. Churn/rework machine parks and blocked-with-no-lever
     // rows live in Backlog (TIMEOUT / blocked groups), not here.
     const twinIdx = unblockTwinIndex(tasks as any[]);
+    const humanAskSubjects = new Set(tasks.filter(isOpenHumanAsk).map(humanAskSubject));
     const admitted = (tasks as any[]).filter((t) =>
       t.status === "in_progress"
       || (t.status === "blocked"
         && !isTimeoutBlock(t)
-        && (t.meta?.awaiting_ask?.ask_id || activeUnblockTwinOf(t, twinIdx))),
+        && (humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx))),
     );
     const taskRows: TopRow[] = admitted.map((t) => {
       const meta = (t.meta ?? {}) as any;
@@ -274,12 +275,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
       {treeRows.flatMap(({ row: r, depth }) => {
         const asks: AskEntry[] = humanAsks.byTask.get(r.taskId ?? r.key) ?? [];
-        // every blocked row carries a child: its live unblock twin (nested via
-        // partOf), the human question (nested ask rows below), or — when the
-        // ask node isn't renderable (e.g. an answered GO awaiting execution) —
-        // a synthetic "awaiting you" child. No blocked row stands alone.
-        const needsAwaitChild = depth === 0 && r.status === "blocked"
-          && asks.length === 0 && !treeRows.some((x) => x.row.partOf === (r.taskId ?? r.key));
         return [
         <div
           key={r.key}
@@ -383,14 +378,6 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         asks.length > 0 && (
           <div key={`${r.key}-asks`} className="ask-band ask-band-nested-group">
             <AskEntries entries={asks} onDone={bumpAsks} openDecision={openAskDetails} nested />
-          </div>
-        ),
-        needsAwaitChild && (
-          <div key={`${r.key}-await`} className="ktable-child top-await-note" onClick={() => r.taskId && openDetails(r.taskId)}>
-            <Chip tone="needs">awaiting you</Chip>
-            <span className="top-await-text" title={r.unblock ?? r.askPending ?? ""}>
-              {r.unblock || r.askPending || "human input required — open the card"}
-            </span>
           </div>
         ),
         ];

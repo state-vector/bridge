@@ -33,12 +33,24 @@ export interface HumanAsks {
   total: number;
 }
 
+/** Only a live human-directed request can put a task in the human ask plane. */
+export function isOpenHumanAsk(t: KbArtefact): boolean {
+  return t.type === "question" && ["todo", "in_progress", "blocked"].includes(t.status)
+    && isHumanDecisionAsk(t.meta?.ask ?? {});
+}
+
+export function humanAskSubject(t: KbArtefact): string | null {
+  const ask = t.meta?.ask;
+  const bound = ask && typeof ask === "object" && "artefact_id" in ask ? ask.artefact_id : null;
+  return t.part_of ?? (typeof bound === "string" ? bound : null);
+}
+
 export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   const evSeq = useKb((s) => s.events[0]?.seq ?? 0);
   const tasks = useKb((s) => s.tasks);
   const nodeAsks = useMemo(
     () => (tasks as any[])
-      .filter((t) => t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status))
+      .filter(isOpenHumanAsk)
       .sort((x, y) => y.created_ts - x.created_ts),
     [tasks],
   );
@@ -76,13 +88,11 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
     // syntax and presence never turn coordination into a human decision.
     const seenAsk = new Set<string>();
     for (const nodeAsk of nodeAsks) {
-      const am = (nodeAsk.meta ?? {}).ask ?? {};
-      if (!isHumanDecisionAsk(am)) continue;
       // identical re-asked asks collapse to the newest
-      const key = `${nodeAsk.part_of ?? ""}:${nodeAsk.title}`;
+      const key = `${humanAskSubject(nodeAsk) ?? ""}:${nodeAsk.title}`;
       if (seenAsk.has(key)) continue;
       seenAsk.add(key);
-      put(nodeAsk.part_of ?? null, { kind: "nodeAsk", nodeAsk });
+      put(humanAskSubject(nodeAsk), { kind: "nodeAsk", nodeAsk });
     }
 
     // within a target: verdict → decision → ask; newest first within a rank
@@ -175,13 +185,14 @@ function BandDecisionRow({ d, onDone, openDecision, nested, pending, onPending, 
   );
 }
 
-function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPending, answered }: {
+export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPending, answered }: {
   nodeAsk: KbArtefact; onDone: () => void; openDecision?: (id: string) => void; nested?: boolean;
   pending?: boolean; onPending?: (on: boolean) => void; answered?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [custom, setCustom] = useState("");
+  const [error, setError] = useState("");
   const m = (nodeAsk.meta ?? {}) as any;
   const ask = m.ask ?? {};
 
@@ -196,7 +207,8 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
   // pointer (the jump-back defect). A 20s failsafe un-grays if the ask
   // somehow survives the answer.
   const answer = async (a: string) => {
-    if (answered) return;
+    if (answered || busy || !a.trim()) return;
+    setError("");
     onPending?.(true);
     setBusy(true);
     try {
@@ -205,6 +217,7 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
       onDone();
       window.setTimeout(() => onPending?.(false), 20_000);
     } catch (e) {
+      setError((e as Error).message || "answer failed");
       useKb.getState().reportError("answer ask", e);
       onPending?.(false);
     } finally {
@@ -213,15 +226,12 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
   };
   return (
     <div className={`ask-band-row ask-band-node ${nested ? "ask-band-nested" : ""} ${pending ? "ask-pending" : ""} ${answered ? "ask-answered" : ""}`}>
-      <span className="ab-kind"><Chip tone="needs">ASK</Chip>{answered && <Chip tone="done">ANSWERED</Chip>}{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}
-        {ask.escalated && <Chip tone="urgent" title={ask.escalated.reason}>ESCALATED — addressee offline</Chip>}</span>
-      <span className="ab-main">
-        {/* BR#6390 (Ray: "the question/body needs to be clear in the UI, not
-            buried ... not small truncated text"): the FULL title and the FULL
-            rendered body_md sit inline in the row — the human gates (merge
-            commands, PR links, why) live in body_md and must never hide
-            behind Details. */}
+      <div className="ab-question-head">
+        <span className="ab-kind"><Chip tone="needs">awaiting you</Chip>{answered && <Chip tone="done">ANSWERED</Chip>}{ask.urgency === "urgent" && <Chip tone="urgent">URGENT</Chip>}</span>
         <span className="ab-title">{nodeAsk.title}</span>
+        <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} · {rel(nodeAsk.created_ts)}</span>
+      </div>
+      <div className="ab-question-content">
         <AskContext body={nodeAsk.body_md} ask={ask} />
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
@@ -258,16 +268,16 @@ function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending, onPend
             <span className="ask-opt-text">type your own answer…</span>
           </div>
         )}
-      </span>
-      <span className="ab-meta"><span className="gw-mono ab-id">{nodeAsk.id}</span>{pending && <span className="ask-spinner" title="sending…" />} {rel(nodeAsk.created_ts)}</span>
+      </div>
       <span className="ab-actions">
+        {error && <span className="k-err" role="alert">{error}</span>}
         {ask.reframe
           ? <span className="muted-note">reframed — awaiting re-ask</span>
           : <Btn size="sm" variant="reject" disabled={busy || answered} title="kick back to the asker: restructure per the ask contract (add feedback in the detail view)"
               onClick={() => { setBusy(true); kbApi.askReframe(nodeAsk.id).catch((e) => useKb.getState().reportError("reframe ask", e)).finally(() => { setBusy(false); void useKb.getState().refresh(); }); }}>Reframe</Btn>}
         <ClaimLocallyBtn task={nodeAsk} ask={{ reason: m.ask?.reason, options: ask.options as string[] | undefined, to: m.ask?.to, from: m.ask?.from }} />
-        <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
-          onClick={() => openDecision?.(nodeAsk.id)}>Details</Btn>
+        {openDecision && <Btn size="sm" quiet title="open the full ask — question, options, free-text answer, comments"
+          onClick={() => openDecision(nodeAsk.id)}>Details</Btn>}
       </span>
     </div>
   );

@@ -232,6 +232,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    squished above tall forms; forms pin to the visual bottom via margin-top:auto */
 .detail-panel .detail-block.history-block { flex: 1 1 auto; min-height: 160px; }
 .detail-panel .detail-block.form-block { margin-top: auto; }
+.lane-detail { overflow-wrap: anywhere; }
+.lane-detail .detail-question { margin: 0; color: var(--text); }
+.lane-detail-status, .lane-detail-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.lane-detail-stats { font-size: 12px; color: var(--text-dim); }
+.lane-detail .train-blocked-banner { grid-template-columns: minmax(0, 1fr); margin-left: 0; }
+.lane-detail-queue, .lane-detail-events { margin: 8px 0 0; padding-left: 22px; }
+.lane-detail-queue li, .lane-detail-events li { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.lane-detail-queue li > span, .lane-detail-events li > span { display: block; font-size: 12px; margin-top: 4px; }
+.lane-detail-queue .k-chip { margin-left: 8px; }
+.lane-detail summary { cursor: pointer; color: var(--text-dim); }
 @keyframes slide-in { from { transform: translateX(30px); opacity: 0; } }
 
 .detail-head { display: flex; justify-content: space-between; align-items: center; }
@@ -1137,16 +1147,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-sdot.sd-in_review { background: var(--amber); }
 .top-sdot.sd-none { background: var(--text-faint, #8b94a7); }
 
-/* synthetic child for blocked rows whose ask isn't renderable (e.g. an
-   answered GO awaiting execution) — no blocked row stands alone */
-.top-await-note {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px 4px 30px; font-size: 11.5px;
-  color: var(--amber); cursor: pointer;
+/* Real questions use the compact amber strip; machine waits never impersonate asks. */
+.ask-band-node {
+  padding: 5px 10px;
+  gap: 3px;
+  border-left: 2px solid color-mix(in srgb, var(--amber) 45%, transparent);
   border-bottom: 1px solid color-mix(in srgb, var(--line, #232b3b) 55%, transparent);
+  background: color-mix(in srgb, var(--amber) 3%, transparent);
 }
-.top-await-note:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
-.top-await-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-band-node:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
+.ab-question-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.ab-question-head .ab-title { flex: 1 1 260px; color: var(--amber); }
+.ab-question-head .ab-meta { margin-left: auto; }
+.ab-question-content { min-width: 0; overflow-wrap: anywhere; }
+.ab-question-content .ask-reason { margin: 2px 0; font-size: 12px; }
+.ab-question-content .ask-opt-list { margin: 4px 0 0; gap: 1px; }
+.ask-band-node .ab-actions { flex-wrap: wrap; gap: 4px; }
 
 /* backlog sections: same ktable rows, grouped heads */
 .backlog-group { margin-bottom: 14px; }

@@ -13,6 +13,7 @@ export * from "./pairing.ts";
 export * from "./provision.ts";
 export * from "./ask.ts";
 export * from "./review.ts";
+export * from "./delivery.ts";
 export * from "./work.ts";
 export * from "./config.ts";
 export * from "./train.ts";

@@ -14,6 +14,7 @@ import { SupersedeBtn } from "./supersede";
 import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
 import { ExecutionHistoryEventSchema, executionHistorySummary } from "@bridge/contracts";
 import { StartupWaitNotice } from "./StartupWaitNotice";
+import { LaneDetail, isLaneCard } from "./LaneDetail";
 
 export const SENTIMENT_CHIP: Record<string, ChipTone> = {
   going_well: "done",
@@ -725,6 +726,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
       setBusy(false);
     }
   };
+
+  if (task?.id === taskId && isLaneCard(task)) {
+    return <LaneDetail key={taskId} task={task} onClose={onClose} onOpen={onOpen} />;
+  }
 
   return (
     <>

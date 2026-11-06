@@ -94,6 +94,7 @@ export const TrainLineFactsSchema = z.object({
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
     at: z.number(),
+    base_observed_at: z.number().optional(),
     base_state: z.object({
       verdict: z.enum(["green", "red", "unsettled", "empty"]),
       red: z.array(EvidenceSchema).optional(), unsettled: z.array(z.string()).optional(),
@@ -111,13 +112,20 @@ export const TrainLineFactsSchema = z.object({
 });
 export type TrainLineFacts = z.infer<typeof TrainLineFactsSchema>;
 
+/** Queue acks and parked-task sweeps do not observe main. Legacy snapshots
+ * use their original publication time until the next hub mutation migrates it. */
+export function trainBaseObservedAt(q: { at?: number; base_observed_at?: number } | null | undefined): number {
+  return q?.base_observed_at ?? q?.at ?? 0;
+}
+
 /** Total, pure presentation reducer. This is the only precedence law for the
  * status, reason, message and banner. Unknown/stale never turns into ready. */
 export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProjection {
   const q = f.queue_facts;
   const bs = q?.base_state;
   const cov = bs?.deploy_coverage;
-  const fresh = !!q && now - q.at < 15 * 60_000;
+  const observedAt = trainBaseObservedAt(q);
+  const fresh = !!bs && observedAt > 0 && now - observedAt < 15 * 60_000;
   const task = f.base_red_resolution?.fix_card ?? f.diagnostic;
   const gatePending = bs?.gate_blocked && bs.gate_red?.length === 0 && !!bs.gate_unsettled?.length;
   // A starvation prompt is not a concrete human requirement for a failed
@@ -127,7 +135,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
   const make = (phase: TrainLineProjection["phase"], label: string, reason: string,
     blocker: TrainLineProjection["blocker"] = null, evidence: TrainLineProjection["evidence"] = [],
     remediation: LineRemediation | null = null): TrainLineProjection => ({
-    ...TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: q?.at ?? 0, remediation }),
+    ...TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: observedAt, remediation }),
   });
   const repair = (): LineRemediation => {
     if (f.base_red_resolution?.phase === "cure_pr_awaiting_force_merge" && task?.pr && task.pr_url && !task.merged && !task.conflict) return {
@@ -154,7 +162,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     const action = repair();
     return make("stopped", action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
   }
-  if (q && !fresh && (f.queue.length || f.currently || bs?.verdict !== "green" || bs?.gate_blocked)) return make(
+  if (q && !fresh) return make(
     "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());
   if (fresh && gatePending) return make("waiting", "Waiting for required checks",
     `The merge gate is waiting for: ${bs.gate_unsettled!.join(", ")}. No gate check has failed.`, "checks_running", [],

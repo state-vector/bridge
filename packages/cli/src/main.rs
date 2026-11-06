@@ -1372,13 +1372,22 @@ COOLDOWN=600
 
 stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 result="${SERVICE_RESULT:-unknown}"
-signal="${SIGNAL:-}"
+exit_code="${EXIT_CODE:-unknown}"
 exit_status="${EXIT_STATUS:-}"
+signal=""
+case "$exit_code" in
+  killed|dumped) signal="$exit_status" ;;
+esac
 
-# deliberate stop (systemctl stop/restart TERMs the unit) — local log only
-if [ "$result" = "success" ] && [ -n "$signal" ]; then
-  echo "$stamp deliberate-stop (TERM) — no alarm" >> "$RECEIPTS"
-  exit 0
+# ExecStopPost gets EXIT_CODE/EXIT_STATUS, not SIGNAL. Only successful TERM
+# stops are routine; KILL/SEGV, failed stops and unexpected exit 0 still alarm.
+if [ "$result" = "success" ] && [ "$exit_code" = "killed" ]; then
+  case "$exit_status" in
+    TERM|15)
+      echo "$stamp successful-stop (TERM) — no crash alarm" >> "$RECEIPTS"
+      exit 0
+      ;;
+  esac
 fi
 
 tail_txt=""
@@ -1388,7 +1397,7 @@ fi
 # cause signature: result + signal + exit only — NOT the log tail (log
 # timestamps would differ every attempt and defeat the cooldown that stops
 # crash-loop spam, BR#4899 defect 2)
-sig="$result|signal=$signal|exit=$exit_status"
+sig="$result|code=$exit_code|signal=$signal|exit=$exit_status"
 
 now=$(date +%s)
 last_ts=$(head -n 1 "$STATE" 2>/dev/null)
@@ -1404,7 +1413,7 @@ fi
 printf '%s\n%s\n' "$now" "$sig" > "$STATE" 2>/dev/null || true
 # state write must never fail the hook: it lives at the home root (no
 # subdir dependency) and a lost state file only costs one extra note
-msg="result=$result signal=${signal:-none} exit=$exit_status last-log: ${tail_txt:-unavailable}"
+msg="result=$result code=$exit_code signal=${signal:-none} exit=$exit_status last-log: ${tail_txt:-unavailable}"
 echo "$stamp ALARM $msg" >> "$RECEIPTS"
 # best-effort board emission; the receipt above is the no-silent-deaths
 # guarantee when the hub itself is unreachable (fail-open by design)
@@ -1583,12 +1592,12 @@ mod tests {
         // cooldown dedupe: one note per distinct cause per 10 min
         assert!(hook.contains("COOLDOWN=600"), "hook:\n{hook}");
         assert!(
-            hook.contains("sig=\"$result|signal=$signal|exit=$exit_status\""),
+            hook.contains("sig=\"$result|code=$exit_code|signal=$signal|exit=$exit_status\""),
             "cause signature must exclude the log tail (timestamps would break dedupe):\n{hook}"
         );
         // deliberate TERM stops never alarm
         assert!(
-            hook.contains("[ \"$result\" = \"success\" ] && [ -n \"$signal\" ]"),
+            hook.contains("[ \"$result\" = \"success\" ] && [ \"$exit_code\" = \"killed\" ]"),
             "deliberate-stop branch lost:\n{hook}"
         );
         // fail-open: local receipt lands BEFORE the best-effort emission
@@ -1606,6 +1615,47 @@ mod tests {
         assert!(!hook.contains("{BIN}"), "unreplaced placeholder:\n{hook}");
         assert!(!hook.contains("{HOME_DIR}"), "unreplaced placeholder:\n{hook}");
         assert!(!hook.contains("{LOG}"), "unreplaced placeholder:\n{hook}");
+    }
+
+    #[test]
+    fn death_hook_executes_real_systemd_exit_environment_without_false_term_alarms() {
+        use std::os::unix::fs::PermissionsExt;
+        for (result, code, status, should_alarm) in [
+            ("success", "killed", "TERM", false),
+            ("success", "killed", "15", false),
+            ("success", "killed", "KILL", true),
+            ("signal", "killed", "TERM", true),
+            ("core-dump", "dumped", "SEGV", true),
+            ("exit-code", "exited", "1", true),
+            ("success", "exited", "0", true),
+        ] {
+            let root = std::env::temp_dir().join(format!("bridge-death-hook-{}-{}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir(&root).unwrap();
+            let binary = root.join("fake-bridge");
+            let calls = root.join("alarm-calls");
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 7\n", calls.display())).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let hook = root.join("death-hook");
+            std::fs::write(&hook, render_death_hook(&binary, root.to_str().unwrap(), &root.join("bridge.log"))).unwrap();
+            for _ in 0..2 {
+                let out = std::process::Command::new("sh").arg(&hook)
+                    .env("SERVICE_RESULT", result).env("EXIT_CODE", code).env("EXIT_STATUS", status)
+                    .env_remove("SIGNAL").output().unwrap();
+                assert!(out.status.success(), "hook must fail open even if alarm delivery fails: {result}/{code}/{status}");
+            }
+            let receipts = std::fs::read_to_string(root.join("bridge-death-telemetry.log")).unwrap();
+            if should_alarm {
+                assert!(receipts.contains(" ALARM "), "missing crash alarm: {result}/{code}/{status}");
+                assert!(receipts.contains("suppressed (cooldown"));
+                assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+            } else {
+                assert!(!calls.exists(), "successful TERM stop was incorrectly labelled a death");
+                assert!(!receipts.contains(" ALARM "));
+                assert!(receipts.contains("successful-stop (TERM)"));
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 

@@ -8,6 +8,44 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+### Delivery responsibility
+
+An open PR remains a delivery obligation even when an old card is retired.
+Replacing a PR-bound task requires a live successor; its ownership and PR
+bindings transfer in the retirement transaction. A bare Supersede without a
+replacement is refused for outstanding bindings. The human disposition endpoint
+also accepts `disposition: {kind:"hold", owner, reason, next, deadline}` (epoch
+milliseconds) or `{kind:"abandon", reason}`. Holds retain their owner and review
+deadline. Abandonment schedules an authorised GitHub-close executor task and
+stays pending until independent outcome review accepts actual closure receipts.
+Exhausted repair rounds and closed-unmerged probes retain the obligation and
+escalate through the existing task-recovery mechanism.
+
+Reconciliation covers every open PR, including undecided reviews and drafts
+after bounded grace. The report includes all-open totals and queued, repairing,
+verifying, held and stranded counts. A binding without executable progress is
+stranded, not healthy accounting. Completed reconcile duties cover their observed
+head rather than the lifetime of a PR.
+
+Independent PR acceptance can use `review_result: {kind:"accepted_pr", task_id,
+legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
+queue admission are committed together; the existing repair passes replay the
+handoff until admitted or explicitly held behind a newer blocker. Explicit
+historical acceptances, including standalone reviews of already-done parents,
+can restore delivery on a successor without rewriting historical completion.
+Historical done-parent restoration requires a fresh observed OPEN PR at the
+accepted head; missing, closed or changed-head observations retain a visible hold.
+Historical intake and admission replay are bounded to ten records per pass.
+A durable round-robin cursor keeps held records from starving later admissions;
+overlapping ingress shares one historical reconciliation pass.
+
+`await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
+health at the lane tip. Retiring a `br_done` dependency is not success: a live
+replacement must reach the required outcome. An unblock duty finding a different
+blocker supplies `unblock_result: {kind:"reblocked", parent_id, reason, next,
+await_event}` so replacement of the parent's wait and completion of the duty
+are atomic. Predicate revisions and accepted heads scope same-receipt deduplication.
+
 Top keeps machine/agent identity and actual **model / tier** in separate aligned
 columns. Parent and child rows share the same tracks; narrower windows scroll
 the task table horizontally rather than folding cells onto a second row.
@@ -30,12 +68,50 @@ aggregate-only data is labelled unresolved executions, never running workers.
 Managed updater holds also mark every advertised model unavailable with the
 explicit draining-for-update reason; a local no-claims hold cannot advertise
 usable spare capacity. Clearing the hold rebuilds availability from actual config.
+Worker completion (including a crashed worker thread) wakes dispatch within a
+100ms sleep slice rather than waiting out the configured fallback poll. The
+runner still verifies quiescence and completes the handoff before reusing a slot.
+Admission runs before optional worktree hygiene. Each hygiene pass inspects at
+most four candidates, with a three-second aggregate status-probe budget and a
+one-second deadline per read; retained trees count against that budget too. A
+persisted oldest-first round cursor prevents the same kept trees from starving
+the rest after each poll/restart. Cleanup still preserves unpublished work.
+`bridge status` writes the current PID and dispatch stage before slow operations
+(readiness, checkpoint, finalization, admission, preparation, hygiene, waiting),
+and logs report each worker's preparation duration. These are local diagnostics,
+not a claim that every held slot is a running process. Worker preparation and
+handoff remain serialized; configured concurrency is an upper bound, not a
+guarantee of twelve continuously occupied slots. Diagnose a slow refill from
+these stages and live scheduler eligibility/occupancy rather than raising the
+slot limit or repeatedly restarting the gateway.
+Within a refill batch, launches reuse the tick's proved worker/config inventory
+for up to 60 seconds, refreshing after slow provisioning instead of repeating
+local probes and a hub advertisement for every slot. Each begin still checks
+the hub's live model selection, scope, credential and capacity fences; a failed
+required refresh never launches a writer.
+Gateway readiness has its own renewal thread, independent of task dispatch,
+checkpointing and completion handoffs. Every 20 seconds it re-probes configured
+backend CLIs/tools, proves the canonical worker credential and advertises the
+current inventory, including managed-update holds. Dispatch consumes that fresh
+proof instead of provisioning a second worker or running a second readiness
+producer. Failed renewal withdraws local admission; authentication failures still
+enter the gateway's existing repair ladder. Config changes invalidate old proofs,
+and stop joins pending renewal before the producer is dropped. This keeps a busy
+gateway from appearing unavailable merely because a synchronous handoff exceeded
+the hub's 120-second observation TTL; the TTL itself is unchanged. Gateway
+readiness does not renew task leases, fabricate worker progress or release slots.
 **Worker drain does not stop merge delivery.** The merge train continues ticking
 while existing agent workers finish. Only after the last worker stops does the
 gateway stop and join the train, then acknowledge the nonce/PID-bound idle receipt
 for supervised restart. A failed train join cannot certify idle. This avoids
 silencing the merge line for a whole worker action budget on every update.
 Retired merge lines are hidden.
+Opening a merge lane shows its live operational view: the same typed status as
+the train row, deployment/recovery links, queue checks and repair tasks, executor
+heartbeat and merge throughput. It refreshes every 30 seconds and flags failed or
+stale observations. Required checks come from live lane configuration; recovery
+history and executor diagnostics are expandable. Lanes do not show task completion
+gauges, model fields, generic unblock/supersede controls or dependency graphs.
 Per-task execution-attention cards are not shown on Top.
 
 **Recovery owns execution priority (BR#6835).** Concrete task-repair duties and
@@ -636,6 +712,16 @@ bridge logs --json          # raw JSON for scripts
 The unit logs to `~/bridge.log` (both streams, `append:`) instead of the journal — user journals are unreadable on many minimal cloud images (journald `Storage=volatile`, or the session predates linger), so `journalctl --user` dead-ends there while the service itself runs fine. It also bakes the install shell's `PATH` into the unit (with the configured agent CLIs' dirs first): systemd's minimal default PATH misses `~/.local/bin`, which left agent CLIs unrunnable under the service. Re-run `bridge service install` after moving agent CLIs, or set `PATH` in `~/.bridge/env` to override.
 
 **The daemon's death is loud** (BR#4682): the unit uses `Restart=always` with exponential restart backoff (5s→60s) and a 0–7s start jitter, so the runner revives from a crash **or** a clean exit without human action. Every restart-causing death fires an ExecStopPost hook that posts one `[daemon-death]` note per distinct cause (result / signal / exit code + last log lines) to the alarm sink card — deduped to one note per 10 minutes per cause, so a crash-loop can't spam the board — and always appends a local receipt to `~/bridge-death-telemetry.log` (the no-silent-deaths guarantee even when the hub itself is unreachable). Deliberate `systemctl stop`/`restart` log locally without alarming. If the supervisor ever truly gives up (`start-limit-hit`, effectively unreachable at 50 starts / 10 min against the 60s backoff cap), a separate give-up escalation unit posts one `[daemon-death ESCALATION]` note naming the manual intervention needed. The unit's `WorkingDirectory` is the user's home — never the directory the installer ran from.
+
+The stop hook classifies systemd's `SERVICE_RESULT`, `EXIT_CODE` and
+`EXIT_STATUS` (there is no systemd `SIGNAL` variable). A successful
+`killed` / `TERM` (or `15`) stop produces a local `successful-stop` receipt,
+not a crash alarm. KILL, SEGV, failed TERM stops and unexpected clean exits
+still alarm. This classifies the exit, not who requested it: use the service
+journal and updater receipt to attribute a restart. Existing installations
+must refresh their installed stop hook; replacing the runner binary alone
+does not replace that script. `bridge service install` from a corrected binary
+refreshes it without restarting the service.
 
 **Runner log format** (BR#4400): every operator-visible line from the runner — dispatch loop, in-process merge-train leg, store/session/keychain, CLI, canary — flows through one mechanism with one shape:
 
@@ -2357,6 +2443,21 @@ other law owns them.
 
 ### One line-health and recovery state (BR#6389)
 
+**Main is monitored even with an empty merge queue (BR#6901).** Every idle
+executor tick reads main's required checks, reconciles deployment coverage,
+and publishes the observation before releasing its lane lease. Pending,
+failed, and recovered main states therefore continue to advance without a
+queued PR. A failed read stays fail-closed; a failed publication is an error,
+never a successful health heartbeat. An in-flight batch still settles through
+the merge-commit CI protocol.
+
+Health freshness uses `queue_facts.base_observed_at`, separately from the
+queue publication timestamp. Parked-task sweeps, acknowledgement messages,
+and executor heartbeats cannot make old main facts fresh. Legacy snapshots
+retain their original timestamp until replaced by a real observation. After
+15 minutes without a health observation, even an idle previously-green lane
+reports **Status is out of date**, rather than implying main is still healthy.
+
 #### Cause-specific closed-loop recovery (BR#6522)
 
 Each failed commit has durable recovery episodes keyed by a typed cause:
@@ -2990,6 +3091,7 @@ double-binding single spawn) and `test/machine.test.ts` (the refusal names child
 ## 5 · Use it
 
 - Open the hub URL → **Board** (live fleet), **For Me** (proposed decisions awaiting your accept/reject — each shows the agent consensus tally and the reasons), **Knowledge** (search), **Discussions** (question threads)
+- **Top questions** use compact amber strips with the full question, essential context, one-click choices and a custom answer. Only actual open human-directed questions render “awaiting you”; machine waits and answered/missing asks never manufacture a human request. Blocked tasks appear in Top only with a real human question or a live unblock worker; other parks belong in Backlog.
 - **Top layout (BR#6526):** interruptions render directly beneath the affected merge line, with cause/checks and recovery side by side on wide screens and stacked on smaller screens. Theme filters stay collapsed until opened; active selections and Clear filters remain visible. The Top subtitle is left-aligned beneath its heading. Four consistent summary cards show observed recent activity, reported work outlook, loaded-board task counts, and completed tasks over 30 days. Bar charts have explicit units/periods and one scale; the sentiment meter has a labelled legend. Completion history refreshes every 30 seconds rather than on each activity event. Activity bins are recalculated without accumulating duplicate counts on rerenders. The cards reflow to two columns and then one on narrow screens.
 - **Reports tab (BR#5126)**: high-resolution delivery metrics — tasks closed per bucket (hour/day/week over 1d–365d windows, avg task/h) and PR throughput (merged + gate bounces per bucket plus average PR/day) from the train ledger, drawn as full-width charts with gridlines, axes and hover detail. Served by `GET /api/kb/metrics/reports` (machine-plane friendly); the dashboard's compact throughput cell (BR#2937) stays on Top.
 - **Every card has a stable URL (BR#3990)**: `/card/BR-3990` deep-links straight to that card's detail panel, and opening or closing a card in the Board keeps the URL in sync — any card view is a shareable link (browser-back steps back out). The dash form is canonical (`BR#3990` → `/card/BR-3990`); the route also accepts `BR%233990` and the bare number. The same URLs ride the MCP payloads: artefact rows returned by `orient`, `search_knowledge`, `get_artefact` (+ `see_also`), `related_artefacts` and `asks` carry `url` (ask rows also `artefact_url` for their bound card), built from the hub's canonical origin — the `CANONICAL_ORIGIN` var (default `https://hub.fleetbridge.run`), regardless of which ingress served the request, so the workers.dev fallback never leaks into emitted links (BR#4695). An agent citing a card can hand you a link that opens it.
@@ -3053,3 +3155,12 @@ contract.
 ## License
 
 [Apache-2.0](LICENSE)
+# Gateway scratch-space recovery
+
+A signing preflight that cannot create its scratch directory because of Linux
+`ENOSPC` pauses dispatch for 60 seconds, then permits a fresh launch preflight.
+It does not require changing the signing identity after space is restored.
+Historical permanent holds for this exact scratch-space failure are converted
+once to the same persisted cooldown; readiness renewals do not extend it.
+Missing keys, invalid signatures and other prerequisite failures remain held.
+Existing writers, checkpoints and updater drain holds are preserved.

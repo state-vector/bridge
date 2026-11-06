@@ -128,7 +128,8 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   transition: z.looseObject({
     execution_result: ExecutionResultSchema.optional().describe("Execution tasks complete only after their actual outcome is achieved. Supply an outcome and per-action receipts; a prerequisite PR merge is not completion."),
-    review_result: ReviewResultSchema.optional().describe("For a review duty closing done: accepted_direct_main carries verified commit and green CI receipts; findings is not acceptance. Prefer this typed result over prose."),
+    review_result: ReviewResultSchema.optional().describe("Independent acceptance: accepted_pr binds task_id plus exact repo/PR/head legs durably; accepted_direct_main carries verified commit and CI; findings is not acceptance."),
+    unblock_result: z.object({ kind: z.literal("reblocked"), parent_id: z.string(), reason: z.string().min(1), next: z.string().min(1), await_event: z.record(z.string(), z.unknown()) }).optional().describe("An unblock duty finding a different blocker atomically replaces the parent's wait before closing."),
     id: z.string(),
     to: z.string(),
     note: z.string().optional(),

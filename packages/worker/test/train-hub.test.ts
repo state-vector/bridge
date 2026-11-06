@@ -103,6 +103,33 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
   return (await queueViaAcceptBoth(opts)).implId;
 }
 
+describe("BR#6901 idle main-health observation", () => {
+  it("persists health separately from sweep/ack activity and recovers without a queued PR", async () => {
+    const repo = "state-vector/idle-health-6901", actor = "gw-idle6901";
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const stamp = (base_state: object) => kbJson("/train.queue_facts", { repo, actor, entries: [], base_state });
+    expect((await stamp({ verdict: "unsettled", unsettled: ["Test"] })).status).toBe(200);
+    const pending = await laneSnap(repo);
+    expect(pending.line).toMatchObject({ phase: "waiting", held: 0 });
+    const observedAt = pending.queue_facts.base_observed_at;
+    expect(observedAt).toBeGreaterThan(0);
+    for (const payload of [{ awaiting_sweep: {} }, { rerun_consumed: "nothing-red" }, { entries: [] }]) {
+      expect((await kbJson("/train.queue_facts", { repo, actor, ...payload })).status).toBe(200);
+      const acked = await laneSnap(repo);
+      expect(acked.queue_facts.base_observed_at).toBe(observedAt);
+      expect(acked.line.observed_at).toBe(observedAt);
+    }
+    await stamp({ verdict: "red", tip_sha: "a".repeat(40), red: [{ name: "Test" }], unsettled: [] });
+    expect((await laneSnap(repo)).line).toMatchObject({ phase: "stopped", blocker: "main_failed", held: 0 });
+    await stamp({ verdict: "green", tip_sha: "a".repeat(40), red: [], unsettled: [] });
+    const recovered = await laneSnap(repo);
+    expect(recovered.queue).toEqual([]);
+    expect(recovered.line).toMatchObject({ phase: "ready", blocker: null, remediation: null, held: 0 });
+    expect(recovered.queue_facts.base_observed_at).toBeGreaterThanOrEqual(observedAt);
+    await kbJson("/train.lease", { repo, actor, action: "release" });
+  });
+});
+
 describe("BR#6776 durable check recovery", () => {
   it("reserves one retry per head/obligation across lease takeover, including unknown effects", async () => {
     const repo = "state-vector/retry-6776", actor = "gw-retry6776", head = "a".repeat(40);
@@ -2809,7 +2836,10 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // tick closes it done, honestly, and it re-files if a cure re-binds
     // (BR#5807: update meta merges per key now — the unbind is an explicit
     // meta_delete, not an omitted-key replace)
-    await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } }, meta_delete: ["prs"] });
+    // Delivery responsibility now requires the executor's actual CLOSED
+    // observation before removing the old PR binding.
+    expect((await kbJson("/reconcile.report", { repo, prs: [{ number: 53499, state: "CLOSED", headRefOid: "d".repeat(40) }] })).status).toBe(200);
+    expect((await kbJson("/update", { id: fix.body.id, meta: { root_fix: { repo, head_sha: "a".repeat(40), base: "main", why: "drill", failing: ["Test"], bound_at: Date.now() } }, meta_delete: ["prs"] })).status).toBe(200);
     expect((await stampRed()).body.error ?? "").toBe("");
     const closedAsk = (await askHits()).find((x: any) => x.id === ask2.id);
     expect(closedAsk?.status).toBe("done");
@@ -3125,6 +3155,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       kbJson("/train.queue_facts", {
         repo, base: "main", actor: "gw-stall",
         entries: [ { id: c1, pr: 53761, cls: "ready" }, { id: c2, pr: 53762, cls: "ready" } ],
+        base_state: { verdict: "green", red: [], unsettled: [] },
         ...(stalled ? { stalled } : {}),
       });
 
