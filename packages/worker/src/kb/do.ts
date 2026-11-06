@@ -5253,7 +5253,7 @@ export class KnowledgeHub {
   private async transition(body: any, actor: string) {
     if (body.to === "in_progress" || body.to === "todo") {
       const wait = this.startupWait(String(body.id ?? ""));
-      if (wait) throw new Error(`gate: ${startupWaitReason(wait)}`);
+      if (wait && !(body.to === "in_progress" && this.executionWork().isInteractive(String(body.token_id ?? "")))) throw new Error(`gate: ${startupWaitReason(wait)}`);
     }
     try {
       return await this.doTransition(body, actor);

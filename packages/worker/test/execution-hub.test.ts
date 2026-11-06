@@ -64,6 +64,19 @@ async function interactive(label: string) {
 }
 
 describe("local handoff authority and lifecycle", () => {
+  it("lets a direct interactive claimant resolve an unstarted gateway prerequisite without repairing that gateway", async () => {
+    const r = await runtimeTask();
+    const id = (await post<{ id: string }>("create", { type: "task", title: "Unstarted gateway prerequisite", project: "bridge", qualified: true })).data.id;
+    const auth = { ...r.auth, id, session: "dispatch-prerequisite-pickup" };
+    expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
+    expect((await post("execution", { ...auth, command_id: "missing-snapshot", command: { kind: "start_failed", stage: "begin", failure_class: "prerequisite", retained_work: true, reason: "gate: snapshot unavailable on gateway" } })).data.kind).toBe("released");
+    expect((await post("execution", { ...auth, command_id: "prerequisite-state", command: { kind: "availability" } })).data.startup_wait).toMatchObject({ phase: "recovery_required" });
+    const local = await interactive(`direct-startup-${serial}`);
+    const pickup = { id, actor: local.label, token_id: local.token_id, session: "human-startup-recovery" };
+    expect((await post("transition", { ...pickup, to: "in_progress", note: "Human requested direct recovery with local source" })).data.error).toBeUndefined();
+    expect((await post("progress.log", { ...pickup, note: "Local source available" })).data.kind).not.toBe("commentary");
+    expect((await post("get", { id })).data.meta).not.toHaveProperty("startup_wait");
+  });
   it("lets human-directed agents claim a capability wait directly, heartbeat and release without a grant loop", async () => {
     const local = await interactive(`direct-capability-${++serial}`);
     const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Interactive recovery of an unavailable gateway", qualified: true, project: "bridge",
@@ -118,7 +131,7 @@ describe("local handoff authority and lifecycle", () => {
     const local = await interactive(`direct-with-human-hold-${serial}`);
     expect((await post("transition", { id: task.id, actor: local.label, token_id: local.token_id, session: "human-hold", to: "in_progress", note: "Cannot bypass the unanswered choice" })).data.error).toMatch(/open human decision/);
   });
-  it("requires actual old-writer quiescence before a direct claim, even after its lease expires", async () => {
+  it("requires actual old-writer quiescence before a direct claim, even when the card is parked", async () => {
     const r = await runtimeTask();
     const task = (await post<{ id: string }>("create", { actor: r.auth.actor, type: "task", title: "Writer still running", qualified: true, project: "bridge" })).data;
     const auth = { ...r.auth, id: task.id, session: "dispatch-still-running" };

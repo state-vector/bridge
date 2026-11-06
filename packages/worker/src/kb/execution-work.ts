@@ -113,6 +113,7 @@ export class ExecutionWork {
     this.sql.exec(`INSERT INTO execution_state(task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(ExecutionStateSchema.parse(state)));
     meta.interactive_execution = InteractiveClaimSchema.parse({ kind: "interactive", token_id: tokenId, session, claimed_at: Date.now() });
     meta.session = session;
+    delete meta.taken_over; // a new claim replaces the old takeover's session fence
     delete meta.execution_wait; delete meta.blocked; delete meta.local_execution; delete meta.startup_wait;
     meta.execution_blockers = [];
     this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
