@@ -566,6 +566,12 @@ Verify verdicts are **machine verdicts** (BR#5377): a verify-verdict decision **
 
 ### The ask contract: asks are question nodes
 
+Top renders real human questions as compact amber strips: full question and
+essential context, one-click choices and a custom answer stay together. There is
+no synthetic “awaiting you” path for machine waits or missing/answered asks.
+Blocked tasks enter Top only with an open human question or a live unblock
+worker; other parks remain in Backlog under their actual exit condition.
+
 **Bridge owns recovery; you own genuine choices (BR#6483).** Missing queue links
 and conflicts schedule agent repair work, not diagnostic questions for you. Live
 execution and current dependencies outrank historical queue metadata. Backlog says

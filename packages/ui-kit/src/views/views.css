@@ -1147,16 +1147,22 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .top-sdot.sd-in_review { background: var(--amber); }
 .top-sdot.sd-none { background: var(--text-faint, #8b94a7); }
 
-/* synthetic child for blocked rows whose ask isn't renderable (e.g. an
-   answered GO awaiting execution) — no blocked row stands alone */
-.top-await-note {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px 4px 30px; font-size: 11.5px;
-  color: var(--amber); cursor: pointer;
+/* Real questions use the compact amber strip; machine waits never impersonate asks. */
+.ask-band-node {
+  padding: 5px 10px;
+  gap: 3px;
+  border-left: 2px solid color-mix(in srgb, var(--amber) 45%, transparent);
   border-bottom: 1px solid color-mix(in srgb, var(--line, #232b3b) 55%, transparent);
+  background: color-mix(in srgb, var(--amber) 3%, transparent);
 }
-.top-await-note:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
-.top-await-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-band-node:hover { background: color-mix(in srgb, var(--amber) 6%, transparent); }
+.ab-question-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.ab-question-head .ab-title { flex: 1 1 260px; color: var(--amber); }
+.ab-question-head .ab-meta { margin-left: auto; }
+.ab-question-content { min-width: 0; overflow-wrap: anywhere; }
+.ab-question-content .ask-reason { margin: 2px 0; font-size: 12px; }
+.ab-question-content .ask-opt-list { margin: 4px 0 0; gap: 1px; }
+.ask-band-node .ab-actions { flex-wrap: wrap; gap: 4px; }
 
 /* backlog sections: same ktable rows, grouped heads */
 .backlog-group { margin-bottom: 14px; }
