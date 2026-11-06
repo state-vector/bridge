@@ -7,6 +7,14 @@ Task and child rows stay aligned; on narrow screens the task table scrolls
 horizontally. Retired merge lines are hidden. One warning appears when no workers
 are available; the header's **Status** popover shows connections, worker readiness
 and per-worker running/reserved/slot counts. Busy workers are not an outage.
+Completed workers wake dispatch promptly instead of waiting for the fallback
+poll. Task admission precedes bounded worktree hygiene: four candidates per
+pass, one-second status reads within a three-second probe budget, with a durable
+fair traversal of retained trees. The runner records its current PID/stage before
+slow work and logs launch-preparation durations. Slot reuse still requires real
+writer quiescence; a concurrency limit is not a guarantee of sustained occupancy.
+Refill batches reuse a fresh worker inventory for at most 60 seconds instead of
+re-advertising it for every launch; live begin authorization still applies.
 
 Use **Go to BR#…** in the web or desktop header to open a card by number from
 any signed-in view. `BR#6690`, `BR-6690`, `#6690`, and `6690` all work; press

@@ -30,6 +30,27 @@ aggregate-only data is labelled unresolved executions, never running workers.
 Managed updater holds also mark every advertised model unavailable with the
 explicit draining-for-update reason; a local no-claims hold cannot advertise
 usable spare capacity. Clearing the hold rebuilds availability from actual config.
+Worker completion (including a crashed worker thread) wakes dispatch within a
+100ms sleep slice rather than waiting out the configured fallback poll. The
+runner still verifies quiescence and completes the handoff before reusing a slot.
+Admission runs before optional worktree hygiene. Each hygiene pass inspects at
+most four candidates, with a three-second aggregate status-probe budget and a
+one-second deadline per read; retained trees count against that budget too. A
+persisted oldest-first round cursor prevents the same kept trees from starving
+the rest after each poll/restart. Cleanup still preserves unpublished work.
+`bridge status` writes the current PID and dispatch stage before slow operations
+(readiness, checkpoint, finalization, admission, preparation, hygiene, waiting),
+and logs report each worker's preparation duration. These are local diagnostics,
+not a claim that every held slot is a running process. Worker preparation and
+handoff remain serialized; configured concurrency is an upper bound, not a
+guarantee of twelve continuously occupied slots. Diagnose a slow refill from
+these stages and live scheduler eligibility/occupancy rather than raising the
+slot limit or repeatedly restarting the gateway.
+Within a refill batch, launches reuse the tick's proved worker/config inventory
+for up to 60 seconds, refreshing after slow provisioning instead of repeating
+local probes and a hub advertisement for every slot. Each begin still checks
+the hub's live model selection, scope, credential and capacity fences; a failed
+required refresh never launches a writer.
 **Worker drain does not stop merge delivery.** The merge train continues ticking
 while existing agent workers finish. Only after the last worker stops does the
 gateway stop and join the train, then acknowledge the nonce/PID-bound idle receipt
