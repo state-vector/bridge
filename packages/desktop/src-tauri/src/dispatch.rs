@@ -366,12 +366,20 @@ fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worke
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
 
 fn execution_call(cfg: &DispatchConfig, tid: &str, command: serde_json::Value) -> Result<serde_json::Value, String> {
+    execution_call_session(cfg, tid, command, None)
+}
+
+fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::Value, session: Option<&str>) -> Result<serde_json::Value, String> {
     let kind = command.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
     let mut id = 0;
     let args = json!({ "id": tid, "command_id": format!("{kind}-{}-{nonce}", std::process::id()), "command": command });
     for retry in 0..3 {
-        match mcp_call_task(cfg, &mut id, "execution", args.clone(), tid) {
+        let result = match session {
+            Some(session) => mcp_call_session(cfg, &mut id, "execution", args.clone(), Some(session)),
+            None => mcp_call_task(cfg, &mut id, "execution", args.clone(), tid),
+        };
+        match result {
             Ok(result) => return Ok(result),
             Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => std::thread::sleep(Duration::from_millis(250 * (retry + 1))),
             Err(e) => return Err(e), // named semantic gates are terminal
@@ -405,8 +413,37 @@ struct ExecutionRuntime {
     generation: u64,
     attempt_id: String,
     control: Arc<crate::transport::RunControl>,
-    last_poll: Instant,
+    maintenance: Option<Arc<LeaseMaintenance>>,
     last_checkpoint: Instant,
+}
+
+/// One clock per attempt: preparing other workers, Git publication and the
+/// dispatch cadence must never starve a running writer's lease or inbox.
+/// Cancellation joins the poller before quiesce/transfer, so no late poll can
+/// renew an attempt after its finalization barrier.
+struct LeaseMaintenance {
+    cancel: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl LeaseMaintenance {
+    fn start(interval: Duration, mut poll: impl FnMut() -> bool + Send + 'static) -> Self {
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while matches!(cancelled.recv_timeout(interval), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                if !poll() { break; }
+            }
+        });
+        Self { cancel, thread: Mutex::new(Some(thread)) }
+    }
+    fn stop(&self) {
+        let _ = self.cancel.send(());
+        if let Ok(mut thread) = self.thread.lock() {
+            if let Some(thread) = thread.take() { let _ = thread.join(); }
+        }
+    }
+}
+impl Drop for LeaseMaintenance {
+    fn drop(&mut self) { self.stop(); }
 }
 
 #[derive(Deserialize)]
@@ -441,6 +478,10 @@ struct RemoteExecution {
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
 impl RemoteExecution {
+    fn permits_renewal(&self, generation: u64, attempt_id: &str) -> bool {
+        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring { .. }))
+            && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered))
+    }
     fn parse(value: serde_json::Value) -> Result<Self, String> {
         let state: Self = serde_json::from_value(value).map_err(|e| format!("durable execution contract drift: {e}"))?;
         if state.policy_version != 1 { return Err("unsupported execution policy version".into()); }
@@ -448,6 +489,33 @@ impl RemoteExecution {
     }
 }
 impl ExecutionRuntime {
+    fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str) {
+        let cfg = cfg.clone();
+        let session = claim_session(&cfg, tid);
+        let tid = tid.to_string();
+        let generation = self.generation;
+        let attempt_id = self.attempt_id.clone();
+        let command = self.command("poll");
+        let control = self.control.clone();
+        self.maintenance = Some(Arc::new(LeaseMaintenance::start(Duration::from_secs(20), move || {
+            if control.stop.load(Ordering::SeqCst) { return false; }
+            let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
+            match state {
+                Ok(state) => {
+                    if state.permits_renewal(generation, &attempt_id) {
+                        control.grant_lease();
+                        return true;
+                    }
+                }
+                Err(error) => dlog(&tid, &format!("execution lease/inbox unavailable: {error}; stopping writer and retaining WIP")),
+            }
+            control.stop.store(true, Ordering::SeqCst);
+            false
+        })));
+    }
+    fn stop_maintenance(&self) {
+        if let Some(maintenance) = &self.maintenance { maintenance.stop(); }
+    }
     fn command(&self, kind: &str) -> serde_json::Value {
         json!({ "kind": kind, "generation": self.generation, "attempt_id": self.attempt_id })
     }
@@ -3510,11 +3578,12 @@ fn spawn_opencode(
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
-    let execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), last_poll: Instant::now(), last_checkpoint: Instant::now() };
+    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), maintenance: None, last_checkpoint: Instant::now() };
     execution.control.grant_lease();
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
     prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
+    execution.start_maintenance(cfg, tid);
     if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
         let restored = (|| -> Result<(), String> {
             let path = worktree.as_deref().ok_or("portable checkpoint requires an isolated Git worktree")?;
@@ -3524,6 +3593,7 @@ fn spawn_opencode(
             Ok(())
         })();
         if let Err(e) = restored {
+            execution.stop_maintenance();
             dlog(tid, &format!("checkpoint restore held: {e}; no agent spawned"));
             // This attempt has never spawned a child. Preserve checkpoint/WIP;
             // don't leave an imaginary writer lease blocking reconciliation.
@@ -3534,14 +3604,15 @@ fn spawn_opencode(
     }
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
-        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
+        Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
     };
     prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", safe_point["messages"]));
     for message in safe_point["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
         let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
         if execution_call(cfg, tid, cmd).is_err() { return; }
     }
-    if !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+    if execution.control.stop.load(Ordering::SeqCst) || !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+        execution.stop_maintenance();
         let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
         let _ = execution_call(cfg, tid, cmd);
         dlog(tid, "safe-point interruption before spawn; no writer launched");
@@ -3725,22 +3796,6 @@ fn tick(
     // expired action budget stops the process group; it never buys more work
     // merely because the model keeps printing. No hot interrupt API is assumed.
     for inf in in_flight.iter_mut() {
-        if inf.execution.last_poll.elapsed() >= Duration::from_secs(20) {
-            match execution_call(cfg, &inf.task_id, inf.execution.command("poll")).and_then(RemoteExecution::parse) {
-                Ok(state) => {
-                    inf.execution.control.grant_lease();
-                    let needs_delivery = state.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered));
-                    if matches!(state.attempt.map(|a| a.state), Some(RemoteAttemptState::Stopping)) || needs_delivery {
-                        inf.execution.control.stop.store(true, Ordering::SeqCst);
-                    }
-                    inf.execution.last_poll = Instant::now();
-                }
-                Err(e) => {
-                    dlog(&inf.task_id, &format!("execution lease/inbox unavailable: {e}; stopping writer and retaining WIP"));
-                    inf.execution.control.stop.store(true, Ordering::SeqCst);
-                }
-            }
-        }
         if !inf.execution.control.stop.load(Ordering::SeqCst) && inf.execution.last_checkpoint.elapsed() >= Duration::from_secs(300) {
             if let Some(path) = inf.worktree.as_deref() {
                 if let Err(e) = inf.execution.checkpoint(cfg, &inf.task_id, path) {
@@ -3857,6 +3912,7 @@ fn tick(
         // Transfer/cleanup barrier: a terminal subprocess is not evidence its
         // children stopped, and a local path is not a portable checkpoint.
         let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
+        inf.execution.stop_maintenance();
         let stopped = inf.execution.control.quiesced.load(Ordering::SeqCst);
         if let Err(e) = &published { dlog(&inf.task_id, &format!("final checkpoint failed: {e}; worktree retained")); }
         let quiesced = if stopped {
@@ -5095,6 +5151,77 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lease_maintenance_keeps_polling_while_dispatch_is_blocked_and_joins_before_finalization() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polled = count.clone();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            polled.fetch_add(1, Ordering::SeqCst);
+            observed.send(()).unwrap();
+            true
+        });
+        // No tick calls: simulate a blocked worktree preparation/publication.
+        for _ in 0..4 { polls.recv_timeout(Duration::from_secs(2)).unwrap(); }
+        pump.stop();
+        let at_barrier = count.load(Ordering::SeqCst);
+        assert!(at_barrier >= 4);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(count.load(Ordering::SeqCst), at_barrier, "no renewal after quiescence barrier");
+        pump.stop(); // finalization and Drop can both cancel safely
+    }
+
+    #[test]
+    fn lease_maintenance_terminal_poll_failure_is_not_retried() {
+        let (observed, polls) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            observed.send(()).unwrap();
+            false
+        });
+        polls.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(polls.recv_timeout(Duration::from_secs(2)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        pump.stop();
+    }
+
+    #[test]
+    fn lease_maintenance_stop_waits_for_in_flight_poll_before_quiescence() {
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let pump = LeaseMaintenance::start(Duration::from_millis(5), move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            true
+        });
+        entering.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (stopped, stopping) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || { pump.stop(); stopped.send(()).unwrap(); });
+        assert!(matches!(stopping.recv_timeout(Duration::from_millis(25)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release.send(()).unwrap();
+        stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn lease_renewal_requires_exact_active_attempt_and_no_pending_mailbox_delivery() {
+        let base = json!({ "policy_version": 1, "attempt": { "generation": 7, "attempt_id": "attempt", "phase": "running" }, "messages": [] });
+        let state = RemoteExecution::parse(base.clone()).unwrap();
+        assert!(state.permits_renewal(7, "attempt"));
+        assert!(!state.permits_renewal(8, "attempt"));
+        assert!(!state.permits_renewal(7, "other"));
+        let mut restoring = base.clone();
+        restoring["attempt"]["phase"] = json!("restoring");
+        restoring["attempt"]["checkpoint"] = json!({ "repo": "repo", "remote_ref": "refs/heads/checkpoint", "commit": "commit", "tree": "tree", "base": "base", "environment": [], "next": "restore", "tests": [] });
+        assert!(RemoteExecution::parse(restoring).unwrap().permits_renewal(7, "attempt"));
+        for phase in ["stopping", "quiesced"] {
+            let mut value = base.clone(); value["attempt"]["phase"] = json!(phase);
+            assert!(!RemoteExecution::parse(value).unwrap().permits_renewal(7, "attempt"));
+        }
+        let mut missing = base.clone(); missing["attempt"] = serde_json::Value::Null;
+        assert!(!RemoteExecution::parse(missing).unwrap().permits_renewal(7, "attempt"));
+        let mut delivered = base; delivered["messages"] = json!([{ "state": "delivered" }]);
+        assert!(!RemoteExecution::parse(delivered).unwrap().permits_renewal(7, "attempt"));
+    }
+
     #[test]
     fn quiescence_can_resume_only_the_same_hosts_unchanged_claim_without_a_local_handoff() {
         let task = json!({ "status": "in_progress", "meta": { "session": "dispatch-BR-1" } });

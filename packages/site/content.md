@@ -142,7 +142,12 @@ publication, newer local WIP or unproven writer isolation retains the work and
 host affinity. A dead host cannot guarantee preservation of changes since its
 last published checkpoint.
 
-Action budgets are independent of stdout activity. Task-addressed coordination
+Action budgets are independent of stdout activity. Coordination mailboxes
+and execution leases are polled every 20 seconds by a dedicated per-attempt
+thread, so slow worker preparation, checkpoints and dispatch ticks cannot starve
+active writers. Pollers stop and join before quiescence/transfer; a refused poll
+stops its writer and preserves WIP.
+Task-addressed coordination
 is delivered through a durable queued/delivered/acknowledged/acted mailbox;
 non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
 operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution

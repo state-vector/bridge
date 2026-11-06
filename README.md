@@ -257,8 +257,11 @@ removing or changing the scope does not restore legacy write access.
   checkpoint and verified commit/tree restoration. Newer local WIP is retained,
   not reset to an older checkpoint. Dirty or unpublished worktrees are retained
   by cleanup if the preservation barrier cannot be proved.
-- **Independent clocks:** a two-minute execution lease is renewed by control
-  polls; the configured task action budget (at most one hour) is independent of
+- **Independent clocks:** a two-minute execution lease is renewed by a dedicated
+  per-attempt control poller every 20 seconds, independently of worker preparation,
+  checkpoint publication and the dispatch tick. The poller is joined before
+  quiescence/transfer; refused polls stop the writer and retain WIP. The configured
+  task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
   diagnosis. Quiet ACP actions can run within their action budget. Unproven
   process-tree isolation retains host affinity; agents must not detach writers
