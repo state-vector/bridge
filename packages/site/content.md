@@ -197,8 +197,10 @@ Worker capacity distinguishes **leased executions**, **starting reservations** a
 execution-lease evidence, not a claim that Bridge has counted OS processes.
 Expired leases and changed/released task claims become unconfirmed; their task,
 generation, session and reason are inspectable. They retain capacity until the
-gateway supplies actual stopped-process-group proof. The board never labels
-these held slots as running workers, and heartbeat-only renewals refresh its
+gateway supplies actual stopped-process-group proof.
+Releasing a live managed claim also fences the attempt into stopping and sends
+its runner an interrupt; capacity stays held until that stop is confirmed.
+The board never labels these held slots as running workers, and heartbeat-only renewals refresh its
 status independently of task edits. Older aggregate-only publishers are labelled
 unresolved executions during rollout.
 

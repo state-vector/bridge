@@ -20,6 +20,9 @@ it is not an independently verified OS process count. Old/expired or claimless
 attempts are **unconfirmed**, with expandable task, generation, session and reason.
 They still hold capacity until the gateway confirms their process groups stopped.
 Card release, heartbeat expiry and daemon restart alone never free those slots.
+Releasing a live managed claim atomically marks its attempt stopping and queues
+an interrupt; the runner must stop and preserve work instead of renewing a
+released worker indefinitely. Only its quiescence confirmation frees the slot.
 The same occupancy facts back scheduler admission, availability and the board;
 lease/inventory renewals push a bounded status refresh so an idle task board does
 not age a healthy worker into a false outage. During rolling deployment, old

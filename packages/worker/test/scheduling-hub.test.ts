@@ -50,6 +50,9 @@ describe("eligibility-first scheduling on real SQLite", () => {
     status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 1, starting: 0, unconfirmed: 0, held: 1 });
     expect((await post("transition", { id, to: "todo", actor: "system:test", note: "Card released, but no stopped-process evidence exists" })).error).toBeUndefined();
+    const fenced = await g.cmd({ kind: "poll", generation: 1, attempt_id: "retained-writer" }, "released-writer-poll", id, r.session);
+    expect(fenced.attempt.phase).toBe("stopping");
+    expect(fenced.messages).toEqual(expect.arrayContaining([expect.objectContaining({ priority: "interrupt", text: expect.stringContaining("Task claim ended") })]));
     status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0]).toMatchObject({ active: 1, reserved: 0, occupancy: { leased: 0, starting: 0, unconfirmed: 1, held: 1,
       slots: [{ kind: "unconfirmed", task_id: id, generation: 1, attempt_id: "retained-writer", session: r.session, reason: "claim_changed", task_status: "todo" }] } });
