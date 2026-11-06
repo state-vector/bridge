@@ -16,6 +16,7 @@ import type {
   DeployCoverageState,
   DeployObservation,
   LaneOperationalState,
+  MechanicalMove,
   TrainEntryClass,
   TrainFixCard,
 } from "@bridge/contracts";
@@ -1232,19 +1233,6 @@ export type MergeCandidateInput = {
  *  brief that renders every bounce as "conflicts with its base" lies on a
  *  coverage bounce (no conflicts exist) and buries a gate defect. */
 export type TrainBounceKind = "coverage" | "conflict" | "gate";
-
-/** The executor-proved mechanical head move (BR#4689 L1.4): the live head is
- *  the stamped head REBASED — `git range-diff old...new` came back all-'='
- *  pairs (same patch-ids, same order, no content delta). Executor-fed fact
- *  like mergeable/commits: the gate reasons over it, it never self-certifies. */
-export type MechanicalMove = {
-  /** the chain tip the move extends (must equal carryChainTip of the leg) */
-  fromHead: string;
-  /** the live head the move lands on (must equal headSha) */
-  toHead: string;
-  /** the proof receipt — the range-diff summary riding the carry record */
-  evidence: string;
-};
 
 /** What the sweep should DO with one candidate. Mechanical defects bounce the
  *  card when it is in_review (returning to its author); otherwise they are a
