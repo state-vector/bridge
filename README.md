@@ -93,6 +93,10 @@ not discard WIP or make local-only work portable.
 The paired gateway may also opt itself out with `bridge execution drain`; it
 cannot enable itself or control another gateway. Re-enabling remains an
 explicit full-agent/human action.
+Gateway SSE wake streams reconnect at least once per minute, so long-lived
+subscriptions cannot indefinitely retain a superseded hub deployment. Reconnects
+carry no execution authority and do not stop workers; durable state and the
+normal polling fallback preserve progress.
 
 New reservations do not consult runner-local give-up/refused-reference caches.
 Repository/startup refusals live in the hub, scoped to the task's prerequisite
