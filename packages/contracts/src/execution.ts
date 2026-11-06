@@ -306,7 +306,11 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     }
     case "prepare": {
       const current = requireAttempt();
-      if (current.phase !== "running" || s.messages.some(x => x.priority === "interrupt" && x.state !== "acted")) throw new Error("gate: pending interruption prevents external mutations");
+      // Name the real cause: a non-running phase (e.g. restoring) is not a pending interruption.
+      if (current.phase !== "running" || s.messages.some(x => x.priority === "interrupt" && x.state !== "acted")) {
+        const why = current.phase !== "running" ? `current phase is ${current.phase}` : "a pending interruption is unacknowledged";
+        throw new Error(`gate: external mutations require a running attempt with acknowledged coordination — ${why}`);
+      }
       if (s.operations.some(x => x.id === command.operation_id)) throw new Error("gate: operation already exists — inspect/reconcile it, do not repeat the effect");
       s.operations.push({ id: command.operation_id, action: command.action, input_revision: command.input_revision, deadline: now + command.budget_ms, state: "prepared", receipts: [] });
       break;

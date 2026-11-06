@@ -51,7 +51,7 @@ describe("durable execution failure boundaries", () => {
     s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
     s = step(s, { ...begin, attempt_id: "two" }, 200, "linux");
     expect(s.attempt?.phase).toBe("restoring");
-    expect(() => step(s, { kind: "prepare", generation: 2, attempt_id: "two", operation_id: "push", action: "push", input_revision: cp.commit, budget_ms: 1000 }, 200, "linux")).toThrow(/pending interruption/);
+    expect(() => step(s, { kind: "prepare", generation: 2, attempt_id: "two", operation_id: "push", action: "push", input_revision: cp.commit, budget_ms: 1000 }, 200, "linux")).toThrow(/restoring/);
     expect(() => step(s, { kind: "restore", generation: 2, attempt_id: "two", tree: "d".repeat(40), commit: cp.commit }, 200, "linux")).toThrow(/exact commit and tree/);
     s = step(s, { kind: "restore", generation: 2, attempt_id: "two", tree: cp.tree, commit: cp.commit }, 200, "linux");
     expect(s.attempt?.phase).toBe("running");
