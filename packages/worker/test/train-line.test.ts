@@ -156,6 +156,21 @@ describe("one line status and recovery contract", () => {
     expect(recovered).toMatchObject({ phase: "ready", blocker: null, remediation: null });
   });
 
+  it("BR#6901: queue activity and executor heartbeats cannot refresh idle main health", () => {
+    for (const verdict of ["green", "unsettled", "red"] as const) {
+      const line = projectTrainLine(facts({
+        queue_facts: { at: now, base_observed_at: 1, base_state: { verdict } },
+        capable: { ready: true, at: now, holder: "gateway" },
+        lease: { heartbeat_ts: now, holder: "gateway" },
+      }), now);
+      expect(line).toMatchObject({ phase: "unknown", blocker: "stale_observation", observed_at: 1, held: 0 });
+    }
+    // Legacy green snapshots expire while idle too; empty queue is not health proof.
+    expect(projectTrainLine(facts({ queue_facts: { at: 1, base_state: { verdict: "green" } } }), now).phase).toBe("unknown");
+    expect(projectTrainLine(facts({ queue_facts: { at: now, base_observed_at: now, base_state: { verdict: "green" } } }), now))
+      .toMatchObject({ phase: "ready", observed_at: now, blocker: null, remediation: null });
+  });
+
   it("all interruption causes have an explicit recovery disposition", () => {
     for (const extra of [
       { queue_facts: { at: now, base_state: { verdict: "empty" } } },

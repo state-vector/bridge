@@ -227,7 +227,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -10066,7 +10066,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const cfg = laneOfMeta(meta);
     const effective = applyDeployObservation(meta.lane?.queue_facts?.base_state, observation, cfg?.required_workflows ?? []);
     meta.lane = { ...meta.lane, deploy_observation: observation,
-      queue_facts: { ...(meta.lane?.queue_facts ?? {}), at: now, base_state: effective } };
+      queue_facts: { ...(meta.lane?.queue_facts ?? {}), at: now, base_observed_at: observation.observed_at, base_state: effective } };
     this.laneSyncReason(row.id, meta, now);
     this.version(row.id, actor, "deploy_observed", `Observed deployment health at ${observation.tip_sha.slice(0, 9)}: ${effective?.verdict}`, { observation });
     if (effective?.verdict === "red") {
@@ -12331,6 +12331,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ...(meta.lane ?? {}),
       queue_facts: {
         at: Date.now(),
+        // Freshness belongs to the main observation, not lease liveness,
+        // queue entries, consumption acks, or the awaiting sweep. Migrate
+        // legacy facts before changing their queue publication timestamp.
+        base_observed_at: rawBaseState ? Date.now() : trainBaseObservedAt(meta.lane?.queue_facts),
         entries: entriesArr,
         ...(baseState ? { base_state: baseState } : preservedQf.base_state ? { base_state: preservedQf.base_state } : {}),
         ...(stalled ? { stalled } : preservedQf.stalled ? { stalled: preservedQf.stalled } : {}),
@@ -14885,7 +14889,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           }
         : null;
       const inNormalSettle = !meta.stop && (meta.currently?.phase === "awaiting-ci" || meta.currently?.phase === "bursting");
-      const qfFresh = Boolean(brQf && now0 - Number(brQf.at ?? 0) < 15 * 60_000);
+      const qfFresh = Boolean(brQf && trainBaseObservedAt(brQf) > 0 && now0 - trainBaseObservedAt(brQf) < 15 * 60_000);
       const isBaseRedNow = qfFresh && String(brQf?.base_state?.verdict ?? "") === "red";
       const brBase: any = qfFresh && brQf?.base_state && String(brQf.base_state?.verdict ?? "") !== "green"
         && (!inNormalSettle || isBaseRedNow)
@@ -15140,7 +15144,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       });
       const projectedLine: TrainLineProjection = lineFacts.success ? projectTrainLine(lineFacts.data, now0) : {
         phase: "unknown", label: "Status needs investigation", reason: "The executor supplied inconsistent line facts; work has not been confirmed healthy.",
-        blocker: "stale_observation", evidence: [], held: queue.length, observed_at: Number(brQf?.at ?? 0),
+        blocker: "stale_observation", evidence: [], held: queue.length, observed_at: trainBaseObservedAt(brQf),
         remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
       };
       let line = await this.ensureLineRecovery(l.id, projectedLine, now0);

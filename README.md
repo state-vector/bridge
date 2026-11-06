@@ -2362,6 +2362,21 @@ other law owns them.
 
 ### One line-health and recovery state (BR#6389)
 
+**Main is monitored even with an empty merge queue (BR#6901).** Every idle
+executor tick reads main's required checks, reconciles deployment coverage,
+and publishes the observation before releasing its lane lease. Pending,
+failed, and recovered main states therefore continue to advance without a
+queued PR. A failed read stays fail-closed; a failed publication is an error,
+never a successful health heartbeat. An in-flight batch still settles through
+the merge-commit CI protocol.
+
+Health freshness uses `queue_facts.base_observed_at`, separately from the
+queue publication timestamp. Parked-task sweeps, acknowledgement messages,
+and executor heartbeats cannot make old main facts fresh. Legacy snapshots
+retain their original timestamp until replaced by a real observation. After
+15 minutes without a health observation, even an idle previously-green lane
+reports **Status is out of date**, rather than implying main is still healthy.
+
 #### Cause-specific closed-loop recovery (BR#6522)
 
 Each failed commit has durable recovery episodes keyed by a typed cause:

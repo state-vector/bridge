@@ -356,6 +356,20 @@ you / agents / MCP ── create ──►  BOARD (todo)  ── claim ──►
 - **A quieter Top view (BR#6526).** Stop-line details sit directly beneath the affected line, with cause and recovery grouped together. Themes are a collapsed filter with visible active selections. The heading and subtitle share a left edge. Four aligned summary cards label activity, reported sentiment, board task counts and 30-day completions; charts show their units and periods without mixing cumulative and per-period scales. Completion history refreshes every 30 seconds. On narrow screens, the cards stack and lane details stay readable.
 - **Reports (BR#5126).** The web board's Reports tab renders delivery metrics at full resolution: tasks closed per bucket (hour/day/week, windows 1d–365d) with the average task/h, and PR merge throughput from the train ledger — merged PRs per bucket plus gate bounces for merge-health context. Same data via `GET /api/kb/metrics/reports`; the compact throughput cell stays on Top.
 
+### Continuous main-health monitoring (BR#6901)
+
+An empty merge queue does not stop main-health monitoring. Idle executor ticks
+read required checks, reconcile deployment coverage, and publish pending,
+failed, or recovered health before releasing the lane. Read/publication failures
+never count as healthy observations; in-flight batches retain their separate
+merge-commit CI settle protocol.
+
+The hub tracks `base_observed_at` separately from queue activity. Sweeps,
+acknowledgements, and executor heartbeats cannot refresh stale health facts.
+After 15 minutes without a real observation, even an idle previously-green lane
+shows **Status is out of date**. Existing snapshots keep their original time
+until a real observation replaces them.
+
 ## Agent integration: one MCP server
 
 Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet. Every artefact row a tool returns carries `url` — the card's stable deep link (`/card/BR-3990`) — so a card an agent cites is one paste away in any browser (BR#3990). Links are always emitted on the canonical hub domain, even when a request arrives via the fallback hostname (BR#4695).

@@ -2450,14 +2450,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // block row (ready blocks = the current batch, Ray 2026-10-30: "we
     // merge what we can in batches").
     let mut qfacts: Vec<serde_json::Value> = Vec::new();
-    if queue.is_empty() {
-        if pass_merged > 0 {
-            // a bursting lane with an empty queue still owes its settle —
-            // all pass heads merged, nothing clean left behind them
-            burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
-            return Ok(());
-        }
-        release_if_idle(ctx, key, repo, base)?;
+    if queue.is_empty() && pass_merged > 0 {
+        // A bursting lane still owes its settle. Idle health observation
+        // below must never replace the merge-commit settle protocol.
+        burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
         return Ok(());
     }
     let mut candidates: Vec<BatchCandidate> = Vec::new();
@@ -2465,7 +2461,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // loop (the old lazy base_cache re-fetched per gate-reaching entry —
     // same values, wasted calls) — classified SCOPED to the lane's
     // required workflows when configured (Fix B: nightly/battery reds
-    // never park the train), and stamped whole into the queue_facts
+    // never park the train). Health observation precedes queue admission:
+    // an empty merge queue must never stop monitoring main (BR#6901).
+    // The observation is stamped whole into the queue_facts
     // payload (Fix A) so the hub renders a loud BLOCKED lane + files the
     // ONE-per-episode human alarm ask while cars are held.
     let required: Vec<String> = lane
@@ -2516,6 +2514,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     );
     if let Some(ref alarm) = base_class.alarm {
         log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
+    }
+    if queue.is_empty() {
+        // Publish before releasing the lease, even when main is pending or
+        // failed. Propagate delivery failure; a heartbeat is not a health
+        // observation and must not be reported as one.
+        ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "base_state": base_state }))?;
+        let msg = format!("idle main-health observation: {}", base_class.verdict.as_str());
+        ctx.note(&msg);
+        log(Some(key), &msg);
+        release_if_idle(ctx, key, repo, base)?;
+        return Ok(());
     }
     if from_awaiting_ci && base_class.verdict == MainVerdict::Red {
         let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": base_state }));
@@ -6671,6 +6680,105 @@ mod tests {
         let (untouched, calls) = mock_hub(vec![]);
         assert!(request_main_recovery_retry(&mut test_ctx(&untouched), &known, "o/r", "main", &head).is_none());
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_lane_observes_pending_green_red_recovery_and_probe_failure_br6901() {
+        let repo = "state-vector/superpositional";
+        let key = "state-vector/superpositional@main";
+        let tip = "a".repeat(40);
+        let lane = json!({ "lane": key, "required_workflows": ["deploy / Deploy to dev"], "queue": [] });
+        let idle = json!({ "lanes": [{ "lane": key, "queue": [], "currently": null, "stop": null }] });
+        let mut script = Vec::new();
+        for phase in 0..5 {
+            if phase < 4 { script.push(ok(json!({ "ok": true }))); } // deployment observation
+            script.extend([ok(json!({ "ok": true })), ok(idle.clone()), ok(json!({ "ok": true }))]);
+        }
+        let (hub, calls) = mock_hub(script);
+        let phase = std::sync::Arc::new(Mutex::new(0usize));
+        let p = phase.clone();
+        let head = tip.clone();
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            assert_eq!(cmd, "gh", "idle health never needs git or a merge");
+            let n = *p.lock().unwrap();
+            let endpoint = args.get(1).copied().unwrap_or("");
+            if endpoint.ends_with("/commits/main") {
+                return Some(if n == 4 { Err("GitHub unavailable".into()) } else {
+                    Ok(json!({ "sha": head, "committed_at": crate::logging::iso(now_ms()) }).to_string())
+                });
+            }
+            let conclusion = match n { 0 => Value::Null, 2 => json!("failure"), _ => json!("success") };
+            let status = if n == 0 { "in_progress" } else { "completed" };
+            if endpoint.contains("/check-runs?") {
+                return Some(Ok(json!([{ "id": 1, "name": "deploy / Deploy to dev", "status": status,
+                    "conclusion": conclusion, "html_url": "https://github.com/state-vector/superpositional/actions/runs/100/job/1" }]).to_string()));
+            }
+            if endpoint.contains("/actions/runs?") {
+                return Some(Ok(json!([{ "id": 100, "name": "Deploy Dev", "path": ".github/workflows/deploy-dev.yml",
+                    "head_sha": head, "status": status, "conclusion": conclusion,
+                    "html_url": "https://github.com/state-vector/superpositional/actions/runs/100" }]).to_string()));
+            }
+            panic!("unexpected shell operation: {cmd} {args:?}");
+        }));
+        for n in 0..5 {
+            *phase.lock().unwrap() = n;
+            drive_lane_inner(&mut ctx, &lane, key, repo, "main", 60_000, 10).unwrap();
+        }
+        let calls = calls.lock().unwrap();
+        let facts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_queue_facts").map(call_args).collect();
+        assert_eq!(facts.len(), 5, "every idle tick publishes a new health observation");
+        let verdicts: Vec<_> = facts.iter().map(|f| f.pointer("/base_state/verdict").and_then(Value::as_str).unwrap()).collect();
+        assert_eq!(verdicts, ["unsettled", "green", "red", "green", "unsettled"]);
+        assert!(facts.iter().all(|f| f.get("entries") == Some(&json!([]))));
+        assert!(facts[4].pointer("/base_state/unsettled/0").unwrap().as_str().unwrap().contains("GitHub unavailable"));
+        assert_eq!(calls.iter().filter(|c| call_name(c) == "train_observe_deploy").count(), 4);
+        assert!(calls.iter().all(|c| !matches!(call_name(c).as_str(), "train_event" | "train_ci")), "health observation cannot merge or settle a card");
+    }
+
+    #[test]
+    fn idle_dark_tip_dispatch_is_bounded_without_a_queued_pr_br6901() {
+        let key = "state-vector/superpositional@main";
+        let idle = json!({ "lanes": [{ "lane": key, "queue": [], "currently": null, "stop": null }] });
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({})), ok(idle.clone()), ok(json!({})),
+            ok(json!({})), ok(idle), ok(json!({})),
+        ]);
+        let dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = dispatches.clone();
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            assert_eq!(cmd, "gh");
+            if args.first() == Some(&"workflow") {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Some(Ok(String::new()));
+            }
+            if args.get(1).unwrap().ends_with("/commits/main") {
+                return Some(Ok(json!({ "sha": "b".repeat(40), "committed_at": crate::logging::iso(now_ms() - 600_000) }).to_string()));
+            }
+            Some(Ok("[]".into()))
+        }));
+        let lane = json!({ "queue": [], "required_workflows": ["deploy / Deploy to dev"] });
+        for _ in 0..2 {
+            drive_lane_inner(&mut ctx, &lane, key, "state-vector/superpositional", "main", 60_000, 10).unwrap();
+        }
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let calls = calls.lock().unwrap();
+        let facts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_queue_facts").map(call_args).collect();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|f| f.pointer("/base_state/deploy_coverage/phase").and_then(Value::as_str) == Some("uncovered_dispatched")));
+    }
+
+    #[test]
+    fn idle_lane_does_not_report_observation_success_when_publication_fails_br6901() {
+        let (hub, calls) = mock_hub(vec![Err("storage unavailable".into())]);
+        let mut ctx = test_ctx(&hub);
+        let result = drive_lane_inner(&mut ctx, &json!({ "queue": [] }), "o/r@main", "o/r", "main", 60_000, 10);
+        assert!(result.unwrap_err().contains("storage unavailable"));
+        assert_eq!(calls.lock().unwrap().len(), 1, "do not release as successfully observed after a rejected publication");
+        assert!(!ctx.last_action.contains("idle main-health observation"));
     }
 
     #[test]
