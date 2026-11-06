@@ -5,6 +5,7 @@ import { ExecutionModel } from "../../ui-kit/src/views/ExecutionModel.tsx";
 import { TaskHistoryLine } from "../../ui-kit/src/views/TaskDetail.tsx";
 import { TopView } from "../../ui-kit/src/views/TopView.tsx";
 import { useKb } from "../../ui-kit/src/server/kbStore.ts";
+import { readFileSync } from "node:fs";
 
 // Zustand SSR normally reads its empty initial snapshot. Select the seeded
 // live snapshot while rendering the actual Top component and its children.
@@ -14,15 +15,33 @@ vi.mock("../../ui-kit/src/server/kbStore.ts", async importOriginal => {
 });
 
 const view = ExecutionModelViewSchema.parse({ minimum_tier: "large", current: { kind: "managed", tier: "medium", model: "provider/glm-5.3", backend: "opencode", host: "gateway", session: "working", generation: 1, lease_until: Date.now() + 60_000, phase: "stopping" } });
-it("renders the real Top agent row with actual size and a distinct requested tier", () => {
+it("gives actual size its own Top column with matching header, parent and child cells", () => {
   const previous = useKb.getState();
-  useKb.setState({ tasks: [{ id: "BR#100", type: "task", title: "Cross-system repair", status: "in_progress", owner: "gateway/worker", created_ts: Date.now(), updated_ts: Date.now(), meta: { session: "working" }, execution: view }], sessions: [], agents: [], events: [] });
+  const task = { id: "BR#100", type: "task", title: "Cross-system repair", status: "in_progress", owner: "gateway/worker", created_ts: Date.now(), updated_ts: Date.now(), meta: { session: "working" }, execution: view };
+  useKb.setState({ tasks: [task, { ...task, id: "BR#101", title: "Verify repair", part_of: task.id }], sessions: [], agents: [], events: [] });
   try {
     const html = renderToStaticMarkup(<TopView />);
     expect(html).toContain("gateway/worker");
     expect(html).toContain("medium · stopping");
     expect(html).toContain("large requested");
     expect(html).toContain("provider/glm-5.3");
+    expect(html).toContain('class="topc-model" title=');
+    expect(html).toContain("model / tier");
+    // Extract the real header and task rows, not a hand-built approximation.
+    const header = /class="ktable-head top-head">([\s\S]*?)<\/div>/.exec(html)![1];
+    const rows = [...html.matchAll(/class="ktable-row top-row[^\"]*"[^>]*>([\s\S]*?)<\/div>/g)];
+    const columns = (markup: string) => [...markup.matchAll(/class="(topc-(?:task|agent|model|session|goal|status|score|gauge|bar|age))(?:\s[^\"]*)?"/g)].map(m => m[1]);
+    expect(columns(header)).toHaveLength(13);
+    const css = readFileSync(new URL("../../ui-kit/src/views/views.css", import.meta.url), "utf8");
+    const templates = [...css.matchAll(/\.top-head, \.top-row \{ --cols: ([^;]+);/g)];
+    const trackCount = (template: string) => template.match(/minmax\([^)]+\)|[^\s]+/g)!.length;
+    expect(templates.map(([, template]) => trackCount(template))).toEqual([13, 9]);
+    expect(columns(header).filter(column => !["topc-session", "topc-gauge"].includes(column))).toHaveLength(9);
+    expect(rows).toHaveLength(2);
+    for (const [, row] of rows) {
+      expect(columns(row)).toEqual(columns(header));
+      expect(row).toMatch(/class="topc-agent"[^>]*><span class="top-agent-name">gateway\/worker<\/span><\/span><span class="topc-model"><span class="execution-model"/);
+    }
   } finally { useKb.setState(previous); }
 });
 it("renders missing/expired receipts honestly instead of claiming large is running", () => {

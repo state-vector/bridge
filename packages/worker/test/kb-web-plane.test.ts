@@ -2,6 +2,7 @@ import { Miniflare } from "miniflare";
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ExecutionAttentionSchema } from "@bridge/contracts";
 
 /**
  * Web comment plane + ask-band/detail UX contracts (BR#3462).
@@ -193,6 +194,22 @@ describe("GET /api/kb/train — the merge-train mirror (Top panel leg 1)", () =>
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(Array.isArray(body.lanes)).toBe(true);
+  });
+});
+
+describe("GET /api/kb/execution_attention — reachable human attention route", () => {
+  it("returns the typed attention snapshot through the authenticated public GET route", async () => {
+    const response = await api("/api/kb/execution_attention?project=bridge");
+    expect(response.status).toBe(200);
+    const snapshot = ExecutionAttentionSchema.parse(await response.json());
+    expect(snapshot.items).toEqual([]);
+    expect(snapshot.interactive_agents).toBeDefined();
+  });
+
+  it("still requires authentication, and does not accept POST as a read", async () => {
+    const response = await mf.dispatchFetch("https://main/api/kb/execution_attention");
+    expect(response.status).toBe(401);
+    expect((await api("/api/kb/execution_attention", { method: "POST", body: "{}" })).status).toBe(404);
   });
 });
 
