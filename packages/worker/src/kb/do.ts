@@ -6273,7 +6273,7 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     const reviewResult = body.review_result === undefined ? undefined : ReviewResultSchema.parse(body.review_result);
     if (body.execution_result !== undefined) meta.execution_result = ExecutionResultSchema.parse(body.execution_result);
-    if (row.type === "task" && body.to === "done" && !mergeCompletesTask(meta) && !ExecutionResultSchema.safeParse(meta.execution_result).success) throw new Error("execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion");
+    if (row.type === "task" && body.to === "done" && completionContract(meta).kind === "execution" && !ExecutionResultSchema.safeParse(meta.execution_result).success) throw new Error("execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion");
     if (row.type === "question" && meta.ask && body.to === "done") throw new Error("answer an ask with ask.answer / answer_ask; a transition or progress note is not an answer");
     if (reviewResult) {
       if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
