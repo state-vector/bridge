@@ -3123,3 +3123,12 @@ contract.
 ## License
 
 [Apache-2.0](LICENSE)
+# Gateway scratch-space recovery
+
+A signing preflight that cannot create its scratch directory because of Linux
+`ENOSPC` pauses dispatch for 60 seconds, then permits a fresh launch preflight.
+It does not require changing the signing identity after space is restored.
+Historical permanent holds for this exact scratch-space failure are converted
+once to the same persisted cooldown; readiness renewals do not extend it.
+Missing keys, invalid signatures and other prerequisite failures remain held.
+Existing writers, checkpoints and updater drain holds are preserved.

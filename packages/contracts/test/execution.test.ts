@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -9,6 +9,22 @@ const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", s
 const started = () => step(initialExecution(), begin);
 
 describe("durable execution failure boundaries", () => {
+  it("recovers historical scratch ENOSPC once without sliding backoff or clearing real signing defects", () => {
+    const reason = "gate: identity profile failed — refusing to dispatch (sign-check scratch dir: No space left on device (os error 28)). Fix the runner's identity config or provision the signing key.";
+    const legacy = { kind: "repair_required", fingerprint: "same-worker/config", failures: 5, reason } as const;
+    const recovered = recoverResourceStartBarrier(legacy, 100);
+    expect(recovered).toMatchObject({ kind: "cooldown", fingerprint: legacy.fingerprint, until_ts: 60_100 });
+    expect(recoverResourceStartBarrier(recovered, 50_000)).toBe(recovered);
+    expect(recoverResourceStartBarrier(recovered, 70_000)).toBe(recovered);
+    let repeated = recovered;
+    for (let i = 1; i <= 5; i++) repeated = nextExecutorStartBarrier(repeated, legacy.fingerprint, reason, i * 70_000, "prerequisite");
+    expect(repeated).toMatchObject({ kind: "cooldown", failures: 1, until_ts: 410_000 });
+    for (const failure of ["gate: signing key not found", "gate: sign check failed (exit 255)", "gate: No space left on device in unrelated tool", "gate: sign-check scratch dir: Permission denied (os error 13)"]) {
+      const barrier = nextExecutorStartBarrier(null, legacy.fingerprint, failure, 100, "prerequisite");
+      expect(barrier.kind).toBe("repair_required");
+      expect(recoverResourceStartBarrier(barrier, 200)).toBe(barrier);
+    }
+  });
   it("bounds unstarted failures across restarts; only changed prerequisites reset their budget", () => {
     const one = nextExecutorStartBarrier(null, "worker/config-one", "begin refused", 100);
     expect(one).toMatchObject({ kind: "cooldown", failures: 1, until_ts: 60_100 });

@@ -230,7 +230,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -5092,7 +5092,14 @@ export class KnowledgeHub {
     const pause = this.one(`SELECT until_ts,reason FROM executor_claim_pauses WHERE token_id=?`, tokenId);
     if (pause && pause.until_ts > now) return { kind: "cooldown", until_ts: pause.until_ts, reason: pause.reason };
     const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
-    const barrier = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
+    const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
+    const barrier = previous?.fingerprint === fingerprint ? recoverResourceStartBarrier(previous, now) : previous;
+    if (barrier !== previous) {
+      // Persist once: advertisements must not slide the cooldown forever. No
+      // claim, writer slot, task wait or identity configuration is changed.
+      this.state.storage.sql.exec(`UPDATE executor_start_barriers SET state=? WHERE token_id=?`, JSON.stringify(barrier), tokenId);
+      this.audit(host, "executor_resource_barrier_recovered", null, { previous, barrier });
+    }
     if (barrier?.fingerprint === fingerprint) {
       if (barrier.kind === "repair_required") return { kind: "repair_required", reason: barrier.reason };
       if (barrier.until_ts > now) return { kind: "cooldown", until_ts: barrier.until_ts, reason: barrier.reason };
@@ -5335,7 +5342,7 @@ export class KnowledgeHub {
       const stage = command.kind === "start_failed" ? command.stage : "begin";
       // Begin's task prerequisites (e.g. checkpoint transfer) do not invalidate
       // a proved worker credential for unrelated work on the same gateway.
-      const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && readiness.kind === "ready";
+      const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && !isSigningScratchResourceFailure(reason) && readiness.kind === "ready";
       const paused = Number(this.one(`SELECT until_ts FROM executor_claim_pauses WHERE token_id=?`, tokenId)?.until_ts ?? 0) > now;
       const barrier = command.kind === "start_failed" && !taskPrerequisite && !paused ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
       const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;

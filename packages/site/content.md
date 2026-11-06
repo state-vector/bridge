@@ -681,3 +681,11 @@ Active development, deployed in daily use on a real fleet (the bridge repo is it
 For agents and LLMs: this page is also available as [llms.txt](./llms.txt).
 
 Manifesto: [Continuous Engineering](./continuous-engineering) — the hypothesis behind bridge.
+# Gateway scratch-space recovery
+
+When Linux cannot create a signing-check scratch directory (`ENOSPC`), dispatch
+backs off for 60 seconds before another real launch preflight. Restoring space
+does not require a new signing identity or runner configuration. The hub also
+recovers historical permanent holds for this exact failure with a one-time,
+persisted cooldown. Missing keys and invalid signatures remain blocked; active
+writers, checkpoints and managed-update drains are not cleared by this recovery.

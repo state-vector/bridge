@@ -43,6 +43,21 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("backs off old-runner scratch ENOSPC without latching identity repair or extending cooldown on advertisements", async () => {
+    const project = "scratch-resource-recovery", g = await gateway(project);
+    const id = await task(project), reservation = await reserve(g);
+    if (reservation.kind !== "reserved") throw new Error("no reservation");
+    const reason = "gate: identity profile failed — refusing to dispatch (sign-check scratch dir: No space left on device (os error 28)). Fix the runner's identity config or provision the signing key.";
+    const result = await g.cmd({ kind: "start_failed", stage: "inspect", reason, retained_work: true, failure_class: "prerequisite" }, "resource-failed", id, reservation.session);
+    expect(result).toMatchObject({ kind: "released", barrier: { kind: "cooldown", failures: 1, reason } });
+    const first = await g.cmd({ kind: "advertise", capabilities: g.capabilities });
+    const second = await g.cmd({ kind: "advertise", capabilities: g.capabilities });
+    expect(first.readiness).toMatchObject({ kind: "cooldown", reason, until_ts: result.barrier.until_ts });
+    expect(second.readiness).toEqual(first.readiness);
+    const card = await post("get", { id });
+    expect(card.meta.startup_wait).toMatchObject({ phase: "waiting_executor", retained_work: true, host: g.host });
+    expect(card.meta.execution_requirements.host).toBe(g.host);
+  });
   it("publishes the actual managed-update hold instead of ready or a generic missing-model explanation", async () => {
     const g = await gateway("update-hold");
     const reason = "Managed update is draining active workers before restart; new claims are paused";

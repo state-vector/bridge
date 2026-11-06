@@ -25,7 +25,22 @@ export const ExecutorStartBarrierSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("repair_required"), fingerprint: text, failures: z.number().int().positive(), reason: text }),
 ]);
 export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
-export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" = "transport"): ExecutorStartBarrier {
+/** Compatibility boundary for old runners that wrapped ENOSPC in an identity
+ * gate. Only the scratch-directory OS error is recoverable this way; missing
+ * keys, failed signatures and arbitrary gate failures remain prerequisites. */
+export function isSigningScratchResourceFailure(reason: string): boolean {
+  return reason.includes("sign-check scratch dir: No space left on device (os error 28)");
+}
+export function recoverResourceStartBarrier(barrier: ExecutorStartBarrier | null, now: number): ExecutorStartBarrier | null {
+  return barrier?.kind === "repair_required" && isSigningScratchResourceFailure(barrier.reason)
+    ? nextExecutorStartBarrier(barrier, barrier.fingerprint, barrier.reason, now, "resource") : barrier;
+}
+export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" | "resource" = "transport"): ExecutorStartBarrier {
+  // Resource recovery changes neither credential nor configuration. Repeated
+  // ENOSPC must back off, not permanently require a new identity fingerprint.
+  if (failureClass === "resource" || isSigningScratchResourceFailure(reason)) return ExecutorStartBarrierSchema.parse({
+    kind: "cooldown", fingerprint, failures: 1, until_ts: now + 60_000, reason,
+  });
   const failures = previous?.fingerprint === fingerprint ? previous.failures + 1 : 1;
   return ExecutorStartBarrierSchema.parse(failureClass === "prerequisite" || failures >= 3
     ? { kind: "repair_required", fingerprint, failures, reason }
@@ -171,7 +186,7 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
   z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000),
     selection: z.object({ backend: z.enum(["opencode", "kiro"]), model: text, tier: ReasoningTierSchema }).optional() }),
-  z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite"]).default("prerequisite") }),
+  z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite", "resource"]).default("prerequisite") }),
   z.object({ kind: z.literal("recover_unstarted"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
   z.object({ kind: z.literal("poll"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
