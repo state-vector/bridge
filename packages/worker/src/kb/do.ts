@@ -235,6 +235,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
+import { boundedWakeStream } from "./sse.ts";
 import {
   parseProxyCondition,
   parseCloseLegs,
@@ -480,20 +481,7 @@ export class KnowledgeHub {
     if (this.sseClients.size >= 64) {
       return new Response("sse subscriber cap reached (64) — a fleet this large should share a wake relay", { status: 503 });
     }
-    const ts = new TransformStream<Uint8Array, Uint8Array>();
-    const writer = ts.writable.getWriter();
-    this.sseClients.add(writer);
-    const drop = () => {
-      this.sseClients.delete(writer);
-      try { writer.close(); } catch { /* already closed */ }
-    };
-    request.signal.addEventListener("abort", drop);
-    writer.write(this.sseEnc.encode("retry: 5000\n\n")).catch(drop);
-    writer.write(this.sseEnc.encode(`data: ${JSON.stringify({ type: "kb.hello", ts: Date.now() })}\n\n`)).catch(drop);
-    return new Response(ts.readable, {
-      status: 200,
-      headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
-    });
+    return boundedWakeStream(request, this.sseClients, `retry: 5000\n\ndata: ${JSON.stringify({ type: "kb.hello", ts: Date.now() })}\n\n`);
   }
 
   // BR#4362 push-driven board: the socket is the source of truth, never a
