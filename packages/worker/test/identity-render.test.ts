@@ -179,7 +179,7 @@ describe("render-time join (real DO)", () => {
     expect(dev.body.id).toBeTruthy();
     const t = await kbJson("/create", { type: "task", title: "render join — principal row", actor: "test" });
     expect(t.body.error).toBeUndefined();
-    const claim = await kbJson("/transition", { id: t.body.id, to: "in_progress", actor: "render-host", token_id: dev.body.id });
+    const claim = await kbJson("/transition", { id: t.body.id, to: "in_progress", actor: "render-host", token_id: dev.body.id, session: "render-principal-claim" });
     expect(claim.body.error).toBeUndefined();
 
     // owner AT REST is the principal — matching reads prove it (orient by principal)

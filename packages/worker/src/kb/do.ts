@@ -233,7 +233,7 @@ import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrere
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
-import { ExecutionWork, isExecutionWait } from "./execution-work.ts";
+import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { boundedWakeStream } from "./sse.ts";
@@ -3596,6 +3596,10 @@ export class KnowledgeHub {
     const actor = String(body.actor ?? "mcp");
 
     try {
+      if (["transition", "progress.log"].includes(op) && !body.session) {
+        const session = await this.resolveSession(body, String(body.token_id ?? ""));
+        if (session) body.session = session;
+      }
       this.executionMutationGuard(op, body);
       switch (op) {
         case "execution": return this.json(await this.executionCommand(body, actor));
@@ -4899,13 +4903,16 @@ export class KnowledgeHub {
     const writes = new Set(["create", "update", "transition", "claim.takeover", "link", "ask.create", "ask.answer", "train.event", "train.ci", "train.lease", "train.recovery_event"]);
     if (!writes.has(op)) return;
     const patch = body.meta as { execution_requirements?: unknown } | undefined;
+    if (body.meta && "interactive_execution" in Object(body.meta) || Array.isArray(body.meta_delete) && body.meta_delete.includes("interactive_execution")) {
+      throw new Error("gate: interactive ownership is lifecycle infrastructure, never caller-supplied metadata");
+    }
     if (op === "update") {
       const task = this.one(`SELECT meta FROM artefacts WHERE id=?`, String(body.id ?? ""));
       const stored = JSON.parse(task?.meta ?? "{}");
       const deletions = Array.isArray(body.meta_delete) ? body.meta_delete : [];
       if (deletions.includes("execution_requirements") && stored.execution_requirements) throw new Error("gate: execution requirements cannot be deleted to bypass capability eligibility");
       if (this.protectedExecution(String(body.id ?? ""), stored)) {
-        for (const key of ["blocked", "execution_wait", "local_execution"]) {
+        for (const key of ["blocked", "execution_wait", "local_execution", "interactive_execution"]) {
           if (deletions.includes(key) || (body.meta && key in Object(body.meta) && JSON.stringify((body.meta as Record<string, unknown>)[key]) !== JSON.stringify(stored[key]))) throw new Error("gate: execution lifecycle infrastructure changes only through its explicit typed controls");
         }
       }
@@ -4920,6 +4927,14 @@ export class KnowledgeHub {
       throw new Error("gate: local execution belongs to the explicitly accepted credential/session");
     }
     const authenticatedToken = String(body.token_id ?? "");
+    if (op === "transition" && authenticatedToken) {
+      const claimed = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, String(body.id ?? ""));
+      const cm = JSON.parse(claimed?.meta ?? "{}");
+      if (claimed?.status === "in_progress" && cm.interactive_execution && cm.taken_over?.from_session !== body.session
+        && !ownsInteractiveClaim(cm, authenticatedToken, String(body.session ?? ""))) {
+        throw new Error("gate: interactive execution belongs to the claiming credential/session; coordinate with its executor");
+      }
+    }
     const bound = authenticatedToken ? this.one(`SELECT task_id FROM execution_state WHERE worker_token_id = ? LIMIT 1`, authenticatedToken) : null;
     if (bound) {
       const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | null;
@@ -4954,8 +4969,10 @@ export class KnowledgeHub {
           if (blockers.length && !capabilities.alternatives.some(c => capabilityBlockers(scheduling, c, token.label).length === 0)) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
           const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(body.id)).project ?? "");
           if (![capabilities, ...capabilities.alternatives].some(c => usableFor(scheduling, c, token.label, project) && (!!a || c.tier === scheduling.tier))) throw new Error("gate: claim requires the globally selected live usable model tier in the task's capability scope");
+        } else if (token && this.executionWork().isInteractive(String(body.token_id))) {
+          this.executionWork().assertInteractiveClaim(String(body.id), String(body.token_id), String(body.session ?? ""));
         } else if (token && requirements) {
-          throw new Error("gate: capability-constrained local execution requires explicit authorised handoff acceptance; interactive credentials are not an implicit bypass");
+          throw new Error("gate: direct claim requires a live full interactive credential or a ready gateway");
         }
       }
     }
@@ -5380,6 +5397,11 @@ export class KnowledgeHub {
       };
       const next: any = { ...meta };
       if (verdict.toSession) next.session = verdict.toSession;
+      // Ownership follows the takeover, including heartbeat/release authority.
+      delete next.interactive_execution;
+      if (verdict.toSession && this.executionWork().isInteractive(tokenId)) {
+        next.interactive_execution = { kind: "interactive", token_id: tokenId, session: verdict.toSession, claimed_at: ts };
+      }
       next.taken_over = stamp;
       delete next.attempt; // churn-funk reset (BR#2997): taken-over ≠ abandoned, counters start clean
       // BR#6159 bookkeeping: the ex-holder's declared-silence stamps die with
@@ -5840,7 +5862,10 @@ export class KnowledgeHub {
     const executionMeta = JSON.parse(row.meta ?? "{}");
     const startupAtStart = this.startupWait(id);
     const localMode = this.executionState(id)?.handoff;
-    if ((isExecutionWait(executionMeta) || localMode?.phase === "preparing" || localMode?.phase === "waiting") && !(to === "superseded" && actor.startsWith("web:"))) {
+    const directInteractiveClaim = row.type === "task" && to === "in_progress" && ["todo", "blocked"].includes(row.status)
+      && this.executionWork().isInteractive(String(body.token_id ?? ""));
+    if (directInteractiveClaim) this.executionWork().assertInteractiveClaim(id, String(body.token_id), String(body.session ?? ""));
+    if ((isExecutionWait(executionMeta) || localMode?.phase === "preparing" || localMode?.phase === "waiting") && !directInteractiveClaim && !(to === "superseded" && actor.startsWith("web:"))) {
       throw new Error("gate: typed local/capability wait owns this exit; ordinary transitions/asks/timeout cannot release it");
     }
     if (localMode?.phase === "accepted" && to === "todo") throw new Error("gate: local execution returns only through explicit human-authorised return with quiescence confirmation");
@@ -6099,7 +6124,7 @@ export class KnowledgeHub {
       if (verdict.status === "todo") {
         delete meta.session;
       } else {
-        const freshClaim = to === "in_progress" && row.status === "todo";
+        const freshClaim = to === "in_progress" && ["todo", "blocked"].includes(row.status);
         if (freshClaim || !meta.session) {
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta.session = String(sess).slice(0, 120);
@@ -6188,7 +6213,7 @@ export class KnowledgeHub {
     const terminalStartup = ["done", "superseded"].includes(verdict.status);
     if (terminalStartup) delete meta.startup_wait;
     this.state.storage.transactionSync(() => {
-      if (row.type === "task" && row.status === "todo" && verdict.status === "in_progress") {
+      if (row.type === "task" && ["todo", "blocked"].includes(row.status) && verdict.status === "in_progress") {
         const current = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
         if (current.status !== row.status || current.owner !== row.owner || current.meta !== row.meta) throw new Error("gate: claim changed during scheduling; preserve the current executor");
         // The lifecycle awaits evidence/session lookups. Re-evaluate execution
@@ -6202,6 +6227,8 @@ export class KnowledgeHub {
           if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
         }
       }
+      if (directInteractiveClaim) this.executionWork().claimInteractive(id, String(body.token_id), String(meta.session), meta);
+      if (row.type === "task" && (verdict.status === "todo" || terminalStartup)) delete meta.interactive_execution;
       if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, true, id);
       if (row.type === "task" && verdict.status === "in_review") {
         const execution = this.executionState(id);
@@ -6956,9 +6983,12 @@ export class KnowledgeHub {
     }
     const execution = this.executionState(id);
     const localAccepted = execution?.handoff.phase === "accepted" && execution.handoff.token_id === body.token_id && execution.handoff.session === body.session;
+    const interactiveOwner = ["in_progress", "in_review"].includes(row.status)
+      && ownsInteractiveClaim(meta, String(body.token_id ?? ""), String(body.session ?? ""))
+      && this.executionWork().isInteractive(String(body.token_id ?? ""));
     const scope = body.execution_scope as { generation?: number; attempt_id?: string } | undefined;
     const staleScope = scope && execution?.attempt && (scope.generation !== execution.attempt.generation || scope.attempt_id !== execution.attempt.attempt_id);
-    if (isExecutionWait(meta) || (!localAccepted && (execution?.attempt?.phase === "quiesced" || staleScope))) {
+    if (isExecutionWait(meta) || (meta.interactive_execution && !interactiveOwner) || (!localAccepted && !interactiveOwner && (execution?.attempt?.phase === "quiesced" || staleScope))) {
       this.audit(actor, "progress_comment", id, { note, will });
       this.version(id, actor, "comment", note, { note, will, kind: "commentary" });
       return { id, kind: "commentary", note, instructions, note_postscript: "Execution wait unchanged; explicit authorised lifecycle exit is required." };

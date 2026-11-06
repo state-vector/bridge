@@ -310,21 +310,33 @@ typed `local_handoff` wait. It disappears from every autonomous claim/retry/
 unblock path. The Top view's **Execution attention** shows all simultaneous
 blockers and offers **Copy continuation prompt** without changing task state.
 
-1. Start the chosen local agent with a unique local session name. `handoffs`
-   provides side-effect-free, project/recipient-filtered paginated discovery,
-   current prerequisites and the continuation prompt.
-2. In the human web session, choose **Authorise a local session**. Select its
-   actual credential label/session/host, model ID/tier and capability evidence;
-   explicitly attest the required tools/access and exact checkpoint restoration.
-   This creates a 15-minute, episode/version-bound grant. It does not resume work.
-3. That interactive agent explicitly calls `handoff_accept`. Acceptance is atomic
-   and race-safe; a winning repeat is idempotent, stale/unauthorised attempts are
-   typed failures. Gateway, cron and provisioned worker credentials cannot pose
-   as local agents. Being interactive never bypasses capability prerequisites.
-4. Record updated published work with `handoff_checkpoint` before returning.
-   Only **Return to automation**, explicitly authorised by the human after local
-   writers stop, removes local-only execution. Other asks/capability blockers
-   still apply. Ordinary ask answers, dismissal and expiry do not do this.
+**Human-directed interactive agents claim directly (BR#6788).** Start the chosen
+agent with a unique session, orient, then call `transition {id, to:"in_progress",
+session, note:"Human-directed pickup"}`. A live full-agent credential is sufficient;
+there is no second human-web authorisation/acceptance loop. This works for todo,
+capability-blocked and fully prepared local-pickup cards. A missing background
+gateway does not disqualify the interactive executor. Gateway, cron and provisioned
+worker credentials cannot impersonate it; classification comes from live token
+tags, never a declared session name or a payload flag.
+
+The claim atomically binds the credential/session, consumes the matching execution
+wait and preserves published checkpoints/continuation evidence. Competing claims
+cannot both win. Original writers must actually be quiescent, unknown external
+effects must be reconciled, local preparation must be complete, and outstanding
+human decisions, qualification and review separation still apply. Owner progress
+updates liveness/gauges even when an old runner attempt is quiesced; other sessions
+can contribute comments but cannot refresh its heartbeat or release its work.
+The owner can submit to review normally, or stop local writers, publish/preserve
+its work and release with `transition {id,to:"todo",session,note:"<done/next and
+work location>"}`. Ownership clears atomically; autonomous capability requirements
+remain and are re-evaluated, rather than erased to force a dispatch.
+
+`handoffs` remains side-effect-free discovery. The older episode/version-bound
+**Authorise a local session** → `handoff_accept` flow remains available when an
+explicit capability grant is desired. For that grant-based flow, publish updates
+with `handoff_checkpoint` and use **Return to automation** after stopping local
+writers. Ordinary ask answers, copying, notification dismissal and expiry never
+claim work. A full agent's explicit claim is the direct pickup operation.
 
 A human decision can explicitly use choice action `local_handoff` instead of
 `resume`, `hold` or `release`. Native-origin work still needs its originating

@@ -64,6 +64,70 @@ async function interactive(label: string) {
 }
 
 describe("local handoff authority and lifecycle", () => {
+  it("lets human-directed agents claim a capability wait directly, heartbeat and release without a grant loop", async () => {
+    const local = await interactive(`direct-capability-${++serial}`);
+    const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Interactive recovery of an unavailable gateway", qualified: true, project: "bridge",
+      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] } } })).data;
+    expect((await post("get", { id: task.id })).data.status).toBe("blocked");
+    const auth = { id: task.id, actor: local.label, token_id: local.token_id, session: "human-directed-recovery" };
+    const claimed = await post("transition", { ...auth, to: "in_progress", note: "Human requested this recovery interactively" });
+    expect(claimed.data.error).toBeUndefined();
+    expect((await post("progress.log", { ...auth, note: "Actual repair in progress", completion_pct: 60, grace_minutes: 20, will: "Watch the decisive deployment" })).data.kind).not.toBe("commentary");
+    const card = (await post("get", { id: task.id })).data;
+    expect(card).toMatchObject({ status: "in_progress", meta: { session: auth.session, interactive_execution: { token_id: local.token_id, session: auth.session }, last_progress: { note: "Actual repair in progress", completion_pct: 60 } } });
+    expect(card.meta).not.toHaveProperty("execution_wait");
+    expect((await post("update", { ...auth, meta_delete: ["interactive_execution"] })).data.error).toMatch(/lifecycle infrastructure/);
+    const foreign = { ...auth, session: "another-session" };
+    expect((await post("progress.log", { ...foreign, note: "An additive observation" })).data.kind).toBe("commentary");
+    expect((await post("transition", { ...foreign, to: "todo", note: "Cannot release another executor" })).data.error).toMatch(/claiming credential\/session/);
+    expect((await post("transition", { ...auth, to: "todo", note: "Release with preserved continuation" })).data.error).toBeUndefined();
+    expect((await post("get", { id: task.id })).data.meta).not.toHaveProperty("interactive_execution");
+    expect((await post("transition", { ...auth, to: "in_progress", note: "Human resumes the released work" })).data.error).toBeUndefined();
+  });
+  it("atomically consumes a prepared local pickup, preserves checkpoints and accepts exactly one direct claimant", async () => {
+    const r = await runtimeTask(); const a = await interactive(`direct-a-${serial}`); const b = await interactive(`direct-b-${serial}`);
+    const claim = (agent: typeof a) => post("transition", { id: r.id, token_id: agent.token_id, actor: agent.label, session: `human-${agent.label}`, to: "in_progress", note: "Human-directed local pickup" });
+    const results = await Promise.all([claim(a), claim(b)]);
+    expect(results.filter(r => !r.data.error)).toHaveLength(1);
+    const winner = results[0].data.error ? b : a;
+    const auth = { id: r.id, token_id: winner.token_id, actor: winner.label, session: `human-${winner.label}` };
+    expect((await post("progress.log", { ...auth, note: "Preserved checkpoint inspected", completion_pct: 90 })).data.kind).not.toBe("commentary");
+    expect((await post("get", { id: r.id })).data.meta).toMatchObject({ last_progress: { completion_pct: 90, session: auth.session } });
+    const state = ExecutionStateSchema.parse((await post("execution", { ...auth, command_id: "direct-inspect", command: { kind: "inspect" } })).data);
+    expect(state.handoff).toMatchObject({ phase: "returned", checkpoint });
+    expect(state.attempt?.checkpoint).toEqual(checkpoint);
+    expect((await post("transition", { ...auth, to: "in_review", note: "Executed recovery: https://github.com/state-vector/bridge/actions/runs/1" })).data.error).toBeUndefined();
+    expect((await post("get", { id: r.id })).data.status).toBe("in_review");
+    expect((await post("progress.log", { ...r.auth, note: "Late runner must not overwrite current progress" })).data.kind).toBe("commentary");
+  });
+  it("does not treat cron, provisioned workers or open human decisions as direct interactive authority", async () => {
+    const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Human decision and unavailable executor", project: "bridge", qualified: true,
+      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] } } })).data;
+    for (const tags of [["cadence:cron"], ["provisioned"], ["by:gateway"]]) {
+      const label = `not-interactive-${++serial}`;
+      const token = (await post<{ secret: string }>("admin.mint", { label, tags })).data;
+      const identity = (await post<{ token_id: string }>("auth.identify", { bearer: token.secret })).data;
+      expect((await post("transition", { id: task.id, actor: label, token_id: identity.token_id, session: "fake-interactive", to: "in_progress", note: "Cannot impersonate" })).data.error).toMatch(/full interactive credential|wait owns/);
+    }
+    const ask = await post<{ id: string }>("ask.create", { actor: "test", route: { kind: "human_decision" }, to: "human", artefact_id: task.id,
+      question: "Which dataset should this task repair?", details: "The dataset is a human choice before execution.",
+      decision: { kind: "information", task_id: task.id, context: "Dataset missing", why_human: "Only the human knows which dataset", choices: [
+        { label: "Dataset A", executor: "bridge", consequence: "Repair dataset A", action: "resume" },
+        { label: "Hold", executor: "human", consequence: "Keep held", action: "hold" }] } });
+    expect(ask.data.error).toBeUndefined();
+    const local = await interactive(`direct-with-human-hold-${serial}`);
+    expect((await post("transition", { id: task.id, actor: local.label, token_id: local.token_id, session: "human-hold", to: "in_progress", note: "Cannot bypass the unanswered choice" })).data.error).toMatch(/open human decision/);
+  });
+  it("requires actual old-writer quiescence before a direct claim, even after its lease expires", async () => {
+    const r = await runtimeTask();
+    const task = (await post<{ id: string }>("create", { actor: r.auth.actor, type: "task", title: "Writer still running", qualified: true, project: "bridge" })).data;
+    const auth = { ...r.auth, id: task.id, session: "dispatch-still-running" };
+    expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
+    expect((await post("execution", { ...auth, command_id: "begin-active-writer", command: { kind: "begin", attempt_id: "active", worker: r.auth.agent, action_budget_ms: 60_000 } })).data.error).toBeUndefined();
+    await post("transition", { ...auth, to: "blocked", note: "Waiting for operation completion", await_event: { event: "time", until_ts: Date.now() + 60_000 } });
+    const local = await interactive(`cannot-steal-writer-${serial}`);
+    expect((await post("transition", { id: task.id, actor: local.label, token_id: local.token_id, session: "human-active-writer", to: "in_progress", note: "Need writer to stop first" })).data.error).toMatch(/writer not quiescent/);
+  });
   it("prevents an old GUI sharing the gateway token from overwriting or borrowing a scoped inventory", async () => {
     const r = await runtimeTask();
     const capability = { ...localCapabilities, backend: "opencode", inventory_revision: 2, worker: { kind: "provisioned", label: `${r.auth.actor}/worker` } };

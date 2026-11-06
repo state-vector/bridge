@@ -94,6 +94,11 @@ export const LocalGrantSchema = z.object({
   source: z.literal("human_attested"), evidence: text, capabilities: ExecutorCapabilitiesSchema,
 });
 export type LocalGrant = z.infer<typeof LocalGrantSchema>;
+/** Authenticated human-directed ownership; never a fabricated executor capability. */
+export const InteractiveClaimSchema = z.object({
+  kind: z.literal("interactive"), token_id: text, session: text, claimed_at: z.number(),
+});
+export type InteractiveClaim = z.infer<typeof InteractiveClaimSchema>;
 export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("startup_wait"), episode_id: text, text, wait: StartupWaitSchema }),
   z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),

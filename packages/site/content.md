@@ -159,17 +159,26 @@ Repair/review/deployment-verification tasks sort first; diagnostics leave the
 last slot available on multi-slot gateways.
 **Local pickup is explicit.** A forced handoff stops/checkpoints the old writer,
 then parks on a typed local-only wait. Execution attention shows the exact action,
-all capability/decision blockers and a copyable continuation. A human authorises
-the chosen interactive credential/session and attests its actual host/model/
-tools/access and checkpoint restoration; only that session's `handoff_accept`
-resumes the task. Competing acceptance is atomic. Copying, answering an ask,
-notification dismissal and expiry never accept it. Updated checkpoints and an
-explicit human-authorised stopped-writer return are required to rejoin automation.
+all capability/decision blockers and a copyable continuation. **Interactive agents
+work at the human's behest and can claim directly**: a live full-agent credential
+and named session use `transition {id,to:"in_progress",session,note}` without an
+extra web-approval loop. This includes unavailable-gateway capability waits and
+fully prepared local pickups. The claim atomically binds one credential/session,
+preserves checkpoints and consumes the execution wait; background capacity is no
+longer a blocker on its active owner. Actual old-writer quiescence, preparation,
+unknown-effect reconciliation, unanswered human decisions and review separation
+still apply. Gateway/cron/provisioned tokens cannot impersonate interactive agents.
+Owner heartbeats/gauges remain authoritative after pickup, while peer/late-runner
+comments cannot refresh them. The owner submits to review normally or stops local
+writers, preserves/publishes work and releases to `todo` with a done/next/location
+note. Release clears the interactive claim and retains automation requirements.
+The explicit capability-grant `handoff_accept` and stopped-writer return flow is
+also available. Copying, answering an ask, dismissal and expiry never claim work.
 Manual-origin preparation has a separately labelled human-attestation path that
 cannot override a managed native writer. Human decision choices may explicitly
 select `local_handoff` rather than automatic resume.
 Humans may explicitly request local pickup for unserved work; it goes through
-the same preparation and authorisation barriers. Episode-deduplicated browser/
+the same preparation barriers and direct agent pickup. Episode-deduplicated browser/
 desktop notifications link to the task; dismissal never changes execution state.
 
 **Capability waits are composable.** Inventories declare configured model IDs,

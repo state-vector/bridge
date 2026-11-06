@@ -1,6 +1,6 @@
 /** Local execution is a human-authorised mode, never an autonomous queue tier.
  * The SQLite transaction owns state + claim + wait + grant consumption. */
-import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema,
+import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema, InteractiveClaimSchema,
   initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
   availableModelTiers, nextAvailableTier,
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
@@ -19,6 +19,10 @@ export function interactiveCredential(token: Credential | null): boolean {
   if (!token || token.revoked_ts) return false;
   const tags: string[] = JSON.parse(token.tags || "[]");
   return !tags.map(t => t.toLowerCase()).some(t => t === "gateway" || t === "provisioned" || t.startsWith("by:") || t.startsWith("cadence:"));
+}
+export function ownsInteractiveClaim(meta: TaskMeta, tokenId: string, session: string): boolean {
+  const claim = InteractiveClaimSchema.safeParse(meta.interactive_execution);
+  return claim.success && claim.data.token_id === tokenId && claim.data.session === session && meta.session === session;
 }
 
 export class ExecutionWork {
@@ -83,6 +87,37 @@ export class ExecutionWork {
     return tier;
   }
   private credential(tokenId: string): Credential | null { return this.one<Credential>(`SELECT id,label,principal,tags,revoked_ts FROM auth_tokens WHERE id=?`, tokenId); }
+  isInteractive(tokenId: string): boolean { return interactiveCredential(this.credential(tokenId)); }
+  /** Validation is repeated inside the claim transaction after asynchronous lifecycle checks. */
+  assertInteractiveClaim(id: string, tokenId: string, session: string) {
+    if (!this.isInteractive(tokenId)) throw new Error("gate: direct claim requires a live full interactive credential");
+    if (!session) throw new Error("gate: direct interactive claim requires a named interactive session");
+    const task = this.task(id); const state = this.state(task);
+    if (state.attempt && state.attempt.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — stop and preserve its work before claiming");
+    if (state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before interactive claim");
+    if (state.handoff.phase === "preparing") throw new Error("gate: local handoff preparation/checkpoint must complete before claiming");
+    if (state.handoff.phase === "accepted") throw new Error("gate: local handoff already has an executor; preserve its claim");
+    const h = state.handoff; const token = this.credential(tokenId)!;
+    if (h.phase === "waiting" && h.recipient && h.recipient !== token.label && h.recipient !== token.principal) throw new Error("gate: local handoff is addressed to another recipient");
+    if (this.asks(id).length || this.one(`SELECT q.id FROM relations r JOIN artefacts q ON q.id=r.src_id WHERE r.dst_id=? AND r.relation='child_of' AND q.type='question' AND q.status NOT IN ('done','superseded') AND json_extract(q.meta,'$.ask.to')='human' LIMIT 1`, id)) throw new Error("gate: an open human decision owns this exit; answer it before claiming");
+  }
+  /** Caller owns the SQLite transaction containing the card's single claim write. */
+  claimInteractive(id: string, tokenId: string, session: string, meta: TaskMeta) {
+    this.assertInteractiveClaim(id, tokenId, session);
+    const task = this.task(id); const state = this.state(task); const token = this.credential(tokenId)!;
+    if (state.handoff.phase === "waiting") {
+      // Explicit claim consumes the pickup, retaining its published continuation and proof.
+      state.handoff = { ...state.handoff, phase: "returned", returned_at: Date.now(), by: token.label };
+    }
+    state.revision += 1;
+    this.sql.exec(`INSERT INTO execution_state(task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(ExecutionStateSchema.parse(state)));
+    meta.interactive_execution = InteractiveClaimSchema.parse({ kind: "interactive", token_id: tokenId, session, claimed_at: Date.now() });
+    meta.session = session;
+    delete meta.execution_wait; delete meta.blocked; delete meta.local_execution; delete meta.startup_wait;
+    meta.execution_blockers = [];
+    this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
+    this.audit(token.label, "interactive_claim", id, { session, checkpoint: state.attempt?.checkpoint?.commit ?? null });
+  }
   private hosts(taskId?: string): CapabilityObservation[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => ({
       host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
@@ -139,7 +174,13 @@ export class ExecutionWork {
     const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id), asks: this.asks(task.id), now, local });
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
-    return blockers;
+    const meta: TaskMeta = JSON.parse(task.meta || "{}");
+    const direct = InteractiveClaimSchema.safeParse(meta.interactive_execution);
+    // Missing unattended capacity is not a blocker on an authenticated interactive owner.
+    // Its actual model remains unreported rather than borrowing the old runner's identity.
+    return direct.success && ["in_progress", "in_review"].includes(task.status)
+      && ownsInteractiveClaim(meta, direct.data.token_id, direct.data.session) && this.isInteractive(direct.data.token_id)
+      ? blockers.filter(b => b.kind !== "capability_unavailable" && b.kind !== "capacity_wait") : blockers;
   }
   /** Reads compute fresh availability without persisting, claiming or granting. */
   read(raw: unknown, tokenId = "", session = "", human = false, attention = false) {

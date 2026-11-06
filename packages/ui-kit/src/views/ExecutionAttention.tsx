@@ -43,6 +43,7 @@ function LocalActions({ item, agents, changed }: { item: ExecutionAttentionItem;
     finally { setBusy(false); }
   }
   return <div className="execution-actions">
+    {h.phase === "waiting" && <p>A human-directed interactive agent can claim this task directly with a named session using transition to in_progress. No additional web authorisation is required. The explicit capability-grant flow below remains available.</p>}
     <button type="button" onClick={copy}>Copy continuation prompt</button>
     <details><summary>Continuation details</summary><pre className="execution-prompt">{item.continuation_prompt}</pre></details>
     {(h.phase === "waiting" || h.phase === "accepted" || h.phase === "preparing") && <button type="button" onClick={() => setOpen(!open)}>
