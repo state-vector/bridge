@@ -206,6 +206,15 @@ describe("eligibility-first scheduling on real SQLite", () => {
 });
 
 describe("priority line recovery capacity", () => {
+  it("honours explicit urgency within concrete repairs in both discovery and atomic reservation", async () => {
+    const project = "urgent-repair", g = await gateway(project);
+    const older = await task(project, { machine_duty: { kind: "task-recovery", reason: "queue_binding" } });
+    const urgent = await task(project, { boosted: Date.now(), machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const orientation = await post("orient", { ...g.auth, label: g.host, tags: ["gateway"] });
+    const ids = orientation.unclaimed_work.map((t: { id: string }) => t.id);
+    expect(ids.indexOf(urgent)).toBeLessThan(ids.indexOf(older));
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: urgent });
+  });
   it("ranks concrete repairs above ordinary verification and generic diagnostics in discovery and reservation", async () => {
     const project = "repair-priority", g = await gateway(project, 3);
     const verify = await task(project); await post("update", { id: verify, roles: ["review"] });

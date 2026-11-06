@@ -689,3 +689,16 @@ does not require a new signing identity or runner configuration. The hub also
 recovers historical permanent holds for this exact failure with a one-time,
 persisted cooldown. Missing keys and invalid signatures remain blocked; active
 writers, checkpoints and managed-update drains are not cleared by this recovery.
+## Capacity survives hub outages
+
+The gateway durably records real stopped-process proof before finalization and
+replays its fenced acknowledgement after transient network failures or daemon
+restart. Missing acknowledgements no longer permanently consume worker slots.
+Checkpoint publication, retained local work, unknown external-operation evidence
+and original-host authority remain independent protections. Historical Linux
+charges can be inspected with `scripts/gateway-reconcile.py` (dry-run by default);
+only complete kernel proof and an absent original daemon permit `--apply`.
+An explicit urgency boost orders concrete repairs ahead of older repairs in
+the same class. Task-specific pre-spawn cancellation permits bounded refill of
+other slots only after authoritative no-writer proof; all gateway-readiness,
+capacity and unknown-effect gates remain in force.

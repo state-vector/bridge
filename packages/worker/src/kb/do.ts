@@ -239,7 +239,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
-import { RecoveryCapacity, schedulingRank, taskSchedulingRank, priorityTask } from "./recovery-capacity.ts";
+import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
@@ -4934,7 +4934,9 @@ export class KnowledgeHub {
       return true;
     });
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
-    eligible.sort((a, b) => rank(a) - rank(b) || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
+    eligible.sort((a, b) => rank(a) - rank(b)
+      || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
+      || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
     return { eligible, reasons };
   }
 
@@ -9087,7 +9089,7 @@ export class KnowledgeHub {
         const tTagsArr: string[] = Array.isArray(t.tags) ? t.tags : [];
         return schedulingRank(m, tTagsArr, verifyParents.has(t.id) ? ["review"] : t.roles ?? []);
       };
-      return rank(a) - rank(b) || a.updated_ts - b.updated_ts;
+      return rank(a) - rank(b) || schedulingBoost(JSON.parse(b.meta ?? "{}")) - schedulingBoost(JSON.parse(a.meta ?? "{}")) || a.updated_ts - b.updated_ts;
     }).slice(0, 10).map((t: any) => {
       // pool traits — the pattern: computed per row, never stored flags. Clients
       // speak domain language (is_question, is_claimable, previously_attempted),

@@ -3132,3 +3132,31 @@ Historical permanent holds for this exact scratch-space failure are converted
 once to the same persisted cooldown; readiness renewals do not extend it.
 Missing keys, invalid signatures and other prerequisite failures remain held.
 Existing writers, checkpoints and updater drain holds are preserved.
+## Stopped-writer capacity recovery
+
+The gateway persists actual process-group-empty observations in
+`~/.bridge/stopped-attempts/` before network finalization. A separate bounded
+delivery loop retries transient hub failures using the original task session,
+generation, attempt and command ID, including after a daemon restart. It waits
+for live checkpoint finalization and retains named gate rejections for diagnosis.
+This frees confirmed stopped capacity without treating lease expiry as proof,
+deleting local work, or resolving unknown external effects.
+
+For historical charges created by older binaries, Linux operators can run:
+
+```bash
+sudo python3 scripts/gateway-reconcile.py --home /home/hermes \
+  --binary /home/hermes/.local/bin/bridge
+# After reviewing the dry-run proofs, repeat with --apply.
+```
+
+This tool requires the original daemon PID to be absent and a complete readable
+same-UID process environment, command-line, working-directory and open-file
+census for each task. It refuses current-daemon attempts, unreadable processes,
+changed fences and retained task scopes. It never kills processes or deletes
+worktrees; apply uses the originating gateway's authenticated fenced quiesce.
+Urgency boosts also break ties within the concrete-repair class, consistently
+in discovery and atomic reservations. A cancelled pre-spawn launch no longer
+stalls every free slot for a poll interval: refill continues only after the hub
+confirms no writer, with a bounded distinct-task budget and fresh hub admission
+on every reservation.

@@ -17,6 +17,9 @@ use crate::logging;
 use crate::opencode;
 use crate::scm;
 
+#[path = "stopped_outbox.rs"]
+mod stopped_outbox;
+
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
@@ -44,6 +47,10 @@ fn claim_session(cfg: &DispatchConfig, tid: &str) -> String {
     CLAIM_SESSIONS.get_or_init(Default::default).lock().expect("claim session map poisoned")
         .get(&format!("{}:{tid}", cfg.label.as_deref().unwrap_or("runner"))).cloned()
         .unwrap_or_else(|| format!("dispatch-{}", slugify(tid))) // legacy claims retain their original identity
+}
+
+fn failed_launch_has_no_writer(state: &serde_json::Value) -> bool {
+    state.get("attempt").is_some_and(|attempt| attempt.is_null() || attempt["phase"] == "quiesced")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -687,6 +694,26 @@ impl ExecutionRuntime {
         execution_call(cfg, tid, cmd)?;
         Ok(())
     }
+}
+
+fn stopped_outbox_root() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".bridge/stopped-attempts"))
+}
+
+fn send_stopped_receipt(cfg: &DispatchConfig, receipt: &stopped_outbox::StoppedReceipt) -> Result<(), String> {
+    if cfg.label.as_deref() != Some(receipt.host.as_str()) || cfg.url.trim_end_matches('/') != receipt.url {
+        return Err("gate: stopped-writer receipt belongs to another gateway or hub".into());
+    }
+    let reply = mcp_call_session(cfg, &mut 0, "execution", receipt.request(), Some(&receipt.session))?;
+    if reply["attempt"]["phase"] != "quiesced" { return Err("hub did not confirm stopped-writer quiescence".into()); }
+    Ok(())
+}
+
+fn persist_stopped_receipt(cfg: &DispatchConfig, tid: &str, runtime: &ExecutionRuntime, group_empty: bool) -> Result<(PathBuf, stopped_outbox::StoppedReceipt), String> {
+    let receipt = stopped_outbox::StoppedReceipt::capture(cfg.label.as_deref().ok_or("gateway label missing")?, &cfg.url,
+        tid, &claim_session(cfg, tid), runtime.generation, &runtime.attempt_id, now_ms(), group_empty)?;
+    let path = stopped_outbox::persist(&stopped_outbox_root().ok_or("outbox home missing")?, &receipt)?;
+    Ok((path, receipt))
 }
 
 /// Accepts the new dict shape ({ "opencode": { ... } }) or the legacy array
@@ -3925,6 +3952,7 @@ fn spawn_opencode(
         let tid2 = tid.to_string();
         let bin = bc.bin.clone();
         let control = execution.control.clone();
+        let execution_for_task = execution.clone();
         let completion_signal = CompletionSignal(completed.clone());
         let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
         std::thread::spawn(move || {
@@ -3945,6 +3973,14 @@ fn spawn_opencode(
                 Some(live_for_task),
                 Some(control),
             );
+            // Capture at transport return, not after the main loop gets around
+            // to draining this receiver. A daemon crash during another task's
+            // network finalization must not lose this stopped-writer proof.
+            if execution_for_task.control.quiesced.load(Ordering::SeqCst) {
+                if let Err(error) = persist_stopped_receipt(&cfg2, &tid2, &execution_for_task, true) {
+                    dlog(&tid2, &format!("transport stopped proof could not be persisted: {error}"));
+                }
+            }
             if backend == opencode::Backend::Kiro {
                 if let Some(sid) = &out.session_id {
                     save_session_id(&tid2, sid);
@@ -4199,16 +4235,22 @@ fn tick(
 
     for (mut inf, outcome) in finished {
         write_task_state(&inf.task_id, &json!({ "task_id": inf.task_id, "status": "result_captured", "generation": inf.execution.generation, "attempt_id": inf.execution.attempt_id, "exit_code": outcome.exit_code, "stdout_tail": outcome.stdout_tail, "stderr_tail": outcome.stderr_tail, "worktree": inf.worktree }));
-        // Transfer/cleanup barrier: a terminal subprocess is not evidence its
-        // children stopped, and a local path is not a portable checkpoint.
-        let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
+        // Capture actual stopped-writer proof durably BEFORE any publication
+        // or hub call. A failed finalization used to discard this proof forever
+        // and charge a stopped process against capacity after every outage.
         inf.execution.stop_maintenance();
         let stopped = inf.execution.control.quiesced.load(Ordering::SeqCst);
+        let receipt = persist_stopped_receipt(cfg, &inf.task_id, &inf.execution, stopped);
+        if let Err(error) = &receipt { dlog(&inf.task_id, &format!("stopped-writer receipt not recorded: {error}; capacity retained")); }
+        // Transfer/cleanup still needs a real portable checkpoint. Capacity
+        // reconciliation alone never deletes WIP or resolves unknown effects.
+        let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
         if let Err(e) = &published { dlog(&inf.task_id, &format!("final checkpoint failed: {e}; worktree retained")); }
-        let quiesced = if stopped {
-            let mut cmd = inf.execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
-            execution_call(cfg, &inf.task_id, cmd).is_ok()
-        } else { false };
+        let quiesced = match receipt {
+            Ok((path, receipt)) => stopped_outbox::deliver(&path, &receipt, now_ms(), |r| send_stopped_receipt(cfg, r))
+                .map_err(|error| dlog(&inf.task_id, &format!("stopped-writer delivery deferred to durable outbox: {error}"))).is_ok(),
+            Err(_) => false,
+        };
         if inf.execution.control.stop.load(Ordering::SeqCst) {
             // Deliberate interruption is not a failed implementation/review.
             // Resume only after the durable checkpoint/quiescence barrier.
@@ -4912,6 +4954,7 @@ fn tick(
             .map_err(|error| format!("hub scheduling contract drift: {error}"))?;
         dlog("", &format!("hub capacity request: {outcome:?}"));
     }
+    let mut reserved_this_tick = HashSet::new();
     while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
         let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
         let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
@@ -4925,6 +4968,9 @@ fn tick(
             Err(error) => return Err(format!("hub scheduling contract drift: {error}")),
         };
         let (tid, session) = (&reservation.0, &reservation.1);
+        if !reserved_this_tick.insert(tid.clone()) {
+            return Err(format!("{tid}: repeated startup reservation in one refill; stop rather than churn"));
+        }
         remember_claim_session(cfg, tid, session);
         let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))?;
         if art["status"].as_str() != Some("in_progress") || art.pointer("/meta/session").and_then(|v| v.as_str()) != Some(session.as_str()) {
@@ -4963,7 +5009,16 @@ fn tick(
             msgs.push(msg);
         } else {
             snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
-            break; // re-prove gateway readiness next tick before another claim
+            // A task-specific pre-spawn interruption must not leave every
+            // other slot idle for another poll interval. Continue only after
+            // authoritative no-writer proof; schedule rechecks gateway readiness
+            // and capacity for EVERY next reservation. Unknown effects stay held.
+            match execution_call(cfg, tid, json!({ "kind": "inspect" })) {
+                Ok(state) if failed_launch_has_no_writer(&state) && reserved_this_tick.len() < cfg.max_sessions + 8 => {
+                    dlog(tid, "no writer after startup reconciliation; continuing capacity refill");
+                }
+                _ => break,
+            }
         }
     }
 
@@ -5114,6 +5169,23 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
     let readiness = dispatch_enabled.then(|| {
         dispatch_stage(&snap, DispatchStage::Readiness);
         GatewayReadiness::start(&cfg)
+    });
+    // Separate from admission and per-writer leases: replay survives a stopped
+    // worker, a blocked dispatch tick and daemon replacement. Use the readiness
+    // producer's current credential/config; never keep a rotated token alive.
+    let stopped_delivery = readiness.as_ref().map(|readiness| {
+        let config = readiness.data.clone();
+        let delivery = LeaseMaintenance::start(Duration::from_secs(20), move || {
+            let cfg = config.lock().expect("gateway readiness poisoned").cfg.clone();
+            if let (Some(root), Some(host)) = (stopped_outbox_root(), cfg.label.as_deref()) {
+                for message in stopped_outbox::flush(&root, host, &cfg.url, now_ms(), |r| send_stopped_receipt(&cfg, r)) {
+                    dlog("gateway", &message);
+                }
+            }
+            true
+        });
+        delivery.wake();
+        delivery
     });
     loop {
         if let Some(request) = update_request() {
@@ -5304,6 +5376,7 @@ pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc
             stop.load(Ordering::Relaxed) || update_request().is_some()
                 || in_flight.iter().any(|inf| inf.completed.load(Ordering::SeqCst)));
     }
+    if let Some(delivery) = stopped_delivery { delivery.stop(); }
     running.store(false, Ordering::Relaxed);
     train_stop.store(true, Ordering::SeqCst);
     if let Some(handle) = train_handle { let _ = handle.join(); }
@@ -5463,6 +5536,15 @@ pub fn logout(state: &DispatchState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_launch_refill_requires_conclusive_no_writer_not_expiry_or_transport_failure() {
+        assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":null})));
+        assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":{"phase":"quiesced"}})));
+        for phase in ["running", "restoring", "stopping"] {
+            assert!(!super::failed_launch_has_no_writer(&serde_json::json!({"attempt":{"phase":phase,"lease_until":0}})));
+        }
+        assert!(!super::failed_launch_has_no_writer(&serde_json::json!({"error":"503"})));
+    }
     use super::*;
     #[test]
     fn update_drain_keeps_train_ticks_live_until_workers_finish_then_joins_before_idle() {

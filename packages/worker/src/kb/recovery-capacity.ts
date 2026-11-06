@@ -18,6 +18,13 @@ export function schedulingRank(meta: Meta, tags: string[], roles: string[]): num
 }
 export const taskSchedulingRank = (task: Task) => schedulingRank(JSON.parse(task.meta || "{}"), parseTags(task.tags), parseTags(task.roles));
 
+/** Human urgency breaks ties WITHIN a class, never displacing concrete repair
+ * with routine verification. Otherwise a freshly diagnosed line fix sits
+ * behind the entire historical repair backlog despite an explicit boost. */
+export function schedulingBoost(meta: Meta): number {
+  return typeof meta.boosted === "number" && Number.isFinite(meta.boosted) ? meta.boosted : meta.boosted ? 1 : 0;
+}
+
 /** Capacity is never transferred on an interrupt alone. One durable handoff
  * per host survives replays, restarts and concurrent scheduler requests. */
 export class RecoveryCapacity {
