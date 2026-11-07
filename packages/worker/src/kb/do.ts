@@ -3740,8 +3740,8 @@ export class KnowledgeHub {
   async fetch(request: Request): Promise<Response> {
     // Build provenance is independent of database health and migration work.
     if (new URL(request.url).pathname === "/version") {
-      const version = await import("../__version.json");
-      return this.json({ commit: version.commit, built_at: version.built_at, lifecycle_protocol: 2 });
+      const version = await import("../__version.json") as { commit?: string; built_at?: string };
+      return this.json({ commit: version.commit ?? "unknown", built_at: version.built_at ?? null, lifecycle_protocol: 2 });
     }
     const route = `${request.method} ${new URL(request.url).pathname}`;
     const trace = this.requestDiagnostics.begin(new URL(request.url).pathname.slice(1), Number(request.headers.get("x-bridge-request-start")));
