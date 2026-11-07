@@ -59,6 +59,19 @@ supervised workers keep their original processes and sessions. This bootstrap
 does not install a binary, change update deadlines, clear health holds, or resolve
 unknown writers/effects.
 
+Confirmed stopped jobs are also rechecked every five seconds against saved hub
+receipts for their original server, session and attempt. A newer job cannot supply
+that proof. Missing proof or an uncertain outside action keeps the old job protected.
+The runner saves the original result, launch record and worktree location before
+archiving old ownership; it does not mark the task complete or remove the worktree.
+Captured real results continue through their normal checkpoint and delivery steps.
+For an older stuck controller, `bridge workers reconcile-stopped [BR#task]` uses
+the same controller lock and defaults to a read-only check. With `--apply`, it
+rechecks the saved confirmation and original record before archiving. Stop only
+the controller while using this verified recovery binary, then restart it;
+independent workers keep running and a live worker lock prevents cleanup.
+This command does not install an update or change its deadline or health checks.
+
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
 **Just want to use it?** The shared hub is live at `https://hub.fleetbridge.run` — sign in with GitHub at the same URL and `bridge pair https://hub.fleetbridge.run`; no deploy needed. The rest of this README is for self-hosting.
@@ -2634,8 +2647,11 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
 - **Mechanical head moves carry by default (BR#4689, child of BR#4633)**: a rebase
   or other content-preserving head update — same patch-ids — no longer bounces for
   coverage. When the live head is not verdict-covered, the executor first tries to
-  PROVE the move mechanical: `git range-diff <base>..old <base>..new`, with the base
-  excluded on BOTH sides (a merge-base-anchored `old...new` would count base-side
+  PROVE the move mechanical: fetch the lane base explicitly into its origin tracking
+  ref, resolve that fetched commit once, then run `git range-diff <base-sha>..old
+  <base-sha>..new`. A stale or missing local `main` branch is irrelevant and is never
+  modified. Failed fetches cannot reuse stale base evidence. The base is excluded
+  on BOTH sides (a merge-base-anchored `old...new` would count base-side
   advances as added patches after a rebase). One or more all-`=` pairs proves it;
   any `<`/`>`/`!` line (authored code changed), an unreadable object or a git failure
   proves nothing — no proof, no carry. With proof, the gate's carry row fires only if

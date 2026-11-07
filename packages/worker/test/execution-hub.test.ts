@@ -63,6 +63,59 @@ async function interactive(label: string) {
   return { ...token, ...identity, label };
 }
 
+describe("historical stopped-writer receipts", () => {
+  async function setup() {
+    const host = `writer-proof-host-${++serial}`;
+    const gateway = (await post<{ secret: string }>("admin.mint", { label: host, tags: ["gateway"] })).data;
+    const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gateway.secret })).data;
+    const worker = (await post<{ id: string }>("agent.provision", { label: `${host}/worker`, actor: host })).data;
+    const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `writer-proof-${serial}` };
+    expect((await post("execution", { ...auth, id: "gateway", command_id: "ready", command: { kind: "advertise", capabilities: {
+      ...localCapabilities, backend: "opencode", capacity: 4, worker: { kind: "provisioned", label: `${host}/worker` },
+    } } })).data.error).toBeUndefined();
+    const id = (await post<{ id: string }>("create", { type: "task", title: `Writer proof ${serial}`, project: "bridge", roles: ["impl"], qualified: true })).data.id;
+    expect((await post("transition", { ...auth, id, to: "in_progress" })).data.error).toBeUndefined();
+    const command = (command_id: string, command: object, extra: object = {}) => post("execution", { ...auth, id, command_id, command, ...extra });
+    expect((await command("begin-old", { kind: "begin", attempt_id: "old", worker: `${host}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
+    return { id, auth, worker, command };
+  }
+
+  it("reads the original immutable proof without releasing a newer active attempt", async () => {
+    const r = await setup(), fence = { generation: 1, attempt_id: "old" };
+    expect((await r.command("lookup", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    await post("update", { id: r.id, meta: { fake_stopped_proof: { ...fence, phase: "quiesced" } } });
+    expect((await r.command("lookup", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    expect((await r.command("actual-old-stop", { kind: "quiesce", ...fence, writers: "process_group_empty" })).data.error).toBeUndefined();
+    expect((await r.command("begin-new", { kind: "begin", attempt_id: "new", worker: `${r.auth.actor}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
+    const before = ExecutionStateSchema.parse((await r.command("before", { kind: "inspect" })).data);
+    expect(before.attempt).toMatchObject({ generation: 2, attempt_id: "new", phase: "running" });
+    const found = await r.command("lookup", { kind: "writer_receipt", ...fence });
+    expect(found.data).toMatchObject({ kind: "writer_receipt_found", task_id: r.id, command_id: "actual-old-stop", source: "quiesce",
+      proof: { host: r.auth.actor, session: r.auth.session, ...fence, phase: "quiesced", writers: "process_group_empty" } });
+    for (const wrong of [{ generation: 2, attempt_id: "new" }, { generation: 1, attempt_id: "different" }]) {
+      expect((await r.command("wrong", { kind: "writer_receipt", ...wrong })).data.kind).toBe("writer_receipt_missing");
+    }
+    expect((await r.command("wrong-session", { kind: "writer_receipt", ...fence }, { session: "different" })).data.kind).toBe("writer_receipt_missing");
+    const peer = await setup();
+    expect((await post("execution", { ...peer.auth, id: r.id, command_id: "foreign", command: { kind: "writer_receipt", ...fence } })).data.kind).toBe("writer_receipt_missing");
+    expect((await r.command("forged", { kind: "writer_receipt", ...fence }, { token_id: r.worker.id, actor: `${r.auth.actor}/worker`, gateway: true })).data.error).toMatch(/originating runner/);
+    expect(ExecutionStateSchema.parse((await r.command("after", { kind: "inspect" })).data)).toEqual(before);
+  });
+
+  it("keeps unresolved outside actions and unfinished result delivery protected", async () => {
+    const r = await setup(), fence = { generation: 1, attempt_id: "old" };
+    await r.command("outside-intent", { kind: "prepare", ...fence, operation_id: "outside", action: "Outside action", input_revision: "one", budget_ms: 10_000 });
+    await r.command("physical-stop", { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    expect((await r.command("held", { kind: "writer_receipt", ...fence })).data).toMatchObject({ kind: "writer_receipt_held" });
+    expect(ExecutionStateSchema.parse((await r.command("inspect-held", { kind: "inspect" })).data).operations[0].state).toBe("prepared");
+    const pending = await setup();
+    await pending.command("captured-stop", { kind: "stopped", ...fence, writers: "process_group_empty",
+      outcome: { kind: "completed", exit_code: 0, stdout_tail: "Captured result still needs delivery", stderr_tail: "" } });
+    expect((await pending.command("not-finalized", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    expect(ExecutionStateSchema.parse((await pending.command("inspect-finalizing", { kind: "inspect" })).data).attempt?.phase).toBe("finalizing");
+  });
+});
+
 describe("local handoff authority and lifecycle", () => {
   it("projects direct human-directed sessions as custom without assigning an autonomous tier", async () => {
     const agent = await interactive("custom-model-session");

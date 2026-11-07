@@ -154,6 +154,15 @@ const AttemptFields = {
   executor: ExecutorCapabilitiesSchema.nullable().default(null),
 };
 export const WriterProofSchema = z.enum(["process_group_empty", "no_live_group_members"]);
+export const WriterReceiptSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("writer_receipt_missing") }),
+  z.object({ kind: z.literal("writer_receipt_held"), reason: text }),
+  z.object({ kind: z.literal("writer_receipt_found"), task_id: text, command_id: text,
+    source: z.enum(["quiesce", "stopped", "finalize"]),
+    proof: FenceSchema.extend({ host: text, session: text, phase: z.literal("quiesced"), writers: WriterProofSchema }),
+  }),
+]);
+export type WriterReceipt = z.infer<typeof WriterReceiptSchema>;
 export const AttemptSchema = z.discriminatedUnion("phase", [
   z.object({ ...AttemptFields, phase: z.literal("restoring"), checkpoint: CheckpointSchema, restored_tree: z.null() }),
   z.object({ ...AttemptFields, phase: z.literal("running"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
@@ -198,6 +207,7 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("resume_claims") }),
   z.object({ kind: z.literal("inspect") }),
   z.object({ kind: z.literal("receipt"), target_command_id: text }),
+  z.object({ kind: z.literal("writer_receipt"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("availability") }),
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
   z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000),
@@ -242,7 +252,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     return a;
   };
   switch (command.kind) {
-    case "schedule": case "schedule_status": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "schedule": case "schedule_status": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
     case "start_failed": {
       if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
       return s; // the authenticated coordinator owns the atomic task release

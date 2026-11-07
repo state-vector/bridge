@@ -240,7 +240,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -3165,6 +3165,10 @@ export class KnowledgeHub {
         request TEXT NOT NULL, result TEXT NOT NULL,
         PRIMARY KEY (task_id, command_id)
       );
+      CREATE INDEX IF NOT EXISTS execution_writer_receipts ON execution_commands(
+        task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
+        json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
+      ) WHERE json_extract(request, '$.command.kind') IN ('quiesce','stopped','finalize');
       CREATE TABLE IF NOT EXISTS execution_hosts (
         token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
       );
@@ -5496,6 +5500,32 @@ export class KnowledgeHub {
       return handoff ? { ...current, capacity_handoff: handoff } : current;
     }
     if (command.kind === "availability") return this.executionWork().availability(req.id);
+    if (command.kind === "writer_receipt") {
+      if (!gateway || !req.session) throw new Error("gate: stopped-writer receipts require the authenticated originating runner/session");
+      // The saved command was authenticated and committed with its result.
+      // Never borrow the mutable current attempt to release an older owner.
+      const receipt = this.one(`SELECT command_id,request,result FROM execution_commands
+        WHERE task_id=? AND json_extract(request,'$.actor')=? AND json_extract(request,'$.session')=?
+        AND json_extract(request,'$.command.generation')=? AND json_extract(request,'$.command.attempt_id')=?
+        AND json_extract(request,'$.command.kind') IN ('quiesce','stopped','finalize') ORDER BY rowid DESC LIMIT 1`,
+        req.id, actor, req.session, command.generation, command.attempt_id);
+      if (!receipt) return { kind: "writer_receipt_missing" };
+      const storedRequest: unknown = JSON.parse(String(receipt.request));
+      if (!storedRequest || typeof storedRequest !== "object" || !("command" in storedRequest)) return { kind: "writer_receipt_missing" };
+      const stored = ExecutionRequestSchema.shape.command.safeParse(storedRequest.command);
+      const state = ExecutionStateSchema.safeParse(JSON.parse(String(receipt.result)));
+      if (!stored.success || !["quiesce", "stopped", "finalize"].includes(stored.data.kind)
+        || !("writers" in stored.data) || !state.success) return { kind: "writer_receipt_missing" };
+      const attempt = state.data.attempt;
+      if (!attempt || attempt.phase !== "quiesced" || attempt.host !== actor || attempt.session !== req.session
+        || attempt.generation !== command.generation || attempt.attempt_id !== command.attempt_id) return { kind: "writer_receipt_missing" };
+      if (state.data.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
+        return { kind: "writer_receipt_held", reason: "The original attempt still has an outside action whose result is unknown" };
+      }
+      return WriterReceiptSchema.parse({ kind: "writer_receipt_found", task_id: req.id, command_id: String(receipt.command_id),
+        source: stored.data.kind, proof: { host: attempt.host, session: attempt.session, generation: attempt.generation,
+          attempt_id: attempt.attempt_id, phase: "quiesced", writers: stored.data.writers } });
+    }
     if (command.kind === "receipt") {
       const receipt = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, command.target_command_id);
       if (!receipt) return { kind: "receipt_missing" };

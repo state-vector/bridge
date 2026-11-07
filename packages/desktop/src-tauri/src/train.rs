@@ -958,11 +958,19 @@ impl Ctx {
     /// failure is an Err, never a silent "not mechanical" — the caller treats
     /// cannot-prove as NO carry (fail-closed to the coverage bounce).
     fn mechanical_rebase(&self, base_ref: &str, old_head: &str, new_head: &str) -> Result<String, String> {
-        // phase 1 — sync: the base ref rides the branch fetch; a stamped head
+        // The production caller supplies the lane name (e.g. "main"), NOT
+        // a local branch. Fetch an explicit tracking ref and pin its commit:
+        // fetching origin/main never advances a stale local main, and a
+        // later fetch must not change the base halfway through the proof.
+        let branch = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
+        self.sh("git", &["check-ref-format", &format!("refs/heads/{branch}")])?;
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        self.sh("git", &["fetch", "--quiet", "origin", &format!("+refs/heads/{branch}:{remote_ref}")])?;
+        let base_sha = self.sh("git", &["rev-parse", "--verify", &format!("{remote_ref}^{{commit}}")])?;
+        // phase 1 — sync: a stamped head
         // orphaned by a force-push is under no fetched ref — GitHub serves
         // fetch-by-sha, so each missing probe head is fetched by name. A miss
         // stays an honest cannot-prove (phase 2), never a silent carry.
-        self.sh("git", &["fetch", "--quiet", "origin", base_ref.trim_start_matches("origin/")])?;
         for head in [old_head, new_head] {
             if !self.commit_object_present(head) {
                 self.sh("git", &["fetch", "--quiet", "origin", head])?;
@@ -970,7 +978,7 @@ impl Ctx {
         }
         // phase 2 — verify: every probe object must be a readable commit;
         // anything else aborts the proof (BR#3935 posture: fail closed).
-        let base_obj = format!("{base_ref}^{{commit}}");
+        let base_obj = format!("{base_sha}^{{commit}}");
         for obj in [&base_obj, old_head, new_head] {
             if !self.commit_object_present(obj) {
                 return Err(format!(
@@ -984,15 +992,15 @@ impl Ctx {
             .args([
                 "range-diff",
                 "--no-color",
-                &format!("{base_ref}..{old_head}"),
-                &format!("{base_ref}..{new_head}"),
+                &format!("{base_sha}..{old_head}"),
+                &format!("{base_sha}..{new_head}"),
             ])
             .current_dir(&self.workdir)
             .output()
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(format!(
-                "git range-diff {base_ref}..{old_head} {base_ref}..{new_head} failed ({}) — cannot prove the head move mechanical, fail-closed: {}",
+                "git range-diff {base_sha}..{old_head} {base_sha}..{new_head} failed ({}) — cannot prove the head move mechanical, fail-closed: {}",
                 out.status,
                 trunc(String::from_utf8_lossy(&out.stderr).trim(), 300)
             ));
@@ -1001,7 +1009,7 @@ impl Ctx {
         let pairs = range_diff_equal_pairs(&text).ok_or_else(|| {
             format!("git range-diff shows a NON-mechanical move (added/removed/rewritten patch lines) old {old_head} → new {new_head}")
         })?;
-        Ok(format!("git range-diff {base_ref}..{old} {base_ref}..{new} — {pairs} patch-id pair(s), all '=' (content-preserving rebase)", old = &old_head[..old_head.len().min(9)], new = &new_head[..new_head.len().min(9)]))
+        Ok(format!("git range-diff {base_sha}..{old} {base_sha}..{new} — {pairs} patch-id pair(s), all '=' (content-preserving rebase; fetched {remote_ref})", old = &old_head[..old_head.len().min(9)], new = &new_head[..new_head.len().min(9)]))
     }
 
     /// One object's local presence (BR#4689 L1.4 probe): `git cat-file -e`
@@ -7648,6 +7656,47 @@ mod tests {
 
         // the unreadable case: a bad object is an Err, never a silent carry
         assert!(ctx.mechanical_rebase("origin/main", BOGUS_SHA, &new_head).is_err());
+    }
+
+    #[test]
+    fn mechanical_rebase_uses_fetched_base_with_stale_or_missing_local_main() {
+        let repo = Repo::new("mech-stale-base");
+        let ctx = repo.ctx();
+        let initial_base = repo.git(&["rev-parse", "main"]);
+        repo.git(&["checkout", "-q", "-b", "pr-stale", "main"]);
+        std::fs::write(repo.dir.join("feature.txt"), "unchanged PR patch\n").unwrap();
+        repo.git(&["add", "feature.txt"]);
+        repo.git(&["commit", "-q", "-m", "feature"]);
+        let old_head = repo.git(&["rev-parse", "HEAD"]);
+        let remote_base = repo.advance_main("unrelated main advance");
+        // Match a gateway checkout: remote main advances, but local main
+        // stays behind. The production lane passes "main" to the probe.
+        repo.git(&["checkout", "-q", "pr-stale"]);
+        repo.git(&["branch", "-f", "main", &initial_base]);
+        repo.git(&["rebase", "-q", "origin/main"]);
+        let rebased = repo.git(&["rev-parse", "HEAD"]);
+        // Pin the real stale-base failure before exercising the fixed helper.
+        let stale_diff = repo.git(&["range-diff", "--no-color", &format!("main..{old_head}"), &format!("main..{rebased}")]);
+        assert!(range_diff_equal_pairs(&stale_diff).is_none(), "stale-base reproduction: {stale_diff}");
+        let evidence = ctx.mechanical_rebase("main", &old_head, &rebased)
+            .expect("an unchanged rebase must carry even when local main is stale");
+        assert!(evidence.contains(&remote_base), "proof must bind the fetched commit: {evidence}");
+        assert_eq!(repo.git(&["rev-parse", "main"]), initial_base, "proof must not modify the local branch");
+
+        // Detached worktrees need no local main. Cover a merge-main update too.
+        repo.git(&["checkout", "-q", "--detach", &old_head]);
+        repo.git(&["branch", "-D", "main"]);
+        repo.git(&["merge", "-q", "--no-edit", "origin/main"]);
+        let merged = repo.git(&["rev-parse", "HEAD"]);
+        ctx.mechanical_rebase("main", &old_head, &merged)
+            .expect("machine-only merge update must carry without a local main branch");
+
+        std::fs::write(repo.dir.join("feature.txt"), "authored change\n").unwrap();
+        repo.git(&["commit", "-q", "-am", "change feature"]);
+        let changed = repo.git(&["rev-parse", "HEAD"]);
+        assert!(ctx.mechanical_rebase("main", &old_head, &changed).is_err(), "authored changes must still invalidate acceptance");
+        repo.git(&["remote", "set-url", "origin", repo.base_dir.join("missing.git").to_str().unwrap()]);
+        assert!(ctx.mechanical_rebase("main", &old_head, &rebased).is_err(), "failed fetch must not reuse cached proof");
     }
 
     #[test]
