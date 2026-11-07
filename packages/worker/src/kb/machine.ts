@@ -1203,6 +1203,18 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // both runners stopped, checkpointed and delivered). The class is named
   // so the Log says WHAT fenced; the pricing is never-a-breach.
   execution_fence: Number.POSITIVE_INFINITY,
+  // BR#6740 — the doTransition exit gate for typed execution waits (do.ts,
+  // isExecutionWait / local handoff preparing|waiting): ANY ordinary
+  // transition/ask/timeout on a card whose exit a durable execution wait owns
+  // is refused with "gate: typed local/capability wait owns this exit;
+  // ordinary transitions/asks/timeout cannot release it" — a bare throw, no
+  // [rule:] tag. The gate refusing IS the wait owning the exit (the BR#4067
+  // law: zero state destroyed, the sweep/writer just doesn't get to move the
+  // card), so it joins the BR#4562/BR#6654/BR#7008 never-a-breach pricing
+  // family. Specimen: 3 watchdog release attempts on BR#6642, 2026-11-05
+  // 23:30:41–58Z, folded "unclassified" (default threshold 3) and raised
+  // breach card BR#6740. The class is named so the Log says WHAT held.
+  "release:held-execution-wait": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1342,6 +1354,17 @@ export function breachClass(reason: string): string {
   // (BR#3611/BR#3612 wording-drift lesson); it sits ~15 chars in, far inside
   // the 300-char audit slice, so the classification survives any tail.
   if (r.includes("execution mutation fenced")) return "execution_fence";
+  // BR#6740: the doTransition exit gate for typed execution waits — an
+  // ordinary transition/ask/timeout on a card whose exit a durable execution
+  // wait owns (meta.blocked.await_event local_handoff/executor_capability, or
+  // a local handoff preparing/waiting). The refusal IS the wait owning the
+  // exit — the BR#4562 pricing law again: the gate succeeding is the system
+  // working. Match the structural fragment "typed local/capability wait owns
+  // this exit", not the whole sentence (BR#3611/BR#3612 wording-drift
+  // lesson); the throw carries no [rule:] tag and runs ~104 chars, well
+  // inside the 300-char audit slice, so the classification survives any tail.
+  // Specimen: BR#6642, 3 events 2026-11-05 23:30:41–58Z (breach card BR#6740).
+  if (r.includes("typed local/capability wait owns this exit")) return "release:held-execution-wait";
   return "unclassified";
 }
 

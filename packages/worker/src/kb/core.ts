@@ -4052,6 +4052,14 @@ export function isDeployWorkflowRun(r: DeployWorkflowRun, required: string[]): b
   if (pathLower.endsWith("/deploy-dev.yml") || pathLower === "deploy-dev.yml" || pathLower.endsWith("/deploy.yml") || pathLower === "deploy.yml") {
     return true;
   }
+  // The bridge repo's own deploy pipeline is `dev-build` (dev-build.yml, on:
+  // push to main): it builds every CLI target and publishes the Cloudflare
+  // Worker + manifest — the decisive deployment this lane actually waits on.
+  // Without recognizing it, deploy coverage stamps `covered` with no run id
+  // and recovery episodes on this lane can never verify (BR#7572).
+  if (pathLower.endsWith("/dev-build.yml") || pathLower === "dev-build.yml" || nameLower === "dev-build") {
+    return true;
+  }
   if (nameLower === "deploy dev" || nameLower === "deploy" || nameLower.startsWith("deploy to ")) {
     return true;
   }
