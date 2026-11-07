@@ -8,7 +8,7 @@ use super::lifecycle::{self, Ownership, Prepared, Finished, Pipeline, Reporter, 
 struct Task { id: String, title: String, body_md: String, project: String, meta: serde_json::Value, roles: Vec<String> }
 #[derive(Clone, Serialize, Deserialize)]
 struct Input { ticket: Ticket, task: Option<Task> }
-enum FinalWork { Active(Record, ExecutionRuntime), Fresh(Record), Journal(Record), Legacy(stopped_outbox::StoppedReceipt) }
+enum FinalWork { Active(Record, ExecutionRuntime), Fresh(Record), Journal(Record), ObserveReservation(Record), Legacy(stopped_outbox::StoppedReceipt) }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AdmissionReply {
@@ -278,10 +278,42 @@ fn tail_bytes(text: &str, max: usize) -> String {
     while !text.is_char_boundary(start) { start += 1; }
     text[start..].to_string()
 }
+
+const RESERVATION_OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
+fn reservation_observable(record: &Record) -> bool {
+    matches!(record.owner, Ownership::Reservation { .. }) && matches!(record.work, Work::Unstarted { .. }) && record.process.is_none()
+}
+
+/// A rejected unstarted reservation is not an unknown writer/effect. Observe
+/// new hub-owned claim facts in the bounded finalizer pool; never repeat its
+/// cancel_start or turn an old failure into permission to launch a writer.
+fn observe_reservation(shared: &Config, record: Record, report: Reporter) -> Finished<FinalWork> {
+    let cfg = config(shared);
+    if !reservation_observable(&record) || record.validate().is_err()
+        || record.url != cfg.url || cfg.label.as_deref() != Some(record.host.as_str()) {
+        return Finished::Held { value: FinalWork::Journal(record), reason: "gate: reservation observation lacks exact unstarted host/owner proof".into() };
+    }
+    let result = (|| -> Result<(), String> {
+        let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":record.ticket().task_id}))?;
+        let released = Released::reservation_reconciled(&record.owner, &task)?;
+        // Only these exact old reservation/journal identities are retired.
+        // Never touch a worktree, newer attempt, worker manifest, or hub state.
+        remove_reservation(&cfg, record.ticket())?;
+        journal::remove(&terminal_root(&cfg)?, &record)?;
+        report.released(released);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Finished::Complete,
+        Err(_) => Finished::Retry { value: FinalWork::ObserveReservation(record), after: RESERVATION_OBSERVATION_INTERVAL },
+    }
+}
+
 fn finalize(shared: &Config, work: FinalWork, report: Reporter) -> Finished<FinalWork> {
     let work = match work { FinalWork::Active(record, runtime) => { runtime.stop_maintenance(); FinalWork::Fresh(record) }, other => other };
     match work {
         FinalWork::Active(_, _) => unreachable!(),
+        FinalWork::ObserveReservation(record) => observe_reservation(shared, record, report),
         FinalWork::Legacy(receipt) => {
             let cfg = config(shared);
             let result = stopped_outbox_root().ok_or("legacy outbox missing".into()).and_then(|root| {
@@ -295,10 +327,24 @@ fn finalize(shared: &Config, work: FinalWork, report: Reporter) -> Finished<Fina
         },
         work @ (FinalWork::Fresh(_) | FinalWork::Journal(_)) => {
         let (record, fresh) = match work { FinalWork::Fresh(record) => (record, true), FinalWork::Journal(record) => (record, false), _ => unreachable!() };
+        // Older builds persisted this wait as a terminal Rejected disposition.
+        // Migrate only provably unstarted reservations to observation-only work;
+        // all attempts, process identities and unknown effects retain their gate.
+        if reservation_observable(&record) && matches!(record.disposition, Disposition::Rejected { .. }) {
+            return observe_reservation(shared, record, report);
+        }
         match finalize_record(shared, record, &report, fresh) {
             Ok(()) => Finished::Complete,
             Err((mut record, error)) => {
                 if error.contains("gate:") || error.contains("[rule:") {
+                    if reservation_observable(&record) {
+                        // Keep the existing on-disk disposition readable by a
+                        // rollback build; the closed runtime variant permits
+                        // only observation, not replay of the rejected write.
+                        record.disposition = Disposition::Rejected { reason: error.clone() };
+                        if let Ok(root) = terminal_root(&config(shared)) { let _ = journal::save(&root, &record); }
+                        return Finished::Retry { value: FinalWork::ObserveReservation(record), after: RESERVATION_OBSERVATION_INTERVAL };
+                    }
                     record.disposition = Disposition::Rejected { reason: error.clone() };
                     if let Ok(root) = terminal_root(&config(shared)) { let _ = journal::save(&root, &record); }
                     Finished::Held { value: FinalWork::Journal(record), reason: error }
@@ -678,6 +724,95 @@ pub(crate) mod tests {
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
         drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
+    #[test]
+    fn held_unstarted_reservation_observes_release_without_replaying_cancel() {
+        let released = Arc::new(AtomicBool::new(false)); let observed = released.clone();
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let attempts = cancels.clone();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let observations = reads.clone();
+        let hub = Hub::new(move |request| {
+            if request["params"]["name"] == "get_artefact" {
+                observations.fetch_add(1, Ordering::SeqCst);
+                return Some(json!({"id":"held-reservation","status":if observed.load(Ordering::SeqCst) { "blocked" } else { "in_progress" },"meta":{"session":"original-session"}}));
+            }
+            let args = &request["params"]["arguments"];
+            assert_eq!(args["command"]["kind"], "cancel_start", "observation cannot begin/stop/finalize a writer or repeat other effects");
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Some(json!({"kind":"held","reason":"existing writer must be reconciled"}))
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        let ticket = Ticket { task_id:"held-reservation".into(),session:"original-session".into() };
+        let record = Record { owner:Ownership::Reservation { ticket:ticket.clone() },url:cfg.url.clone(),host:cfg.label.clone().unwrap(),observed_at:1,
+            disposition:Disposition::Pending,process:None,work:Work::Unstarted { reason:"prepare did not launch".into() } };
+        journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
+        let mut controller = Controller::new(&cfg,&ready,&snap);
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record)).ok().unwrap();
+        let deadline = Instant::now()+Duration::from_secs(12);
+        while cancels.load(Ordering::SeqCst)==0 {
+            controller.tick(&snap,false,true).unwrap(); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 { controller.tick(&snap,false,true).unwrap(); std::thread::sleep(Duration::from_millis(1)); }
+        assert!(!controller.controller_ready(),"an unchanged claim cannot release the handoff barrier");
+        assert_eq!(controller.registry.counts().charged,1);
+        assert_eq!(cancels.load(Ordering::SeqCst),1);
+        assert_eq!(reads.load(Ordering::SeqCst),1,"a wait must be paced, not a foreground polling storm");
+        assert!(matches!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap()[0].disposition,Disposition::Rejected { .. }),"rollback builds must still understand the retained journal");
+        released.store(true,Ordering::SeqCst);
+        while !controller.controller_ready() {
+            controller.tick(&snap,false,true).unwrap(); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(controller.registry.counts().charged,0);
+        assert_eq!(cancels.load(Ordering::SeqCst),1,"the rejected cancellation must never be replayed");
+        assert!(reads.load(Ordering::SeqCst)>=2);
+        assert!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap().is_empty());
+        drop(controller); let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn old_rejected_unstarted_reservation_recovers_read_only_and_preserves_other_work() {
+        let hub=Hub::new(|request| {
+            assert_eq!(request["params"]["name"],"get_artefact","a persisted rejected reservation may only observe new facts");
+            Some(json!({"id":"old-reservation","status":"todo","meta":{}}))
+        });
+        let (cfg,ready,snap)=fixture(&hub);
+        let ticket=Ticket { task_id:"old-reservation".into(),session:"old-session".into() };
+        let record=Record { owner:Ownership::Reservation { ticket },host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,
+            disposition:Disposition::Rejected { reason:"old semantic cancellation hold".into() },work:Work::Unstarted { reason:"never launched".into() } };
+        journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
+        let newer=reservation_path(&cfg,&Ticket { task_id:"old-reservation".into(),session:"new-session".into() }).unwrap();
+        journal::write_file(&newer,b"new owner's reservation").unwrap();
+        let worktree=root(&cfg).unwrap().join("preserved-wip"); journal::write_file(&worktree,b"unpublished work").unwrap();
+        let mut controller=Controller::new(&cfg,&ready,&snap);
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record)).ok().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while !controller.registry.is_idle() { controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(std::fs::read(&newer).unwrap(),b"new owner's reservation");
+        assert_eq!(std::fs::read(&worktree).unwrap(),b"unpublished work");
+        assert!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap().is_empty());
+        drop(controller);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn rejected_unknown_attempt_never_becomes_reservation_observation() {
+        let hub=Hub::new(|request| {
+            assert_eq!(request["params"]["arguments"]["command"]["kind"],"receipt","unknown writer/effect cannot be turned into reservation cleanup");
+            Some(json!({"kind":"receipt_missing"}))
+        });
+        let (cfg,ready,snap)=fixture(&hub);
+        let record=Record { owner:Ownership::Attempt { ticket:Ticket { task_id:"unknown".into(),session:"session".into() },host:cfg.label.clone().unwrap(),generation:1,attempt_id:"unknown-one".into() },
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,
+            disposition:Disposition::Rejected { reason:"gate: unknown external effect".into() },work:Work::UnknownWriter { reason:"physical proof missing".into() } };
+        journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
+        let before=std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap();
+        let mut controller=Controller::new(&cfg,&ready,&snap);
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while controller.registry.counts().held==0 { controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(controller.registry.counts().charged,1);
+        assert!(!controller.controller_ready());
+        assert_eq!(std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap(),before);
+        drop(controller);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
     #[test]
     fn train_only_health_proves_connection_without_fabricating_worker_readiness() {
         let hub = Hub::new(|request| {

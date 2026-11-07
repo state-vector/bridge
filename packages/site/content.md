@@ -19,6 +19,10 @@ Explicit stops remain fenced through handoff; an older health check cannot clear
 a newer update request.
 Interrupted manifest publication remains in launch-intent recovery without
 freezing unrelated work; corrupt published identities are retained for diagnosis.
+Held, never-launched reservations observe fresh authoritative claim facts on a
+bounded cadence and clear when that claim ends, without replaying rejected writes.
+Unknown writers and external effects remain protected, and rollback journal
+compatibility is preserved.
 
 ### Operational diagnostics
 

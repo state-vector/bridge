@@ -29,6 +29,24 @@ mod tests {
     }
     fn ticket(id: &str) -> Ticket { Ticket { task_id: id.into(), session: format!("session-{id}") } }
     fn owner(t: &Ticket) -> Ownership { Ownership::Attempt { ticket: t.clone(), host: "host".into(), generation: 1, attempt_id: format!("attempt-{}", t.session) } }
+    #[test]
+    fn reservation_release_requires_complete_authoritative_claim_facts() {
+        let ticket = ticket("reservation");
+        let owner = Ownership::Reservation { ticket: ticket.clone() };
+        for task in [
+            serde_json::json!({"id":ticket.task_id}),
+            serde_json::json!({"id":ticket.task_id,"status":"unknown","meta":{}}),
+            serde_json::json!({"id":ticket.task_id,"status":"blocked"}),
+            serde_json::json!({"id":ticket.task_id,"status":"in_progress","meta":{}}),
+            serde_json::json!({"id":ticket.task_id,"status":"in_progress","meta":{"session":""}}),
+            serde_json::json!({"id":ticket.task_id,"status":"in_progress","meta":{"session":ticket.session}}),
+            serde_json::json!({"id":"other","status":"blocked","meta":{}}),
+        ] { assert!(Released::reservation_reconciled(&owner, &task).is_err(), "incomplete/unchanged facts released the reservation: {task}"); }
+        for task in [
+            serde_json::json!({"id":ticket.task_id,"status":"blocked","meta":{}}),
+            serde_json::json!({"id":ticket.task_id,"status":"in_progress","meta":{"session":"new-owner"}}),
+        ] { assert!(Released::reservation_reconciled(&owner, &task).is_ok()); }
+    }
     fn release(owner: &Ownership) -> Released {
         let reply = match owner {
             Ownership::Reservation { ticket } => serde_json::json!({"kind":"released","task_id":ticket.task_id}),
@@ -126,7 +144,13 @@ pub struct Released(Ownership);
 impl Released {
     pub fn reservation_reconciled(owner: &Ownership, task: &serde_json::Value) -> Result<Self, String> {
         let Ownership::Reservation { ticket } = owner else { return Err("not an unlaunched reservation".into()); };
-        if task["id"] == ticket.task_id && (task["status"] != "in_progress" || task["meta"]["session"] != ticket.session) {
+        let status = task["status"].as_str();
+        let known_status = matches!(status, Some("todo" | "in_progress" | "in_review" | "blocked" | "done" | "superseded"));
+        let claim_changed = match status {
+            Some("in_progress") => task["meta"]["session"].as_str().is_some_and(|session| !session.is_empty() && session != ticket.session),
+            _ => known_status,
+        };
+        if task["id"] == ticket.task_id && task["meta"].is_object() && claim_changed {
             Ok(Self(owner.clone()))
         } else { Err("reservation still belongs to this executor".into()) }
     }
