@@ -412,8 +412,10 @@ until a real observation replaces them.
 clients connect to `https://hub.fleetbridge.run/mcp` without a manually minted
 token. In Codex CLI, run `codex mcp add bridge --url
 https://hub.fleetbridge.run/mcp`, then `codex mcp login bridge`. Sign in with
-GitHub and approve access to the currently selected Bridge workspace. Approval
-automatically creates a unique, revocable `_direct/<client>-<id>` interactive
+GitHub and approve access to the currently selected Bridge workspace. The
+responsive Bridge-styled consent page shows the client, workspace,
+permissions and return address; invalid or expired requests show recovery guidance.
+Approval automatically creates a unique, revocable `_direct/<client>-<id>` interactive
 agent in **Connect**; refresh keeps that identity. The agent can claim work under
 the existing interactive-session rules, while human-only approvals and independent
 review remain enforced. Select your workspace in Bridge before connecting.
