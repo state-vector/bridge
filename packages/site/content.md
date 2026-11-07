@@ -27,6 +27,14 @@ An offline `bridge workers reconcile-reservations` recovery command supports
 older stuck controllers: controller-lock fenced, read-only by default, with
 explicit `--apply`, fresh claim rechecks and retained original-record archives.
 Only the controller is stopped; supervised workers continue independently.
+Confirmed stopped jobs use saved hub confirmations for the exact original server,
+session and attempt. The runner retains the original result and worktree location
+before archiving old ownership; uncertain outside actions stay protected and real
+captured results still need their normal delivery. An older stuck controller can
+use `bridge workers reconcile-stopped [BR#task]`: read-only by default, with an
+explicit `--apply`, the same controller lock, and fresh proof and record checks.
+A live worker lock prevents cleanup. Neither command marks tasks complete,
+removes worktrees, installs updates or changes update deadlines or health checks.
 
 ### Operational diagnostics
 

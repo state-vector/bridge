@@ -16,6 +16,25 @@ pub enum Ownership {
     Attempt { ticket: Ticket, host: String, generation: u64, attempt_id: String },
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterReceiptSource { Quiesce, Stopped, Finalize }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleasedWriterPhase { Quiesced }
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReleasedWriterProof {
+    pub host: String, pub session: String, pub generation: u64, pub attempt_id: String,
+    pub phase: ReleasedWriterPhase, pub writers: super::attempt_journal::WriterProof,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WriterReceipt {
+    WriterReceiptMissing,
+    WriterReceiptHeld { reason: String },
+    WriterReceiptFound { task_id: String, command_id: String, source: WriterReceiptSource, proof: ReleasedWriterProof },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,6 +48,29 @@ mod tests {
     }
     fn ticket(id: &str) -> Ticket { Ticket { task_id: id.into(), session: format!("session-{id}") } }
     fn owner(t: &Ticket) -> Ownership { Ownership::Attempt { ticket: t.clone(), host: "host".into(), generation: 1, attempt_id: format!("attempt-{}", t.session) } }
+    #[test]
+    fn historical_writer_receipt_matches_shared_contract_and_exact_original_owner() {
+        let cases:Vec<serde_json::Value>=serde_json::from_str(include_str!("../../../contracts/fixtures/writer-receipts.json")).unwrap();
+        let owner=Ownership::Attempt {ticket:Ticket {task_id:"old-task".into(),session:"old-session".into()},host:"original-host".into(),generation:1,attempt_id:"old-attempt".into()};
+        for value in &cases {
+            let receipt:WriterReceipt=serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&receipt).unwrap(),*value);
+            assert_eq!(Released::from_writer_receipt(&owner,&receipt).is_ok(),value["kind"]=="writer_receipt_found");
+        }
+        let good=cases.last().unwrap();
+        for key in ["host","session","attempt_id"] {
+            let mut bad=good.clone();bad["proof"][key]=serde_json::json!("someone-else");
+            assert!(Released::from_writer_receipt(&owner,&serde_json::from_value(bad).unwrap()).is_err());
+        }
+        let mut bad=good.clone();bad["proof"]["generation"]=serde_json::json!(2);
+        assert!(Released::from_writer_receipt(&owner,&serde_json::from_value(bad).unwrap()).is_err());
+        let mut bad=good.clone();bad["task_id"]=serde_json::json!("another-task");
+        assert!(Released::from_writer_receipt(&owner,&serde_json::from_value(bad).unwrap()).is_err());
+        for (key,value) in [("phase","running"),("writers","not_launched")] {
+            let mut bad=good.clone();bad["proof"][key]=serde_json::json!(value);
+            assert!(serde_json::from_value::<WriterReceipt>(bad).is_err());
+        }
+    }
     #[test]
     fn reservation_release_requires_complete_authoritative_claim_facts() {
         let ticket = ticket("reservation");
@@ -142,6 +184,16 @@ impl Ownership {
 /// subprocess exit, local stop request or successful checkpoint does not.
 pub struct Released(Ownership);
 impl Released {
+    pub fn from_writer_receipt(owner: &Ownership, receipt: &WriterReceipt) -> Result<Self, String> {
+        if let (Ownership::Attempt { ticket, host, generation, attempt_id },
+            WriterReceipt::WriterReceiptFound { task_id, command_id, proof, .. }) = (owner, receipt) {
+            if task_id == &ticket.task_id && !command_id.is_empty() && proof.host == *host
+                && proof.session == ticket.session && proof.generation == *generation && proof.attempt_id == *attempt_id {
+                return Ok(Self(owner.clone()));
+            }
+        }
+        Err("Stopped-job receipt does not cover this exact original owner".into())
+    }
     pub fn reservation_reconciled(owner: &Ownership, task: &serde_json::Value) -> Result<Self, String> {
         let Ownership::Reservation { ticket } = owner else { return Err("not an unlaunched reservation".into()); };
         let status = task["status"].as_str();
