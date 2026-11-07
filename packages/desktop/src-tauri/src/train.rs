@@ -39,7 +39,7 @@
 
 use crate::train_gate::{
     carry_chain_tip, classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
-    is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    is_root_fix_card, latest_red_deploy_health_runs, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
     reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
     verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision,
