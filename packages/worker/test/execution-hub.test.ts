@@ -238,6 +238,22 @@ describe("local handoff authority and lifecycle", () => {
     expect(read1.data).toEqual(read2.data);
     const card = await post<{ status: string }>("get", { id: r.id }); expect(card.data.status).toBe("blocked");
   });
+  it("recorded retirement cannot consume an independently protected local pickup", async () => {
+    const r = await runtimeTask();
+    const answer = `Close the old wrapper — retire ${r.id}`;
+    const ask = await post<{ id: string }>("ask.create", { to: "human", artefact_id: r.id, actor: "fixture-owner",
+      question: "Retire this local-only task?", reason: "The owner decides whether the task is retained.", details: `Local pickup ${r.id} still has a checkpoint and its own authoritative exit.`,
+      options: [answer, "KEEP the local pickup"] });
+    expect(ask.data.error).toBeUndefined();
+    await post("ask.answer", { id: ask.data.id, answer, actor: "web:rayh" });
+    const agent = await interactive(`retirement-reader-${serial}`);
+    const refused = await post("transition", { id: r.id, to: "superseded", actor: agent.label, token_id: agent.token_id, session: "retirement-reader", batch_auth: { ask: ask.data.id } });
+    expect(refused.data.error).toMatch(/wait|quiescen/i);
+    expect((await post("get", { id: r.id })).data.status).toBe("blocked");
+    const state = ExecutionStateSchema.parse((await post("execution", { id: r.id, actor: agent.label, token_id: agent.token_id, command_id: "read-retirement-fence", command: { kind: "inspect" } })).data);
+    expect(state.handoff.phase).toBe("waiting");
+    expect(state.attempt?.checkpoint).toEqual(checkpoint);
+  });
   it("rejects worker impersonation over real MCP, requires scoped human grants, and chooses exactly one local acceptor", async () => {
     const r = await runtimeTask(); const a = await interactive(`local-a-${serial}`); const b = await interactive(`local-b-${serial}`);
     const request = { id: r.id, handoff_id: r.h.id, version: r.h.version, session: "local-a" };
