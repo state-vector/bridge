@@ -274,7 +274,7 @@ class Supervisor:
             return False
         if not self.health(candidate):
             return False
-        if self.pid() != pid or self.running_build(pid) != candidate or not self.idle(nonce, pid):
+        if self.pid() != pid or self.running_build(pid) != candidate or not self.idle(nonce, pid) or read(self.request, {}).get("nonce") != nonce:
             return False
         message = f"Bridge verified the already-running candidate on {os.uname().nodename}: {candidate[:9]}; existing update recovered without another install/restart"
         self.record(Phase.CONFIRMED, next_attempt_at=self.state.get("next_attempt_at", 0), pending_notification=message)

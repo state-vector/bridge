@@ -469,6 +469,8 @@ for line in sys.stdin:
         assert_eq!(pid, original_worker, "adoption must preserve the exact running worker process");
         assert!(child("dispatch::worker_session::tests::worker_process_entry", &path).status().unwrap().success());
         assert_eq!(fs::read_to_string(root.join("starts")).unwrap().lines().count(), 1, "duplicate attachment launched a second writer");
+        second.tick(&snap, true, true).unwrap();
+        assert!(!second.controller_ready(), "an explicit stop cannot be abandoned during an update handoff before durable delivery");
         // An actual operator stop still propagates to the adopted worker,
         // whereas the controller-only update above did not interrupt it.
         while !second.idle() { second.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }

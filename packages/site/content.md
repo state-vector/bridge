@@ -15,6 +15,8 @@ Use `bridge workers status [BR#task]` to inspect local workers and
 restarts preserve workers. Update holds describe handoff/health verification,
 not an invented active drain. Refresh the separately installed updater script
 as documented in the README to enable the negotiated handoff.
+Explicit stops remain fenced through handoff; an older health check cannot clear
+a newer update request.
 
 ### Operational diagnostics
 

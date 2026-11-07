@@ -154,16 +154,19 @@ class UpdateTests(unittest.TestCase):
 
     def test_already_running_candidate_requires_real_gates_without_install_or_budget_reset(self):
         config = {"auto_update": {"enabled": True, "channel": "main"}}
-        for case in ("valid", "wrong_build", "wrong_nonce", "failed_health", "changed_pid"):
+        for case in ("valid", "wrong_build", "wrong_nonce", "failed_health", "changed_pid", "changed_nonce"):
             with self.subTest(case=case):
                 self.u.state = {"phase":"recovery_required", "from_commit":"old", "to_commit":"known-candidate", "next_attempt_at":20000000}
                 m.atomic(self.u.request, {"nonce":"n"})
                 m.atomic(self.u.root / "idle.json", {"nonce":"wrong" if case == "wrong_nonce" else "n", "pid":123, "phase":"idle"})
+                def health(commit):
+                    if case == "changed_nonce": m.atomic(self.u.request, {"nonce":"new-request"})
+                    return case != "failed_health"
                 with patch.object(self.u, "config", return_value=config), patch.object(m.time, "time", return_value=10000), \
                      patch.object(self.u, "build", return_value="known-candidate"), \
                      patch.object(self.u, "pid", side_effect=[123,124] if case == "changed_pid" else None, return_value=123), \
                      patch.object(self.u, "running_build", return_value="other" if case == "wrong_build" else "known-candidate"), \
-                     patch.object(self.u, "health", return_value=case != "failed_health"), \
+                     patch.object(self.u, "health", side_effect=health), \
                      patch.object(self.u, "service") as service, patch.object(self.u, "notify"), \
                      patch.object(m, "fetch", side_effect=AssertionError("known running install must not be downloaded/reinstalled")):
                     self.u.reconcile()
