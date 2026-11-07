@@ -2253,6 +2253,29 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(inferDeployWorkflow(required, wfRunsWithDhr)).toBe("deploy-dev.yml");
     expect(inferDeployWorkflow(required, [])).toBe("deploy-dev.yml");
 
+    // BR#7572: the bridge repo's own deploy pipeline `dev-build` (dev-build.yml,
+    // push-to-main Workers + CLI binaries) is the decisive deploy workflow —
+    // recognized by name alone (older observation payloads carry no path) and
+    // by path; a differently-named lookalike stays unrecognized.
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588979, name: "dev-build", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588979, name: "dev-build", path: ".github/workflows/dev-build.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588980, name: "dev-build canary", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(false);
+
     // 2. Inside grace window (age 120s < 300s): uncovered_grace, no dispatch yet
     const planGrace = reconcileDeployCoverage({
       tipSha: darkTip,
