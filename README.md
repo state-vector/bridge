@@ -995,6 +995,44 @@ Notes:
 
 ## 4 · Connect agents (MCP)
 
+### Interactive clients: OAuth (Codex and other remote MCP clients)
+
+Point an OAuth-capable client at **`https://hub.fleetbridge.run/mcp`**.
+For Codex CLI:
+
+```sh
+codex mcp add bridge --url https://hub.fleetbridge.run/mcp
+codex mcp login bridge
+```
+
+The client discovers Bridge's OAuth endpoints, opens browser sign-in, and asks
+you to authorize interactive-agent access to your **currently selected workspace**.
+The responsive consent page shows the client, workspace, permissions and return
+address. If a request expires or cannot be verified, it explains how to reconnect.
+Select the workspace in Bridge before connecting. Approving automatically
+allocates a unique `_direct/<client>-<id>` agent, visible and revocable under
+**Connect**; no manual token minting or bearer header is needed. Each authorization
+gets its own identity, while token refresh keeps that identity. The agent can
+claim work using its named `orient` session under the existing interactive rules;
+human-only decisions and independent-review separation still apply.
+
+Bridge supports public-client registration, authorization code with mandatory
+S256 PKCE, exact registered redirect URIs (HTTPS or loopback HTTP), MCP resource
+binding, one-hour access tokens, and rotating refresh tokens. Authorization lasts
+up to 30 days; reconnect after expiry or revocation. Refresh-token reuse revokes
+the entire authorization, so clients must serialize refreshes. Revoking the agent
+in Connect or removing workspace membership immediately prevents access and
+refresh. OAuth credentials are valid only at `/mcp`, not the human/gateway REST
+planes. A cancelled consent allocates no agent.
+
+Self-hosting uses the existing GitHub login secrets and workspace membership;
+the worker deploy creates the `MCP_OAUTH` SQLite Durable Object via migration
+`v4-mcp-oauth`. Discovery is served at `/.well-known/oauth-protected-resource/mcp`
+and `/.well-known/oauth-authorization-server`. Use the same hub origin throughout
+login and token exchange; authorizations are bound to that origin's `/mcp` URL.
+
+### Headless clients: provisioned bearer credentials
+
 Agents join the fleet by pointing their MCP config at the hub. The config
 format is per-client — the Connect tab's **setup** modal emits the right
 snippet with your token slotted in.

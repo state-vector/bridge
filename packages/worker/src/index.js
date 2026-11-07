@@ -2,6 +2,8 @@
 export { FlowsHub } from "./do.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
 import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
+import { handleOAuth } from "./mcp-oauth.ts";
+export { McpOAuth } from "./mcp-oauth.ts";
 
 export { KnowledgeHub };
 export { RunnerUpdates } from "./runner-updates.ts";
@@ -9,6 +11,15 @@ export { RunnerUpdates } from "./runner-updates.ts";
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (["/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"].includes(url.pathname) || url.pathname.startsWith("/oauth/")) {
+      return kbGuard("mcp.oauth", handleOAuth(request, env, () => checkAuth(request, env)));
+    }
+    // Resource-bound OAuth credentials belong only to MCP, never the legacy
+    // gateway/web REST planes (in particular, never human-authoritative acts).
+    const oauthBearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+    if (/^bo[ar]_/.test(oauthBearer) && url.pathname !== "/mcp") {
+      return json({ error: "OAuth credentials are scoped to /mcp" }, 403);
+    }
     if (url.pathname.startsWith("/api/runner-updates/")) {
       return env.RUNNER_UPDATES.get(env.RUNNER_UPDATES.idFromName("channels")).fetch(request);
     }
@@ -916,10 +927,18 @@ async function handleGithubCallback(request, env) {
   // CLI / VS Code make; the listener is single-shot, 127.0.0.1-bound, and the
   // port was validated at /login. The browser still gets its Set-Cookie.
   const desktop = parseDesktopState(state);
+  const mcpReturn = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)bridge_mcp_return=([^;\s]+)/);
+  let returnTo = "/";
+  if (mcpReturn) {
+    try {
+      const path = decodeURIComponent(mcpReturn[1]);
+      if (path.startsWith("/oauth/authorize?")) returnTo = path;
+    } catch { /* malformed return cookie: use the normal home page */ }
+  }
   const headers = new Headers({
     Location: desktop
       ? `http://127.0.0.1:${desktop.port}/callback?bridge_session=${encodeURIComponent(sessionValue)}`
-      : "/",
+      : returnTo,
     "Cache-Control": "no-store",
   });
   headers.append(
@@ -927,6 +946,7 @@ async function handleGithubCallback(request, env) {
     `${SESSION_COOKIE}=${sessionValue}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
   );
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  headers.append("Set-Cookie", "bridge_mcp_return=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax");
   return new Response(null, { status: 302, headers });
 }
 
