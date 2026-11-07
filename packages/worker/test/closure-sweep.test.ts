@@ -198,7 +198,7 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
 
   // ---------- BR#3668: stale-true dedup + the human-gate law (real DO) ----------
 
-  it("BR#3668: a born-true atom spawns ONCE — the identical receipt never re-fires; a genuine false→true transition still spawns exactly once", async () => {
+  it("completed rounds continue born-true and false→true waits without repeat duty churn", async () => {
     const sweepDutiesFor = (titlePrefix: string) =>
       (async () => (await unblockDuties()).filter((x: any) =>
         x.title.startsWith(titlePrefix) && String(x.body_md).includes("MACHINE PROXY")))();
@@ -228,29 +228,22 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     });
     expect(rd1.status, JSON.stringify(rd1.body)).toBe(200);
 
-    // sweep past the park-time flood window: the born-true atom fires ONCE
+    // The first round is already complete: consume the known prerequisite
+    // and continue the actual task instead of generating another close round.
     const sweep1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 95 * 60_000 });
     expect(sweep1.body.error).toBeUndefined();
     const s1duties = await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill");
-    expect(s1duties.length).toBe(1);
-    const duty1 = s1duties[0];
-    expect(String(duty1.body_md)).toContain(`${t1id} status=done`);
-
-    // the family pattern: the spawned duty closes fast — re-arming the spawn
-    await kbJson("/transition", { id: duty1.id, to: "in_progress", actor: "drill-exec-d1", session: "drill-exec-d1" });
-    const dd1 = await kbJson("/transition", {
-      id: duty1.id, to: "done", actor: "drill-exec-d1",
-      note: "live re-verify: the atom was already true at park time — a steady-true receipt, NOT a flip; stand-down findings recorded, the card is still blocked on its human leg",
-    });
-    expect(dd1.status, JSON.stringify(dd1.body)).toBe(200);
+    expect(s1duties.length).toBe(0);
+    expect((await taskById(s1id)).status).toBe("todo");
+    expect((await taskById(s1id)).meta.proxy_check.receipts.join(" ")).toContain(`${t1id} status=done`);
 
     // sweep again: identical receipt → dedup, NO second duty (the churn dies here)
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 125 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
-    expect((await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill")).length).toBe(1);
+    expect((await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill")).length).toBe(0);
     const s1meta = (await taskById(s1id)).meta;
     expect(s1meta?.proxy_check?.verdict).toBe("true");
-    expect(String(s1meta?.proxy_check?.spawn_skipped ?? "")).toContain("BR#3668");
+    expect(s1meta.blocked).toBeUndefined();
 
     // S2 — a GENUINE false→true transition: the changed receipt spawns, once.
     const t2 = await kbJson("/create", { type: "task", title: "Canonical: late-flip target", qualified: true, session: "drill-exec-s2t" });
@@ -285,13 +278,14 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     const fsweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 185 * 60_000 });
     expect(fsweep2.body.error).toBeUndefined();
     const s2duties = await sweepDutiesFor("Unblock: IMPL: late-flip drill");
-    expect(s2duties.length).toBe(1);
-    expect(String(s2duties[0].body_md)).toContain(`${t2id} status=done`);
+    expect(s2duties.length).toBe(0);
+    expect((await taskById(s2id)).status).toBe("todo");
+    expect((await taskById(s2id)).meta.proxy_check.receipts.join(" ")).toContain(`${t2id} status=done`);
 
     // and a further sweep with the same receipt spawns nothing more
     const fsweep3 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 215 * 60_000 });
     expect(fsweep3.body.error).toBeUndefined();
-    expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(1);
+    expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(0);
   });
 
   it("BR#3668: a human-gated park never flips — a machine-shaped await_event contradicting the markers is ignored, no spawn, no migration ask", async () => {
@@ -926,16 +920,16 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     await kbJson("/transition", { id: qid, to: "in_progress", actor: "web:rayh", session: "web" });
     await kbJson("/transition", { id: qid, to: "done", actor: "web:rayh", session: "web", note: "GO — Option A" });
 
-    // sweep 2: flip — verdict true, fresh duty spawned with the receipt
+    // The original round is complete: continue with the verified receipt.
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 517 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const aNow = await taskById(aid);
     expect(aNow.meta?.proxy_check?.verdict).toBe("true");
+    expect(aNow.status).toBe("todo");
     const flip = (await unblockDuties()).find((x: any) =>
       x.title.startsWith("Unblock: IMPL: parked on the ruling (BR#3620)") && ["todo", "in_progress", "blocked"].includes(x.status));
-    expect(flip, "the flip must spawn a fresh unblock duty").toBeTruthy();
-    expect(String(flip.body_md)).toContain("MACHINE PROXY");
-    expect(String(flip.body_md)).toContain(`${qid} status=done (answered)`);
+    expect(flip, "the consumed prerequisite must not spawn another round").toBeUndefined();
+    expect(aNow.meta.proxy_check.receipts.join(" ")).toContain(`${qid} status=done (answered)`);
   });
 
   it("pr_merged + bare br_pr_merged flip from the train-stamped provenance ledger (no creds)", async () => {
@@ -977,12 +971,13 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     for (const id of [p1id, p2id]) {
       const now = await taskById(id);
       expect(now.meta?.proxy_check?.verdict, id).toBe("true");
-      expect(now.meta?.proxy_check?.spawned, id).toBeTruthy();
+      if (id === p1id) expect(now.status).toBe("todo");
+      else expect(now.meta?.proxy_check?.spawned, id).toBeTruthy();
     }
     // the spawn receipts cite the LEDGER (sha + signer), never a GitHub read
     const duties = (await unblockDuties()).filter((d: any) =>
       d.title.startsWith("Unblock: IMPL: parked on the train (BR#3620") && ["todo", "in_progress", "blocked"].includes(d.status));
-    const bodies = duties.map((d: any) => String(d.body_md)).join("\n");
+    const bodies = [...duties.map((d: any) => String(d.body_md)), ...((await taskById(p1id)).meta.proxy_check.receipts ?? [])].join("\n");
     expect(bodies).toContain("provenance: state-vector/superpositional#2440 merged (sha 8adf1e85c, signer drill-signer)");
     expect(bodies).toContain("provenance: BR#");
   });
@@ -1321,8 +1316,9 @@ describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (m
     expect(aAfter.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 640 * 60_000) + REARM_MS });
     expect(aAfter.meta?.unblock_escalated).toBeUndefined();
     const nAfter = await taskById(nid);
-    expect(nAfter.status).toBe("blocked");
+    expect(nAfter.status).toBe("todo");
     expect(nAfter.meta?.unblock_escalated?.rounds).toBe(3);
-    expect(String(nAfter.meta?.proxy_check?.spawn_skipped)).toContain("unblock spawner cap");
+    expect(nAfter.meta?.blocked).toBeUndefined();
+    expect(nAfter.meta?.proxy_check?.receipts.join(" ")).toContain("timer elapsed");
   });
 });
