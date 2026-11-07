@@ -979,7 +979,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
 });
 
 describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clobber class)", () => {
-  const laneConfig = {
+  let laneConfig = {
     lane: {
       repo: "state-vector/bridge", base: "main",
       required_workflows: ["Test", "CLI build (packages/cli)"],
@@ -992,8 +992,13 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
   };
   const seedLaneCard = async (title: string) => {
     const { body: t } = await kbJson("/create", { type: "task", title });
+    // Each test is a distinct live lane. Canonical authority must not rebind
+    // the same repo/base from another still-active fixture card.
+    const repo = `state-vector/meta-lane-${String(t.id).slice(3)}`;
+    laneConfig = { ...laneConfig, lane: { ...laneConfig.lane, repo, key: `${repo}@main` } };
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
-    await kbJson("/update", { id: t.id, meta: laneConfig, actor: "gw-1" });
+    const configured = await kbJson("/update", { id: t.id, meta: laneConfig, actor: "gw-1" });
+    expect(configured.status, JSON.stringify(configured.body)).toBe(200);
     return t.id;
   };
 
@@ -1010,7 +1015,7 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
     const m = after.body.meta;
     // lane config intact — every infrastructure key the old replace semantics amputated
     expect(m.lane).toEqual(laneConfig.lane);
-    expect(m.lane.key).toBe("state-vector/bridge@main");
+    expect(m.lane.key).toBe(laneConfig.lane.key);
     expect(m.lane.required_workflows).toEqual(laneConfig.lane.required_workflows);
     expect(m.lease).toEqual(laneConfig.lease);
     expect(m.currently).toEqual(laneConfig.currently);
@@ -1023,7 +1028,7 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
 
   it("a present top-level key replaces WHOLESALE — nested objects are never Frankenstein-merged", async () => {
     const id = await seedLaneCard("BR#5807 wholesale-replace regression lane");
-    const newLane = { repo: "state-vector/bridge", base: "main", key: "state-vector/bridge@main", ci_typical_minutes: 12 };
+    const newLane = { repo: laneConfig.lane.repo, base: "main", key: laneConfig.lane.key, ci_typical_minutes: 12 };
     const r = await kbJson("/update", { id, actor: "gw-1", meta: { lane: newLane } });
     expect(r.status).toBe(200);
     const m = (await kbJson("/get", { id })).body.meta;

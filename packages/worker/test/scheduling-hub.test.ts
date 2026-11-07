@@ -193,6 +193,36 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const board = await response.json() as { workers: { host: string; state: string; reason: string }[] };
     expect(board.workers.find(worker => worker.host === g.host)).toMatchObject({ state: "unavailable", reason });
   });
+  it("separates an operator admission pause from model readiness and preserves active writer control", async () => {
+    const project = "operator-pause", g = await gateway(project, 2);
+    const first = await task(project), claimed = await reserve(g);
+    if (claimed.kind !== "reserved") throw new Error("no reservation");
+    await g.cmd({ kind: "begin", attempt_id: "active", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin", first, claimed.session);
+    const waiting = await task(project);
+    const pause = { kind: "pause_claims", reason: "Operator maintenance", budget_ms: 60_000 };
+    const receipt = await g.cmd(pause, "pause"); expect(await g.cmd(pause, "pause")).toEqual(receipt);
+    const advertised = await g.cmd({ kind: "advertise", capabilities: g.capabilities });
+    expect(advertised.readiness).toMatchObject({ kind: "paused", reason: pause.reason, until_ts: receipt.until_ts });
+    const availability = await g.cmd({ kind: "availability" }, "availability", waiting);
+    expect(availability.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "executor_not_ready", causes: [expect.objectContaining({ readiness: expect.objectContaining({ kind: "paused" }) })] })]));
+    expect(availability.blockers.some((b: { kind: string }) => b.kind === "capability_unavailable")).toBe(false);
+    expect((await reserve(g)).kind).toBe("gateway_not_ready");
+    expect((await g.cmd({ kind: "poll", generation: 1, attempt_id: "active" }, "poll", first, claimed.session)).attempt.phase).toBe("running");
+    await g.cmd({ kind: "resume_claims" }, "resume");
+    expect((await g.cmd({ kind: "advertise", capabilities: g.capabilities })).readiness.kind).toBe("ready");
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: waiting });
+  });
+  it("reports typed controller handoff while retaining the older inventory admission mask", async () => {
+    const project = "typed-update", g = await gateway(project);
+    const id = await task(project), reason = "Controller handoff and health verification";
+    const capabilities = { ...g.capabilities, admission_hold: { kind: "update_handoff", reason }, availability: { kind: "unavailable", reason } };
+    expect((await g.cmd({ kind: "advertise", capabilities })).readiness).toMatchObject({ kind: "updating", reason });
+    expect((await reserve(g)).kind).toBe("gateway_not_ready");
+    const availability = await g.cmd({ kind: "availability" }, "availability", id);
+    expect(availability.blockers[0]).toMatchObject({ kind: "executor_not_ready", causes: [{ host: g.host, readiness: { kind: "updating", reason } }] });
+    expect((await g.cmd({ kind: "advertise", capabilities: g.capabilities })).readiness.kind).toBe("ready");
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
+  });
   it("keeps released old writers charged but labels them unconfirmed, and frees capacity only after same-host quiescence", async () => {
     const project = "truthful-occupancy", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), r = await reserve(g);

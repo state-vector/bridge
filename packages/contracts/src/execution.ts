@@ -1,6 +1,7 @@
 /** Durable executor protocol, v1. Transport activity is not action progress. */
 import { z } from "zod";
 import { StartupWaitSchema } from "./startup.ts";
+import { ExecutorNotReadySchema } from "./executor-readiness.ts";
 
 export const EXECUTION_POLICY_VERSION = 1;
 export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
@@ -61,7 +62,8 @@ export const ModelCapabilitySchema = z.object({
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
 });
-export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional() });
+export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional(),
+  admission_hold: z.object({ kind: z.literal("update_handoff"), reason: text }).optional() });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
   const tiers: ReasoningTier[] = ["small", "medium", "large"];
@@ -117,6 +119,7 @@ export type InteractiveClaim = z.infer<typeof InteractiveClaimSchema>;
 export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("startup_wait"), episode_id: text, text, wait: StartupWaitSchema }),
   z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),
+  z.object({ kind: z.literal("executor_not_ready"), episode_id: text, text, evidence: z.array(text), causes: z.array(z.object({ host: text, readiness: ExecutorNotReadySchema })).min(1) }),
   z.object({ kind: z.literal("capacity_wait"), episode_id: text, text }),
   z.object({ kind: z.literal("human_answer_required"), episode_id: text, ask_id: text, text }),
   z.object({ kind: z.literal("local_pickup_required"), episode_id: text, handoff_id: text, version: z.number(), text }),

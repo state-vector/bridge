@@ -40,6 +40,15 @@ checks explain missing evidence and executor state rather than declaring main re
 Maintenance yields between committed phases, and mutation acknowledgements do not
 run board aggregation synchronously. Indexed current-review lookups preserve exact
 review authority without repeatedly scanning unrelated retained history.
+Worker status distinguishes operator pauses, update handoffs, drains, cooldowns,
+task prerequisites and missing identity from missing models or occupied capacity.
+A verified connection can stay healthy through a pause or update hold while new
+claims remain stopped; real backend, transport and credential faults still fail
+health. Existing workers retain their control and result-delivery paths.
+Versioned lane snapshots are authoritative. Card metadata is an atomic compatibility
+projection, stale writers are rejected, and incident acceptance commits repair
+bindings and receipts together before notifying observers. Legacy lanes promote
+on their next machinery write; unsupported versions fail closed.
 Merge executors publish current-base health before deployment observations and
 candidate checks, so a stuck candidate cannot suppress newly observed main health.
 Backlog checks run in short steps with a saved position, so a failed lookup or

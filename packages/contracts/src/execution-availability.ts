@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { WorkerOccupancy } from "./worker-status.ts";
 import { capabilityBlockers, ExecutionBlockerSchema, ExecutionRequirementsSchema, LocalHandoffSchema, type ExecutionBlocker, type ExecutionRequirements, type ExecutorCapabilities, type LocalHandoff } from "./execution.ts";
+import type { ExecutorReadiness } from "./executor-readiness.ts";
+export type { ExecutorReadiness } from "./executor-readiness.ts";
 
 export const ExecutionAttentionSchema = z.object({
   workspace: z.string().default("state-vector"),
@@ -12,7 +14,9 @@ export const ExecutionAttentionSchema = z.object({
 export type ExecutionAttention = z.infer<typeof ExecutionAttentionSchema>;
 export type ExecutionAttentionItem = ExecutionAttention["items"][number];
 
-export type ExecutorReadiness = { kind: "ready"; worker_id: string; fingerprint: string } | { kind: "unprovisioned" | "repair_required" | "draining"; reason: string } | { kind: "cooldown"; reason: string; until_ts: number };
+export function isExecutorAvailabilityBlocker(blocker: ExecutionBlocker): blocker is Extract<ExecutionBlocker, { kind: "capability_unavailable" | "executor_not_ready" }> {
+  return blocker.kind === "capability_unavailable" || blocker.kind === "executor_not_ready";
+}
 export interface CapabilityObservation { host: string; capabilities: ExecutorCapabilities; observed_at: number; active: number; readiness?: ExecutorReadiness; occupancy?: WorkerOccupancy }
 export function usableFor(required: ExecutionRequirements, capability: ExecutorCapabilities | ExecutorCapabilities["alternatives"][number], host: string, project: string): boolean {
   return capability.availability.kind === "usable" && capability.model !== null && capability.projects.some(p => p === "*" || p === project)
@@ -40,14 +44,19 @@ export function projectExecutionBlockers(input: {
     && input.local.capabilities.projects.some(p => p === "*" || p === project);
   const blockers: ExecutionBlocker[] = [];
   if (!localReady && !usable.length) {
+    const causes = live.flatMap(h => h.readiness && h.readiness.kind !== "ready" ? [{ host: h.host, readiness: h.readiness }] : []);
+    if (causes.length) blockers.push({ kind: "executor_not_ready", episode_id: `readiness:${id}:${JSON.stringify(requirements)}`,
+      text: [...new Set(causes.map(c => `${c.host}: ${c.readiness.reason}`))].join(" "), causes,
+      evidence: [...new Set(live.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}`))] });
     const reason = !configured.length ? "not_configured" : !live.length ? "offline" : "unavailable";
-    const causes = [...new Set(live.flatMap(h => h.capabilities.availability.kind === "unavailable" ? [h.capabilities.availability.reason]
-      : h.readiness && h.readiness.kind !== "ready" ? [h.readiness.reason] : []))];
+    const modelCauses = [...new Set(live.filter(h => !h.readiness || h.readiness.kind === "ready").flatMap(h => h.capabilities.availability.kind === "unavailable" ? [h.capabilities.availability.reason] : []))];
+    if (!causes.length || modelCauses.length) {
     blockers.push({ kind: "capability_unavailable", episode_id: key, reason,
       text: reason === "not_configured" ? `No gateway configured for ${requirements.tier} reasoning and the required scope.`
         : reason === "offline" ? `The last supporting gateway for ${requirements.tier} reasoning is offline.`
-        : causes.length ? causes.join(" ") : `Supporting gateways report the required model/capability unavailable.`,
+        : modelCauses.length ? modelCauses.join(" ") : `Supporting gateways report the required model/capability unavailable.`,
       evidence: configured.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}; model ${h.capabilities.model ?? "unreported"}${h.capabilities.availability.kind === "unavailable" ? `; ${h.capabilities.availability.reason}` : ""}`) });
+    }
   } else if (!localReady && usable.every(h => h.active >= h.capabilities.capacity)) {
     blockers.push({ kind: "capacity_wait", episode_id: `capacity:${id}`, text: usable.some(h => (h.occupancy?.unconfirmed ?? 0) > 0)
       ? "Capacity held for unconfirmed executions; the gateway must reconcile stopped process groups."

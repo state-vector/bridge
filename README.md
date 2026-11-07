@@ -105,6 +105,23 @@ uses indexed declared subjects and incoming child relations instead of scanning
 retained review history per task; pending, findings and detached rounds retain
 their exact submission/revision authority.
 
+Executor availability keeps its cause: an operator pause, update handoff, drain,
+startup cooldown, task-specific prerequisite, and missing worker identity are
+structured readiness states, separate from missing models or occupied capacity.
+The board and task attention show the recorded cause. A fresh authenticated hub
+connection with a locally usable backend can remain healthy during a typed pause
+or update hold, while new-worker admission stays closed. Transport, identity,
+backend and protocol failures still invalidate health; existing writers keep their
+lease and result-delivery paths.
+
+Lane machinery reads versioned `lane_state` snapshots rather than mutable card
+metadata. The card remains an atomic compatibility projection for older builds;
+ordinary card fields stay independently editable. Revision checks reject stale
+writers. Lease changes and cause-specific incident acceptance commit their state,
+repair binding and receipts together; notifications are emitted after commit.
+Legacy lanes are promoted on their next machinery write. Unsupported canonical
+versions fail closed, and a lane can only rebind after its predecessor is retired.
+
 **Health checks paused** means no live merge executor is reporting fresh deployment
 evidence. **Health checks overdue** means an executor is present but its evidence
 is stale. Both retain the existing unknown-health phase, show the actual last-check

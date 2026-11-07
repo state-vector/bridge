@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ExecutorReadinessSchema } from "./executor-readiness.ts";
 
 const attempt = { task_id: z.string(), generation: z.number(), attempt_id: z.string(), session: z.string(),
   phase: z.enum(["running", "restoring", "stopping"]), lease_until: z.number(), action_deadline: z.number(), task_status: z.string() };
@@ -27,6 +28,7 @@ export const WorkerStatusSchema = z.object({
   reason: z.string(), active: z.number(), reserved: z.number(), capacity: z.number(),
   // Optional only for a rolling deployment from the older aggregate-only publisher.
   occupancy: WorkerOccupancySchema.optional(),
+  readiness: ExecutorReadinessSchema.optional(),
 });
 export type WorkerStatus = z.infer<typeof WorkerStatusSchema>;
 

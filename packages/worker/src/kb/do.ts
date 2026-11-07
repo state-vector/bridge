@@ -451,7 +451,9 @@ import {
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "./review-query";
+import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
+import type { ExecutorReadiness } from "@bridge/contracts";
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
@@ -627,6 +629,7 @@ export class KnowledgeHub {
   }
 
   private broadcastEvent(ev: unknown) {
+    if (this.laneTransactionFrames) { this.laneTransactionFrames.push(ev); return; }
     const frame = JSON.stringify({ type: "kb.event", event: ev });
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(frame); } catch { this.wsSendFail++; /* hibernated client gone — counted (BR#4212) */ }
@@ -1637,7 +1640,7 @@ export class KnowledgeHub {
     const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
     switch (atom.kind) {
       case "lane_health": {
-        const row = this.one(`SELECT meta FROM artefacts WHERE json_extract(meta,'$.lane.repo')=? AND json_extract(meta,'$.lane.base')=? LIMIT 1`, atom.repo, atom.base ?? "main");
+        const row = this.one(`SELECT id,meta FROM lane_cards WHERE json_extract(meta,'$.lane.repo')=? AND json_extract(meta,'$.lane.base')=? LIMIT 1`, atom.repo, atom.base ?? "main");
         const m = JSON.parse(String(row?.meta ?? "{}"));
         if (!m.lane?.queue_facts?.base_state) return { ok: false, receipt: `${atom.repo}@${atom.base ?? "main"} has no observed deployment health` };
         const observation = DeployObservationSchema.safeParse(m.lane?.deploy_observation);
@@ -2681,7 +2684,7 @@ export class KnowledgeHub {
        WHERE a.type IN ('task','question')
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END ASC, a.updated_ts DESC
        LIMIT 250`,
-    ).toArray().map((t: any) => ({ ...t, meta: JSON.parse(t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    ).toArray().map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // One bounded JSON parameter avoids the runtime's SQL variable ceiling on
     // full (250-card) snapshots without loading every historical execution.
     const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, JSON.stringify(tasks.map(task => String(task.id)))).toArray() : [];
@@ -2795,10 +2798,10 @@ export class KnowledgeHub {
       const readiness = this.executorReadiness(tokenId, host, capabilities, now);
       const usable = [capabilities, ...capabilities.alternatives].some(model => model.availability.kind === "usable");
       const state = now - Number(row.observed_ts) >= 120_000 ? "offline"
-        : readiness.kind === "draining" ? "draining"
+        : readiness.kind === "draining" || readiness.kind === "updating" ? "draining"
         : readiness.kind !== "ready" || !usable || capabilities.capacity <= 0 ? "unavailable"
         : occupancy.active + occupancy.reserved >= capabilities.capacity ? "busy" : "ready";
-      return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, ...occupancy, capacity: capabilities.capacity,
+      return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, readiness, ...occupancy, capacity: capabilities.capacity,
         reason: state === "offline" ? "Worker heartbeat is stale." : readiness.kind !== "ready" ? readiness.reason
           : !usable ? [capabilities, ...capabilities.alternatives].map(c => c.availability.kind === "unavailable" ? c.availability.reason : "").find(Boolean) || "No configured model is usable."
           : capabilities.capacity <= 0 ? "No worker slots configured."
@@ -3426,10 +3429,14 @@ export class KnowledgeHub {
       `ALTER TABLE ws_tokens ADD COLUMN principal TEXT`, // BR#3787: principal→ws for the agent-plane repair route
       `ALTER TABLE sessions ADD COLUMN kind TEXT`,
       `ALTER TABLE sessions ADD COLUMN worktree TEXT`, // BR#3204: where the session's tree lives — board collision visibility
+      `ALTER TABLE lane_state ADD COLUMN lane_id TEXT`,
+      `ALTER TABLE lane_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
     this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(LANE_VIEW_SQL);
 
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
     this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
@@ -4740,6 +4747,7 @@ export class KnowledgeHub {
     // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    if (metaDel.includes(LANE_REVISION) || body.meta && Object.hasOwn(body.meta, LANE_REVISION)) throw new Error("gate: lane revisions are owned by canonical persistence");
     if (["review_result", "execution_review_of", "review_subject", "work_revision", "human_delivery_approval"].some(k => metaDel.includes(k)
       || (body.meta && Object.hasOwn(body.meta, k) && JSON.stringify(body.meta[k]) !== JSON.stringify(preMeta[k]))))
       throw new Error("gate: review results and subject bindings are owned by the review lifecycle, not metadata updates");
@@ -4793,7 +4801,8 @@ export class KnowledgeHub {
       const lost = trainLegs(preMeta).filter(l => !retained.has(`${l.repo}#${l.number}`) && !this.one(`SELECT merge_sha FROM provenance WHERE repo=? AND pr=?`, l.repo, l.number) && !this.one(`SELECT receipt FROM delivery_pr_outcomes WHERE repo=? AND pr=? AND state IN ('CLOSED','MERGED')`, l.repo, l.number));
       if (lost.length) throw new Error("gate: PR delivery bindings cannot be removed by metadata edits; transfer or close through the delivery disposition lifecycle");
     }
-    const meta = JSON.stringify(metaObj);
+    const publicMeta = { ...metaObj }; delete publicMeta[LANE_REVISION];
+    const meta = JSON.stringify(publicMeta);
     if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
     const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
     // roles replacement semantics, same as tags (explicit array = replace)
@@ -4806,10 +4815,16 @@ export class KnowledgeHub {
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);
     // update does not touch status — transitions are the only status path
-    this.state.storage.sql.exec(
-      `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
-      title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
-    );
+    this.atomicLaneMutation(() => {
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
+        title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
+      );
+      if (preMeta.lane || metaObj.lane) {
+        if (!laneOfMeta(metaObj)) throw new Error("gate: preserve lane identity; retire the lane through its lifecycle");
+        this.saveLaneState(id, metaObj, Date.now());
+      }
+    });
     // BR#5807: meta key changes ride the audit trail — a meta SHRINK (deleted
     // keys) is exactly the silent-amputation class, so the history line names
     // what was set and what was removed instead of a bare "updated meta".
@@ -5269,20 +5284,14 @@ export class KnowledgeHub {
     }
   }
 
-  private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number):
-    | { kind: "ready"; worker_id: string; fingerprint: string }
-    | { kind: "unprovisioned"; reason: string }
-    | { kind: "cooldown"; reason: string; until_ts: number }
-    | { kind: "repair_required" | "draining"; reason: string } {
+  private executorReadiness(tokenId: string, host: string, capabilities: ExecutorCapabilities, now: number): ExecutorReadiness {
     const control = this.one(`SELECT mode,reason FROM gateway_dispatch_control WHERE token_id=?`, tokenId);
-    if (control?.mode === "draining") return { kind: "draining", reason: String(control.reason) };
     const worker = capabilities.worker;
     if (worker.kind !== "provisioned" || !worker.label.startsWith(`${host}/`)) return { kind: "unprovisioned", reason: "Provision the gateway's canonical worker credential before claiming work" };
     const child = this.one(`SELECT id, tags FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`, worker.label);
     if (!child || tagsSayGateway(parseTags(child.tags))) return { kind: "unprovisioned", reason: "Worker credential is missing, revoked or the wrong class" };
     const fingerprint = executorStartupFingerprint(String(child.id), capabilities.config_revision);
     const pause = this.one(`SELECT until_ts,reason FROM executor_claim_pauses WHERE token_id=?`, tokenId);
-    if (pause && pause.until_ts > now) return { kind: "cooldown", until_ts: pause.until_ts, reason: pause.reason };
     const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
     const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
     const barrier = previous?.fingerprint === fingerprint ? recoverResourceStartBarrier(previous, now) : previous;
@@ -5296,6 +5305,9 @@ export class KnowledgeHub {
       if (barrier.kind === "repair_required") return { kind: "repair_required", reason: barrier.reason };
       if (barrier.until_ts > now) return { kind: "cooldown", until_ts: barrier.until_ts, reason: barrier.reason };
     }
+    if (control?.mode === "draining") return { kind: "draining", reason: String(control.reason) };
+    if (pause && pause.until_ts > now) return { kind: "paused", until_ts: Number(pause.until_ts), reason: String(pause.reason) };
+    if (capabilities.admission_hold) return { kind: "updating", reason: capabilities.admission_hold.reason };
     return { kind: "ready", worker_id: String(child.id), fingerprint };
   }
 
@@ -5462,7 +5474,7 @@ export class KnowledgeHub {
       const readiness = obsoleteInventory ? { kind: "repair_required" as const, reason: "A scoped-inventory runner has adopted this gateway; upgrade this obsolete producer before new claims" } : body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
         ? this.executorReadiness(tokenId, actor, command.capabilities, now)
         : { kind: "unprovisioned" as const, reason: "Upgrade to the worker-ready runner protocol before claiming work" };
-      const keepReady = obsoleteInventory || (readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
+      const keepReady = obsoleteInventory || (!command.capabilities.admission_hold && readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
         && this.executorReadiness(tokenId, actor, ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)), now).kind === "ready");
       // An obsolete GUI can drain existing work, but cannot overwrite the live
       // readiness of a corrected runner or borrow its proof to claim a card.
@@ -6537,7 +6549,7 @@ export class KnowledgeHub {
       { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
       this.ruleCtx(row, body, id, tTags, actor),
     );
-    const freshClaim = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+    const freshClaim = this.one(`SELECT id,status,owner,meta FROM artefacts WHERE id=?`, id);
     if (freshClaim.status !== row.status || freshClaim.owner !== row.owner || JSON.parse(freshClaim.meta ?? "{}").session !== JSON.parse(row.meta ?? "{}").session
       || JSON.parse(freshClaim.meta ?? "{}").work_revision !== JSON.parse(row.meta ?? "{}").work_revision
       || JSON.stringify(this.startupWait(id)) !== JSON.stringify(startupAtStart)
@@ -6890,8 +6902,11 @@ export class KnowledgeHub {
       rebound = { id: String(parent.id), meta: pm };
     }
     if (terminalStartup) delete meta.startup_wait;
-    this.state.storage.transactionSync(() => {
-      if (rebound) this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(rebound.meta), ts, rebound.id);
+    this.atomicLaneMutation(() => {
+      if (rebound) {
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(rebound.meta), ts, rebound.id);
+        if (laneOfMeta(rebound.meta)) this.saveLaneState(rebound.id, rebound.meta, ts);
+      }
       if (row.type === "task" && verdict.status === "superseded") {
         const replacement = String(body.replacement_id ?? "");
         this.conserveDelivery(row, replacement, true);
@@ -6902,7 +6917,7 @@ export class KnowledgeHub {
         }
       }
       if (row.type === "task" && ["todo", "blocked"].includes(row.status) && verdict.status === "in_progress") {
-        const current = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+        const current = this.one(`SELECT id,status,owner,meta FROM artefacts WHERE id=?`, id);
         if (current.status !== row.status || current.owner !== row.owner || current.meta !== row.meta) throw new Error("gate: claim changed during scheduling; preserve the current executor");
         // The lifecycle awaits evidence/session lookups. Re-evaluate execution
         // prerequisites at the write boundary, not just at HTTP ingress.
@@ -6942,6 +6957,9 @@ export class KnowledgeHub {
         `UPDATE artefacts SET status = ?, status_ts = ?, meta = ?, updated_ts = ?, owner = ?, tags = ?, body_md = ? WHERE id = ?`,
         verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
       );
+      // A lane lifecycle change shares the canonical write boundary. Historical
+      // retired predecessors must never rebind a successor's authority.
+      if (laneOfMeta(meta) && (!terminalStartup || this.laneStore().operational(id))) this.saveLaneState(id, meta, ts);
       if (row.type === "task" && verdict.status === "done" && tRoles.includes("review")) {
         this.persistDeliveryAdmission(id, reviewResult, actor, ts);
       }
@@ -10549,6 +10567,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    * Authenticated executors report GitHub facts; the hub owns every decision.
    * This never merges, clears stops, or grants a bypass. */
   private async trainRecoveryEvent(body: unknown, actor: string): Promise<unknown> {
+    return this.atomicLaneMutation(() => this.applyTrainRecoveryEvent(body, actor));
+  }
+  private applyTrainRecoveryEvent(body: unknown, actor: string): unknown {
     const cmd = RecoveryCommandSchema.parse(body);
     if (!isValidGitHubRepo(cmd.repo)) throw new Error("recovery requires a valid repository");
     const row = this.laneRow(laneKey(cmd.repo, cmd.base));
@@ -10650,7 +10671,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const repair = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
     const repairMeta = JSON.parse(repair?.meta ?? "{}");
     if (!repairMeta.root_fix && !repairMeta.recovery_links) return;
-    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
+    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
     const now = Date.now();
     for (const row of rows) {
       const meta = JSON.parse(String(row.meta ?? "{}"));
@@ -10736,7 +10757,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const failing = Array.isArray(effective.red) ? effective.red : [];
       const repairId = await this.ensureRootFixCard({ repo, base, sha: observation.tip_sha, failing,
         why: `Decisive deployment failed at ${observation.tip_sha.slice(0, 9)}`, actor, now, laneId: row.id, culpritId: null, pr: null });
-      const receiptMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, row.id)?.meta ?? "{}");
+      const receiptMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, row.id)?.meta ?? "{}");
       const knownEpisodes = RecoveryLedgerSchema.parse(receiptMeta.lane?.recovery_episodes ?? {});
       const specificRepair = Object.values(knownEpisodes).some((e) => e.head_sha === observation.tip_sha && e.cause.kind !== "check_failure" && recoveryIsOpen(e));
       const latestTipRun = [...observation.runs].filter((r) => r.head_sha === observation.tip_sha && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
@@ -10747,7 +10768,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const run = observation.runs.find((r) => r.id === failure.run_id);
         if (!run || !repairId) continue;
         const cause = failure.cause ?? { kind: "check_failure" as const, check: failure.name };
-        const current = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, row.id)?.meta ?? "{}");
+        const current = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, row.id)?.meta ?? "{}");
         const existing = RecoveryLedgerSchema.parse(current.lane?.recovery_episodes ?? {});
         if (cause.kind === "check_failure" && Object.values(existing).some((e) => e.head_sha === observation.tip_sha && e.cause.check === cause.check && e.cause.kind !== "check_failure" && recoveryIsOpen(e))) continue;
         await this.trainRecoveryEvent({ repo, base, head_sha: observation.tip_sha, cause,
@@ -10762,7 +10783,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   private laneRow(laneKeyValue: string): any {
     return this.one(
-      `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM artefacts
+      `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM lane_cards
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
        ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END ASC, created_ts DESC
        LIMIT 1`,
@@ -10776,7 +10797,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  history goes dark. */
   private laneTerminalRows(laneKeyValue: string): any[] {
     return (this.state.storage.sql.exec(
-      `SELECT id, status, title, meta, status_ts FROM artefacts
+      `SELECT id, status, title, meta, status_ts FROM lane_cards
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
        ORDER BY created_ts ASC`,
       laneKeyValue,
@@ -10836,7 +10857,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         }
         if (!live) {
           live = this.one(
-            `SELECT id FROM artefacts
+            `SELECT id FROM lane_cards
              WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
              ORDER BY created_ts DESC LIMIT 1`,
             key,
@@ -10880,7 +10901,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const vol = { currently: tm.currently ?? null, stop: tm.stop ?? null, bypass_wait: tm.bypass_wait ?? null };
         if (!vol.currently && !vol.stop && !vol.bypass_wait) continue;
         const liveRow = this.one(
-          `SELECT id, meta FROM artefacts
+          `SELECT id, meta FROM lane_cards
            WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
            ORDER BY created_ts DESC LIMIT 1`,
           key,
@@ -10891,11 +10912,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         for (const [k2, v] of Object.entries(vol)) {
           if (v && !patched[k2]) patched[k2] = v;
         }
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(patched), liveRow.id);
-        for (const [k2, v] of Object.entries(vol)) {
-          if (v) tm[k2] = null;
-        }
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(tm), t.id);
+        this.atomicLaneMutation(() => {
+          this.saveLaneState(liveRow.id, patched, Date.now());
+          for (const [k2, v] of Object.entries(vol)) {
+            if (v) tm[k2] = null;
+          }
+          delete tm[LANE_REVISION];
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(tm), t.id);
+        });
         this.audit(actor, "lane_rebound", liveRow.id, {
           lane: key, from_terminal: t.id,
           migrated: Object.entries(vol).filter(([, v]) => !!v).map(([k2]) => k2),
@@ -11227,12 +11251,28 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     return reason;
   }
 
-  /** BR#6012: single atomic persistence point for a merge lane's state.
-   *  Writes both `artefacts.meta` AND the canonical `lane_state` SQLite row
-   *  unconditionally, eliminating the split-brain where mutations were dropped
-   *  in memory whenever `meta.blocked.reason` stayed constant. */
+  private canonicalLaneStore: LaneStore | null = null;
+  private laneTransactionFrames: unknown[] | null = null;
+  private laneStore(): LaneStore {
+    return this.canonicalLaneStore ??= new LaneStore(this.state.storage, action => this.atomicLaneMutation(action));
+  }
+  /** Receipt/state/card writes commit before an observer can see their frames.
+   * Nested machinery calls share the same SQLite transaction and event outbox. */
+  private atomicLaneMutation<T>(action: () => T): T {
+    if (this.laneTransactionFrames) return action();
+    this.laneTransactionFrames = [];
+    let result: T;
+    try { result = this.state.storage.transactionSync(action); }
+    catch (error) { this.laneTransactionFrames = null; this._lastMutation = null; throw error; }
+    const frames = this.laneTransactionFrames;
+    this.laneTransactionFrames = null;
+    for (const frame of frames) this.broadcastEvent(frame);
+    return result;
+  }
+
+  /** Versioned lane_state is authoritative; the card is an atomic rolling-
+   * compatibility projection. A stale snapshot cannot overwrite a newer one. */
   private saveLaneState(laneId: string, meta: any, now: number): LaneOperationalState | null {
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, laneId);
     const lane = laneOfMeta(meta);
     if (!lane) return null;
     const opState = resolveLaneOperationalState({
@@ -11241,25 +11281,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       currently: meta.currently ?? null,
       now,
     });
-    const lease: TrainLease | null = meta.lease ?? null;
-    const key = laneKey(lane.repo, lane.base);
-    this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO lane_state (
-         lane_key, repo, base, phase, lease_holder, lease_heartbeat_ts, lease_expires_ts,
-         last_capable_ts, last_capable_holder, state_json, updated_ts
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      key,
-      lane.repo,
-      lane.base,
-      opState.phase,
-      lease?.holder ?? null,
-      lease?.heartbeat_ts ?? null,
-      lease?.expires_ts ?? null,
-      Number(meta.lane?.last_capable_lease_ts ?? 0) || null,
-      meta.lane?.last_capable_holder ? String(meta.lane.last_capable_holder) : null,
-      JSON.stringify(opState),
-      now,
-    );
+    this.laneStore().save(laneId, laneKey(lane.repo, lane.base), lane.repo, lane.base, meta, opState, now);
     return opState;
   }
 
@@ -11270,7 +11292,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  incident — the red line is, and that lives in the stopped flow). */
   private async trainWatchSweep(now: number): Promise<void> {
     const rows = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
+      `SELECT id, status, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const r of rows) {
       try {
@@ -11284,7 +11306,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           const holder = lease!.holder;
           meta.lease = null;
           const reason = this.laneSyncReason(r.id, meta, now);
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, r.id);
+          this.saveLaneState(r.id, meta, now);
           this.audit("system:merge-train", "lease_lapsed", r.id, { holder, expired_at: new Date(lease!.expires_ts).toISOString(), reason });
           this.version(r.id, "system:merge-train", "lease_lapsed", `lease of ${holder} lapsed — ${reason}`, {});
         } else if (meta.blocked?.reason === "merge-train: leased by ..." || !meta.blocked?.reason?.startsWith("merge-train:")) {
@@ -11311,6 +11333,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (!action) throw new Error("action must be acquire | renew | release");
     const holder = String(body.holder ?? actor).trim() || actor;
     const lane = await this.laneEnsure(repo, base, actor);
+    const outcome = this.atomicLaneMutation(() => {
     const meta = JSON.parse(lane.meta ?? "{}");
     const now = Date.now();
     const decided = leaseDecide(meta.lease ?? null, now, holder, action);
@@ -11328,11 +11351,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         const proofNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
         meta.lease = null; // expire — takeover within one tick
         meta.zombie = { holder, at: now, age_ms: progress.stale_ms, queue_len: queue.length, last_progress: proofNote };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
         const reason = this.laneSyncReason(lane.id, meta, now);
         this.audit(actor, "train:lease_evicted", lane.id, { lane: laneKey(repo, base), holder, stale_ms: progress.stale_ms, queue_len: queue.length, reason });
         this.version(lane.id, actor, "train:lease_evicted", `renewal denied — ${progress.reason}`, { lease: null, zombie: meta.zombie, reason });
-        throw Object.assign(new Error(progress.reason), { lease_conflict: true });
+        return { phase: "evicted" as const, error: Object.assign(new Error(progress.reason), { lease_conflict: true }) };
       }
       if (progress.verdict === "unknown" && queue.length > 0) {
         this.audit(actor, "train:lease_renew_no_progress_proof", lane.id, { lane: laneKey(repo, base), holder, queue_len: queue.length, note: "legacy renewal carries no progress payload — allowed (deprecation window, BR#4129)" });
@@ -11396,14 +11418,15 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     }
     const reason = this.laneSyncReason(lane.id, meta, now);
-    // BR#5114 + BR#6012: laneSyncReason persists only on a reason CHANGE —
-    // while meta.stop is set (or on re-acquire with an unchanged reason),
-    // meta.lease, meta.lane.last_capable_lease_ts, and now_action still
-    // change every lease op, so ALWAYS persist meta explicitly here.
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    // State, reason and lease receipt share this transaction; no mirror-only
+    // write or derived-string save gate is an alternate authority.
     this.audit(actor, `train:lease_${action}`, lane.id, { lane: laneKey(repo, base), note: decided.note });
     this.version(lane.id, actor, `train:lease_${action}`, decided.note, { lease: meta.lease, reason });
-    return { ok: true, lane: laneKey(repo, base), lease: meta.lease, currently: meta.currently ?? null, stop: meta.stop ?? null, reason, note: decided.note };
+    return { phase: "committed" as const, result: { ok: true, lane: laneKey(repo, base), lease: meta.lease, currently: meta.currently ?? null, stop: meta.stop ?? null, reason, note: decided.note } };
+    });
+    // An eviction is a committed state transition even though renewal is denied.
+    if (outcome.phase === "evicted") throw outcome.error;
+    return outcome.result;
   }
 
   /** Resolve the delivery chain for a queued/landed PR — task, verdict
@@ -11778,7 +11801,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.audit(actor, "train:starvation_cleared", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha.slice(0, 9), prev_since: prevStarv.since ?? null, ask_id: prevStarv.ask_id ?? null, duty_id: prevStarv.duty_id ?? null });
       }
       const reason = this.laneSyncReason(lane.id, meta, now);
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+      this.saveLaneState(lane.id, meta, now);
       ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}), ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) }, chain.task_id, mergedAt);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
@@ -12817,7 +12840,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       const boundExceeded = now - Number(meta.currently?.merged_at ?? now) > TRAIN_CI_BOUND_MULTIPLIER * ((laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000);
       const edge = trainLandedCloseEdge({ breach_class: klass, failures, bound_exceeded: boundExceeded });
       meta.currently = { ...meta.currently, landed_close: { failures, breach_class: klass, last_error: error.slice(0, 300), first_failed_at: Number(prev.first_failed_at ?? now), last_failed_at: now } };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), lane.id);
+      this.saveLaneState(lane.id, meta, now);
       const reason = this.laneSyncReason(lane.id, meta, now);
       if (edge.edge === "retry") {
         // loud per tick — the audit IS the log; the version fires once so
@@ -12968,7 +12991,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           delete meta.lane.queue_facts.base_state;
         }
         const reason = this.laneSyncReason(lane.id, meta, now);
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+        this.saveLaneState(lane.id, meta, now);
         this.audit(actor, "train:line_green_ci", lane.id, { lane: laneKey(repo, base), sha: clearedSha.slice(0, 9), reason });
         this.version(lane.id, actor, "train:line_green", `line green again — required workflows settled green on ${clearedSha.slice(0, 9)}; stop cleared`, { stop: null, reason });
         return { ok: true, decided: "line_green", lane: laneKey(repo, base), sha: clearedSha, stop: null, reason };
@@ -13004,7 +13027,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ancestorsStamped = true;
     }
     if (burstFlipped || ancestorsStamped) {
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+      this.saveLaneState(lane.id, meta, now);
       this.audit(actor, burstFlipped ? "train:burst_settle_begin" : "train:burst_ancestors", lane.id, {
         lane: laneKey(repo, base),
         merged: Number(meta.currently.burst_merged ?? 0),
@@ -13111,7 +13134,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       ...args.phantoms,
     ])];
     meta.lane = { ...(meta.lane ?? {}), phantom_required: stamped };
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    this.saveLaneState(lane.id, meta, now);
     this.audit(actor, "train:phantom_required_stamped", lane.id, { lane: laneKey(args.repo, args.base), phantom_required: stamped });
     try {
       await this.askCreate(
@@ -13258,7 +13281,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         }
       }
     }
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now, lane.id);
+    this.saveLaneState(lane.id, meta, now);
     const stepsShown = Object.entries(stop.bisect.steps ?? {}).map(([s, v]: [string, any]) => `${s.slice(0, 9)}=${typeof v === "object" ? v.verdict : v}`).join(", ") || "none";
     this.audit(actor, "train:bisect", lane.id, {
       lane: laneKey(repo, base),
@@ -13426,10 +13449,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // Recovery task creation awaits; re-read before persisting the enriched
     // projection so a concurrent lease/event mutation is never overwritten.
     if (entriesArr.some(e => e.repair_task)) {
-      const freshMeta = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id=?`, lane.id)?.meta ?? "{}"));
+      const freshMeta = JSON.parse(String(this.one(`SELECT id,meta FROM lane_cards WHERE id=?`, lane.id)?.meta ?? "{}"));
       if (freshMeta.lane?.queue_facts?.at === meta.lane.queue_facts.at) {
         freshMeta.lane.queue_facts.entries = entriesArr;
         this.saveLaneState(lane.id, freshMeta, Date.now());
+        for (const key of LANE_RUNTIME_KEYS) delete meta[key];
+        Object.assign(meta, freshMeta);
+      } else {
+        return this.trainStatus({ repo }); // newer facts own the continuation
       }
     }
     if (deployCov?.phase === "uncovered_dispatched" && deployCov.tip_sha !== prevDispatchedSha) {
@@ -13465,7 +13492,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const ackBypass = String(body.bypass_consumed ?? "").trim();
     const ackRerun = String(body.rerun_consumed ?? "").trim();
     if (ackBypass || ackRerun) {
-      const laneM = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+      const laneM = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
       let changed = false;
       if (ackBypass && laneM.lane?.bypass_merge) {
         delete laneM.lane.bypass_merge;
@@ -13479,7 +13506,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         this.version(lane.id, actor, "update", `re-run stamp consumed (${ackRerun}) — the failing checks were re-run`, {});
         this.audit(actor, "train:rerun_consumed", lane.id, { outcome: ackRerun });
       }
-      if (changed) this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneM), Date.now(), lane.id);
+      if (changed) this.saveLaneState(lane.id, laneM, Date.now());
     }
     const tipShaForRed = typeof baseState?.tip_sha === "string" ? baseState.tip_sha.trim() : "";
     if (
@@ -13590,7 +13617,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         actor,
       );
     } else if (baseState && meta.lane?.dark_tip && (!darkTipCov || String(baseState.verdict ?? "") !== "empty")) {
-      const freshLane = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+      const freshLane = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
       const ep = freshLane.lane?.dark_tip;
       if (ep) {
         delete freshLane.lane.dark_tip;
@@ -14022,7 +14049,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     //    PR — the human clicked DECLINE ("hold the line"); the same episode
     //    on the same PR must not re-ask. A different cure PR or a different
     //    red set (different title) re-arms the gate.
-    const laneMetaRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id) as any;
+    const laneMetaRow = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id) as any;
     const lm = laneMetaRow ? JSON.parse(laneMetaRow.meta ?? "{}") : {};
     const pendingBypass = lm.lane?.bypass_merge ?? null;
     const declinedStamp = lm.lane?.base_red_ask_declined ?? null;
@@ -14110,12 +14137,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const held = entriesArr.length;
     const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const askTitle = trainGateBlockedAskTitle({ repo, base }, gateReds.map((r: { name: string }) => r.name));
-    let meta: any = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    let meta: any = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     let ep = meta.lane?.gate_blocked ?? null;
     if (!ep) {
       ep = { since: Date.now(), ask_id: null as string | null, duty_id: null as string | null };
       meta.lane = { ...(meta.lane ?? {}), gate_blocked: ep };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), lane.id);
+      this.saveLaneState(lane.id, meta, Date.now());
       this.audit(actor, "train:gate_blocked_episode", lane.id, {
         lane: `${repo}@${base}`,
         held,
@@ -14189,7 +14216,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     ep.ask_id = null;
     // persist the episode's ask/duty ids (re-read meta first — the ask/duty
     // writes above may have bumped the row)
-    meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    meta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     if (meta.lane?.gate_blocked && (meta.lane.gate_blocked.ask_id !== ep.ask_id || meta.lane.gate_blocked.duty_id !== ep.duty_id)) {
       // ask/duty ids change only when re-derived; write once when they differ
       meta.lane.gate_blocked.ask_id = null;
@@ -14216,7 +14243,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const askTitle = trainDarkTipAskTitle({ repo, base }, coverage.tip_sha);
     const brief = trainDarkTipAskBrief({ lane: { repo, base }, held, alarm, coverage });
-    let meta: any = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    let meta: any = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     let ep = meta.lane?.dark_tip ?? null;
     if (!ep || ep.sha !== coverage.tip_sha) {
       ep = {
@@ -14246,7 +14273,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (existing) this.cancelRequest(String(existing.id), "Bridge owns deployment investigation. No human decision has been identified.", "system:recovery");
     ep.ask_id = null;
     ep.duty_id = await this.ensureTaskRecovery(lane.id, "execution_environment");
-    meta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
+    meta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id)?.meta ?? "{}") ?? {};
     meta.lane = {
       ...(meta.lane ?? {}),
       dark_tip: {
@@ -14344,7 +14371,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // Write episode stamp BEFORE awaits so concurrent callers (train.status + alarm sweep) never double-fire
         meta.lane = { ...(meta.lane ?? {}), starvation: ep, starved_since: meta.lane?.starved_since ?? since };
         meta.starvation = ep;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+        this.saveLaneState(l.id, meta, now0);
 
         const baseState: any = meta.lane?.queue_facts?.base_state ?? null;
         const baseVerdict = String(baseState?.verdict ?? "unknown");
@@ -14437,7 +14464,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         ep.ask_id = null; // the diagnostic duty owns investigation; no human decision
         meta.lane = { ...(meta.lane ?? {}), starvation: ep, starved_since: meta.lane?.starved_since ?? since };
         meta.starvation = ep;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+        this.saveLaneState(l.id, meta, now0);
         return { ...ep, mins, kind: "merge_starved" };
       }
       if (existingEp.ask_id) {
@@ -14471,7 +14498,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       : null;
     if (starved && !meta.lane?.starved_since) {
       meta.lane = { ...(meta.lane ?? {}), starved_since: starved.since };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+      this.saveLaneState(l.id, meta, now0);
       this.audit("system:train", "lane.starved", l.id, {
         lane: `${lane.repo}@${lane.base}`, queue_len: queue.length,
         starved_mins: starved.mins, starved_since: starved.since,
@@ -14505,7 +14532,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       }
     } else if (!starved && meta.lane?.starved_since && !meta.lane?.starvation) {
       meta.lane = { ...(meta.lane ?? {}), starved_since: null };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+      this.saveLaneState(l.id, meta, now0);
     }
     return starved;
   }
@@ -14519,7 +14546,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // in the loop below (status selected for the guard); a reseeded lane
     // alarms once, on its live card, not per duplicate card.
     const lanes = this.state.storage.sql.exec(
-      `SELECT id, status, status_ts, created_ts, project, meta FROM artefacts
+      `SELECT id, status, status_ts, created_ts, project, meta FROM lane_cards
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const l of lanes) {
@@ -14628,7 +14655,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    * Join the recorded alarm episode to its exact old template, not a general
    * title classifier. No user-authored decision is cancelled by this migration. */
   private retireLegacyRecoveryRequests(): void {
-    const lanes = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`).toArray();
+    const lanes = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`).toArray();
     for (const lane of lanes) {
       const meta = JSON.parse(String(lane.meta ?? "{}"));
       let changed = false;
@@ -14998,7 +15025,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    * this repairs missing ownership and escalates only after bounded attempts. */
   private async ensureLineRecovery(laneId: string, line: TrainLineProjection, now: number): Promise<TrainLineProjection> {
     if (!line.blocker) {
-      const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneId);
+      const row = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, laneId);
       const m = JSON.parse(row?.meta ?? "{}");
       const askId = m.lane?.line_recovery_ask_id;
       if (askId) {
@@ -15010,7 +15037,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       return line;
     }
     if (line.phase === "ready" || line.phase === "retired" || line.phase === "working" || line.remediation?.kind !== "attention") return line;
-    const lane = this.one(`SELECT meta FROM artefacts WHERE id = ?`, laneId);
+    const lane = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, laneId);
     const meta = JSON.parse(lane?.meta ?? "{}");
     const cfg = laneOfMeta(meta);
     if (!cfg) return line;
@@ -15439,7 +15466,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const repo = darkTip[1];
       const base = darkTip[2] || "main";
       const laneRow = this.one(
-        `SELECT id, meta FROM artefacts
+        `SELECT id, meta FROM lane_cards
          WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
            AND status NOT IN ('done', 'superseded') LIMIT 1`,
         laneKey(repo, base),
@@ -15486,7 +15513,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const base = baseRed ? baseRed[2] : "main";
     if (!repo) return;
     const laneRow = this.one(
-      `SELECT id, meta FROM artefacts
+      `SELECT id, meta FROM lane_cards
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
          AND status NOT IN ('done', 'superseded') LIMIT 1`,
       laneKey(repo, base),
@@ -15537,7 +15564,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ...(laneMeta.lane ?? {}),
         bypass_merge: { repo, base, pr: bypassPr, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
       };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.saveLaneState(laneRow.id, laneMeta, now);
       this.version(laneRow.id, actor, "update", `bypass-merge authorized by ask ${askId} — ${repo}#${bypassPr} merges out of turn on the next tick (answer: "${ans.slice(0, 120)}")`, {});
       this.audit(actor, "train:bypass_merge_stamped", laneRow.id, { repo, base, pr: bypassPr, ask_id: askId });
     } else if (decline) {
@@ -15549,7 +15576,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ...(laneMeta.lane ?? {}),
         base_red_ask_declined: { repo, base, pr: declinedPr, ask_title: String(title ?? ""), ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
       };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.saveLaneState(laneRow.id, laneMeta, now);
       this.version(laneRow.id, actor, "update", `human gate DECLINED by ask ${askId} — the line holds; this episode's gate stays answered for ${repo}#${declinedPr || "?"} (no re-ask for 24h or until a different cure PR binds)`, {});
       this.audit(actor, "train:base_red_ask_declined", laneRow.id, { repo, base, pr: declinedPr, ask_id: askId });
     } else {
@@ -15557,7 +15584,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ...(laneMeta.lane ?? {}),
         rerun_failed: { repo, base, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
       };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(laneMeta), now, laneRow.id);
+      this.saveLaneState(laneRow.id, laneMeta, now);
       this.version(laneRow.id, actor, "update", `failed-check re-run authorized by ask ${askId} (answer: "${ans.slice(0, 120)}") — the executor re-runs the failing checks on the next tick`, {});
       this.audit(actor, "train:rerun_stamped", laneRow.id, { repo, base, ask_id: askId });
     }
@@ -15568,7 +15595,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const now0 = Date.now();
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
-      `SELECT id, title, status, meta, status_ts, updated_ts, project FROM artefacts
+      `SELECT id, title, status, meta, status_ts, updated_ts, project FROM lane_cards
        WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
        ORDER BY title`,
     ).toArray() as any[];
@@ -15578,7 +15605,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     // NO successor stays visibly retired (BR#4977 — the panel names why).
     const liveKeys = new Set(
       (this.state.storage.sql.exec(
-        `SELECT DISTINCT json_extract(meta, '$.lane.key') AS k FROM artefacts
+         `SELECT DISTINCT json_extract(meta, '$.lane.key') AS k FROM lane_cards
          WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
            AND status NOT IN ('done','superseded')`,
       ).toArray() ?? []).map((r: any) => String(r.k ?? "")),
@@ -16090,7 +16117,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             merged_at: now0,
           };
           this.laneSyncReason(l.id, meta, now0);
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), now0, l.id);
+          this.saveLaneState(l.id, meta, now0);
         }
         base_red_resolution = {
           verdict: brGateBlocked
@@ -16188,7 +16215,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           unblock: "restart the merge-train gateway/executor onto the current build",
         };
       }
-      const lane_state = resolveLaneOperationalState({
+      let lane_state = this.laneStore().operational(String(l.id)) ?? resolveLaneOperationalState({
         baseState: brQf?.base_state ?? null,
         stop: meta.stop ?? null,
         currently: meta.currently ?? null,
@@ -16225,11 +16252,12 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
       };
       let line = await this.ensureLineRecovery(l.id, projectedLine, now0);
-      const latestMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, l.id)?.meta ?? "{}");
+      const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
       line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })));
       latestMeta.lane = { ...latestMeta.lane, line };
       this.saveLaneState(l.id, latestMeta, now0);
+      lane_state = this.laneStore().operational(String(l.id)) ?? lane_state;
       // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued
       // PRs riding out their owner clock. `expired` + close_reason feed the
       // executor's gh close leg (the hub holds no VCS credentials — the
@@ -16952,7 +16980,12 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   // strict ratchet will want are deferred until that pass (BR#2505 guard landed
   // non-strict on purpose).
   private one(query: string, ...params: any[]): any {
-    return this.state.storage.sql.exec(query, ...params).toArray()[0] ?? null;
+    const row = this.state.storage.sql.exec(query, ...params).toArray()[0] ?? null;
+    if (row?.id && typeof row.meta === "string" && this.laneStore().isCanonicalCard(String(row.id))) {
+      const canonical = this.state.storage.sql.exec(`SELECT meta FROM lane_cards WHERE id=?`, String(row.id)).toArray()[0];
+      if (canonical) row.meta = canonical.meta;
+    }
+    return row;
   }
 
   /** BR#4262 render-time join, single-row form (shape()'s payloads: get, list,
@@ -16971,7 +17004,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   }
 
   private shape(row: any): any {
-    return { ...row, owner: this.displayOwner(row.owner), meta: JSON.parse(row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
+    return { ...row, owner: this.displayOwner(row.owner), meta: this.laneStore().publicMeta(String(row.id), row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
   }
 
   private json(obj: unknown, status = 200) {

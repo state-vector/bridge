@@ -1,10 +1,31 @@
 import { describe, expect, it } from "vitest";
 import { ExecutorCapabilitiesSchema, ExecutionRequirementsSchema, initialExecution, projectExecutionBlockers, reduceExecution } from "../src/index.ts";
+import type { ExecutorReadiness } from "../src/index.ts";
 
 const required = ExecutionRequirementsSchema.parse({ tier: "large", tools: ["cargo"], environment: ["dev-access"] });
 const capabilities = ExecutorCapabilitiesSchema.parse({ tier: "large", model: "test/large", tools: ["cargo"], environment: ["dev-access"], projects: ["bridge"] });
 const base = { id: "BR#1", project: "bridge", requirements: required, handoff: { phase: "none" as const }, hosts: [], asks: [], now: 200_000 };
 describe("composable execution blockers", () => {
+  const holds: Exclude<ExecutorReadiness, { kind: "ready" }>[] = [
+    { kind: "paused", reason: "Operator paused new claims", until_ts: 300_000 },
+    { kind: "updating", reason: "Controller update handoff" },
+    { kind: "cooldown", reason: "Transport retry backoff", until_ts: 300_000 },
+    { kind: "repair_required", reason: "Identity needs repair" },
+    { kind: "task_prerequisite", reason: "Repository input needs repair" },
+    { kind: "unprovisioned", reason: "Worker credential is absent" },
+    { kind: "draining", reason: "Gateway is retired from admission" },
+  ];
+  it.each(holds)("retains typed $kind readiness without inventing model absence or human action", readiness => {
+    const blockers = projectExecutionBlockers({ ...base, hosts: [{ host: "host", observed_at: base.now, active: 0, capabilities, readiness }] });
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0]).toMatchObject({ kind: "executor_not_ready", causes: [{ host: "host", readiness }], text: expect.stringContaining(readiness.reason) });
+  });
+  it("clears a held host blocker when another matching host is genuinely ready", () => {
+    expect(projectExecutionBlockers({ ...base, hosts: [
+      { host: "held", observed_at: base.now, active: 0, capabilities, readiness: holds[0] },
+      { host: "ready", observed_at: base.now, active: 0, capabilities, readiness: { kind: "ready", worker_id: "worker", fingerprint: "proof" } },
+    ] })).toEqual([]);
+  });
   it("distinguishes unconfigured, offline, unavailable and busy without downgrading or a human ask", () => {
     expect(projectExecutionBlockers(base)[0]).toMatchObject({ reason: "not_configured" });
     const host = { host: "host", capabilities, observed_at: 1, active: 0 };

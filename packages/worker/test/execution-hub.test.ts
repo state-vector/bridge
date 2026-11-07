@@ -190,7 +190,7 @@ describe("local handoff authority and lifecycle", () => {
     const pause = await r.command("pause-gateway", { kind: "pause_claims", reason: "Operator update drain", budget_ms: 60_000 });
     expect(pause.data.kind).toBe("claims_paused");
     const availability = await post<{ hosts: { host: string; readiness: { kind: string } }[] }>("execution", { ...auth, command_id: "paused-availability", command: { kind: "availability" } });
-    expect(availability.data.hosts.find(host => host.host === r.auth.actor)?.readiness.kind).toBe("cooldown");
+    expect(availability.data.hosts.find(host => host.host === r.auth.actor)?.readiness.kind).toBe("paused");
     const release = await post("execution", { ...auth, command_id: "drain-start", command: { kind: "start_failed", stage: "begin", reason: "gate: operator paused launch", retained_work: false, failure_class: "prerequisite" } });
     expect(release.data).toMatchObject({ kind: "released", barrier: null });
     expect((await r.command("resume-gateway", { kind: "resume_claims" })).data.kind).toBe("claims_resumed");
@@ -313,7 +313,9 @@ describe("durable executor on real SQLite", () => {
     const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], config_revision: "initial" };
     const cmd = (command_id: string, command: object) => post("execution", { ...auth, command_id, command });
     expect((await cmd("legacy", { kind: "advertise", capabilities })).data.ok).toBe(false);
-    expect((await cmd("unavailable", { kind: "availability" })).data.phase).toBe("unavailable");
+    const unprovisioned = await cmd("unavailable", { kind: "availability" });
+    expect(unprovisioned.data.phase).toBe("executor_not_ready");
+    expect(unprovisioned.data.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "executor_not_ready", causes: expect.arrayContaining([expect.objectContaining({ readiness: expect.objectContaining({ kind: "unprovisioned" }) })]) })]));
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/worker|readiness/);
     expect((await post("get", { id: task.id })).data.status).toBe("blocked"); // global policy exposes unavailable worker capacity
     await post("agent.provision", { label: `${host}/worker`, actor: host });

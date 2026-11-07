@@ -682,7 +682,7 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
                     update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
                 }
             }
-            if readiness.data.lock().map(|d| match &d.state { GatewayReadinessState::Ready(p) => p.observed.elapsed() < Duration::from_secs(60), GatewayReadinessState::Connected { observed } => observed.elapsed() < Duration::from_secs(60), _ => false }).unwrap_or(false) {
+            if readiness.data.lock().map(|d| d.state.connection_fresh(Duration::from_secs(60))).unwrap_or(false) {
                 update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
             }
             last_update_receipt = Instant::now();
