@@ -1,0 +1,4 @@
+[
+  { "phase": "complete" },
+  { "phase": "checking", "after_id": "BR#2" }
+]

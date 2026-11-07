@@ -212,6 +212,20 @@ export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
 ]);
 export type LaneOperationalState = z.infer<typeof LaneOperationalStateSchema>;
 
+/** Versioned canonical persistence envelope. Producer facts retain the rolling
+ * wire format; the operational lifecycle remains the closed union above. */
+export const LaneSnapshotSchema = z.object({
+  schema_version: z.literal(1), lane_id: z.string().min(1), revision: z.number().int().positive(),
+  operational: LaneOperationalStateSchema,
+  facts: z.object({
+    lane: z.looseObject({ key: z.string().min(1), repo: z.string().min(1), base: z.string().min(1) }),
+    lease: z.object({ holder: z.string().min(1), heartbeat_ts: z.number(), expires_ts: z.number() }).nullable().optional(),
+    currently: z.unknown().optional(), stop: z.unknown().optional(), bypass_wait: z.unknown().optional(),
+    zombie: z.unknown().optional(), blocked: z.unknown().optional(),
+  }),
+});
+export type LaneSnapshot = z.infer<typeof LaneSnapshotSchema>;
+
 // ---- BR#6330: one merge classification — the typed card phase is the single source ----
 
 /** The closed lifecycle of a card's merge-train slot, `meta.merge_train.state`.

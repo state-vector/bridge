@@ -2,7 +2,7 @@
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema, InteractiveClaimSchema,
   initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
-  availableModelTiers, nextAvailableTier,
+  availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker,
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
 import { gatewayOccupancy } from "./scheduling.ts";
@@ -140,7 +140,7 @@ export class ExecutionWork {
     const meta = JSON.parse(task?.meta ?? "{}");
     const fingerprint = task && proof.kind === "ready" ? startupPrerequisiteFingerprint(proof.fingerprint, { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } }) : "";
     return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint IN (?,?)`, id, host, proof.fingerprint, fingerprint)
-      ? { kind: "repair_required", reason: "This task's startup prerequisite requires changed executor/configuration proof" } : proof;
+      ? { kind: "task_prerequisite", reason: "This task's startup prerequisite requires changed executor/configuration proof" } : proof;
   }
   private startupWait(id: string) {
     const row = this.one<{ state: string }>(`SELECT state FROM executor_start_waits WHERE task_id=?`, id);
@@ -148,7 +148,7 @@ export class ExecutionWork {
   }
   availability(id: string) {
     const task = this.task(id); const blockers = this.blockers(task, Date.now());
-    const capability = blockers.find(b => b.kind === "capability_unavailable");
+    const capability = blockers.find(isExecutorAvailabilityBlocker);
     const state = this.state(task);
     const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
     const hosts = this.hosts(id).map(host => {
@@ -162,7 +162,7 @@ export class ExecutionWork {
     const startup_wait = this.startupWait(id);
     return { requirements, blockers, startup_wait, model_policy: this.modelPolicy(),
       next_available_tier: nextAvailableTier(state.attempt?.executor?.tier ?? state.requirements.tier, availableModelTiers(this.hosts(id), requirements, task.project, Date.now())),
-      phase: startup_wait ? "unavailable" : capability?.kind === "capability_unavailable" ? capability.reason
+      phase: startup_wait ? "unavailable" : capability?.kind === "capability_unavailable" ? capability.reason : capability?.kind === "executor_not_ready" ? "executor_not_ready"
       : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts };
   }
   private asks(id: string) {
@@ -194,7 +194,7 @@ export class ExecutionWork {
     // Its actual model remains unreported rather than borrowing the old runner's identity.
     return direct.success && ["in_progress", "in_review"].includes(task.status)
       && ownsInteractiveClaim(meta, direct.data.token_id, direct.data.session) && this.isInteractive(direct.data.token_id)
-      ? blockers.filter(b => b.kind !== "capability_unavailable" && b.kind !== "capacity_wait") : blockers;
+      ? blockers.filter(b => !isExecutorAvailabilityBlocker(b) && b.kind !== "capacity_wait") : blockers;
   }
   /** Reads compute fresh availability without persisting, claiming or granting. */
   read(raw: unknown, tokenId = "", session = "", human = false, attention = false) {
@@ -345,7 +345,7 @@ export class ExecutionWork {
       this.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), Date.now(), id);
       this.sweep(); return;
     }
-    if (this.blockers(task, Date.now()).some(b => b.kind === "capability_unavailable")) return;
+    if (this.blockers(task, Date.now()).some(isExecutorAvailabilityBlocker)) return;
     const meta: TaskMeta = JSON.parse(task.meta || "{}"); delete meta.blocked;
     this.sql.exec(`UPDATE artefacts SET status='in_progress',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), Date.now(), id);
     this.audit("system:local-answer", "local_execution_resumed", id, { session: state.handoff.phase === "accepted" ? state.handoff.session : "" });
@@ -368,7 +368,7 @@ export class ExecutionWork {
     const rows = first.length || !cursor ? first : batch(0);
     for (const task of rows) {
       const state = this.state(task); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now);
-      const unavailable = blockers.find(b => b.kind === "capability_unavailable");
+      const unavailable = blockers.find(isExecutorAvailabilityBlocker);
       const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
       let status = task.status;
       if (this.startupWait(task.id)) {

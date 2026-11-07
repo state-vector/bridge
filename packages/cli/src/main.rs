@@ -87,8 +87,19 @@ fn main() {
             if let Err(error) = dispatch::worker_entry(&path) { eprintln!("independent worker: {error}"); std::process::exit(1); }
         }
         "workers" => {
-            let stop = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("stop") => true, _ => { eprintln!("usage: bridge workers status|stop [BR#task]"); std::process::exit(2); } };
             let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found"); std::process::exit(1); });
+            if matches!(args.get(2).map(String::as_str), Some("reconcile-reservations" | "reconcile-stopped")) {
+                let mut apply=false; let mut task=None;
+                for arg in &args[3..] {
+                    if arg == "--apply" && !apply { apply=true; }
+                    else if arg.strip_prefix("BR#").is_some_and(|id| id.parse::<u64>().is_ok()) && task.is_none() { task=Some(arg.as_str()); }
+                    else { eprintln!("usage: bridge workers reconcile-reservations|reconcile-stopped [--apply] [BR#task]"); std::process::exit(2); }
+                }
+                let result = if args[2] == "reconcile-stopped" { dispatch::reconcile_stopped(&cfg,apply,task) } else { dispatch::reconcile_reservations(&cfg,apply,task) };
+                match result { Ok(value)=>println!("{}",serde_json::to_string_pretty(&value).unwrap()),Err(error)=>{eprintln!("local ownership recovery: {error}");std::process::exit(1);} }
+                return;
+            }
+            let stop = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("stop") => true, _ => { eprintln!("usage: bridge workers status|stop [BR#task]; bridge workers reconcile-reservations [--apply] [BR#task]"); std::process::exit(2); } };
             match dispatch::workers_command(&cfg, stop, args.get(3).map(String::as_str)) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workers: {error}"); std::process::exit(1); } }
         }
         "update" => {

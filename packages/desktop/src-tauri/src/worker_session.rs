@@ -42,9 +42,9 @@ enum State {
     Finished { owner: Ownership },
 }
 
-struct Lock(fs::File);
+pub(super) struct Lock(fs::File);
 impl Lock {
-    fn acquire(path: &Path) -> Result<Option<Self>, String> {
+    pub(super) fn acquire(path: &Path) -> Result<Option<Self>, String> {
         let mut options = fs::OpenOptions::new(); options.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
         let file = options.open(path).map_err(|e| e.to_string())?;

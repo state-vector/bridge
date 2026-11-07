@@ -19,8 +19,28 @@ Explicit stops remain fenced through handoff; an older health check cannot clear
 a newer update request.
 Interrupted manifest publication remains in launch-intent recovery without
 freezing unrelated work; corrupt published identities are retained for diagnosis.
+Held, never-launched reservations observe fresh authoritative claim facts on a
+bounded cadence and clear when that claim ends, without replaying rejected writes.
+Unknown writers and external effects remain protected, and rollback journal
+compatibility is preserved.
+An offline `bridge workers reconcile-reservations` recovery command supports
+older stuck controllers: controller-lock fenced, read-only by default, with
+explicit `--apply`, fresh claim rechecks and retained original-record archives.
+Only the controller is stopped; supervised workers continue independently.
+Confirmed stopped jobs use saved hub confirmations for the exact original server,
+session and attempt. The runner retains the original result and worktree location
+before archiving old ownership; uncertain outside actions stay protected and real
+captured results still need their normal delivery. An older stuck controller can
+use `bridge workers reconcile-stopped [BR#task]`: read-only by default, with an
+explicit `--apply`, the same controller lock, and fresh proof and record checks.
+A live worker lock prevents cleanup. Neither command marks tasks complete,
+removes worktrees, installs updates or changes update deadlines or health checks.
 
 ### Operational diagnostics
+
+Review carry checks fetch the lane base and use one fixed commit for both sides
+of the comparison. A stale or absent local `main` cannot make an unchanged rebase
+look like an authored change. Failed fetches and changed patches still prevent carry.
 
 Operational diagnostics are available on demand in the merge-train panel and
 through authenticated `/api/kb/diagnostics`: current request stages, bounded
@@ -29,6 +49,25 @@ read-only `npm run diagnose:hub -- --seconds 45` command summarizes live Cloudfl
 traffic without collecting credentials or payloads. Gateway renewals stay separate
 from bounded, fairly scheduled backlog maintenance. Paused or overdue health
 checks explain missing evidence and executor state rather than declaring main red.
+Maintenance yields between committed phases, and mutation acknowledgements do not
+run board aggregation synchronously. Indexed current-review lookups preserve exact
+review authority without repeatedly scanning unrelated retained history.
+Worker status distinguishes operator pauses, update handoffs, drains, cooldowns,
+task prerequisites and missing identity from missing models or occupied capacity.
+A verified connection can stay healthy through a pause or update hold while new
+claims remain stopped; real backend, transport and credential faults still fail
+health. Existing workers retain their control and result-delivery paths.
+Versioned lane snapshots are authoritative. Card metadata is an atomic compatibility
+projection, stale writers are rejected, and incident acceptance commits repair
+bindings and receipts together before notifying observers. Legacy lanes promote
+on their next machinery write; unsupported versions fail closed.
+Merge executors publish current-base health before deployment observations and
+candidate checks, so a stuck candidate cannot suppress newly observed main health.
+Backlog checks run in short steps with a saved position, so a failed lookup or
+one PR needing repair cannot discard other ready changes. The train rechecks
+review, tests and main health before each merge, checks GitHub after a lost
+merge reply, stops adding changes if main fails, and checks the deployment
+after each batch.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 

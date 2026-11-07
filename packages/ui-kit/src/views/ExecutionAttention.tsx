@@ -108,7 +108,7 @@ export function ExecutionAttentionCards({ data, changed, openTask }: { data: Exe
       <ul>{item.blockers.map(blocker => <li key={blocker.episode_id}>
         <strong>{blocker.kind === "local_pickup_required" ? "Blocked — pick up locally: " : blocker.kind === "human_answer_required" ? "Blocked — needs your decision: " : blocker.kind === "capacity_wait" ? "Waiting — capacity: " : "Blocked — "}</strong>
         {blocker.text}{blocker.kind === "human_answer_required" && <a href={`https://hub.fleetbridge.run/card/${blocker.ask_id.replace("#", "-")}`}> Open decision</a>}
-        {blocker.kind === "capability_unavailable" && blocker.evidence.length > 0 && <details><summary>Gateway/config evidence</summary><ul>{blocker.evidence.map(e => <li key={e}>{e}</li>)}</ul></details>}
+        {(blocker.kind === "capability_unavailable" || blocker.kind === "executor_not_ready") && blocker.evidence.length > 0 && <details><summary>Gateway/config evidence</summary><ul>{blocker.evidence.map(e => <li key={e}>{e}</li>)}</ul></details>}
       </li>)}</ul>
       {item.handoff.phase === "accepted" && <p>Local execution accepted by session <strong>{item.handoff.session}</strong>. Automation remains fenced.</p>}
       {item.continuation_prompt && <LocalActions item={item} agents={data.interactive_agents} changed={changed} />}

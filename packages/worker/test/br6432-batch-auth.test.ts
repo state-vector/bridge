@@ -323,7 +323,8 @@ describe("batch_auth supersede (BR#6432)", () => {
     const drain = await task("EXECUTE: lane-card drain (drill)");
     const laneCard = await task("Merge lane: drill repo@main (drill)");
     await park(laneCard, "state-vector/bridge", 333, "drill-owner-j");
-    await kbJson("/update", { id: laneCard, meta: { lane: { key: "state-vector/bridge@main", now_action: null } } });
+    const configured = await kbJson("/update", { id: laneCard, meta: { lane: { repo: "state-vector/batch-auth-protection", base: "main", key: "state-vector/batch-auth-protection@main", now_action: null } } });
+    expect(configured.status, JSON.stringify(configured.body)).toBe(200);
     const askId = await authAsk(drain, [laneCard], ["(Recommended) SUPERSEDE all 1", "NO"]);
     await kbJson("/ask.answer", { id: askId, answer: "SUPERSEDE all 1", actor: "web:rayh" });
     const r = await apply(laneCard, askId);

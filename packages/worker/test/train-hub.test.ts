@@ -107,6 +107,33 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
   return (await queueViaAcceptBoth(opts)).implId;
 }
 
+describe("BR#7736 saved batch checking progress", () => {
+  it("preserves a checked position through health reports, lease handoff and later completion", async () => {
+    const repo = "state-vector/batch-progress-7736", first = "first-merger", second = "second-merger";
+    expect((await acquire(repo, first)).status).toBe(200);
+    const scan = { phase: "checking", after_id: "BR#last-checked" };
+    expect((await kbJson("/train.queue_facts", { repo, actor: first, scan,
+      entries: [{ id: "BR#next", cls: "waiting" }],
+      base_state: { verdict: "green", red: [], unsettled: [] },
+    })).status).toBe(200);
+    const observedAt = (await laneSnap(repo)).queue_facts.base_observed_at;
+    for (const payload of [{ awaiting_sweep: {} }, { entries: [] }, { base_state: { verdict: "green", red: [], unsettled: [] } }]) {
+      expect((await kbJson("/train.queue_facts", { repo, actor: first, ...payload })).status).toBe(200);
+      expect((await laneSnap(repo)).queue_facts.scan).toEqual(scan);
+    }
+    expect((await kbJson("/train.queue_facts", { repo, actor: first, scan: { phase: "checking" } })).status).toBeGreaterThanOrEqual(400);
+    expect((await laneSnap(repo)).queue_facts.scan).toEqual(scan);
+    expect((await kbJson("/train.lease", { repo, actor: first, action: "release" })).status).toBe(200);
+    expect((await acquire(repo, second)).status).toBe(200);
+    expect((await laneSnap(repo)).queue_facts.scan).toEqual(scan);
+    expect((await kbJson("/train.queue_facts", { repo, actor: second, scan: { phase: "complete" } })).status).toBe(200);
+    expect((await laneSnap(repo)).queue_facts).toMatchObject({ scan: { phase: "complete" } });
+    expect((await laneSnap(repo)).queue_facts.base_observed_at).toBeGreaterThanOrEqual(observedAt);
+    expect((await kbJson("/train.queue_facts", { repo, actor: first, scan })).status).toBeGreaterThanOrEqual(400);
+    expect((await laneSnap(repo)).queue_facts.scan).toEqual({ phase: "complete" });
+  });
+});
+
 describe("BR#6901 idle main-health observation", () => {
   it("persists health separately from sweep/ack activity and recovers without a queued PR", async () => {
     const repo = "state-vector/idle-health-6901", actor = "gw-idle6901";
@@ -4222,6 +4249,10 @@ describe("bounce budget: 6 same-kind bounces escalate once and de-queue (BR#4688
   /** The production storm cycle: the bounced card re-enters review and a
    *  fresh verify accept re-queues it — one bounce per queue admission. */
   const requeue = async (card: string, head: string, n: number, rp = repo, prNum = PR) => {
+    // A real repair keeps one named owner across its rounds. Anonymous
+    // in-progress fixtures can legitimately be returned to todo by maintenance
+    // between these requests, which is not a failure of the bounce budget.
+    const actor = "budget-repair", session = `budget-repair-${card}`;
     // main's lifecycle law (BR#6839 repair handoff): todo → in_progress → in_review.
     // The todo hop only applies when the bounce left the card AT todo; the
     // escalation-clear round's owner leg already resumed the parked card to
@@ -4229,10 +4260,10 @@ describe("bounce budget: 6 same-kind bounces escalate once and de-queue (BR#4688
     // in_progress is an illegal same-status edge.
     const cur = String((await kbJson("/get", { id: card })).body?.status ?? "");
     if (cur === "todo") {
-      const ip = await kbJson("/transition", { id: card, to: "in_progress", session: "", note: `drill: repair leg picks up the bounce — PR https://github.com/${rp}/pull/${prNum}` });
+      const ip = await kbJson("/transition", { id: card, to: "in_progress", actor, session, note: `drill: repair leg picks up the bounce — PR https://github.com/${rp}/pull/${prNum}` });
       expect(ip.status, `in_progress failed: ${JSON.stringify(ip.body)}`).toBeLessThan(400);
     }
-    const ir = await kbJson("/transition", { id: card, to: "in_review", session: "", note: `drill: re-verify after bounce — PR https://github.com/${rp}/pull/${prNum}` });
+    const ir = await kbJson("/transition", { id: card, to: "in_review", actor, session, note: `drill: re-verify after bounce — PR https://github.com/${rp}/pull/${prNum}` });
     expect(ir.status, `in_review failed: ${JSON.stringify(ir.body)}`).toBeLessThan(400);
     const verify = await kbJson("/create", { type: "task", title: `VERIFY: budget drill ${card} r${n}`, roles: ["review"], session: `bridge-task-BR-drill-verify-${n}` });
     expect(verify.status).toBe(200);

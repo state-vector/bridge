@@ -19,6 +19,7 @@ import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema, UnblockResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
+import { TrainQueueScanSchema } from "./train-scan.ts";
 import { RecoveryCommandSchema } from "./train-recovery.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema, CandidateIntegrationSchema } from "./train-checks.ts";
 import { ExecutionRequestSchema, HandoffReadSchema, HandoffAcceptSchema, HandoffCheckpointSchema } from "./execution.ts";
@@ -331,6 +332,7 @@ export const TOOL_ARG_SCHEMAS = {
   train_queue_facts: z.looseObject({
     repo: z.string(),
     base: z.string().optional(),
+    scan: TrainQueueScanSchema.optional(),
     entries: z.array(z.looseObject({
       id: z.string(),
       pr: z.number().int().optional(),
