@@ -36,6 +36,8 @@ If recovery observes that its recorded candidate is already the actual managed
 executable, it can finish that existing update after exact PID/nonce, fresh health,
 stable-process and doctor checks. It performs no reinstall/restart and preserves
 the existing next-install deadline.
+Pending worker-stop requests block controller-ready acknowledgment until they
+are delivered, and candidate health cannot clear a changed update-request nonce.
 
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 

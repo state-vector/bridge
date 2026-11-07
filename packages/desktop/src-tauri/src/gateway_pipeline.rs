@@ -418,7 +418,7 @@ impl Controller {
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
     pub fn controller_ready(&self) -> bool {
         self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
-            && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| worker.reattachable.load(Ordering::SeqCst)))
+            && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| !worker.stop.load(Ordering::SeqCst) && worker.reattachable.load(Ordering::SeqCst)))
     }
     pub fn tick(&mut self, snap: &SharedSnapshot, stop: bool, update: bool) -> Result<(), String> {
         if stop { self.registry.drain(); } else if update { self.registry.natural_drain(); } else { self.registry.resume_admission(); }
