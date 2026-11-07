@@ -118,6 +118,12 @@ uses indexed declared subjects and incoming child relations instead of scanning
 retained review history per task; pending, findings and detached rounds retain
 their exact submission/revision authority.
 
+The append-only receipt ledger has canonical lookup indexes for card history,
+actor activity, per-card actions and action/time windows. Watchdog and control
+queries use these indexes through the existing event/version views; unrelated
+retained receipts do not require a full scan for each task. History sequence,
+actor attribution, scoring windows and every stored receipt remain unchanged.
+
 Executor availability keeps its cause: an operator pause, update handoff, drain,
 startup cooldown, task-specific prerequisite, and missing worker identity are
 structured readiness states, separate from missing models or occupied capacity.

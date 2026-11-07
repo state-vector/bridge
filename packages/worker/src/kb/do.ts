@@ -451,6 +451,7 @@ import {
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "./review-query";
+import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
 import type { ExecutorReadiness } from "@bridge/contracts";
@@ -1132,7 +1133,7 @@ export class KnowledgeHub {
       const age = now - (v.age_ts ?? now);
       if (age <= 60 * 60_000) continue;
       const lastNudge = this.one(
-        `SELECT ts FROM events WHERE artefact_id = ? AND op = 'nudge' ORDER BY ts DESC LIMIT 1`, v.verify_task,
+        LAST_NUDGE_SQL, v.verify_task,
       );
       if (lastNudge && now - Number(lastNudge.ts) <= 60 * 60_000) continue;
       const mins = Math.round(age / 60_000);
@@ -2937,7 +2938,7 @@ export class KnowledgeHub {
     };
     for (const t of tokens) sig(t.label); // agents with no activity still get a row
     for (const p of this.state.storage.sql.exec(
-      `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
+      RECENT_PROGRESS_SQL,
       weekTs,
     ).toArray() as any[]) {
       const s = sig(p.actor);
@@ -3483,6 +3484,7 @@ export class KnowledgeHub {
     } catch (e) {
       console.log("ledger migration:", String(e).slice(0, 200));
     }
+    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA);
 
     // sessions.kind backfill: gateway identity via the local token registry
     try {
@@ -6383,7 +6385,7 @@ export class KnowledgeHub {
       // recent version-log rows (newest first) for the server-side silent-churn fold
       recentEvents: () =>
         (this.state.storage.sql.exec(
-          `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+          RECENT_TASK_MUTATIONS_SQL,
           id,
         ).toArray() as any[]).map((r) => ({ ts: Number(r.ts), actor: String(r.actor), action: String(r.action), summary: String(r.summary ?? "") })),
     };
@@ -7994,8 +7996,7 @@ export class KnowledgeHub {
 
   private async getHistory(artefactId: string, limit = 100) {
     const rows = this.state.storage.sql.exec(
-      `SELECT seq, ts, actor, action, summary, data FROM artefact_versions
-       WHERE artefact_id = ? ORDER BY seq DESC LIMIT ?`,
+      TASK_HISTORY_SQL,
       artefactId, Math.min(limit, 200),
     ).toArray().map((r: any) => ({ ...r, data: JSON.parse(r.data ?? "{}") }));
     return { artefact_id: artefactId, versions: rows };
@@ -9721,7 +9722,7 @@ export class KnowledgeHub {
       const ownerLabel = t.owner || label;
       const wasDoing = mine && meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
       const lastOwn = this.one(
-        `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, ownerLabel,
+        LAST_ACTOR_SIGNAL_SQL, t.id, ownerLabel,
       )?.ts ?? 0;
       const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
       if (mine && idleFor < idleLimit) {

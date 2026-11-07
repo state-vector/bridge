@@ -52,6 +52,9 @@ checks explain missing evidence and executor state rather than declaring main re
 Maintenance yields between committed phases, and mutation acknowledgements do not
 run board aggregation synchronously. Indexed current-review lookups preserve exact
 review authority without repeatedly scanning unrelated retained history.
+Indexed receipt-ledger lookups keep per-task history, activity and maintenance
+queries independent of unrelated retained receipts, preserving their exact
+history order, actor attribution and time windows.
 Worker status distinguishes operator pauses, update handoffs, drains, cooldowns,
 task prerequisites and missing identity from missing models or occupied capacity.
 A verified connection can stay healthy through a pause or update hold while new
