@@ -7012,7 +7012,7 @@ mod tests {
     fn missing_bridge_tools_is_a_void_configuration_failure_not_a_completed_diagnostic_br7500() {
         for (stdout, stderr) in [(BRIDGE_TOOLS_MISSING, ""), ("", BRIDGE_TOOLS_MISSING)] {
             assert!(void_run(stdout, stderr), "exit 0 cannot hand off as done/in_review");
-            assert!(is_config_error(stdout) || is_config_error(stderr), "do not repeat unchanged launches on this host");
+            assert!(is_config_error(stdout) || is_config_error(stderr), "missing tools require execution-configuration repair");
         }
         assert!(!void_run("Repaired an earlier `MCP UNAVAILABLE: bridge tools missing` launch; verified the tools now work.", ""));
         let mut breaker = CircuitBreaker::default();

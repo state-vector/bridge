@@ -1949,8 +1949,9 @@ candidates cannot merge. Candidates waiting for current-base CI or integration
 repair are deferred while the executor continues the remaining independent batch;
 their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
 missing` is a failed execution configuration, never a successful diagnostic or
-review. The runner preserves its work, releases the failed claim for repair and
-stops repeating the unchanged launch on that host.
+review. The runner preserves its work and releases the failed claim for execution
+repair. Repeated missing-tool failures name that exact cause in the gateway's
+bounded cooldown; they cannot generate successful diagnostic or review receipts.
 
 Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
 original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
