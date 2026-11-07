@@ -1,5 +1,14 @@
 # bridge
 
+Knowledge REST and MCP use authenticated credential identity rather than
+caller-supplied actor or gateway flags. Workspace routing is not authentication.
+Gateway infrastructure reports process facts; task submission and acceptance
+belong to task agents and independent reviewers.
+Display labels cannot confer human authority on a machine credential.
+Legacy machine read mirrors also validate credentials. Desktop decision actions
+require a signed human session and a decision target; a paired gateway bearer
+cannot become human approval.
+
 ### One gateway lifecycle, durable outcomes
 
 The gateway prepares and finalizes tasks in bounded independent jobs, so one slow
@@ -714,6 +723,9 @@ An authenticated interactive owner's preserved-work handoff archives the old
 retry history and starts a fresh execution round, rather than manufacturing a
 24-hour failure cooldown. Foreign sessions, active writers and uncertain external
 operations remain fenced; unattended retry failures keep their normal cooldown.
+A bounced `todo` repair without another recovery owner can be dispatched again.
+Its old bounce is not a future event; actual prerequisites, live train slots,
+recovery ownership, writers and unknown effects continue to hold it.
 
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following

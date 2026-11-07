@@ -8,6 +8,25 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+### Knowledge-plane identity
+
+Knowledge REST bearer requests authenticate through the workspace's credential
+validator; routing a token to a workspace alone is not authentication. Unknown
+credentials are rejected, while identity infrastructure failures stay retryable.
+REST mutations and MCP derive actor, token binding and gateway class from the
+authenticated credential, overriding caller-supplied attribution. Gateway tokens
+report fenced process facts; they cannot submit a task for review or mark one
+done. Task agents and independent reviewers retain those business actions.
+Human authority uses the `web:<login>` / `human:<identity>` actor namespaces,
+outside the credential-label grammar. A bare display label such as `web` is an
+ordinary agent name. Legacy credentials conflicting with a human namespace may
+drain writers through gateway execution control and self-rename through the
+existing machine endpoint; they cannot use the conflict as human authority.
+The legacy machine `stats`, `list` and `search` mirrors validate bearers through
+the same credential boundary. The desktop decision action at
+`/api/kb-machine/act` requires a signed human session cookie and verifies that the
+stored target is a decision; a paired gateway token cannot approve decisions.
+
 ### Delivery responsibility
 
 An open PR remains a delivery obligation even when an old card is retired.
@@ -1406,6 +1425,10 @@ handoff, not another failed automated attempt: prior retry history is archived i
 an `interactive_handoff` event and the new execution round starts at zero. Foreign
 sessions, live writers, uncertain operations and unattended watchdog churn remain
 subject to their normal fences and cooldowns.
+A bounced `todo` repair with no separate recovery owner is executable board
+work, not an active train wait. Discovery and atomic reservation ignore only
+that historical bounce; real typed prerequisites, queued slots, recovery owners,
+writer quiescence and external-operation receipts still gate dispatch.
 
 A satisfied typed prerequisite must have a continuation. If its unblock round
 finishes while the parent remains parked, the next proxy pass atomically consumes

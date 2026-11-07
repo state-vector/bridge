@@ -71,6 +71,66 @@ describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", ()
     expect(denied.status).toBe(401);
   });
 
+  it.each(["stats", "list", "search?q=authority"])("authenticates the legacy machine read route: %s", async route => {
+    const denied = await mf.dispatchFetch(`https://main/api/kb-machine/${route}`, { headers: { authorization: "Bearer not-a-vended-credential" } });
+    expect(denied.status).toBe(401);
+  });
+
+  it.each(["stats", "list", "search?q=authority"])("preserves authenticated machine reads: %s", async route => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `machine-read-${route.split("?")[0]}`, tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const allowed = await mf.dispatchFetch(`https://main/api/kb-machine/${route}`, { headers: { authorization: `Bearer ${minted.secret}` } });
+    expect(allowed.status, await allowed.text()).toBe(200);
+  });
+
+  it.each(["unknown", "gateway"])("never turns a %s bearer into a human desktop decision", async credential => {
+    let secret = "not-a-vended-credential";
+    if (credential === "gateway") secret = (await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "machine-act-gateway", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>)).secret;
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "decision", title: `Real human choice ${credential}` }) }).then(r => r.json() as Promise<{ id: string }>);
+    const denied = await mf.dispatchFetch("https://main/api/kb-machine/act", { method: "POST",
+      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" }, body: JSON.stringify({ op: "transition", id: created.id, to: "accepted" }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(401);
+    expect(row.status).toBe("proposed");
+  });
+
+  it("checks the actual target type on the human desktop decision route", async () => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "machine-act-extra", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "Decision route cannot retire a task" }) }).then(r => r.json() as Promise<{ id: string }>);
+    await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "blocked", note: "Hold for a real disposition", await_event: { event: "time", until_ts: Date.now() + 3_600_000 } }) });
+    const denied = await mf.dispatchFetch("https://main/api/kb-machine/act", { method: "POST", headers: { cookie, authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ op: "transition", id: created.id, to: "superseded" }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(403);
+    expect(row.status).toBe("blocked");
+  });
+
+  it("keeps the desktop decision action available to the authenticated human", async () => {
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "decision", title: "Authenticated desktop human choice" }) }).then(r => r.json() as Promise<{ id: string }>);
+    const accepted = await api("/api/kb-machine/act", { method: "POST", body: JSON.stringify({ op: "transition", id: created.id, to: "accepted", actor: "web:forged", gateway: true, token_id: "forged-token" }) });
+    expect(accepted.status, await accepted.text()).toBe(200);
+    const history = await api(`/api/kb/history?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ versions: { actor: string; action: string }[] }>);
+    expect(history.versions.some(v => v.actor === "web:ray" && v.action === "transition")).toBe(true);
+  });
+
+  it.each(["REST", "MCP"])("a reserved display label cannot confer human authority over %s", async transport => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "web", tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: `Reserved-label authority ${transport}` }) }).then(r => r.json() as Promise<{ id: string }>);
+    expect((await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "blocked", note: "Human-only terminal disposition remains pending",
+      await_event: { event: "time", until_ts: Date.now() + 3_600_000 } }) })).status).toBe(200);
+    const args = { id: created.id, to: "superseded", session: "reserved-label-proof" };
+    const denied = await mf.dispatchFetch(`https://main${transport === "REST" ? "/api/kb/transition" : "/mcp"}`, { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify(transport === "REST" ? args : { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "transition", arguments: args } }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(transport === "REST" ? 400 : 200);
+    if (transport === "MCP") expect((JSON.parse(text) as { result: { isError: boolean } }).result.isError).toBe(true);
+    expect(text).toContain("human-authority");
+    expect(row.status).toBe("blocked");
+  });
+
   it("derives gateway completion authority from the authenticated bearer, not forged REST fields", async () => {
     const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "rest-completion-gateway", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>);
     const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "REST gateway cannot author an outcome", roles: ["analysis"] }) }).then(r => r.json() as Promise<{ id: string }>);

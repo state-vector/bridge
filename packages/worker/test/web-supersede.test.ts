@@ -27,7 +27,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const SECRET = "test-gh-secret";
 
-function sessionCookie(login = "ray", ws = "global") {
+function sessionCookie(login = "ray", ws = "state-vector") {
   const exp = String(Date.now() + 60_000);
   const sig = createHmac("sha256", SECRET).update(`${exp}.${login}.${ws}`).digest("hex");
   return `bridge_session=${exp}.${login}.${ws}.${sig}`;
@@ -175,7 +175,7 @@ describe("POST /api/kb/supersede — the one-click human supersede (BR#3910)", (
   });
 
   it("refuses a gateway bearer 403 — agents cannot supersede (BR#2480), card unchanged", async () => {
-    const mint = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "supersede-agent-test", tags: [] }) });
+    const mint = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "supersede-agent-test", tags: ["gateway"] }) });
     expect(mint.status).toBe(200);
     const { secret } = await mint.json() as any;
     expect(secret).toBeTruthy();

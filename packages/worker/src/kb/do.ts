@@ -178,6 +178,7 @@ import {
   trainCloseFailAskDetails,
   TRAIN_LANDED_CLOSE_MAX_RETRIES,
   releaseHold,
+  todoDispatchHold,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
   decideProseDisposition,
@@ -290,7 +291,7 @@ const ANCHOR_REARM_MS = 24 * 60 * 60_000;
  *  stays in machine.ts). Distinguishes "accepted by human" (a panel ratify of
  *  a legacy proposed verdict) from "machine-applied" (the create-time
  *  system:verifier apply). */
-const HUMAN_ACTOR_RX = /^web(:|$)|^human:/;
+const HUMAN_ACTOR_RX = HUMAN_ACTOR;
 /** BR#5377 F4: the adoption sweep only takes verdicts at least this old — a
  *  fresh straggler (create-time auto-apply failed) shows proposed in the
  *  panel first; the deploy-time backlog is older than any window and adopts
@@ -3843,6 +3844,13 @@ export class KnowledgeHub {
     const actor = String(body.actor ?? "mcp");
 
     try {
+      // Public transports stamp the authenticated token id and actor. A
+      // machine's display label must never enter the human actor namespace.
+      if (body.token_id && HUMAN_ACTOR.test(actor)) {
+        const credential = this.one(`SELECT label,tags FROM auth_tokens WHERE id=?`, String(body.token_id));
+        if (credential?.label === actor && !(op === "execution" && tagsSayGateway(credential.tags)))
+          return this.json({ error: "Machine credentials cannot use a reserved human actor name; drain existing writers through execution control and rename the credential's display label through /api/kb-machine/rename.", result_class: "gate_rejected" }, 403);
+      }
       if (["transition", "progress.log"].includes(op) && !body.session) {
         const session = await this.resolveSession(body, String(body.token_id ?? ""));
         if (session) body.session = session;
@@ -5024,7 +5032,7 @@ export class KnowledgeHub {
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
       else if (this.unmetBars(row).length) reason = "qualification";
-      else if (this.protectedExecution(id, meta) || releaseHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
+      else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
       else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";
@@ -8614,7 +8622,7 @@ export class KnowledgeHub {
   /** Human-actor authority, same shape machine.ts uses for decision
    *  acceptance: the web plane stamps `web:<login>`, humans sign `human:*`.
    *  Gateway/agent labels are rejected — a claim is a HUMAN hold. */
-  private static HUMAN_ACTOR = /^web(:|$)|^human:/;
+  private static HUMAN_ACTOR = HUMAN_ACTOR;
 
   /** BR#3911: Claim on a question = a named human takes it — a transient hold
    *  that dismisses the question from the agent surfaces ("claimed by <human>
