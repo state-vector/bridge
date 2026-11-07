@@ -1317,6 +1317,11 @@ protected. Replaying the same completed retirement is an idempotent acknowledgem
 Executor-observed CLOSED/MERGED PR receipts satisfy delivery conservation for a
 retirement; a closed PR is not an outstanding open obligation. Malformed legacy
 PR bindings are audited against the typed event grammar and retained as history.
+An authenticated interactive owner's deliberate preserved-work release is a
+handoff, not another failed automated attempt: prior retry history is archived in
+an `interactive_handoff` event and the new execution round starts at zero. Foreign
+sessions, live writers, uncertain operations and unattended watchdog churn remain
+subject to their normal fences and cooldowns.
 
 A satisfied typed prerequisite must have a continuation. If its unblock round
 finishes while the parent remains parked, the next proxy pass atomically consumes

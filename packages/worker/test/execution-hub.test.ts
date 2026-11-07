@@ -97,7 +97,7 @@ describe("local handoff authority and lifecycle", () => {
   it("lets human-directed agents claim a capability wait directly, heartbeat and release without a grant loop", async () => {
     const local = await interactive(`direct-capability-${++serial}`);
     const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Interactive recovery of an unavailable gateway", qualified: true, project: "bridge",
-      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] } } })).data;
+      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] }, attempt: { attempts: 7, last_reason: "Old gateway retries before the human-directed repair" } } })).data;
     expect((await post("get", { id: task.id })).data.status).toBe("blocked");
     const auth = { id: task.id, actor: local.label, token_id: local.token_id, session: "human-directed-recovery" };
     const claimed = await post("transition", { ...auth, to: "in_progress", note: "Human requested this recovery interactively" });
@@ -111,7 +111,13 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("progress.log", { ...foreign, note: "An additive observation" })).data.kind).toBe("commentary");
     expect((await post("transition", { ...foreign, to: "todo", note: "Cannot release another executor" })).data.error).toMatch(/claiming credential\/session/);
     expect((await post("transition", { ...auth, to: "todo", note: "Release with preserved continuation" })).data.error).toBeUndefined();
-    expect((await post("get", { id: task.id })).data.meta).not.toHaveProperty("interactive_execution");
+    const released = (await post<{ status: string; meta: { attempt?: { attempts: number }; interactive_execution?: unknown; blocked?: unknown } }>("get", { id: task.id })).data;
+    expect(released.meta).not.toHaveProperty("interactive_execution");
+    expect(released.status).toBe("todo");
+    expect(released.meta).not.toHaveProperty("blocked");
+    expect(released.meta.attempt?.attempts ?? 0).toBe(0);
+    const history = (await post<{ versions: { action: string; data?: { previous_attempt?: { attempts: number } } }[] }>("get_history", { id: task.id })).data;
+    expect(history.versions.find(v => v.action === "interactive_handoff")?.data?.previous_attempt?.attempts).toBe(7);
     expect((await post("transition", { ...auth, to: "in_progress", note: "Human resumes the released work" })).data.error).toBeUndefined();
   });
   it("atomically consumes a prepared local pickup, preserves checkpoints and accepts exactly one direct claimant", async () => {

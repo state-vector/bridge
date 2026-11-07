@@ -7069,6 +7069,11 @@ export class KnowledgeHub {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
           break;
         }
+        case "interactive_handoff": {
+          this.audit(actor, "interactive_handoff", id, { previous_attempt: fx.previous_attempt, session: body.session });
+          this.version(id, actor, "interactive_handoff", "Authenticated owner handed off preserved work; prior automated retry history archived, not counted as a new failure", { previous_attempt: fx.previous_attempt, session: body.session });
+          break;
+        }
         case "skip_unblock_spawn": {
           if (fx.flood) {
             // BR#4282: a flood-guard skip is the dedup WORKING — the round

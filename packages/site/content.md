@@ -645,6 +645,10 @@ without another approval; KEEP/NO decisions and live delivery responsibility are
 preserved, and replaying the completed retirement is idempotent.
 Verified CLOSED/MERGED PR observations satisfy retirement's delivery-conservation
 check; malformed legacy PR references are audited and retained as history.
+An authenticated interactive owner's preserved-work handoff archives the old
+retry history and starts a fresh execution round, rather than manufacturing a
+24-hour failure cooldown. Foreign sessions, active writers and uncertain external
+operations remain fenced; unattended retry failures keep their normal cooldown.
 
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following
