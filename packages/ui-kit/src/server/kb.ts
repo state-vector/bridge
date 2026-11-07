@@ -352,7 +352,8 @@ export interface KbTrainLane {
    *  ALL open PRs on the lane:
    *  - in_progress: active implementation or bounced back to in_progress
    *  - verifying: in verification (being verified + waiting to be verified)
-   *  - ready: verified (ACCEPT) and ready to merge */
+   *  - ready: verified (ACCEPT), no conflicts with base; exactly the green
+   *    block count, independent of lane stops or main CI/deploy holds */
   pr_stats?: { in_progress: number; verifying: number; ready: number };
   /** BR#5658 (Ray 2026-11-03, v2): all verifying + ready PRs on the lane
    *  partitioned into sequential merge batches (Batch 1 | Batch 2 | …) via

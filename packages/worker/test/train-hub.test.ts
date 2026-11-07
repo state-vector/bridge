@@ -107,6 +107,70 @@ async function queueViaAccept(opts: { repo: string; pr: number; head?: string | 
   return (await queueViaAcceptBoth(opts)).implId;
 }
 
+describe("BR#8075 one PR readiness definition", () => {
+  it("keeps accepted conflict-free PRs green and counted ready through missing, green, settling, red and stopped main observations", async () => {
+    const repo = "state-vector/ready-colours-8075", actor = "gw-colours8075";
+    const cards: string[] = [];
+    for (let pr = 1; pr <= 6; pr++) cards.push(await queueViaAccept({ repo, pr, head: "a".repeat(40) }));
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const entries = [
+      { id: cards[0], pr: 1, cls: "waiting" },
+      { id: cards[1], pr: 2, cls: "ready" },
+      { id: cards[2], pr: 3, cls: "conflict" },
+      { id: cards[3], pr: 4, cls: "blocked" },
+      { id: cards[4], pr: 5, cls: "needs-review" },
+      // PR 6 was accepted after the last executor observation.
+    ];
+    const assertReadiness = async () => {
+      const lane = await laneSnap(repo);
+      const cars = lane.batches.flat();
+      expect(lane.pr_stats).toEqual({ in_progress: 2, verifying: 1, ready: 3 });
+      expect(cars.map((car: any) => [car.pr, car.state])).toEqual([
+        [1, "ready"], [2, "ready"], [6, "ready"], [5, "waiting"],
+      ]);
+      expect(lane.pr_stats.ready).toBe(cars.filter((car: any) => car.state === "ready").length);
+      expect(lane.pr_stats.verifying).toBe(cars.filter((car: any) => car.state !== "ready").length);
+    };
+    expect((await kbJson("/train.queue_facts", { repo, actor, entries })).status).toBe(200);
+    await assertReadiness();
+    for (const verdict of ["green", "unsettled", "red"]) {
+      expect((await kbJson("/train.queue_facts", { repo, actor, entries,
+        base_state: { verdict, tip_sha: "b".repeat(40), red: verdict === "red" ? [{ name: "Test" }] : [], unsettled: verdict === "unsettled" ? ["Test"] : [] },
+      })).status).toBe(200);
+      await assertReadiness();
+    }
+    expect((await kbJson("/train.event", { repo, actor, kind: "stopped", head_sha: "b".repeat(40), reason: "main Test failed" })).status).toBe(200);
+    expect((await laneSnap(repo)).stop).toBeTruthy();
+    await assertReadiness();
+    await kbJson("/train.lease", { repo, actor, action: "release" });
+  });
+
+  it("classifies the queued PR from its own facts rather than a sibling leg's, regardless of fact order", async () => {
+    const repo = "state-vector/ready-legs-8075", actor = "gw-legs8075", head = "a".repeat(40);
+    const implId = (await kbJson("/create", { type: "task", title: "IMPL: readiness legs", session: "" })).body.id;
+    const verifyId = (await kbJson("/create", { type: "task", title: "VERIFY: readiness legs", roles: ["review"], session: "legs8075-verify" })).body.id;
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier" });
+    expect((await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier",
+      note: `Accepted PR https://github.com/${repo}/pull/1 head ${head}; PR https://github.com/${repo}/pull/2 head ${head}`,
+      review_result: await reviewOutcome(kbJson, verifyId, { kind: "accepted_pr", task_id: implId,
+        legs: [1, 2].map(number => ({ repo, number, head_sha_at_acceptance: head })) }),
+    })).status).toBe(200);
+    await acquire(repo, actor);
+    const entries = [{ id: implId, pr: 1, cls: "conflict" }, { id: implId, pr: 2, cls: "ready" }];
+    for (const currentReady of [false, true]) {
+      const legFacts = entries.map(entry => ({ ...entry, cls: (entry.pr === 1) === currentReady ? "ready" : "conflict" }));
+      for (const facts of [legFacts, [...legFacts].reverse()]) {
+        expect((await kbJson("/train.queue_facts", { repo, actor, entries: facts })).status).toBe(200);
+        const lane = await laneSnap(repo);
+        expect(lane.pr_stats).toEqual({ in_progress: currentReady ? 0 : 1, verifying: 0, ready: currentReady ? 1 : 0 });
+        expect(lane.batches.flat().map((car: any) => [car.pr, car.state])).toEqual(currentReady ? [[1, "ready"]] : []);
+      }
+    }
+    await kbJson("/train.lease", { repo, actor, action: "release" });
+  });
+});
+
 describe("BR#7736 saved batch checking progress", () => {
   it("preserves a checked position through health reports, lease handoff and later completion", async () => {
     const repo = "state-vector/batch-progress-7736", first = "first-merger", second = "second-merger";
@@ -244,6 +308,21 @@ describe("BR#6776 durable check recovery", () => {
 });
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("rejects a holder override on acquire, renew, and release", async () => {
+    const repo = "state-vector/lease-holder-identity";
+    const actor = "authenticated-merger";
+    const acquireOverride = await kbJson("/train.lease", { repo, actor, action: "acquire", holder: "session-label" });
+    expect(acquireOverride.status).toBe(400);
+    expect(acquireOverride.body.error).toContain("holder must match the authenticated actor");
+    await acquire(repo, actor);
+    for (const action of ["renew", "release"]) {
+      const result = await kbJson("/train.lease", { repo, actor: "other-actor", action, holder: actor });
+      expect(result.status).toBe(400);
+      expect(result.body.error).toContain("holder must match the authenticated actor");
+    }
+    expect((await laneSnap(repo)).lease.holder).toBe(actor);
+  });
+
   it("out-of-band repair merge observations require the accepted PR/head and do not certify live recovery", async () => {
     const repo = "state-vector/repair-delivery-6522", baseline = "7".repeat(40), acceptedHead = "9".repeat(40);
     const task = await queueViaAccept({ repo, pr: 991, head: acceptedHead });
@@ -3943,7 +4022,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     });
 
     // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2
-    // An accepted substance verdict does not turn a current waiting gate green.
+    // An accepted, conflict-free PR stays ready while the executor/main waits.
     await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-ng", merge_capable: true });
     await kbJson("/train.queue_facts", {
       repo,
@@ -3962,15 +4041,14 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       verifying: 2,   // PR 502 (waiting) + PR 503 (actively verifying)
       ready: 1,       // PR 504 (ready)
     });
-    // Active verification precedes waiters; accepted PR504 is still waiting on
-    // a current executor/main observation, not promised to merge this pass.
+    // Ready PR504 leads even without a current executor/main observation.
     expect(laneSnap.batches.length).toBe(2);
     expect(laneSnap.batches[0].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
-      { pr: 503, state: "verifying" },
+      { pr: 504, state: "ready" },
       { pr: 502, state: "waiting" },
     ]);
     expect(laneSnap.batches[1].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
-      { pr: 504, state: "waiting" },
+      { pr: 503, state: "verifying" },
     ]);
   });
 
