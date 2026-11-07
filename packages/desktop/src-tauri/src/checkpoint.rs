@@ -81,6 +81,28 @@ pub fn publish_captured(path: &Path, checkpoint: &Checkpoint) -> Result<(), Stri
     Ok(())
 }
 
+pub fn verify_published(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
+    if repository_identity(&git(path, &["remote", "get-url", "origin"], None)?) != checkpoint.repo { return Err("checkpoint repository mismatch".into()); }
+    let observed = git(path, &["ls-remote", "--exit-code", "origin", &checkpoint.remote_ref], None)?;
+    if observed.split_whitespace().next() != Some(checkpoint.commit.as_str()) { return Err("checkpoint remote no longer matches its verified receipt".into()); }
+    Ok(())
+}
+
+/// Compare all snapshot inputs, including dirty/untracked files, without
+/// altering HEAD or the user's index. Cleanup consumes this exact proof.
+pub fn matches_working_tree(path: &Path, checkpoint: &Checkpoint) -> Result<bool, String> {
+    let git_dir = git(path, &["rev-parse", "--absolute-git-dir"], None)?;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let index = std::path::PathBuf::from(git_dir).join(format!("bridge-workspace-{}-{nonce}.index", std::process::id()));
+    let result = (|| {
+        git(path, &["read-tree", "HEAD"], Some(&index))?;
+        git(path, &["add", "--all", "--", "."], Some(&index))?;
+        Ok(git(path, &["write-tree"], Some(&index))? == checkpoint.tree)
+    })();
+    let _ = std::fs::remove_file(index);
+    result
+}
+
 /// Never reset an existing dirty worktree to a checkpoint. That is newer work,
 /// not disposable residue. A restoring runner must preserve it first.
 pub fn restore(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {

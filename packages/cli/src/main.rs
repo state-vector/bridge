@@ -102,6 +102,11 @@ fn main() {
             let stop = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("stop") => true, _ => { eprintln!("usage: bridge workers status|stop [BR#task]; bridge workers reconcile-reservations [--apply] [BR#task]"); std::process::exit(2); } };
             match dispatch::workers_command(&cfg, stop, args.get(3).map(String::as_str)) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workers: {error}"); std::process::exit(1); } }
         }
+        "workspaces" => {
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found"); std::process::exit(1); });
+            let reconcile = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("reconcile") => true, _ => { eprintln!("usage: bridge workspaces status|reconcile"); std::process::exit(2); } };
+            match dispatch::workspaces_command(&cfg, reconcile) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workspaces: {error}"); std::process::exit(1); } }
+        }
         "update" => {
             if let Err(error) = update::command(&args[2..]) { eprintln!("update: {error}"); std::process::exit(1); }
         }

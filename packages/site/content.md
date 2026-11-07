@@ -1,5 +1,34 @@
 # bridge
 
+### One owner for execution disk
+
+The native gateway owns each workspace from allocation through reclamation in
+its existing durable lifecycle journal. A unique per-claim directory contains
+source, temporary files, build caches and bounded live output. Shared repository
+clones are managed cache resources. Every allocation is recorded before use.
+
+Once the exact execution is confirmed stopped and its result acknowledged, the
+owner publishes and verifies source checkpoints, verifies that local inputs have
+not changed, then removes the local allocation. Waiting for review does not pin
+build output. Checkpoint receipts remain available after local deletion.
+
+Fair reconciliation runs every 30 seconds while other jobs are busy, held or
+waiting for an update, and resumes durable preservation/deletion stages after
+restart. Active readers, newer source, unknown writers/effects and publication
+failures retain their own resources with explicit retry reasons. Unpublished
+non-Git scratch inputs remain protected until delivered or preserved.
+
+The default budget is 100 GiB of owned disk with 5 GiB filesystem headroom;
+`BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` configure it.
+New allocations pause when the budget is exceeded; reclamation continues.
+`bridge status` includes disk accounting, and `bridge workspaces status` shows
+resource states, retention errors and checkpoint receipts. Offline
+`bridge workspaces reconcile` uses the same owner and controller lock.
+
+Old registered worktrees, runner session/scratch roots, `~/opencode-tmp` and
+repository caches are adopted into the same lifecycle with preservation and
+reader checks. Removal counters describe actual completed reclamation.
+
 ### Restart the gateway without restarting its agents
 
 Linux gateways supervise new tasks in independent per-attempt systemd units.
@@ -233,7 +262,7 @@ bridge pair https://hub.fleetbridge.run
 
 That pairs with the shared hub — the same host you sign in to with GitHub (`https://hub.fleetbridge.run/login`). Self-hosting instead? Deploy your own hub per the README and pair `https://your-hub.workers.dev`.
 
-That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions on your machine, in isolated git worktrees (auto-provisioned per task; teardown preserves uncommitted work to a `wip/` branch and is eventual — terminal tasks sweep at once, everything else no running session holds sweeps after 7 days, BR#3633; the sweep also enumerates `git worktree list` of the runner's clones, and a machine-local **worktree registry** — `~/.bridge/worktree-registry.jsonl`, 2026-11-02 — closes the loop mechanically: the runner registers every provisioned tree at creation and deregisters at teardown, the takeover prompts direct local sessions to register theirs with an exact one-liner (an unregistered tree is never swept — registration IS the contract), and the sweep enumerates registered paths wherever they live, pruning dead lines on read), one PR per task. Results come back to the board for review. Pairing vends a device credential exactly once (hub-generated, stored at `~/.bridge/principal`, never regenerated); re-pairing rotates the gateway token in place against that credential — the hostname is a display label only.
+That is the whole runner. It pairs with your hub using a device code, then claims tasks and dispatches them to `opencode` sessions in isolated, gateway-owned workspaces. One workspace owner allocates disk, verifies source preservation and reclaims stopped executions independently of task review status. Delivery follows the repository's policy, and results come back to the board for independent review. Pairing vends a device credential exactly once (hub-generated, stored at `~/.bridge/principal`, never regenerated); re-pairing rotates the gateway token in place against that credential — the hostname is a display label only.
 
 **Unclaimed means no owner.** Board and orient owner lookups never match an empty owner to a token's empty principal, including revoked registrations. Retired machine names cannot appear as fabricated owners of pooled work.
 

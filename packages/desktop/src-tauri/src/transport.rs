@@ -110,9 +110,12 @@ pub struct RunControl {
     cancel: Option<Arc<AtomicBool>>,
     process: Mutex<Option<ProcessIdentity>>,
     observer: Option<Arc<dyn Fn(ProcessIdentity) -> Result<(), String> + Send + Sync>>,
+    environment: Vec<(String, String)>,
 }
 impl RunControl {
     pub fn with_cancel(cancel: Option<Arc<AtomicBool>>) -> Self { Self { cancel, ..Self::default() } }
+    pub fn with_environment(mut self, environment: Vec<(String, String)>) -> Self { self.environment = environment; self }
+    fn apply_environment(&self, command: &mut Command) { command.envs(self.environment.iter().cloned()); }
     pub fn observe_launch(mut self, observer: impl Fn(ProcessIdentity) -> Result<(), String> + Send + Sync + 'static) -> Self { self.observer = Some(Arc::new(observer)); self }
     pub fn identity(&self) -> Option<ProcessIdentity> { self.process.lock().ok().and_then(|p| p.clone()) }
     pub fn writer_state(&self) -> Option<GroupState> { self.proof.lock().ok().and_then(|p| *p) }
@@ -201,6 +204,7 @@ fn process_group(cmd: &mut Command) {
 }
 
 fn spawn_agent(cmd: &mut Command, control: Option<&Arc<RunControl>>) -> std::io::Result<Child> {
+    if let Some(control) = control { control.apply_environment(cmd); }
     if let Some(control) = control {
         if control.cancel.as_ref().is_some_and(|cancel| cancel.load(Ordering::SeqCst)) || control.should_stop() {
             control.stopped(GroupState::Empty); // no process was created
@@ -222,6 +226,18 @@ fn spawn_agent(cmd: &mut Command, control: Option<&Arc<RunControl>>) -> std::io:
         }
     }
     Ok(child)
+}
+
+#[test]
+fn all_agent_transports_apply_the_owned_disk_environment_at_the_spawn_boundary() {
+    let control = Arc::new(RunControl::default().with_environment(vec![("TMPDIR".into(), "/owned/task/tmp".into()), ("CARGO_TARGET_DIR".into(), "/owned/task/cache/cargo".into())]));
+    control.grant_lease();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf '%s' \"$TMPDIR|$CARGO_TARGET_DIR\""]).stdout(Stdio::piped());
+    let child = spawn_agent(&mut command, Some(&control)).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "/owned/task/tmp|/owned/task/cache/cargo");
 }
 
 fn kill_group(child: &mut Child, control: Option<&Arc<RunControl>>) {
