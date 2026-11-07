@@ -27,15 +27,13 @@ stopping only `bridge.service` preserves independently supervised workers; use
 the worker stop command when stopping the work itself. Worker units inherit the
 gateway PATH and `~/.bridge/env`, keeping provider configuration with the worker.
 
-The independent updater script must also be refreshed from this build using the
-documented updater installation procedure. Replacing the native binary alone
-does not upgrade an already-installed Python updater. Update availability now
-reports the admission hold for controller handoff/health verification rather
-than implying that zero-slot workers are still draining.
-If recovery observes that its recorded candidate is already the actual managed
-executable, it can finish that existing update after exact PID/nonce, fresh health,
-stable-process and doctor checks. It performs no reinstall/restart and preserves
-the existing next-install deadline.
+The independent supervisor is the single owner of server recovery. It keeps one
+versioned journal through prerequisite checking, handoff, reconciliation,
+installation and health verification. Restarting either participant resumes the
+same saved operation; a planned controller reconnect does not add another hour.
+After a verified native update, the supervisor updates its own shipped source
+and continues from the same journal, avoiding a permanently older recovery script.
+Existing useful-work windows and failed-build rejection remain enforced.
 Pending worker-stop requests block controller-ready acknowledgment until they
 are delivered, and candidate health cannot clear a changed update-request nonce.
 Only published worker manifests are adopted. An interrupted manifest write stays
@@ -49,28 +47,29 @@ This also recovers journals written by older builds. Missing/malformed facts,
 unknown writers/effects and foreign host identities retain their barriers.
 The journal format remains readable by rollback builds.
 
-For an older controller already stuck on these historical reservations, use a
-verified recovery binary's `bridge workers reconcile-reservations [BR#task]`
-while **only the controller service is stopped**. It refuses a live controller's
-exclusive lock and defaults to a read-only drill. `--apply` rechecks current claim
-facts, archives each eligible original record, and retires only its exact ended,
-never-launched reservation. Restart the controller afterward; independently
-supervised workers keep their original processes and sessions. This bootstrap
-does not install a binary, change update deadlines, clear health holds, or resolve
-unknown writers/effects.
+`bridge recovery inspect [BR#task]` observes the shared reconciliation path.
+`bridge recovery reconcile [--apply] [BR#task]` is its guarded execution adapter;
+without `--apply` it is read-only, and execution requires the controller's lock.
+The supervisor calls this same implementation when an older controller cannot
+reconcile its saved records. The old separate reservation/stopped-job commands
+and recovery/rollback ladders have been removed.
 
-Confirmed stopped jobs are also rechecked every five seconds against saved hub
-receipts for their original server, session and attempt. A newer job cannot supply
-that proof. Missing proof or an uncertain outside action keeps the old job protected.
-The runner saves the original result, launch record and worktree location before
-archiving old ownership; it does not mark the task complete or remove the worktree.
-Captured real results continue through their normal checkpoint and delivery steps.
-For an older stuck controller, `bridge workers reconcile-stopped [BR#task]` uses
-the same controller lock and defaults to a read-only check. With `--apply`, it
-rechecks the saved confirmation and original record before archiving. Stop only
-the controller while using this verified recovery binary, then restart it;
-independent workers keep running and a live worker lock prevents cleanup.
-This command does not install an update or change its deadline or health checks.
+When needed, the supervisor freezes only the controller's systemd group and
+requires a complete kernel census proving that no child/effect process is in it
+before a controlled handoff. A busy boundary is thawed without stopping its work.
+Independent worker units keep running. Reconciliation requires exact original
+scope, real stop confirmation or an original worker lock plus kernel proof;
+unknown outside actions remain protected. Original results and worktree locations
+are retained. Unavailable results follow the normal checkpoint/delivery protocol
+and never become fabricated success. An unproved record creates one explicit wait
+instead of repeated controller restarts.
+
+To bootstrap an existing installation, stop **only** `bridge-update`, use a
+verified build's `bridge update install --managed-bin /absolute/path/to/installed/bridge`,
+then reload systemd and start `bridge-update`. The installer uses the supervisor's
+exclusive lock and preserves its existing journal and deadlines. It does not
+replace the running native binary. Subsequent recovery belongs to the supervisor.
+See [the recovery ownership and removal map](docs/recovery.md).
 
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 

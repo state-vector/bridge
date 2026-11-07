@@ -24,11 +24,19 @@ pub fn command(args: &[String]) -> Result<(), String> {
         "install" => {
             if !cfg!(target_os = "linux") { return Err("automatic installation currently requires Linux/systemd".into()); }
             if !Command::new("python3").arg("--version").status().map(|s|s.success()).unwrap_or(false) { return Err("install Python 3.10+ first".into()); }
-            let bin = std::env::current_exe().map_err(|e|e.to_string())?;
+            let bin = match args {
+                [_, flag, path] if flag=="--managed-bin" => PathBuf::from(path).canonicalize().map_err(|e|e.to_string())?,
+                [_] => std::env::current_exe().map_err(|e|e.to_string())?,
+                _=>return Err("usage: bridge update install [--managed-bin /absolute/path/to/installed/bridge]".into()),
+            };
             let root = home.join(".bridge/update");
             std::fs::create_dir_all(&root).map_err(|e|e.to_string())?;
+            let _lock = install_lock(&root)?;
             let script = root.join("supervisor.py");
-            std::fs::write(&script, include_str!("../updater/supervisor.py")).map_err(|e|e.to_string())?;
+            let staged=script.with_extension("new");
+            std::fs::write(&staged, include_str!("../updater/supervisor.py")).map_err(|e|e.to_string())?;
+            std::fs::File::open(&staged).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+            std::fs::rename(staged,&script).map_err(|e|e.to_string())?;
             let units = home.join(".config/systemd/user");
             std::fs::create_dir_all(&units).map_err(|e|e.to_string())?;
             let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
@@ -36,11 +44,20 @@ pub fn command(args: &[String]) -> Result<(), String> {
             let dropins = units.join("bridge.service.d");
             std::fs::create_dir_all(&dropins).map_err(|e|e.to_string())?;
             std::fs::write(dropins.join("update.conf"), "[Service]\nEnvironment=BRIDGE_MANAGED_UPDATES=1\n").map_err(|e|e.to_string())?;
-            println!("Installed updater (did NOT enable config or start/restart services).\nRun bridge service install if needed, then: systemctl --user daemon-reload\nEnable opt-in: bridge update enable main\nOnce existing work is safely idle: systemctl --user enable --now bridge bridge-update");
+            println!("Installed the single recovery supervisor; existing recovery state and deadlines preserved.\nRun systemctl --user daemon-reload, then start bridge-update. The supervisor owns the managed controller handoff; independent workers are not restarted.\nAutomatic updates remain explicitly opt-in: bridge update enable main");
         }
         _ => return Err("usage: bridge update install | enable main|stable|pinned | disable | status".into()),
     }
     Ok(())
+}
+
+fn install_lock(root:&std::path::Path)->Result<std::fs::File,String> {
+    let lock=std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(root.join("lock")).map_err(|e|e.to_string())?;
+    #[cfg(unix)] {
+        use std::os::fd::AsRawFd;
+        if unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {return Err("Stop only bridge-update before refreshing its bootstrap; the live recovery owner holds the lock".into());}
+    }
+    Ok(lock)
 }
 
 #[cfg(test)]
