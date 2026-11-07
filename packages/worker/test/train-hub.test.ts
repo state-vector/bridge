@@ -131,6 +131,26 @@ describe("BR#6901 idle main-health observation", () => {
 });
 
 describe("BR#6776 durable check recovery", () => {
+  it("BR#7500: independent ready candidates keep lane recovery separate from a failed candidate's repair", async () => {
+    const repo = "state-vector/ready-not-blocked-7500", actor = "gw-7500";
+    const failed = await queueViaAccept({ repo, pr: 1, head: "a".repeat(40) });
+    const ready = await queueViaAccept({ repo, pr: 2, head: "b".repeat(40) });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const stamp = await kbJson("/train.queue_facts", { repo, actor, entries: [
+      { id: failed, pr: 1, cls: "blocked", repair: { kind: "head_checks", head_sha: "a".repeat(40), checks: [{ name: "Test", url: "https://github.com/run/failure" }] } },
+      { id: ready, pr: 2, cls: "ready" },
+    ], base_state: { verdict: "green", tip_sha: "c".repeat(40), red: [], unsettled: [] },
+      stalled: { batch: [2], ticks: 3, since: 1, last_error: "GitHub rejected the independent ready candidate" } });
+    expect(stamp.body.error).toBeUndefined();
+    const snap = await laneSnap(repo);
+    const candidateRepair = snap.queue_facts.entries[0].repair_task;
+    expect(candidateRepair).toMatch(/^BR#/);
+    expect(snap.line.blocker).toBe("merge_failed");
+    expect(snap.line.remediation.task?.id).not.toBe(candidateRepair);
+    const recovery = (await kbJson("/get", { id: snap.line.remediation.task.id })).body;
+    expect(recovery.meta.machine_duty).toMatchObject({ kind: "line_recovery", subject: snap.card });
+    expect(recovery.tags).toContain("p0");
+  });
   it("reserves one retry per head/obligation across lease takeover, including unknown effects", async () => {
     const repo = "state-vector/retry-6776", actor = "gw-retry6776", head = "a".repeat(40);
     const id = await queueViaAccept({ repo, pr: 1, head });

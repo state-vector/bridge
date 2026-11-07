@@ -20,6 +20,9 @@ use crate::scm;
 #[path = "stopped_outbox.rs"]
 mod stopped_outbox;
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
@@ -3292,7 +3295,13 @@ fn is_config_error(text: &str) -> bool {
         "is not a valid model",
         "no such agent",
     ];
-    MARKERS.iter().any(|m| text.contains(m))
+    MARKERS.iter().any(|m| text.contains(m)) || bridge_tools_missing(text)
+}
+
+const BRIDGE_TOOLS_MISSING: &str = "MCP UNAVAILABLE: bridge tools missing";
+
+fn bridge_tools_missing(text: &str) -> bool {
+    text.lines().any(|line| line.trim() == BRIDGE_TOOLS_MISSING)
 }
 
 fn extract_pr(stdout: &str) -> Option<String> {
@@ -3333,6 +3342,7 @@ fn void_run(stdout: &str, stderr: &str) -> bool {
         "\"name\": \"UnknownError\"",
     ];
     SIGS.iter().any(|s| stdout.contains(s) || stderr.contains(s))
+        || bridge_tools_missing(stdout) || bridge_tools_missing(stderr)
 }
 
 /// BR#3352: local side-effect receipts appended to completed_result_lost
@@ -4042,7 +4052,7 @@ impl CircuitBreaker {
         if claim_race_run(stdout, stderr) {
             return;
         }
-        let sig = ["Unexpected server error", "Model blocked by guardrail", "0 endpoints out of", "no endpoints are available matching your guardrail", "UnknownError"]
+        let sig = [BRIDGE_TOOLS_MISSING, "Unexpected server error", "Model blocked by guardrail", "0 endpoints out of", "no endpoints are available matching your guardrail", "UnknownError"]
             .iter().find(|s| stdout.contains(*s) || stderr.contains(*s))
             .map(|s| s.to_string())
             .unwrap_or_else(|| "other".into());
@@ -4618,9 +4628,9 @@ fn tick(
             if fails >= 3 {
                 let void_cause = void_run(&outcome.stdout_tail, &outcome.stderr_tail);
                 let note = if void_cause {
-                    "runner: dispatch VOID — provider guardrails blocked the model (0 endpoints), no work performed, 3 attempts — released for attention (BR#877: void runs never hand off as complete)"
+                    format!("runner: dispatch VOID — no valid completion, 3 attempts — released for execution repair; cause: {}", truncate(&tail, 300))
                 } else {
-                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — released for attention"
+                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — released for attention".to_string()
                 };
                 let _ = mcp_call(
                     cfg,
@@ -6996,6 +7006,19 @@ mod tests {
         let plain = reclaim_resolution_note(&json!({ "status": "todo" }));
         assert!(plain.contains("re-claim"));
         assert!(!plain.contains("re-stamped"));
+    }
+
+    #[test]
+    fn missing_bridge_tools_is_a_void_configuration_failure_not_a_completed_diagnostic_br7500() {
+        for (stdout, stderr) in [(BRIDGE_TOOLS_MISSING, ""), ("", BRIDGE_TOOLS_MISSING)] {
+            assert!(void_run(stdout, stderr), "exit 0 cannot hand off as done/in_review");
+            assert!(is_config_error(stdout) || is_config_error(stderr), "missing tools require execution-configuration repair");
+        }
+        assert!(!void_run("Repaired an earlier `MCP UNAVAILABLE: bridge tools missing` launch; verified the tools now work.", ""));
+        let mut breaker = CircuitBreaker::default();
+        for _ in 0..CircuitBreaker::THRESHOLD { breaker.record_failure(BRIDGE_TOOLS_MISSING, ""); }
+        assert!(breaker.tripped());
+        assert_eq!(breaker.last_signature, BRIDGE_TOOLS_MISSING, "report the machinery fault, not 'other'");
     }
 
     #[test]

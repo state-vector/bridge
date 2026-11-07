@@ -509,6 +509,14 @@ The train status, message and recovery banner consume the hub's shared typed
 `line` projection. Routine builds, deployments and check waits stay compact in
 the overview row; expanded banners appear only for stopped or unknown/error
 states. Click the lane for full operational details in its card view.
+**STOP THE LINE — merge machinery stalled** means queued work has gone an hour
+without a merge. The error names elapsed time, main's check health, executor
+presence and candidates passing initial gates. Bridge owns priority recovery;
+an active gateway alone does not prove progress. One candidate waiting for
+current-base CI or integration repair does not stop independent batch members,
+and its repair cannot conceal a separate lane-level merge fault. Diagnostics
+that report missing Bridge MCP tools fail as execution-configuration errors;
+exit zero cannot close them successfully or count as restored delivery.
 A failed decisive deployment overrides green job subsets;
 when a ready cure needs a human bypass merge, the line says **Fix ready — your
 merge is needed** and links directly to the fix PR and its confirmation request.
@@ -719,3 +727,7 @@ Queued repair status does not imply an agent shortage or guaranteed priority;
 the banner distinguishes queued work from an active executor.
 Critical repair priority continues through independent review; review separation
 and acceptance requirements are preserved while the repair's urgency is retained.
+The gateway protocol separates a captured process result from business
+completion. Exact-fence `finalize` receipts persist the result and stopped-writer
+proof atomically; retries replay that receipt. Unfinished work is reconciled
+through the hub scheduler while independent waits and unknown effects stay held.
