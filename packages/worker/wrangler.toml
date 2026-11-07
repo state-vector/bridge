@@ -39,6 +39,7 @@ bindings = [
   { name = "HUB", class_name = "FlowsHub" },
   { name = "KB", class_name = "KnowledgeHub" },
   { name = "RUNNER_UPDATES", class_name = "RunnerUpdates" },
+  { name = "MCP_OAUTH", class_name = "McpOAuth" },
 ]
 
 [[migrations]]
@@ -53,6 +54,10 @@ new_sqlite_classes = ["KnowledgeHub"]
 tag = "v3-runner-updates"
 new_sqlite_classes = ["RunnerUpdates"]
 
+[[migrations]]
+tag = "v4-mcp-oauth"
+new_sqlite_classes = ["McpOAuth"]
+
 # Webapp deployment: @bridge/webapp is built to dist and served as worker assets,
 # same origin as /ws + /api/state (Access cookie just works; no CORS).
 # API/WS/legacy-UI routes hit the worker first; everything else is the SPA.
@@ -62,7 +67,7 @@ not_found_handling = "single-page-application"
 # A route missing from this list is silently eaten by the SPA assets layer
 # (372bbe973). Any new worker-handled path MUST be added here. BR#4252
 # removed /v1/models (fabricated hub-side model authority) — do not re-add.
-run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/*", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/api/kb/*", "/api/kb-machine/*", "/api/runner-updates/*", "/token.rename", "/kb-ws"]
+run_worker_first = ["/__version", "/ingest", "/api/state", "/api/session", "/api/workspaces", "/api/workspaces/*", "/api/pair/*", "/api/token/repair", "/ws", "/ui", "/login", "/login/callback", "/logout", "/mcp", "/oauth/*", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/api/kb/*", "/api/kb-machine/*", "/api/runner-updates/*", "/token.rename", "/kb-ws"]
 
 [vars]
 # BR#4695: the origin stamped into every emitted artefact/permalink URL (MCP

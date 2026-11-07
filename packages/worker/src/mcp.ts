@@ -14,6 +14,7 @@
 import { composeBootstrap, DEFAULT_WS_SLUG, doWs, hashAuthToken, tokenWorkspace } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 import { emitOrigin, stampPermalinks } from "./permalink.ts";
+import { oauthChallenge, oauthResource, resolveOAuthBearer } from "./mcp-oauth.ts";
 
 /** Build marker lives in ./mcp-tools.ts (single source) — re-exported here. */
 import { BUILD, TOOL_TABLE, err, toolsList } from "./mcp-tools.ts";
@@ -78,11 +79,18 @@ const isInfraFault = (e: any) => {
 };
 
 export async function handleMcp(request: Request, env: any): Promise<Response> {
+  return oauthChallenge(request, await handleAuthenticatedMcp(request, env));
+}
+
+async function handleAuthenticatedMcp(request: Request, env: any): Promise<Response> {
+  let bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!bearer) return json({ error: "unauthorized: missing auth token" }, 401);
+  const resolved = await resolveOAuthBearer(env, bearer, oauthResource(request));
+  if (resolved instanceof Response) return resolved;
+  bearer = resolved;
   if (request.method !== "POST") {
     return json({ error: "MCP endpoint: POST only" }, 405);
   }
-  const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!bearer) return json({ error: "unauthorized: missing auth token" }, 401);
 
   let msg: any;
   try {
