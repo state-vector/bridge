@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ReviewResultSchema, type ReviewResult } from "./review.ts";
 
 /** A PR may DELIVER work or merely enable its execution. Only delivery can
  * complete a task on a merge receipt. Execution always needs outcome receipts. */
@@ -24,6 +25,34 @@ export const ExecutionResultSchema = z.object({
   outcome: z.string().min(1),
   receipts: z.array(z.string().min(1)).min(1),
 });
+
+export const UnblockResultSchema = z.object({
+  kind: z.literal("reblocked"), parent_id: z.string().regex(/^BR#\d+$/),
+  reason: z.string().min(1), next: z.string().min(1),
+  await_event: z.record(z.string(), z.unknown()),
+});
+
+/** Positive outcome evidence is distinct from a process exit or transcript.
+ * The hub supplies the role from the stored task, never from the result. */
+export type DutyOutcome =
+  | { kind: "review"; result: ReviewResult }
+  | { kind: "analysis" | "unblock"; result: z.infer<typeof ExecutionResultSchema> }
+  | { kind: "reblocked"; result: z.infer<typeof UnblockResultSchema> };
+export function dutyOutcome(role: string, body: { review_result?: unknown; execution_result?: unknown; unblock_result?: unknown }): DutyOutcome | null {
+  if (role === "review") {
+    const result = ReviewResultSchema.safeParse(body.review_result);
+    return result.success ? { kind: "review", result: result.data } : null;
+  }
+  if (role === "unblock" && body.unblock_result !== undefined) {
+    const result = UnblockResultSchema.safeParse(body.unblock_result);
+    return result.success ? { kind: "reblocked", result: result.data } : null;
+  }
+  if (role === "analysis" || role === "unblock") {
+    const result = ExecutionResultSchema.safeParse(body.execution_result);
+    return result.success ? { kind: role, result: result.data } : null;
+  }
+  return null;
+}
 
 /** Persistable command receipt for clients that cannot yet carry the newer
  * transition argument. Consumption still uses the SAME human-authority gate. */

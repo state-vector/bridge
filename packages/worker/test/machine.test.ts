@@ -69,6 +69,8 @@ const input = (over: Partial<RuleInput>): RuleInput => ({
   now: 1_000_000,
   ...over,
 });
+const observedOutcome = { outcome: "Fixture findings observed", receipts: ["https://example.test/observed-findings"] };
+const reviewFindings = { kind: "findings", summary: "Fixture review found no accepted delivery" };
 
 const ok = (v: Awaited<ReturnType<typeof decide>>): Applied => {
   expect(v.ok, `expected Applied, got Rejection: ${JSON.stringify(v)}`).toBe(true);
@@ -137,11 +139,27 @@ describe("transition matrix (task: role × from × to)", () => {
     }
   });
 
-  it("verdict duties may still close done with receipts, and only then", async () => {
-    const ok = await check(input({ status: "in_progress", to: "done", roles: ["review"], body: { note: "receipts: https://github.com/x/y/pull/1 merged" } }), baseCtx());
+  it("verdict duties require a typed result rather than a receipt-shaped note", async () => {
+    const ok = await check(input({ status: "in_progress", to: "done", roles: ["review"], body: { review_result: reviewFindings } }), baseCtx());
     expect(ok).toBeNull();
     const noReceipts = await check(input({ status: "in_progress", to: "done", roles: ["review"], body: { note: "looks fine" } }), baseCtx());
-    expect(noReceipts).toContain("cannot complete without receipts");
+    expect(noReceipts).toContain("cannot complete without a typed outcome");
+  });
+
+  it("a gateway cannot manufacture a submitted or completed outcome even with forged valid-looking evidence", async () => {
+    for (const to of ["in_review", "done"]) for (const roles of [[], ["analysis"], ["review"], ["unblock"]]) {
+      const verdict = await decide(input({ status: "in_progress", to, roles, body: { gateway: true, agent: "gw/worker",
+        note: "exit 0; verified against https://github.com/a/b/pull/1", review_result: reviewFindings, execution_result: observedOutcome } }), baseCtx());
+      expect(verdict).toMatchObject({ ok: false, rule: "gateway-cannot-author-completion" });
+    }
+  });
+
+  it("an unknown exit-zero diagnostic reply is never completion without positive outcome evidence", async () => {
+    for (const note of ["", "MCP UNAVAILABLE: bridge tools missing", "A new unrecognised failure; exit 0", "verified against: task history; PR https://github.com/a/b/pull/1"]) {
+      expect(await decide(input({ status: "in_progress", to: "done", roles: ["analysis"], body: { note } }), baseCtx()))
+        .toMatchObject({ ok: false, rule: "analysis-done-needs-outcome" });
+    }
+    expect(await check(input({ status: "in_progress", to: "done", roles: ["analysis"], body: { execution_result: observedOutcome } }), baseCtx())).toBeNull();
   });
 
   it("verdict-duty blocked survives only as an ask-gate", async () => {
@@ -186,7 +204,7 @@ describe("transition matrix (task: role × from × to)", () => {
     const c = baseCtx();
     c.openChildren = () => 2;
     c.openChildDetails = () => [{ id: "BR#21", status: "in_progress" }, { id: "BR#22", status: "todo" }];
-    const msg = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), c);
+    const msg = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x", execution_result: observedOutcome } }), c);
     expect(msg).toContain("still has 2 open child task(s)");
     // BR#5370 finding B: the rejection carries child ids + statuses so
     // attempt 1 points at the right action (the BR#5349 duty session
@@ -200,22 +218,22 @@ describe("transition matrix (task: role × from × to)", () => {
     c.openChildIds = () => ["BR#12", "BR#13"];
     // complete + reasoned → the gate passes (do.ts logs the repair)
     expect(
-      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13 — self-edge made these unclosable; repaired per BR#3819" } }), c),
+      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13 — self-edge made these unclosable; repaired per BR#3819", execution_result: observedOutcome } }), c),
     ).toBeNull();
     // partial list → refused, naming the missing child
-    const partial = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12 — some reason" } }), c);
+    const partial = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12 — some reason", execution_result: observedOutcome } }), c);
     expect(partial).toContain("missing: BR#13");
     // no reason → refused with the grammar
-    const noReason = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13" } }), c);
+    const noReason = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "force-close-children: BR#12, BR#13", execution_result: observedOutcome } }), c);
     expect(noReason).toContain("force-close-children");
     // no marker at all → the ordinary open-children refusal, teaching the grammar
-    const plain = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done" } }), c);
+    const plain = await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done", execution_result: observedOutcome } }), c);
     expect(plain).toContain("force-close-children");
     // zero open children → passes without any marker (self-edge-only state reads as clean)
     const clean = baseCtx();
     clean.openChildren = () => 0;
     expect(
-      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done" } }), clean),
+      await check(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "done", execution_result: observedOutcome } }), clean),
     ).toBeNull();
   });
 
@@ -278,7 +296,7 @@ describe("transition matrix (task: role × from × to)", () => {
     const c = baseCtx();
     c.parent = () => ({ id: "BR#0", meta: { session: "session-a" } });
     const msg = await check(
-      input({ status: "in_progress", to: "done", roles: ["review"], meta: { session: "session-a" }, body: { note: "PR https://x/pull/1 merged" } }),
+      input({ status: "in_progress", to: "done", roles: ["review"], meta: { session: "session-a" }, body: { note: "PR https://x/pull/1 merged", review_result: reviewFindings } }),
       c,
     );
     expect(msg).toContain("cannot also produce the review");
@@ -469,6 +487,8 @@ describe("loop regressions", () => {
   it("every rule has a name and the set is stable (table drift alarm)", () => {
     expect(RULES.map((r) => r.name).sort()).toEqual(
       [
+        "analysis-done-needs-outcome",
+        "gateway-cannot-author-completion",
         "bounce-needs-findings",
         "blocked-needs-typed-await",
         "claim-bars",
@@ -987,7 +1007,7 @@ describe("effects decided executor-side (F4)", () => {
   });
 
   it("parent movement supersedes ephemeral children; a bounce keeps the newest verify round", async () => {
-    const done = ok(await decide(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x" } }), baseCtx()));
+    const done = ok(await decide(input({ status: "in_review", to: "done", roles: ["analysis"], body: { note: "x", execution_result: observedOutcome } }), baseCtx()));
     expect(done.effects).toContainEqual({ kind: "supersede_children", parent: "BR#1", tag: "unblock", keep_newest: false, cause: "BR#1 → done — unblock round closed" });
     expect(done.effects).toContainEqual({ kind: "supersede_children", parent: "BR#1", tag: "review", keep_newest: false, cause: "BR#1 done — verification round closed" });
 
@@ -1009,7 +1029,7 @@ describe("effects decided executor-side (F4)", () => {
   it("completion resets the churn counter but keeps the last-attempt display", async () => {
     const v = ok(
       await decide(
-        input({ status: "in_review", to: "done", roles: ["analysis"], meta: { attempt: { by: "agent-x", at: 5, attempts: 4, last_reason: "r" } } }),
+        input({ status: "in_review", to: "done", roles: ["analysis"], meta: { attempt: { by: "agent-x", at: 5, attempts: 4, last_reason: "r" } }, body: { execution_result: observedOutcome } }),
         baseCtx(),
       ),
     );
@@ -1599,14 +1619,14 @@ describe("verdict-receipts gate classification + note shape (BR#4295)", () => {
     expect(breachClass(trainQueueHold.slice(0, 300))).toBe("release:held-train-queue");
   });
 
-  it("the guard's rejection teaches the shape hasReceipts actually accepts", async () => {
+  it("the rejection teaches the positive structured outcome contract", async () => {
     const msg = await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note: "verdict NO_UNBLOCK, still 'blocked'" } }), baseCtx());
-    expect(msg).toContain("cannot complete without receipts");
-    expect(msg).toContain("URL"); // a bare URL suffices
-    expect(msg).toContain("still blocked"); // the exact token — quoted 'blocked' or "unblock verdict" never match
+    expect(msg).toContain("cannot complete without a typed outcome");
+    expect(msg).toContain("execution_result {outcome,receipts}");
+    expect(msg).toContain("unblock_result");
   });
 
-  it("hasReceipts accepts a URL and the bare verdict tokens; near-miss prose still rejects", async () => {
+  it("bare verdict tokens and URLs cannot author completion, while structured observations can", async () => {
     for (const note of [
       "verified: https://github.com/x/y/pull/1 merged", // any URL
       "BR#3311 still blocked — the hub proxy TRUE was the timer atom only", // bare token, exactly what BR#4291 needed
@@ -1614,14 +1634,15 @@ describe("verdict-receipts gate classification + note shape (BR#4295)", () => {
       "passed",
       "unblocked",
     ]) {
-      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must pass: ${note}`).toBeNull();
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must reject untyped: ${note}`).toContain("typed outcome");
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note, execution_result: observedOutcome } }), baseCtx())).toBeNull();
     }
     for (const note of [
       "still 'blocked'", // quoted — not the token (the BR#4291 specimen)
       "unblock verdict: NO_UNBLOCK", // no -ed, preceded by non-space
       "the check I ran looks clean", // honest prose, zero tokens
     ]) {
-      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must reject: ${note}`).toContain("cannot complete without receipts");
+      expect(await check(input({ status: "in_progress", to: "done", roles: ["unblock"], body: { note } }), baseCtx()), `must reject: ${note}`).toContain("typed outcome");
     }
   });
 });

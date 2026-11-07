@@ -233,10 +233,11 @@ import {
   UNBLOCK_SPAWN_CAP,
   OWNER_RELEASE_EXEMPT,
   HUMAN_ACTOR,
+  effectiveRole,
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, type RecoveryReason } from "@bridge/contracts";
+import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
@@ -358,7 +359,7 @@ export function verifyDutyBody(parentId: string, rootTitle: string, prLink: stri
   const direct = !leg ? parseDirectCommitReceipt(prLink) : null;
   if (direct?.repo) return `Independent review of ${parentId} — "${rootTitle}".
 
-The change is already on main: ${prLink}. Check it in a fresh session; do not ask the human to arrange a reviewer.
+Submitted commit: ${prLink}. A published commit URL does not prove that it landed on main. Verify its location and delivery in a fresh session; do not ask the human to arrange a reviewer.
 
 1. Confirm this commit is an ancestor of current main, its GitHub signature is valid, and CI succeeded for this commit.
 2. Check that the delivered behaviour meets the parent task, including current deployed behaviour where applicable. Cite the evidence and tests you actually checked.
@@ -4101,6 +4102,14 @@ export class KnowledgeHub {
       if (kindTag && !tags.includes(kindTag)) tags.push(kindTag);
       delete createMeta.kind;
     }
+    if (type === "task") {
+      // New tasks always declare what completion means. Analysis and unblock
+      // work deliver observed outcomes, never an incidental PR merge.
+      if (createMeta.completion === undefined && roles.some(r => r === "analysis" || r === "unblock")) {
+        createMeta.completion = { kind: "execution", outcome: "Publish the task's observed findings and per-action evidence." };
+      }
+      createMeta.completion = completionContract(createMeta);
+    }
 
     if (type === "task" && (body.qualified === true || (Array.isArray(body.await) && body.await.length))) {
       createMeta.qualification = {
@@ -4583,6 +4592,11 @@ export class KnowledgeHub {
     // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    if (row.type === "task" && !OWNER_RELEASE_EXEMPT.test(actor)) {
+      if (metaDel.includes("completion") && preMeta.completion !== undefined) throw new Error("gate: a completion contract cannot be deleted; preserve the task's outcome obligation");
+      if (completionContract(preMeta).kind === "execution" && body.meta?.completion !== undefined
+          && CompletionContractSchema.parse(body.meta.completion).kind !== "execution") throw new Error("gate: an execution outcome cannot be weakened to incidental code delivery");
+    }
     if (["delivery_disposition", "closure_authority"].some(k => metaDel.includes(k) || (body.meta && Object.hasOwn(body.meta, k)))) throw new Error("gate: delivery dispositions and closure authority are owned by the authenticated disposition lifecycle");
     if (metaDel.includes("startup_wait") || (body.meta && Object.hasOwn(body.meta, "startup_wait"))) throw new Error("gate: startup waits are owned by executor readiness reconciliation");
     if (preMeta.ask && (metaDel.includes("ask") || (body.meta && Object.hasOwn(body.meta, "ask") && !body.meta.ask))) throw new Error("an ask's authoritative lifecycle cannot be deleted through metadata updates");
@@ -6303,7 +6317,8 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     const reviewResult = body.review_result === undefined ? undefined : ReviewResultSchema.parse(body.review_result);
     if (body.execution_result !== undefined) meta.execution_result = ExecutionResultSchema.parse(body.execution_result);
-    if (row.type === "task" && body.to === "done" && completionContract(meta).kind === "execution" && !ExecutionResultSchema.safeParse(meta.execution_result).success) throw new Error("execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion");
+    const explicitDutyOutcome = dutyOutcome(effectiveRole(tRoles), body);
+    if (row.type === "task" && body.to === "done" && completionContract(meta).kind === "execution" && !explicitDutyOutcome && !ExecutionResultSchema.safeParse(meta.execution_result).success) throw new Error("execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion");
     if (row.type === "question" && meta.ask && body.to === "done") throw new Error("answer an ask with ask.answer / answer_ask; a transition or progress note is not an answer");
     if (reviewResult) {
       if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
@@ -13383,7 +13398,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
    *  verify close on an in_progress (bounced) card or a card blocked on a
    *  non-train reason never re-queues it. */
   private async trainQueueOnAccept(parentId: string, src: { note?: string; dutyBody?: string; review_result?: ReviewResult }, actor: string): Promise<void> {
-    const parent = this.one(`SELECT id, type, status, meta, body_md FROM artefacts WHERE id = ?`, parentId);
+    const parent = this.one(`SELECT id, type, status, meta, body_md, roles FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
     const meta = JSON.parse(parent.meta ?? "{}");
     if (!mergeCompletesTask(meta)) {
@@ -13402,12 +13417,16 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // PR metadata. Never infer acceptance from the implementer's receipts:
     // cannot-proceed/findings closes must not silently deliver the parent.
     const typedAccept = src.review_result?.kind === "accepted_direct_main" ? src.review_result : null;
-    // Compatibility adapter for historical verdicts; new reviews use the
-    // closed result above. A parent body alone is never an accepted verdict.
-    const legacyCommit = !src.review_result && /\b(?:VERIFY ACCEPT|VERIFIED|ACCEPTED)\b/i.test(note) && !/\b(?:BOUNCE|CANNOT PROCEED|REJECTED|CHANGES REQUESTED)\b/i.test(note) && /https:\/\/github\.com\/[^\s]+\/actions\/runs\/\d+/.test(note) ? parseDirectCommitReceipt(note) : null;
-    const acceptedCommit = typedAccept ? { sha: typedAccept.commit, repo: typedAccept.repo } : legacyCommit;
+    // Prose is diagnostic history, never a new acceptance. Historical verdicts
+    // without a typed result must be reconciled by an independent reviewer.
+    const acceptedCommit = typedAccept ? { sha: typedAccept.commit, repo: typedAccept.repo } : null;
     if (parent.status === "in_review" && acceptedCommit) {
-      await this.transition({ id: parentId, to: "done", session: "", note: `Verified direct-to-main commit ${acceptedCommit.sha}; ${note}` }, actor);
+      const analysisResult = parseTags(parent.roles).includes("analysis") ? {
+        outcome: `Independent review accepted the submitted analysis artifact at ${acceptedCommit.sha}`,
+        receipts: [`https://github.com/${acceptedCommit.repo}/commit/${acceptedCommit.sha}`, typedAccept!.ci_run_url],
+      } : undefined;
+      await this.transition({ id: parentId, to: "done", session: "", execution_result: analysisResult,
+        note: `Verified direct-to-main commit ${acceptedCommit.sha}; ${note}` }, actor);
       // Read the completed row again: terminal-transition cleanup owns its
       // metadata. Never overwrite that cleanup with the pre-transition copy.
       const completed = this.one(`SELECT meta FROM artefacts WHERE id = ?`, parentId);

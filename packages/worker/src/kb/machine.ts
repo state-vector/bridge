@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
-import { mergeCompletesTask, ExecutionResultSchema } from "@bridge/contracts";
+import { mergeCompletesTask, ExecutionResultSchema, dutyOutcome } from "@bridge/contracts";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -370,6 +370,11 @@ export const UNBLOCK_SPAWN_CAP = 3;
 
 export const RULES: Rule[] = [
   {
+    name: "gateway-cannot-author-completion",
+    when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
+    guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
+  },
+  {
     name: "verdict-no-in_review",
     when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
     guard: (i) =>
@@ -631,9 +636,15 @@ export const RULES: Rule[] = [
     name: "verdict-done-needs-receipts",
     when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
     guard: (i) =>
-      hasReceipts(noteOf(i))
+      dutyOutcome(role(i), i.body ?? {})
         ? null
-        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — the note must cite receipts: ${RECEIPTS_DOC}.`,
+        : `${role(i)} ${i.id} cannot complete without a typed outcome: ${role(i) === "review" ? "supply review_result (accepted_pr, accepted_direct_main, accepted_execution, findings, or stronger_implementation_required)" : "supply execution_result {outcome,receipts} or unblock_result {kind:reblocked,parent_id,reason,next,await_event}"}. Notes, exit zero and transcripts are not outcome receipts.`,
+  },
+  {
+    name: "analysis-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && role(i) === "analysis",
+    guard: (i) => dutyOutcome("analysis", i.body ?? {}) ? null
+      : `analysis ${i.id} requires execution_result {outcome,receipts} describing its actual findings. A process exit or a completed diagnostic does not prove the incident recovered.`,
   },
   {
     name: "review-separation-of-duties",
