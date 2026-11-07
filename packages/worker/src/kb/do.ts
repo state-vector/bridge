@@ -11229,8 +11229,10 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const open = this.state.storage.sql.exec(
       `SELECT id, status, meta, tags FROM artefacts
        WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-       AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
-       ORDER BY created_ts DESC LIMIT 20`,
+        AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
+        AND (json_type(meta, '$.root_fix') = 'object' OR json_extract(meta, '$.root_blocker_for_lane') IS NOT NULL
+          OR json_extract(meta, '$.main_tip') IS NOT NULL OR json_extract(meta, '$.tip_sha') IS NOT NULL OR json_extract(meta, '$.red_since') IS NOT NULL)
+        ORDER BY created_ts DESC LIMIT 20`,
       a.repo, a.repo, a.repo,
     ).toArray() as any[];
     for (const o of open) {
@@ -13740,8 +13742,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     });
     // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
     // Top-panel budget chip reads this; the executor ignores the extra
-    // fields. over_budget mirrors the bounce-time rule (6th same-kind
-    // bounce breaches), computed from the same train_events rows.
+    // fields. Historical totals span different heads/kinds and are NOT the
+    // active same-kind budget episode. Only its persisted escalation is active.
     const prs = [...new Set(entries.map((e) => Number(metaById.get(e.id)?.merge_train?.pr ?? 0)).filter(Boolean))];
     const counts = new Map<number, number>(
       (prs.length
@@ -13758,7 +13760,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // BR#4688: EVERY entry carries the bounce pair (0/false when the card
       // has no PR leg) — a union return would force every consumer (the
       // batch-candidate splice, the queue chips) to narrow before reading.
-      return { ...e, ...(pr ? { pr } : {}), bounces, over_budget: bounces > TRAIN_BOUNCE_BUDGET };
+      const escalation = metaById.get(e.id)?.merge_train?.escalated;
+      return { ...e, ...(pr ? { pr } : {}), bounces,
+        over_budget: !!(escalation && !escalation.cleared_at && Number(escalation.pr) === pr && escalation.repo === repo) };
     });
   }
 
@@ -15056,8 +15060,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags FROM artefacts
          WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-           AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR json_extract(meta, '$.repo') = ? OR json_extract(meta, '$.root_blocker_for_lane') LIKE ?)
-         ORDER BY updated_ts DESC LIMIT 20`,
+            AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR json_extract(meta, '$.repo') = ? OR json_extract(meta, '$.root_blocker_for_lane') LIKE ?)
+            AND (json_type(meta, '$.root_fix') = 'object' OR json_extract(meta, '$.root_blocker_for_lane') IS NOT NULL
+              OR json_extract(meta, '$.main_tip') IS NOT NULL OR json_extract(meta, '$.tip_sha') IS NOT NULL OR json_extract(meta, '$.red_since') IS NOT NULL)
+          ORDER BY updated_ts DESC LIMIT 20`,
         repo, repo, repo, repo, repo, `${repo}@%`,
       ).toArray() as any[];
       for (const r of rows) {
@@ -15505,6 +15511,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             .map((r) => Number(r.pr ?? 0))
             .filter((n) => n > 0),
         );
+        for (const observed of this.state.storage.sql.exec(`SELECT pr FROM proxy_probes
+          WHERE repo=? AND kind='pr_merged' AND state='verified' AND ok=1`, lane.repo).toArray()) mergedPrs.add(Number(observed.pr));
         const ignoredPrs = new Set<number>(
           (this.state.storage.sql.exec(`SELECT pr FROM reconcile_ignores WHERE repo = ?`, lane.repo).toArray() as any[])
             .map((r) => Number(r.pr ?? 0))
@@ -15554,6 +15562,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           const qLegState = q.pr ? String(qCardMeta?.merge_train?.legs?.[String(q.pr)]?.state ?? "") : "";
           // Already merged in the current batch and settling on main — not waiting in the backlog
           if (
+            (q.pr && mergedPrs.has(Number(q.pr))) ||
             (meta.currently?.task_id && q.id === String(meta.currently.task_id)) ||
             (q.pr && Number(meta.currently?.pr) === Number(q.pr)) ||
             String(qCardMeta?.merge_train?.state ?? "") === "awaiting-ci" ||
@@ -15564,7 +15573,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           }
           const cls = factFor(q.id);
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
-          if (cls === "conflict" || (cls === "blocked" && baseGreenInWalk && !meta.stop) || skippedByWalk) {
+          if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {
             verifying++;
@@ -15597,8 +15606,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               ...(q.pr ? { pr: q.pr } : {}),
               ...(q.bounces != null ? { bounces: q.bounces } : {}),
               ...(q.over_budget ? { over_budget: true } : {}),
-              state: "ready",
-              detail: cls === "waiting" ? "verified — ready to merge (waiting on lane/CI)" : "verified — merges this pass (batch)",
+              state: cls === "ready" && baseGreenInWalk && !meta.stop ? "ready" : "waiting",
+              detail: cls === "ready" && baseGreenInWalk && !meta.stop ? "passed queue gates — current-base admission is checked before merging"
+                : "verified — waiting for current executor and main checks",
             });
           }
         }
@@ -15996,10 +16006,19 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         : starved ? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id : null;
       const diagnosticAskRow = diagnosticAskId ? this.one(`SELECT id, title, meta FROM artefacts WHERE id = ? AND status = 'todo'`, String(diagnosticAskId)) : null;
       const diagnosticAskMeta = diagnosticAskRow ? JSON.parse(diagnosticAskRow.meta ?? "{}") : null;
+      // A recorded human action is already authoritative as an acknowledgement;
+      // a first-hand proxy receipt additionally proves the PR merged. Neither
+      // requires waiting for the merge executor before withdrawing the request.
+      const pendingMerge = meta.lane?.bypass_merge;
+      const responsePr = Number(pendingMerge?.pr ?? base_red_resolution?.fix_card?.pr ?? 0);
+      const mergeProbe = responsePr > 0 ? this.one(`SELECT receipt,updated_ts FROM proxy_probes
+        WHERE repo=? AND pr=? AND kind='pr_merged' AND state='verified' AND ok=1`, lane.repo, responsePr) : null;
+      const mergeResponse = mergeProbe ? { phase: "observed_merged", pr: responsePr, at: Number(mergeProbe.updated_ts), receipt: String(mergeProbe.receipt) }
+        : pendingMerge && responsePr > 0 ? { phase: "recorded", pr: responsePr, at: Number(pendingMerge.at) } : null;
       const lineFacts = TrainLineFactsSchema.safeParse({
         queue, currently: meta.currently ?? null, stop: meta.stop ?? null,
         lease: meta.lease ?? null, capable, queue_facts: brQf,
-        base_red_resolution, diagnostic,
+        base_red_resolution, diagnostic, merge_response: mergeResponse,
         diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,
         starved, bypass_wait: meta.bypass_wait ?? null,
         attempt: headHold ? { note: headHold.note, hold: headHold.class } : null,

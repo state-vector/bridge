@@ -167,7 +167,8 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
 }) {
   const activeLanes = lanes?.filter(lane => !lane.retired && lane.line?.phase !== "retired");
   return <div className="train-panel">
-    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span></div>
+    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
+      <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
     {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
     {!!activeLanes?.length && <div className="ktable-head train-head-cols">
@@ -202,12 +203,12 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
             {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
           </span>
           <span className="train-stats">
-            <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} ready</span>
+            <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
           </span>
           <span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
-            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · ${q.bounces} train bounce(s) on this PR (budget 5 same-kind — BR#4688)${q.over_budget ? " — OVER bounce budget (escalated, de-queued)" : ""}` : ""}`} onClick={() => openTask?.(q.id)}>{q.bounces ? <span className={`train-bounce-chip${q.over_budget ? " over-budget" : ""}`}>×{q.bounces}</span> : null}</span>)}
+            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · Returned to repair/review ${q.bounces} time(s) across tracked history${q.over_budget ? " — active bounce-budget escalation" : ""}` : ""}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
       </div>
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
