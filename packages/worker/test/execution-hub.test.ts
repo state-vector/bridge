@@ -161,6 +161,8 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
     expect((await post("execution", { ...auth, command_id: "begin-active-writer", command: { kind: "begin", attempt_id: "active", worker: r.auth.agent, action_budget_ms: 60_000 } })).data.error).toBeUndefined();
     await post("transition", { ...auth, to: "blocked", note: "Waiting for operation completion", await_event: { event: "time", until_ts: Date.now() + 60_000 } });
+    const held = await post<{ blockers: { kind: string; text: string }[] }>("execution", { ...auth, command_id: "show-writer-hold", command: { kind: "availability" } });
+    expect(held.data.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "writer_quiescence_required", text: expect.stringContaining("no stopped-writer proof") })]));
     const local = await interactive(`cannot-steal-writer-${serial}`);
     expect((await post("transition", { id: task.id, actor: local.label, token_id: local.token_id, session: "human-active-writer", to: "in_progress", note: "Need writer to stop first" })).data.error).toMatch(/writer not quiescent/);
   });

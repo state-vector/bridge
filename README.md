@@ -1999,6 +1999,14 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+Merge responses are acknowledged immediately in the line status: a recorded
+response waits for GitHub reconciliation; an observed merged PR waits for
+deployment verification. Neither keeps asking for the same merge. PR blocks
+show verification state; historical repair/review returns are available in their
+details rather than overprinted `×N` labels. Historical totals are separate from
+an active same-kind bounce-budget escalation. Repairs held by an unconfirmed old
+writer name the gateway reconciliation required before another worker may start.
+
 The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 records remaining lifecycle, completion, priority and recovery gaps at commit
 `4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
