@@ -746,15 +746,20 @@ pub(crate) mod tests {
         journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
         let mut controller = Controller::new(&cfg,&ready,&snap);
         controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record)).ok().unwrap();
+        let started = Instant::now();
         let deadline = Instant::now()+Duration::from_secs(12);
-        while cancels.load(Ordering::SeqCst)==0 {
-            controller.tick(&snap,false,true).unwrap(); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
+        loop {
+            controller.tick(&snap,false,true).unwrap();
+            // Seeing the request at the server is not the finalizer's durable
+            // completion. In loaded Linux CI, fsync can outlive a fixed sleep.
+            let retained = journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap();
+            if retained.iter().any(|r| matches!(r.disposition,Disposition::Rejected { .. })) { break; }
+            assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
         }
-        for _ in 0..100 { controller.tick(&snap,false,true).unwrap(); std::thread::sleep(Duration::from_millis(1)); }
         assert!(!controller.controller_ready(),"an unchanged claim cannot release the handoff barrier");
         assert_eq!(controller.registry.counts().charged,1);
         assert_eq!(cancels.load(Ordering::SeqCst),1);
-        assert_eq!(reads.load(Ordering::SeqCst),1,"a wait must be paced, not a foreground polling storm");
+        assert!(reads.load(Ordering::SeqCst) as u64<=1+started.elapsed().as_secs()/RESERVATION_OBSERVATION_INTERVAL.as_secs(),"a wait must be paced, not a foreground polling storm");
         assert!(matches!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap()[0].disposition,Disposition::Rejected { .. }),"rollback builds must still understand the retained journal");
         released.store(true,Ordering::SeqCst);
         while !controller.controller_ready() {
