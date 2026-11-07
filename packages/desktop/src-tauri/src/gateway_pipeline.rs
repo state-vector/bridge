@@ -26,20 +26,21 @@ enum Admission {
 }
 enum Recovery {
     Initial,
-    Loading { job: lifecycle::Job<Result<Vec<(Ownership, FinalWork)>, String>>, initial: bool },
+    Loading { job: lifecycle::Job<Result<Vec<Recovered>, String>>, initial: bool },
     Ready { next: Instant },
     Retry { next: Instant, initial: bool },
     Held { reason: String },
 }
+enum Recovered { Running(InFlight), Final(Ownership, FinalWork) }
 type Registry = Pipeline<Input, InFlight, FinalWork>;
 type Config = Arc<Mutex<GatewayReadinessData>>;
 
 fn config(shared: &Config) -> DispatchConfig { let mut cfg = shared.lock().expect("gateway readiness poisoned").cfg.clone(); cfg.url = cfg.url.trim_end_matches('/').into(); cfg }
-fn root(cfg: &DispatchConfig) -> Result<PathBuf, String> {
+pub(super) fn root(cfg: &DispatchConfig) -> Result<PathBuf, String> {
     let key = journal::stable_key(&[cfg.url.trim_end_matches('/'), cfg.label.as_deref().ok_or("gateway host missing")?]);
     Ok(PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?).join(".bridge/lifecycle").join(key))
 }
-fn terminal_root(cfg: &DispatchConfig) -> Result<PathBuf, String> { Ok(root(cfg)?.join("terminal")) }
+pub(super) fn terminal_root(cfg: &DispatchConfig) -> Result<PathBuf, String> { Ok(root(cfg)?.join("terminal")) }
 fn reservation_path(cfg: &DispatchConfig, ticket: &Ticket) -> Result<PathBuf, String> {
     let key = journal::stable_key(&[&ticket.task_id, &ticket.session]);
     Ok(root(cfg)?.join("reservations").join(format!("{key}.json")))
@@ -66,6 +67,9 @@ pub(super) fn arm_launch(cfg: &DispatchConfig, task: &str, generation: u64, atte
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Launch { record: Record, worktree: Option<PathBuf> }
+pub(super) fn launch_record(cfg: &DispatchConfig, owner: &Record) -> Option<Record> {
+    std::fs::read(root(cfg).ok()?.join("launches").join(owner.name())).ok().and_then(|b| serde_json::from_slice::<Launch>(&b).ok()).map(|l| l.record)
+}
 fn remove_launch(cfg: &DispatchConfig, record: &Record) -> Result<(), String> {
     std::fs::remove_file(root(cfg)?.join("launches").join(record.name())).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())
 }
@@ -154,6 +158,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                 if root.join(record.name()).exists() {
                     if let Work::Stopped { outcome, writers, worktree, .. } = record.work.clone() { record.work = Work::Stopped { outcome, writers, worktree, step: Step::Acknowledged { reply: receipt["result"].clone() } }; journal::save(&root, &record)?; }
                     remove_launch(&cfg, &record)?;
+                    worker_session::retire(&cfg, &record)?;
                     journal::remove(&root, &record)?;
                 }
                 remove_reservation(&cfg, record.ticket())?;
@@ -252,6 +257,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                             }
                             remove_reservation(&cfg, record.ticket())?;
                             remove_launch(&cfg, &record)?;
+                            worker_session::retire(&cfg, &record)?;
                             journal::remove(&root, &record)?;
                             return Ok(());
                         },
@@ -320,12 +326,18 @@ fn reserve(shared: &Config, id: &str) -> Result<AdmissionReply, String> {
     Ok(reply)
 }
 
-fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<(Ownership, FinalWork)>, String> {
+fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String> {
     let cfg = config(shared); let mut recovered = Vec::new();
     let root = root(&cfg)?; let host = cfg.label.as_deref().ok_or("gateway host missing")?;
     let mut known: std::collections::BTreeSet<Ticket> = skip.into_iter().collect();
     for record in journal::pending(&root.join("terminal"), host, cfg.url.trim_end_matches('/'))? {
-        if known.insert(record.ticket().clone()) { recovered.push((record.owner.clone(), FinalWork::Journal(record))); }
+        if known.insert(record.ticket().clone()) { recovered.push(Recovered::Final(record.owner.clone(), FinalWork::Journal(record))); }
+    }
+    for running in worker_session::discover(&cfg, &known.iter().cloned().collect::<Vec<_>>())? {
+        let ticket = running.worker.as_ref().expect("discovery returns supervised workers").owner.ticket().clone();
+        // The persisted worker manifest, not a new claim, mutable task cache or
+        // conversation ID, supplies the original session/fence.
+        known.insert(ticket); recovered.push(Recovered::Running(running));
     }
     if let Ok(entries) = std::fs::read_dir(root.join("launches")) {
         for entry in entries {
@@ -345,7 +357,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<(Ownership, FinalWo
                 Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into() }, worktree: launch.worktree }
             };
             let record = journal::insert(&root.join("terminal"), record)?;
-            recovered.push((record.owner.clone(), FinalWork::Journal(record)));
+            recovered.push(Recovered::Final(record.owner.clone(), FinalWork::Journal(record)));
         }
     }
     if let Ok(entries) = std::fs::read_dir(root.join("reservations")) {
@@ -366,7 +378,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<(Ownership, FinalWo
                     work: Work::Unstarted { reason: "Recovered a persisted reservation with no active owned attempt; reconcile before scheduling".into() } }
             };
             let record = journal::insert(&root.join("terminal"), record)?;
-            recovered.push((record.owner.clone(), FinalWork::Journal(record)));
+            recovered.push(Recovered::Final(record.owner.clone(), FinalWork::Journal(record)));
         }
     }
     if let Some(legacy) = stopped_outbox_root() {
@@ -375,7 +387,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<(Ownership, FinalWo
                 let ticket = Ticket { task_id: receipt.task_id.clone(), session: receipt.session.clone() };
                 if receipt.ready_for_replay(now_ms()) && receipt.host == host && receipt.url == cfg.url && known.insert(ticket.clone()) {
                     let owner = Ownership::Attempt { ticket, host: host.into(), generation: receipt.generation, attempt_id: receipt.attempt_id.clone() };
-                    recovered.push((owner, FinalWork::Legacy(receipt)));
+                    recovered.push(Recovered::Final(owner, FinalWork::Legacy(receipt)));
                 }
             } }
         } }
@@ -404,11 +416,20 @@ impl Controller {
     }
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
+    pub fn controller_ready(&self) -> bool {
+        self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
+            && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| worker.reattachable.load(Ordering::SeqCst)))
+    }
     pub fn tick(&mut self, snap: &SharedSnapshot, stop: bool, update: bool) -> Result<(), String> {
         if stop { self.registry.drain(); } else if update { self.registry.natural_drain(); } else { self.registry.resume_admission(); }
-        self.registry.visit_running(|_, running, stopping| { if stopping { running.execution.control.stop.store(true, Ordering::SeqCst); } });
+        self.registry.visit_running(|_, running, stopping| { if stopping {
+            if let Some(worker) = &running.worker { worker.stop.store(true, Ordering::SeqCst); }
+            else { running.execution.control.stop.store(true, Ordering::SeqCst); }
+        } });
         let shared = self.shared.clone();
-        self.registry.poll(|running| match running.rx.try_recv() {
+        self.registry.poll(|running| {
+            if let Some(worker) = &running.worker { return worker.rx.try_recv().ok().map(FinalWork::Journal); }
+            match running.rx.try_recv() {
             Ok(outcome) => {
                 match record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()) {
                     Ok(record) => Some(FinalWork::Active(record, running.execution.clone())),
@@ -420,7 +441,7 @@ impl Controller {
                 record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()).ok().map(|r| FinalWork::Active(r, running.execution.clone()))
             },
             Err(TryRecvError::Empty) => None,
-        });
+        } });
         let cfg = config(&self.shared);
         let recovery = std::mem::replace(&mut self.recovery, Recovery::Initial);
         self.recovery = match recovery {
@@ -433,7 +454,13 @@ impl Controller {
             Recovery::Loading { mut job, initial } => match job.poll() {
                 None => Recovery::Loading { job, initial },
                 Some(Ok(Ok(records))) => {
-                    for (owner, work) in records { if !self.registry.contains(owner.ticket()) { let _ = self.registry.restore_finalization(owner, work); } }
+                    for record in records { match record {
+                        Recovered::Running(running) => {
+                            let owner = running.worker.as_ref().expect("recovered running worker has an immutable owner").owner.clone();
+                            if !self.registry.contains(owner.ticket()) { let _ = self.registry.restore_running(owner, running); }
+                        },
+                        Recovered::Final(owner, work) => if !self.registry.contains(owner.ticket()) { let _ = self.registry.restore_finalization(owner, work); },
+                    } }
                     Recovery::Ready { next: Instant::now() + Duration::from_secs(30) }
                 },
                 Some(Ok(Err(reason))) | Some(Err(reason)) => {
@@ -555,8 +582,14 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
         let active = controller.as_ref().map(Controller::active).unwrap_or(0);
         if let Some(request) = request {
             if last_update_receipt.elapsed() >= Duration::from_secs(1) {
-            if matches!(update_train_barrier(active, &train_stop, &mut train)?, UpdateTrainBarrier::Quiescent) {
-                update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
+            let adopting = request["worker_protocol"] == worker_session::PROTOCOL;
+            let restart_ready = adopting && controller.as_ref().map(Controller::controller_ready).unwrap_or(true);
+            if matches!(update_train_barrier(if restart_ready { 0 } else { active }, &train_stop, &mut train)?, UpdateTrainBarrier::Quiescent) {
+                if restart_ready {
+                    update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"controller_ready","worker_protocol":worker_session::PROTOCOL}));
+                } else {
+                    update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
+                }
             }
             if readiness.data.lock().map(|d| match &d.state { GatewayReadinessState::Ready(p) => p.observed.elapsed() < Duration::from_secs(60), GatewayReadinessState::Connected { observed } => observed.elapsed() < Duration::from_secs(60), _ => false }).unwrap_or(false) {
                 update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
@@ -581,13 +614,13 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    struct Hub { url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
+    pub(crate) struct Hub { url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
     impl Hub {
-        fn new(mut answer: impl FnMut(serde_json::Value) -> Option<serde_json::Value> + Send + 'static) -> Self {
+        pub(crate) fn new(mut answer: impl FnMut(serde_json::Value) -> Option<serde_json::Value> + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -620,7 +653,7 @@ mod tests {
         }
     }
     impl Drop for Hub { fn drop(&mut self) { self.stop.store(true, Ordering::SeqCst); let _ = TcpStream::connect(self.url.trim_start_matches("http://")); if let Some(t) = self.thread.take() { let result = t.join(); if !std::thread::panicking() { result.unwrap(); } } } }
-    fn fixture(hub: &Hub) -> (DispatchConfig, GatewayReadiness, SharedSnapshot) {
+    pub(crate) fn fixture(hub: &Hub) -> (DispatchConfig, GatewayReadiness, SharedSnapshot) {
         let cfg: DispatchConfig = serde_json::from_value(json!({"url":hub.url,"token":"fixture-only","label":format!("pipeline-fixture-{}-{}",std::process::id(),hub.url.rsplit(':').next().unwrap()),"max_sessions":20})).unwrap();
         let label = format!("{}/worker", cfg.label.as_ref().unwrap());
         let ready = GatewayReadiness::with_probe(&cfg, Duration::from_secs(3600), move |_| Ok(WorkerCredential { label: label.clone(), secret: "fixture-only".into() }));

@@ -1,5 +1,21 @@
 # bridge
 
+### Restart the gateway without restarting its agents
+
+Linux gateways supervise new tasks in independent per-attempt systemd units.
+Those workers retain their agent connection, renew execution leases and preserve
+output/results while the controller restarts. The new controller rediscovers the
+same fenced workers without launching another agent or execution generation.
+Controller-only updates negotiate support in both forward and rollback builds;
+legacy/incompatible workers still drain safely during migration. Health checks,
+unknown-effect fencing and result acknowledgments remain enforced.
+
+Use `bridge workers status [BR#task]` to inspect local workers and
+`bridge workers stop [BR#task]` to request a scoped stop. Controller service
+restarts preserve workers. Update holds describe handoff/health verification,
+not an invented active drain. Refresh the separately installed updater script
+as documented in the README to enable the negotiated handoff.
+
 Knowledge REST and MCP use authenticated credential identity rather than
 caller-supplied actor or gateway flags. Workspace routing is not authentication.
 Gateway infrastructure reports process facts; task submission and acceptance
@@ -116,7 +132,8 @@ Linux runners can explicitly opt into automatic updates in config:
 a successful versioned release. A separate systemd updater receives build-ready
 push events, reconciles on reconnect, and uses an hourly fallback instead of
 aggressively polling releases. It verifies the download and embedded source SHA,
-waits for active work to finish and the train thread to join, then restarts under
+waits for a fenced controller handoff and the train thread to join (or full worker
+drain for legacy/incompatible builds), then restarts under
 a no-claims hold. Fresh process/backend/hub health proves adoption; an unhealthy
 candidate rolls back before work resumes. Update/deferral/rollback receipts reach
 Bridge's ops feed and configured Slack shipping. Auto-update is never enabled by
