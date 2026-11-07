@@ -2179,10 +2179,12 @@ reconcile deploy coverage as a closed 6-state machine (`DeployCoverageState`:
   uncovered (`verdict == "empty"`, no deploy workflow run in flight or queued
   for `tip_sha`, secondary observers like `Deploy Health Record` excluded) and
   the tip commit is older than `DEPLOY_RECONCILE_GRACE_SECS` (5 minutes), the
-  executor dispatches the deploy workflow (`gh workflow run deploy-dev.yml
-  --repo <repo> --ref <base>`) at most **once per SHA**, persisted both in
-  executor memory and hub-side (`lane.deploy_dispatched`) and audited as
-  `train:deploy_dispatched`.
+  executor dispatches the deploy workflow inferred from the lane's observed
+  runs (`gh workflow run <deploy>.yml --repo <repo> --ref <base>` — e.g.
+  `deploy-dev.yml` on `Deploy Dev` repos, `dev-build.yml` on repos whose
+  push-to-main pipeline is `dev-build`) at most **once per SHA**, persisted
+  both in executor memory and hub-side (`lane.deploy_dispatched`) and audited
+  as `train:deploy_dispatched`.
 - **B. Deploy-coverage predicate & lane vocabulary**: `queue_facts.base_state`
   stamps `tip_sha`, `tip_age_secs`, `covered_by` (the SHA of the newest
   decisive green deploy), `coverage_age_secs`, and `deploy_coverage`. The lane
