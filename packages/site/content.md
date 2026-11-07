@@ -57,6 +57,9 @@ completion evidence. Execution acceptance cannot be replaced by a prerequisite
 PR merge; reviewed PR heads still wait for the train's decisive delivery checks.
 Acceptance echoes the review's server-captured subject revision. Definition/input
 changes and new submissions invalidate old verdicts, while progress does not.
+Only the current review round can accept work, including detached reviews.
+Claimed duties retain their captured subject; changed submissions get a fresh
+round. Historical transcripts remain evidence for review, never admission authority.
 Merge/provenance observations trigger independent decisive-delivery verification;
 they do not manufacture completion or landed CI. Existing human approvals remain
 bound to their exact task revision and PR heads.

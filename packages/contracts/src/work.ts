@@ -43,7 +43,7 @@ export type CurrentTaskReview =
  * and heads. Approval does not merge or waive decisive delivery checks. */
 export const HumanDeliveryApprovalSchema = z.object({
   kind: z.literal("human_delivery_approval"), task_id: z.string().regex(/^BR#\d+$/),
-  revision: z.string().min(1), actor: z.string().regex(/^(web(?::|$)|human(?::|$))/), at: z.number(),
+  revision: z.string().min(1), actor: z.string().regex(/^(web:|human:)/), at: z.number(),
   legs: z.array(z.object({ repo: z.string(), number: z.number().int().positive(), head: z.string().regex(/^[0-9a-f]{40}$/i) })).min(1),
 });
 

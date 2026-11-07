@@ -6167,9 +6167,9 @@ export class KnowledgeHub {
               || result.kind === "accepted_execution" && result.task_id === id && !mergeCompletesTask(taskMeta)
               || result.kind === "accepted_pr" && result.task_id === id && mergeCompletesTask(taskMeta) && landed) return { ok: true, via: current.id };
           }
-          // Historical acceptances may already have been sealed in the durable
-          // admission ledger. Preserve those exact receipts, never their prose.
-          if (landed && this.one(`SELECT review_id FROM delivery_admissions WHERE json_extract(record,'$.state.task_id')=? AND json_extract(record,'$.state.phase')='admitted' AND COALESCE(json_extract(record,'$.state.subject_revision'),'legacy')=? AND (? IS NULL OR review_id=?) LIMIT 1`, id, taskMeta.work_revision ?? "legacy", current.phase === "none" ? null : current.id, current.phase === "none" ? null : current.id)) return { ok: true, via: "delivery-admission" };
+          // A historical outbox row cannot upgrade a transcript into authority.
+          // Preserve only an exact typed PR acceptance behind that admission.
+          if (landed && this.one(`SELECT a.review_id FROM delivery_admissions a JOIN artefacts c ON c.id=a.review_id WHERE json_extract(a.record,'$.state.task_id')=? AND json_extract(a.record,'$.state.phase')='admitted' AND COALESCE(json_extract(a.record,'$.state.subject_revision'),'legacy')=? AND c.status='done' AND json_extract(c.meta,'$.review_result.kind')='accepted_pr' AND json_extract(c.meta,'$.review_result.task_id')=json_extract(a.record,'$.task_id') AND (? IS NULL OR a.review_id=?) LIMIT 1`, id, taskMeta.work_revision ?? "legacy", current.phase === "none" ? null : current.id, current.phase === "none" ? null : current.id)) return { ok: true, via: "delivery-admission" };
           return { ok: false };
         }
         // Bar-based claim gate: a claim is legal unless the task DECLARES
@@ -6235,26 +6235,15 @@ export class KnowledgeHub {
         }
         return null;
       },
-      // newest OPEN verify round (reuse candidate) — a re-handoff re-enters the
-      // same round instead of stacking a fresh card per bounce cycle
-      openVerifyChild: () =>
-        this.one(
-          `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-             AND c.roles LIKE '%"review"%' AND r.src_id != r.dst_id ORDER BY c.updated_ts DESC LIMIT 1`, id,
-        ),
-      // BR#6518: the subject's stamped DETACHED verify round (meta.verify_round.duty)
-      // while that duty is still an open role:review task — a detached duty has no
-      // child_of edge, so openVerifyChild cannot see it
-      openVerifyRound: () => {
-        const m = JSON.parse(String(row.meta ?? "{}")) as Record<string, any>;
-        const dutyId = m.verify_round?.duty;
-        if (typeof dutyId !== "string" || !dutyId) return null;
-        const d = this.one(`SELECT id, status, roles FROM artefacts WHERE id = ?`, dutyId);
-        if (!d || !["todo", "in_progress", "blocked"].includes(String(d.status))) return null;
-        if (!parseTags(d.roles).includes("review")) return null;
-        return { id: String(d.id) };
+      // A new submission may reuse an unclaimed round, including a detached
+      // one. A claimed duty keeps its immutable subject and cannot be rebound.
+      openVerifyChild: () => {
+        const current = this.currentTaskReview(id);
+        if (current.phase !== "pending") return null;
+        return this.one(`SELECT id FROM artefacts WHERE id=? AND json_type(meta,'$.review_subject') IS NULL`, current.id);
       },
+      // The canonical query above already includes detached rounds.
+      openVerifyRound: () => null,
       // at most ONE live unblock child per parent, ever (cap ≤1 open)
       openUnblockChild: () =>
         this.one(
@@ -6883,7 +6872,7 @@ export class KnowledgeHub {
         verdict.status, ts, JSON.stringify(meta), ts, verdict.owner_clear ? "" : owner, JSON.stringify(tagsForWrite(verdict, tTags)), nextBodyMd, id,
       );
       if (row.type === "task" && verdict.status === "done" && tRoles.includes("review")) {
-        this.persistDeliveryAdmission(id, String(body.note ?? ""), reviewResult, actor, ts);
+        this.persistDeliveryAdmission(id, reviewResult, actor, ts);
       }
       if (row.type === "task") {
         if (terminalStartup) {
@@ -8079,43 +8068,18 @@ export class KnowledgeHub {
   }
 
   /** Runs inside the SAME SQLite transaction that closes the independent review.
-   * A findings close is never acceptance. Prose adaptation is restricted to
-   * the historical backfill; new transitions require a typed result. */
-  private persistDeliveryAdmission(reviewId: string, note: string, result: ReviewResult | undefined, actor: string, ts: number, historical = false): void {
-    if (result && result.kind !== "accepted_pr") return;
-    if (!result && !historical) return;
-    if (!result && !/^\s*(?:(?:VERDICT|VERIFY)\s*:\s*)?(?:VERIFY\s+ACCEPT|ACCEPT(?:ED)?|VERIFIED)\b/i.test(note)) return;
-    const parsedLegs = result ? [] : trainParseNoteLegs(note);
-    let parent = this.one(`SELECT p.* FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=? AND r.relation='child_of' AND p.type='task' LIMIT 1`, reviewId);
-    if (!parent && result?.kind === "accepted_pr") parent = this.one(`SELECT * FROM artefacts WHERE id=? AND type='task'`, result.task_id);
-    if (!parent && parsedLegs.length === 1) {
-      // Historical standalone duties (e.g. PR2329) had no child_of edge.
-      // Resolve only an exact PR binding and explicit card receipt, never a
-      // title guess or an arbitrary most-recent card.
-      const l = parsedLegs[0];
-      const candidates = this.state.storage.sql.exec(`SELECT a.* FROM artefacts a WHERE a.type='task' AND a.roles NOT LIKE '%review%' AND ((json_extract(a.meta,'$.pr.repo')=? AND json_extract(a.meta,'$.pr.number')=?) OR EXISTS(SELECT 1 FROM json_each(a.meta,'$.prs') j WHERE json_extract(j.value,'$.repo')=? AND json_extract(j.value,'$.number')=?))`, l.repo, l.number, l.repo, l.number).toArray();
-      const refs = new Set(parseCardIdRefs(note));
-      const named = candidates.filter(c => refs.has(String(c.id)));
-      parent = named.length === 1 ? named[0] : candidates.length === 1 ? candidates[0] : null;
-    }
-    if (!parent || (result?.kind === "accepted_pr" && result.task_id !== parent.id)) return;
-    const pm = JSON.parse(parent.meta ?? "{}");
-    if (!mergeCompletesTask(pm)) return;
-    let legs = result?.kind === "accepted_pr" ? result.legs : parsedLegs;
-    if (legs.length === 1 && !legs[0].head_sha_at_acceptance) {
-      const head = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
-      if (head) legs = [{ ...legs[0], head_sha_at_acceptance: head }];
-    }
-    if (!legs.length) {
-      const head = TRAIN_HEAD_STAMP_RE.exec(note)?.[1];
-      const stamped = trainLegs(pm).filter(l => !trainLegLanded(pm, l));
-      if (head && stamped.length === 1) legs = [{ ...stamped[0], head_sha_at_acceptance: head }];
-    }
-    if (!legs.length || legs.some(l => !/^[a-f0-9]{40}$/i.test(l.head_sha_at_acceptance ?? ""))) return;
+   * Historical backfill accepts the same typed receipts; transcripts remain
+   * evidence for a fresh review, never a second acceptance authority. */
+  private persistDeliveryAdmission(reviewId: string, input: ReviewResult | undefined, actor: string, ts: number): void {
+    const parsed = ReviewResultSchema.safeParse(input);
+    if (!parsed.success || parsed.data.kind !== "accepted_pr") return;
+    const result = parsed.data;
+    const parent = this.one(`SELECT * FROM artefacts WHERE id=? AND type='task'`, result.task_id);
+    if (!parent || !mergeCompletesTask(JSON.parse(parent.meta ?? "{}"))) return;
     const record: DeliveryAdmission = { review_id: reviewId, task_id: String(parent.id),
       delivery_owner: String(parent.owner || actor), actor, accepted_at: ts,
-      subject_revision: result?.kind === "accepted_pr" ? result.subject_revision ?? "legacy" : "legacy",
-      legs: legs as AcceptedPrLeg[], state: { phase: "pending" } };
+      subject_revision: result.subject_revision ?? "legacy",
+      legs: result.legs, state: { phase: "pending" } };
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO delivery_admissions(review_id,record) VALUES(?,?)`, reviewId, JSON.stringify(record));
   }
 
@@ -8130,6 +8094,12 @@ export class KnowledgeHub {
       const a = JSON.parse(String(row.record)) as DeliveryAdmission;
       const save = () => this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
       try {
+        const reviewed = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, a.review_id);
+        const authorization = ReviewResultSchema.safeParse(JSON.parse(String(reviewed?.meta ?? "{}")).review_result);
+        if (reviewed?.status !== "done" || !authorization.success || authorization.data.kind !== "accepted_pr"
+          || authorization.data.task_id !== a.task_id) {
+          a.state = { phase: "held", reason: "Historical admission has no typed subject-bound acceptance; preserve its evidence for a fresh review." }; save(); continue;
+        }
         const newer = this.one(`SELECT review_id FROM delivery_admissions WHERE json_extract(record,'$.task_id')=? AND CAST(json_extract(record,'$.accepted_at') AS INTEGER)>? ORDER BY CAST(json_extract(record,'$.accepted_at') AS INTEGER) DESC LIMIT 1`, a.task_id, a.accepted_at);
         if (newer) { a.state = { phase: "replaced", review_id: String(newer.review_id) }; save(); continue; }
         let parent = this.one(`SELECT * FROM artefacts WHERE id=?`, a.task_id);
@@ -8198,8 +8168,8 @@ export class KnowledgeHub {
     // parents, then replay the durable outbox on every existing repair pass.
     const accepted = this.state.storage.sql.exec(`SELECT c.id,c.meta,c.status_ts FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%review%' AND NOT EXISTS(SELECT 1 FROM delivery_admissions a WHERE a.review_id=c.id) AND NOT EXISTS(SELECT 1 FROM delivery_review_backfill b WHERE b.review_id=c.id AND b.status_ts=c.status_ts) ORDER BY c.rowid LIMIT 10`).toArray();
     for (const r of accepted) {
-      const receipt = this.one(`SELECT actor,data FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, r.id);
-      if (receipt) this.persistDeliveryAdmission(String(r.id), String(JSON.parse(String(receipt.data ?? "{}")).note ?? ""), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts), true);
+      const receipt = this.one(`SELECT actor FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, r.id);
+      if (receipt) this.persistDeliveryAdmission(String(r.id), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
     await this.replayDeliveryAdmissions();
@@ -8594,11 +8564,16 @@ export class KnowledgeHub {
     if (!parent || parent.type !== "task") throw new Error(`independent review requires an existing task: ${taskId}`);
     if (parent.status === "done" || parent.status === "superseded") return { kind: "independent_review", task_id: taskId, id: taskId, status: "complete", message: "This work is already complete. No action is needed from you." };
     if (parent.status !== "in_review") throw new Error("submit the implementation to in_review with delivery receipts first; Bridge automatically assigns an independent review");
-    const active = this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task' AND c.status IN ('todo','in_progress') AND c.roles LIKE '%review%' LIMIT 1`, taskId);
-    if (active) return { kind: "independent_review", task_id: taskId, id: active.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
-    const accepted = this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status = 'done' AND c.status_ts >= ? AND json_extract(c.meta, '$.review_result.kind') = 'accepted_direct_main' ORDER BY c.created_ts DESC LIMIT 1`, taskId, parent.status_ts);
-    if (accepted) return { kind: "independent_review", task_id: taskId, id: String(accepted.id), status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
     const meta = JSON.parse(parent.meta ?? "{}");
+    const current = this.currentTaskReview(taskId);
+    if (current.phase === "pending") {
+      const duty = this.one(`SELECT meta FROM artefacts WHERE id=?`, current.id);
+      const captured = ReviewSubjectSchema.safeParse(JSON.parse(String(duty?.meta ?? "{}")).review_subject);
+      if (!captured.success || captured.data.revision === (meta.work_revision ?? "legacy"))
+        return { kind: "independent_review", task_id: taskId, id: current.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
+    }
+    if (current.phase === "accepted" && current.subject.revision === (meta.work_revision ?? "legacy"))
+      return { kind: "independent_review", task_id: taskId, id: current.id, status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
     const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
     const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
     const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], project: parent.project, meta: recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), session: "" }, actor);
@@ -13623,16 +13598,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     throw new Error(`train.carry: no queued card on ${repo}@${base} rides PR #${pr} — carries feed only the lane's queued heads`);
   }
 
-  /** The ACCEPT hook (verify-side convention, BR#3516 §1): a verify duty
-   *  closing done on an impl card stamps the card's PR provenance and queues
-   *  it onto the train. Parses the PRs + heads from BOARD data (the close
-   *  note) — zero hub GitHub calls. Idempotent: an already-queued card just
-   *  re-stamps the (new) heads.
-   *  BR#3659: a close may cite MULTIPLE PRs — every cited PR becomes a LEG
-   *  (meta.prs; meta.pr stays the first leg), each bound to its own head;
-   *  one unbound leg fail-closes the queue. Bounce guards (defect 2): a
-   *  verify close on an in_progress (bounced) card or a card blocked on a
-   *  non-train reason never re-queues it. */
+   /** Apply only the current typed, exact-revision acceptance. PR delivery uses
+    * the transactional admission outbox; execution and direct-main acceptance
+    * close through the same guarded transition and preserve terminal cleanup. */
   private async applyCurrentReview(parentId: string, reviewId: string, actor: string): Promise<void> {
     const parent = this.one(`SELECT id, type, status, meta, body_md, roles FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;

@@ -260,4 +260,65 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect(refused.body.error).toContain("separation of duties");
     expect((await get(review)).status).toBe("in_progress");
   });
+
+  it("reuses the canonical detached pending review when independent review is requested", async () => {
+    const { id, review } = await submission(["analysis"]);
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: { kind: "findings", summary: "A new detached round will verify the remaining evidence." } })).status).toBe(200);
+    const latest = (await call("create", { type: "task", title: "Canonical detached review", roles: ["review"],
+      meta: { execution_review_of: id }, session: "" })).body.id;
+    const request = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(request.status, JSON.stringify(request.body)).toBe(200);
+    expect(request.body.id).toBe(latest);
+  });
+
+  it("does not report old acceptance after the canonical review returned findings", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const child = await task(["analysis"]);
+    await call("link", { src: child, relation: "child_of", dst: id });
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(200);
+    const latest = (await call("create", { type: "task", title: "New review found missing evidence", roles: ["review"],
+      meta: { execution_review_of: id }, session: "" })).body.id;
+    await call("transition", { id: latest, to: "in_progress", actor: "new-reviewer", session: "new-review" });
+    expect((await call("transition", { id: latest, to: "done", actor: "new-reviewer", session: "new-review",
+      review_result: { kind: "findings", summary: "Newer evidence does not support acceptance." } })).status).toBe(200);
+    const request = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(request.status, JSON.stringify(request.body)).toBe(200);
+    expect(request.body.id).not.toBe(review);
+    expect((await get(request.body.id)).status).toBe("todo");
+  });
+
+  it("gives a changed submission a fresh review instead of rebinding a claimed old duty", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const oldSubject = (await get(review)).meta.review_subject;
+    expect((await call("transition", { id, to: "in_progress", actor: "impl", session: "impl-session", note: "Repair after changed evidence" })).status).toBe(200);
+    const submitted = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", execution_result: outcome });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    const fresh = submitted.body.verify_task;
+    expect(fresh).not.toBe(review);
+    expect((await get(review)).meta.review_subject).toEqual(oldSubject);
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(400);
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: { kind: "findings", summary: "The captured submission changed; retained as a historical review." } })).status).toBe(200);
+    expect((await call("transition", { id: fresh, to: "in_progress", actor: "fresh-reviewer", session: "new-submission-review" })).status).toBe(200);
+    expect((await get(fresh)).meta.review_subject?.revision).toBe((await get(id)).meta.work_revision);
+    expect((await call("transition", { id: fresh, to: "done", actor: "fresh-reviewer", session: "new-submission-review",
+      review_result: await resultFor(fresh, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(200);
+    expect((await get(id)).status).toBe("done");
+  });
+
+  it("can reuse an unclaimed review because no prior subject has been captured", async () => {
+    const id = await task(["analysis"]);
+    const first = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", execution_result: outcome });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect((await get(first.body.verify_task)).meta.review_subject).toBeUndefined();
+    await call("transition", { id, to: "in_progress", actor: "impl", session: "impl-session", note: "Replace unreviewed evidence" });
+    const second = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", execution_result: outcome });
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.verify_task).toBe(first.body.verify_task);
+    await call("transition", { id: second.body.verify_task, to: "in_progress", actor: "new-reviewer", session: "unclaimed-review" });
+    expect((await get(second.body.verify_task)).meta.review_subject?.revision).toBe((await get(id)).meta.work_revision);
+  });
 });

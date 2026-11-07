@@ -85,13 +85,18 @@ completion contract: `accepted_execution` verifies actual execution receipts;
 `accepted_pr` records exact reviewed heads, with delivery still waiting for the
 train's decisive required checks. Claim readiness and absent qualification bars
 never imply completion acceptance. Notes, parks and decision text do not create
-new acceptance; legacy prose is confined to historical receipt reconciliation.
+new acceptance. Historical transcripts stay available as evidence for a fresh
+review; they cannot author or replay delivery admission.
 
 On claim, a review captures `review_subject: {task_id, revision}`. Echo that exact
 revision as `review_result.subject_revision` on acceptance. Task-definition,
 repository-input and outcome edits, or a new submission (even identical content),
 invalidate old acceptance. Ordinary progress and machine bounce annotations do
 not. Revision/subject/result fields are lifecycle-owned, not generic metadata.
+Only the latest review round can author acceptance, including detached duties.
+An unclaimed round can be reused; a claimed duty keeps its captured subject,
+and changed submissions receive a fresh round. Independent-review requests use
+that same current round rather than duplicating detached or capability-held work.
 Existing human force-review approval is captured against its exact revision and
 PR heads; it still cannot merge or skip decisive delivery checks.
 
