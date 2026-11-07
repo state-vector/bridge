@@ -103,11 +103,13 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   expect((await cmd("yield", { kind: "yield" })).error).toBeUndefined();
   expect((await post("get_history", { id: impl.id, limit: 100 })).versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "execution_yielded", destination: "agent_pool", minimum_tier: "large" }) })]));
   await advertise(false, "remove-large");
+  await post("admin.execution_sweep", {});
   const blocked = await post("get", { id: impl.id });
   expect(blocked.status).toBe("blocked");
   expect(blocked.meta.execution_blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable", reason: "not_configured" })]));
   expect((await post("execution", { ...auth, command_id: "old-writer", command: { kind: "escalate", generation: 1, attempt_id: "one", tier: "large", reason: "Late old writer" } })).error).toMatch(/claim|session/);
   await advertise(true, "restore-large");
+  await post("admin.execution_sweep", {});
   expect((await post("get", { id: impl.id })).status).toBe("todo");
   expect((await post("transition", { ...auth, to: "in_progress" })).error).toBeUndefined();
   const wrong = await post("execution", { ...auth, command_id: "wrong-model", command: { kind: "begin", attempt_id: "two", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/medium", tier: "medium" } } });

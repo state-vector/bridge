@@ -35,6 +35,7 @@ command = "printf '{\"commit\":\"%s\",\"built_at\":\"%s\"}' \"$(git rev-parse HE
 # Workers AI: re-enable by adding [ai] binding = "AI" once the deploy env has
 # CLOUDFLARE_API_TOKEN (local dev fails without it). Until then search = FTS + trigram fuzzy.
 [durable_objects]
+code_update_strategy = { mode = "deferred", max_delay = 60 }
 bindings = [
   { name = "HUB", class_name = "FlowsHub" },
   { name = "KB", class_name = "KnowledgeHub" },

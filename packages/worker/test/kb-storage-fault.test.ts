@@ -67,6 +67,12 @@ const kbPost = (hub: KnowledgeHub, path: string, body = "{}") =>
   }));
 
 describe("DO fetch entry: injected storage faults (BR#4212)", () => {
+  it("serves stateful build provenance independently of SQL readiness", async () => {
+    const hub = new KnowledgeHub(fakeState({ sql: true }), {});
+    const response = await hub.fetch(new Request("https://kb/version"));
+    expect(response.status).toBe(200);
+    expect((await jsonBody(response)).lifecycle_protocol).toBe(2);
+  });
   it("ensureSchema fault → typed JSON 503, never a throw, never HTML", async () => {
     const hub = new KnowledgeHub(fakeState({ sql: true }), {});
     const res = await kbPost(hub, "/orient");

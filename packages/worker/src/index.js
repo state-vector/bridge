@@ -69,6 +69,9 @@ export default {
     // /artefacts route (filters read query params there; a POST /list with an
     // empty body would silently drop the filters).
     if (url.pathname === "/__version") {
+      if (url.searchParams.get("scope") === "stateful") {
+        return kbGuard("kb.version", env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/version"));
+      }
       // deploy provenance: the [build] hook writes src/__version.json with the
       // commit SHA — the drift probe and `bridge doctor` compare it to HEAD
       try {
@@ -239,6 +242,7 @@ export default {
           : sub === "artefact" ? "https://kb/artefact"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
+          : sub === "diagnostics" ? "https://kb/diagnostics"
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
@@ -254,6 +258,7 @@ export default {
         const rateKey = auth.login ? `web:${auth.login}` : `ip:${request.headers.get("cf-connecting-ip") ?? "anon"}`;
         const fwd = new Request(kbUrl + url.search, request);
         fwd.headers.set("x-kb-rate-key", rateKey);
+        fwd.headers.set("x-bridge-request-start", String(Date.now()));
         return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(fwd)));
       }
       if (request.method === "POST") {

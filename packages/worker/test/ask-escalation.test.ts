@@ -244,7 +244,7 @@ describe("ask TTL escalation (real DO)", () => {
     };
 
     // alarmSweep's body
-    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     expect(sweepOpen).toBeGreaterThan(-1);
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
 

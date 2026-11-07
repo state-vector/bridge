@@ -16,6 +16,18 @@ restarts preserve workers. Update holds describe handoff/health verification,
 not an invented active drain. Refresh the separately installed updater script
 as documented in the README to enable the negotiated handoff.
 
+### Operational diagnostics
+
+Operational diagnostics are available on demand in the merge-train panel and
+through authenticated `/api/kb/diagnostics`: current request stages, bounded
+latency/error observations, and explicit instance/freshness timestamps. The
+read-only `npm run diagnose:hub -- --seconds 45` command summarizes live Cloudflare
+traffic without collecting credentials or payloads. Gateway renewals stay separate
+from bounded, fairly scheduled backlog maintenance. Paused or overdue health
+checks explain missing evidence and executor state rather than declaring main red.
+Deployment verification checks the web edge and the actual stateful hub separately;
+current static assets alone do not prove that the scheduler adopted a fix.
+
 Knowledge REST and MCP use authenticated credential identity rather than
 caller-supplied actor or gateway flags. Workspace routing is not authentication.
 Gateway infrastructure reports process facts; task submission and acceptance
@@ -33,7 +45,8 @@ every reservation, writer, delivery and hold. The hub acknowledges exact
 stopped-writer proof and releases execution capacity before slow checkpoint
 publication; the task remains exclusively finalizing until its result is delivered.
 Backlog bounds prevent unbounded queued finalization. Snapshots distinguish these
-phases, and managed updates wait for outstanding delivery as well as writers.
+phases. Managed updates settle controller-owned delivery; compatible supervised
+workers keep running across the controller handoff.
 
 Admission identities, launch identities and terminal outcomes survive restart;
 retries reuse immutable command receipts. Unverifiable writers remain held.

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import type { LineRemediation, TrainLineProjection } from "@bridge/contracts";
+import type { HubDiagnostics, LineRemediation, TrainLineProjection } from "@bridge/contracts";
 import { recoveryCauseLabel, recoveryIsOpen } from "@bridge/contracts";
 import { kbApi, type KbTrainLane } from "../server/kb";
-import { Chip, type ChipTone } from "./index-kit";
+import { Btn, Chip, type ChipTone } from "./index-kit";
 
 function age(ts: number | undefined, now: number): string {
   if (!ts) return "unknown";
@@ -13,7 +13,7 @@ function age(ts: number | undefined, now: number): string {
 }
 
 const tones: Record<TrainLineProjection["phase"], ChipTone> = {
-  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "err", retired: "muted",
+  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "warn", retired: "muted",
 };
 const unavailable: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
@@ -80,7 +80,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
  * come from the hub's typed `line` projection, shared with its row and message. */
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
-  return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
+  return <div className={`train-blocked-banner${line.phase === "waiting" || line.phase === "unknown" ? " train-blocked-banner-amber" : ""}`} role="alert">
     <div className="train-banner-cause">
     <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
     <span className="train-banner-line">{line.reason}</span>
@@ -120,6 +120,32 @@ export function LaneRecoveryHistory({ line, now, openTask }: { line: TrainLinePr
 }
 
 const REFRESH_MS = 30_000;
+export function HubRequestDiagnostics({ now }: { now: number }) {
+  const [snapshot, setSnapshot] = useState<HubDiagnostics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = async () => {
+    if (loading) return;
+    setLoading(true);
+    try { setSnapshot(await kbApi.diagnostics()); setError(null); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { setLoading(false); }
+  };
+  return <details className="muted-note" onToggle={event => { if (event.currentTarget.open && !snapshot) void load(); }}>
+    <summary>Hub request diagnostics</summary>
+    <div>Request timings and current processing stages. Loaded on demand; opening this view does not run scheduler or repair sweeps.</div>
+    <Btn onClick={() => void load()} disabled={loading}>{loading ? "Reading hub…" : "Refresh diagnostics"}</Btn>
+    {error && <div role="alert">Diagnostics unavailable: {error}</div>}
+    {snapshot && <>
+      <div>Observed {age(snapshot.observed_at, now)} ago · instance running since {new Date(snapshot.started_at).toISOString()} · timings reset on hub restart</div>
+      <div>{snapshot.active.length} tracked requests in progress</div>
+      {snapshot.active.map(r => <div key={r.id}>{r.operation}: {r.stage} · {r.elapsed_ms}ms elapsed at observation</div>)}
+      {[...snapshot.operations].sort((a, b) => b.max_ms - a.max_ms).slice(0, 12).map(r => <div key={r.operation}>
+        {r.operation}: {r.count} requests · {r.errors} server errors · max ingress {r.max_ingress_ms}ms · max processing {r.max_ms}ms
+      </div>)}
+    </>}
+  </details>;
+}
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -187,5 +213,6 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
       </section>;
     })}
+    <HubRequestDiagnostics now={now} />
   </div>;
 }

@@ -47,6 +47,35 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("acknowledges capability renewal without reconciling the backlog on the liveness request", async () => {
+    const project = "bounded-control-plane", g = await gateway(project);
+    const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });
+    expect((await post("get", { id })).status).toBe("blocked");
+    const capabilities = { ...g.capabilities, tools: ["git", "aws"] };
+    expect((await g.cmd({ kind: "advertise", capabilities })).ok).toBe(true);
+    expect((await post("get", { id })).status).toBe("blocked");
+    // The scheduler owns bounded reconciliation before choosing work; moving
+    // it off advertisement must not strand newly eligible tasks.
+    const ready = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "inspect" }));
+    expect(ready).toMatchObject({ kind: "ready", candidates: [id] });
+  });
+
+  it("bounds capability maintenance and fairly reaches the whole retained backlog", async () => {
+    const project = "bounded-maintenance", g = await gateway(project);
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
+    for (let pass = 0; pass < 4; pass++) await post("admin.execution_sweep", {});
+    expect((await Promise.all(ids.map(id => post("get", { id })))).every(t => t.status === "blocked")).toBe(true);
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
+    await post("admin.execution_sweep", {});
+    const first = await Promise.all(ids.map(id => post("get", { id })));
+    const advanced = first.filter(t => t.status === "todo").length;
+    expect(advanced).toBeGreaterThan(0);
+    expect(advanced).toBeLessThanOrEqual(25);
+    for (let pass = 0; pass < 4; pass++) await post("admin.execution_sweep", {});
+    expect((await Promise.all(ids.map(id => post("get", { id })))).every(t => t.status === "todo")).toBe(true);
+  });
+
   it("dispatches an unowned bounced TODO repair without consuming real waits or another recovery owner's work", async () => {
     const project = "bounced-board-repair", g = await gateway(project, 3);
     const pr = (number: number) => ({ repo: "state-vector/bridge", number });
@@ -245,6 +274,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     if (result.kind !== "reserved") throw new Error("no reservation");
     await post("admin.execution_sweep", { now: result.expires_at + 1 });
     await g.cmd({ kind: "advertise", capabilities: g.capabilities });
+    await g.cmd({ kind: "schedule", mode: "inspect" });
     const card = await post("get", { id });
     expect(card).toMatchObject({ status: "todo", owner: "", meta: { execution_requirements: { host: g.host }, dispatch_recovery: { kind: "reservation_expired" } } });
     expect(card.meta.attempt).toBeUndefined();

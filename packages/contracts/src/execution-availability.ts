@@ -41,9 +41,12 @@ export function projectExecutionBlockers(input: {
   const blockers: ExecutionBlocker[] = [];
   if (!localReady && !usable.length) {
     const reason = !configured.length ? "not_configured" : !live.length ? "offline" : "unavailable";
+    const causes = [...new Set(live.flatMap(h => h.capabilities.availability.kind === "unavailable" ? [h.capabilities.availability.reason]
+      : h.readiness && h.readiness.kind !== "ready" ? [h.readiness.reason] : []))];
     blockers.push({ kind: "capability_unavailable", episode_id: key, reason,
       text: reason === "not_configured" ? `No gateway configured for ${requirements.tier} reasoning and the required scope.`
-        : reason === "offline" ? `The last supporting gateway for ${requirements.tier} reasoning is offline.` : `Supporting gateways report the required model/capability unavailable.`,
+        : reason === "offline" ? `The last supporting gateway for ${requirements.tier} reasoning is offline.`
+        : causes.length ? causes.join(" ") : `Supporting gateways report the required model/capability unavailable.`,
       evidence: configured.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}; model ${h.capabilities.model ?? "unreported"}${h.capabilities.availability.kind === "unavailable" ? `; ${h.capabilities.availability.reason}` : ""}`) });
   } else if (!localReady && usable.every(h => h.active >= h.capabilities.capacity)) {
     blockers.push({ kind: "capacity_wait", episode_id: `capacity:${id}`, text: usable.some(h => (h.occupancy?.unconfirmed ?? 0) > 0)

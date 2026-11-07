@@ -27,4 +27,5 @@ export * from "./execution-availability.ts";
 export * from "./runner-update.ts";
 export * from "./model-policy.ts";
 export * from "./execution-observability.ts";
+export * from "./hub-diagnostics.ts";
 export { WorkerStatusSchema, currentWorkerStatus, WorkerSlotSchema, WorkerOccupancySchema, currentWorkerOccupancy, type WorkerStatus, type WorkerSlot, type WorkerOccupancy } from "./worker-status.ts";
