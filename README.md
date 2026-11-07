@@ -280,6 +280,20 @@ new process/build's fresh readiness receipt, a stable process, and passing hub/
 backend doctor checks. Failed candidates roll back to the previous verified
 binary while that hold remains. Interrupted installs recover conservatively;
 failed rollback retains the hold for inspection rather than starting writers.
+An already-applied rollback is verified against the actual managed executable
+and PID rather than stopped and restarted again. Failed rollback health enters
+`recovery_required`, retaining the hold and useful-work retry budget. A newer
+CI-approved channel build can continue through `recovery_preparing` only after
+the restored process supplies its exact nonce/PID idle acknowledgement. Digest,
+embedded commit, doctor, stable-process health and rollback gates still apply;
+the same failed candidate is not replayed. A restart during preparation retains
+the hold and repeats only pre-install reads, never an unknown install effect.
+
+For a host already looping in rollback, atomically refresh the independently
+installed supervisor from the exact signed fix commit and restart **only
+`bridge-update`** while preserving `request.json`, `idle.json`, `health.json`,
+state and retained binaries. The corrected recovery protocol owns continuation;
+never clear the hold, forge a health/idle receipt or reset its cooldown manually.
 
 Success, deferral and rollback produce durable local state and a deduplicated
 ops notification through the existing Bridge alarm feed (visible in Log and in

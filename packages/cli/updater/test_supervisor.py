@@ -101,6 +101,81 @@ class UpdateTests(unittest.TestCase):
             self.u.recover()
         self.assertFalse(self.u.request.exists())
 
+    def test_already_restored_rollback_checks_health_without_restarting_again(self):
+        self.u.backup.write_text("previous")
+        self.u.record(m.Phase.ROLLING_BACK, from_commit="old", to_commit="failed")
+        m.atomic(self.u.request, {"nonce": "n"})
+        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 12, "phase": "idle"})
+        with patch.object(self.u, "pid", return_value=12), \
+             patch.object(self.u, "running_build", return_value="old", create=True), \
+             patch.object(self.u, "health", return_value=True), \
+             patch.object(self.u, "service") as service, patch.object(self.u, "notify"):
+            self.u.recover()
+        service.assert_not_called()
+        self.assertEqual(self.u.state["phase"], "rolled_back")
+        self.assertFalse(self.u.request.exists())
+
+    def test_failed_rollback_health_persists_recovery_without_restarting_or_releasing_hold(self):
+        self.u.backup.write_text("previous")
+        self.u.record(m.Phase.ROLLING_BACK, from_commit="old", to_commit="failed", attempt_started_at=1000000)
+        m.atomic(self.u.request, {"nonce": "n"})
+        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 12, "phase": "idle"})
+        with patch.object(self.u, "pid", return_value=12), \
+             patch.object(self.u, "running_build", return_value="old", create=True), \
+             patch.object(self.u, "health", return_value=False), \
+             patch.object(self.u, "service") as service, patch.object(self.u, "notify"):
+            self.u.recover()
+            restarted = m.Supervisor(self.bin, self.home)
+            restarted.recover()
+        service.assert_not_called()
+        self.assertEqual(restarted.state["phase"], "recovery_required")
+        self.assertEqual(restarted.state["to_commit"], "failed")
+        self.assertGreaterEqual(restarted.state["next_attempt_at"], 4600000)
+        self.assertTrue(self.u.request.exists())
+
+    def test_recovery_preparation_restart_never_releases_the_existing_hold(self):
+        self.u.record(m.Phase.RECOVERY_PREPARING, from_commit="old", to_commit="new")
+        m.atomic(self.u.request, {"nonce": "n"})
+        with patch.object(self.u, "service") as service, patch.object(self.u, "rollback") as rollback:
+            self.u.recover()
+        self.assertEqual(m.read(self.u.request), {"nonce": "n"})
+        service.assert_not_called()
+        rollback.assert_not_called()
+
+    def test_recovery_never_retries_failed_candidate_or_uses_wrong_process_or_nonce(self):
+        machine = type("Uname", (), {"machine": "aarch64"})()
+        target = "aarch64-unknown-linux-gnu"
+        sha = "c" * 40
+        manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
+            "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
+            "sha256": "d" * 64}}}
+        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
+        for case in ("same_candidate", "wrong_process", "wrong_nonce", "cooldown"):
+            with self.subTest(case=case):
+                self.u.state = {"phase": "recovery_required", "from_commit": "old", "to_commit": sha if case == "same_candidate" else "b" * 40,
+                                "next_attempt_at": 20000000 if case == "cooldown" else 0}
+                m.atomic(self.u.request, {"nonce": "n"})
+                m.atomic(self.u.root / "idle.json", {"nonce": "wrong" if case == "wrong_nonce" else "n", "pid": 123, "phase": "idle"})
+                fetched = []
+                def fetch(url, timeout):
+                    fetched.append(url)
+                    self.assertFalse(url.endswith("tar.gz"), "unproven recovery downloaded an archive")
+                    return io.BytesIO(json.dumps(manifest).encode())
+                with patch.object(m.time, "time", return_value=10000), patch.object(m.os, "uname", return_value=machine), \
+                     patch.object(self.u, "config", return_value=config), patch.object(self.u, "build", return_value="old"), \
+                     patch.object(self.u, "pid", return_value=123), patch.object(m.Path, "resolve", return_value=self.bin), \
+                     patch.object(self.u, "running_build", return_value=None if case == "wrong_process" else "old"), \
+                     patch.object(self.u, "service") as service, patch.object(m, "fetch", side_effect=fetch):
+                    if case in ("wrong_process", "wrong_nonce"):
+                        with self.assertRaisesRegex(RuntimeError, "exact idle acknowledgement"):
+                            self.u.reconcile()
+                    else:
+                        self.u.reconcile()
+                service.assert_not_called()
+                self.assertEqual(m.read(self.u.request), {"nonce": "n"})
+                if case == "cooldown":
+                    self.assertEqual(fetched, [])
+
     def test_every_drain_outcome_preserves_work_window_across_restart(self):
         config = {"auto_update": {"enabled": True, "channel": "main"}}
         for phase in (m.Phase.CONFIRMED, m.Phase.DEFERRED, m.Phase.ROLLED_BACK):
@@ -210,11 +285,16 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(checked, [10000, 13600])
 
     def test_full_install_and_failed_candidate_rollback_keep_writers_held(self):
-        for fail_health in (False, True):
-            with self.subTest(fail_health=fail_health):
+        for fail_health, recovery in ((False, None), (True, None), (False, "recovery_required"), (False, "recovery_preparing"),
+                                      (False, "bad_digest"), (False, "changed_pid"), (False, "doctor_fault")):
+            with self.subTest(fail_health=fail_health, recovery=recovery):
                 self.bin.write_bytes(b"old binary")
                 self.u.state = {}
                 sha = "c" * 40
+                if recovery:
+                    self.u.state = {"phase": "recovery_preparing" if recovery == "recovery_preparing" else "recovery_required",
+                                    "from_commit": "old", "to_commit": sha if recovery == "recovery_preparing" else "b" * 40}
+                    m.atomic(self.u.request, {"nonce": "existing-recovery-hold"})
                 target = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[m.os.uname().machine] + "-unknown-linux-gnu"
                 archive = io.BytesIO()
                 with tarfile.open(fileobj=archive, mode="w:gz") as tar:
@@ -224,7 +304,7 @@ class UpdateTests(unittest.TestCase):
                 data = archive.getvalue()
                 manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
                     "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
-                    "sha256": m.hashlib.sha256(data).hexdigest()}}}
+                    "sha256": "0" * 64 if recovery == "bad_digest" else m.hashlib.sha256(data).hexdigest()}}}
                 config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
                 actions = []
                 def idle(nonce, pid):
@@ -242,13 +322,26 @@ class UpdateTests(unittest.TestCase):
                 def fetch(url, timeout):
                     return io.BytesIO(data if url.full_url.endswith("tar.gz") else json.dumps(manifest).encode())
                 machine = type("Uname", (), {"machine": target.split("-unknown")[0], "nodename": "test-host"})()
-                with patch.object(self.u, "config", return_value=config), patch.object(self.u, "pid", return_value=123), \
+                with patch.object(self.u, "config", return_value=config), \
+                     patch.object(self.u, "pid", side_effect=[123, 124] if recovery == "changed_pid" else None, return_value=123), \
+                     patch.object(self.u, "running_build", side_effect=lambda pid: "old" if self.bin.read_bytes() == b"old binary" else sha), \
                      patch.object(self.u, "build", side_effect=lambda p: sha if Path(p).read_bytes() == b"new binary" else "old"), \
                      patch.object(self.u, "idle", side_effect=idle), patch.object(self.u, "service", side_effect=service), \
-                     patch.object(self.u, "health", side_effect=health), patch.object(self.u, "run", return_value=""), \
+                     patch.object(self.u, "health", side_effect=health), \
+                     patch.object(self.u, "run", side_effect=m.subprocess.CalledProcessError(1, "doctor") if recovery == "doctor_fault" else None, return_value=""), \
                      patch.object(self.u, "notify") as notify, patch.object(m.Path, "resolve", return_value=self.bin), \
                      patch.object(m.urllib.request, "urlopen", side_effect=fetch), patch.object(m.os, "uname", return_value=machine):
-                    if fail_health:
+                    if recovery in ("bad_digest", "changed_pid", "doctor_fault"):
+                        with self.assertRaises((ValueError, RuntimeError, m.subprocess.CalledProcessError)):
+                            self.u.reconcile()
+                        self.assertEqual(actions, [])
+                        self.assertEqual(self.bin.read_bytes(), b"old binary")
+                        self.assertTrue(self.u.request.exists())
+                        self.assertEqual(m.read(self.u.request)["nonce"], "existing-recovery-hold")
+                        self.u.recover()
+                        self.assertTrue(self.u.request.exists())
+                        continue
+                    elif fail_health:
                         with self.assertRaisesRegex(RuntimeError, "candidate did not pass"):
                             self.u.reconcile()
                     else:

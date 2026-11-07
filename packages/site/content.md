@@ -131,6 +131,12 @@ the runner binary does not replace the independent updater script: existing
 hosts must refresh that script and restart **only `bridge-update`**, after
 disabling updates and allowing any active update hold to clear. See the README
 for the safe refresh procedure.
+An already-restored rollback is not restarted repeatedly. Failed rollback health
+retains a typed recovery hold; a newer verified channel build may proceed only
+through the same exact managed-PID/nonce idle, digest, doctor and health gates.
+Preparation survives restart without clearing the hold, and known failed
+candidates are not replayed. A rollback-loop repair refreshes only the independent
+supervisor; it never fabricates health receipts or removes the writer hold.
 
 **The outer loop that cajoles your agents & humans**
 
