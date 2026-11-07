@@ -350,6 +350,10 @@ mod tests {
         let view = attach(spec).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !view.worker.as_ref().unwrap().reattachable.load(Ordering::SeqCst) || !ticks.exists() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
+        if std::env::var("BRIDGE_WORKER_FIXTURE_ABRUPT").as_deref() == Ok("1") {
+            fs::write(ticks.with_file_name("controller-ready"), "ready").unwrap();
+            while Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+        }
         // Returning exits the actual controller process and all of its reader
         // threads. The separately grouped worker keeps the transport and lease.
     }
@@ -439,8 +443,17 @@ for line in sys.stdin:
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
         spec.agent.workdir = root.to_string_lossy().into(); spec.agent.bin = agent.to_string_lossy().into();
         let path = persist_spec(&spec).unwrap();
-        let mut first_controller = child("dispatch::worker_session::tests::controller_process_entry", &path).spawn().unwrap();
-        assert!(first_controller.wait().unwrap().success(), "first real controller could not hand off its worker");
+        let mut launch = child("dispatch::worker_session::tests::controller_process_entry", &path);
+        if acp { launch.env("BRIDGE_WORKER_FIXTURE_ABRUPT", "1"); }
+        let mut first_controller = launch.spawn().unwrap();
+        if acp {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !root.join("controller-ready").exists() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
+            first_controller.kill().unwrap();
+            assert!(!first_controller.wait().unwrap().success(), "ACP drill must actually kill the controller process");
+        } else {
+            assert!(first_controller.wait().unwrap().success(), "first real controller could not hand off its worker");
+        }
         let before = fs::read(root.join("ticks")).unwrap().len();
         let first_state: State = serde_json::from_slice(&fs::read(root.join("state.json")).unwrap()).unwrap();
         let State::Running { pid: original_worker, .. } = first_state else { panic!("worker already stopped") };
