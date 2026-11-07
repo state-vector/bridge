@@ -17,6 +17,8 @@ up to 64 recent completions, 128 tracked active requests, and 64 operation group
 Timings reset when the hub instance restarts; the observation and instance-start
 timestamps make that scope explicit. Reading diagnostics performs no repair sweep.
 Slow hub requests also emit structured `bridge.request` stage timings to Cloudflare.
+Processing-stage durations use the runtime's event clock; ingress/hop waits are
+reported separately. Use the live-tail wall/CPU measurements for end-to-end latency.
 
 From a registered checkout with dependencies installed and `wrangler whoami`
 authenticated, capture live traffic with:
