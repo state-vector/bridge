@@ -169,11 +169,12 @@ describe("BR#3819 C — the done gate and the force-close exit (real-DO drill)",
     // the legal path to done: todo → in_progress → in_review (PR-linked) → done;
     // →in_review auto-spawns a Verify child — an open child the gate counts
     await kbJson("/transition", { id: p.id, to: "in_progress", note: "claim" });
-    const review = await kbJson("/transition", { id: p.id, to: "in_review", note: "PR https://github.com/state-vector/bridge/pull/1" });
+    const execution_result = { outcome: "Relation anomaly investigated; child dispositions remain explicit.", receipts: [c.id] };
+    const review = await kbJson("/transition", { id: p.id, to: "in_review", execution_result, note: "PR https://github.com/state-vector/bridge/pull/1" });
     const verifyId = review.body.verify_task;
     expect(verifyId, "in_review must auto-spawn its Verify child").toBeTruthy();
 
-    const refused = await kbJson("/transition", { id: p.id, to: "done", note: "trying to close with an open child" });
+    const refused = await kbJson("/transition", { id: p.id, to: "done", execution_result, note: "trying to close with an open child" });
     expect(String(refused.body.error)).toContain("open child");
     expect(String(refused.body.error)).toContain("force-close-children");
 
@@ -183,7 +184,7 @@ describe("BR#3819 C — the done gate and the force-close exit (real-DO drill)",
     const { body: c2 } = await kbJson("/create", { type: "task", title: "fc child 2", qualified: true });
     await kbJson("/link", { src: c2.id, relation: "child_of", dst: p.id });
     const partial = await kbJson("/transition", {
-      id: p.id, to: "done", note: `force-close-children: ${c.id} — partial lists must be refused`,
+      id: p.id, to: "done", execution_result, note: `force-close-children: ${c.id} — partial lists must be refused`,
     });
     const missingList = /missing: (.*?)\. put/.exec(String(partial.body.error))?.[1] ?? "";
     const missing = missingList.split(",").map((s) => s.trim());
@@ -191,7 +192,7 @@ describe("BR#3819 C — the done gate and the force-close exit (real-DO drill)",
 
     // complete + reasoned → passes; the repair is stamped on the card + ledger
     const done = await kbJson("/transition", {
-      id: p.id, to: "done",
+      id: p.id, to: "done", execution_result,
       note: `force-close-children: ${c.id}, ${c2.id}, ${verifyId} — children unclosable in this drill; repaired per BR#3819`,
     });
     expect(done.body.error).toBeUndefined();

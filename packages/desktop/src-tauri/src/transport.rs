@@ -23,6 +23,73 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProcessIdentity { Linux { group: u32, start_ticks: u64, #[serde(default)] boot_id: String }, Unverifiable { group: u32 } }
+impl ProcessIdentity { pub fn group(&self) -> u32 { match self { Self::Linux { group, .. } | Self::Unverifiable { group } => *group } } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupState { Empty, ZombiesOnly, Live, Unobservable }
+impl GroupState { pub fn quiescent(self) -> bool { matches!(self, Self::Empty | Self::ZombiesOnly) } }
+
+#[cfg(target_os = "linux")]
+fn proc_stat(raw: &str) -> Option<(char, u32, u64)> {
+    let fields: Vec<_> = raw.get(raw.rfind(") ")? + 2..)?.split_whitespace().collect();
+    Some((fields.first()?.chars().next()?, fields.get(2)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+pub fn process_identity(group: u32) -> ProcessIdentity {
+    #[cfg(target_os = "linux")] {
+        if let (Some((_, _, start_ticks)), Ok(boot_id)) = (std::fs::read_to_string(format!("/proc/{group}/stat")).ok().and_then(|raw| proc_stat(&raw)), std::fs::read_to_string("/proc/sys/kernel/random/boot_id")) {
+            return ProcessIdentity::Linux { group, start_ticks, boot_id: boot_id.trim().into() };
+        }
+    }
+    ProcessIdentity::Unverifiable { group }
+}
+pub fn group_state(identity: &ProcessIdentity) -> GroupState {
+    let group = identity.group();
+    if group <= 1 || group > i32::MAX as u32 { return GroupState::Unobservable; }
+    #[cfg(unix)] {
+        if unsafe { libc::kill(-(group as i32), 0) } == -1 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { GroupState::Empty } else { GroupState::Unobservable };
+        }
+    }
+    #[cfg(target_os = "linux")] {
+        // Zombies cannot perform I/O or fork. This is a different, explicitly
+        // attested proof from an empty group; hidden/denied procfs fails closed.
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return GroupState::Unobservable; };
+        if mounts.lines().any(|line| line.split_whitespace().nth(1) == Some("/proc") && line.contains("hidepid=") && !line.contains("hidepid=0")) { return GroupState::Unobservable; }
+        let Ok(entries) = std::fs::read_dir("/proc") else { return GroupState::Unobservable; };
+        let mut members = 0;
+        for entry in entries {
+            let Ok(entry) = entry else { return GroupState::Unobservable; };
+            if !entry.file_name().to_string_lossy().bytes().all(|c| c.is_ascii_digit()) { continue; }
+            let raw = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(raw) => raw, Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, Err(_) => return GroupState::Unobservable,
+            };
+            let Some((state, process_group, _)) = proc_stat(&raw) else { return GroupState::Unobservable; };
+            if process_group == group { members += 1; if !matches!(state, 'Z' | 'X') { return GroupState::Live; } }
+        }
+        if members > 0 { return GroupState::ZombiesOnly; }
+    }
+    GroupState::Unobservable
+}
+
+/// Recovery may stop only the exact persisted leader identity, never a recycled
+/// PID, an unidentifiable group, or an arbitrary process selected by task title.
+pub fn stop_recovered(identity: &ProcessIdentity) -> GroupState {
+    let state = group_state(identity);
+    if state != GroupState::Live { return state; }
+    #[cfg(target_os = "linux")] {
+        if let ProcessIdentity::Linux { group, start_ticks, boot_id } = identity {
+            if !boot_id.is_empty() && matches!(process_identity(*group), ProcessIdentity::Linux { start_ticks: current, boot_id: current_boot, .. } if current == *start_ticks && current_boot == *boot_id) {
+                unsafe { libc::kill(-(*group as i32), libc::SIGKILL); }
+                return group_state(identity);
+            }
+        }
+    }
+    GroupState::Unobservable
+}
 
 pub struct RunOutcome {
     pub ok: bool,
@@ -36,11 +103,26 @@ pub struct RunOutcome {
 #[derive(Default)]
 pub struct RunControl {
     pub stop: AtomicBool,
-    /// Set only after the process group was killed AND observed empty.
+    /// Set only after no process was launched, or the group has no live members.
     pub quiesced: AtomicBool,
+    proof: Mutex<Option<GroupState>>,
     lease_deadline: Mutex<Option<Instant>>,
+    cancel: Option<Arc<AtomicBool>>,
+    process: Mutex<Option<ProcessIdentity>>,
+    observer: Option<Arc<dyn Fn(ProcessIdentity) -> Result<(), String> + Send + Sync>>,
 }
 impl RunControl {
+    pub fn with_cancel(cancel: Option<Arc<AtomicBool>>) -> Self { Self { cancel, ..Self::default() } }
+    pub fn observe_launch(mut self, observer: impl Fn(ProcessIdentity) -> Result<(), String> + Send + Sync + 'static) -> Self { self.observer = Some(Arc::new(observer)); self }
+    pub fn identity(&self) -> Option<ProcessIdentity> { self.process.lock().ok().and_then(|p| p.clone()) }
+    pub fn writer_state(&self) -> Option<GroupState> { self.proof.lock().ok().and_then(|p| *p) }
+    fn stopped(&self, state: GroupState) {
+        if let Ok(mut proof) = self.proof.lock() { *proof = Some(state); }
+        self.quiesced.store(state.quiescent(), Ordering::SeqCst);
+    }
+    pub fn lease_valid(&self) -> bool {
+        self.lease_deadline.lock().map(|d| d.map(|until| Instant::now() < until).unwrap_or(false)).unwrap_or(false)
+    }
     pub fn grant_lease(&self) {
         if let Ok(mut deadline) = self.lease_deadline.lock() { *deadline = Some(Instant::now() + Duration::from_secs(90)); }
     }
@@ -118,6 +200,30 @@ fn process_group(cmd: &mut Command) {
     }
 }
 
+fn spawn_agent(cmd: &mut Command, control: Option<&Arc<RunControl>>) -> std::io::Result<Child> {
+    if let Some(control) = control {
+        if control.cancel.as_ref().is_some_and(|cancel| cancel.load(Ordering::SeqCst)) || control.should_stop() {
+            control.stopped(GroupState::Empty); // no process was created
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "preparation cancelled before process creation"));
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => { if let Some(control) = control { control.stopped(GroupState::Empty); } return Err(error); },
+    };
+    if let Some(control) = control {
+        let identity = process_identity(child.id());
+        if let Ok(mut process) = control.process.lock() { *process = Some(identity.clone()); }
+        if let Some(observer) = &control.observer {
+            if let Err(error) = observer(identity) {
+                kill_group(&mut child, Some(control));
+                return Err(std::io::Error::other(format!("launched process ownership could not be journaled; writer stopped: {error}")));
+            }
+        }
+    }
+    Ok(child)
+}
+
 fn kill_group(child: &mut Child, control: Option<&Arc<RunControl>>) {
     #[cfg(unix)] {
         let group = -(child.id() as i32);
@@ -126,15 +232,14 @@ fn kill_group(child: &mut Child, control: Option<&Arc<RunControl>>) {
         unsafe { libc::kill(group, libc::SIGKILL); }
         let _ = child.wait();
         // Reap before observing; never infer quiescence from child exit alone.
-        let mut empty = false;
+        let mut state = GroupState::Unobservable;
         for _ in 0..20 {
             // EPERM/other probe failures are NOT evidence of an empty group.
-            let result = unsafe { libc::kill(group, 0) };
-            empty = result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            if empty { break; }
+            state = group_state(&ProcessIdentity::Unverifiable { group: child.id() });
+            if state.quiescent() { break; }
             std::thread::sleep(Duration::from_millis(50));
         }
-        if let Some(c) = control { c.quiesced.store(empty, Ordering::SeqCst); }
+        if let Some(c) = control { c.stopped(state); }
     }
     #[cfg(not(unix))] {
         let _ = child.kill();
@@ -226,7 +331,7 @@ impl AgentTransport for OpencodeRun {
         }
         cmd.arg(req.prompt);
 
-        let mut child = match cmd.spawn() {
+        let mut child = match spawn_agent(&mut cmd, req.control) {
             Ok(c) => c,
             Err(e) => {
                 return RunOutcome {
@@ -346,7 +451,7 @@ impl AgentTransport for OpencodeAcp {
             cmd.env("OPENCODE_CONFIG_CONTENT", cfg_json);
         }
 
-        let mut child = match cmd.spawn() {
+        let mut child = match spawn_agent(&mut cmd, req.control) {
             Ok(c) => c,
             Err(e) => {
                 return RunOutcome {
@@ -715,7 +820,7 @@ impl AgentTransport for KiroChat {
 
         process_group(&mut cmd);
 
-        let mut child = match cmd.spawn() {
+        let mut child = match spawn_agent(&mut cmd, req.control) {
             Ok(c) => c,
             Err(e) => {
                 return RunOutcome {

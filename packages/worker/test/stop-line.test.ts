@@ -401,6 +401,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
   it("green required runs land through the machine proxy and close the card; the lane idles and the queue advances", async () => {
     const repo = "state-vector/lane-land";
     const card = await parkQueued("IMPL: stop-line drill — green landing");
+    await completePrReview(kbJson, card, [{ repo, number: 2703, head_sha_at_acceptance: "b".repeat(40) }]);
     await acquire(repo, "gw-mint", { required_workflows: ["Test", "Deploy"] });
     const M = "c".repeat(40);
     const merged = await kbJson("/train.event", {
@@ -630,12 +631,17 @@ describe("train.status red-main episode — who broke it / who is fixing it (BR#
 
     // the episode record: an open root-blocker/main-red task in the lane's
     // project, unowned — exactly how a real main-red lives on the board
-    // (BR#4724/BR#4728 class: filed by a session, nobody owns it)
+    // (BR#4724/BR#4728 class: filed by a session, nobody owns it). Recovery
+    // minted episode cards carry an execution completion contract — the line
+    // recovers on a verified outcome receipt, not on a PR merge (BR#7564
+    // close gates: execution-contract cards close through the sanctioned
+    // review fixture, bare delivery cards cannot).
     const ep = await kbJson("/create", {
       type: "task",
       title: "ROOT BLOCKER (main-red): banner drill — Deploy Dev red on main tip deadbeef",
       tags: ["root-blocker", "main-red"],
       project: "red-banner",
+      meta: { completion: { kind: "execution", outcome: "The main-red episode is resolved on verified live evidence" } },
     });
     expect(ep.status, `create failed: ${JSON.stringify(ep.body)}`).toBeLessThan(400);
     const epId = String(ep.body.id);
@@ -666,10 +672,15 @@ describe("train.status red-main episode — who broke it / who is fixing it (BR#
     expect(snap.red_main?.executor_session).toBe("banner-drill-fixer");
 
     // the line recovers → the episode task leaves the open set → banner gone
-    const out = await kbJson("/transition", { id: epId, to: "done", session: "banner-drill-fixer", note: "drill: main settled green — Deploy Dev SUCCESS at tip, merge gate cleared" });
-    expect(out.status, `close failed: ${JSON.stringify(out.body)}`).toBeLessThan(400);
+    // (base-integration: main's done-unreviewed gate, BR#7564, now requires
+    // an independent typed acceptance — close through the sanctioned fixture)
+    await completeExecutionReview(kbJson, epId, {
+      outcome: "drill: main settled green — Deploy Dev SUCCESS at tip, merge gate cleared",
+      receipts: ["drill: Deploy Dev SUCCESS at tip, merge gate cleared"],
+    });
     snap = await laneSnap(repo);
     expect(snap.red_main).toBeNull();
     expect(snap.last_merge?.pr).toBe(2710);
   });
 });
+import { completeExecutionReview, completePrReview } from "./completion-fixture";

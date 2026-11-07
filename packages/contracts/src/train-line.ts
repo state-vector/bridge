@@ -94,6 +94,7 @@ export const TrainLineFactsSchema = z.object({
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
     at: z.number(),
+    entries: z.array(z.object({ id: z.string(), cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]) })).optional(),
     base_observed_at: z.number().optional(),
     base_state: z.object({
       verdict: z.enum(["green", "red", "unsettled", "empty"]),
@@ -106,6 +107,10 @@ export const TrainLineFactsSchema = z.object({
   base_red_resolution: BaseRedResolutionSchema.nullable().optional(),
   diagnostic: TrainFixCardSchema.nullable().optional(),
   diagnostic_ask: ActionSchema.nullable().optional(),
+  merge_response: z.discriminatedUnion("phase", [
+    z.object({ phase: z.literal("recorded"), pr: z.number().int().positive(), at: z.number() }),
+    z.object({ phase: z.literal("observed_merged"), pr: z.number().int().positive(), at: z.number(), receipt: z.string().min(1) }),
+  ]).nullable().optional(),
   starved: z.object({ since: z.number() }).nullable().optional(),
   bypass_wait: z.object({ pr: z.number() }).nullable().optional(),
   attempt: z.object({ note: z.string(), hold: z.string() }).nullable().optional(),
@@ -132,12 +137,18 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
   // deployment. Prefer the cause-bound repair's actual human action only.
   const mainFailed = bs?.verdict === "red" || (bs?.gate_blocked && !gatePending) || cov?.phase === "failed" || !!f.stop;
   const ask = f.base_red_resolution?.ask ?? (mainFailed ? null : f.diagnostic_ask);
+  const mergeResponse = f.merge_response;
+  const matchingResponse = mergeResponse && task?.pr === mergeResponse.pr ? mergeResponse : null;
+  const responseText = mergeResponse ? mergeResponse.phase === "observed_merged"
+    ? `PR #${mergeResponse.pr} is merged. Bridge is verifying deployment; a merge receipt is not a green deployment.`
+    : `Your merge response for PR #${mergeResponse.pr} is recorded. Bridge is checking GitHub before verifying deployment.` : "";
   const make = (phase: TrainLineProjection["phase"], label: string, reason: string,
     blocker: TrainLineProjection["blocker"] = null, evidence: TrainLineProjection["evidence"] = [],
     remediation: LineRemediation | null = null): TrainLineProjection => ({
     ...TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: observedAt, remediation }),
   });
   const repair = (): LineRemediation => {
+    if (matchingResponse) return { kind: "machine", text: responseText, url: task?.pr_url ?? null };
     if (f.base_red_resolution?.phase === "cure_pr_awaiting_force_merge" && task?.pr && task.pr_url && !task.merged && !task.conflict) return {
       kind: "merge", text: `Bypass-merge fix PR #${task.pr} to unblock this line. Main's failing deployment check prevents the automatic merge.`,
       pr: task.pr, url: task.pr_url, request: ask ?? null,
@@ -145,6 +156,9 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     if (ask) return { kind: "human", text: task?.pr && !task.merged
       ? `Merge repair PR #${task.pr}, then choose DONE in the request. Main's failing checks prevent the automatic merge.`
       : ask.question, action: ask };
+    if (f.starved && !mainFailed && task && (task.status === "done" || task.status === "superseded")) return {
+      kind: "attention", text: `Diagnostic ${task.id} ended without restoring merges. Bridge must investigate the failed recovery and assign executable repair work; task completion is not line recovery.`,
+    };
     if (task?.execution_blockers?.length) return taskRemediation(task);
     if (task?.active_agent) return taskRemediation(task);
     if (task && (task.status === "todo" || task.status === "in_review")) return {
@@ -160,10 +174,18 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];
     const names = evidence.map((e) => e.name).join(", ");
     const action = repair();
-    return make("stopped", action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
+    const label = matchingResponse ? matchingResponse.phase === "observed_merged" ? "Fix merged — verifying deployment" : "Merge response received — checking GitHub"
+      : action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing";
+    return make("stopped", label, `${responseText ? `${responseText} ` : ""}${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
   }
-  if (q && !fresh) return make(
-    "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());
+  if (q && !fresh) {
+    const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
+      || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
+    const age = observedAt > 0 ? `${Math.max(0, Math.floor((now - observedAt) / 60_000))} minutes ago` : "at an unknown time";
+    return make("unknown", executorLive ? "Health checks overdue" : "Health checks paused",
+      `Main was last checked ${age}. ${executorLive ? "The active executor has not published fresh deployment evidence." : "No live merge executor is reporting GitHub/deployment health."} This does not establish that main is failing.`,
+      "stale_observation", [], repair());
+  }
   if (fresh && gatePending) return make("waiting", "Waiting for required checks",
     `The merge gate is waiting for: ${bs.gate_unsettled!.join(", ")}. No gate check has failed.`, "checks_running", [],
     { kind: "machine", text: "The executor rechecks automatically when these checks settle.", url: null });
@@ -183,8 +205,17 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     "GitHub rejected the selected PR merges. The executor must reconcile branch policy and required checks before retrying.", "merge_failed", [],
     ask ? { kind: "human", text: ask.question, action: ask }
       : { kind: "attention", text: "Bridge must repair the rejected merge. No bypass-merge request has been issued for this failure." });
-  if (f.starved) return make("stopped", "Work is not moving",
-    "Changes have waited over an hour without a merge.", "no_progress", [], repair());
+  if (f.starved) {
+    const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
+      || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
+    const mins = Math.max(1, Math.floor((now - f.starved.since) / 60_000));
+    const ready = q?.entries?.filter(e => e.cls === "ready").length ?? 0;
+    const reason = `No merge for ${mins} minutes. ${fresh && bs?.verdict === "green" ? "Main's required checks are green. " : ""}`
+      + (executorLive ? "The gateway is active, but merge execution is not advancing. " : "No live merge executor is confirmed. ")
+      + (ready ? `${ready} candidate(s) passed the initial queue gates; Bridge must investigate current-base admission and merge execution, and continue independent candidates.`
+        : "Bridge must inspect candidate checks, review and executor failures, then restore delivery.");
+    return make("stopped", "STOP THE LINE — merge machinery stalled", reason, "no_progress", [], repair());
+  }
   if (f.currently) return make(f.currently.phase === "bursting" ? "working" : "waiting",
     f.currently.phase === "bursting" ? "Merging changes" : "Waiting for checks and deployment",
     `Watching main after PR #${f.currently.pr ?? "?"}.`, f.currently.phase === "bursting" ? null : "checks_running", [],

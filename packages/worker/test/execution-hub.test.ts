@@ -97,7 +97,7 @@ describe("local handoff authority and lifecycle", () => {
   it("lets human-directed agents claim a capability wait directly, heartbeat and release without a grant loop", async () => {
     const local = await interactive(`direct-capability-${++serial}`);
     const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Interactive recovery of an unavailable gateway", qualified: true, project: "bridge",
-      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] } } })).data;
+      meta: { execution_requirements: { tier: "large", environment: ["offline-only"] }, attempt: { attempts: 7, last_reason: "Old gateway retries before the human-directed repair" } } })).data;
     expect((await post("get", { id: task.id })).data.status).toBe("blocked");
     const auth = { id: task.id, actor: local.label, token_id: local.token_id, session: "human-directed-recovery" };
     const claimed = await post("transition", { ...auth, to: "in_progress", note: "Human requested this recovery interactively" });
@@ -111,7 +111,13 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("progress.log", { ...foreign, note: "An additive observation" })).data.kind).toBe("commentary");
     expect((await post("transition", { ...foreign, to: "todo", note: "Cannot release another executor" })).data.error).toMatch(/claiming credential\/session/);
     expect((await post("transition", { ...auth, to: "todo", note: "Release with preserved continuation" })).data.error).toBeUndefined();
-    expect((await post("get", { id: task.id })).data.meta).not.toHaveProperty("interactive_execution");
+    const released = (await post<{ status: string; meta: { attempt?: { attempts: number }; interactive_execution?: unknown; blocked?: unknown } }>("get", { id: task.id })).data;
+    expect(released.meta).not.toHaveProperty("interactive_execution");
+    expect(released.status).toBe("todo");
+    expect(released.meta).not.toHaveProperty("blocked");
+    expect(released.meta.attempt?.attempts ?? 0).toBe(0);
+    const history = (await post<{ versions: { action: string; data?: { previous_attempt?: { attempts: number } } }[] }>("get_history", { id: task.id })).data;
+    expect(history.versions.find(v => v.action === "interactive_handoff")?.data?.previous_attempt?.attempts).toBe(7);
     expect((await post("transition", { ...auth, to: "in_progress", note: "Human resumes the released work" })).data.error).toBeUndefined();
   });
   it("atomically consumes a prepared local pickup, preserves checkpoints and accepts exactly one direct claimant", async () => {
@@ -155,6 +161,8 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
     expect((await post("execution", { ...auth, command_id: "begin-active-writer", command: { kind: "begin", attempt_id: "active", worker: r.auth.agent, action_budget_ms: 60_000 } })).data.error).toBeUndefined();
     await post("transition", { ...auth, to: "blocked", note: "Waiting for operation completion", await_event: { event: "time", until_ts: Date.now() + 60_000 } });
+    const held = await post<{ blockers: { kind: string; text: string }[] }>("execution", { ...auth, command_id: "show-writer-hold", command: { kind: "availability" } });
+    expect(held.data.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "writer_quiescence_required", text: expect.stringContaining("no stopped-writer proof") })]));
     const local = await interactive(`cannot-steal-writer-${serial}`);
     expect((await post("transition", { id: task.id, actor: local.label, token_id: local.token_id, session: "human-active-writer", to: "in_progress", note: "Need writer to stop first" })).data.error).toMatch(/writer not quiescent/);
   });
@@ -230,6 +238,22 @@ describe("local handoff authority and lifecycle", () => {
     expect(read1.data).toEqual(read2.data);
     const card = await post<{ status: string }>("get", { id: r.id }); expect(card.data.status).toBe("blocked");
   });
+  it("recorded retirement cannot consume an independently protected local pickup", async () => {
+    const r = await runtimeTask();
+    const answer = `Close the old wrapper — retire ${r.id}`;
+    const ask = await post<{ id: string }>("ask.create", { to: "human", artefact_id: r.id, actor: "fixture-owner",
+      question: "Retire this local-only task?", reason: "The owner decides whether the task is retained.", details: `Local pickup ${r.id} still has a checkpoint and its own authoritative exit.`,
+      options: [answer, "KEEP the local pickup"] });
+    expect(ask.data.error).toBeUndefined();
+    await post("ask.answer", { id: ask.data.id, answer, actor: "web:rayh" });
+    const agent = await interactive(`retirement-reader-${serial}`);
+    const refused = await post("transition", { id: r.id, to: "superseded", actor: agent.label, token_id: agent.token_id, session: "retirement-reader", batch_auth: { ask: ask.data.id } });
+    expect(refused.data.error).toMatch(/wait|quiescen/i);
+    expect((await post("get", { id: r.id })).data.status).toBe("blocked");
+    const state = ExecutionStateSchema.parse((await post("execution", { id: r.id, actor: agent.label, token_id: agent.token_id, command_id: "read-retirement-fence", command: { kind: "inspect" } })).data);
+    expect(state.handoff.phase).toBe("waiting");
+    expect(state.attempt?.checkpoint).toEqual(checkpoint);
+  });
   it("rejects worker impersonation over real MCP, requires scoped human grants, and chooses exactly one local acceptor", async () => {
     const r = await runtimeTask(); const a = await interactive(`local-a-${serial}`); const b = await interactive(`local-b-${serial}`);
     const request = { id: r.id, handoff_id: r.h.id, version: r.h.version, session: "local-a" };
@@ -269,6 +293,7 @@ describe("local handoff authority and lifecycle", () => {
     const ready = await post("execution", { actor: "cap-restoration", token_id: identity.token_id,
       id: "gateway", command_id: "restore", command: { kind: "advertise", capabilities: { tier: "large", backend: "opencode", model: "test/large", tools: ["cargo"], environment: ["special-access"], projects: ["bridge"], worker: { kind: "provisioned", label: "cap-restoration/worker" } } } });
     expect(ready.data.error).toBeUndefined();
+    await post("admin.execution_sweep", {}); // maintenance is separate from renewal
     expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("todo");
     await post("admin.execution_sweep", { now: Date.now() + 121_000 });
     expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("blocked");
@@ -294,6 +319,7 @@ describe("durable executor on real SQLite", () => {
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     expect((await cmd("ready", { kind: "advertise", capabilities: ready })).data.ok).toBe(true);
+    await post("admin.execution_sweep", {});
     const obsolete = await post("execution", { ...auth, runner_protocol: undefined, command_id: "obsolete",
       command: { kind: "advertise", capabilities: ready } });
     expect(obsolete.data.ok).toBe(false);
@@ -342,6 +368,7 @@ describe("durable executor on real SQLite", () => {
     expect((await post("execution", { ...auth, command_id: "still-ready", command: { kind: "advertise", capabilities: original.capabilities } })).data.ok).toBe(true);
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/startup prerequisite|Startup prerequisite/);
     await post("execution", { ...auth, command_id: "repaired-task-prerequisite", command: { kind: "advertise", capabilities: { ...original.capabilities, config_revision: "task-repaired" } } });
+    await post("admin.startup_sweep", {});
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
     expect((await cmd("begin", { kind: "begin", worker: "affinity-original/worker", attempt_id: "prior", action_budget_ms: 60_000 })).data.error).toBeUndefined();
     await cmd("quiet", { kind: "quiesce", generation: 1, attempt_id: "prior", writers: "process_group_empty" });
@@ -410,6 +437,7 @@ describe("durable executor on real SQLite", () => {
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     await Promise.all(["ready-one", "ready-two"].map(command_id => post("execution", { ...auth, id: "gateway", command_id, command: { kind: "advertise", capabilities: ready } })));
+    await post("admin.startup_sweep", {});
     const recovered = (await post("get", { id })).data;
     expect(recovered).toMatchObject({ status: "todo", meta: { execution_requirements: { host, tier: "medium", tools: ["git"] }, startup_recovery: { previous_attempts: { attempts: 5 } } } });
     expect(recovered.meta).not.toHaveProperty("blocked");
@@ -443,6 +471,7 @@ describe("durable executor on real SQLite", () => {
     expect((await post("get", { id: ids[0] })).data.meta).not.toHaveProperty("startup_wait");
     expect((await post("get", { id: ids[1] })).data).toMatchObject({ status: "blocked", meta: { startup_wait: { host } } });
     await advertise();
+    await post("admin.startup_sweep", {});
     expect((await post("get", { id: ids[0] })).data.status).toBe("blocked");
     expect((await post("get", { id: ids[1] })).data.status).toBe("todo");
   });
@@ -471,6 +500,7 @@ describe("durable executor on real SQLite", () => {
     const other = (await post<{ id: string }>("create", { type: "task", title: "Unrelated dispatch remains healthy", qualified: true })).data;
     expect((await post("transition", { ...auth, id: other.id, session: "unrelated-work", to: "in_progress" })).data.error).toBeUndefined();
     await advertise("after-repair");
+    await post("admin.startup_sweep", {});
     expect((await post("get", { id })).data.meta).not.toHaveProperty("startup_wait");
     expect((await post("transition", { ...auth, id, session: "repaired-work", to: "in_progress" })).data.error).toBeUndefined();
     const localId = (await post<{ id: string }>("create", { type: "task", title: "Explicit local conversion of startup wait", qualified: true })).data.id;

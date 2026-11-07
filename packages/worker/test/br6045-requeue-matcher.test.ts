@@ -98,6 +98,8 @@ describe("BR#6045: the re-queued spelling binds like the canonical one (fix a)",
       await_event: { event: "pr_merged", repo: REPO, n: 25551 },
     });
     expect(park.status).toBe(200);
+    expect((await getOne(id)).meta.pr.head_sha_at_acceptance).toBe(OLD);
+    await completePrReview(post, id, [{ repo: REPO, number: 25551, head_sha_at_acceptance: NEW }]);
     const now = await getOne(id);
     expect(now.status).toBe("blocked");
     // the stamp folded forward to the note's live head — the drain walk's
@@ -125,6 +127,7 @@ describe("BR#6045: the re-queued spelling binds like the canonical one (fix a)",
       await_event: { event: "pr_merged", repo: REPO, n: 25552 },
     });
     expect(park.status).toBe(200);
+    await completePrReview(post, id, [{ repo: REPO, number: 25552, head_sha_at_acceptance: NEW }]);
     const now = await getOne(id);
     expect(now.meta?.pr?.head_sha_at_acceptance).toBe(NEW);
     expect(now.meta?.merge_train?.state).toBe("queued");
@@ -164,3 +167,4 @@ describe("BR#6045: empty-is-loud — a merge-train note matching no hook is audi
     expect((await getVersions(id)).some((v) => v.action === "queue_hook_unmatched")).toBe(false);
   });
 });
+import { completePrReview } from "./completion-fixture";

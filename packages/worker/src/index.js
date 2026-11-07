@@ -1,7 +1,9 @@
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
-import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
+import { DEFAULT_WS_SLUG, doWs, isWsSlug, tagsSayGateway } from "./kb/core.ts";
+import { handleOAuth } from "./mcp-oauth.ts";
+export { McpOAuth } from "./mcp-oauth.ts";
 
 export { KnowledgeHub };
 export { RunnerUpdates } from "./runner-updates.ts";
@@ -9,6 +11,15 @@ export { RunnerUpdates } from "./runner-updates.ts";
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (["/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"].includes(url.pathname) || url.pathname.startsWith("/oauth/")) {
+      return kbGuard("mcp.oauth", handleOAuth(request, env, () => checkAuth(request, env)));
+    }
+    // Resource-bound OAuth credentials belong only to MCP, never the legacy
+    // gateway/web REST planes (in particular, never human-authoritative acts).
+    const oauthBearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+    if (/^bo[ar]_/.test(oauthBearer) && url.pathname !== "/mcp") {
+      return json({ error: "OAuth credentials are scoped to /mcp" }, 403);
+    }
     if (url.pathname.startsWith("/api/runner-updates/")) {
       return env.RUNNER_UPDATES.get(env.RUNNER_UPDATES.idFromName("channels")).fetch(request);
     }
@@ -49,8 +60,8 @@ export default {
     if (url.pathname === "/api/kb-machine/stats") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.stats", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/stats"));
     }
     // machine-plane list mirror (bearer): lets runners/scripts enumerate artefacts
@@ -58,6 +69,9 @@ export default {
     // /artefacts route (filters read query params there; a POST /list with an
     // empty body would silently drop the filters).
     if (url.pathname === "/__version") {
+      if (url.searchParams.get("scope") === "stateful") {
+        return kbGuard("kb.version", env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/version"));
+      }
       // deploy provenance: the [build] hook writes src/__version.json with the
       // commit SHA — the drift probe and `bridge doctor` compare it to HEAD
       try {
@@ -70,25 +84,30 @@ export default {
     if (url.pathname === "/api/kb-machine/list") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.artefacts", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" }));
     }
-    // machine-plane transition (bearer): bounded — only decisions may move, and
-    // only between proposed/accepted/rejected/superseded. Human-authoritative
-    // accept still routes as actor "web:*" from the paired gateway identity.
+    // Legacy desktop decision action: human authority requires a real session,
+    // never a paired gateway bearer. Check the stored target, not caller type.
     if (url.pathname === "/api/kb-machine/act") {
-      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-      if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+      const auth = await checkAuth(request, env);
+      if (auth instanceof Response) return auth;
       const body = await request.json().catch(() => ({}));
-      if (body.op !== "transition" || body.type !== undefined)
+      if (body.op !== "transition" || body.type !== undefined
+        || !["proposed", "accepted", "rejected", "superseded"].includes(body.to))
         return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
-      return kbGuard("kb.transition", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/transition", {
+      if (typeof body.id !== "string" || !body.id) return json({ error: "decision id required" }, 400);
+      const kb = env.KB.get(env.KB.idFromName(doWs(auth.ws)));
+      const target = await kbGuard("kb.artefact", kb.fetch(`https://kb/artefact?id=${encodeURIComponent(body.id)}`));
+      if (!target.ok) return target;
+      if ((await target.json()).type !== "decision")
+        return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
+      return kbGuard("kb.transition", kb.fetch("https://kb/transition", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...body, actor: "web:desktop" }),
+        body: JSON.stringify(kbMutationIdentity(body, auth)),
       }));
     }
 
@@ -98,8 +117,8 @@ export default {
     if (url.pathname === "/api/kb-machine/search") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.search", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" }));
     }
 
@@ -223,6 +242,7 @@ export default {
           : sub === "artefact" ? "https://kb/artefact"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
+          : sub === "diagnostics" ? "https://kb/diagnostics"
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
@@ -238,12 +258,12 @@ export default {
         const rateKey = auth.login ? `web:${auth.login}` : `ip:${request.headers.get("cf-connecting-ip") ?? "anon"}`;
         const fwd = new Request(kbUrl + url.search, request);
         fwd.headers.set("x-kb-rate-key", rateKey);
+        fwd.headers.set("x-bridge-request-start", String(Date.now()));
         return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(fwd)));
       }
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         return kbCors(await kbGuard("kb.ask.reframe", env.KB.get(kbId).fetch("https://kb/ask.reframe", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
@@ -260,8 +280,7 @@ export default {
         }));
       }
       if (sub === "purge_smoke" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         return kbCors(await kbGuard("kb.purge_smoke", env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
@@ -304,8 +323,7 @@ export default {
       }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         // BR#6135: a web-plane takeover names its holder — the taker's
         // session is its web:<login> actor, so the holder flip (and with it
         // the ex-holder stand-down and the idempotent re-click) engages on
@@ -644,9 +662,21 @@ function githubConfigured(env) {
   return !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
 }
 
-/** Cookie-first auth with gateway-token fallback for the knowledge web plane.
- *  The desktop shell (and any native webview) holds a gateway token, not a hub
- *  session cookie — this lets it read/write the same KB plane the webapp uses.
+/** Same trusted identity boundary as MCP; JSON cannot replace credential class
+ * or strip the token binding that enforces a worker's execution fence. */
+function kbMutationIdentity(input, auth) {
+  const body = { ...input, actor: auth.bearer ? auth.identity.label : `web:${auth.login ?? "anon"}`,
+    gateway: auth.bearer ? tagsSayGateway(auth.identity.tags) : false };
+  if (auth.bearer) body.token_id = auth.identity.token_id;
+  else delete body.token_id;
+  if (!body.gateway) delete body.agent;
+  else if (body.agent != null) body.agent = String(body.agent).trim().slice(0, 60);
+  return body;
+}
+
+/** Cookie-first auth with authenticated token fallback for the knowledge plane.
+ *  Human browser/native sessions use their cookie; machine clients can use
+ *  vended credentials with their actual class and execution binding.
  *  Admin routes intentionally stay on checkAuth (cookie-only). */
 async function authKb(request, env) {
   const session = await checkAuth(request, env);
@@ -654,11 +684,28 @@ async function authKb(request, env) {
   const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "")
     || new URL(request.url).searchParams.get("token") || "";
   if (!bearer) return session;
+  return kbAuthenticateBearer(env, bearer);
+}
+
+/** Shared bearer validation for REST and legacy machine read mirrors. */
+async function kbAuthenticateBearer(env, bearer) {
   const { resolveTokenWs } = await import("./mcp.ts");
-  let ws;
-  try { ws = await resolveTokenWs(env, bearer); } catch { return session; }
-  if (!ws) return session;
-  return { login: null, ws, bearer: true };
+  try {
+    const ws = await resolveTokenWs(env, bearer);
+    if (!ws) return json({ error: "unauthorized" }, 401);
+    // Routing an unknown token to the default workspace is not authentication.
+    const identified = await kbGuard("kb.auth.identify", env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/auth.identify", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bearer }),
+    }));
+    if (!identified.ok) return identified.status >= 500 ? identified : json({ error: "unauthorized" }, 401);
+    const identity = await identified.json();
+    if (typeof identity.token_id !== "string" || !identity.token_id || typeof identity.label !== "string" || !identity.label
+      || !Array.isArray(identity.tags) || !identity.tags.every(tag => typeof tag === "string"))
+      return json({ error: "Knowledge authentication identity unavailable", result_class: "infra_storage_fault" }, 503);
+    return { login: null, ws, bearer: true, identity };
+  } catch {
+    return json({ error: "Knowledge authentication temporarily unavailable", result_class: "infra_storage_fault" }, 503);
+  }
 }
 
 /** Native shells hit the hub cross-origin — bearer auth needs no credentials,
@@ -728,7 +775,7 @@ async function checkAuth(request, env) {
     if (!env.BRIDGE_UI_PASSWORD) {
       return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET (or legacy BRIDGE_UI_PASSWORD)" }, 503);
     }
-    const legacy = parseLegacyPasswordCookie(request, env);
+    const legacy = await parseLegacyPasswordCookie(request, env);
     return legacy ? { login: null, ws: DEFAULT_WS_SLUG, legacy: true } : loginResponse(request);
   }
   const cookie = request.headers.get("Cookie") || "";
@@ -916,10 +963,18 @@ async function handleGithubCallback(request, env) {
   // CLI / VS Code make; the listener is single-shot, 127.0.0.1-bound, and the
   // port was validated at /login. The browser still gets its Set-Cookie.
   const desktop = parseDesktopState(state);
+  const mcpReturn = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)bridge_mcp_return=([^;\s]+)/);
+  let returnTo = "/";
+  if (mcpReturn) {
+    try {
+      const path = decodeURIComponent(mcpReturn[1]);
+      if (path.startsWith("/oauth/authorize?")) returnTo = path;
+    } catch { /* malformed return cookie: use the normal home page */ }
+  }
   const headers = new Headers({
     Location: desktop
       ? `http://127.0.0.1:${desktop.port}/callback?bridge_session=${encodeURIComponent(sessionValue)}`
-      : "/",
+      : returnTo,
     "Cache-Control": "no-store",
   });
   headers.append(
@@ -927,6 +982,7 @@ async function handleGithubCallback(request, env) {
     `${SESSION_COOKIE}=${sessionValue}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Lax`,
   );
   headers.append("Set-Cookie", `${OAUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  headers.append("Set-Cookie", "bridge_mcp_return=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax");
   return new Response(null, { status: 302, headers });
 }
 

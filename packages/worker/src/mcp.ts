@@ -14,6 +14,7 @@
 import { composeBootstrap, DEFAULT_WS_SLUG, doWs, hashAuthToken, tokenWorkspace } from "./kb/core.ts";
 import { KnowledgeHub } from "./kb/do.ts";
 import { emitOrigin, stampPermalinks } from "./permalink.ts";
+import { oauthChallenge, oauthResource, resolveOAuthBearer } from "./mcp-oauth.ts";
 
 /** Build marker lives in ./mcp-tools.ts (single source) — re-exported here. */
 import { BUILD, TOOL_TABLE, err, toolsList } from "./mcp-tools.ts";
@@ -78,11 +79,18 @@ const isInfraFault = (e: any) => {
 };
 
 export async function handleMcp(request: Request, env: any): Promise<Response> {
+  return oauthChallenge(request, await handleAuthenticatedMcp(request, env));
+}
+
+async function handleAuthenticatedMcp(request: Request, env: any): Promise<Response> {
+  let bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!bearer) return json({ error: "unauthorized: missing auth token" }, 401);
+  const resolved = await resolveOAuthBearer(env, bearer, oauthResource(request));
+  if (resolved instanceof Response) return resolved;
+  bearer = resolved;
   if (request.method !== "POST") {
     return json({ error: "MCP endpoint: POST only" }, 405);
   }
-  const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!bearer) return json({ error: "unauthorized: missing auth token" }, 401);
 
   let msg: any;
   try {
@@ -169,7 +177,7 @@ export async function handleMcp(request: Request, env: any): Promise<Response> {
   const call = async (op: string, payload: object) => {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-bridge-request-start": String(Date.now()) },
       body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id,
         execution_scope: request.headers.get("x-bridge-task") ? {
           id: request.headers.get("x-bridge-task"),
@@ -278,7 +286,7 @@ function kbError(op: string, status: number, out: any): any {
 async function kb(hub: any, op: string, payload: object) {
   const r = await hub.fetch(`https://kb/${op}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "x-bridge-request-start": String(Date.now()) },
     body: JSON.stringify(payload),
   });
   const out = await r.json();

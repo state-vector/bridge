@@ -9,7 +9,7 @@ export const ExecutionModelViewSchema = z.object({
   current: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("unreported") }),
     z.object({ kind: z.literal("managed"), ...identity, host: z.string(), session: z.string(), generation: z.number(), lease_until: z.number(),
-      phase: z.enum(["running", "restoring", "stopping", "quiesced", "expired", "previous", "paused"]) }),
+      phase: z.enum(["running", "restoring", "stopping", "finalizing", "quiesced", "expired", "previous", "paused"]) }),
     z.object({ kind: z.literal("local"), ...identity, host: z.string(), session: z.string(), phase: z.enum(["active", "paused", "previous"]) }),
     z.object({ kind: z.literal("interactive"), session: z.string(), phase: z.enum(["active", "paused", "previous"]) }),
   ]),
@@ -32,7 +32,7 @@ export function projectExecutionModel(state: ExecutionState | null, task: { stat
   }
   const a = state?.attempt;
   if (!a?.executor) return { minimum_tier, current: { kind: "unreported" } };
-  const phase = a.phase === "quiesced" ? "quiesced" : a.lease_until <= now ? "expired" : task.session !== a.session ? "previous" : task.status !== "in_progress" ? "paused" : a.phase;
+  const phase = a.phase === "quiesced" || a.phase === "finalizing" ? a.phase : a.lease_until <= now ? "expired" : task.session !== a.session ? "previous" : task.status !== "in_progress" ? "paused" : a.phase;
   return { minimum_tier, current: { kind: "managed", ...ExecutionModelIdentitySchema.parse(a.executor), host: a.host, session: a.session, generation: a.generation, lease_until: a.lease_until, phase } };
 }
 
@@ -40,7 +40,7 @@ export type DisplayModelSize = "small" | "medium" | "large" | "custom" | "unknow
 export function executionPresentation(view: ExecutionModelView, now: number) {
   const current = view.current;
   const size: DisplayModelSize = current.kind === "unreported" ? "unknown" : current.kind === "managed" ? current.tier : "custom";
-  const phase = current.kind === "managed" && !["quiesced", "previous"].includes(current.phase) && current.lease_until <= now ? "expired"
+  const phase = current.kind === "managed" && !["quiesced", "finalizing", "previous"].includes(current.phase) && current.lease_until <= now ? "expired"
     : current.kind === "unreported" ? "unreported" : current.phase;
   const requested = current.kind === "managed" && view.minimum_tier && ["small", "medium", "large"].indexOf(view.minimum_tier) > ["small", "medium", "large"].indexOf(current.tier) ? view.minimum_tier : null;
   const state = phase === "expired" ? "lease expired" : phase === "quiesced" ? "quiescent" : phase === "previous" ? "previous execution" : phase === "active" ? "interactive" : phase;

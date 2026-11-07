@@ -1,5 +1,6 @@
 import { getKbHubConfig } from "./config";
 import type { ExecutionModelView } from "@bridge/contracts";
+import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
  *  Auth: the human session cookie — browser (webapp) sends it same-origin via
@@ -337,7 +338,8 @@ export interface KbTrainLane {
   /** BR#5190 four-tier ladder: root_fix (the bound main-breakage fix, tier 0)
    *  > boosted (the human/starvation boost stamp) > critical (manual
    *  meta.priority rung) > normal; under a stopped lane only root_fix rides. */
-  queue: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true; pr?: number }[];
+  queue: { id: string; priority: "root_fix" | "boosted" | "critical" | "normal"; root_fix?: true; pr?: number;
+    bounces?: number; over_budget?: boolean }[];  // BR#4688: LEDGER bounce count per PR leg — over_budget mirrors the hub bounce-budget rule
   /** cards parked Awaiting review on this lane's unlanded legs, OLDEST FIRST
    *  (BR#4962, per accepted BR#4960 — the ask-era review_asks chips are
    *  gone: zero asks ride the lanes): one chip per parked card — amber
@@ -357,7 +359,8 @@ export interface KbTrainLane {
    *  iterative selectBatch (conflict_pairs + burst_max). Inside each batch,
    *  state drives the block colour: "ready" (green solid), "verifying"
    *  (orange pulsing), "waiting" (orange solid). */
-  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string }[][];
+  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string;
+    bounces?: number; over_budget?: boolean }[][];  // BR#4688: bounce chip facts ride the batch blocks too
   /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
    *  (rank) order — the queue block row. cls: ready (merges this pass) |
    *  waiting (checks/mergeability pending) | conflict | needs-review |
@@ -435,6 +438,9 @@ export interface KbTrainLane {
   /** the lane's newest landed merge (train_events ledger) — the probable
    *  "who broke it" anchor when no machine culprit was recorded on the stop */
   last_merge?: { ts: number; pr?: number; task_id?: string; gateway?: string; merge_sha?: string } | null;
+  /** Active bounce-budget escalations (BR#4688): de-queued PRs riding out
+   *  their owner clock; `expired` ones are closed by the executor's gh leg. */
+  escalations?: { task_id: string; pr: number; bounce_kind?: string | null; bounce_no: number; at: number; grace_until: number; ask_id?: string | null; expired: boolean; close_reason?: string }[];
   /** executor activity (hub-computed over the train_events ledger) */
   activity?: {
     merged_1h: number;
@@ -511,6 +517,7 @@ export const kbApi = {
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
   // merge-train snapshot (all lanes) — lease holders + derived queue for the Top panel
   train: () => j<{ lanes: KbTrainLane[] }>("/api/kb/train"),
+  diagnostics: async () => HubDiagnosticsSchema.parse(await j<unknown>("/api/kb/diagnostics")),
   // human replies on a question thread — the same log_progress door agents use
   progress: (id: string, note: string, extra?: { will?: string; sentiment?: string }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),

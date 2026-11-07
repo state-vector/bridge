@@ -8,6 +8,48 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("explains stale evidence and absent executor without declaring main failed", () => {
+    const present = now + 90 * 60_000;
+    const f = facts({ queue_facts: { at: now, base_state: { verdict: "green" } } });
+    const line = projectTrainLine(f, present);
+    expect(line).toMatchObject({ phase: "unknown", label: "Health checks paused", blocker: "stale_observation" });
+    expect(line.reason).toContain("90 minutes ago");
+    expect(line.reason).toContain("No live merge executor");
+    expect(line.reason).toContain("does not establish that main is failing");
+    expect(projectTrainLine({ ...f, lease: { holder: "runner", heartbeat_ts: present } }, present).label).toBe("Health checks overdue");
+  });
+  it("withdraws the merge action immediately after a recorded response, then distinguishes observed merge from recovery", () => {
+    const fix = { ...task, pr: 2965, pr_url: "https://github.com/o/r/pull/2965", merged: false, conflict: false };
+    const f = facts({ stop: { reason: "Old main deployment failed" }, base_red_resolution: {
+      verdict: "red", phase: "cure_pr_awaiting_force_merge", held: 2, whats_broken: [], ask: null, fix_card: fix,
+    } });
+    expect(projectTrainLine(f, now).remediation?.kind).toBe("merge");
+    f.merge_response = { phase: "recorded", pr: 2965, at: now };
+    const pending = projectTrainLine(f, now);
+    expect(pending).toMatchObject({ label: "Merge response received — checking GitHub", remediation: { kind: "machine" } });
+    expect(pending.reason).toContain("is recorded");
+    expect(pending.reason).not.toContain("PR #2965 is merged");
+    f.merge_response = { phase: "observed_merged", pr: 2965, at: now, receipt: fix.pr_url };
+    const merged = projectTrainLine(f, now);
+    expect(merged).toMatchObject({ phase: "stopped", blocker: "main_failed", label: "Fix merged — verifying deployment", remediation: { kind: "machine" } });
+    expect(merged.reason).toContain("PR #2965 is merged");
+    expect(merged.reason).toContain("not a green deployment");
+  });
+  it("names stalled merge machinery, actual elapsed time and a live gateway instead of implying capacity shortage", () => {
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#1" }, { id: "BR#2" }], starved: { since: now - 87 * 60_000 },
+      lease: { holder: "gateway", heartbeat_ts: now }, queue_facts: { at: now, base_state: { verdict: "green" },
+        entries: [{ id: "BR#1", cls: "blocked" }, { id: "BR#2", cls: "ready" }] },
+      diagnostic: { ...task, active_agent: false, status: "done" },
+    }), now);
+    expect(line).toMatchObject({ phase: "stopped", blocker: "no_progress", label: "STOP THE LINE — merge machinery stalled" });
+    expect(line.reason).toContain("87 minutes");
+    expect(line.reason).toContain("required checks are green");
+    expect(line.reason).toContain("gateway is active");
+    expect(line.reason).toContain("1 candidate(s) passed the initial queue gates");
+    expect(line.remediation).toMatchObject({ kind: "attention", text: expect.stringContaining("ended without restoring merges") });
+    const absent = projectTrainLine(facts({ queue: [{ id: "BR#1" }], starved: { since: 1 } }), now);
+    expect(absent.reason).toContain("No live merge executor is confirmed");
+  });
   it("shows the actual priority capacity handoff rather than passively waiting for an executor", () => {
     const repair = { ...task, status: "todo", active_agent: false, execution_blockers: [{ kind: "capacity_wait" as const, episode_id: "capacity", text: "Full" }],
       preemption: { phase: "stopping_verification" as const, recovery_id: task.id, victim_id: "BR#2", generation: 1, attempt_id: "one", session: "verify", requested_at: now, checkpoint_commit: "a".repeat(40) } };

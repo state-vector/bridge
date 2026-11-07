@@ -1,5 +1,47 @@
 # bridge — self-hosting
 
+## Gateway restarts preserve running workers
+
+On Linux with a user systemd manager, each new task runs in a separate
+`bridge-worker-<attempt>.service`. That process owns the agent's ACP/stdio
+connection, lease/mailbox renewal, latest output journal and terminal result.
+Restarting or replacing the gateway controller leaves these units running. The
+new controller discovers their original task/session/generation manifests and
+reattaches to the same workers; it does not start a new agent conversation or
+execution generation. A worker that itself died is reconciled from physical
+process identity and its durable result, never blindly relaunched under the
+same fence.
+
+Controller-only updates negotiate live-worker protocol support in both the new
+and rollback builds. They pause new admission, settle controller-owned work,
+join the train leg, and acknowledge **controller ready** while supervised agents
+continue. This is distinct from claiming that all workers are idle. Initial
+migration from older in-process workers, incompatible builds, and unsupported
+hosts retain the safe full-drain path. Existing update health checks and rollback
+fences remain mandatory.
+
+`bridge workers status [BR#task]` shows local worker identities and observations.
+`bridge workers stop [BR#task]` requests a fenced stop (omit the task for all
+local supervised workers). A stop request is not quiescence proof. Restarting or
+stopping only `bridge.service` preserves independently supervised workers; use
+the worker stop command when stopping the work itself. Worker units inherit the
+gateway PATH and `~/.bridge/env`, keeping provider configuration with the worker.
+
+The independent updater script must also be refreshed from this build using the
+documented updater installation procedure. Replacing the native binary alone
+does not upgrade an already-installed Python updater. Update availability now
+reports the admission hold for controller handoff/health verification rather
+than implying that zero-slot workers are still draining.
+If recovery observes that its recorded candidate is already the actual managed
+executable, it can finish that existing update after exact PID/nonce, fresh health,
+stable-process and doctor checks. It performs no reinstall/restart and preserves
+the existing next-install deadline.
+Pending worker-stop requests block controller-ready acknowledgment until they
+are delivered, and candidate health cannot clear a changed update-request nonce.
+Only published worker manifests are adopted. An interrupted manifest write stays
+under launch-intent recovery without blocking unrelated workers; corrupt
+published identities remain fail-closed.
+
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
 **Just want to use it?** The shared hub is live at `https://hub.fleetbridge.run` — sign in with GitHub at the same URL and `bridge pair https://hub.fleetbridge.run`; no deploy needed. The rest of this README is for self-hosting.
@@ -7,6 +49,69 @@
 Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed Durable Object, hibernating WebSockets, worker assets for the web UI.
 
 ## Quick card lookup
+
+### Operational diagnostics
+
+Open **Merge trains → Hub request diagnostics** for an on-demand snapshot of
+in-flight request stages and per-operation latency/error counts. The authenticated
+`GET /api/kb/diagnostics` endpoint exposes the same bounded, isolate-local data:
+up to 64 recent completions, 128 tracked active requests, and 64 operation groups.
+Timings reset when the hub instance restarts; the observation and instance-start
+timestamps make that scope explicit. Reading diagnostics performs no repair sweep.
+Slow hub requests also emit structured `bridge.request` stage timings to Cloudflare.
+Processing-stage durations use the runtime's event clock; ingress/hop waits are
+reported separately. Use the live-tail wall/CPU measurements for end-to-end latency.
+
+From a registered checkout with dependencies installed and `wrangler whoami`
+authenticated, capture live traffic with:
+
+```sh
+npm run diagnose:hub -- --seconds 45
+npm run diagnose:hub -- --seconds 45 --json
+```
+
+The read-only tool reports request counts, server errors, cancellations, wall-time
+percentiles, edge CPU and slow hub stages. It excludes credentials, headers,
+payloads, query strings and arbitrary log messages. Wall time includes upstream
+and queue waits; edge CPU alone does not identify the bottleneck.
+
+Gateway capability renewal acknowledges the current inventory/readiness without
+running global backlog reconciliation or building a board snapshot. The scheduler
+and watchdog reconcile at most 25 capability-waiting tasks per pass with a durable
+fair cursor and one host/occupancy snapshot per synchronous pass. Reservations
+still check current capability, ownership and execution fences before starting work.
+
+**Health checks paused** means no live merge executor is reporting fresh deployment
+evidence. **Health checks overdue** means an executor is present but its evidence
+is stale. Both retain the existing unknown-health phase, show the actual last-check
+age, and do not assert that main is failing. The recorded gateway hold or readiness
+failure appears as the cause instead of a generic unavailable-model explanation.
+
+`/__version` reports the web edge; `/__version?scope=stateful` reports the actual
+knowledge Durable Object build and lifecycle protocol without depending on SQL
+or scheduler readiness. The deploy drift gate checks both layers: a current web
+bundle alone is not adoption of the stateful controller. Durable Object updates
+use an explicit deferred strategy with a 60-second code-update budget rather
+than the platform's five-minute default. Neither version probe mutates task state.
+
+### Knowledge-plane identity
+
+Knowledge REST bearer requests authenticate through the workspace's credential
+validator; routing a token to a workspace alone is not authentication. Unknown
+credentials are rejected, while identity infrastructure failures stay retryable.
+REST mutations and MCP derive actor, token binding and gateway class from the
+authenticated credential, overriding caller-supplied attribution. Gateway tokens
+report fenced process facts; they cannot submit a task for review or mark one
+done. Task agents and independent reviewers retain those business actions.
+Human authority uses the `web:<login>` / `human:<identity>` actor namespaces,
+outside the credential-label grammar. A bare display label such as `web` is an
+ordinary agent name. Legacy credentials conflicting with a human namespace may
+drain writers through gateway execution control and self-rename through the
+existing machine endpoint; they cannot use the conflict as human authority.
+The legacy machine `stats`, `list` and `search` mirrors validate bearers through
+the same credential boundary. The desktop decision action at
+`/api/kb-machine/act` requires a signed human session cookie and verifies that the
+stored target is a decision; a paired gateway token cannot approve decisions.
 
 ### Delivery responsibility
 
@@ -27,7 +132,7 @@ verifying, held and stranded counts. A binding without executable progress is
 stranded, not healthy accounting. Completed reconcile duties cover their observed
 head rather than the lifetime of a PR.
 
-Independent PR acceptance can use `review_result: {kind:"accepted_pr", task_id,
+Independent PR acceptance must use `review_result: {kind:"accepted_pr", task_id, subject_revision,
 legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
 queue admission are committed together; the existing repair passes replay the
 handoff until admitted or explicitly held behind a newer blocker. Explicit
@@ -38,6 +143,54 @@ accepted head; missing, closed or changed-head observations retain a visible hol
 Historical intake and admission replay are bounded to ten records per pass.
 A durable round-robin cursor keeps held records from starving later admissions;
 overlapping ingress shares one historical reconciliation pass.
+
+### Explicit completion authority
+
+Gateway credentials report process facts through the fenced execution protocol;
+they cannot submit a task for review or mark one done. The running task agent
+uses its own provisioned credential and exact execution scope to submit work.
+Both MCP and knowledge REST derive actor, token binding and gateway class from
+the authenticated credential, overriding caller-supplied attribution. Workspace
+routing alone is not authentication; unknown bearers are rejected and identity
+infrastructure failures remain retryable rather than becoming false auth verdicts.
+Exit zero, an empty/error transcript, a commit link and a finished review process
+are not business outcomes.
+
+Analysis/diagnostic tasks close with `execution_result: {outcome, receipts}`
+describing actual findings. Execution submissions supply that result on the
+submission itself; a previously stored result cannot substitute for a new one.
+Unblock duties use that same observed-findings result or `unblock_result` for an
+atomic replacement wait. New analysis and unblock tasks have execution completion
+contracts; ordinary metadata edits cannot delete a contract or weaken execution
+into delivery.
+
+Review duties close with a typed `review_result`. Findings finish the review
+without accepting its parent. Acceptance must match the duty's exact task and
+completion contract: `accepted_execution` verifies actual execution receipts;
+`accepted_direct_main` verifies signed main ancestry and green CI;
+`accepted_pr` records exact reviewed heads, with delivery still waiting for the
+train's decisive required checks. Claim readiness and absent qualification bars
+never imply completion acceptance. Notes, parks and decision text do not create
+new acceptance. Historical transcripts stay available as evidence for a fresh
+review; they cannot author or replay delivery admission.
+
+On claim, a review captures `review_subject: {task_id, revision}`. Echo that exact
+revision as `review_result.subject_revision` on acceptance. Task-definition,
+repository-input and outcome edits, or a new submission (even identical content),
+invalidate old acceptance. Ordinary progress and machine bounce annotations do
+not. Revision/subject/result fields are lifecycle-owned, not generic metadata.
+Only the latest review round can author acceptance, including detached duties.
+An unclaimed round can be reused; a claimed duty keeps its captured subject,
+and changed submissions receive a fresh round. Independent-review requests use
+that same current round rather than duplicating detached or capability-held work.
+Existing human force-review approval is captured against its exact revision and
+PR heads; it still cannot merge or skip decisive delivery checks.
+
+A merge observation or provenance row resumes independent delivery verification;
+it does not itself prove CI or mark a leg landed. A live canonical lane already
+settling that task retains its exit. Reconcile reports `reverse_verifying` and
+observed merges awaiting verification instead of claiming a refused close
+succeeded. Closed-unmerged work retains its delivery obligation.
 
 `await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
 health at the lane tip. Retiring a `br_done` dependency is not success: a live
@@ -213,6 +366,20 @@ new process/build's fresh readiness receipt, a stable process, and passing hub/
 backend doctor checks. Failed candidates roll back to the previous verified
 binary while that hold remains. Interrupted installs recover conservatively;
 failed rollback retains the hold for inspection rather than starting writers.
+An already-applied rollback is verified against the actual managed executable
+and PID rather than stopped and restarted again. Failed rollback health enters
+`recovery_required`, retaining the hold and useful-work retry budget. A newer
+CI-approved channel build can continue through `recovery_preparing` only after
+the restored process supplies its exact nonce/PID idle acknowledgement. Digest,
+embedded commit, doctor, stable-process health and rollback gates still apply;
+the same failed candidate is not replayed. A restart during preparation retains
+the hold and repeats only pre-install reads, never an unknown install effect.
+
+For a host already looping in rollback, atomically refresh the independently
+installed supervisor from the exact signed fix commit and restart **only
+`bridge-update`** while preserving `request.json`, `idle.json`, `health.json`,
+state and retained binaries. The corrected recovery protocol owns continuation;
+never clear the hold, forge a health/idle receipt or reset its cooldown manually.
 
 Success, deferral and rollback produce durable local state and a deduplicated
 ops notification through the existing Bridge alarm feed (visible in Log and in
@@ -995,6 +1162,44 @@ Notes:
 
 ## 4 · Connect agents (MCP)
 
+### Interactive clients: OAuth (Codex and other remote MCP clients)
+
+Point an OAuth-capable client at **`https://hub.fleetbridge.run/mcp`**.
+For Codex CLI:
+
+```sh
+codex mcp add bridge --url https://hub.fleetbridge.run/mcp
+codex mcp login bridge
+```
+
+The client discovers Bridge's OAuth endpoints, opens browser sign-in, and asks
+you to authorize interactive-agent access to your **currently selected workspace**.
+The responsive consent page shows the client, workspace, permissions and return
+address. If a request expires or cannot be verified, it explains how to reconnect.
+Select the workspace in Bridge before connecting. Approving automatically
+allocates a unique `_direct/<client>-<id>` agent, visible and revocable under
+**Connect**; no manual token minting or bearer header is needed. Each authorization
+gets its own identity, while token refresh keeps that identity. The agent can
+claim work using its named `orient` session under the existing interactive rules;
+human-only decisions and independent-review separation still apply.
+
+Bridge supports public-client registration, authorization code with mandatory
+S256 PKCE, exact registered redirect URIs (HTTPS or loopback HTTP), MCP resource
+binding, one-hour access tokens, and rotating refresh tokens. Authorization lasts
+up to 30 days; reconnect after expiry or revocation. Refresh-token reuse revokes
+the entire authorization, so clients must serialize refreshes. Revoking the agent
+in Connect or removing workspace membership immediately prevents access and
+refresh. OAuth credentials are valid only at `/mcp`, not the human/gateway REST
+planes. A cancelled consent allocates no agent.
+
+Self-hosting uses the existing GitHub login secrets and workspace membership;
+the worker deploy creates the `MCP_OAUTH` SQLite Durable Object via migration
+`v4-mcp-oauth`. Discovery is served at `/.well-known/oauth-protected-resource/mcp`
+and `/.well-known/oauth-authorization-server`. Use the same hub origin throughout
+login and token exchange; authorizations are bound to that origin's `/mcp` URL.
+
+### Headless clients: provisioned bearer credentials
+
 Agents join the fleet by pointing their MCP config at the hub. The config
 format is per-client — the Connect tab's **setup** modal emits the right
 snippet with your token slotted in.
@@ -1126,6 +1331,26 @@ spawns DETACHED (no `child_of` edge — the cap holds by the letter; a verify du
 recurse anyway, review cards never spawn one), the round is stamped on the subject
 (`meta.verify_round`) so a bounce re-entry reuses it instead of stacking a duplicate, and
 the (now unreachable) skip path audits `spawn_verify_skipped` without folding.
+
+**The bounce budget caps the loop** (BR#4688): same-kind bounces on one PR are budgeted at
+**5** — the hub counts `train_events` per (repo, base, PR, bounce kind) since the last
+cleared escalation, and the **6th bounce of the same kind escalates** per the BR#3312
+disposition instead of re-entering the queue: the card is stamped
+`meta.merge_train.escalated` (kind, bounce number, head sha, grace window), folded
+**blocked-on-ask**, and exactly **one bound ask** is filed — the fold is itself the
+de-queue, so a 7th bounce is unrepresentable (the BR#279/#281 storm class: 31 gate bounces
+on one PR in a day; replaying the 2026-10-28 ledger, this budget escalates both PRs at
+bounce 6, ~11h before the RCA was filed). Re-queueing an escalated card requires real
+movement — the head must move past the escalation's stamped sha, or the ask must be
+answered; either stamps `cleared_at` + `cleared_via` (audit `bounce_budget_cleared`) and
+resets the episode's counter. A different bounce kind still bounces normally — new
+information, not the loop. If the grace lapses (`pr_grace_hours`, default 48, never 0), the
+executor's expiry leg probes the PR live via `gh`, closes it with the reason as a comment,
+and reports `escalation_closed`; the hub acts only when it can validate an ACTIVE escalation
+of its own (the executor never self-certifies), answers the ask, and leaves the card `todo`
+as the record — the storm ends, the history survives. The trains panel renders the count
+live: a ×N ledger-bounce chip per queued PR (red once over budget) — on the queue rows and
+the merge-batch blocks alike — plus the escalation clock chips while an episode is open.
 The trains panel is honest about capability and activity (BR#4981): a held lock names
 its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
 shows the pill `train ready` (the tooltip names the machine and its last tick age);
@@ -1289,6 +1514,35 @@ authorisation gate and recheck the target; neither grants an agent human authori
 The alarm also consumes persisted disposition requests, so a crash between request
 and application cannot skip the cleanup. Semantic refusals become terminal receipts;
 storage faults leave the command pending for retry.
+Recorded **per-card** human retirement decisions are replayable through that same
+gate: an explicit `SUPERSEDE` answer, or a `retire BR#N` clause naming the ask's
+bound task, can retire its still-unclaimed `todo`/`blocked` card. KEEP/NO answers,
+unrelated targets, active writers and outstanding PR responsibility remain
+protected. Replaying the same completed retirement is an idempotent acknowledgement.
+That exact recorded retirement can cancel an unstarted capability wait; local
+pickup, paused interactive ownership, live writers and uncertain operations
+retain their independent fences.
+Executor-observed CLOSED/MERGED PR receipts satisfy delivery conservation for a
+retirement; a closed PR is not an outstanding open obligation. Malformed legacy
+PR bindings are audited against the typed event grammar and retained as history.
+An authenticated interactive owner's deliberate preserved-work release is a
+handoff, not another failed automated attempt: prior retry history is archived in
+an `interactive_handoff` event and the new execution round starts at zero. Foreign
+sessions, live writers, uncertain operations and unattended watchdog churn remain
+subject to their normal fences and cooldowns.
+A bounced `todo` repair with no separate recovery owner is executable board
+work, not an active train wait. Discovery and atomic reservation ignore only
+that historical bounce; real typed prerequisites, queued slots, recovery owners,
+writer quiescence and external-operation receipts still gate dispatch.
+
+A satisfied typed prerequisite must have a continuation. If its unblock round
+finishes while the parent remains parked, the next proxy pass atomically consumes
+that wait and returns the parent to the executable pool, preserving its actual
+execution/review requirements and recording the prerequisite receipts. Train
+settlement, operator decisions, local/executor waits and unreconciled external
+operations keep their own authoritative exits. Unbound executor-coordination
+questions also retire when their explicitly addressed task becomes terminal;
+this records cancellation, never a fabricated answer or review acceptance.
 The same machine-ownership rule covers stalled batches, mismatched merge checks,
 missing deployment evidence and no-progress diagnostics. A genuinely unavailable
 execution host instead produces a concrete request to start Bridge on a computer,
@@ -1931,6 +2185,32 @@ GitHub cannot lie about GitHub. The pure decision tables survive, pinned
 unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
+
+Merge responses are acknowledged immediately in the line status: a recorded
+response waits for GitHub reconciliation; an observed merged PR waits for
+deployment verification. Neither keeps asking for the same merge. PR blocks
+show verification state; historical repair/review returns are available in their
+details rather than overprinted `×N` labels. Historical totals are separate from
+an active same-kind bounce-budget escalation. Repairs held by an unconfirmed old
+writer name the gateway reconciliation required before another worker may start.
+
+The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+records remaining lifecycle, completion, priority and recovery gaps at commit
+`4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
+
+**A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
+queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
+with elapsed time, main-check health, live executor presence and the number of
+candidates that passed initial queue gates. Bridge owns priority diagnosis and
+repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
+A single candidate's failed check must not be presented as the reason independent
+candidates cannot merge. Candidates waiting for current-base CI or integration
+repair are deferred while the executor continues the remaining independent batch;
+their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
+missing` is a failed execution configuration, never a successful diagnostic or
+review. The runner preserves its work and releases the failed claim for execution
+repair. Repeated missing-tool failures name that exact cause in the gateway's
+bounded cooldown; they cannot generate successful diagnostic or review receipts.
 
 Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
 original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
@@ -3218,13 +3498,37 @@ Missing keys, invalid signatures and other prerequisite failures remain held.
 Existing writers, checkpoints and updater drain holds are preserved.
 ## Stopped-writer capacity recovery
 
-The gateway persists actual process-group-empty observations in
-`~/.bridge/stopped-attempts/` before network finalization. A separate bounded
-delivery loop retries transient hub failures using the original task session,
-generation, attempt and command ID, including after a daemon restart. It waits
-for live checkpoint finalization and retains named gate rejections for diagnosis.
-This frees confirmed stopped capacity without treating lease expiry as proof,
-deleting local work, or resolving unknown external effects.
+The gateway uses one bounded lifecycle controller for reservation, preparation,
+running, stopped-result delivery and held ownership. Up to four preparation and
+four finalization jobs perform blocking work independently; the controller keeps
+harvesting completions and requesting hub admission. A full controller also asks
+the hub for safe recovery-priority capacity. Normal mailbox coordination does not
+stop a writer; an explicit interrupt or expired local lease does.
+
+`~/.bridge/lifecycle/<hub-and-host>/` holds durable admission identities, launch
+intent/process identities and terminal results. The originating runner sends an
+exact fenced `stopped` receipt before checkpoint network publication. The hub
+records the result and a truthful `process_group_empty` or Linux
+`no_live_group_members` (zombies-only) proof, freeing execution capacity while
+retaining exclusive `finalizing` task ownership. The runner then publishes the
+captured checkpoint and finalizes delivery. Local and hub backlog bounds prevent
+unbounded accumulation. Runner snapshots distinguish running, preparing,
+finalizing, delivering and held work; an update waits for every outstanding job.
+
+Retries use original command IDs and immutable receipt lookup, including after a
+daemon restart. Full local results are archived after acknowledgment. Launch
+recovery stops only an exact persisted process identity; missing identity or
+unreadable process proof retains ownership. Legacy `~/.bridge/stopped-attempts/`
+receipts are imported through this same finalizer. Lease expiry never proves a
+stopped writer, deletes local work, or resolves unknown external effects. New
+controllers require the serving hub's lifecycle protocol 2 before claiming work.
+
+Background hygiene runs behind an idle workspace barrier, after admission and
+terminal delivery. It rechecks terminal task status and acknowledged writer
+quiescence before cleanup; age alone cannot revoke another executor's work or
+resolve an unknown external operation. Dirty or unpublished trees remain
+registered; cleanup uses bounded, non-forced Git removal and retains a tree if
+newer work appears during the final check.
 
 For historical charges created by older binaries, Linux operators can run:
 
@@ -3240,10 +3544,10 @@ census for each task. It refuses current-daemon attempts, unreadable processes,
 changed fences and retained task scopes. It never kills processes or deletes
 worktrees; apply uses the originating gateway's authenticated fenced quiesce.
 Urgency boosts also break ties within the concrete-repair class, consistently
-in discovery and atomic reservations. A cancelled pre-spawn launch no longer
-stalls every free slot for a poll interval: refill continues only after the hub
-confirms no writer, with a bounded distinct-task budget and fresh hub admission
-on every reservation.
+in discovery and atomic reservations. Cancelled preparation follows the same
+finalizer; never-launched cancellation releases its reservation without consuming
+the retry budget or changing gateway readiness. Every reservation still uses
+fresh authoritative hub admission.
 Standing merge-lane infrastructure never completes from a PR merge receipt,
 even when an agent accidentally attaches PR-delivery metadata. Provenance
 cleanup may finish delivery cards, but cannot retire the train itself.
@@ -3256,3 +3560,14 @@ alone is not evidence of top scheduling priority or unavailable agent capacity.
 Independent reviews of concrete/line recovery inherit the repair's scheduling
 class and urgency. They remain separate review sessions with the same acceptance
 gates, but cannot fall behind unrelated repair backlog as ordinary verification.
+### Fenced terminal-result capture
+
+The execution protocol requires `stopped` before `finalize`, with the exact
+generation/attempt, stopped-writer proof and immutable typed process outcome
+(`completed`, `interrupted`, `failed`, `timed_out`, or `result_unavailable`). The
+hub atomically records each command and replay receipt. Late polls and interrupts
+cannot resurrect a stopped writer, and a new generation cannot begin while the
+old result is finalizing. A successful process exit never closes a task or
+fabricates review acceptance. Unfinished claims return through the same scheduler
+with their prior result attached; independent waits, local handoffs, unknown
+operations, host affinity and the persistent retry budget remain enforced.

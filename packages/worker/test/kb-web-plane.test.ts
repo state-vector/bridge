@@ -25,7 +25,7 @@ import { ExecutionAttentionSchema } from "@bridge/contracts";
 
 const SECRET = "test-gh-secret";
 
-function sessionCookie(login = "ray", ws = "global") {
+function sessionCookie(login = "ray", ws = "state-vector") {
   const exp = String(Date.now() + 60_000);
   const sig = createHmac("sha256", SECRET).update(`${exp}.${login}.${ws}`).digest("hex");
   return `bridge_session=${exp}.${login}.${ws}.${sig}`;
@@ -66,6 +66,118 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
   });
 
 describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
+  it("reports stateful deployment provenance separately from the web edge without requiring credentials", async () => {
+    const response = await mf.dispatchFetch("https://main/__version?scope=stateful");
+    expect(response.status).toBe(200);
+    const version = await response.json() as { commit: string; lifecycle_protocol: number };
+    expect(version.commit).toMatch(/^[0-9a-f]{40}$/);
+    expect(version.lifecycle_protocol).toBe(2);
+  });
+  it("exposes authenticated bounded request diagnostics without credentials or business mutations", async () => {
+    expect((await mf.dispatchFetch("https://main/api/kb/diagnostics")).status).toBe(401);
+    const res = await api("/api/kb/diagnostics");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { instance_id: string; active: object[]; recent: object[] };
+    expect(body.instance_id).toBeTruthy();
+    expect(body.active.length).toBeGreaterThan(0);
+    expect(JSON.stringify(body)).not.toContain(SECRET);
+  });
+  it("does not confuse workspace routing with authentication for an unknown bearer", async () => {
+    const denied = await mf.dispatchFetch("https://main/api/kb/board", { headers: { authorization: "Bearer not-a-vended-credential" } });
+    expect(denied.status).toBe(401);
+  });
+
+  it.each(["stats", "list", "search?q=authority"])("authenticates the legacy machine read route: %s", async route => {
+    const denied = await mf.dispatchFetch(`https://main/api/kb-machine/${route}`, { headers: { authorization: "Bearer not-a-vended-credential" } });
+    expect(denied.status).toBe(401);
+  });
+
+  it.each(["stats", "list", "search?q=authority"])("preserves authenticated machine reads: %s", async route => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: `machine-read-${route.split("?")[0]}`, tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const allowed = await mf.dispatchFetch(`https://main/api/kb-machine/${route}`, { headers: { authorization: `Bearer ${minted.secret}` } });
+    expect(allowed.status, await allowed.text()).toBe(200);
+  });
+
+  it.each(["unknown", "gateway"])("never turns a %s bearer into a human desktop decision", async credential => {
+    let secret = "not-a-vended-credential";
+    if (credential === "gateway") secret = (await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "machine-act-gateway", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>)).secret;
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "decision", title: `Real human choice ${credential}` }) }).then(r => r.json() as Promise<{ id: string }>);
+    const denied = await mf.dispatchFetch("https://main/api/kb-machine/act", { method: "POST",
+      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" }, body: JSON.stringify({ op: "transition", id: created.id, to: "accepted" }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(401);
+    expect(row.status).toBe("proposed");
+  });
+
+  it("checks the actual target type on the human desktop decision route", async () => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "machine-act-extra", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "Decision route cannot retire a task" }) }).then(r => r.json() as Promise<{ id: string }>);
+    await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "blocked", note: "Hold for a real disposition", await_event: { event: "time", until_ts: Date.now() + 3_600_000 } }) });
+    const denied = await mf.dispatchFetch("https://main/api/kb-machine/act", { method: "POST", headers: { cookie, authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ op: "transition", id: created.id, to: "superseded" }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(403);
+    expect(row.status).toBe("blocked");
+  });
+
+  it("keeps the desktop decision action available to the authenticated human", async () => {
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "decision", title: "Authenticated desktop human choice" }) }).then(r => r.json() as Promise<{ id: string }>);
+    const accepted = await api("/api/kb-machine/act", { method: "POST", body: JSON.stringify({ op: "transition", id: created.id, to: "accepted", actor: "web:forged", gateway: true, token_id: "forged-token" }) });
+    expect(accepted.status, await accepted.text()).toBe(200);
+    const history = await api(`/api/kb/history?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ versions: { actor: string; action: string }[] }>);
+    expect(history.versions.some(v => v.actor === "web:ray" && v.action === "transition")).toBe(true);
+  });
+
+  it.each(["REST", "MCP"])("a reserved display label cannot confer human authority over %s", async transport => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "web", tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: `Reserved-label authority ${transport}` }) }).then(r => r.json() as Promise<{ id: string }>);
+    expect((await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "blocked", note: "Human-only terminal disposition remains pending",
+      await_event: { event: "time", until_ts: Date.now() + 3_600_000 } }) })).status).toBe(200);
+    const args = { id: created.id, to: "superseded", session: "reserved-label-proof" };
+    const denied = await mf.dispatchFetch(`https://main${transport === "REST" ? "/api/kb/transition" : "/mcp"}`, { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify(transport === "REST" ? args : { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "transition", arguments: args } }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(transport === "REST" ? 400 : 200);
+    if (transport === "MCP") expect((JSON.parse(text) as { result: { isError: boolean } }).result.isError).toBe(true);
+    expect(text).toContain("human-authority");
+    expect(row.status).toBe("blocked");
+  });
+
+  it("derives gateway completion authority from the authenticated bearer, not forged REST fields", async () => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "rest-completion-gateway", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "REST gateway cannot author an outcome", roles: ["analysis"] }) }).then(r => r.json() as Promise<{ id: string }>);
+    expect((await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "in_progress", session: "rest-gateway-proof" }) })).status).toBe(200);
+    const refused = await mf.dispatchFetch("https://main/api/kb/transition", { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: created.id, to: "done", session: "rest-gateway-proof", actor: "web:forged", gateway: false, token_id: "forged-token",
+        execution_result: { outcome: "Process exited zero", receipts: [created.id] } }) });
+    expect(refused.status).toBe(400);
+    expect((await refused.json() as { error: string }).error).toContain("gateway infrastructure cannot");
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(row.status).toBe("in_progress");
+  });
+
+  it("preserves a real agent's REST identity and strips forged infrastructure attribution", async () => {
+    const label = "rest-completion-agent";
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "REST agent authors its explicit finding", roles: ["analysis"] }) }).then(r => r.json() as Promise<{ id: string }>);
+    const transition = (to: string) => mf.dispatchFetch("https://main/api/kb/transition", { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: created.id, to, session: "rest-agent-proof", gateway: true, agent: "pretend-other-agent",
+        execution_result: { outcome: "Analysis findings recorded", receipts: [created.id] } }) });
+    const claimed = await transition("in_progress");
+    expect(claimed.status, await claimed.text()).toBe(200);
+    const finished = await transition("done");
+    expect(finished.status, await finished.text()).toBe(200);
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string; owner: string }>);
+    expect(row.status).toBe("done");
+    expect(row.owner).toBe(label);
+  });
+
   it("posts a web comment through to progress.log (200, logged, visible in history)", async () => {
     // verdict-duty tasks are claimable without qualification (role:review) —
     // same rig the throughput route test uses. The task must be in_progress:
@@ -324,6 +436,25 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
     expect(trainPanelSrc).toContain("line.observed_at");
+  });
+
+  it("keeps historical return counts in readable details and active escalation clocks separate", () => {
+    const kbServerSrc = readFileSync(new URL("../../ui-kit/src/server/kb.ts", import.meta.url).pathname, "utf8");
+    // queue chips carry the ledger bounce count; over budget reads as an error, never a green chip
+    expect(trainPanelSrc).toMatch(/q\.over_budget/);
+    expect(trainPanelSrc).not.toContain("train-bounce-chip");
+    expect(trainPanelSrc).not.toMatch(/×\{q\.bounces\}/);
+    expect(trainPanelSrc).toContain("Returned to repair/review");
+    expect(trainPanelSrc).toContain("active bounce-budget escalation");
+    // de-queued escalations ride their own clock chips: ⏳ pr ×bounce_no, err once expired
+    expect(trainPanelSrc).toMatch(/l\.escalations/);
+    expect(trainPanelSrc).toContain("⏳");
+    expect(trainPanelSrc).toMatch(/e\.expired \? "err" : "warn"/);
+    expect(trainPanelSrc).toMatch(/e\.grace_until/);
+    // the server type carries both surfaces (the panel consumes the snapshot shape)
+    expect(kbServerSrc).toMatch(/over_budget\?: boolean/);
+    expect(kbServerSrc).toMatch(/escalations\?:/);
+    expect(kbServerSrc).toMatch(/expired: boolean/);
   });
 });
 

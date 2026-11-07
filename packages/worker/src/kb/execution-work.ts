@@ -11,6 +11,8 @@ import { ExecutionModelIdentitySchema, type ExecutionHistoryEvent } from "@bridg
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
 interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" }; blocked?: unknown; session?: string; [key: string]: unknown }
+interface HostInventory { tokenId: string; host: string; capabilities: ExecutorCapabilities; observed_at: number;
+  active: number; occupancy: ReturnType<typeof gatewayOccupancy>["occupancy"] }
 export function isExecutionWait(meta: TaskMeta): boolean {
   const b = meta.blocked as { await_event?: { event?: string } } | undefined;
   return b?.await_event?.event === "local_handoff" || b?.await_event?.event === "executor_capability";
@@ -26,6 +28,7 @@ export function ownsInteractiveClaim(meta: TaskMeta, tokenId: string, session: s
 }
 
 export class ExecutionWork {
+  private hostSnapshot: HostInventory[] | null = null;
   constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace: string,
     private readiness: (token: string, host: string, capabilities: ExecutorCapabilities, now: number) => ExecutorReadiness,
     private modelPolicy: () => ModelPolicy = () => DEFAULT_MODEL_POLICY,
@@ -119,14 +122,17 @@ export class ExecutionWork {
     this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
     this.audit(token.label, "interactive_claim", id, { session, checkpoint: state.attempt?.checkpoint?.commit ?? null });
   }
-  private hosts(taskId?: string): CapabilityObservation[] {
+  private hostInventory(): HostInventory[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => {
       const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label));
       return {
-      host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
-       active: n.active + n.reserved, occupancy: n.occupancy,
-      readiness: this.taskReadiness(taskId, String(row.token_id), String(row.label), ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)))),
-    }; });
+      tokenId: String(row.token_id), host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
+        active: n.active + n.reserved, occupancy: n.occupancy,
+     }; });
+  }
+  private hosts(taskId?: string): CapabilityObservation[] {
+    return (this.hostSnapshot ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
+      readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities) }));
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
     const proof = this.readiness(token, host, capabilities, Date.now());
@@ -178,6 +184,11 @@ export class ExecutionWork {
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
+    if (state.attempt && state.attempt.phase !== "quiesced" && !["in_progress", "in_review"].includes(task.status)
+        && !blockers.some(b => b.kind === "writer_quiescence_required")) blockers.push({
+      kind: "writer_quiescence_required", episode_id: `writer:${task.id}:${state.attempt.generation}:${state.attempt.attempt_id}`,
+      text: `The previous execution on ${state.attempt.host} has no stopped-writer proof. The gateway must reconcile generation ${state.attempt.generation} before this repair can start; priority cannot safely replace an unconfirmed writer.`,
+    });
     const direct = InteractiveClaimSchema.safeParse(meta.interactive_execution);
     // Missing unattended capacity is not a blocker on an authenticated interactive owner.
     // Its actual model remains unreported rather than borrowing the old runner's identity.
@@ -342,9 +353,19 @@ export class ExecutionWork {
   /** Expiry is level-triggered. Only queued capability waits resume; never
    * interfere with a healthy active writer or clear a human/local dependency. */
   sweep(now = Date.now()) {
+    // A synchronous pass cannot observe an intervening host/occupancy change.
+    // Reuse its inventory instead of rescanning every writer for every task.
+    this.hostSnapshot = this.hostInventory();
+    try { this.sweepBatch(now); }
+    finally { this.hostSnapshot = null; }
+  }
+  private sweepBatch(now: number) {
     // Legacy workspaces without any managed executor inventory retain their
     // manual workflow. Once a gateway advertises, global defaults apply too.
-    const rows = this.sql.exec(`SELECT id,title,project,status,owner,meta,updated_ts FROM artefacts WHERE type='task' AND status IN ('todo','blocked') AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) LIMIT 2000`).toArray() as unknown as TaskRow[];
+    const cursor = Number(this.one<{ value: string }>(`SELECT value FROM settings WHERE key='execution_sweep_cursor'`)?.value ?? 0);
+    const batch = (after: number) => this.sql.exec(`SELECT rowid AS sweep_cursor,id,title,project,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status IN ('todo','blocked') AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT 25`, after).toArray() as unknown as (TaskRow & { sweep_cursor: number })[];
+    const first = batch(cursor);
+    const rows = first.length || !cursor ? first : batch(0);
     for (const task of rows) {
       const state = this.state(task); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now);
       const unavailable = blockers.find(b => b.kind === "capability_unavailable");
@@ -365,5 +386,6 @@ export class ExecutionWork {
       // never manufactures an approval ask or an unblock-child storm.
       this.audit("system:capabilities", "execution_blockers_changed", task.id, { blockers: blockers.map(b => ({ kind: b.kind, episode: b.episode_id })), status });
     }
+    this.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('execution_sweep_cursor',?)`, String(rows.at(-1)?.sweep_cursor ?? 0));
   }
 }

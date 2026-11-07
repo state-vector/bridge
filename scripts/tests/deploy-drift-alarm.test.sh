@@ -99,6 +99,14 @@ expect_grep "::warning::" "the in-flight deploy is a non-failing settling warn"
 expect_grep "live hub matches the pushed SHA" "green receipt names the match"
 expect_nogrep "::error::" "settling never fails the check"
 
+run VERSION_SCOPE=both FAKE_HUB_RESPONSES="${EXPECTED}:${OLD}:${EXPECTED}:${EXPECTED}" FAKE_TIP_SHA="${TIP}" SETTLE_WINDOW_SECONDS=30
+expect_rc 0 "edge-only adoption keeps settling until stateful and edge both match"
+expect_grep "edge=.*stateful=" "split deployment evidence is visible during settling"
+expect_grep "live hub matches the pushed SHA" "both-layer adoption produces the green receipt"
+
+run VERSION_SCOPE=both FAKE_HUB_RESPONSES="${EXPECTED}:${OLD}" FAKE_TIP_SHA="${TIP}"
+expect_rc 1 "a fresh edge cannot green a stale stateful controller"
+
 run FAKE_HUB_RESPONSES="${OLD}:${TIP}" FAKE_TIP_SHA="${TIP}" SETTLE_WINDOW_SECONDS=30
 expect_rc 0 "hub reaching a NEWER main tip containing the push is green (superseded push)"
 expect_grep "newer push superseded" "green-by-tip is named as such"

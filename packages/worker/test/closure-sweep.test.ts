@@ -134,6 +134,7 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     await kbJson("/transition", { id: parkRound.id, to: "in_progress", actor: "drill-exec-u1", session: "drill-exec-u1" });
     const parkDone = await kbJson("/transition", {
       id: parkRound.id, to: "done", actor: "drill-exec-u1",
+      execution_result: { outcome: "Condition remains blocked at check time.", receipts: [p1id] },
       note: "checked the condition first-hand — still blocked at check time (findings); the executor's gh and a train event are the credentialed readers now",
     });
     expect(parkDone.status, `park round done failed: ${JSON.stringify(parkDone.body)}`).toBe(200);
@@ -198,17 +199,17 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
 
   // ---------- BR#3668: stale-true dedup + the human-gate law (real DO) ----------
 
-  it("BR#3668: a born-true atom spawns ONCE — the identical receipt never re-fires; a genuine false→true transition still spawns exactly once", async () => {
+  it("completed rounds continue born-true and false→true waits without repeat duty churn", async () => {
     const sweepDutiesFor = (titlePrefix: string) =>
       (async () => (await unblockDuties()).filter((x: any) =>
         x.title.startsWith(titlePrefix) && String(x.body_md).includes("MACHINE PROXY")))();
 
     // S1 — the stale-true specimen: the target card is ALREADY done at park
     // time (the BR#3358 shape — the atom is born true and can never flip).
-    const t1 = await kbJson("/create", { type: "task", title: "Canonical: stale-true target", qualified: true, session: "drill-exec-s1t" });
+    const t1 = await kbJson("/create", { type: "task", title: "Canonical: stale-true target", roles: ["analysis"], qualified: true, session: "drill-exec-s1t" });
     const t1id = String(t1.body.id);
     await kbJson("/transition", { id: t1id, to: "in_progress", actor: "drill-exec-s1t", session: "drill-exec-s1t" });
-    const t1done = await kbJson("/transition", { id: t1id, to: "done", actor: "drill-exec-s1t", note: "done BEFORE the park — the stale-true specimen" });
+    const t1done = await kbJson("/transition", { id: t1id, to: "done", actor: "drill-exec-s1t", execution_result: { outcome: "Analysis observation precedes the park", receipts: [t1id] }, note: "done BEFORE the park — the stale-true specimen" });
     expect(t1done.status, JSON.stringify(t1done.body)).toBe(200);
 
     const s1 = await kbJson("/create", { type: "task", title: "IMPL: stale-true dedup drill", qualified: true, session: "drill-exec-s1" });
@@ -224,36 +225,30 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     await kbJson("/transition", { id: round1.id, to: "in_progress", actor: "drill-exec-u1", session: "drill-exec-u1" });
     const rd1 = await kbJson("/transition", {
       id: round1.id, to: "done", actor: "drill-exec-u1",
+      execution_result: { outcome: "Target was already done at park time; no new flip.", receipts: [t1id] },
       note: "checked first-hand — the target was already done at park time; the card is still blocked at check time (findings)",
     });
     expect(rd1.status, JSON.stringify(rd1.body)).toBe(200);
 
-    // sweep past the park-time flood window: the born-true atom fires ONCE
+    // The first round is already complete: consume the known prerequisite
+    // and continue the actual task instead of generating another close round.
     const sweep1 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 95 * 60_000 });
     expect(sweep1.body.error).toBeUndefined();
     const s1duties = await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill");
-    expect(s1duties.length).toBe(1);
-    const duty1 = s1duties[0];
-    expect(String(duty1.body_md)).toContain(`${t1id} status=done`);
-
-    // the family pattern: the spawned duty closes fast — re-arming the spawn
-    await kbJson("/transition", { id: duty1.id, to: "in_progress", actor: "drill-exec-d1", session: "drill-exec-d1" });
-    const dd1 = await kbJson("/transition", {
-      id: duty1.id, to: "done", actor: "drill-exec-d1",
-      note: "live re-verify: the atom was already true at park time — a steady-true receipt, NOT a flip; stand-down findings recorded, the card is still blocked on its human leg",
-    });
-    expect(dd1.status, JSON.stringify(dd1.body)).toBe(200);
+    expect(s1duties.length).toBe(0);
+    expect((await taskById(s1id)).status).toBe("todo");
+    expect((await taskById(s1id)).meta.proxy_check.receipts.join(" ")).toContain(`${t1id} status=done`);
 
     // sweep again: identical receipt → dedup, NO second duty (the churn dies here)
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 125 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
-    expect((await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill")).length).toBe(1);
+    expect((await sweepDutiesFor("Unblock: IMPL: stale-true dedup drill")).length).toBe(0);
     const s1meta = (await taskById(s1id)).meta;
     expect(s1meta?.proxy_check?.verdict).toBe("true");
-    expect(String(s1meta?.proxy_check?.spawn_skipped ?? "")).toContain("BR#3668");
+    expect(s1meta.blocked).toBeUndefined();
 
     // S2 — a GENUINE false→true transition: the changed receipt spawns, once.
-    const t2 = await kbJson("/create", { type: "task", title: "Canonical: late-flip target", qualified: true, session: "drill-exec-s2t" });
+    const t2 = await kbJson("/create", { type: "task", title: "Canonical: late-flip target", roles: ["analysis"], qualified: true, session: "drill-exec-s2t" });
     const t2id = String(t2.body.id);
     await kbJson("/transition", { id: t2id, to: "in_progress", actor: "drill-exec-s2t", session: "drill-exec-s2t" });
     const s2 = await kbJson("/create", { type: "task", title: "IMPL: late-flip drill", qualified: true, session: "drill-exec-s2" });
@@ -267,6 +262,7 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     await kbJson("/transition", { id: round2.id, to: "in_progress", actor: "drill-exec-u2", session: "drill-exec-u2" });
     const rd2 = await kbJson("/transition", {
       id: round2.id, to: "done", actor: "drill-exec-u2",
+      execution_result: { outcome: "Target still runs; condition does not hold.", receipts: [t2id] },
       note: "checked first-hand — the target still runs, so the card is still blocked at check time; the condition does NOT hold yet (findings)",
     });
     expect(rd2.status, JSON.stringify(rd2.body)).toBe(200);
@@ -278,27 +274,28 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(0);
 
     // the flip: the target actually completes
-    const t2done = await kbJson("/transition", { id: t2id, to: "done", actor: "drill-exec-s2t", note: "real completion — the false→true transition" });
+    const t2done = await kbJson("/transition", { id: t2id, to: "done", actor: "drill-exec-s2t", execution_result: { outcome: "Late analysis observation recorded", receipts: [t2id] }, note: "real completion — the false→true transition" });
     expect(t2done.status, JSON.stringify(t2done.body)).toBe(200);
 
     // sweep on the flip: the CHANGED receipt spawns exactly once
     const fsweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 185 * 60_000 });
     expect(fsweep2.body.error).toBeUndefined();
     const s2duties = await sweepDutiesFor("Unblock: IMPL: late-flip drill");
-    expect(s2duties.length).toBe(1);
-    expect(String(s2duties[0].body_md)).toContain(`${t2id} status=done`);
+    expect(s2duties.length).toBe(0);
+    expect((await taskById(s2id)).status).toBe("todo");
+    expect((await taskById(s2id)).meta.proxy_check.receipts.join(" ")).toContain(`${t2id} status=done`);
 
     // and a further sweep with the same receipt spawns nothing more
     const fsweep3 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 215 * 60_000 });
     expect(fsweep3.body.error).toBeUndefined();
-    expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(1);
+    expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(0);
   });
 
   it("BR#3668: a human-gated park never flips — a machine-shaped await_event contradicting the markers is ignored, no spawn, no migration ask", async () => {
-    const t3 = await kbJson("/create", { type: "task", title: "Canonical: human-gated target", qualified: true, session: "drill-exec-s3t" });
+    const t3 = await kbJson("/create", { type: "task", title: "Canonical: human-gated target", roles: ["analysis"], qualified: true, session: "drill-exec-s3t" });
     const t3id = String(t3.body.id);
     await kbJson("/transition", { id: t3id, to: "in_progress", actor: "drill-exec-s3t", session: "drill-exec-s3t" });
-    const t3done = await kbJson("/transition", { id: t3id, to: "done", actor: "drill-exec-s3t", note: "done — the machine leg reads true, the exit is still human-only" });
+    const t3done = await kbJson("/transition", { id: t3id, to: "done", actor: "drill-exec-s3t", execution_result: { outcome: "Board analysis observation recorded", receipts: [t3id] }, note: "done — the machine leg reads true, the exit is still human-only" });
     expect(t3done.status, JSON.stringify(t3done.body)).toBe(200);
 
     const s3 = await kbJson("/create", { type: "task", title: "IMPL: human-gated park drill", qualified: true, session: "drill-exec-s3" });
@@ -341,7 +338,7 @@ describe("BR#3986 — multi-atom conjunctions + self-await migration fence (real
     const id = String(r.body.id);
     await kbJson("/transition", { id, to: "in_progress", actor: session, session });
     if (done) {
-      const d = await kbJson("/transition", { id, to: "done", actor: session, session, note: "done — drill leg verified first-hand" });
+      const d = await kbJson("/transition", { id, to: "done", actor: session, session, execution_result: { outcome: "Drill leg verified first-hand", receipts: [id] }, note: "done — drill leg verified first-hand" });
       expect(d.status, JSON.stringify(d.body)).toBe(200);
     }
     return id;
@@ -364,6 +361,7 @@ describe("BR#3986 — multi-atom conjunctions + self-await migration fence (real
     await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-3986-u", session: "drill-3986-u" });
     const rd = await kbJson("/transition", {
       id: round.id, to: "done", actor: "drill-3986-u",
+      execution_result: { outcome: "Placeholder leg does not exist; condition remains blocked.", receipts: [pid] },
       note: "checked the condition first-hand — still blocked at check time (findings); placeholder leg does not exist",
     });
     expect(rd.status, JSON.stringify(rd.body)).toBe(200);
@@ -392,7 +390,7 @@ describe("BR#3986 — multi-atom conjunctions + self-await migration fence (real
 
     // leg B completes → the conjunction flips → the duty spawns
     await kbJson("/transition", { id: legB, to: "in_progress", actor: "drill-3986-b", session: "drill-3986-b" });
-    const d = await kbJson("/transition", { id: legB, to: "done", actor: "drill-3986-b", session: "drill-3986-b", note: "done — drill leg verified first-hand" });
+    const d = await kbJson("/transition", { id: legB, to: "done", actor: "drill-3986-b", session: "drill-3986-b", execution_result: { outcome: "Drill leg B verified first-hand", receipts: [legB] }, note: "done — drill leg verified first-hand" });
     expect(d.status, JSON.stringify(d.body)).toBe(200);
     const s2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 305 * 60_000 });
     expect(s2.body.error).toBeUndefined();
@@ -432,6 +430,7 @@ describe("done-close-legs auto-derivation (real DO)", () => {
   it("unreceipted done is rejected, derives the close-duty child once, and the child's receipted done unblocks the parent", async () => {
     const d = await kbJson("/create", {
       type: "task", title: "IMPL: close-leg drill", qualified: true, session: "drill-exec-parent",
+      meta: { completion: { kind: "execution", outcome: "Close the issue and verify the actual closure receipt" } },
       body_md: "work\n\n## Done when\n- close GH #2261 (the incident issue)\n",
     });
     expect(d.status).toBe(200);
@@ -439,7 +438,8 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     await kbJson("/transition", { id: dId, to: "in_progress", actor: "drill-exec-parent", session: "drill-exec-parent" });
 
     // done without a receipt → gate rejects, error names the rule
-    const rej = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "work complete" });
+    const execution_result = { outcome: "Closure leg inspected", receipts: [dId] };
+    const rej = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", execution_result, note: "work complete" });
     expect(rej.status).toBe(400);
     expect(String(rej.body.error)).toContain("terminal close leg(s) not receipted");
     expect(String(rej.body.error)).toContain("[rule: done-close-legs]");
@@ -456,7 +456,7 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     expect((await taskById(dId)).meta?.last_close_leg_spawn?.child).toBe(childId);
 
     // retry while the child is open → still rejected, no SECOND child (flood+cap)
-    const rej2 = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "work complete (retry)" });
+    const rej2 = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", execution_result, note: "work complete (retry)" });
     expect(rej2.status).toBe(400);
     const duties2 = (await unblockDuties()).filter((x: any) => x.title.startsWith("Close-leg duty: IMPL: close-leg drill"));
     expect(duties2.length).toBe(1);
@@ -466,13 +466,14 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     await kbJson("/transition", { id: childId, to: "in_progress", actor: "drill-exec-closer", session: "drill-exec-closer" });
     const childDone = await kbJson("/transition", {
       id: childId, to: "done", actor: "drill-exec-closer",
+      execution_result: { outcome: "Issue closed and closing comment observed", receipts: ["https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240"] },
       note: "close executed: GH #2261 state=closed, closing comment 17623388240 (https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240), guard run 40198911366 guard=allow",
     });
     expect(childDone.status, `child done failed: ${JSON.stringify(childDone.body)}`).toBe(200);
 
     // now the parent's done passes — the closed close-duty child owns the leg
-    const parentDone = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "executed via the close-leg duty child" });
-    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
+    await completeExecutionReview(kbJson, dId, { outcome: "Issue closure and its closing comment verified", receipts: ["https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240"] });
+    expect((await taskById(dId)).status).toBe("done");
   });
 });
 
@@ -696,7 +697,7 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
     expect(String(round.body_md)).toContain("MACHINE PROXY");
     expect(String(round.body_md)).toContain(sha.slice(0, 9));
     expect(String(round.body_md)).toContain("BR#4282");
-    expect(String(round.body_md)).toContain("close YOURSELF done");
+    expect(String(round.body_md)).toContain("Close YOURSELF done with execution_result");
 
     // 5. the contract executes: the duty closes ITSELF done first (receipts
     // cited — the done-open-children gate needs the child closed), then the
@@ -704,6 +705,7 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
     await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-exec-closer4282", session: "drill-exec-closer4282" });
     const roundDone = await kbJson("/transition", {
       id: round.id, to: "done", actor: "drill-exec-closer4282",
+      execution_result: { outcome: "Merge observed; awaiting-CI is not decisive deployment success.", receipts: ["https://github.com/state-vector/superpositional/pull/2400"] },
       note: "verified on the board receipts: PR 2400 merged as 4282feedf (train awaiting-ci stamp, BR#4282) — closing the parent done",
     });
     expect(roundDone.status, `duty done failed: ${JSON.stringify(roundDone.body)}`).toBe(200);
@@ -711,8 +713,8 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
       id, to: "done", actor: "drill-exec-closer4282",
       note: "closed via the unblock duty: PR https://github.com/state-vector/superpositional/pull/2400 merged as 4282feedf (board merge receipt)",
     });
-    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
-    expect((await taskById(id)).status).toBe("done");
+    expect(parentDone.status).toBe(400);
+    expect((await taskById(id)).status).toBe("in_progress");
   });
 });
 
@@ -911,7 +913,7 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     expect(parkRound, "the park-time round must exist").toBeTruthy();
     const c1 = await kbJson("/transition", { id: parkRound.id, to: "in_progress", actor: "drill-u1", session: "drill-u1" });
     expect(c1.status, `park-round claim failed: ${JSON.stringify(c1.body)}`).toBe(200);
-    const c2 = await kbJson("/transition", { id: parkRound.id, to: "done", actor: "drill-u1", note: "checked first-hand: the ruling is still open at check time — condition still blocked (findings)" });
+    const c2 = await kbJson("/transition", { id: parkRound.id, to: "done", actor: "drill-u1", execution_result: { outcome: "Ruling remains open", receipts: [qid] }, note: "checked first-hand: the ruling is still open at check time — condition still blocked (findings)" });
     expect(c2.status, `park-round close failed: ${JSON.stringify(c2.body)}`).toBe(200);
 
     // sweep 1: the ruling card is still todo → verdict false, nothing spawns
@@ -926,16 +928,16 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     await kbJson("/transition", { id: qid, to: "in_progress", actor: "web:rayh", session: "web" });
     await kbJson("/transition", { id: qid, to: "done", actor: "web:rayh", session: "web", note: "GO — Option A" });
 
-    // sweep 2: flip — verdict true, fresh duty spawned with the receipt
+    // The original round is complete: continue with the verified receipt.
     const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 517 * 60_000 });
     expect(sweep2.body.error).toBeUndefined();
     const aNow = await taskById(aid);
     expect(aNow.meta?.proxy_check?.verdict).toBe("true");
+    expect(aNow.status).toBe("todo");
     const flip = (await unblockDuties()).find((x: any) =>
       x.title.startsWith("Unblock: IMPL: parked on the ruling (BR#3620)") && ["todo", "in_progress", "blocked"].includes(x.status));
-    expect(flip, "the flip must spawn a fresh unblock duty").toBeTruthy();
-    expect(String(flip.body_md)).toContain("MACHINE PROXY");
-    expect(String(flip.body_md)).toContain(`${qid} status=done (answered)`);
+    expect(flip, "the consumed prerequisite must not spawn another round").toBeUndefined();
+    expect(aNow.meta.proxy_check.receipts.join(" ")).toContain(`${qid} status=done (answered)`);
   });
 
   it("pr_merged + bare br_pr_merged flip from the train-stamped provenance ledger (no creds)", async () => {
@@ -968,7 +970,7 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
       expect(round, prefix).toBeTruthy();
       const c3 = await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-u2", session: "drill-u2" });
       expect(c3.status, `park-round claim failed (${prefix}): ${JSON.stringify(c3.body)}`).toBe(200);
-      const c4 = await kbJson("/transition", { id: round.id, to: "done", actor: "drill-u2", note: "checked first-hand: no provenance row at check time — condition still blocked (findings)" });
+      const c4 = await kbJson("/transition", { id: round.id, to: "done", actor: "drill-u2", execution_result: { outcome: "No qualifying provenance row at check time", receipts: [round.id] }, note: "checked first-hand: no provenance row at check time — condition still blocked (findings)" });
       expect(c4.status, `park-round close failed (${prefix}): ${JSON.stringify(c4.body)}`).toBe(200);
     }
 
@@ -977,12 +979,13 @@ describe("unblockProxySweep — BR#3620 flips (real DO)", () => {
     for (const id of [p1id, p2id]) {
       const now = await taskById(id);
       expect(now.meta?.proxy_check?.verdict, id).toBe("true");
-      expect(now.meta?.proxy_check?.spawned, id).toBeTruthy();
+      if (id === p1id) expect(now.status).toBe("todo");
+      else expect(now.meta?.proxy_check?.spawned, id).toBeTruthy();
     }
     // the spawn receipts cite the LEDGER (sha + signer), never a GitHub read
     const duties = (await unblockDuties()).filter((d: any) =>
       d.title.startsWith("Unblock: IMPL: parked on the train (BR#3620") && ["todo", "in_progress", "blocked"].includes(d.status));
-    const bodies = duties.map((d: any) => String(d.body_md)).join("\n");
+    const bodies = [...duties.map((d: any) => String(d.body_md)), ...((await taskById(p1id)).meta.proxy_check.receipts ?? [])].join("\n");
     expect(bodies).toContain("provenance: state-vector/superpositional#2440 merged (sha 8adf1e85c, signer drill-signer)");
     expect(bodies).toContain("provenance: BR#");
   });
@@ -1088,6 +1091,7 @@ describe("BR#4702 — capped re-attempts under a standing escalation are observa
       await kbJson("/transition", { id: round.id, to: "in_progress", actor: `duty-br4702-${n}`, session: `duty-br4702-${n}` });
       const done = await kbJson("/transition", {
         id: round.id, to: "done", actor: `duty-br4702-${n}`,
+        execution_result: { outcome: "PR remains open; exit not satisfied", receipts: [`https://github.com/a/b/pull/${n}`] },
         note: `receipts: exit ${n} re-verified on the board — PR https://github.com/a/b/pull/${n} still OPEN, exit not held; findings recorded per the unblock contract`,
       });
       expect(done.status, `round ${n} done failed: ${JSON.stringify(done.body)}`).toBe(200);
@@ -1273,7 +1277,7 @@ describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (m
       const lnk = await kbJson("/link", { src: cid, relation: "child_of", dst: parent });
       expect(lnk.status, `link failed: ${JSON.stringify(lnk.body)}`).toBe(200);
       await kbJson("/transition", { id: cid, to: "in_progress", actor: `duty-${tag}`, session: `duty-${tag}` });
-      const done = await kbJson("/transition", { id: cid, to: "done", actor: `duty-${tag}`, session: `duty-${tag}`, note: "receipts: https://github.com/a/b/pull/1 re-verified — exit not held; findings recorded" });
+      const done = await kbJson("/transition", { id: cid, to: "done", actor: `duty-${tag}`, session: `duty-${tag}`, execution_result: { outcome: "Exit not satisfied; findings recorded", receipts: ["https://github.com/a/b/pull/1"] }, note: "receipts: https://github.com/a/b/pull/1 re-verified — exit not held; findings recorded" });
       expect(done.status, `child done failed: ${JSON.stringify(done.body)}`).toBe(200);
     };
 
@@ -1321,8 +1325,10 @@ describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (m
     expect(aAfter.meta?.blocked?.await_event).toEqual({ event: "time", until_ts: (t0 + 640 * 60_000) + REARM_MS });
     expect(aAfter.meta?.unblock_escalated).toBeUndefined();
     const nAfter = await taskById(nid);
-    expect(nAfter.status).toBe("blocked");
+    expect(nAfter.status).toBe("todo");
     expect(nAfter.meta?.unblock_escalated?.rounds).toBe(3);
-    expect(String(nAfter.meta?.proxy_check?.spawn_skipped)).toContain("unblock spawner cap");
+    expect(nAfter.meta?.blocked).toBeUndefined();
+    expect(nAfter.meta?.proxy_check?.receipts.join(" ")).toContain("timer elapsed");
   });
 });
+import { completeExecutionReview } from "./completion-fixture";

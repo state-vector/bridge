@@ -711,14 +711,8 @@ export function canonicalVerdictTitle(meta: unknown): string | null {
   return title;
 }
 
-/** Human-facing banner for verify-verdict decisions, prepended to body_md at
- *  creation (do.ts). Verifiers file receipts-dense cards whose body never
- *  says what the verdict does or who applied it — BR#2453 taught us that.
- *  BR#5377 F4: verdicts are MACHINE verdicts now — they accept on filing
- *  (actor system:verifier) and the accept-side hook applies them to their
- *  target; the human is not a per-merge GO/NO-GO gate. The statement states
- *  machine-application reality (and the one remaining human leg: supersede).
- *  Pure: meta in, markdown out. */
+/** A decision's display text never certifies its business effect or receipts.
+ * Actual task acceptance belongs to the subject-bound typed review lifecycle. */
 export function verifyVerdictStatement(meta: unknown): string {
   const m = (meta ?? {}) as Record<string, unknown>;
   const target = String(m.task ?? m.verify_target ?? "").trim() || "the task";
@@ -726,15 +720,15 @@ export function verifyVerdictStatement(meta: unknown): string {
   const isBounce = String(m.verdict ?? "").toLowerCase() === "bounce";
   const session = String(m.session ?? "").trim();
   const effect = isBounce
-    ? `bounced **${target}** back to \`in_progress\` with the findings`
-    : `accepted **${target}** — impl work queues on the merge train (the train owns delivery); verify duties close done`;
-  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}`;
+    ? `requests that **${target}** return to work with the findings; its actual task history records whether that transition applied`
+    : `records the authored verdict about **${target}**; it does not close a task or admit a PR to the train`;
   return [
-    `> ⚖️ **Verify verdict — machine-applied** — *auto-added, not part of the verifier's receipts*`,
+    `> ⚖️ **Verify verdict — recorded decision** — *auto-added, not completion evidence*`,
     `>`,
-    `> This is a machine verdict (BR#5377): it accepted on filing (actor \`system:verifier\`) — no human GO/NO-GO step. The verdict ${effect}.`,
-    `> - Doesn't hold? **Supersede** it (decisions panel) — superseding records why; the target re-enters the normal flow.`,
-    `> You are NOT being asked to re-verify — ${checked}.`,
+    `> This decision is recorded on filing without a human GO/NO-GO step. It ${effect}.`,
+    `> Acceptance requires the independent review's typed result, exact subject revision and delivery/outcome receipts. Decision text is not acceptance.`,
+    `> Authored evidence${session ? ` from session \`${session}\`` : ""} follows below; this banner does not certify it was checked live.`,
+    `> Doesn't hold? **Supersede** the decision with the reason; task completion remains separately evidence-bound.`,
   ].join("\n");
 }
 
@@ -1908,6 +1902,11 @@ export interface TrainBatchCar {
   pr?: number;
   state: "ready" | "verifying" | "waiting";
   detail?: string;
+  /** BR#4688: ledger bounce count for the PR leg + the over-budget mirror —
+   *  the Top panel's batch blocks render the same bounce chip the queue rows
+   *  carry; the merge walk ignores the extra fields. */
+  bounces?: number;
+  over_budget?: boolean;
 }
 
 /** BR#5658 (Ray 2026-11-03): partition all verifying + ready PRs on a lane into
@@ -2405,6 +2404,14 @@ export function releaseHold(meta: any): string | null {
   if (m.awaiting_ask)
     return `a bound ask (${String(m.awaiting_ask.ask_id ?? "")}) — the answer owns the exit`;
   return null;
+}
+
+/** TODO repair work has already left the train. Its historical bounce is not
+ * a future event. A declared recovery owner and every actual upstream wait
+ * still hold it; discovery and atomic reservation use this same predicate. */
+export function todoDispatchHold(meta: any): string | null {
+  if (meta?.merge_train?.state !== "bounced" || meta?.recovery?.task_id) return releaseHold(meta);
+  return releaseHold({ ...meta, merge_train: undefined });
 }
 
 /** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE
@@ -3153,6 +3160,92 @@ export function resolveTrainBounceKind(input: {
   if ((input.conflictFiles ?? []).length) return "conflict";
   if (input.defect && TRAIN_COVERAGE_DEFECT_RE.test(input.defect)) return "coverage";
   return "gate";
+}
+
+// ---- bounce budget (TRAIN-DEFENCE L1.3, BR#4688; disposition per BR#3312) ----
+//
+// Defect: no ceiling on repeated bounces — bridge PRs #279/#281 each bounced
+// 31×/33× in ~10h (43% of all train cycles), pure churn with no escalation.
+// The budget: per-(PR, bounce-kind) ceiling on the train_events ledger. The
+// 6th same-kind bounce breaches it: the train stops re-serving the PR (the
+// re-queue paths refuse) and escalates per the BR#3312 disposition — ONE
+// bound ask to the owning agent ("merge, rebase, or close-with-reason within
+// 48h"), expiry closes the PR with reason (the card survives as the record).
+
+/** Same-kind bounces a PR may absorb before the train escalates. The breach
+ *  fires ON the bounce that exceeds this — budget 5 ⇒ escalation at #6. */
+export const TRAIN_BOUNCE_BUDGET = 5;
+
+/** Default owner-response clock for a bounce-budget escalation (hours) —
+ *  BR#3312's pr_grace_hours knob (settings override, same key). */
+export const TRAIN_BOUNCE_GRACE_HOURS = 48;
+
+/** One ledger row the replay consumes — the shape train_history serves
+ *  (train_events), narrowed to what the budget reads. */
+export interface TrainLedgerBounce {
+  ts: number;
+  kind: string;
+  repo: string;
+  base?: string | null;
+  pr: number | null;
+  task_id?: string | null;
+  detail?: { bounce_kind?: string | null; conflict_files?: string[] } | null;
+}
+
+/** Pure replay of the bounce budget over a ledger slice (train_history
+ *  events, any order). Walks events per (repo, base, pr, bounce_kind),
+ *  oldest first; the first same-kind bounce past TRAIN_BOUNCE_BUDGET emits
+ *  one escalation — never a second for the same (pr, kind) episode. This is
+ *  the SAME rule the DO applies live at train:bounced, so replay and runtime
+ *  can never disagree. */
+export function replayBounceBudget(
+  events: TrainLedgerBounce[],
+  opts?: { budget?: number; now?: number; graceHours?: number },
+): { pr: number; repo: string; base: string; bounce_kind: string; bounce_no: number; at: number; task_id: string | null; grace_until: number }[] {
+  const budget = Math.max(1, opts?.budget ?? TRAIN_BOUNCE_BUDGET);
+  const graceMs = Math.max(1, opts?.graceHours ?? TRAIN_BOUNCE_GRACE_HOURS) * 3_600_000;
+  const counts = new Map<string, number>();
+  const escalated = new Set<string>();
+  const out: ReturnType<typeof replayBounceBudget> = [];
+  for (const e of [...events].sort((a, b) => a.ts - b.ts)) {
+    if (e.kind !== "bounced" || !e.pr || !e.repo) continue;
+    const kind = String(e.detail?.bounce_kind ?? "gate");
+    const base = String(e.base ?? "main");
+    const key = `${e.repo}@${base}#${e.pr}/${kind}`;
+    if (escalated.has(key)) continue; // one escalation per (pr, kind) episode
+    const n = (counts.get(key) ?? 0) + 1;
+    counts.set(key, n);
+    if (n > budget) {
+      escalated.add(key);
+      out.push({ pr: Number(e.pr), repo: e.repo, base, bounce_kind: kind, bounce_no: n, at: e.ts, task_id: e.task_id ?? null, grace_until: e.ts + graceMs });
+    }
+  }
+  return out;
+}
+
+/** The escalation ask's title — deterministic per (repo, pr, kind, episode
+ *  bounce_no): the identical-open-ask guard dedupes re-fires of the SAME
+ *  episode; a post-clear storm (new bounce_no) files fresh. ≤240 chars,
+ *  ends in '?' — the ask contract (rule 6c). */
+export function trainEscalationAskTitle(repo: string, prNumber: number, cardId: string, kind: string, bounceNo: number, graceHours: number): string {
+  const prefix = `PR #${prNumber} (${repo}) on ${cardId} bounced ${bounceNo}× ${kind} on the merge train — `;
+  const text = `merge, rebase, or close it with reason within ${graceHours}h? The train stopped serving it`;
+  const suffix = `?`;
+  if (prefix.length + text.length + suffix.length <= 240) return prefix + text + suffix;
+  // over the cap: the free-form PREFIX (long card id / repo) shrinks — the
+  // ask itself never does (ask contract, rule 6c: one plain-reading question
+  // ≤240 chars)
+  const budget = Math.max(40, 240 - text.length - suffix.length);
+  return (prefix.slice(0, budget - 1).trimEnd() + "…" + text + suffix).slice(0, 240);
+}
+
+/** The expiry close reason — BR#3312's law text: cites the escalation ask id,
+ *  the breach facts, and the revive path (closures are reversible). */
+export function trainEscalationClosedReason(input: { repo: string; prNumber: number; kind: string; bounceNo: number; askId: string | null; escalatedAt: number; graceHours: number }): string {
+  const at = new Date(input.escalatedAt).toISOString();
+  return [
+    `Bounce-budget expiry (BR#4688, disposition per BR#3312): PR #${input.prNumber} (${input.repo}) breached the same-kind bounce budget — ${input.bounceNo}× ${input.kind} — escalated ${at} (ask ${input.askId ?? "no longer on record"}) and unanswered for ${input.graceHours}h. Closing with reason; the board card survives as the record. Revive: re-open this PR once the underlying work resumes (PRs are reopenable).`,
+  ].join("\n");
 }
 
 /** train:bounced fix-up brief — per bounce KIND (BR#4066). A coverage bounce

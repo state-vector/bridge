@@ -37,6 +37,14 @@ fn repository_identity(raw: &str) -> String {
 }
 
 pub fn publish(path: &Path, task: &str, generation: u64, next: &str, environment: Vec<String>) -> Result<Checkpoint, String> {
+    let checkpoint = capture(path, task, generation, next, environment)?;
+    publish_captured(path, &checkpoint)?;
+    Ok(checkpoint)
+}
+
+/// Local immutable snapshot first; callers persist this exact object before
+/// publication. Retrying publication never invents another ref/commit/effect.
+pub fn capture(path: &Path, task: &str, generation: u64, next: &str, environment: Vec<String>) -> Result<Checkpoint, String> {
     let repo = repository_identity(&git(path, &["remote", "get-url", "origin"], None)?);
     let base = git(path, &["rev-parse", "HEAD"], None)?;
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
@@ -52,13 +60,25 @@ pub fn publish(path: &Path, task: &str, generation: u64, next: &str, environment
         let commit = git(path, &["commit-tree", "-S", &tree, "-p", &base, "-m", &format!("Bridge checkpoint {task} generation {generation}")], None)?;
         let slug: String = task.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
         let remote_ref = format!("refs/heads/bridge-checkpoints/{slug}/{generation}/{nonce}");
-        git(path, &["push", "origin", &format!("{commit}:{remote_ref}")], None)?;
-        let observed = git(path, &["ls-remote", "--exit-code", "origin", &remote_ref], None)?;
-        if observed.split_whitespace().next() != Some(&commit) { return Err("checkpoint publication readback did not match content".into()); }
         Ok(Checkpoint { repo, remote_ref, commit, tree, base, environment, next: next.into(), tests: vec![] })
     })();
     let _ = std::fs::remove_file(&index);
     snapshot
+}
+
+pub fn publish_captured(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
+    if repository_identity(&git(path, &["remote", "get-url", "origin"], None)?) != checkpoint.repo { return Err("checkpoint repository mismatch".into()); }
+    if !checkpoint.remote_ref.starts_with("refs/heads/bridge-checkpoints/") { return Err("gate: checkpoint publication cannot write a delivery branch".into()); }
+    if git(path, &["rev-parse", &format!("{}^{{tree}}", checkpoint.commit)], None)? != checkpoint.tree { return Err("gate: captured checkpoint tree does not match its immutable commit".into()); }
+    git(path, &["merge-base", "--is-ancestor", &checkpoint.base, &checkpoint.commit], None)?;
+    let observed = git(path, &["ls-remote", "origin", &checkpoint.remote_ref], None)?;
+    if let Some(head) = observed.split_whitespace().next() {
+        return if head == checkpoint.commit { Ok(()) } else { Err("gate: checkpoint ref already contains different content; retain work".into()) };
+    }
+    git(path, &["push", "origin", &format!("{}:{}", checkpoint.commit, checkpoint.remote_ref)], None)?;
+    let observed = git(path, &["ls-remote", "--exit-code", "origin", &checkpoint.remote_ref], None)?;
+    if observed.split_whitespace().next() != Some(checkpoint.commit.as_str()) { return Err("checkpoint publication readback did not match content".into()); }
+    Ok(())
 }
 
 /// Never reset an existing dirty worktree to a checkpoint. That is newer work,
@@ -88,7 +108,7 @@ pub fn restore(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
     struct Sandbox(PathBuf);
@@ -108,7 +128,7 @@ mod tests {
         }
     }
     impl Drop for Sandbox { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-    fn init(root: &Path) -> PathBuf {
+    pub(crate) fn init(root: &Path) -> PathBuf {
         let remote = root.join("remote.git");
         git(root, &["init", "--bare", remote.to_str().unwrap()], None).unwrap();
         let source = root.join("source");

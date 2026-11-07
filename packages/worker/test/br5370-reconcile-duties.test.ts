@@ -125,18 +125,14 @@ describe("BR#5370 B — reverse duties are relates-linked, never child_of their 
     // the landed-close class (occurrence #7): the zombie binding closes
     // FIRST-LINE with the ruling duty still open — no 3-rejection breach burn
     await kbJson("/transition", { id: bindingId, to: "in_progress", note: "drill: unpark for the close" });
-    const closed = await kbJson("/transition", {
-      id: bindingId, to: "done",
-      note: "drill: landed close with the ruling duty open — machine-duty children do not fence the close-target (BR#5370)",
-    });
-    expect(closed.status, `binding close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    await completeMainReview(kbJson, bindingId, repo, "a".repeat(40));
     expect((await get(bindingId)).status).toBe("done");
   });
 });
 
 describe("BR#5370 C — the done gate ignores machine-duty children; the refusal names the rest", () => {
   it("a machine_duty child does not fence done; a plain child does — and the refusal names it with its status", async () => {
-    const { body: parent } = await kbJson("/create", { type: "task", title: "IMPL: br5370 gate drill", session: "" });
+    const { body: parent } = await kbJson("/create", { type: "task", title: "Analysis: br5370 relation gate drill", roles: ["analysis"], session: "" });
     const parentId = String(parent.id);
     const { body: duty } = await kbJson("/create", {
       type: "task", title: `Unblock: br5370 gate drill (machine duty)`, session: "",
@@ -144,26 +140,27 @@ describe("BR#5370 C — the done gate ignores machine-duty children; the refusal
       roles: ["unblock"],
     });
     const dutyId = String(duty.id);
-    const { body: plain } = await kbJson("/create", { type: "task", title: "subtask: br5370 gate drill (real child)", session: "" });
+    const { body: plain } = await kbJson("/create", { type: "task", title: "subtask: br5370 gate drill (real child)", roles: ["analysis"], session: "" });
     const plainId = String(plain.id);
     for (const child of [dutyId, plainId]) {
       const l = await kbJson("/link", { src: child, relation: "child_of", dst: parentId });
       expect(l.body.error ?? "").toBe("");
     }
     await kbJson("/transition", { id: parentId, to: "in_progress", note: "drill: claim" });
+    const execution_result = { outcome: "Relation graph investigated", receipts: [parentId, plainId] };
 
     // attempt 1 with BOTH open: the machine duty is invisible to the gate;
     // the plain child is named — id AND status — on the FIRST rejection
-    const refused = await kbJson("/transition", { id: parentId, to: "done", note: "drill: closing with children open" });
+    const refused = await kbJson("/transition", { id: parentId, to: "done", execution_result, note: "drill: closing with children open" });
     expect(String(refused.body.error)).toContain("still has 1 open child task(s)");
     expect(String(refused.body.error)).toContain(`Open child: ${plainId} (todo)`);
     expect(String(refused.body.error)).not.toContain(dutyId);
 
     // close the plain child → the parent closes with the machine duty open
     await kbJson("/transition", { id: plainId, to: "in_progress", note: "drill: claim child" });
-    const closedChild = await kbJson("/transition", { id: plainId, to: "done", note: "drill: child closed" });
+    const closedChild = await kbJson("/transition", { id: plainId, to: "done", execution_result: { outcome: "Child analysis complete", receipts: [plainId] }, note: "drill: child closed" });
     expect(closedChild.status, JSON.stringify(closedChild.body)).toBeLessThan(400);
-    const done = await kbJson("/transition", { id: parentId, to: "done", note: "drill: parent closes with the machine duty open (BR#5370)" });
+    const done = await kbJson("/transition", { id: parentId, to: "done", execution_result, note: "drill: parent closes with the machine duty open (BR#5370)" });
     expect(done.status, `parent close failed: ${JSON.stringify(done.body)}`).toBeLessThan(400);
     expect((await get(parentId)).status).toBe("done");
     // the close itself proved the exclusion: attempt 1 named only the plain
@@ -250,3 +247,4 @@ describe("BR#5370 D — vanish-detection consults the merge train; the migration
     expect(parsed2.ts).toBe(parsed.ts);
   });
 });
+import { completeMainReview } from "./completion-fixture";

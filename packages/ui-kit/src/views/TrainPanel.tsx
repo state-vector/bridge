@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import type { LineRemediation, TrainLineProjection } from "@bridge/contracts";
+import type { HubDiagnostics, LineRemediation, TrainLineProjection } from "@bridge/contracts";
 import { recoveryCauseLabel, recoveryIsOpen } from "@bridge/contracts";
 import { kbApi, type KbTrainLane } from "../server/kb";
-import { Chip, type ChipTone } from "./index-kit";
+import { Btn, Chip, type ChipTone } from "./index-kit";
 
 function age(ts: number | undefined, now: number): string {
   if (!ts) return "unknown";
@@ -13,7 +13,7 @@ function age(ts: number | undefined, now: number): string {
 }
 
 const tones: Record<TrainLineProjection["phase"], ChipTone> = {
-  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "err", retired: "muted",
+  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "warn", retired: "muted",
 };
 const unavailable: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
@@ -80,7 +80,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
  * come from the hub's typed `line` projection, shared with its row and message. */
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
-  return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
+  return <div className={`train-blocked-banner${line.phase === "waiting" || line.phase === "unknown" ? " train-blocked-banner-amber" : ""}`} role="alert">
     <div className="train-banner-cause">
     <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
     <span className="train-banner-line">{line.reason}</span>
@@ -189,6 +189,33 @@ function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: strin
     </div>
   );
 }
+
+export function HubRequestDiagnostics({ now }: { now: number }) {
+  const [snapshot, setSnapshot] = useState<HubDiagnostics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = async () => {
+    if (loading) return;
+    setLoading(true);
+    try { setSnapshot(await kbApi.diagnostics()); setError(null); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { setLoading(false); }
+  };
+  return <details className="muted-note" onToggle={event => { if (event.currentTarget.open && !snapshot) void load(); }}>
+    <summary>Hub request diagnostics</summary>
+    <div>Request timings and current processing stages. Loaded on demand; opening this view does not run scheduler or repair sweeps.</div>
+    <Btn onClick={() => void load()} disabled={loading}>{loading ? "Reading hub…" : "Refresh diagnostics"}</Btn>
+    {error && <div role="alert">Diagnostics unavailable: {error}</div>}
+    {snapshot && <>
+      <div>Observed {age(snapshot.observed_at, now)} ago · instance running since {new Date(snapshot.started_at).toISOString()} · timings reset on hub restart</div>
+      <div>{snapshot.active.length} tracked requests in progress</div>
+      {snapshot.active.map(r => <div key={r.id}>{r.operation}: {r.stage} · {r.elapsed_ms}ms elapsed at observation</div>)}
+      {[...snapshot.operations].sort((a, b) => b.max_ms - a.max_ms).slice(0, 12).map(r => <div key={r.operation}>
+        {r.operation}: {r.count} requests · {r.errors} server errors · max ingress {r.max_ingress_ms}ms · max processing {r.max_ms}ms
+      </div>)}
+    </>}
+  </details>;
+}
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -214,7 +241,8 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
 }) {
   const activeLanes = lanes?.filter(lane => !lane.retired && lane.line?.phase !== "retired");
   return <div className="train-panel">
-    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span></div>
+    <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
+      <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
     {!error && (activeLanes ?? []).filter((l) => l.stop || l.red_main).map((l) => (
       <StopLineBanner key={`stopline-${l.lane}`} l={l} openTask={openTask} />
@@ -242,18 +270,22 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>
-        <span className="trainc-msg">{line.remediation?.text ?? line.reason}</span>
+        <span className="trainc-msg">{line.remediation?.text ?? line.reason}
+          {(l.escalations ?? []).map((e) => <Chip key={`${e.task_id}-${e.pr}`} pill tone={e.expired ? "err" : "warn"}
+            title={`bounce budget (BR#4688): ${e.task_id} PR #${e.pr} breached at ${e.bounce_no}× ${e.bounce_kind ?? "?"} bounces — de-queued, escalation ask ${e.ask_id ?? "?"}; owner clock ${e.expired ? `expired ${age(e.grace_until, now)} ago (executor closes the PR)` : `${age(e.grace_until, now)} left`}`}>⏳ {e.pr ? `#${e.pr}` : e.task_id} ×{e.bounce_no}</Chip>)}
+        </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog"><span className="train-stats">
-          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} ready</span>
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
-          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}`}
-            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}`} onClick={() => openTask?.(q.id)} />)}
+          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
+            title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · Returned to repair/review ${q.bounces} time(s) across tracked history${q.over_budget ? " — active bounce-budget escalation" : ""}` : ""}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
       </div>
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
       </section>;
     })}
+    <HubRequestDiagnostics now={now} />
   </div>;
 }

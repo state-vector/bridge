@@ -192,6 +192,9 @@ describe("BR#6163: bounce-release strand — evidence, re-board, alarm, exclusio
       await_event: { event: "pr_merged", repo: REPO, n: 3001 },
     });
     expect(park.status).toBe(200);
+    // Seed the historical unbound state explicitly. A new prose-only park
+    // cannot manufacture acceptance or an accepted-head stamp.
+    await kbJson("/update", { id, meta: { merge_train: { state: "unbound", pr: 3001, repo: REPO } } });
     let cur = (await kbJson("/get", { id })).body;
     expect(cur.meta?.merge_train?.state).toBe("unbound");
     // backdate the park past the strand window
