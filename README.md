@@ -3311,13 +3311,37 @@ Missing keys, invalid signatures and other prerequisite failures remain held.
 Existing writers, checkpoints and updater drain holds are preserved.
 ## Stopped-writer capacity recovery
 
-The gateway persists actual process-group-empty observations in
-`~/.bridge/stopped-attempts/` before network finalization. A separate bounded
-delivery loop retries transient hub failures using the original task session,
-generation, attempt and command ID, including after a daemon restart. It waits
-for live checkpoint finalization and retains named gate rejections for diagnosis.
-This frees confirmed stopped capacity without treating lease expiry as proof,
-deleting local work, or resolving unknown external effects.
+The gateway uses one bounded lifecycle controller for reservation, preparation,
+running, stopped-result delivery and held ownership. Up to four preparation and
+four finalization jobs perform blocking work independently; the controller keeps
+harvesting completions and requesting hub admission. A full controller also asks
+the hub for safe recovery-priority capacity. Normal mailbox coordination does not
+stop a writer; an explicit interrupt or expired local lease does.
+
+`~/.bridge/lifecycle/<hub-and-host>/` holds durable admission identities, launch
+intent/process identities and terminal results. The originating runner sends an
+exact fenced `stopped` receipt before checkpoint network publication. The hub
+records the result and a truthful `process_group_empty` or Linux
+`no_live_group_members` (zombies-only) proof, freeing execution capacity while
+retaining exclusive `finalizing` task ownership. The runner then publishes the
+captured checkpoint and finalizes delivery. Local and hub backlog bounds prevent
+unbounded accumulation. Runner snapshots distinguish running, preparing,
+finalizing, delivering and held work; an update waits for every outstanding job.
+
+Retries use original command IDs and immutable receipt lookup, including after a
+daemon restart. Full local results are archived after acknowledgment. Launch
+recovery stops only an exact persisted process identity; missing identity or
+unreadable process proof retains ownership. Legacy `~/.bridge/stopped-attempts/`
+receipts are imported through this same finalizer. Lease expiry never proves a
+stopped writer, deletes local work, or resolves unknown external effects. New
+controllers require the serving hub's lifecycle protocol 2 before claiming work.
+
+Background hygiene runs behind an idle workspace barrier, after admission and
+terminal delivery. It rechecks terminal task status and acknowledged writer
+quiescence before cleanup; age alone cannot revoke another executor's work or
+resolve an unknown external operation. Dirty or unpublished trees remain
+registered; cleanup uses bounded, non-forced Git removal and retains a tree if
+newer work appears during the final check.
 
 For historical charges created by older binaries, Linux operators can run:
 
@@ -3333,10 +3357,10 @@ census for each task. It refuses current-daemon attempts, unreadable processes,
 changed fences and retained task scopes. It never kills processes or deletes
 worktrees; apply uses the originating gateway's authenticated fenced quiesce.
 Urgency boosts also break ties within the concrete-repair class, consistently
-in discovery and atomic reservations. A cancelled pre-spawn launch no longer
-stalls every free slot for a poll interval: refill continues only after the hub
-confirms no writer, with a bounded distinct-task budget and fresh hub admission
-on every reservation.
+in discovery and atomic reservations. Cancelled preparation follows the same
+finalizer; never-launched cancellation releases its reservation without consuming
+the retry budget or changing gateway readiness. Every reservation still uses
+fresh authoritative hub admission.
 Standing merge-lane infrastructure never completes from a PR merge receipt,
 even when an agent accidentally attaches PR-delivery metadata. Provenance
 cleanup may finish delivery cards, but cannot retire the train itself.
@@ -3351,10 +3375,12 @@ class and urgency. They remain separate review sessions with the same acceptance
 gates, but cannot fall behind unrelated repair backlog as ordinary verification.
 ### Fenced terminal-result capture
 
-The execution protocol supports `finalize` with the exact generation/attempt,
-`writers: "process_group_empty"`, and a typed process outcome (`completed`,
-`interrupted`, or `failed`). The hub atomically records the captured result,
-quiescence and its replay receipt. A successful process exit never closes a
-task or fabricates review acceptance. Unfinished claims return through the
-same scheduler with their prior result attached; independent waits, unknown
+The execution protocol requires `stopped` before `finalize`, with the exact
+generation/attempt, stopped-writer proof and immutable typed process outcome
+(`completed`, `interrupted`, `failed`, `timed_out`, or `result_unavailable`). The
+hub atomically records each command and replay receipt. Late polls and interrupts
+cannot resurrect a stopped writer, and a new generation cannot begin while the
+old result is finalizing. A successful process exit never closes a task or
+fabricates review acceptance. Unfinished claims return through the same scheduler
+with their prior result attached; independent waits, local handoffs, unknown
 operations, host affinity and the persistent retry budget remain enforced.

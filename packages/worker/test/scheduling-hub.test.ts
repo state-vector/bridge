@@ -43,6 +43,21 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("cancels a never-launched reservation without poisoning readiness or spending retry budget, including lost-response replay", async () => {
+    const project = "drain-cancel-reservation", g = await gateway(project), peer = await gateway(project);
+    const id = await task(project), claim = await reserve(g);
+    if (claim.kind !== "reserved") throw new Error("no reservation");
+    const command = { kind: "cancel_start", writers: "not_launched", retained_work: true };
+    expect((await peer.cmd(command, "foreign-cancel", id, claim.session)).error).toMatch(/authority|claim/);
+    const cancelled = await g.cmd(command, "cancel-before-fork", id, claim.session);
+    expect(cancelled).toMatchObject({ kind: "released", barrier: null });
+    expect(await g.cmd(command, "cancel-before-fork", id, claim.session)).toEqual(cancelled);
+    const state = await g.cmd({ kind: "inspect" }, "cancelled-state", id, claim.session);
+    expect(state).toMatchObject({ generation: 0, attempt: null, budget_exhaustions: 0 });
+    expect((await g.cmd({ kind: "advertise", capabilities: g.capabilities })).readiness.kind).toBe("ready");
+    expect((await post("get", { id })).meta.startup_wait).toBeUndefined();
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
+  });
   it("atomically captures and replays a stopped result without guessing completion, then uses the same scheduler to reconcile it", async () => {
     const project = "terminal-result-protocol", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), claim = await reserve(g);
@@ -51,9 +66,18 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const final = { kind: "finalize", generation: 1, attempt_id: "terminal-one", writers: "process_group_empty",
       outcome: { kind: "completed", exit_code: 0, stdout_tail: "Work saved; explicit review still required", stderr_tail: "" } };
     expect((await peer.cmd(final, "forged-final", id, claim.session)).error).toMatch(/executor authority|originating runner/);
+    expect((await g.cmd(final, "before-stop", id, claim.session)).error).toMatch(/acknowledged stopped-writer/);
+    const stopped = await g.cmd({ ...final, kind: "stopped" }, "terminal-stopped", id, claim.session);
+    expect(stopped).toMatchObject({ attempt: { phase: "finalizing", writers: "process_group_empty" } });
+    expect((await post("get", { id })).status).toBe("in_progress");
+    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0].occupancy.held).toBe(0);
+    expect((await g.cmd({ ...final, kind: "stopped", outcome: { ...final.outcome, stdout_tail: "replacement" } }, "changed-evidence", id, claim.session)).error).toMatch(/immutable/);
+    expect((await g.cmd({ kind: "begin", attempt_id: "premature", worker: g.auth.agent, action_budget_ms: 60_000 }, "before-finalize", id, claim.session)).error).toMatch(/quiescence/);
     const first = await g.cmd(final, "terminal-final", id, claim.session);
     expect(first).toMatchObject({ attempt: { phase: "quiesced" }, terminal: { generation: 1, outcome: { kind: "completed" } } });
     expect(await g.cmd(final, "terminal-final", id, claim.session)).toEqual(first);
+    expect(await g.cmd({ kind: "receipt", target_command_id: "terminal-final" }, "read-final-receipt", id, claim.session)).toEqual({ kind: "receipt_found", result: first });
+    expect((await peer.cmd({ kind: "receipt", target_command_id: "terminal-final" }, "foreign-receipt", id, claim.session)).error).toMatch(/originating runner/);
     const card = await post("get", { id });
     expect(card.status).toBe("todo");
     expect(card.meta.execution_resume).toMatchObject({ kind: "terminal_result", generation: 1 });
@@ -67,13 +91,38 @@ describe("eligibility-first scheduling on real SQLite", () => {
     if (claim.kind !== "reserved") throw new Error("no reservation");
     await g.cmd({ kind: "begin", attempt_id: "unknown-one", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-begin", id, claim.session);
     await g.cmd({ kind: "prepare", generation: 1, attempt_id: "unknown-one", operation_id: "publish", action: "Push exact ref", input_revision: "a", budget_ms: 60_000 }, "unknown-prepare", id, claim.session);
-    const final = await g.cmd({ kind: "finalize", generation: 1, attempt_id: "unknown-one", writers: "process_group_empty",
-      outcome: { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "network lost; preserve all work" } }, "unknown-final", id, claim.session);
+    const command = { kind: "finalize", generation: 1, attempt_id: "unknown-one", writers: "process_group_empty",
+      outcome: { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "network lost; preserve all work" } };
+    expect((await g.cmd({ ...command, kind: "stopped" }, "unknown-stopped", id, claim.session)).error).toBeUndefined();
+    const final = await g.cmd(command, "unknown-final", id, claim.session);
     expect(final.operations).toMatchObject([{ id: "publish", state: "prepared" }]);
     expect((await post("get", { id })).status).toBe("in_progress");
     const status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].occupancy.held).toBe(0);
     expect((await g.cmd({ kind: "begin", attempt_id: "unsafe-retry", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-retry", id, claim.session)).error).toMatch(/unknown external operations/);
+  });
+  it("never resurrects stopped writers on late poll or interrupt, and bounds unfinished finalization before refilling", async () => {
+    const project = "finalization-boundary", g = await gateway(project);
+    const one = await task(project), two = await task(project), three = await task(project);
+    const first = await reserve(g); if (first.kind !== "reserved") throw new Error("no first reservation");
+    const stop = async (id: string, session: string, attempt_id: string) => {
+      await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 }, `begin-${id}`, id, session);
+      return g.cmd({ kind: "stopped", generation: 1, attempt_id, writers: "no_live_group_members",
+        outcome: { kind: "result_unavailable", exit_code: null, stdout_tail: "", stderr_tail: "Recovered dead writer; preserve receipts" } }, `stop-${id}`, id, session);
+    };
+    const stopped = await stop(first.task_id, first.session, "stopped-one");
+    expect(stopped).toMatchObject({ attempt: { phase: "finalizing", writers: "no_live_group_members" } });
+    await g.cmd({ kind: "message", message_id: "late-interrupt", text: "Stop safely", priority: "interrupt" }, "late-message", first.task_id, first.session);
+    await post("transition", { id: first.task_id, to: "todo", actor: "system:test", note: "Claim ended; stopped delivery remains owned" });
+    const poll = await g.cmd({ kind: "poll", generation: 1, attempt_id: "stopped-one" }, "late-poll", first.task_id, first.session);
+    expect(poll.attempt).toMatchObject({ phase: "finalizing", lease_until: stopped.attempt.lease_until });
+    const second = await reserve(g); if (second.kind !== "reserved") throw new Error("released writer capacity was not refilled");
+    expect(second.task_id).not.toBe(first.task_id);
+    await stop(second.task_id, second.session, "stopped-two");
+    expect(await reserve(g)).toMatchObject({ kind: "finalization_backpressure", active: 0, reserved: 0, finalizing: 2 });
+    expect([one, two, three]).toContain(second.task_id);
+    // Even after lease expiry, the exact finalizer can register preserved content.
+    expect((await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "stopped-one", checkpoint: publishedCheckpoint }, "finalization-checkpoint", first.task_id, first.session)).error).toBeUndefined();
   });
   it("backs off old-runner scratch ENOSPC without latching identity repair or extending cooldown on advertisements", async () => {
     const project = "scratch-resource-recovery", g = await gateway(project);

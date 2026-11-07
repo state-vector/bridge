@@ -9,6 +9,17 @@ const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", s
 const started = () => step(initialExecution(), begin);
 
 describe("durable execution failure boundaries", () => {
+  it("finishes an authored local handoff only after stopped proof and checkpoint, never by exit code", () => {
+    let s = step(started(), { kind: "local_handoff", ...fence, reason: "Local device needed", action: "Run on paired device", findings: "Remote device is unavailable", tried: "Inspected device binding", next: "Verify on local device", evidence: ["device binding"], approvals: [], recipient: null });
+    const outcome = { kind: "interrupted", exit_code: null, stdout_tail: "WIP retained", stderr_tail: "" } as const;
+    s = step(s, { kind: "stopped", ...fence, writers: "no_live_group_members", outcome });
+    expect(s.handoff.phase).toBe("preparing");
+    expect(() => step(s, { kind: "prepare", ...fence, operation_id: "new-effect", action: "Must not run", input_revision: cp.commit, budget_ms: 1000 })).toThrow(/stopped/);
+    s = step(s, { kind: "checkpoint", ...fence, checkpoint: cp }, 1_000_000);
+    s = step(s, { kind: "finalize", ...fence, writers: "no_live_group_members", outcome }, 1_000_000);
+    expect(s.attempt?.phase).toBe("quiesced");
+    expect(s.handoff).toMatchObject({ phase: "waiting", checkpoint: cp, quiescence: { kind: "runner", generation: 1 } });
+  });
   it("recovers historical scratch ENOSPC once without sliding backoff or clearing real signing defects", () => {
     const reason = "gate: identity profile failed — refusing to dispatch (sign-check scratch dir: No space left on device (os error 28)). Fix the runner's identity config or provision the signing key.";
     const legacy = { kind: "repair_required", fingerprint: "same-worker/config", failures: 5, reason } as const;

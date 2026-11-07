@@ -5104,6 +5104,7 @@ export class KnowledgeHub {
       if (mode !== "inspect" && selection.eligible[0]) facts.preemption = recoveryCapacity.request(tokenId, host, priorityTask(selection.eligible[0])) ?? undefined;
       return record({ kind: "at_capacity", ...facts });
     }
+    if (occupancy.active + occupancy.reserved + occupancy.finalizing >= facts.capacity + Math.min(facts.capacity, 4)) return record({ kind: "finalization_backpressure", ...facts });
     if (!selection.eligible.length) return record({ kind: "no_eligible_work", ...facts });
     if (mode !== "reserve") return record({ kind: "ready", ...facts, candidates: selection.eligible.map(t => String(t.id)) });
     // Persist a pending command before the lifecycle's async evidence checks.
@@ -5121,7 +5122,10 @@ export class KnowledgeHub {
           await this.transition({ ...body, id, to: "in_progress", session, gateway: true, agent: capabilities.worker.kind === "provisioned" ? capabilities.worker.label : "", note: "Hub scheduler reserved eligible work" }, host);
           const reservation = this.one(`SELECT expires_at FROM dispatch_reservations WHERE task_id=? AND token_id=? AND session=?`, id, tokenId, session);
           if (!reservation) throw new Error("gate: reservation no longer held after claim");
-          result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at) };
+          const assigned = this.one(`SELECT id,title,body_md,project,meta,roles,tags FROM artefacts WHERE id=?`, id)!;
+          result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
+            task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
+              meta: JSON.parse(String(assigned.meta ?? "{}")), roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
           recoveryCapacity.consume(tokenId, id);
           break;
         } catch (error) {
@@ -5345,7 +5349,7 @@ export class KnowledgeHub {
       this.executionWork().sweep();
       this.reconcileSchedulingHealth(now);
       this.publishWorkerStatus(actor, now);
-      return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000 };
+      return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000, lifecycle_protocol: 2 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
     if (!row) throw new Error("gate: durable execution requires a task");
@@ -5357,9 +5361,16 @@ export class KnowledgeHub {
       return handoff ? { ...current, capacity_handoff: handoff } : current;
     }
     if (command.kind === "availability") return this.executionWork().availability(req.id);
+    if (command.kind === "receipt") {
+      const receipt = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, command.target_command_id);
+      if (!receipt) return { kind: "receipt_missing" };
+      const request = JSON.parse(String(receipt.request));
+      if (!gateway || request.actor !== actor || request.session !== req.session) throw new Error("gate: receipt belongs to another originating runner/session");
+      return { kind: "receipt_found", result: JSON.parse(String(receipt.result)) };
+    }
     // A released failed-start acknowledgement never authorises a writer or an
     // external operation. Its exact authenticated replay survives owner clear.
-    if ((command.kind === "start_failed" || command.kind === "recover_unstarted") && gateway && req.session) {
+    if (["start_failed", "recover_unstarted", "cancel_start", "stopped", "finalize"].includes(command.kind) && gateway && req.session) {
       const replay = this.one(`SELECT request, result FROM execution_commands WHERE task_id = ? AND command_id = ?`, req.id, req.command_id);
       if (replay) {
         if (replay.request !== JSON.stringify({ command, session: req.session, actor })) throw new Error("gate: command_id reused with different input");
@@ -5373,7 +5384,7 @@ export class KnowledgeHub {
     const startClaim = this.one(`SELECT token_id, session FROM executor_start_claims WHERE task_id = ?`, req.id);
     // Bootstrap authority is the exact authenticated startup reservation, not
     // caller-supplied body.agent. No attempt/worker binding exists before begin.
-    const ownsUnstartedClaim = gateway && ["begin", "start_failed", "recover_unstarted"].includes(command.kind)
+    const ownsUnstartedClaim = gateway && ["begin", "start_failed", "recover_unstarted", "cancel_start"].includes(command.kind)
       && startClaim?.token_id === tokenId && startClaim.session === req.session;
     if (command.kind !== "message" && !(owner === row.owner || worker || ownsUnstartedClaim || (gateway && attemptHost === actor))) throw new Error("gate: execution command requires task executor authority");
     const session = req.session ?? "";
@@ -5386,7 +5397,7 @@ export class KnowledgeHub {
       if (old.request !== encoded) throw new Error("gate: command_id reused with different input");
       return JSON.parse(old.result);
     }
-    if (command.kind === "start_failed" || command.kind === "recover_unstarted") {
+    if (command.kind === "start_failed" || command.kind === "recover_unstarted" || command.kind === "cancel_start") {
       const recovering = command.kind === "recover_unstarted";
       const legacyChurn = recovering && row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
       if (!gateway || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (!ownsUnstartedClaim && !(token.principal && token.principal === row.owner)) || (row.status !== "in_progress" && !legacyChurn) || meta.session !== session) throw new Error("gate: failed start requires the authenticated runner's current claim/session");
@@ -5404,7 +5415,7 @@ export class KnowledgeHub {
       const fingerprint = readiness.kind === "ready" ? readiness.fingerprint : executorStartupFingerprint(String(child?.id ?? "missing"), capabilities.config_revision);
       const stored = this.one(`SELECT state FROM executor_start_barriers WHERE token_id = ?`, tokenId);
       const previous = stored ? ExecutorStartBarrierSchema.parse(JSON.parse(stored.state)) : null;
-      const reason = command.kind === "start_failed" ? command.reason : "Canonical worker readiness restored after a legacy pre-begin credential rejection";
+      const reason = command.kind === "start_failed" ? command.reason : command.kind === "cancel_start" ? "Runtime cancelled preparation before an agent writer launched" : "Canonical worker readiness restored after a legacy pre-begin credential rejection";
       const stage = command.kind === "start_failed" ? command.stage : "begin";
       // Begin's task prerequisites (e.g. checkpoint transfer) do not invalidate
       // a proved worker credential for unrelated work on the same gateway.
@@ -5415,11 +5426,12 @@ export class KnowledgeHub {
       const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
       meta.execution_requirements = requirements;
       const taskFingerprint = taskPrerequisite ? this.taskStartupProof(req.id, fingerprint, meta) : fingerprint;
-      const startupWait = !recovering && !current.attempt && current.generation === 0 && !current.operations.length
+      const startupWait = command.kind === "start_failed" && !current.attempt && current.generation === 0 && !current.operations.length
         ? StartupWaitSchema.parse({ phase: taskPrerequisite ? "recovery_required" : "waiting_executor", source: "start_failed",
           host: actor, fingerprint: taskFingerprint, reason, since: now, retained_work: command.retained_work }) : null;
       current = { ...current, requirements };
-      meta.execution_start_failure = { stage, reason, host: actor, at: now };
+      if (command.kind === "cancel_start") meta.execution_cancelled_start = { stage, reason, host: actor, at: now };
+      else meta.execution_start_failure = { stage, reason, host: actor, at: now };
       if (startupWait) meta.startup_wait = startupWait;
       if (recovering) {
         meta.startup_recovery = { at: now, host: actor, previous_attempts: meta.attempt ?? null };
@@ -5441,11 +5453,11 @@ export class KnowledgeHub {
         this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(result));
       });
       this.version(req.id, actor, "transition", `${row.status} → todo — worker never launched (${stage}); released without watchdog abandonment`, { from: row.status, to: "todo", note: reason });
-      this.audit(actor, "execution_start_failed", req.id, { stage, reason, barrier });
+      this.audit(actor, command.kind === "cancel_start" ? "execution_start_cancelled" : "execution_start_failed", req.id, { stage, reason, barrier });
       return result;
     }
     if (command.kind === "poll") {
-      if (current.attempt && (row.status !== "in_progress" || meta.session !== current.attempt.session)) current.attempt.phase = "stopping";
+      if (current.attempt && !["quiesced", "finalizing"].includes(current.attempt.phase) && (row.status !== "in_progress" || meta.session !== current.attempt.session)) current.attempt.phase = "stopping";
       // Reconcile the durable ask inbox on every safe-point poll. This repairs
       // a crash between ask creation and notification without a second writer
       // or a bootstrap-only inbox. The question remains the source of truth.
@@ -5488,11 +5500,12 @@ export class KnowledgeHub {
       workerTokenId = child.id;
       begunExecutor = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: [], inventory_revision: inventory.inventory_revision });
       this.state.storage.sql.exec(`DELETE FROM executor_start_barriers WHERE token_id = ?`, tokenId);
-    } else if (["poll", "restore", "checkpoint", "quiesce", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
+    } else if (["poll", "restore", "checkpoint", "quiesce", "stopped", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
     const finalizeCurrentClaim = command.kind === "finalize" && row.status === "in_progress" && meta.session === session;
+    const finalizedLocalHandoff = command.kind === "finalize" && ["in_progress", "blocked"].includes(row.status) && meta.session === session && next.handoff.phase === "waiting";
     const canRescheduleFinalized = finalizeCurrentClaim && !this.protectedExecution(req.id, meta, true)
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
@@ -5505,10 +5518,11 @@ export class KnowledgeHub {
       meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
+    const response = command.kind === "finalize" ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
     this.state.storage.transactionSync(() => {
       if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
-      this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(next));
+      this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
       // Control polls do not authorise external effects. Keep a bounded replay
       // window for their transport retries; mutation/effect receipts persist.
       if (command.kind === "poll") this.state.storage.sql.exec(`DELETE FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' AND rowid NOT IN (SELECT rowid FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' ORDER BY rowid DESC LIMIT 32)`, req.id, req.id);
@@ -5526,12 +5540,14 @@ export class KnowledgeHub {
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
         this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
         this.version(req.id, actor, "execution_terminal", "Writer stopped; captured result awaits reconciliation through the hub scheduler, not inferred completion", { generation: next.generation, outcome: command.kind === "finalize" ? command.outcome.kind : "unknown" });
-      } else if (command.kind === "yield") {
+      } else if (command.kind === "yield" || finalizedLocalHandoff) {
         delete meta.session;
         const local = next.handoff.phase === "waiting" ? next.handoff : null;
         if (local) meta.blocked = { reason: `Pick up locally: ${local.action}`, unblock_condition: "Explicit human-authorised local acceptance of this handoff episode; answers/dismissals do not resume it", ts: now,
           await_event: { event: "local_handoff", handoff_id: local.id, version: local.version } };
         this.state.storage.sql.exec(`UPDATE artefacts SET status = ?, owner = '', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, local ? "blocked" : "todo", now, now, JSON.stringify(meta), req.id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       } else {
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), req.id);
       }
@@ -5539,8 +5555,8 @@ export class KnowledgeHub {
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
     else this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     if (command.kind === "yield") this.executionWork().sweep();
-    if (command.kind === "finalize") this.publishWorkerStatus(next.attempt?.host ?? actor, now);
-    return next;
+    if (command.kind === "finalize" || command.kind === "stopped") this.publishWorkerStatus(next.attempt?.host ?? actor, now);
+    return response;
   }
 
   private async transition(body: any, actor: string) {
@@ -6696,6 +6712,7 @@ export class KnowledgeHub {
           const capacity = gatewayCapacity(ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)));
           const n = gatewayOccupancy(this.state.storage.sql, String(body.token_id), String(credential.label));
           if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
+          if (n.active + n.reserved + n.finalizing >= capacity + Math.min(capacity, 4)) throw new Error("gate: gateway finalization backlog is full; deliver retained outcomes before claiming more work");
         }
       }
       if (directInteractiveClaim) this.executionWork().claimInteractive(id, String(body.token_id), String(meta.session), meta);
