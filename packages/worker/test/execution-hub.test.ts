@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 import { ExecutionStateSchema, WorkerStatusSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
@@ -280,7 +281,7 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("transition", { ...r.auth, to: "in_progress" })).data.error).toMatch(/wait owns/);
     expect((await post("update", { id: r.id, meta: { blocked: {} } })).data.error).toMatch(/lifecycle infrastructure/);
     expect((await post("progress.log", { ...r.auth, note: "A comment is not acceptance" })).data.kind).toBe("commentary");
-    const ask = await post<{ id: string }>("ask.create", { actor: "coordinator", to: "human", artefact_id: r.id, question: "Is the dataset approved?", reason: "Dataset choice", details: "Choose the data source for the local repair.", options: ["GO", "Hold"] });
+    const ask = await post<{ id: string }>("ask.create", { actor: "coordinator", to: "human", artefact_id: r.id, question: "Is the dataset approved?", decision: decisionFixture(r.id, ["GO", "Hold"]) });
     expect(ask.data.error).toBeUndefined();
     expect((await post("ask.answer", { id: ask.data.id, answer: "GO", actor: "web:test" })).data.error).toBeUndefined();
     await post("admin.stall_sweep", { now: Date.now() + 7 * 86_400_000 });
@@ -294,7 +295,7 @@ describe("local handoff authority and lifecycle", () => {
   it("recorded retirement cannot consume an independently protected local pickup", async () => {
     const r = await runtimeTask();
     const answer = `Close the old wrapper — retire ${r.id}`;
-    const ask = await post<{ id: string }>("ask.create", { to: "human", artefact_id: r.id, actor: "fixture-owner",
+    const ask = await post<{ id: string }>("ask.create", { to: "legacy-peer", artefact_id: r.id, actor: "fixture-owner",
       question: "Retire this local-only task?", reason: "The owner decides whether the task is retained.", details: `Local pickup ${r.id} still has a checkpoint and its own authoritative exit.`,
       options: [answer, "KEEP the local pickup"] });
     expect(ask.data.error).toBeUndefined();

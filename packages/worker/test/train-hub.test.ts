@@ -2051,7 +2051,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
 // { landed, landed_retry, bounce_gate, bounce_bound } and the queue advances.
 
 describe("BR#4753 landed-close recovery (real bundled worker)", () => {
-  it("a gate-rejected landed close CLOSE-BOUNCES the culprit card, idles the lane, and files ONE alarm-sink ask — never a raw throw", async () => {
+  it("a gate-rejected landed close CLOSE-BOUNCES the culprit card, advances the lane and schedules agent recovery without asking the human", async () => {
     const repo = "state-vector/lane-closebounce";
     // a reachable alarm sink for this episode (the setting overrides BR#3124)
     const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — close-bounce", session: "" });
@@ -2100,13 +2100,16 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     expect(snap.currently).toBeNull();
     expect(snap.queue.map((x: any) => x.id)).not.toContain(card);
 
-    // the ledger names the episode; exactly ONE ask rides the sink
+    // The ledger names the episode; a durable repair owns the actual card.
     const hist = (await kbJson("/train.history", { repo })).body.events;
     const landedEv = hist.find((e: any) => e.kind === "landed");
     expect(JSON.stringify(landedEv)).toContain("close_bounced");
     const asks = await kbJson(`/search?q=${encodeURIComponent("landed close failed")}&type=question&limit=50`);
     const mine = asks.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(repo));
-    expect(mine.length).toBe(1);
+    expect(mine.length).toBe(0);
+    const recovery = (await kbJson("/get", { id: c.meta.recovery.task_id })).body;
+    expect(recovery.meta.machine_duty).toMatchObject({ kind: "task-recovery", subject: card, reason: "queue_binding" });
+    expect(recovery.roles).toContain("impl");
     const audits = (await kbJson("/events?limit=500")).body.events.filter((e: any) => e.op === "train:landed_close_bounced");
     expect(audits.length).toBeGreaterThanOrEqual(1);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-cb" });
@@ -2655,7 +2658,7 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     expect(ok1.status).toBeLessThan(400);
   });
 
-  it("phantom-required past the bound LANDS on the workflows that exist + files the config-defect ask (Ray 2026-10-30); observed-stuck keeps the stop", async () => {
+  it("phantom-required past the bound LANDS on observed workflows and schedules agent config diagnosis; observed-stuck keeps the stop", async () => {
     const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — phantom required", session: "" });
     await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });
 
@@ -2681,7 +2684,10 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     expect((await laneSnap(repo)).currently).toBeNull();
     const asks = await kbJson("/search?q=Lane config defect&limit=50");
     const mine = asks.body.artefacts.filter((x: any) => x.type === "question" && String(x.title).includes(`${repo}@main`));
-    expect(mine.length).toBe(1);
+    expect(mine.length).toBe(0);
+    const laneCard = (await kbJson("/get", { id: (await laneSnap(repo)).card })).body;
+    const repair = (await kbJson("/get", { id: laneCard.meta.recovery.task_id })).body;
+    expect(repair.meta.machine_duty).toMatchObject({ kind: "task-recovery", subject: laneCard.id, reason: "execution_environment" });
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-ph" });
 
     // (b) a genuinely stuck OBSERVED run (check exists, never concluded)
@@ -3176,7 +3182,8 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(String(ask2.body_md)).toContain("https://github.com/" + repo + "/pull/53499");
     const askMetaM = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
     expect(askMetaM.ask.options[0]).toContain("DONE — PR #53499 merged");
-    expect(String(askMetaM.ask.reason ?? "")).toContain("human gate");
+    expect(String(askMetaM.ask.reason ?? "")).toContain("your repository authority");
+    expect(askMetaM.ask.decision.task_id).toBe(fix.body.id);
 
     // fix_card prefers the root-fix card and carries the cure PR link
     const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
@@ -4283,6 +4290,9 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(exhausted.line.remediation.action.url).toContain("/card/");
     // A subsequent real submission supersedes historical watchdog failures,
     // without making an unreviewed PR eligible for train admission.
+    const decisionAsk = (await kbJson("/get", { id: exhausted.line.remediation.action.id })).body;
+    await kbJson("/ask.answer", { id: decisionAsk.id, answer: decisionAsk.meta.ask.options[1], actor: "web:rayh" });
+    await kbJson("/transition", { id: repair, to: "in_progress", actor: "repair-agent", session: "repair-6389", note: "Operator supplied new recovery direction" });
     await kbJson("/update", { id: repair, meta_delete: ["escalate"] });
     const submitted = await kbJson("/transition", { id: repair, to: "in_review", actor: "repair-agent", session: "repair-6389",
       note: `PR https://github.com/${repo}/pull/6587 — delivered repair awaiting independent review` });

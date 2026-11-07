@@ -82,7 +82,7 @@ export const DispositionRequestSchema = z.object({
   ask: z.string().regex(/^BR#\d+$/),
 });
 
-export const RecoveryReasonSchema = z.enum(["queue_binding", "conflict", "execution_environment", "head_checks"]);
+export const RecoveryReasonSchema = z.enum(["queue_binding", "conflict", "execution_environment", "head_checks", "resume_condition"]);
 export type RecoveryReason = z.infer<typeof RecoveryReasonSchema>;
 export type RecoveryPlan =
   | { kind: "none" }

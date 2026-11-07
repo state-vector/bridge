@@ -14,19 +14,35 @@ import { z } from "zod";
 export const HumanDecisionSchema = z.object({
   kind: z.enum(["authority", "information", "preference"]),
   task_id: z.string().regex(/^BR#\d+$/),
-  context: z.string().min(1).max(2000),
-  why_human: z.string().min(1).max(1200),
+  context: z.string().trim().min(1).max(2000),
+  why_human: z.string().trim().min(1).max(1200),
   choices: z.array(z.object({
-    label: z.string().min(1).max(200),
+    label: z.string().trim().min(1).max(200),
     executor: z.enum(["bridge", "human"]),
-    consequence: z.string().min(1).max(500),
+    consequence: z.string().trim().min(1).max(500),
     action: z.enum(["resume", "hold", "release", "local_handoff"]),
   })).min(2).max(8),
 }).superRefine((d, ctx) => {
   if (new Set(d.choices.map((c) => c.label)).size !== d.choices.length) ctx.addIssue({ code: "custom", message: "decision choice labels must be unique" });
   for (const c of d.choices) if (c.executor === "human" && c.action !== "hold" && c.action !== "local_handoff") ctx.addIssue({ code: "custom", message: "a human execution step must hold the task or enter explicit local handoff until completion is confirmed" });
+  if (d.choices.some((c, i) => i > 0 && /^\(recommended\)/i.test(c.label))) ctx.addIssue({ code: "custom", message: "put the recommended choice first" });
 });
 export type HumanDecision = z.infer<typeof HumanDecisionSchema>;
+
+/** One admission rule for inferred audiences, direct artefact writes and MCP.
+ * Legacy stored requests remain readable/answerable; new human requests must
+ * explain a real choice and bind its effect independently of the button text. */
+export function requireHumanDecision(ask: { route?: unknown; to?: unknown; decision?: unknown; artefact_id?: unknown; options?: unknown }): HumanDecision | undefined {
+  if (!isHumanDecisionAsk(ask)) {
+    if (ask.decision !== undefined) throw new Error("decision is only valid for human_decision requests");
+    return undefined;
+  }
+  if (!ask.decision) throw new Error("human_decision requires decision: affected task, plain-language context, why only the human can decide, and choices naming executor, consequence and action; diagnostics belong to agent recovery");
+  const decision = HumanDecisionSchema.parse(ask.decision);
+  if (ask.artefact_id && ask.artefact_id !== decision.task_id) throw new Error("the decision's affected task must match artefact_id; notification sinks are not action targets");
+  if (ask.options !== undefined && JSON.stringify(ask.options) !== JSON.stringify(decision.choices.map(c => c.label))) throw new Error("human ask options must match the decision choices exactly");
+  return decision;
+}
 
 /** Audience and lifecycle are explicit. Review is executable work, never a
  * human decision disguised as an ask. Missing routes are legacy input only. */

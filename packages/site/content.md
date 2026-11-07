@@ -789,6 +789,18 @@ post-deploy work. Execution completes only with outcome receipts. Existing human
 batch authorisations remain applicable without another round of approval, through
 the same receipt-scoped gate.
 
+**Clear requests at every entry point (BR#8106).** Every new human request needs
+the same structured decision, including older callers that address `ray`,
+`rayh` or `human` without an explicit route. Direct question writes and edits
+cannot bypass it. The request explains the situation and why you must decide;
+each option states who acts, what happens and its typed effect. Blank context,
+options that disagree with their effects, and a recommendation placed after
+other options are rejected. Technical evidence stays expandable.
+Bridge schedules agent repair for missing resume conditions, repeated failed
+attempts, completion-review gaps and missing change tracking. Those are no
+longer generic “re-scope / release / drop” or “fix the gate” choices in your
+inbox. Repairing a wait preserves the task's original outcome and your authority.
+
 **Satisfied waits continue; obsolete requests retire.** When an unblock round
 finishes but leaves its parent on an already-satisfied typed prerequisite, the
 proxy watch consumes the wait and returns the actual work to the executable pool
