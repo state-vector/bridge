@@ -450,6 +450,8 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "./review-query";
+import type { HubRequestStage } from "@bridge/contracts";
 
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
@@ -530,6 +532,7 @@ export class KnowledgeHub {
   // rate or the client count — the 2026-10-29 overload was every client
   // refetching the FULL board per event (11 board GETs/sec on one DO).
   private boardCache: { at: number; body: any } | null = null;
+  private boardRevision = 0;
   private boardLastPush = 0;
   private boardDirty = false;
   private workerStatusPushAt = new Map<string, number>();
@@ -542,6 +545,7 @@ export class KnowledgeHub {
   }
   private boardBuilds = 0;
   private boardPushes = 0;
+  private boardPushScheduled = false;
 
   // BR#4397 pull-surface rate limits — a brake against pollers, never against
   // push clients. The DO is single-threaded, so in-memory windows are exact.
@@ -580,12 +584,15 @@ export class KnowledgeHub {
   private async boardPayload(force = false): Promise<any> {
     if (!force && this.boardCache && Date.now() - this.boardCache.at < 2000) return this.boardCache.body;
     const trace = this.requestDiagnostics.begin("board.snapshot");
+    const revision = this.boardRevision;
     trace.stage("board");
     let status = 503;
     try {
     const body = await this.board();
     this.boardBuilds++;
-    this.boardCache = { at: Date.now(), body };
+    // A mutation may interleave while board() awaits. Its invalidation wins;
+    // never resurrect a pre-mutation HTTP cache when that build completes.
+    if (revision === this.boardRevision) this.boardCache = { at: Date.now(), body };
     status = 200;
     return body;
     } finally {
@@ -596,16 +603,27 @@ export class KnowledgeHub {
 
   /** Build once, send to every socket. Fire-and-forget on the mutation path —
    *  a failing push never fails the write that triggered it. */
-  private pushBoardSnapshot(force = true): void {
+  private pushBoardSnapshot(force = true): Promise<void> {
     this.boardPushes++;
-    this.boardPayload(force)
+    return this.boardPayload(force)
       .then((board) => {
         const frame = JSON.stringify({ type: "kb.board", board });
         for (const ws of this.state.getWebSockets()) {
           try { ws.send(frame); } catch { this.wsSendFail++; }
         }
       })
-      .catch(() => { /* counted as no push; the tail flush retries next tick */ });
+      .catch(() => { this.boardDirty = true; /* the tail flush retries next tick */ });
+  }
+
+  /** UI aggregation is not part of acknowledging an execution mutation. Yield
+   * before building, and retain one coalesced build across concurrent events. */
+  private scheduleBoardSnapshot(): void {
+    if (this.boardPushScheduled) { this.boardDirty = true; return; }
+    this.boardPushScheduled = true;
+    const pending = new Promise<void>(resolve => setTimeout(resolve, 0))
+      .then(() => this.pushBoardSnapshot())
+      .finally(() => { this.boardPushScheduled = false; });
+    this.state.waitUntil(pending);
   }
 
   private broadcastEvent(ev: unknown) {
@@ -619,6 +637,7 @@ export class KnowledgeHub {
     // after-write must reflect the write (a 2s-stale board after a claim is
     // a correctness bug, not a performance trade; the storm protection is
     // the invalidation, not the staleness).
+    this.boardRevision++;
     this.boardCache = null;
     // coalesced state push: ≥1s between builds; the burst's tail mutation is
     // flushed by the alarm tail-flush below (≤60s worst case, events already
@@ -628,7 +647,7 @@ export class KnowledgeHub {
     if (Date.now() - this.boardLastPush >= 1000) {
       this.boardLastPush = Date.now();
       this.boardDirty = false;
-      this.pushBoardSnapshot();
+      this.scheduleBoardSnapshot();
     }
   }
 
@@ -679,7 +698,7 @@ export class KnowledgeHub {
     if (this.boardDirty && Date.now() - this.boardLastPush >= 1000) {
       this.boardDirty = false;
       this.boardLastPush = Date.now();
-      this.pushBoardSnapshot();
+      this.scheduleBoardSnapshot();
     }
     try {
       await this.alarmSweep(trace);
@@ -690,15 +709,23 @@ export class KnowledgeHub {
     }
   }
 
+  private async maintenanceCheckpoint(trace: RequestTrace | undefined, stage: HubRequestStage) {
+    // A real event-loop yield admits control requests between independent,
+    // committed maintenance phases and advances the runtime diagnostic clock.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    trace?.stage(stage);
+  }
+
   private async alarmSweep(trace?: RequestTrace) {
     await this.ensureSchema();
-    trace?.stage("capability.maintenance");
+    await this.maintenanceCheckpoint(trace, "capability.maintenance");
     this.executionWork().sweep();
+    await this.maintenanceCheckpoint(trace, "task.maintenance");
     const now0 = Date.now();
     this.reconcileDispatchReservations(now0);
     this.reconcileSchedulingHealth(now0);
     // Readiness owns startup waits, not the task churn/timer machinery.
-    trace?.stage("startup.maintenance");
+    await this.maintenanceCheckpoint(trace, "startup.maintenance");
     this.reconcileStartupWaits(now0);
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
     // but an ask to an agent that never answers would pause its task FOREVER
@@ -732,7 +759,7 @@ export class KnowledgeHub {
     // (A) the in_progress stall sweep — BR#4282 moved the phase into its own
     // method (stallSweep below) so the admin.stall_sweep drill runs it in
     // isolation, mirroring admin.unblock_proxy_sweep.
-    trace?.stage("task.maintenance");
+    await this.maintenanceCheckpoint(trace, "task.maintenance");
     await this.stallSweep(now0);
     // (A1) BR#5226 awaiting-park re-evaluation — the migration + steady-state
     // pass: every Awaiting park whose anchored accepted verdict covers the
@@ -758,7 +785,7 @@ export class KnowledgeHub {
     // queued lane with no merge-capable executor alarms even with zero
     // panel readers (the outage's silence failure).
     try {
-      trace?.stage("train.maintenance");
+      await this.maintenanceCheckpoint(trace, "train.maintenance");
       await this.sweepLaneStarvation(now0);
     } catch (e) {
       this.audit("system:train", "starve_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -780,7 +807,7 @@ export class KnowledgeHub {
     // pattern above): every tick escalates, and an escalation error can't
     // mask (or ride) the starvation sweep's own audit.
     try {
-      trace?.stage("review.maintenance");
+      await this.maintenanceCheckpoint(trace, "review.maintenance");
       await this.escalateStaleAsks(now0);
     } catch (e) {
       this.audit("system:watchdog", "ask_escalation_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -792,7 +819,7 @@ export class KnowledgeHub {
     // stranded car from a genuinely stalled train. One machine re-board per
     // episode + one alarm per episode (24h dedupe) to the train alarm sink.
     try {
-      trace?.stage("train.maintenance");
+      await this.maintenanceCheckpoint(trace, "train.maintenance");
       await this.sweepStrandedTrainCards(now0);
     } catch (e) {
       this.audit("system:train", "strand_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -3402,6 +3429,7 @@ export class KnowledgeHub {
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
+    this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA);
 
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
     this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
@@ -6165,8 +6193,7 @@ export class KnowledgeHub {
   /** One current review round, including detached duties. Closed old rounds
    * cannot outrank a newer pending round or a newer explicit non-acceptance. */
   private currentTaskReview(id: string): CurrentTaskReview {
-    const declared = `COALESCE(json_extract(c.meta,'$.review_subject.task_id'),json_extract(c.meta,'$.execution_review_of'),json_extract(c.meta,'$.review_result.task_id'))`;
-    const row = this.one(`SELECT c.id,c.status,c.meta,c.created_ts,c.status_ts FROM artefacts c WHERE c.type='task' AND c.roles LIKE '%"review"%' AND c.status!='superseded' AND (${declared}=? OR (${declared} IS NULL AND EXISTS(SELECT 1 FROM relations r WHERE r.src_id=c.id AND r.relation='child_of' AND r.dst_id=?) AND (SELECT COUNT(*) FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=c.id AND r.relation='child_of' AND p.type='task')=1)) ORDER BY c.created_ts DESC,c.rowid DESC LIMIT 1`, id, id);
+    const row = this.one(CURRENT_REVIEW_SQL, id, id);
     if (!row) return { phase: "none" };
     const base = { id: String(row.id), at: Math.max(Number(row.created_ts), Number(row.status_ts)) };
     if (row.status !== "done") return { phase: "pending", ...base };

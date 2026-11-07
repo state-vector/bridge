@@ -80,6 +80,13 @@ running global backlog reconciliation or building a board snapshot. The schedule
 and watchdog reconcile at most 25 capability-waiting tasks per pass with a durable
 fair cursor and one host/occupancy snapshot per synchronous pass. Reservations
 still check current capability, ownership and execution fences before starting work.
+Watchdog maintenance yields between committed phases so foreground control requests
+can interleave. Mutation events are sent immediately; coalesced board aggregation
+starts after yielding, and failed builds remain dirty for a later retry. An
+interleaved write cannot resurrect a stale HTTP board cache. Current-review lookup
+uses indexed declared subjects and incoming child relations instead of scanning
+retained review history per task; pending, findings and detached rounds retain
+their exact submission/revision authority.
 
 **Health checks paused** means no live merge executor is reporting fresh deployment
 evidence. **Health checks overdue** means an executor is present but its evidence

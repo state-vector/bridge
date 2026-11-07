@@ -29,6 +29,9 @@ read-only `npm run diagnose:hub -- --seconds 45` command summarizes live Cloudfl
 traffic without collecting credentials or payloads. Gateway renewals stay separate
 from bounded, fairly scheduled backlog maintenance. Paused or overdue health
 checks explain missing evidence and executor state rather than declaring main red.
+Maintenance yields between committed phases, and mutation acknowledgements do not
+run board aggregation synchronously. Indexed current-review lookups preserve exact
+review authority without repeatedly scanning unrelated retained history.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 
