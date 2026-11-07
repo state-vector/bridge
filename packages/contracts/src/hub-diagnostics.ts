@@ -10,7 +10,7 @@ export const HubRequestTimingSchema = z.discriminatedUnion("phase", [
 export const HubDiagnosticsSchema = z.object({
   observed_at: z.number(), instance_id: z.string(), started_at: z.number(),
   active: z.array(HubRequestTimingSchema), recent: z.array(HubRequestTimingSchema),
-  operations: z.array(z.object({ operation: z.string(), count: z.number(), errors: z.number(), max_ms: z.number(), total_ms: z.number() })),
+  operations: z.array(z.object({ operation: z.string(), count: z.number(), errors: z.number(), max_ms: z.number(), total_ms: z.number(), max_ingress_ms: z.number().default(0) })),
 });
 export type HubRequestStage = z.infer<typeof HubRequestStageSchema>;
 export type HubRequestTiming = z.infer<typeof HubRequestTimingSchema>;

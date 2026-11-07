@@ -43,6 +43,13 @@ is stale. Both retain the existing unknown-health phase, show the actual last-ch
 age, and do not assert that main is failing. The recorded gateway hold or readiness
 failure appears as the cause instead of a generic unavailable-model explanation.
 
+`/__version` reports the web edge; `/__version?scope=stateful` reports the actual
+knowledge Durable Object build and lifecycle protocol without depending on SQL
+or scheduler readiness. The deploy drift gate checks both layers: a current web
+bundle alone is not adoption of the stateful controller. Durable Object updates
+use an explicit deferred strategy with a 60-second code-update budget rather
+than the platform's five-minute default. Neither version probe mutates task state.
+
 ### Knowledge-plane identity
 
 Knowledge REST bearer requests authenticate through the workspace's credential

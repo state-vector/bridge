@@ -69,6 +69,9 @@ export default {
     // /artefacts route (filters read query params there; a POST /list with an
     // empty body would silently drop the filters).
     if (url.pathname === "/__version") {
+      if (url.searchParams.get("scope") === "stateful") {
+        return kbGuard("kb.version", env.KB.get(env.KB.idFromName(doWs(DEFAULT_WS_SLUG))).fetch("https://kb/version"));
+      }
       // deploy provenance: the [build] hook writes src/__version.json with the
       // commit SHA — the drift probe and `bridge doctor` compare it to HEAD
       try {

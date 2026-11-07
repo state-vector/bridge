@@ -141,7 +141,7 @@ export function HubRequestDiagnostics({ now }: { now: number }) {
       <div>{snapshot.active.length} tracked requests in progress</div>
       {snapshot.active.map(r => <div key={r.id}>{r.operation}: {r.stage} · {r.elapsed_ms}ms elapsed at observation</div>)}
       {[...snapshot.operations].sort((a, b) => b.max_ms - a.max_ms).slice(0, 12).map(r => <div key={r.operation}>
-        {r.operation}: {r.count} requests · {r.errors} server errors · max {r.max_ms}ms · mean {Math.round(r.total_ms / r.count)}ms
+        {r.operation}: {r.count} requests · {r.errors} server errors · max ingress {r.max_ingress_ms}ms · max processing {r.max_ms}ms
       </div>)}
     </>}
   </details>;

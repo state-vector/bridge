@@ -77,4 +77,4 @@ jobs:
           EXPECTED_SHA: ${{ github.sha }}
           DEPLOY_DRIFT_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/deploy-drift-alarm.sh
+        run: VERSION_SCOPE=both bash scripts/deploy-drift-alarm.sh

@@ -66,6 +66,13 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
   });
 
 describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
+  it("reports stateful deployment provenance separately from the web edge without requiring credentials", async () => {
+    const response = await mf.dispatchFetch("https://main/__version?scope=stateful");
+    expect(response.status).toBe(200);
+    const version = await response.json() as { commit: string; lifecycle_protocol: number };
+    expect(version.commit).toMatch(/^[0-9a-f]{40}$/);
+    expect(version.lifecycle_protocol).toBe(2);
+  });
   it("exposes authenticated bounded request diagnostics without credentials or business mutations", async () => {
     expect((await mf.dispatchFetch("https://main/api/kb/diagnostics")).status).toBe(401);
     const res = await api("/api/kb/diagnostics");

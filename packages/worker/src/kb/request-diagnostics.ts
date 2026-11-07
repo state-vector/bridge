@@ -28,8 +28,9 @@ export class RequestDiagnostics {
         this.active.delete(id); this.recent.push(result);
         if (this.recent.length > 64) this.recent.shift();
         if (!this.operations.has(result.operation) && this.operations.size >= 64) this.operations.delete(this.operations.keys().next().value!);
-        const aggregate = this.operations.get(result.operation) ?? { operation: result.operation, count: 0, errors: 0, max_ms: 0, total_ms: 0 };
+        const aggregate = this.operations.get(result.operation) ?? { operation: result.operation, count: 0, errors: 0, max_ms: 0, total_ms: 0, max_ingress_ms: 0 };
         aggregate.count++; aggregate.errors += Number(status >= 500); aggregate.max_ms = Math.max(aggregate.max_ms, result.elapsed_ms); aggregate.total_ms += result.elapsed_ms;
+        aggregate.max_ingress_ms = Math.max(aggregate.max_ingress_ms, result.ingress_ms);
         this.operations.set(result.operation, aggregate);
         return result;
       },
