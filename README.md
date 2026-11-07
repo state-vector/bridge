@@ -1445,29 +1445,27 @@ solid if waiting to be"):
    back to `in_progress` / conflicted); `verifying` counts all PRs in the
    verification stage across `in_review` (both `Verify:` todo and `Verify:` in
    progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
-   counts verified (`ACCEPT`) PRs ready to merge. BR#5897 correction (Ray colour
-   law, 2026-11-03): a car already sitting in `lane.queue` has **passed
-   verification** — a `cls: "waiting"` car renders `ready` green while the
-   walk's base verdict is still settling (`verified — ready to merge (waiting
-   on lane/CI)`), and once the base is green in the walk the same car renders
-   `verifying` (orange pulsing, `being verified — checks/mergeability running`)
-   while its own head checks / mergeability / gate re-run finish; `verifying`
-   (orange pulsing) is otherwise strictly PRs being verified right now (an
-   active `Verify:` child, an in-flight `awaiting` park, a live reconcile
-   verify duty), `waiting` (orange solid) is strictly PRs waiting to be
-   verified (`Verify:` todo, an idle park, `cls: "needs-review"`, an unclaimed
-   reconcile-seen PR), and `conflict`/`blocked` — like a queued car with no
-   stamp at all after a bounce-free walk — count as in progress.
+   counts **verified (`ACCEPT`), base-conflict-free PRs**. The count is derived
+   from the same car states as the colours: `K ready` means exactly K green
+   blocks. A verified queued PR stays green through a stopped line, red or
+   settling main, a deployment in flight, or an executor wait (`cls: "waiting"`);
+   those are lane holds, not loss of PR readiness. An explicit `needs-review`
+   (invalidated acceptance) is orange solid; `conflict`/`blocked` and a queued
+   car skipped after a bounce-free walk count as in progress. Per-PR facts
+   classify each leg separately when a task carries multiple PRs.
 2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
    orders candidates by readiness state first (`ready` → `verifying` → `waiting` —
    the train is NOT FIFO: ready PRs merge immediately in Batch 1 without waiting on
    verifying PRs) and runs `selectBatch` iteratively over the lane's verifying + ready
    PRs (using the executor's `conflict_pairs` and `lane.burst_max`), separating batches
-   with `.train-block-gap` dividers.
+   with `.train-block-gap` dividers. All ready cars precede unverified cars across
+   the whole strip, including when ready cars conflict with each other and need
+   separate batches. Conflicts between queued PRs affect batching; conflicts with
+   base affect readiness.
 3. **Verification colour law & lane idle/held clarity**: inside each batch, **green solid (`.tb-ready`)** =
-   ready (verified), **orange pulsing (`.tb-verifying`)** = actively being
+   ready (verified, no conflicts with base), **orange pulsing (`.tb-verifying`)** = actively being
    verified right now (`Verify:` child `in_progress` / live heartbeat <10m /
-   walk checks running), **orange solid (`.tb-wait`)** = waiting to be verified
+   active review), **orange solid (`.tb-wait`)** = waiting to be verified
    (`Verify:` child `todo` or idle `awaiting` park; never red on awaiting,
    never diagonal stripes, per BR#5476). When `ready === 0`, the lane status pill
    shows whether the line is idle waiting on verification/PR checks (`idle — 0 ready`)

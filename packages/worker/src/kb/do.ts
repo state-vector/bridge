@@ -15761,7 +15761,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // - "waiting"   → orange solid (.tb-wait): waiting to be verified
       const { prStats, batches } = (() => {
         const facts = meta.lane?.queue_facts?.entries ?? [];
-        const factFor = (id: string) => String(facts.find((e: any) => e.id === id)?.cls ?? "");
+        const factFor = (id: string, pr?: number) => String((
+          facts.find((e: any) => e.id === id && e.pr === pr) ??
+          facts.find((e: any) => e.id === id && e.pr == null)
+        )?.cls ?? "");
         const mergedPrs = new Set<number>(
           (this.state.storage.sql.exec(`SELECT pr FROM provenance WHERE repo = ?`, lane.repo).toArray() as any[])
             .map((r) => Number(r.pr ?? 0))
@@ -15776,7 +15779,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         );
         const seenCards = new Set<string>();
         const seenPrs = new Set<number>();
-        let inProgress = 0, verifying = 0, ready = 0;
+        let inProgress = 0;
         const batchCandidates: TrainBatchCar[] = [];
 
         const cardLegsForLane = (cm: any, title: string, bodyMd: string, extraText: string = ""): { pr?: number }[] => {
@@ -15806,7 +15809,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // already queued BEFORE the walk (`status_ts <= qfAt`) and has NO entry in
         // `facts` was skipped by the walk because its PR is CLOSED on GitHub.
         const qfAt = Number(meta.lane?.queue_facts?.at ?? 0);
-        const baseGreenInWalk = String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green";
         const walkCompletedWithoutBounce =
           facts.length > 0 &&
           facts.every((e: any) => e.cls === "ready" || e.cls === "waiting");
@@ -15827,12 +15829,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           ) {
             continue;
           }
-          const cls = factFor(q.id);
+          const cls = factFor(q.id, q.pr);
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
           if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {
-            verifying++;
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
@@ -15841,30 +15842,17 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               state: "waiting",
               detail: "waiting to be verified — needs a fresh review",
             });
-          } else if (cls === "waiting" && baseGreenInWalk) {
-            // Base was green in the walk, so this car was skipped because its
-            // own head checks / mergeability / gate-rerun are still running
-            verifying++;
-            batchCandidates.push({
-              id: q.id,
-              ...(q.pr ? { pr: q.pr } : {}),
-              ...(q.bounces != null ? { bounces: q.bounces } : {}),
-              ...(q.over_budget ? { over_budget: true } : {}),
-              state: "verifying",
-              detail: "being verified — checks/mergeability running",
-            });
           } else {
-            // cls === "ready", or cls === "waiting" while base is settling, or
-            // newly verify-accepted after the last walk → verified & ready (green)
-            ready++;
+            // Accepted and no base conflict/repair or invalidated review:
+            // ready is a PR property. Lane stops, main CI/deploy and executor
+            // waits do not undo verification or change this car's colour.
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
               ...(q.bounces != null ? { bounces: q.bounces } : {}),
               ...(q.over_budget ? { over_budget: true } : {}),
-              state: cls === "ready" && baseGreenInWalk && !meta.stop ? "ready" : "waiting",
-              detail: cls === "ready" && baseGreenInWalk && !meta.stop ? "passed queue gates — current-base admission is checked before merging"
-                : "verified — waiting for current executor and main checks",
+              state: "ready",
+              detail: "ready to merge — verified, no conflicts with base",
             });
           }
         }
@@ -15900,7 +15888,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           for (const leg of legs) {
             if (leg.pr && seenPrs.has(leg.pr)) continue;
             if (leg.pr) seenPrs.add(leg.pr);
-            verifying++;
             const state = activeVerify ? "verifying" : "waiting";
             const detail = activeVerify
               ? `being verified (${activeVerify.id} in progress)`
@@ -15914,7 +15901,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           if (seenCards.has(a.task) || (a.pr && seenPrs.has(a.pr))) continue;
           seenCards.add(a.task);
           if (a.pr) seenPrs.add(a.pr);
-          verifying++;
           const state = a.in_flight ? "verifying" : "waiting";
           const detail = a.in_flight
             ? "being verified — review in progress"
@@ -15940,7 +15926,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             if (leg.pr && seenPrs.has(leg.pr)) continue;
             if (leg.pr) seenPrs.add(leg.pr);
             if (mtState === "awaiting") {
-              verifying++;
               const lastSig = Math.max(Number(rm.session_alive_ts ?? 0), Number(rm.last_progress?.ts ?? 0));
               const live = lastSig > 0 && now0 - lastSig < 10 * 60_000;
               batchCandidates.push({
@@ -15983,7 +15968,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               : null;
             const activeDuty = vDuty ?? childVerify;
             if (activeDuty) {
-              verifying++;
               const dm = JSON.parse(activeDuty.meta ?? "{}");
               const sig = Math.max(Number(dm.session_alive_ts ?? 0), Number(dm.last_progress?.ts ?? 0), Number(activeDuty.updated_ts ?? 0));
               const live = String(activeDuty.status) === "in_progress" && now0 - sig < 10 * 60_000;
@@ -16003,8 +15987,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const conflictPairs: [number, number][] = Array.isArray(meta.lane?.queue_facts?.conflict_pairs)
           ? meta.lane.queue_facts.conflict_pairs
           : [];
+        // Count the same car states that drive colour and ready-first order.
+        // A separate queued-card tally can disagree with the visible blocks.
+        const ready = batchCandidates.filter(car => car.state === "ready").length;
         return {
-          prStats: { in_progress: inProgress, verifying, ready },
+          prStats: { in_progress: inProgress, verifying: batchCandidates.length - ready, ready },
           batches: partitionMergeBatches(batchCandidates, conflictPairs, lane.burst_max),
         };
       })();
