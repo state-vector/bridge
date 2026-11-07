@@ -171,10 +171,16 @@ pub(super) fn no_readers(root: &Path) -> Result<(), String> {
             if !process.file_name().is_some_and(|p| p.to_string_lossy().chars().all(|c| c.is_ascii_digit())) { continue; }
             let metadata = match fs::metadata(&process) { Ok(m) => m, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(e.to_string()) };
             if metadata.uid() != unsafe { libc::getuid() } { continue; }
+            // Exited processes can remain as zombies while their parent reaps
+            // them. Linux denies their ptrace-gated cwd/exe links, but their
+            // kernel state proves they cannot hold files or perform writes.
+            let stat=match fs::read_to_string(process.join("stat")) {Ok(raw)=>raw,Err(e) if e.kind()==io::ErrorKind::NotFound=>continue,Err(e)=>return Err(format!("workspace process state incomplete at {}: {e}",process.display()))};
+            let state=crate::transport::proc_stat(&stat).ok_or_else(||format!("workspace process state malformed at {}",process.display()))?.0;
+            if matches!(state,'Z'|'X') {continue;}
             for link in ["cwd", "exe"] {
                 match fs::read_link(process.join(link)) {
                     Ok(path) if path.starts_with(root) => return Err(format!("workspace is held by process {}", process.display())),
-                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(format!("workspace process visibility incomplete: {e}")),
+                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(format!("workspace process visibility incomplete at {}/{} (state {state}): {e}",process.display(),link)),
                 }
             }
             // A compiler can be between opens while still owning its target
