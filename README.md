@@ -1352,6 +1352,28 @@ authorisation gate and recheck the target; neither grants an agent human authori
 The alarm also consumes persisted disposition requests, so a crash between request
 and application cannot skip the cleanup. Semantic refusals become terminal receipts;
 storage faults leave the command pending for retry.
+Recorded **per-card** human retirement decisions are replayable through that same
+gate: an explicit `SUPERSEDE` answer, or a `retire BR#N` clause naming the ask's
+bound task, can retire its still-unclaimed `todo`/`blocked` card. KEEP/NO answers,
+unrelated targets, active writers and outstanding PR responsibility remain
+protected. Replaying the same completed retirement is an idempotent acknowledgement.
+Executor-observed CLOSED/MERGED PR receipts satisfy delivery conservation for a
+retirement; a closed PR is not an outstanding open obligation. Malformed legacy
+PR bindings are audited against the typed event grammar and retained as history.
+An authenticated interactive owner's deliberate preserved-work release is a
+handoff, not another failed automated attempt: prior retry history is archived in
+an `interactive_handoff` event and the new execution round starts at zero. Foreign
+sessions, live writers, uncertain operations and unattended watchdog churn remain
+subject to their normal fences and cooldowns.
+
+A satisfied typed prerequisite must have a continuation. If its unblock round
+finishes while the parent remains parked, the next proxy pass atomically consumes
+that wait and returns the parent to the executable pool, preserving its actual
+execution/review requirements and recording the prerequisite receipts. Train
+settlement, operator decisions, local/executor waits and unreconciled external
+operations keep their own authoritative exits. Unbound executor-coordination
+questions also retire when their explicitly addressed task becomes terminal;
+this records cancellation, never a fabricated answer or review acceptance.
 The same machine-ownership rule covers stalled batches, mismatched merge checks,
 missing deployment evidence and no-progress diagnostics. A genuinely unavailable
 execution host instead produces a concrete request to start Bridge on a computer,

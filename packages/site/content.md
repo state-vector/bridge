@@ -659,6 +659,24 @@ post-deploy work. Execution completes only with outcome receipts. Existing human
 batch authorisations remain applicable without another round of approval, through
 the same receipt-scoped gate.
 
+**Satisfied waits continue; obsolete requests retire.** When an unblock round
+finishes but leaves its parent on an already-satisfied typed prerequisite, the
+proxy watch consumes the wait and returns the actual work to the executable pool
+with receipts. It never substitutes a prerequisite for completed execution or
+independent acceptance. Active train settlement, operator choices, protected
+execution and uncertain external operations retain their authoritative exits.
+Executor-coordination questions retire when their explicitly addressed task is
+terminal, even if the request was unbound. A recorded human per-card `SUPERSEDE`
+or explicit `retire BR#N` decision can be replayed on that exact unclaimed task,
+without another approval; KEEP/NO decisions and live delivery responsibility are
+preserved, and replaying the completed retirement is idempotent.
+Verified CLOSED/MERGED PR observations satisfy retirement's delivery-conservation
+check; malformed legacy PR references are audited and retained as history.
+An authenticated interactive owner's preserved-work handoff archives the old
+retry history and starts a fresh execution round, rather than manufacturing a
+24-hour failure cooldown. Foreign sessions, active writers and uncertain external
+operations remain fenced; unattended retry failures keep their normal cooldown.
+
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following
 its current claim holder), and `independent_review` (Bridge schedules/reuses a review duty,
