@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 import { isAwaitingMerge, mergePhaseOf } from "@bridge/contracts";
 import { exitClassOf, blockedSummaryOf, EXIT_CLASSES } from "../../ui-kit/src/server/views";
 import { trainStrandClass } from "../src/kb/core";
@@ -246,6 +247,7 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect((await kbJson("/transition", { id: drainId, to: "in_progress", actor: "drill-drain-owner", note: "working" })).status).toBe(200);
     const askRes = await kbJson("/ask.create", {
       to: "human",
+      decision: decisionFixture(drainId, ["(Recommended) SUPERSEDE all 29 — 6 dead + 23 conflicting parks", "SUPERSEDE only the 6 dead parks", "NO — leave all 29 parked"]),
       question: "29 cards need SUPERSEDE (6 on closed PRs, 23 on conflicting PRs). Authorize?",
       reason: "Supersede is human-authority — requesting batch drop authorization.",
       details: "Executing the strand-backlog disposition on 29 stale parked cards whose PRs are closed or conflicting.",

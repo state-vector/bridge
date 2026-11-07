@@ -2,6 +2,7 @@ import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readyGateway, executorRequest } from "./executor-fixture";
+import { decisionFixture } from "./ask-fixture";
 
 /**
  * DO integration tests — the tier that would have caught today's production
@@ -225,12 +226,14 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
   });
 
   it("asks create type=question nodes (no question tag), answerable to done", async () => {
+    const subject = (await kbJson("/create", { type: "task", title: "Roles column publication policy" })).body.id;
     const ask = await kbJson("/ask.create", {
       question: "integration: merge the roles column PR?",
       options: ["GO — merge", "NO-GO — hold"],
       reason: "integration test coverage",
       details: "Adds a roles column to tasks so review-gated cards dispatch only to review-role agents. PR is green; this ask covers the go/no-go on merging it.",
       to: "human",
+      decision: decisionFixture(subject, ["GO — merge", "NO-GO — hold"]),
     });
     expect(ask.status).toBe(200);
     // human-directed asks require the plain-reading brief (details) — bare
@@ -242,7 +245,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       to: "human",
     });
     expect(bare.status).toBe(400);
-    expect(String(bare.body.error)).toContain("details");
+    expect(String(bare.body.error)).toContain("decision");
     const node = await kbJson("/get", { id: ask.body.id });
     expect(node.body.type).toBe("question");
     expect(node.body.tags).toEqual([]);
@@ -263,7 +266,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Keep the executor lease or release the card?",
       options: ["KEEP — stay parked", "RELEASE — back to the pool"],
       reason: "BR#3822 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       artefact_id: t.id,
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
 
@@ -330,7 +333,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Should the verifier park this card?",
       options: ["PARK", "GO"],
       reason: "BR#3822 failure-path fixture",
-      to: "human",
+      to: "legacy-peer",
       artefact_id: t.id,
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
 
@@ -359,7 +362,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Rework loop on the card — drop it?",
       options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
       reason: "churn guard rework loop",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -390,7 +393,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Execute the recorded retire-GO: drop this card?",
       options: ["(Recommended) SUPERSEDE — drop it now", "KEEP — stay parked", "RE-SCOPE — I'll rewrite it myself"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -411,7 +414,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Keep parked while the base is red?",
       options: ["(Recommended) KEEP — stay parked", "RELEASE — back to the pool"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -431,7 +434,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Proceed with the ordinary plan?",
       options: ["(Recommended) Yes — proceed", "No — rethink"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -791,7 +794,7 @@ describe("typed answers dispatch like the option click (BR#3912 type-your-own)",
     // rule-6 parking: askCreate flips an IN_PROGRESS subject to blocked-on-ask
     await kbJson("/transition", { id: subject.id, to: "in_progress", note: "claim" });
     const { body: ask } = await kbJson("/ask.create", {
-      to: "ray",
+      to: "legacy-peer",
       question: `Rework loop on ${subject.id} "${title}" — the release→claim→stall cycle is now invalid (it failed 20 times). What do you want to do with it?`,
       reason: "20 dispatch attempts without completion — re-running repeats the claim→stall cycle",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
@@ -876,7 +879,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
     const wrong = await kbJson("/question.claim", { id: t.id, actor: "web:rayh" });
     expect(wrong.status).toBe(400);
     expect(String(wrong.body.error)).toContain("only on question");
-    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for the human-claim hold lifecycle.", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "legacy-peer", reason: "drill", details: "drill brief: fixture ask for the human-claim hold lifecycle.", options: ["GO", "NO-GO"] });
     expect(ask.status).toBe(200);
     await kbJson("/ask.answer", { id: ask.body.id, answer: "GO" });
     const ans = await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
@@ -906,7 +909,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
   });
 
   it("an answer resolves the hold — the timer is cancelled and the stamp clears", async () => {
-    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for answer-resolves-hold behavior.", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "legacy-peer", reason: "drill", details: "drill brief: fixture ask for answer-resolves-hold behavior.", options: ["GO", "NO-GO"] });
     await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
     const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO", actor: "web:rayh" });
     expect(ans.status).toBe(200);

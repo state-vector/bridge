@@ -1638,6 +1638,22 @@ For Me has no duplicate blanket GO action detached from the actual question.
 Legacy exact human targets (`human`, `ray`, `rayh`) adapt to human decisions;
 bare agent labels, coordinator tokens and offline stamps never imply human audience.
 
+**Human ask admission (BR#8106).** New requests must include a structured
+`decision` even when the caller omits `route` and uses a legacy human recipient.
+The same rule applies to direct question creation and metadata edits. Name the
+affected task, explain the situation and why your decision is needed, and give
+each choice an executor, a concrete consequence and a typed effect. The visible
+options must match those choices; blank context and misplaced recommendations
+are rejected. Supporting logs and event grammar belong in expandable evidence.
+Older stored questions remain readable and answerable.
+
+Missing resume conditions, repeated failed attempts, missing completion reviews
+and change-tracking failures schedule deduplicated agent repair work. They do
+not ask you to “re-scope, release or drop” a task or “fix the gate precondition”.
+A protected task keeps its scope and actual outcome obligation; repairing its
+wait only resumes that work. A real missing permission or product choice may
+still be escalated explicitly after the repair executor has diagnosed it.
+
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
