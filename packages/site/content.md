@@ -38,6 +38,10 @@ removes worktrees, installs updates or changes update deadlines or health checks
 
 ### Operational diagnostics
 
+Review carry checks fetch the lane base and use one fixed commit for both sides
+of the comparison. A stale or absent local `main` cannot make an unchanged rebase
+look like an authored change. Failed fetches and changed patches still prevent carry.
+
 Operational diagnostics are available on demand in the merge-train panel and
 through authenticated `/api/kb/diagnostics`: current request stages, bounded
 latency/error observations, and explicit instance/freshness timestamps. The

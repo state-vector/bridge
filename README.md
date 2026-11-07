@@ -2630,8 +2630,11 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
 - **Mechanical head moves carry by default (BR#4689, child of BR#4633)**: a rebase
   or other content-preserving head update — same patch-ids — no longer bounces for
   coverage. When the live head is not verdict-covered, the executor first tries to
-  PROVE the move mechanical: `git range-diff <base>..old <base>..new`, with the base
-  excluded on BOTH sides (a merge-base-anchored `old...new` would count base-side
+  PROVE the move mechanical: fetch the lane base explicitly into its origin tracking
+  ref, resolve that fetched commit once, then run `git range-diff <base-sha>..old
+  <base-sha>..new`. A stale or missing local `main` branch is irrelevant and is never
+  modified. Failed fetches cannot reuse stale base evidence. The base is excluded
+  on BOTH sides (a merge-base-anchored `old...new` would count base-side
   advances as added patches after a rebase). One or more all-`=` pairs proves it;
   any `<`/`>`/`!` line (authored code changed), an unreadable object or a git failure
   proves nothing — no proof, no carry. With proof, the gate's carry row fires only if
