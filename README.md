@@ -1939,6 +1939,10 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+records remaining lifecycle, completion, priority and recovery gaps at commit
+`4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
+
 **A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
 queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
 with elapsed time, main-check health, live executor presence and the number of
