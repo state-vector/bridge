@@ -102,11 +102,32 @@ describe("MCP OAuth over the real worker and SQLite", () => {
   });
   it("requires cookie-bound same-origin consent and handles denial without allocating an agent", async () => {
     const client = await register(), id = await consent(client);
-    expect((await approve(id, true, { Origin: "https://attacker.test" })).status).toBe(403);
+    for (const attacker of ["https://attacker.test", "null", ""]) {
+      const rejected = await approve(id, true, { Origin: attacker });
+      expect(rejected.status).toBe(403);
+      expect(rejected.headers.get("content-type")).toContain("text/html");
+      expect(await rejected.text()).toContain("Restart the connection from your client");
+    }
     expect((await approve(id, true, { Cookie: cookie("other-user") })).status).toBe(400);
     const denied = await approve(id, false);
     expect(new URL(denied.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
     expect((await approve(id)).status).toBe(400);
+  });
+  it("serves styled consent without suppressing the browser form Origin and renders readable errors", async () => {
+    const client = await register('<script>alert("client")</script>');
+    const page = await fetchPath(authorizeUrl(client), { headers: { Cookie: humanCookie } });
+    expect(page.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    const html = await page.text();
+    const nonce = html.match(/<style nonce="([^"]+)"/)![1];
+    expect(page.headers.get("content-security-policy")).toContain(`style-src 'nonce-${nonce}'`);
+    expect(page.headers.get("content-security-policy")).toContain("form-action 'self' http://localhost:1455;");
+    expect(html).toContain('name="viewport"');
+    expect(html).toContain("&lt;script&gt;alert(&quot;client&quot;)&lt;/script&gt;");
+    expect(html).not.toContain('<script>alert("client")</script>');
+    const expired = await approve("consent_expired");
+    expect(expired.status).toBe(400);
+    expect(expired.headers.get("content-type")).toContain("text/html");
+    expect(await expired.text()).toContain("Connection not completed");
   });
   it("binds codes to client, redirect, PKCE and resource, then consumes once under concurrency", async () => {
     const client = await register(), c = await code(client), other = await register();

@@ -1007,6 +1007,8 @@ codex mcp login bridge
 
 The client discovers Bridge's OAuth endpoints, opens browser sign-in, and asks
 you to authorize interactive-agent access to your **currently selected workspace**.
+The responsive consent page shows the client, workspace, permissions and return
+address. If a request expires or cannot be verified, it explains how to reconnect.
 Select the workspace in Bridge before connecting. Approving automatically
 allocates a unique `_direct/<client>-<id>` agent, visible and revocable under
 **Connect**; no manual token minting or bearer header is needed. Each authorization
