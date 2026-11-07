@@ -157,6 +157,15 @@ export const AttemptSchema = z.discriminatedUnion("phase", [
   z.object({ ...AttemptFields, phase: z.literal("quiesced"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
 ]);
 export type ExecutionAttempt = z.infer<typeof AttemptSchema>;
+/** Process outcome is evidence, never business acceptance. The agent/hub owns
+ * task completion; exit 0 cannot manufacture a review or close a diagnostic. */
+export const TerminalOutcomeSchema = z.object({
+  kind: z.enum(["completed", "interrupted", "failed"]),
+  exit_code: z.number().int().nullable(),
+  stdout_tail: z.string().max(16_000),
+  stderr_tail: z.string().max(8_000),
+});
+export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema });
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -168,10 +177,11 @@ export const ExecutionStateSchema = z.object({
   budget_exhaustions: z.number().int().nonnegative().default(0),
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
+  terminal: TerminalReceiptSchema.nullable().default(null),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, delivery: null, handoff: { phase: "none" } };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, delivery: null, handoff: { phase: "none" }, terminal: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -192,6 +202,7 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
   z.object({ kind: z.literal("checkpoint"), ...FenceSchema.shape, checkpoint: CheckpointSchema }),
   z.object({ kind: z.literal("quiesce"), ...FenceSchema.shape, writers: z.literal("process_group_empty") }),
+  z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: z.literal("process_group_empty"), outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]) }),
   z.object({ kind: z.literal("ack"), ...FenceSchema.shape, message_id: text, state: z.enum(["acknowledged", "acted"]) }),
@@ -278,6 +289,14 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       break;
     }
     case "quiesce": requireAttempt(true).phase = "quiesced"; break;
+    case "finalize": {
+      requireAttempt(true).phase = "quiesced";
+      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome };
+      // Receipt of stop/interrupt does not mean its requested business action
+      // was completed. Keep it acknowledged for the next executor to reconcile.
+      for (const message of s.messages) if (message.state === "delivered") message.state = "acknowledged";
+      break;
+    }
     case "yield": {
       const current = requireAttempt(true);
       if (current.phase !== "quiesced" || !current.checkpoint) throw new Error("gate: yield requires a published checkpoint and quiescent writer");

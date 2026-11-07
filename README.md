@@ -3277,3 +3277,12 @@ alone is not evidence of top scheduling priority or unavailable agent capacity.
 Independent reviews of concrete/line recovery inherit the repair's scheduling
 class and urgency. They remain separate review sessions with the same acceptance
 gates, but cannot fall behind unrelated repair backlog as ordinary verification.
+### Fenced terminal-result capture
+
+The execution protocol supports `finalize` with the exact generation/attempt,
+`writers: "process_group_empty"`, and a typed process outcome (`completed`,
+`interrupted`, or `failed`). The hub atomically records the captured result,
+quiescence and its replay receipt. A successful process exit never closes a
+task or fabricates review acceptance. Unfinished claims return through the
+same scheduler with their prior result attached; independent waits, unknown
+operations, host affinity and the persistent retry budget remain enforced.
