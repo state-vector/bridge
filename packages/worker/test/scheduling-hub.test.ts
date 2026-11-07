@@ -43,6 +43,19 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("dispatches an unowned bounced TODO repair without consuming real waits or another recovery owner's work", async () => {
+    const project = "bounced-board-repair", g = await gateway(project, 3);
+    const pr = (number: number) => ({ repo: "state-vector/bridge", number });
+    const bounce = (number: number) => ({ state: "bounced", repo: "state-vector/bridge", pr: number, bounce_kind: "conflict" });
+    const runnable = await task(project, { pr: pr(901), merge_train: bounce(901) });
+    await task(project, { pr: pr(902), merge_train: bounce(902), blocked: { reason: "Upstream still pending", await_event: { event: "time", until_ts: Date.now() + 86_400_000 } } });
+    await task(project, { pr: pr(903), merge_train: { state: "queued", repo: "state-vector/bridge", pr: 903 } });
+    const child = await task(project, { operator_gated: "Existing recovery owner has its own prerequisite" });
+    await task(project, { pr: pr(904), merge_train: bounce(904), recovery: { kind: "duty", task_id: child, reason: "conflict" } });
+    const discovery = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "inspect" }));
+    expect(discovery).toMatchObject({ kind: "ready", candidates: [runnable], reasons: { independent_wait: 3 } });
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: runnable });
+  });
   it("atomically captures and replays a stopped result without guessing completion, then uses the same scheduler to reconcile it", async () => {
     const project = "terminal-result-protocol", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), claim = await reserve(g);

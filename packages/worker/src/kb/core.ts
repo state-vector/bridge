@@ -2412,6 +2412,14 @@ export function releaseHold(meta: any): string | null {
   return null;
 }
 
+/** TODO repair work has already left the train. Its historical bounce is not
+ * a future event. A declared recovery owner and every actual upstream wait
+ * still hold it; discovery and atomic reservation use this same predicate. */
+export function todoDispatchHold(meta: any): string | null {
+  if (meta?.merge_train?.state !== "bounced" || meta?.recovery?.task_id) return releaseHold(meta);
+  return releaseHold({ ...meta, merge_train: undefined });
+}
+
 /** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE
  *  mergeTrainQueue. The queue derives candidates from the `merge-train:`
  *  reason prefix alone, so a watchdog hold-park whose note lacks the prefix

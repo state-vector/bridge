@@ -179,6 +179,7 @@ import {
   trainCloseFailAskDetails,
   TRAIN_LANDED_CLOSE_MAX_RETRIES,
   releaseHold,
+  todoDispatchHold,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
   decideProseDisposition,
@@ -4981,7 +4982,7 @@ export class KnowledgeHub {
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
       else if (this.unmetBars(row).length) reason = "qualification";
-      else if (this.protectedExecution(id, meta) || releaseHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
+      else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
       else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";

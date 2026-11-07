@@ -679,6 +679,9 @@ An authenticated interactive owner's preserved-work handoff archives the old
 retry history and starts a fresh execution round, rather than manufacturing a
 24-hour failure cooldown. Foreign sessions, active writers and uncertain external
 operations remain fenced; unattended retry failures keep their normal cooldown.
+A bounced `todo` repair without another recovery owner can be dispatched again.
+Its old bounce is not a future event; actual prerequisites, live train slots,
+recovery ownership, writers and unknown effects continue to hold it.
 
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following

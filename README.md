@@ -1363,6 +1363,10 @@ handoff, not another failed automated attempt: prior retry history is archived i
 an `interactive_handoff` event and the new execution round starts at zero. Foreign
 sessions, live writers, uncertain operations and unattended watchdog churn remain
 subject to their normal fences and cooldowns.
+A bounced `todo` repair with no separate recovery owner is executable board
+work, not an active train wait. Discovery and atomic reservation ignore only
+that historical bounce; real typed prerequisites, queued slots, recovery owners,
+writer quiescence and external-operation receipts still gate dispatch.
 
 A satisfied typed prerequisite must have a continuation. If its unblock round
 finishes while the parent remains parked, the next proxy pass atomically consumes
