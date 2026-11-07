@@ -509,6 +509,9 @@ The train status, message and recovery banner consume the hub's shared typed
 `line` projection. Routine builds, deployments and check waits stay compact in
 the overview row; expanded banners appear only for stopped or unknown/error
 states. Click the lane for full operational details in its card view.
+The [delivery architecture review and structural repair plan](https://github.com/state-vector/bridge/blob/main/docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+documents remaining mechanism gaps and proposed acceptance tests; it is a plan,
+not a declaration that the gateway refactor is complete.
 **STOP THE LINE — merge machinery stalled** means queued work has gone an hour
 without a merge. The error names elapsed time, main's check health, executor
 presence and candidates passing initial gates. Bridge owns priority recovery;
