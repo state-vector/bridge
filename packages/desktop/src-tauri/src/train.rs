@@ -29,13 +29,10 @@
 //!
 //! Loop (one tick): preflight → train_status → per lane: CAS-lease →
 //! reconcile from live GitHub → awaiting-CI poll → else WALK the derived
-//! queue in order and drive the first entry that can act (BR#3935: a
-//! permanently unlandable entry must not starve the lane — a stamp-less leg
-//! is BOUNCED off the hub so lane.queue self-heals (BR#5753), a CLOSED PR or
-//! an entry with no unlanded leg on this lane is logged and the walk
-//! advances in the SAME tick; a transient no-op still blocks) →
-//! decideTrainGate → act: merge → train:merged → next tick polls CI on the
-//! merge commit. Carry law (BR#3516 §5): machine-clean carries,
+//! queue in bounded, saved steps. Failed reads and individual repairs do not
+//! discard other ready changes. Compatible candidates are rechecked and merged
+//! in queue order, with one deployment check for the final batch commit.
+//! A saved scan position is never permission to merge. Carry law (BR#3516 §5): machine-clean carries,
 //! human-resolved invalidates. Local git plumbing is three-valued (BR#3935):
 //! a git FAILURE is never folded into a conflict/behind verdict — the PR
 //! head is fetched explicitly before any local op names it.
@@ -55,12 +52,30 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logging::{emit, iso, now_ms, prefer_stdout};
 
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const SCAN_BUDGET: Duration = Duration::from_secs(30);
+const SCAN_MAX_ENTRIES: usize = 32;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum QueueScan {
+    Complete,
+    Checking { after_id: String },
+}
+
+fn queue_scan_order(queue: &[Value], scan: &QueueScan) -> Vec<usize> {
+    let start = match scan {
+        QueueScan::Checking { after_id } => queue.iter().position(|q| q["id"].as_str() == Some(after_id))
+            .map(|i| (i + 1) % queue.len().max(1)).unwrap_or(0),
+        QueueScan::Complete => 0,
+    };
+    (start..queue.len()).chain(0..start).collect()
+}
 
 /// How the tick's gh credential classifies (BR#3181). Probed from
 /// `gh api user --jq .login`; Worker = an identity on the worker allowlist.
@@ -193,6 +208,8 @@ fn clone_cache_base() -> String {
 }
 
 struct Ctx {
+    /// Local time budget only; progress and merge authority live on the hub.
+    operation_deadline: Option<Instant>,
     http: reqwest::blocking::Client,
     hub: String,
     token: String,
@@ -293,6 +310,50 @@ fn log(lane: Option<&str>, msg: &str) {
     emit("train", lane.unwrap_or(""), msg);
 }
 
+/// Drain both pipes while the command runs: waiting for exit before reading
+/// can deadlock on large GitHub responses. A timeout stops this command's own
+/// process group only. Callers must inspect GitHub before repeating a write.
+fn train_command_output(mut command: Command, budget: Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| format!("Cannot start train command: {e}"))?;
+    let pid = child.id();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let read = |mut pipe: Box<dyn Read + Send>| std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let out = read(Box::new(stdout));
+    let err = read(Box::new(stderr));
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                #[cfg(unix)] unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(match result {
+                    Err(e) => format!("Cannot check train command: {e}; inspect outside results before repeating a write"),
+                    _ => format!("Train command exceeded {}ms; inspect GitHub before repeating a write", budget.as_millis()),
+                });
+            }
+        }
+    };
+    // A child may exit while a descendant still holds the output pipe open.
+    #[cfg(unix)] unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    let stdout = out.join().map_err(|_| "Cannot read train command output")?.map_err(|e| e.to_string())?;
+    let stderr = err.join().map_err(|_| "Cannot read train command error")?.map_err(|e| e.to_string())?;
+    Ok(std::process::Output { status: status?, stdout, stderr })
+}
+
 fn short_host() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -334,6 +395,7 @@ impl Ctx {
             .unwrap_or(45);
         let workdir_env = std::env::var("MERGE_TRAIN_WORKDIR").ok().filter(|s| !s.is_empty());
         Ok(Ctx {
+            operation_deadline: None,
             http: reqwest::blocking::Client::builder().timeout(RPC_TIMEOUT).build().map_err(|e| e.to_string())?,
             hub: hub.trim_end_matches('/').to_string(),
             token,
@@ -383,6 +445,7 @@ impl Ctx {
         let resp = self
             .http
             .post(format!("{}/mcp", self.hub))
+            .timeout(self.operation_budget(if name == "get_artefact" { Duration::from_secs(10) } else { RPC_TIMEOUT })?)
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token))
             .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
@@ -419,6 +482,14 @@ impl Ctx {
     }
 
     // gh/git inside the target clone; we read stdout, surface stderr on failure.
+    fn operation_budget(&self, maximum: Duration) -> Result<Duration, String> {
+        match self.operation_deadline {
+            Some(deadline) => deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+                .map(|remaining| remaining.min(maximum)).ok_or_else(|| "Time for checking this group has elapsed; continue from the saved position".into()),
+            None => Ok(maximum),
+        }
+    }
+
     fn sh(&self, cmd: &str, cmd_args: &[&str]) -> Result<String, String> {
         #[cfg(test)]
         if let Some(ref mock) = self.sh_mock {
@@ -426,11 +497,12 @@ impl Ctx {
                 return res;
             }
         }
-        let out = Command::new(cmd)
-            .args(cmd_args)
-            .current_dir(&self.workdir)
-            .output()
-            .map_err(|e| e.to_string())?;
+        let mut command = Command::new(cmd);
+        command.args(cmd_args).current_dir(&self.workdir);
+        let maximum = if cmd == "git" && cmd_args.iter().any(|a| matches!(*a, "clone" | "fetch")) {
+            Duration::from_secs(90)
+        } else { Duration::from_secs(30) };
+        let out = train_command_output(command, self.operation_budget(maximum)?)?;
         if !out.status.success() {
             return Err(format!("{cmd} {} failed ({}): {}", cmd_args.join(" "), out.status, trunc(String::from_utf8_lossy(&out.stderr).trim(), 400)));
         }
@@ -1691,6 +1763,7 @@ fn drive_lane(ctx: &mut Ctx, lane: &Value) {
     ctx.tick_error = None;
     ctx.note(&format!("ticking {key}"));
     let result = drive_lane_inner(ctx, lane, &key, &repo, &base, typical_ms, burst_cap);
+    ctx.operation_deadline = None;
     // BR#5376: the tick's landing truth feeds the stall tracker BEFORE the
     // error path releases the lease. Pure state here; the EVENT fires on the
     // next walk under the lease (stall_fire_check at the queue_facts stamp).
@@ -1742,6 +1815,33 @@ struct BatchCandidate {
     root_fix: bool,
 }
 
+enum MergeCommandResult {
+    ObservedMerged,
+    KnownRefusal(String),
+}
+
+impl MergeCommandResult {
+    fn into_result(self) -> Result<String, String> {
+        match self { Self::ObservedMerged => Ok(String::new()), Self::KnownRefusal(reason) => Err(reason) }
+    }
+}
+
+fn reconcile_merge_command(ctx: &Ctx, repo: &str, pr: i64, head: &str,
+    attempted: Result<String, String>) -> Result<MergeCommandResult, String> {
+    let facts = ctx.pr_facts(repo, pr).map_err(|error|
+        format!("Cannot establish whether PR #{pr} merged; no more writes this pass: {error}"))?;
+    if vstr(&facts, "headRefOid") != Some(head) {
+        return Err(format!("PR #{pr} changed while merging; inspect the new version before any retry"));
+    }
+    if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").and_then(Value::as_str).is_some() {
+        return Ok(MergeCommandResult::ObservedMerged);
+    }
+    match attempted {
+        Err(reason) if vstr(&facts, "state") == Some("OPEN") => Ok(MergeCommandResult::KnownRefusal(reason)),
+        _ => Err(format!("PR #{pr} has no confirmed merge result; no more writes this pass")),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum IntegrationAdmission {
     Current,
@@ -1773,6 +1873,30 @@ fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandida
     if to_head == head { return Err("Branch update accepted but new head not yet observable; hold for fresh CI".into()); }
     ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head, "to_head": to_head }))?;
     Ok(IntegrationAdmission::AwaitingCi { base_sha, head_sha: to_head.into() })
+}
+
+/// Recheck acceptance, exact head, signatures and CI at the write boundary.
+/// A scan position or an earlier ready result is never permission to merge.
+fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
+    base_verdict: MainVerdict, base_red_names: &[String]) -> Result<bool, String> {
+    let card = ctx.mcp("get_artefact", json!({ "id": cand.head_id }))?;
+    let meta = card.get("meta").cloned().unwrap_or(json!({}));
+    let legs = train_legs(&meta);
+    let Some((index, _)) = legs.iter().enumerate().find(|(_, leg)| leg.repo == repo
+        && leg.number == cand.pr && leg.base.as_deref().unwrap_or("main") == base) else { return Ok(false); };
+    let facts = ctx.pr_facts(repo, cand.pr)?;
+    if vstr(&facts, "state") != Some("OPEN") || vstr(&facts, "headRefOid") != Some(&cand.head_sha) { return Ok(false); }
+    let checks = ctx.check_runs(repo, &cand.head_sha);
+    let commits = ctx.pr_commits(repo, cand.pr);
+    Ok(matches!(decide_train_gate(crate::train_gate::TrainGateInput {
+        pr_number: cand.pr, head_sha: &cand.head_sha, card_meta: &meta,
+        card_status: vstr(&card, "status"), base_gate_green: base_verdict == MainVerdict::Green,
+        base_verdict, mergeable: facts.get("mergeable").and_then(Value::as_bool),
+        merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
+        commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
+        mechanical_move: None, root_fix: is_root_fix_card(&card), base_red_names,
+        train_owned_branch: false,
+    }), MergeAction::Merge { .. }))
 }
 
 // ---- BR#5633: the Awaiting-park sweep ---------------------------------
@@ -2613,11 +2737,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
 
     // ---- drain arm (idle, or mid-pass "bursting"): THREE phases (BR#4996,
     // Ray ruling 2026-10-29, amending the BR#4934 burst-drain). PHASE A
-    // classifies the whole derived queue IN ORDER without landing anything:
+    // classifies a bounded window of the derived queue without landing anything:
     // gate-clean heads become batch candidates; Skip/Note entries are
-    // skipped past (a transient no-op no longer settles the pass or ends
-    // the walk); Bounce / HumanLeg / CloseSuperseded still fire ON SIGHT
-    // and end the tick. PHASE B selects the batch: the maximal set of
+    // skipped past. Repairs apply to their own card only; read failures are
+    // recorded without discarding ready work. PHASE B selects the batch: the maximal set of
     // MUTUALLY non-conflicting candidates (select_batch — file-set
     // intersection, merge-tree-confirmed, BR#3935 fail-closed; queue order
     // = landing order, oldest-first; burst_max caps the batch). PHASE C
@@ -2746,7 +2869,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         log(Some(key), "awaiting-ci: base tip is RED — holding batch continuation until base is green");
         return Ok(());
     }
-    for (qi, head) in queue.iter().enumerate() {
+    let previous_scan = lane.pointer("/queue_facts/scan").cloned()
+        .and_then(|value| serde_json::from_value::<QueueScan>(value).ok()).unwrap_or(QueueScan::Complete);
+    let scan_order = queue_scan_order(&queue, &previous_scan);
+    let mut visited = Vec::new();
+    let ready_limit = if burst_cap == 0 { 10 } else { (burst_cap as usize).min(10) };
+    ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
+    for &qi in &scan_order {
+        if visited.len() >= SCAN_MAX_ENTRIES || candidates.len() >= ready_limit
+            || ctx.operation_budget(SCAN_BUDGET).is_err() { break; }
+        let head = &queue[qi];
+        visited.push(qi);
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with clean heads queued (drain_burst_decision: Settle, not Drain).
         if pass_merged > 0 && drain_burst_decision(pass_merged, burst_cap, true, false) != DrainDecision::Drain {
@@ -2764,6 +2897,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         if pass_merged > 0 && !tip_sha.is_empty() {
             let tip_runs = ctx.check_runs(repo, &tip_sha);
             if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
+                ctx.operation_deadline = None;
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("burst drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
@@ -2772,6 +2906,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
         }
         let head_id = vstr(head, "id").unwrap_or("").to_string();
+        // A read or repair for one card must not discard other ready cards.
+        // Keep failures inside this entry; merge writes remain outside this
+        // boundary and still require their own first-hand reconciliation.
+        let checked = (|| -> Result<(), String> {
         let card = ctx.mcp("get_artefact", json!({ "id": head_id }))?;
         let card_meta = card.get("meta").cloned().unwrap_or(json!({}));
         let card_status = card.get("status").and_then(|v| v.as_str()).map(String::from);
@@ -2816,7 +2954,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }))?;
                 ctx.note(&format!("reconcile: re-stamped landed card {head_id}"));
                 log(Some(key), &format!("reconcile: card {head_id} all legs landed — re-stamped PR #{} for the landed close", last.number));
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             // BR#3935: this entry can never drive on this lane — advance.
@@ -2828,7 +2965,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // SIBLING lane via its other unlanded legs — a hub bounce here
             // would yank it off that lane's queue.
             log(Some(key), &format!("queue[{qi}] {head_id} has no unlanded leg on this lane ({} leg(s) cited) — advancing to the next queue entry", legs.len()));
-            continue;
+            return Ok(());
         }
         // BR#4934 parked filter: advance past awaiting-ci legs to the first
         // leg this tick can actually drive; ALL parked → the pass settle
@@ -2838,7 +2975,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             Some(&i) => i,
             None => {
                 log(Some(key), &format!("queue[{qi}] {head_id} is parked awaiting-ci on this lane — the pass settle owns it, advancing"));
-                continue;
+                return Ok(());
             }
         };
         let leg = legs[leg_idx].clone();
@@ -2876,15 +3013,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }))?;
                 ctx.note(&format!("bounced {head_id} (gate, stamp-less) — leg {leg_number} carries no PR stamp; lane.queue self-heals this tick"));
                 log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp — bounced off the hub (impl re-stamps the binding, re-verifies, re-queues; BR#5753)"));
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             // BR#3935 (fail-open residue): no bounceable pr stamp at all —
             // advance (the hub audit owns the convention violation).
             log(Some(key), &format!("queue[{qi}] {head_id} leg {leg_number} carries no PR stamp and no bounceable train stamp — advancing to the next queue entry (verify convention violation; see hub audit)"));
-            continue;
+            return Ok(());
         }
-        let mut facts = ctx.pr_facts(repo, pr)?;
+        let facts = ctx.pr_facts(repo, pr)?;
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
             // reconcile: merged on GitHub, no train event (crash between merge and
             // event) — stamp it and continue walking the remaining queue entries.
@@ -2892,33 +3028,21 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
-            continue;
+            return Ok(());
         }
-        // L1.1 (BR#4685): poll, don't bounce. An unanswered mergeStateStatus
-        // (null/UNKNOWN — GitHub computing, typical right after a base merge)
-        // is backoff-polled inside this tick — bounded by the lease heartbeat
-        // (renewed around every wait) — until GitHub answers. The gate below
-        // bounces ONLY on definitive DIRTY/CONFLICTING; a merge/closure that
-        // lands mid-poll reconciles through the arms below instead of gating.
+        // An unanswered mergeability check is a wait, never a conflict.
+        // Leave it until the next pass instead of sleeping ahead of ready work.
         if vstr(&facts, "state") == Some("OPEN") && !mergeability_definitive(&facts) {
-            log(Some(key), &format!("queue[{qi}] PR #{pr} mergeStateStatus not yet computed — backoff-polling before the gate (BR#4685, lease-bounded)"));
-            for wait in mergeability_poll_secs() {
-                renew_lease(ctx, repo, base);
-                std::thread::sleep(Duration::from_secs(wait));
-                renew_lease(ctx, repo, base);
-                facts = ctx.pr_facts(repo, pr)?;
-                let st = vstr(&facts, "state").unwrap_or("");
-                if st == "MERGED" || st == "CLOSED" || mergeability_definitive(&facts) {
-                    break;
-                }
-            }
+            qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "waiting" }));
+            log(Some(key), &format!("PR #{pr}: GitHub is still checking whether it can merge; checking other changes meanwhile"));
+            return Ok(());
         }
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
             renew_lease(ctx, repo, base);
             ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
-            continue;
+            return Ok(());
         }
         // BR#5639 ghost car + BR#3935/BR#5897 lineage, fail-closed
         // (BR#5911 F3): a leg whose live PR state is not OPEN can NEVER be
@@ -2933,7 +3057,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             let st = vstr(&facts, "state").unwrap_or("(unreadable)");
             qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
             log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} live state is {st} (not OPEN) — unlandable, never a batch candidate, advancing to the next queue entry (card stays for the humans)"));
-            continue;
+            return Ok(());
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_string();
         // BR#4996: the lane's base sha + verdict are read ONCE per
@@ -3118,15 +3242,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 "checks": [{ "name": "GitHub branch policy remains BLOCKED", "url": format!("https://github.com/{repo}/pull/{pr}") }] });
         }
 
-        // ONE write action per tick (strict serialization): a Bounce /
-        // HumanLeg / CloseSuperseded fires ON SIGHT and the walk ends — the
-        // next tick re-derives the queue and continues. THE ONE EXCEPTION is
-        // the merge (BR#4934): gate-clean heads ride the phase-B/C batch
-        // (BR#4996) — classified here, landed back-to-back after the walk.
-        // A NOT-READY head no longer holds the queue (Ray, 2026-10-30: "PRs
-        // shouldn't be in the merge queue if they are not ready to merge —
-        // or, if they must be, we don't hold up the queue, obviously"):
-        // Skip/Note ADVANCES past it in the same walk. The identity gate
+        // Individual repairs do not end the window or discard ready work.
+        // Writes remain serialized under the lane lease. The identity gate
         // (BR#3181) is enforced at each write boundary: the close arm
         // below, and the batch landing (phase C).
         match gate {
@@ -3138,7 +3255,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // once, on the final merge of the batch (phase C tail).
                 ctx.note(&format!("PR #{pr} ({head_id}) not ready — {reason}; continuing to the next queued PR"));
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) not ready — advancing (the queue is not held)"));
-                continue;
+                return Ok(());
             }
             MergeAction::RerunGate { reason } => {
                 // STALE DEPLOY-HEALTH SELF-HEAL (2026-11-02 Ray directive —
@@ -3209,7 +3326,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
                 // the entry is a clock (waiting), never a defect: advance —
                 // the queue is not held by a stale red
-                continue;
+                return Ok(());
             }
             MergeAction::HumanLeg { reason } => {
                 // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
@@ -3248,7 +3365,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     }))?;
                     ctx.note(&format!("root-fix fast lane: filed the human-gate merge ask for PR #{pr} (circular deploy-health class)"));
                     log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
-                    release_if_idle(ctx, key, repo, base)?;
                     return Ok(());
                 }
                 // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
@@ -3262,7 +3378,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }))?;
                 ctx.note(&format!("filed human-leg ask for {head_id}"));
                 log(Some(key), &format!("human leg filed: {reason}"));
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             MergeAction::CloseSuperseded { reason } => {
@@ -3270,21 +3385,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if !ctx.write_allowed() {
                     ctx.note("identity gate: write leg withheld");
                     log(Some(key), &format!("IDENTITY GATE: close leg for PR #{pr} withheld — gh is NOT a worker-class credential (BR#3181); lease released for a worker gateway"));
-                    release_if_idle(ctx, key, repo, base)?;
                     return Ok(());
                 }
                 renew_lease(ctx, repo, base);
                 ctx.sh("gh", &["pr", "close", &pr.to_string(), "--repo", repo, "--comment", &trunc(&reason, 240)])?;
                 ctx.note(&format!("closed superseded PR #{pr}"));
                 log(Some(key), &format!("PR #{pr} closed (superseded card)"));
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             MergeAction::Carry { from_head, to_head, evidence, receipt } => {
                 renew_lease(ctx, repo, base);
-                // ONE action per tick (strict serialization): stamp the carry
-                // leg — the hub re-validates contiguity server-side and
-                // refuses a skipping leg — and end the walk. The merge itself
+                // Stamp the carry; the hub rejects a non-contiguous chain.
+                // Defer this PR only, retaining independent ready work. The merge itself
                 // re-gates next tick on the now-covered head: no bounce, no
                 // re-verify duty, no review re-ask (BR#4689 L1.4).
                 let ev = json!({
@@ -3295,7 +3407,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 if let Err(e) = ctx.mcp("train_event", ev) {
                     log(Some(key), &format!("PR #{pr} carry stamp FAILED ({e}) — the head stays uncovered this tick; next tick re-probes"));
                     ctx.note(&format!("carry stamp failed for PR #{pr}"));
-                    release_if_idle(ctx, key, repo, base)?;
                     return Ok(());
                 }
                 ctx.note(&format!("carried verdict across mechanical head move PR #{pr} {from_head}→{to_head}"));
@@ -3307,7 +3418,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         t = &to_head[..to_head.len().min(9)],
                     ),
                 );
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             MergeAction::Bounce { defect, bounce_kind } => {
@@ -3346,7 +3456,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     _ => defect.clone(),
                 };
                 log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}"));
-                release_if_idle(ctx, key, repo, base)?;
                 return Ok(());
             }
             MergeAction::Merge { .. } => {
@@ -3363,10 +3472,40 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     head_sha: head_sha.clone(),
                     root_fix,
                 });
-                continue;
+                return Ok(());
             }
         }
+        })();
+        if let Err(error) = checked {
+            let lower = error.to_lowercase();
+            if lower.contains("403") || lower.contains("permission") || lower.contains("not authorized") {
+                ctx.operation_deadline = None;
+                return Err(error);
+            }
+            if let Some(entry) = qfacts.iter_mut().find(|entry| entry["id"] == head_id) {
+                entry["cls"] = json!("waiting");
+                entry["error"] = json!(trunc(&error, 240));
+            } else {
+                qfacts.push(json!({ "id": head_id, "cls": "waiting", "error": trunc(&error, 240) }));
+            }
+            ctx.note(&format!("Could not check {head_id}; continuing other ready changes"));
+            log(Some(key), &format!("Could not check {head_id}: {}; other ready changes can continue", trunc(&error, 240)));
+        }
     }
+    ctx.operation_deadline = None;
+    let mut scan = if visited.len() == queue.len() { QueueScan::Complete } else {
+        visited.last().map(|&qi| QueueScan::Checking { after_id: vstr(&queue[qi], "id").unwrap_or("").to_string() })
+            .unwrap_or(previous_scan)
+    };
+    // Unvisited entries are waiting for a fresh check, never implicitly ready
+    // from a previous pass. Keep the public facts and batch in queue rank order.
+    for entry in &queue {
+        let id = vstr(entry, "id").unwrap_or("");
+        if !qfacts.iter().any(|fact| fact["id"].as_str() == Some(id)) {
+            qfacts.push(json!({ "id": id, "cls": "waiting" }));
+        }
+    }
+    qfacts.sort_by_key(|fact| queue.iter().position(|entry| entry["id"] == fact["id"]).unwrap_or(usize::MAX));
     // BR#5114: stamp this walk's per-entry verdicts (rank order preserved —
     // collected as the walk touched them) so the panel's queue blocks show
     // the truth of this pass: which entries are ready (the next batch) and
@@ -3387,9 +3526,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     let mut batch_deferred_log: Option<String> = None;
     let mut batch_selected_log: Option<(usize, String)> = None;
     if !candidates.is_empty() {
+        ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
+        let mut last_file_check = None;
         let mut clean: Vec<bool> = vec![true; candidates.len()];
         let mut file_sets: Vec<crate::train_gate::FileSet> = Vec::with_capacity(candidates.len());
         for (i, c) in candidates.iter().enumerate() {
+            if ctx.operation_budget(SCAN_BUDGET).is_ok() { last_file_check = Some(c.head_id.clone()); }
             match ctx.pr_file_set(base, c.pr, &c.head_sha) {
                 Ok(set) => file_sets.push(set),
                 Err(e) => {
@@ -3414,7 +3556,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
             }
         }
+        if ctx.operation_budget(SCAN_BUDGET).is_err() {
+            if let Some(after_id) = last_file_check { scan = QueueScan::Checking { after_id }; }
+        }
+        ctx.operation_deadline = None;
         batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
+        batch.sort_by_key(|&i| candidates[i].qi);
         if batch.len() < candidates.len() {
             let dropped: Vec<String> = candidates
                 .iter()
@@ -3437,7 +3584,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // the loud STALLED lane/banner off it (freshness-guarded, same law as
         // base_state); the next stamp after a landing omits it, which clears
         // the state by itself.
-        let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state });
+        let mut qf = json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state, "scan": scan });
         if !conflict_pairs_prs.is_empty() {
             qf.as_object_mut().unwrap().insert("conflict_pairs".into(), json!(conflict_pairs_prs));
         }
@@ -3453,7 +3600,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }),
             );
         }
-        let _ = ctx.mcp("train_queue_facts", qf);
+        ctx.mcp("train_queue_facts", qf)?;
         // BR#5376: the ONE-per-episode stall alarm — fired under the walk's
         // lease (the handler requires it), only when a previous settle
         // crossed the threshold. The hub renders the STALLED banner and
@@ -3502,6 +3649,42 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let head_id = cand.head_id.as_str();
         let pr = cand.pr;
         let head_sha = cand.head_sha.as_str();
+        if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to merge; no further writes".into()); }
+        ctx.operation_deadline = Some(Instant::now() + Duration::from_secs(60));
+        let mut landing_base = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict.clone() };
+        let mut landing_red = base_class.red.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        if ctx.base_probe {
+            let (sha, age) = ctx.base_tip_facts(repo, base)?;
+            let runs = ctx.check_runs(repo, &sha);
+            let mut live = classify_base_check_runs(&runs, &required);
+            let own_batch_still_running = pass_merged > 0 && sha == tip_sha && live.verdict == MainVerdict::Unsettled;
+            let matching_root_fix = cand.root_fix && sha == probed_base_sha && live.verdict == MainVerdict::Red;
+            if live.verdict != MainVerdict::Green && !own_batch_still_running && !matching_root_fix {
+                ctx.operation_deadline = None;
+                reconcile_base_deploy(ctx, lane, key, repo, base, &sha, age, &mut live, &required, 0)?;
+                if pass_merged > 0 && sha == tip_sha && live.verdict == MainVerdict::Red {
+                    ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": sha, "checks": runs }))?;
+                    return Ok(());
+                }
+                log(Some(key), "Main has not passed its current checks; stopping further merges");
+                break;
+            }
+            landing_red = live.red.iter().map(|r| r.name.clone()).collect();
+            landing_base = if own_batch_still_running { MainVerdict::Green } else { live.verdict };
+        }
+        let ready = candidate_ready_to_land(ctx, repo, base, cand, landing_base, &landing_red);
+        ctx.operation_deadline = None;
+        match ready {
+            Ok(true) => {},
+            Ok(false) => {
+                log(Some(key), &format!("PR #{pr}: its review or checks changed; leaving it for a fresh check and continuing other changes"));
+                continue;
+            }
+            Err(error) => {
+                log(Some(key), &format!("PR #{pr}: could not recheck its review and tests ({}); checking other changes", trunc(&error, 240)));
+                continue;
+            }
+        }
         // BR#4934 cap: at burst_max merges per pass the drain settles even
         // with batch members left (drain_burst_decision: Settle, not Drain).
         if pass_merged > 0 && drain_burst_decision(pass_merged, burst_cap, true, false) != DrainDecision::Drain {
@@ -3531,7 +3714,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // main-red. Carry the substance verdict across a clean base update,
         // but never carry CI: the integrated head must run its actual checks.
         // Re-evaluate for EACH member, including after this pass advanced base.
-        match admit_current_base(ctx, repo, base, cand)? {
+        if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to prepare this PR; no further writes".into()); }
+        let admission = match admit_current_base(ctx, repo, base, cand) {
+            Ok(admission) => admission,
+            Err(error) => {
+                log(Some(key), &format!("PR #{pr}: could not finish its current-main check ({}); checking the other changes", trunc(&error, 240)));
+                continue;
+            }
+        };
+        match admission {
             IntegrationAdmission::Current => {},
             IntegrationAdmission::RepairDispatched => {
                 for entry in &mut qfacts {
@@ -3555,7 +3746,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 continue;
             }
         }
-        renew_lease(ctx, repo, base);
+        if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission immediately before merging; no further writes".into()); }
         // BR#5376: a remembered working method (the repo refused the
         // configured one earlier) goes straight there — no wasted refusal
         // per member.
@@ -3564,11 +3755,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             None => method_flag_for(&ctx.method),
         };
         ctx.tick_attempted = true;
-        let mut merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
+        let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
+        let mut merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
         if merge_res.is_err() && cand.root_fix {
-            if let Ok(out) = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin", "--match-head-commit", head_sha]) {
-                merge_res = Ok(out);
-            }
+            let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin", "--match-head-commit", head_sha]);
+            merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
         }
         if pass_merged > 0 {
             for wait_secs in [3u64, 5, 8] {
@@ -3587,7 +3778,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 renew_lease(ctx, repo, base);
                 std::thread::sleep(Duration::from_secs(wait_secs));
                 renew_lease(ctx, repo, base);
-                merge_res = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
+                let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
+                merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
             }
         }
         if let Err(err) = merge_res {
@@ -4734,6 +4926,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
         return Err("no pairing — the gateway leg needs `bridge pair` (or a signed-in desktop app)".into());
     }
     Ok(Ctx {
+        operation_deadline: None,
         http: reqwest::blocking::Client::builder().timeout(RPC_TIMEOUT).build().map_err(|e| e.to_string())?,
         hub: hub.trim_end_matches('/').to_string(),
         token,
@@ -6008,9 +6201,13 @@ mod tests {
     /// Spawns a one-thread JSON-RPC mock. Returns (base_url, recorded calls).
     /// Each recorded call is the full `params` object of the tools/call.
     fn mock_hub(script: Script) -> (String, std::sync::Arc<Mutex<Vec<Value>>>) {
+        let script = Mutex::new(VecDeque::from(script));
+        mock_hub_with(move |_| script.lock().unwrap().pop_front().unwrap_or_else(|| Err("mock script exhausted".into())))
+    }
+
+    fn mock_hub_with(handler: impl Fn(&Value) -> Result<Value, String> + Send + 'static) -> (String, std::sync::Arc<Mutex<Vec<Value>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let script = std::sync::Arc::new(Mutex::new(VecDeque::from(script)));
         let calls: std::sync::Arc<Mutex<Vec<Value>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
         let calls_t = calls.clone();
         std::thread::spawn(move || {
@@ -6045,11 +6242,9 @@ mod tests {
                 let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 calls_t.lock().unwrap().push(params.clone());
-                let next = script.lock().unwrap().pop_front();
-                let payload = match next {
-                    Some(Ok(v)) => json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": v.to_string() }], "isError": false } }),
-                    Some(Err(msg)) => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32000, "message": msg } }),
-                    None => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32000, "message": "mock script exhausted" } }),
+                let payload = match handler(&params) {
+                    Ok(v) => json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": v.to_string() }], "isError": false } }),
+                    Err(msg) => json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32000, "message": msg } }),
                 };
                 let payload = payload.to_string();
                 let resp = format!(
@@ -6070,6 +6265,7 @@ mod tests {
 
     fn test_ctx(hub: &str) -> Ctx {
         Ctx {
+            operation_deadline: None,
             http: reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
             hub: hub.to_string(),
             token: "test-token".into(),
@@ -6218,6 +6414,7 @@ mod tests {
             } })),                                                    // get_artefact
             ok(json!({ "ok": true })),                                // renew_lease (bounce arm)
             ok(json!({ "ok": true })),                                // train_event bounced
+            ok(json!({ "ok": true })),                                // publish checked entries and saved position
             ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
             ok(json!({ "note": "lease released — idle" })),           // release
         ]);
@@ -6227,8 +6424,8 @@ mod tests {
         let names: Vec<String> = recorded.iter().map(call_name).collect();
         assert_eq!(
             names,
-            vec!["train_lease", "get_artefact", "train_lease", "train_event", "train_status", "train_lease"],
-            "the stamp-less arm must bounce (renew → train_event) and end the tick, got {:?}",
+            vec!["train_lease", "get_artefact", "train_lease", "train_event", "train_queue_facts", "train_status", "train_lease"],
+            "the stamp-less arm must bounce and publish progress before releasing, got {:?}",
             names
         );
         let ev = call_args(&recorded[3]);
@@ -6566,6 +6763,7 @@ mod tests {
         /// git in `workdir` and touch nothing else).
         fn ctx(&self) -> Ctx {
             Ctx {
+                operation_deadline: None,
                 http: reqwest::blocking::Client::new(),
                 hub: String::new(),
                 token: String::new(),
@@ -6613,6 +6811,269 @@ mod tests {
     }
 
     #[test]
+    fn saved_scan_uses_the_shared_contract_and_handles_queue_changes_br7736() {
+        let fixture: Vec<Value> = serde_json::from_str(include_str!("../../../contracts/fixtures/train-scan.json")).unwrap();
+        let queue = vec![json!({"id":"BR#1"}), json!({"id":"BR#2"}), json!({"id":"BR#3"})];
+        for value in fixture {
+            let scan: QueueScan = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&scan).unwrap(), value);
+            assert_eq!(queue_scan_order(&queue, &scan), if matches!(scan, QueueScan::Complete) {vec![0,1,2]} else {vec![2,0,1]});
+            assert!(queue_scan_order(&[], &scan).is_empty());
+        }
+        assert_eq!(queue_scan_order(&queue, &QueueScan::Checking{after_id:"removed-task".into()}),vec![0,1,2]);
+    }
+
+    #[test]
+    fn batch_progress_and_write_guards_survive_failures_br7736() {
+        for scenario in ["lookup", "repair", "revoked", "main-red", "lost-reply", "unknown-reply", "restart"] {
+            let repo = Repo::new(scenario);
+            let head = repo.side_commit("ready", "reviewed change");
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+            let base = repo.git(&["rev-parse", "main"]);
+            let card = json!({ "id": "BR#2", "status": "blocked", "meta": {
+                "prs": [{ "repo": "o/r", "number": 2, "head_sha_at_acceptance": head }],
+                "merge_train": { "state": "queued", "pr": 2 }
+            } });
+            let card_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reads = card_reads.clone();
+            let (hub, calls) = mock_hub_with(move |params| {
+                let args = call_args(params);
+                match call_name(params).as_str() {
+                    "get_artefact" if args["id"] == "BR#2" => {
+                        let mut current = card.clone();
+                        if scenario == "revoked" && reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                            current["meta"]["prs"][0]["head_sha_at_acceptance"] = json!(BOGUS_SHA);
+                        }
+                        Ok(current)
+                    }
+                    "get_artefact" if scenario == "repair" => Ok(json!({ "id": "BR#3", "status": "blocked", "meta": {
+                        "prs": [{ "repo": "o/r", "number": 0 }], "merge_train": { "state": "queued", "pr": 3 }
+                    } })),
+                    "get_artefact" => Err("unrelated task lookup failed".into()),
+                    "train_status" => Ok(json!({"lanes":[{"lane":"o/r@main","currently":null}]})),
+                    "train_history" => Ok(json!({"events":[]})),
+                    "train_ci" => Ok(json!({"decided":"pending"})),
+                    "train_lease" | "train_queue_facts" | "train_event" => Ok(json!({})),
+                    other => panic!("unexpected hub operation {other}"),
+                }
+            });
+            let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let write_count = writes.clone();
+            let merged = std::sync::Arc::new(AtomicBool::new(false));
+            let merged_c = merged.clone();
+            let base_reads = std::sync::atomic::AtomicUsize::new(0);
+            let mut ctx = test_ctx(&hub);
+            ctx.workdir = repo.dir.to_string_lossy().to_string();
+            ctx.base_probe = true;
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                if cmd != "gh" { return None; }
+                if args.first() == Some(&"pr") {
+                    if args[1] == "merge" {
+                        write_count.fetch_add(1, Ordering::SeqCst);
+                        merged_c.store(true, Ordering::SeqCst);
+                        return Some(if matches!(scenario, "lost-reply" | "unknown-reply") { Err("reply was lost".into()) } else { Ok(String::new()) });
+                    }
+                    if scenario == "unknown-reply" && merged_c.load(Ordering::SeqCst) { return Some(Err("GitHub cannot be reached".into())); }
+                    let done = merged_c.load(Ordering::SeqCst);
+                    return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
+                        "mergeable":"MERGEABLE", "mergeStateStatus":"CLEAN",
+                        "mergeCommit": if done { json!({"oid":head}) } else { Value::Null }
+                    }).to_string()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint == "repos/o/r" { return Some(Ok(json!({"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}).to_string())); }
+                if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/commits/main") {
+                    base_reads.fetch_add(1, Ordering::SeqCst);
+                    return Some(Ok(json!({"sha":base,"committed_at":crate::logging::iso(now_ms())}).to_string()));
+                }
+                if endpoint.contains("/check-runs?") {
+                    let red = scenario == "main-red" && endpoint.contains(&base) && base_reads.load(Ordering::SeqCst) > 1;
+                    return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                panic!("unexpected gh command {args:?}");
+            }));
+            let mut queue = vec![json!({"id":"BR#3"}), json!({"id":"BR#2"})];
+            if scenario == "restart" {
+                queue = (0..SCAN_MAX_ENTRIES + 1).map(|i| json!({"id":format!("BR#{}",100+i)})).collect();
+                queue.push(json!({"id":"BR#2"}));
+            }
+            let mut lane = json!({"queue":queue,"required_workflows":["Test"]});
+            let mut result = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10);
+            if scenario == "restart" {
+                assert!(result.is_ok());
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                let saved = calls.lock().unwrap().iter().filter(|p| call_name(p) == "train_queue_facts")
+                    .last().map(|p| call_args(p)["scan"].clone()).unwrap();
+                assert_eq!(saved, json!({"phase":"checking","after_id":format!("BR#{}",100+SCAN_MAX_ENTRIES-1)}));
+                lane["queue_facts"] = json!({"scan":saved});
+                let mut restarted = test_ctx(&hub);
+                restarted.workdir = ctx.workdir.clone();
+                restarted.base_probe = true;
+                restarted.sh_mock = ctx.sh_mock.clone();
+                result = drive_lane_inner(&mut restarted, &lane, "o/r@main", "o/r", "main", 60_000, 10);
+            }
+            if scenario == "unknown-reply" {
+                assert!(result.unwrap_err().contains("Cannot establish whether"));
+                assert_eq!(writes.load(Ordering::SeqCst), 1, "unknown write must never be repeated");
+            } else {
+                assert!(result.is_ok(), "{scenario}: {result:?}");
+                let should_merge = !matches!(scenario, "revoked" | "main-red");
+                assert_eq!(writes.load(Ordering::SeqCst), usize::from(should_merge), "{scenario}");
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.iter().any(|p| call_name(p) == "train_ci"), should_merge, "successful work still owes deployment checks");
+                if scenario == "repair" { assert!(calls.iter().any(|p| call_name(p) == "train_event" && call_args(p)["kind"] == "bounced")); }
+                if scenario == "main-red" { assert!(calls.iter().any(|p| call_name(p) == "train_queue_facts" && call_args(p).pointer("/base_state/verdict") == Some(&json!("red")))); }
+            }
+        }
+    }
+
+    #[test]
+    fn tested_batch_merges_in_order_and_stops_if_main_turns_red_br7736() {
+        for red_after_first in [false, true] {
+            let repo = Repo::new(if red_after_first { "batch-red" } else { "batch-green" });
+            let base = repo.git(&["rev-parse", "main"]);
+            let first = repo.side_commit("first", "first reviewed change");
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
+            repo.git(&["checkout", "-q", "main"]);
+            repo.git(&["merge", "--no-ff", "-qm", "tested first merge", "first"]);
+            let first_merge = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["checkout", "-qb", "second"]);
+            std::fs::write(repo.dir.join("second.txt"), "second reviewed change\n").unwrap();
+            repo.git(&["add", "second.txt"]);
+            repo.git(&["commit", "-qm", "second tested change includes the first merge"]);
+            let second = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+            repo.git(&["checkout", "-q", "main"]);
+            repo.git(&["reset", "--hard", &base]);
+            let heads = [first, second];
+            let cards = heads.iter().enumerate().map(|(i, head)| json!({"id":format!("BR#{}",i+1),"status":"blocked","meta":{
+                "prs":[{"repo":"o/r","number":i+1,"head_sha_at_acceptance":head}],"merge_train":{"state":"queued","pr":i+1}
+            }})).collect::<Vec<_>>();
+            let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+                "get_artefact" => Ok(cards[if call_args(params)["id"] == "BR#1" {0} else {1}].clone()),
+                "train_history" => Ok(json!({"events":[]})),
+                "train_ci" => Ok(json!({"decided":if red_after_first {"stopped"} else {"pending"}})),
+                "train_lease" | "train_queue_facts" | "train_event" => Ok(json!({})),
+                other => panic!("unexpected hub command {other}"),
+            });
+            let landed = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let landed_c = landed.clone();
+            let current_base = Mutex::new(base);
+            let dir = repo.dir.clone();
+            let mut ctx = test_ctx(&hub);
+            ctx.workdir = repo.dir.to_string_lossy().to_string();
+            ctx.base_probe = true;
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                if cmd != "gh" { return None; }
+                if args.first() == Some(&"pr") {
+                    let i = args[2].parse::<usize>().unwrap()-1;
+                    let merge_sha = if i == 0 { &first_merge } else { &heads[1] };
+                    if args[1] == "merge" {
+                        assert!(Command::new("git").args(["push","-q","origin",&format!("{merge_sha}:main")]).current_dir(&dir).status().unwrap().success());
+                        landed_c.lock().unwrap().push(i+1);
+                        *current_base.lock().unwrap() = merge_sha.clone();
+                        return Some(Ok(String::new()));
+                    }
+                    let done = landed_c.lock().unwrap().contains(&(i+1));
+                    return Some(Ok(json!({"state":if done {"MERGED"} else {"OPEN"},"headRefOid":heads[i],
+                        "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","mergeCommit":if done {json!({"oid":merge_sha})} else {Value::Null}}).to_string()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint == "repos/o/r" { return Some(Ok(json!({"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}).to_string())); }
+                if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/commits/main") { return Some(Ok(json!({"sha":*current_base.lock().unwrap(),"committed_at":crate::logging::iso(now_ms())}).to_string())); }
+                if endpoint.contains("/check-runs?") {
+                    let red = red_after_first && endpoint.contains(&first_merge);
+                    return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                panic!("unexpected gh command {args:?}");
+            }));
+            drive_lane_inner(&mut ctx, &json!({"queue":[{"id":"BR#1"},{"id":"BR#2"}],"required_workflows":["Test"]}),
+                "o/r@main","o/r","main",60_000,10).unwrap();
+            assert_eq!(*landed.lock().unwrap(), if red_after_first {vec![1]} else {vec![1,2]});
+            let calls = calls.lock().unwrap();
+            let receipts = calls.iter().filter(|p| call_name(p)=="train_event" && call_args(p)["kind"]=="merged").count();
+            assert_eq!(receipts, if red_after_first {1} else {2});
+            assert_eq!(calls.iter().filter(|p| call_name(p)=="train_ci").count(),1,"one final deployment check for the batch");
+        }
+    }
+
+    #[test]
+    fn train_commands_drain_large_output_and_bound_descendants_br7736() {
+        let mut output = Command::new("sh");
+        output.args(["-c", "dd if=/dev/zero bs=262144 count=1 2>/dev/null"]);
+        let result = train_command_output(output, Duration::from_secs(3)).unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout.len(), 256 * 1024);
+        let mut hung = Command::new("sh");
+        hung.args(["-c", "sleep 30 & wait"]);
+        let started = Instant::now();
+        assert!(train_command_output(hung, Duration::from_millis(100)).unwrap_err().contains("inspect GitHub"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ready_candidate_survives_an_unrelated_task_lookup_failure_br7736() {
+        let repo = Repo::new("unrelated-read-failure");
+        let current = repo.side_commit("ready", "reviewed change");
+        repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+        let base = repo.git(&["rev-parse", "main"]);
+        let card = json!({ "id": "BR#2", "status": "blocked", "meta": {
+            "prs": [{ "repo": "o/r", "number": 2, "head_sha_at_acceptance": current }],
+            "merge_train": { "state": "queued", "pr": 2 }
+        } });
+        let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+            "get_artefact" if call_args(params)["id"] == "BR#2" => Ok(card.clone()),
+            "get_artefact" => Err("unrelated task lookup timed out".into()),
+            "train_history" => Ok(json!({"events":[]})),
+            "train_ci" => Ok(json!({"decided":"pending"})),
+            "train_lease" | "train_queue_facts" | "train_event" => Ok(json!({})),
+            other => panic!("unexpected hub command {other}"),
+        });
+        let mut ctx = test_ctx(&hub);
+        ctx.workdir = repo.dir.to_string_lossy().to_string();
+        ctx.base_probe = true;
+        let merged = std::sync::Arc::new(AtomicBool::new(false));
+        let merged_c = merged.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            if cmd != "gh" { return None; }
+            if args.first() == Some(&"pr") {
+                if args[1] == "merge" {
+                    assert_eq!(args[2], "2");
+                    merged_c.store(true, Ordering::SeqCst);
+                    return Some(Ok(String::new()));
+                }
+                let done = merged_c.load(Ordering::SeqCst);
+                return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" },
+                    "headRefOid": current, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                    "mergeCommit": if done { json!({ "oid": current }) } else { Value::Null }
+                }).to_string()));
+            }
+            let endpoint = args.get(1).copied().unwrap_or("");
+            if endpoint == "repos/o/r" { return Some(Ok(json!({ "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true }).to_string())); }
+            if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
+            if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
+            if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
+            if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+            if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{ "verified": true }]).to_string())); }
+            panic!("unexpected gh command {args:?}");
+        }));
+        let result = drive_lane_inner(&mut ctx,
+            &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#2" }, { "id": "BR#3" }] }),
+            "o/r@main", "o/r", "main", 60_000, 10);
+        assert!(result.is_ok(), "unrelated task read discarded a ready PR: {result:?}");
+        assert!(merged.load(Ordering::SeqCst), "ready PR must merge despite a later lookup failure");
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged"));
+        assert!(calls.iter().any(|c| call_name(c) == "train_ci"), "the merged batch still owes its deployment checks");
+    }
+
+    #[test]
     fn deferred_integration_never_blocks_an_independent_current_candidate_br7500() {
         for worker_owned in [true, false] {
             let repo = Repo::new(if worker_owned { "batch-ci" } else { "batch-repair" });
@@ -6636,12 +7097,14 @@ mod tests {
             let card = |pr: i64, head: &str| json!({ "id": format!("BR#{pr}"), "status": "blocked", "meta": {
                 "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": head }], "merge_train": { "state": "queued", "pr": pr }
             } });
-            let (hub, calls) = mock_hub(vec![
-                ok(json!({})), // fresh base facts precede candidate classification
-                ok(card(1, &stale)), ok(card(2, &current)), ok(json!({})), // classify and publish batch
-                ok(json!({})), ok(json!({})), ok(json!({})), // renew, carry/bounce first, publish its hold
-                ok(json!({})), ok(json!({})), ok(json!({})), ok(json!({ "events": [] })), ok(json!({ "decided": "pending" })), // merge second, ancestry and settle
-            ]);
+            let cards = [card(1, &stale), card(2, &current)];
+            let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+                "get_artefact" => Ok(cards[if call_args(params)["id"] == "BR#1" {0} else {1}].clone()),
+                "train_history" => Ok(json!({"events":[]})),
+                "train_ci" => Ok(json!({"decided":"pending"})),
+                "train_lease" | "train_queue_facts" | "train_event" | "train_carry" => Ok(json!({})),
+                other => panic!("unexpected hub command {other}"),
+            });
             let mut ctx = test_ctx(&hub);
             ctx.workdir = repo.dir.to_string_lossy().to_string();
             ctx.base_probe = true;
@@ -6954,12 +7417,11 @@ mod tests {
         }
     }
 
-    /// A fake `gh` on PATH: logs every invocation to a file, answers
+    /// A fake `gh` scoped to one Ctx (never process-global PATH): logs calls,
     /// `pr view … --jq .state` with the scripted state, succeeds everything.
     struct FakeGh {
         dir: PathBuf,
         log: PathBuf,
-        orig_path: String,
     }
     impl FakeGh {
         fn new(state: &str) -> Self {
@@ -6980,20 +7442,23 @@ mod tests {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let orig_path = std::env::var("PATH").unwrap_or_default();
-            std::env::set_var("PATH", format!("{}:{}", dir.display(), orig_path));
-            Self { dir, log, orig_path }
+            Self { dir, log }
+        }
+        fn attach(&self, ctx: &mut Ctx) {
+            let bin = self.dir.join("gh");
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                if cmd != "gh" { return None; }
+                let output = Command::new(&bin).args(args).output().map_err(|e| e.to_string());
+                Some(output.and_then(|out| if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).trim().into()) }
+                    else { Err(format!("fake gh failed: {}", out.status)) }))
+            }));
         }
         fn calls(&self) -> Vec<String> {
             std::fs::read_to_string(&self.log).unwrap_or_default().lines().map(String::from).collect()
         }
-        fn clear(&self) {
-            let _ = std::fs::remove_file(&self.log);
-        }
     }
     impl Drop for FakeGh {
         fn drop(&mut self) {
-            std::env::set_var("PATH", &self.orig_path);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -7307,7 +7772,8 @@ mod tests {
             let (hub, calls) = mock_hub(if reject_publication {
                 vec![Err("health publication unavailable".into())]
             } else {
-                vec![ok(json!({})), ok(json!({})), Err("candidate fetch unavailable".into())]
+                vec![ok(json!({})), ok(json!({})), Err("candidate fetch unavailable".into()),
+                    ok(json!({})), ok(json!({"lanes":[{"lane":"o/r@main","currently":null}]})), ok(json!({}))]
             });
             let mut ctx = test_ctx(&hub);
             ctx.base_probe = true;
@@ -7330,16 +7796,17 @@ mod tests {
             }));
             let lane = json!({"queue":[{"id":"BR#1"}],"required_workflows":["deploy / Deploy to dev"],
                 "queue_facts":{"base_state":{"tip_sha":"old"}}});
-            let error = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10).unwrap_err();
+            let result = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10);
             let calls = calls.lock().unwrap();
             assert_eq!(call_name(&calls[0]), "train_queue_facts", "fresh main evidence must not wait behind candidate work");
             assert_eq!(call_args(&calls[0]).pointer("/base_state/tip_sha"), Some(&json!(tip)));
             if reject_publication {
-                assert!(error.contains("health publication unavailable"));
+                assert!(result.unwrap_err().contains("health publication unavailable"));
                 assert_eq!(calls.len(), 1, "a failed publication must not admit observation or candidate work");
             } else {
-                assert!(error.contains("candidate fetch unavailable"));
-                assert_eq!(calls.iter().map(call_name).collect::<Vec<_>>(), ["train_queue_facts", "train_observe_deploy", "get_artefact"]);
+                assert!(result.is_ok(), "one failed candidate must not discard published health");
+                assert_eq!(calls.iter().map(call_name).collect::<Vec<_>>(), ["train_queue_facts", "train_observe_deploy", "get_artefact", "train_queue_facts", "train_status", "train_lease"]);
+                assert!(call_args(&calls[3])["entries"][0]["error"].as_str().unwrap().contains("candidate fetch unavailable"));
                 assert_eq!(call_args(&calls[1]).pointer("/observation/tip_sha"), Some(&json!(tip)));
             }
         }
@@ -7507,11 +7974,14 @@ mod tests {
             ok(json!({ "ok": true })),                   // fresh base facts before observation
             ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
-            ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
             ok(json!({ "ok": true })),                   // train_queue_facts (ready)
+            ok(json!({ "ok": true })),                   // renew before fresh checks
+            ok(card_val.clone()),                        // fresh acceptance before merge
+            ok(json!({ "ok": true })),                   // renew before current-base preparation
             ok(json!({ "ok": true })),                   // renew_lease (before merge)
             ok(json!({ "ok": true })),                   // train_event (merged)
             ok(json!({ "ok": true })),                   // renew_lease (burst_settle_feed)
+            ok(json!({ "events": [] })),                 // settled ancestry ledger
             ok(json!({ "decided": "pending" })),         // train_ci (burst_settle_feed)
         ]);
 
@@ -7734,6 +8204,7 @@ mod tests {
             ok(json!({ "note": "lease released — idle" })), // release
         ]);
         let mut ctx = test_ctx(&hub);
+        gh.attach(&mut ctx);
         drive_lane_inner(&mut ctx, &lane(99, "BR#99"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000, 10).unwrap();
         let recorded = calls.lock().unwrap();
         let names: Vec<String> = recorded.iter().map(call_name).collect();
@@ -7760,6 +8231,7 @@ mod tests {
             ok(json!({ "note": "lease released — idle" })),
         ]);
         let mut ctx = test_ctx(&hub);
+        gh.attach(&mut ctx);
         drive_lane_inner(&mut ctx, &lane(98, "BR#98"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000, 10).unwrap();
         let recorded = calls.lock().unwrap();
         let ev = call_args(&recorded[1]);
@@ -7780,6 +8252,7 @@ mod tests {
             ok(json!({ "note": "lease released — idle" })),
         ]);
         let mut ctx = test_ctx(&hub);
+        gh.attach(&mut ctx);
         drive_lane_inner(&mut ctx, &lane(97, "BR#97"), "state-vector/bridge@main", repo_name, "main", 30 * 60_000, 10).unwrap();
         let names: Vec<String> = calls.lock().unwrap().iter().map(call_name).collect();
         assert_eq!(names, vec!["train_queue_facts", "train_status", "train_lease"], "a failed probe defers: no renew, no close, no event — only the idle publish + release");

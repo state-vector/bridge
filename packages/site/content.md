@@ -38,6 +38,11 @@ run board aggregation synchronously. Indexed current-review lookups preserve exa
 review authority without repeatedly scanning unrelated retained history.
 Merge executors publish current-base health before deployment observations and
 candidate checks, so a stuck candidate cannot suppress newly observed main health.
+Backlog checks run in short steps with a saved position, so a failed lookup or
+one PR needing repair cannot discard other ready changes. The train rechecks
+review, tests and main health before each merge, checks GitHub after a lost
+merge reply, stops adding changes if main fails, and checks the deployment
+after each batch.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 

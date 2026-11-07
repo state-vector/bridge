@@ -2191,6 +2191,16 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+The train checks the backlog in short, saved steps. One failed task lookup,
+outdated PR, or unfinished GitHub check cannot discard other ready changes.
+Each checking step lasts at most 30 seconds and visits at most 32 tasks; its
+saved position survives a restart or a change of server. The train rechecks
+the exact reviewed version, signatures, tests, current main and its permission
+to merge immediately before writing. If a merge reply is lost, it checks
+GitHub before trying again. Compatible changes merge in queue order; a new
+failure on main stops further merges, and each batch still needs deployment
+checks before it is considered complete.
+
 Merge responses are acknowledged immediately in the line status: a recorded
 response waits for GitHub reconciliation; an observed merged PR waits for
 deployment verification. Neither keeps asking for the same merge. PR blocks
