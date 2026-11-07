@@ -34,6 +34,7 @@ enum Recovery {
 enum Recovered { Running(InFlight), Final(Ownership, FinalWork) }
 type Registry = Pipeline<Input, InFlight, FinalWork>;
 type Config = Arc<Mutex<GatewayReadinessData>>;
+const CONTROLLER_LOCK_FILE: &str = ".bridge/gateway-runtime.lock";
 
 fn config(shared: &Config) -> DispatchConfig { let mut cfg = shared.lock().expect("gateway readiness poisoned").cfg.clone(); cfg.url = cfg.url.trim_end_matches('/').into(); cfg }
 pub(super) fn root(cfg: &DispatchConfig) -> Result<PathBuf, String> {
@@ -284,6 +285,51 @@ fn reservation_observable(record: &Record) -> bool {
     matches!(record.owner, Ownership::Reservation { .. }) && matches!(record.work, Work::Unstarted { .. }) && record.process.is_none()
 }
 
+fn reservation_release(cfg: &DispatchConfig, record: &Record) -> Result<Released, String> {
+    if !reservation_observable(record) || record.validate().is_err()
+        || record.url != cfg.url.trim_end_matches('/') || cfg.label.as_deref() != Some(record.host.as_str()) {
+        return Err("gate: reservation observation lacks exact unstarted host/owner proof".into());
+    }
+    let task = mcp_call(cfg, &mut 0, "get_artefact", json!({"id":record.ticket().task_id}))?;
+    Released::reservation_reconciled(&record.owner, &task)
+}
+
+/// Offline bootstrap for an old controller that cannot reconsider its durable
+/// holds. The SAME controller flock excludes live/restarting controllers; only
+/// ended, rejected, never-launched reservations are eligible. Default is a drill.
+pub(super) fn reconcile_reservations(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
+    reconcile_reservations_locked(cfg, apply, task, &home.join(CONTROLLER_LOCK_FILE))
+}
+fn reconcile_reservations_locked(cfg: &DispatchConfig, apply: bool, task: Option<&str>, lock_path: &Path) -> Result<serde_json::Value, String> {
+    let _lock = worker_session::Lock::acquire(lock_path)?.ok_or("gate: stop only the gateway controller before reconciling reservations; live controller lock is held")?;
+    let terminal = terminal_root(cfg)?;
+    let host = cfg.label.as_deref().ok_or("gateway host missing")?;
+    let records = journal::pending(&terminal, host, cfg.url.trim_end_matches('/'))?;
+    let mut eligible = Vec::new(); let mut waiting = Vec::new(); let mut protected = 0;
+    for record in records {
+        if task.is_some_and(|task| task != record.ticket().task_id) { continue; }
+        if !reservation_observable(&record) || !matches!(record.disposition, Disposition::Rejected { .. }) { protected += 1; continue; }
+        match reservation_release(cfg, &record) {
+            Ok(_) => {
+                if apply {
+                    // Retain the original rejected record as evidence before
+                    // using the normal exact-owner cleanup. No outcome is made up.
+                    let archive = root(cfg)?.join("reconciled-reservations").join(record.name());
+                    if !archive.exists() { journal::write_file(&archive, &serde_json::to_vec(&record).map_err(|e| e.to_string())?)?; }
+                    reservation_release(cfg, &record)?; // fresh claim facts, never a cached authorization
+                    remove_reservation(cfg, record.ticket())?;
+                    journal::remove(&terminal, &record)?;
+                }
+                eligible.push(json!({"owner":record.owner,"applied":apply}));
+            },
+            Err(error) => waiting.push(json!({"owner":record.owner,"reason":error})),
+        }
+    }
+    Ok(json!({"kind":"reservation_reconciliation","apply":apply,"eligible":eligible,"waiting":waiting,"protected":protected,
+        "note":"Only ended rejected unstarted local reservations are reconciled. Worker/WIP/attempt/unknown-effect records are never modified."}))
+}
+
 /// A rejected unstarted reservation is not an unknown writer/effect. Observe
 /// new hub-owned claim facts in the bounded finalizer pool; never repeat its
 /// cancel_start or turn an old failure into permission to launch a writer.
@@ -294,8 +340,7 @@ fn observe_reservation(shared: &Config, record: Record, report: Reporter) -> Fin
         return Finished::Held { value: FinalWork::Journal(record), reason: "gate: reservation observation lacks exact unstarted host/owner proof".into() };
     }
     let result = (|| -> Result<(), String> {
-        let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":record.ticket().task_id}))?;
-        let released = Released::reservation_reconciled(&record.owner, &task)?;
+        let released = reservation_release(&cfg, &record)?;
         // Only these exact old reservation/journal identities are retired.
         // Never touch a worktree, newer attempt, worker manifest, or hub state.
         remove_reservation(&cfg, record.ticket())?;
@@ -594,7 +639,7 @@ impl Controller {
 pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>, snap: SharedSnapshot) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
     std::fs::create_dir_all(home.join(".bridge")).map_err(|e| e.to_string())?;
-    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(home.join(".bridge/gateway-runtime.lock")).map_err(|e| e.to_string())?;
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(home.join(CONTROLLER_LOCK_FILE)).map_err(|e| e.to_string())?;
     #[cfg(unix)] {
         use std::os::fd::AsRawFd;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -725,6 +770,62 @@ pub(crate) mod tests {
         drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
     #[test]
+    fn offline_reservation_recovery_is_controller_fenced_read_only_by_default_and_exact() {
+        let hub=Hub::new(|request| {
+            assert_eq!(request["params"]["name"],"get_artefact","offline repair cannot replay a hub mutation");
+            let id=request["params"]["arguments"]["id"].as_str().unwrap();
+            assert!(matches!(id,"ended"|"owned"),"unknown writer/effect records must not enter reservation recovery");
+            Some(json!({"id":id,"status":if id=="ended" {"blocked"} else {"in_progress"},"meta":{"session":"original"}}))
+        });
+        let (cfg,ready,_)=fixture(&hub);
+        let record=|id:&str| Record { owner:Ownership::Reservation {ticket:Ticket {task_id:id.into(),session:"original".into()}},host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,
+            disposition:Disposition::Rejected {reason:"gate: historical cancellation held".into()},work:Work::Unstarted {reason:"never launched".into()} };
+        let ended=record("ended");let owned=record("owned");
+        let unknown=Record {owner:Ownership::Attempt {ticket:Ticket {task_id:"unknown".into(),session:"original".into()},host:cfg.label.clone().unwrap(),generation:1,attempt_id:"one".into()},
+            work:Work::UnknownWriter {reason:"unknown effect".into()},..record("unknown")};
+        let terminal=terminal_root(&cfg).unwrap();
+        for record in [&ended,&owned,&unknown] {journal::insert(&terminal,record.clone()).unwrap();}
+        let original=std::fs::read(terminal.join(ended.name())).unwrap();
+        let unknown_bytes=std::fs::read(terminal.join(unknown.name())).unwrap();
+        let newer=reservation_path(&cfg,&Ticket {task_id:"ended".into(),session:"new-owner".into()}).unwrap();
+        journal::write_file(&newer,b"new owner data").unwrap();
+        let lock_path=root(&cfg).unwrap().join("controller-test.lock");
+        let lock=worker_session::Lock::acquire(&lock_path).unwrap().unwrap();
+        assert!(reconcile_reservations_locked(&cfg,true,None,&lock_path).unwrap_err().contains("live controller lock is held"));
+        drop(lock);
+        let dry=reconcile_reservations_locked(&cfg,false,None,&lock_path).unwrap();
+        assert_eq!(dry["eligible"].as_array().unwrap().len(),1);assert_eq!(dry["waiting"].as_array().unwrap().len(),1);assert_eq!(dry["protected"],1);
+        assert_eq!(std::fs::read(terminal.join(ended.name())).unwrap(),original);
+        let applied=reconcile_reservations_locked(&cfg,true,None,&lock_path).unwrap();
+        assert_eq!(applied["eligible"][0]["applied"],true);
+        assert!(!terminal.join(ended.name()).exists());assert!(terminal.join(owned.name()).exists());
+        assert_eq!(std::fs::read(terminal.join(unknown.name())).unwrap(),unknown_bytes);
+        assert_eq!(std::fs::read(root(&cfg).unwrap().join("reconciled-reservations").join(ended.name())).unwrap(),original);
+        assert_eq!(std::fs::read(newer).unwrap(),b"new owner data");
+        drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn offline_reservation_recovery_rechecks_claim_after_archiving() {
+        let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));let seen=reads.clone();
+        let hub=Hub::new(move |request| {
+            assert_eq!(request["params"]["name"],"get_artefact");
+            let first=seen.fetch_add(1,Ordering::SeqCst)==0;
+            Some(json!({"id":"changed","status":if first {"blocked"} else {"in_progress"},"meta":{"session":"original"}}))
+        });
+        let (cfg,ready,_)=fixture(&hub);
+        let record=Record {owner:Ownership::Reservation {ticket:Ticket {task_id:"changed".into(),session:"original".into()}},host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,
+            disposition:Disposition::Rejected {reason:"gate: held".into()},work:Work::Unstarted {reason:"no writer".into()}};
+        let path=journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
+        let before=std::fs::read(terminal_root(&cfg).unwrap().join(path.name())).unwrap();
+        let result=reconcile_reservations_locked(&cfg,true,None,&root(&cfg).unwrap().join("controller-test.lock"));
+        assert!(result.unwrap_err().contains("reservation still belongs"));
+        assert_eq!(reads.load(Ordering::SeqCst),2);
+        assert_eq!(std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap(),before);
+        drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
     fn held_unstarted_reservation_observes_release_without_replaying_cancel() {
         let released = Arc::new(AtomicBool::new(false)); let observed = released.clone();
         let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let attempts = cancels.clone();
@@ -746,15 +847,20 @@ pub(crate) mod tests {
         journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
         let mut controller = Controller::new(&cfg,&ready,&snap);
         controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record)).ok().unwrap();
+        let started = Instant::now();
         let deadline = Instant::now()+Duration::from_secs(12);
-        while cancels.load(Ordering::SeqCst)==0 {
-            controller.tick(&snap,false,true).unwrap(); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
+        loop {
+            controller.tick(&snap,false,true).unwrap();
+            // Seeing the request at the server is not the finalizer's durable
+            // completion. In loaded Linux CI, fsync can outlive a fixed sleep.
+            let retained = journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap();
+            if retained.iter().any(|r| matches!(r.disposition,Disposition::Rejected { .. })) { break; }
+            assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
         }
-        for _ in 0..100 { controller.tick(&snap,false,true).unwrap(); std::thread::sleep(Duration::from_millis(1)); }
         assert!(!controller.controller_ready(),"an unchanged claim cannot release the handoff barrier");
         assert_eq!(controller.registry.counts().charged,1);
         assert_eq!(cancels.load(Ordering::SeqCst),1);
-        assert_eq!(reads.load(Ordering::SeqCst),1,"a wait must be paced, not a foreground polling storm");
+        assert!(reads.load(Ordering::SeqCst) as u64<=1+started.elapsed().as_secs()/RESERVATION_OBSERVATION_INTERVAL.as_secs(),"a wait must be paced, not a foreground polling storm");
         assert!(matches!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap()[0].disposition,Disposition::Rejected { .. }),"rollback builds must still understand the retained journal");
         released.store(true,Ordering::SeqCst);
         while !controller.controller_ready() {

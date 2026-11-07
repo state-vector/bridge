@@ -49,6 +49,16 @@ This also recovers journals written by older builds. Missing/malformed facts,
 unknown writers/effects and foreign host identities retain their barriers.
 The journal format remains readable by rollback builds.
 
+For an older controller already stuck on these historical reservations, use a
+verified recovery binary's `bridge workers reconcile-reservations [BR#task]`
+while **only the controller service is stopped**. It refuses a live controller's
+exclusive lock and defaults to a read-only drill. `--apply` rechecks current claim
+facts, archives each eligible original record, and retires only its exact ended,
+never-launched reservation. Restart the controller afterward; independently
+supervised workers keep their original processes and sessions. This bootstrap
+does not install a binary, change update deadlines, clear health holds, or resolve
+unknown writers/effects.
+
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
 **Just want to use it?** The shared hub is live at `https://hub.fleetbridge.run` — sign in with GitHub at the same URL and `bridge pair https://hub.fleetbridge.run`; no deploy needed. The rest of this README is for self-hosting.
