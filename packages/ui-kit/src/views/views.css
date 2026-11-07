@@ -564,12 +564,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    queue, Y waiting on review (muted, own tooltip); the blocks show only the
    batch that merges this pass (Ray: the mergeable set, not the audit trail).
    The awaiting band + divider are gone — parks render nowhere (not train
-   cars), the audit-trail block classes are removed with them. */
+   cars), the audit-trail block classes are removed with them.
+   BR#5106: the honest depth line (`queue N · open M`) rides the same cell
+   via .train-depth — the derived queue is the actionable subset, open is
+   every open PR the repo's last reconcile pass listed. */
 .trainc-backlog { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; overflow: hidden; }
 .train-backlog-count { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; cursor: default; }
 .train-queued-count { font-weight: 600; color: var(--text, #d7dce6); }
 .train-await-count { color: var(--text-faint, #8b94a7); cursor: help; }
 .train-count-label { font-weight: 400; color: var(--text-faint, #8b94a7); }
+.train-depth { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; cursor: help; }
 .train-blocks { display: inline-flex; align-items: center; gap: 3px; cursor: help; flex-wrap: nowrap; max-width: 100%; overflow: hidden; }
 .train-block { width: 11px; height: 16px; border-radius: 3px; cursor: pointer; flex: none; border: 1px solid transparent; }
 .train-block:hover { filter: brightness(1.2); }

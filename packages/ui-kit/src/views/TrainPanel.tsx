@@ -120,6 +120,28 @@ export function LaneRecoveryHistory({ line, now, openTask }: { line: TrainLinePr
 }
 
 const REFRESH_MS = 30_000;
+
+/** BR#5106 depth-counter honesty (Ray: "depth counters seem wrong — there
+ *  are way more PRs open"): the derived queue is the ACTIONABLE subset
+ *  (verdict-stamped, gate-clean heads per the BR#4079 contract) while `open`
+ *  is every open PR the repo's last reconcile pass listed. Both render —
+ *  `queue N · open M` — so a lane can never read nearly-empty while GitHub
+ *  shows a pile (the "43 open PRs, queue EMPTY" class, BR#5022). No
+ *  reconcile data yet → queue alone, never a made-up zero. */
+export function trainQueueDepthLabel(l: Pick<KbTrainLane, "queue" | "open_prs">): string {
+  const depth = `queue ${l.queue?.length ?? 0}`;
+  return l.open_prs ? `${depth} · open ${l.open_prs.count}` : depth;
+}
+
+/** Merge-trains panel (BR#5658 v2, Ray 2026-11-03): one row per lane on the
+ *  shared justified grid — the lane's PRs column carries the 3-bucket stat
+ *  line (`N in progress · M verifying · K ready`) above the sequential merge
+ *  batches, and the BR#5106 honest depth line (`queue N · open M`) rides the
+ *  same cell so the buckets never read as the whole truth. Interruptions
+ *  render through the hub's typed `line` projection (LineStopBanner).
+ *  Data: GET /api/kb/train (the DO's train.status snapshot — lease is
+ *  executor-fed, queue/pr_stats/batches/open_prs are hub-computed). Polls
+ *  every 30s (the tick is 45s); errors surface in-panel, never silent. */
 export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -176,9 +198,14 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
             title={`bounce budget (BR#4688): ${e.task_id} PR #${e.pr} breached at ${e.bounce_no}× ${e.bounce_kind ?? "?"} bounces — de-queued, escalation ask ${e.ask_id ?? "?"}; owner clock ${e.expired ? `expired ${age(e.grace_until, now)} ago (executor closes the PR)` : `${age(e.grace_until, now)} left`}`}>⏳ {e.pr ? `#${e.pr}` : e.task_id} ×{e.bounce_no}</Chip>)}
         </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
-        <span className="trainc-backlog"><span className="train-stats">
-          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
-        </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
+        <span className="trainc-backlog">
+          <span className="train-depth top-num" title={`${l.queue?.length ?? 0} card(s) waiting to merge — the derived queue, the actionable subset (verdict-stamped, gate-clean heads)${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed (${age(l.open_prs.ts, now)} ago) — the verification buckets are not the whole truth; the derived queue is only the actionable subset (BR#5106/BR#5022)` : "\nno reconcile data yet — queue alone, never a made-up zero (BR#5106/BR#5022)"}`}>
+            {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
+          </span>
+          <span className="train-stats">
+            <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
+          </span>
+          <span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
             title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · Returned to repair/review ${q.bounces} time(s) across tracked history${q.over_budget ? " — active bounce-budget escalation" : ""}` : ""}`} onClick={() => openTask?.(q.id)} />)}

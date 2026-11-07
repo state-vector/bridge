@@ -279,14 +279,19 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // PROGRESS: x of y in the current batch
     expect(trainPanelSrc).toMatch(/merged this batch/);
     expect(trainPanelSrc).toContain("Merged — checking deployment");
-    // BACKLOG (BR#5412, Ray: the queue-block row = THE BATCH): only the
-    // cars the machine's walk stamped ready this pass render — the
-    // mergeable set, not the audit trail; head ringed; click opens the card
+    // BACKLOG: one row of colored blocks — only the cars the machine's walk
+    // stamped ready this pass render (BR#5412, the mergeable set, not the
+    // audit trail); head ringed; click opens the card — AND the BR#5106
+    // honest counters ride the same cell: `queue N · open M` via
+    // trainQueueDepthLabel (the derived queue is only the actionable subset)
     expect(trainPanelSrc).toMatch(/train-blocks/);
     expect(trainPanelSrc).toContain('q.state === "ready"');
     expect(trainPanelSrc).not.toContain("l.queue_facts?.entries.find");
     expect(trainPanelSrc).toMatch(/openTask\?\.\(q\.id\)/);
     expect(trainPanelSrc).toContain("line.remediation?.text ?? line.reason");
+    expect(trainPanelSrc).toMatch(/train-depth top-num/);
+    expect(trainPanelSrc).toMatch(/\{trainQueueDepthLabel\(l\)\}\{l\.queue_awaiting_review \? ` · \$\{l\.queue_awaiting_review\} need reviews` : ""\}/);
+    expect(trainPanelSrc).toMatch(/BR#5106\/BR#5022/);
     // errors surface in-panel — nothing in the kit may swallow an error
     expect(trainPanelSrc).toMatch(/train status unavailable/);
   });
@@ -320,6 +325,14 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     // MSG: the freshest true message — the live machine note (aged out at
     // the lease TTL), else the attempt sentence, else the last ledger action
     expect(trainPanelSrc).toContain("line.remediation?.text ?? line.reason");
+    // queue depth with the head named — BR#5106: both counters render as
+    // `queue N · open M` via the pure trainQueueDepthLabel fn (exact output
+    // pinned by the label probes here and in the column-spec test above);
+    // the queue count still derives from l.queue.length, the open count
+    // from lane.open_prs.
+    expect(trainPanelSrc).toMatch(/trainQueueDepthLabel\(l\)/);
+    expect(trainPanelSrc).toMatch(/queue \$\{l\.queue\?\.length \?\? 0\}/);
+    expect(trainPanelSrc).toMatch(/open \$\{l\.open_prs\.count\}/);
     // RATE: merges per hour / 24h
     expect(trainPanelSrc).toMatch(/l\.activity\?\.merged_1h/);
     expect(trainPanelSrc).toContain("/24h");
