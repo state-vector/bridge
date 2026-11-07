@@ -33,6 +33,7 @@ mod worker_session;
 pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
 pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
 pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
+pub fn reconcile_reservations(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_reservations(cfg, apply, task) }
 
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".

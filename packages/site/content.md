@@ -23,6 +23,10 @@ Held, never-launched reservations observe fresh authoritative claim facts on a
 bounded cadence and clear when that claim ends, without replaying rejected writes.
 Unknown writers and external effects remain protected, and rollback journal
 compatibility is preserved.
+An offline `bridge workers reconcile-reservations` recovery command supports
+older stuck controllers: controller-lock fenced, read-only by default, with
+explicit `--apply`, fresh claim rechecks and retained original-record archives.
+Only the controller is stopped; supervised workers continue independently.
 
 ### Operational diagnostics
 
