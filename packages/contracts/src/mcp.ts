@@ -238,10 +238,12 @@ export const TOOL_ARG_SCHEMAS = {
     // BR#4687 "updated": the executor's silent machine-rebase carry — the
     // train updates its OWN behind worker-authored branch and stamps the
     // carry the moment the update lands (no bounce, no status change).
+    // BR#4688 "escalation_closed": the executor's expiry leg closed an escalated PR
+    // after the grace lapsed (hub-validated; the card survives as the record).
     // BR#4689 L1.4 "carried": the executor's PROVEN mechanical head move —
     // a rebase-only move (same patch-ids, range-diff all-'=') extends the
     // verdict's carry chain instead of bouncing.
-    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated", "carried"]),
+    kind: z.enum(["merged", "bounced", "stopped", "landed", "stalled", "updated", "escalation_closed", "carried"]),
     base: z.string().optional(),
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
