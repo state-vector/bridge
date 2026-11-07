@@ -551,13 +551,13 @@ export const RULES: Rule[] = [
   },
   {
     name: "execution-submission-needs-outcome",
-    when: (i) => isTask(i) && i.to === "in_review" && !mergeCompletesTask(i.meta ?? {}),
+    when: (i) => isTask(i) && i.to === "in_review" && (role(i) === "analysis" || !mergeCompletesTask(i.meta ?? {})),
     guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result).success ? null
       : `execution submission for ${i.id} requires execution_result {outcome,receipts} from this submission. A commit link, old result or process exit cannot establish the actual outcome.`,
   },
   {
     name: "execution-done-needs-outcome",
-    when: (i) => isTask(i) && i.to === "done" && !mergeCompletesTask(i.meta ?? {}) && !VERDICT_ROLES.includes(role(i)),
+    when: (i) => isTask(i) && i.to === "done" && !i.meta?.lane && !mergeCompletesTask(i.meta ?? {}) && !VERDICT_ROLES.includes(role(i)),
     guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success ? null
       : `execution completion for ${i.id} requires execution_result {outcome,receipts}; prerequisite delivery is not task completion.`,
   },

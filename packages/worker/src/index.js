@@ -1,7 +1,7 @@
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
-import { DEFAULT_WS_SLUG, doWs, isWsSlug } from "./kb/core.ts";
+import { DEFAULT_WS_SLUG, doWs, isWsSlug, tagsSayGateway } from "./kb/core.ts";
 import { handleOAuth } from "./mcp-oauth.ts";
 export { McpOAuth } from "./mcp-oauth.ts";
 
@@ -253,8 +253,7 @@ export default {
       }
       if (request.method === "POST") {
       if (sub === "ask_reframe" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         return kbCors(await kbGuard("kb.ask.reframe", env.KB.get(kbId).fetch("https://kb/ask.reframe", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
@@ -271,8 +270,7 @@ export default {
         }));
       }
       if (sub === "purge_smoke" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         return kbCors(await kbGuard("kb.purge_smoke", env.KB.get(kbId).fetch("https://kb/purge_smoke", {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         })));
@@ -315,8 +313,7 @@ export default {
       }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
-        const body = await request.json().catch(() => ({}));
-        body.actor = auth.bearer ? "gateway" : `web:${auth.login ?? "anon"}`;
+        const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
         // BR#6135: a web-plane takeover names its holder — the taker's
         // session is its web:<login> actor, so the holder flip (and with it
         // the ex-holder stand-down and the idempotent re-click) engages on
@@ -655,7 +652,19 @@ function githubConfigured(env) {
   return !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
 }
 
-/** Cookie-first auth with gateway-token fallback for the knowledge web plane.
+/** Same trusted identity boundary as MCP; JSON cannot replace credential class
+ * or strip the token binding that enforces a worker's execution fence. */
+function kbMutationIdentity(input, auth) {
+  const body = { ...input, actor: auth.bearer ? auth.identity.label : `web:${auth.login ?? "anon"}`,
+    gateway: auth.bearer ? tagsSayGateway(auth.identity.tags) : false };
+  if (auth.bearer) body.token_id = auth.identity.token_id;
+  else delete body.token_id;
+  if (!body.gateway) delete body.agent;
+  else if (body.agent != null) body.agent = String(body.agent).trim().slice(0, 60);
+  return body;
+}
+
+/** Cookie-first auth with authenticated token fallback for the knowledge plane.
  *  The desktop shell (and any native webview) holds a gateway token, not a hub
  *  session cookie — this lets it read/write the same KB plane the webapp uses.
  *  Admin routes intentionally stay on checkAuth (cookie-only). */
@@ -666,10 +675,22 @@ async function authKb(request, env) {
     || new URL(request.url).searchParams.get("token") || "";
   if (!bearer) return session;
   const { resolveTokenWs } = await import("./mcp.ts");
-  let ws;
-  try { ws = await resolveTokenWs(env, bearer); } catch { return session; }
-  if (!ws) return session;
-  return { login: null, ws, bearer: true };
+  try {
+    const ws = await resolveTokenWs(env, bearer);
+    if (!ws) return session;
+    // Routing an unknown token to the default workspace is not authentication.
+    const identified = await env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/auth.identify", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bearer }),
+    });
+    if (!identified.ok) return identified.status >= 500 ? identified : json({ error: "unauthorized" }, 401);
+    const identity = await identified.json();
+    if (typeof identity.token_id !== "string" || !identity.token_id || typeof identity.label !== "string" || !identity.label
+      || !Array.isArray(identity.tags) || !identity.tags.every(tag => typeof tag === "string"))
+      return json({ error: "Knowledge authentication identity unavailable", result_class: "infra_storage_fault" }, 503);
+    return { login: null, ws, bearer: true, identity };
+  } catch {
+    return json({ error: "Knowledge authentication temporarily unavailable", result_class: "infra_storage_fault" }, 503);
+  }
 }
 
 /** Native shells hit the hub cross-origin — bearer auth needs no credentials,

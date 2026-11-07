@@ -711,14 +711,8 @@ export function canonicalVerdictTitle(meta: unknown): string | null {
   return title;
 }
 
-/** Human-facing banner for verify-verdict decisions, prepended to body_md at
- *  creation (do.ts). Verifiers file receipts-dense cards whose body never
- *  says what the verdict does or who applied it — BR#2453 taught us that.
- *  BR#5377 F4: verdicts are MACHINE verdicts now — they accept on filing
- *  (actor system:verifier) and the accept-side hook applies them to their
- *  target; the human is not a per-merge GO/NO-GO gate. The statement states
- *  machine-application reality (and the one remaining human leg: supersede).
- *  Pure: meta in, markdown out. */
+/** A decision's display text never certifies its business effect or receipts.
+ * Actual task acceptance belongs to the subject-bound typed review lifecycle. */
 export function verifyVerdictStatement(meta: unknown): string {
   const m = (meta ?? {}) as Record<string, unknown>;
   const target = String(m.task ?? m.verify_target ?? "").trim() || "the task";
@@ -726,15 +720,15 @@ export function verifyVerdictStatement(meta: unknown): string {
   const isBounce = String(m.verdict ?? "").toLowerCase() === "bounce";
   const session = String(m.session ?? "").trim();
   const effect = isBounce
-    ? `bounced **${target}** back to \`in_progress\` with the findings`
-    : `accepted **${target}** — impl work queues on the merge train (the train owns delivery); verify duties close done`;
-  const checked = `the receipts below were checked live${session ? ` by session \`${session}\`` : ""}`;
+    ? `requests that **${target}** return to work with the findings; its actual task history records whether that transition applied`
+    : `records the authored verdict about **${target}**; it does not close a task or admit a PR to the train`;
   return [
-    `> ⚖️ **Verify verdict — machine-applied** — *auto-added, not part of the verifier's receipts*`,
+    `> ⚖️ **Verify verdict — recorded decision** — *auto-added, not completion evidence*`,
     `>`,
-    `> This is a machine verdict (BR#5377): it accepted on filing (actor \`system:verifier\`) — no human GO/NO-GO step. The verdict ${effect}.`,
-    `> - Doesn't hold? **Supersede** it (decisions panel) — superseding records why; the target re-enters the normal flow.`,
-    `> You are NOT being asked to re-verify — ${checked}.`,
+    `> This decision is recorded on filing without a human GO/NO-GO step. It ${effect}.`,
+    `> Acceptance requires the independent review's typed result, exact subject revision and delivery/outcome receipts. Decision text is not acceptance.`,
+    `> Authored evidence${session ? ` from session \`${session}\`` : ""} follows below; this banner does not certify it was checked live.`,
+    `> Doesn't hold? **Supersede** the decision with the reason; task completion remains separately evidence-bound.`,
   ].join("\n");
 }
 

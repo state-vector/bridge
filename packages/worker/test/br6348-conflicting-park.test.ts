@@ -197,6 +197,7 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
       await_event: { event: "pr_merged", repo: REPO, n: 309 },
     });
     expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    await completePrReview(kbJson, id, [{ repo: REPO, number: 309, head_sha_at_acceptance: head }]);
     expect((await kbJson("/get", { id })).body.meta?.merge_train?.state).toBe("queued");
 
     // the executor's conflict bounce: trial-merge enumerated the files
@@ -337,3 +338,4 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     expect(cur.meta.merge_train.conflicting_alarm).toBeUndefined();
   });
 });
+import { completePrReview } from "./completion-fixture";

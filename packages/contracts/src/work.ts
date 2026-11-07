@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ReviewResultSchema, type ReviewResult } from "./review.ts";
+import { ReviewResultSchema, type ReviewResult, type ReviewAcceptance } from "./review.ts";
 
 /** A PR may DELIVER work or merely enable its execution. Only delivery can
  * complete a task on a merge receipt. Execution always needs outcome receipts. */
@@ -24,6 +24,27 @@ export function mergeCompletesTask(meta: { completion?: unknown; depends_on?: un
 export const ExecutionResultSchema = z.object({
   outcome: z.string().min(1),
   receipts: z.array(z.string().min(1)).min(1),
+});
+
+/** Server-captured subject, echoed by the independent reviewer. Definition
+ * edits and every new submission change the revision; mailbox/progress do not. */
+export const ReviewSubjectSchema = z.object({
+  task_id: z.string().regex(/^BR#\d+$/), revision: z.string().min(1),
+});
+export type ReviewSubject = z.infer<typeof ReviewSubjectSchema>;
+export type CurrentTaskReview =
+  | { phase: "none" }
+  | { phase: "pending"; id: string; at: number }
+  | { phase: "rejected"; id: string; at: number; result: Exclude<ReviewResult, ReviewAcceptance> }
+  | { phase: "accepted"; id: string; at: number; subject: ReviewSubject; result: ReviewAcceptance }
+  | { phase: "historical"; id: string; at: number };
+
+/** Existing human force-review authority, captured at the exact task revision
+ * and heads. Approval does not merge or waive decisive delivery checks. */
+export const HumanDeliveryApprovalSchema = z.object({
+  kind: z.literal("human_delivery_approval"), task_id: z.string().regex(/^BR#\d+$/),
+  revision: z.string().min(1), actor: z.string().regex(/^(web(?::|$)|human(?::|$))/), at: z.number(),
+  legs: z.array(z.object({ repo: z.string(), number: z.number().int().positive(), head: z.string().regex(/^[0-9a-f]{40}$/i) })).min(1),
 });
 
 export const UnblockResultSchema = z.object({

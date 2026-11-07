@@ -1,12 +1,15 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { reviewOutcome } from "./completion-fixture";
+import type { ReviewResult } from "@bridge/contracts";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
 interface Reply {
   id: string; status: string; verify_task: string; error?: string; result_class?: string;
-  meta: { completion: { kind: string }; execution_result?: object; merge_train?: object; review_result?: object };
+  meta: { completion: { kind: string }; execution_result?: object; merge_train?: object; review_result?: object;
+    work_revision: string; review_subject?: { task_id: string; revision: string } };
 }
 async function call(op: string, body: object = {}) {
   const response = await stub.fetch(`https://kb/${op}`, { method: "POST",
@@ -14,6 +17,7 @@ async function call(op: string, body: object = {}) {
   return { status: response.status, body: await response.json() as Reply };
 }
 const get = async (id: string) => (await call("get", { id })).body;
+const resultFor = (id: string, result: ReviewResult) => reviewOutcome((path, body) => call(path.slice(1), body), id, result);
 const repo = "state-vector/completion-authority";
 const commit = "a".repeat(40);
 const receipt = `https://github.com/${repo}/commit/${commit}`;
@@ -117,7 +121,7 @@ describe("positive completion authority on the real SQLite hub", () => {
     const { id, review } = await submission();
     const other = await task();
     const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
-      review_result: { kind: "accepted_pr", task_id: other, legs: [{ repo, number: 1, head_sha_at_acceptance: commit }] } });
+      review_result: await resultFor(review, { kind: "accepted_pr", task_id: other, legs: [{ repo, number: 1, head_sha_at_acceptance: commit }] }) });
     expect(refused.status).toBe(400);
     expect((await get(review)).status).toBe("in_progress");
     expect((await get(id)).status).toBe("in_review");
@@ -127,17 +131,26 @@ describe("positive completion authority on the real SQLite hub", () => {
   it("accepts the actual analysis execution outcome through an independent review", async () => {
     const { id, review } = await submission(["analysis"]);
     const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
-      review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await get(id)).status).toBe("done");
   });
 
-  it.each(["accepted_direct_main", "accepted_pr"])("does not substitute %s for an execution outcome", async kind => {
+  it("accepts an explicitly declared analysis artifact delivery without inventing its findings", async () => {
+    const { id, review } = await submission(["analysis"], { completion: { kind: "delivery" } });
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, { kind: "accepted_direct_main", repo, commit, ci_run_url: `https://github.com/${repo}/actions/runs/1` }) });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await get(id)).status).toBe("done");
+    expect((await get(id)).meta.execution_result).toEqual(outcome);
+  });
+
+  it.each(["accepted_direct_main", "accepted_pr"] as const)("does not substitute %s for an execution outcome", async kind => {
     const { id, review } = await submission(["impl"], { completion: { kind: "execution", outcome: "Prove actual deployed recovery" } });
     const review_result = kind === "accepted_direct_main"
       ? { kind, repo, commit, ci_run_url: `https://github.com/${repo}/actions/runs/1` }
       : { kind, task_id: id, legs: [{ repo, number: 1, head_sha_at_acceptance: commit }] };
-    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review", review_result });
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review", review_result: await resultFor(review, review_result) });
     expect(refused.status).toBe(400);
     expect((await get(review)).status).toBe("in_progress");
     expect((await get(id)).status).toBe("in_review");
@@ -148,5 +161,103 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect((await call("update", { id, meta_delete: ["completion"] })).status).toBe(400);
     expect((await call("update", { id, meta: { completion: { kind: "delivery" } } })).status).toBe(400);
     expect((await get(id)).meta.completion.kind).toBe("execution");
+  });
+
+  it("cannot upgrade completed findings to acceptance by editing metadata", async () => {
+    const { id, review } = await submission();
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: { kind: "findings", summary: "Outcome is still unverified." } })).status).toBe(200);
+    const forged = await call("update", { id: review, meta: { review_result: { kind: "accepted_direct_main", repo, commit,
+      ci_run_url: `https://github.com/${repo}/actions/runs/1` } } });
+    expect(forged.status).toBe(400);
+    expect((await get(id)).status).toBe("in_review");
+    expect((await get(review)).meta.review_result).toMatchObject({ kind: "findings" });
+  });
+
+  it("requires the reviewer to echo the server-captured subject revision", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("subject_revision");
+    expect((await get(review)).status).toBe("in_progress");
+  });
+
+  it.each(["definition edit", "repository input edit", "repository input deletion", "identical resubmission"])("fences late acceptance after %s", async change => {
+    const { id, review } = await submission(["analysis"], { repo: "https://github.com/state-vector/original-input" });
+    const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });
+    if (change === "definition edit") {
+      expect((await call("update", { id, body_md: "The requested outcome changed after review began." })).status).toBe(200);
+    } else if (change === "repository input edit") {
+      expect((await call("update", { id, meta: { repo: "https://github.com/state-vector/changed-input" } })).status).toBe(200);
+    } else if (change === "repository input deletion") {
+      expect((await call("update", { id, meta_delete: ["repo"] })).status).toBe(200);
+    } else {
+      expect((await call("transition", { id, to: "in_progress", actor: "impl", session: "impl-session", note: "New execution attempt needs a fresh submission" })).status).toBe(200);
+      expect((await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note: receipt, execution_result: outcome })).status).toBe(200);
+    }
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review", review_result: result });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("subject_revision");
+    expect((await get(id)).status).toBe("in_review");
+    expect((await get(review)).status).toBe("in_progress");
+  });
+
+  it("does not invalidate exact-submission review on ordinary progress", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });
+    const revision = (await get(id)).meta.work_revision;
+    expect((await call("progress.log", { id, actor: "impl", session: "impl-session", note: "Evidence remains unchanged; review is running." })).status).toBe(200);
+    expect((await get(id)).meta.work_revision).toBe(revision);
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review", review_result: result });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await get(id)).status).toBe("done");
+  });
+
+  it("does not replay a valid old acceptance onto changed work after a structural child closes", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const child = await task(["analysis"]);
+    expect((await call("link", { src: child, relation: "child_of", dst: id })).status).toBe(200);
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await get(id)).status).toBe("in_review"); // structural child still open
+    const changed = { outcome: "A different execution outcome now needs verification.", receipts: [id] };
+    expect((await call("update", { id, body_md: "New scope after the old review completed", meta: { execution_result: changed } })).status).toBe(200);
+    expect((await call("transition", { id: child, to: "done", actor: "impl", session: "impl-session",
+      execution_result: { outcome: "Child analysis complete", receipts: [child] } })).status).toBe(200);
+    for (let pass = 0; pass < 2; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
+    expect((await get(id)).status).toBe("in_review");
+    expect((await get(id)).meta.execution_result).toEqual(changed);
+    expect((await get(review)).status).toBe("done"); // preserve the historical verdict
+  });
+
+  it.each(["pending", "findings"])("a newer detached %s review supersedes older acceptance authority", async state => {
+    const { id, review } = await submission(["impl"], { completion: { kind: "execution", outcome: "Verify actual execution" } });
+    const child = await task(["analysis"]);
+    await call("link", { src: child, relation: "child_of", dst: id });
+    expect((await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(200);
+    const latest = (await call("create", { type: "task", title: "New detached review round", roles: ["review"],
+      meta: { execution_review_of: id }, session: "" })).body.id;
+    expect((await call("transition", { id: latest, to: "in_progress", actor: "latest-reviewer", session: "latest-review" })).status).toBe(200);
+    if (state === "findings") expect((await call("transition", { id: latest, to: "done", actor: "latest-reviewer", session: "latest-review",
+      review_result: { kind: "findings", summary: "The latest review does not accept this outcome." } })).status).toBe(200);
+    expect((await call("transition", { id: child, to: "done", actor: "impl", session: "impl-session",
+      execution_result: { outcome: "Structural child complete", receipts: [child] } })).status).toBe(200);
+    for (let pass = 0; pass < 2; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
+    expect((await get(id)).status).toBe("in_review");
+  });
+
+  it("enforces session separation for a detached subject-bound review", async () => {
+    const { id } = await submission(["impl"], { completion: { kind: "execution", outcome: "Verify execution" } });
+    const review = (await call("create", { type: "task", title: "Detached review cannot self-accept", roles: ["review"],
+      meta: { execution_review_of: id }, session: "" })).body.id;
+    expect((await call("transition", { id: review, to: "in_progress", actor: "impl", session: "impl-session" })).status).toBe(200);
+    const refused = await call("transition", { id: review, to: "done", actor: "impl", session: "impl-session",
+      review_result: await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("separation of duties");
+    expect((await get(review)).status).toBe("in_progress");
   });
 });

@@ -40,10 +40,17 @@ Completion has explicit authority: gateways report fenced process facts, task
 agents submit their actual work, and independent reviewers accept the exact
 subject using a typed result. Exit zero, a transcript or a commit URL cannot
 manufacture success. Diagnostic and unblock findings name their observed outcome
-and evidence; findings do not declare the incident recovered. A closed review
+and evidence. Both MCP and knowledge REST use verified credential identity rather
+than caller-supplied gateway or actor flags. Workspace routing is not authentication.
+Findings do not declare the incident recovered. A closed review
 with findings is not acceptance, and a task without claim bars still needs real
 completion evidence. Execution acceptance cannot be replaced by a prerequisite
 PR merge; reviewed PR heads still wait for the train's decisive delivery checks.
+Acceptance echoes the review's server-captured subject revision. Definition/input
+changes and new submissions invalidate old verdicts, while progress does not.
+Merge/provenance observations trigger independent decisive-delivery verification;
+they do not manufacture completion or landed CI. Existing human approvals remain
+bound to their exact task revision and PR heads.
 
 Dependency waits follow replacement outcomes rather than treating supersession
 as success. Deployment-health waits observe the relevant repo/base/tip. Unblock

@@ -340,7 +340,7 @@ describe("BR#3352 completed_result_lost — session-trail classification", () =>
 });
 
 describe("verify-verdict decision statement (machine-application reality, BR#5377 F4)", () => {
-  it("PASS states the machine-apply: accepted on filing, no GO/NO-GO, supersede is the human leg", () => {
+  it("PASS records the decision without certifying acceptance or checked evidence", () => {
     const s = verifyVerdictStatement({
       decision_class: "verify-verdict",
       verify_target: "BR#1865",
@@ -348,19 +348,21 @@ describe("verify-verdict decision statement (machine-application reality, BR#537
       round: "1",
       session: "dispatch-BR-2391",
     });
-    expect(s).toContain("machine-applied");
-    expect(s).toContain("no human GO/NO-GO");
-    expect(s).toContain("accepted **BR#1865**");
-    expect(s).toContain("merge train");
+    expect(s).toContain("recorded decision");
+    expect(s).toContain("human GO/NO-GO");
+    expect(s).toContain("authored verdict about **BR#1865**");
+    expect(s).toContain("does not close a task");
+    expect(s).toContain("does not certify it was checked live");
     expect(s).toContain("Supersede");
     expect(s).toContain("dispatch-BR-2391");
     expect(s).toContain("auto-added"); // clearly marked as machine-generated
     expect(s).not.toContain("What you are deciding"); // the human-gate framing is gone
   });
 
-  it("BOUNCE states the applied bounce", () => {
+  it("BOUNCE directs the reader to actual transition evidence", () => {
     const s = verifyVerdictStatement({ decision_class: "verify-verdict", task: "BR#42", verdict: "bounce" });
-    expect(s).toContain("bounced **BR#42** back to `in_progress` with the findings");
+    expect(s).toContain("requests that **BR#42** return to work");
+    expect(s).toContain("actual task history records whether that transition applied");
     expect(s).not.toContain("accepted **");
   });
 

@@ -27,7 +27,7 @@ verifying, held and stranded counts. A binding without executable progress is
 stranded, not healthy accounting. Completed reconcile duties cover their observed
 head rather than the lifetime of a PR.
 
-Independent PR acceptance must use `review_result: {kind:"accepted_pr", task_id,
+Independent PR acceptance must use `review_result: {kind:"accepted_pr", task_id, subject_revision,
 legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
 queue admission are committed together; the existing repair passes replay the
 handoff until admitted or explicitly held behind a newer blocker. Explicit
@@ -44,6 +44,10 @@ overlapping ingress shares one historical reconciliation pass.
 Gateway credentials report process facts through the fenced execution protocol;
 they cannot submit a task for review or mark one done. The running task agent
 uses its own provisioned credential and exact execution scope to submit work.
+Both MCP and knowledge REST derive actor, token binding and gateway class from
+the authenticated credential, overriding caller-supplied attribution. Workspace
+routing alone is not authentication; unknown bearers are rejected and identity
+infrastructure failures remain retryable rather than becoming false auth verdicts.
 Exit zero, an empty/error transcript, a commit link and a finished review process
 are not business outcomes.
 
@@ -63,6 +67,20 @@ completion contract: `accepted_execution` verifies actual execution receipts;
 train's decisive required checks. Claim readiness and absent qualification bars
 never imply completion acceptance. Notes, parks and decision text do not create
 new acceptance; legacy prose is confined to historical receipt reconciliation.
+
+On claim, a review captures `review_subject: {task_id, revision}`. Echo that exact
+revision as `review_result.subject_revision` on acceptance. Task-definition,
+repository-input and outcome edits, or a new submission (even identical content),
+invalidate old acceptance. Ordinary progress and machine bounce annotations do
+not. Revision/subject/result fields are lifecycle-owned, not generic metadata.
+Existing human force-review approval is captured against its exact revision and
+PR heads; it still cannot merge or skip decisive delivery checks.
+
+A merge observation or provenance row resumes independent delivery verification;
+it does not itself prove CI or mark a leg landed. A live canonical lane already
+settling that task retains its exit. Reconcile reports `reverse_verifying` and
+observed merges awaiting verification instead of claiming a refused close
+succeeded. Closed-unmerged work retains its delivery obligation.
 
 `await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
 health at the lane tip. Retiring a `br_done` dependency is not success: a live

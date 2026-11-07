@@ -61,6 +61,7 @@ const parkQueuedCar = async (id: string, repo: string, n: number, actor: string,
     await_event: { event: "pr_merged", repo, n },
   });
   expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+  await completePrReview(kbJson, id, [{ repo, number: n, head_sha_at_acceptance: head }]);
   const cur = (await kbJson("/get", { id })).body;
   expect(cur.meta?.merge_train?.state).toBe("queued");
   return cur;
@@ -174,7 +175,7 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect(current.meta.lane.key).toBe(`${repo}@main`);
     expect((await kbJson("/train.lane", { repo, base: "main" })).body.id).toBe(lane.id);
   });
-  it("closes a queued car whose PR has a provenance merge receipt (lifecycle-legal, receipt cited)", async () => {
+  it("gives a merged queued car one delivery review without inventing decisive CI", async () => {
     const REPO = "state-vector/br6330-heal";
     const N = 6330;
     const HEAD = "1".repeat(40);
@@ -185,16 +186,17 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
     const cur = (await kbJson("/get", { id })).body;
-    expect(cur.status, `card should be done, got ${cur.status}`).toBe("done");
-    expect(cur.meta?.merge_train?.state).toBe("landed");
-    expect(cur.meta?.merge_train?.via).toBe("merged-park-heal");
-    expect(String(cur.meta?.merge_train?.merge_sha ?? "")).toBe(SHA);
+    expect(cur.status).toBe("in_review");
+    expect(cur.meta?.merge_train?.state).not.toBe("landed");
     const hist = (await kbJson(`/history?id=${encodeURIComponent(id)}`)).body;
     const notes = (hist?.versions ?? []).map((v: any) => `${v?.summary ?? ""}\n${v?.action ?? ""}`).join("\n");
-    expect(notes).toMatch(/merged-park heal/);
+    expect(notes).toContain("independent delivery review");
+    const before = (await kbJson("/relations", { id })).body.relations.length;
+    await kbJson("/admin.alarm_sweep");
+    expect((await kbJson("/relations", { id })).body.relations).toHaveLength(before);
   });
 
-  it("multi-leg card: the merged leg stamps landed, the card re-queues to the remaining leg (no close)", async () => {
+  it("multi-leg merge observation retains both obligations and cannot stamp a leg landed without CI", async () => {
     const REPO = "state-vector/br6330-multi";
     const N1 = 6331, N2 = 6332;
     const HEAD = "3".repeat(40);
@@ -216,14 +218,14 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
       ],
     } });
     expect(upd.status).toBeLessThan(400);
+    await completePrReview(kbJson, id, [{ repo: REPO, number: N1, head_sha_at_acceptance: HEAD },
+      { repo: REPO, number: N2, head_sha_at_acceptance: "5".repeat(40) }]);
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
     const cur = (await kbJson("/get", { id })).body;
-    expect(cur.status).toBe("blocked");
-    expect(cur.meta?.merge_train?.state).toBe("queued");
-    expect(cur.meta?.merge_train?.legs?.[String(N1)]?.state).toBe("landed");
-    expect(cur.meta?.merge_train?.legs?.[String(N1)]?.via).toBe("merged-park-heal");
-    expect(Number(cur.meta?.merge_train?.remaining ?? 0)).toBe(1);
+    expect(cur.status).toBe("in_review");
+    expect(cur.meta.prs).toHaveLength(2);
+    expect(cur.meta?.merge_train?.legs?.[String(N1)]?.state).not.toBe("landed");
   });
 
   it("a queued car WITHOUT a merge receipt is untouched (live queue slots are never guess-closed)", async () => {
@@ -268,3 +270,4 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect(["in_progress", "todo"]).toContain(after.status);
   });
 });
+import { completePrReview } from "./completion-fixture";

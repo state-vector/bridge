@@ -711,17 +711,9 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
    *  demands review evidence (a done review-role child first), the lifecycle
    *  demands a claim before done, and the close cites its investigation. */
   const closeBreachCard = async (cardId: string) => {
-    const { body: child } = await kbJson("/create", { type: "task", title: `verify ${cardId}`, roles: ["review"] });
-    const linked = await kbJson("/link", { src: child.id, relation: "child_of", dst: cardId });
-    expect(linked.status).toBe(200);
-    const claim = await kbJson("/transition", { id: child.id, to: "in_progress", note: "claim verify duty", actor: "verifier-opencode" });
-    expect(claim.status).toBe(200);
-    const done = await kbJson("/transition", { id: child.id, to: "done", review_result: { kind: "findings", summary: "No-refold control investigated" }, note: "verified PR https://github.com/state-vector/bridge/pull/0 — no-refold control", actor: "verifier-opencode" });
-    expect(done.status).toBe(200);
     const take = await kbJson("/transition", { id: cardId, to: "in_progress", note: "claim breach investigation", actor: "investigator-opencode" });
     expect(take.status).toBe(200);
-    const close = await kbJson("/transition", { id: cardId, to: "done", execution_result: { outcome: "Investigated and adjudicated breach evidence", receipts: [cardId, child.id] }, note: "investigated and adjudicated", actor: "investigator-opencode" });
-    expect(close.status).toBe(200);
+    await completeExecutionReview(kbJson, cardId, { outcome: "Audit evidence investigated and adjudicated; the closed fold high-water covers these events.", receipts: [cardId] });
   };
 
   const rejectOnce = async (id: string) => {
@@ -1461,3 +1453,4 @@ describe("interactive claim takeover (BR#6135)", () => {
     expect(door.body.taken_over).toBe(true);
   });
 });
+import { completeExecutionReview } from "./completion-fixture";

@@ -202,18 +202,19 @@ describe("BR#6384 Leg 1 — observed-merge close (real DO)", () => {
     expect(rep.status).toBe(200);
     expect(rep.body.ok).toBe(true);
     expect(rep.body.accounting.observed_merged).toBe(1);
-    expect(rep.body.line).toContain("1 observed-merged closed");
-    expect(rep.body.spawned).toHaveLength(0); // no ruling duty, no tracking card
+    expect(rep.body.line).toContain("1 awaiting delivery verification");
+    expect(rep.body.spawned).toHaveLength(1); // one actual delivery review
     const cur = await taskById(id);
-    expect(cur.status).toBe("done");
+    expect(cur.status).toBe("in_review");
     const hist = (await kbJson("/get_history", { id })).body;
-    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("observed MERGED"));
+    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("Observed MERGED"));
     expect(close, "the close note must cite the observation").toBeTruthy();
-    expect(String(close.summary)).toContain(SHA.slice(0, 9));
-    expect(String(close.summary)).toContain("BR#6384");
-    // the close spawned nothing itself: the only duty child is the card's
-    // own block-time round (main's park law, present before the report)
+    expect(String(close.data.note)).toContain(SHA);
+    expect(String(close.data.note)).toContain("decisive required CI");
+    // Existing unblock duties do not multiply. The separately reported new
+    // child is an actual delivery review, not another unblock round.
     expect(await dutyChildrenOf(id)).toHaveLength(beforeChildren.length);
+    expect((await taskById(rep.body.spawned[0].card)).roles).toContain("review");
   });
 });
 
@@ -236,11 +237,11 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect(ev.body.error ?? "").toBe("");
     await alarm();
     const cur = await taskById(id);
-    expect(cur.status).toBe("done");
+    expect(cur.status).toBe("in_review");
     const hist = (await kbJson("/get_history", { id })).body;
-    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("strand disposition (BR#6384)"));
+    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("Observed MERGED"));
     expect(close, "the close must ride the strand-disposition receipt").toBeTruthy();
-    expect(String(close.summary)).toContain("provenance");
+    expect(String(close.data.note)).toContain("decisive required CI");
     expect(String(close.summary)).toContain("e".repeat(40).slice(0, 9));
   });
 
@@ -319,7 +320,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect((await kbJson("/transition", { id: duty, to: "in_progress", actor: "rig", note: "ruling the round" })).status).toBeLessThan(400);
     expect((await kbJson("/transition", {
       id: duty, to: "done", actor: "rig",
-      execution_result: { outcome: "PR remains open and advancing", receipts: [duty] },
+      review_result: { kind: "findings", summary: "PR remains open and advancing; no delivery accepted." },
       note: "re-verified first-hand: PR still OPEN and advancing — re-queued the car (https://github.com/x/pull/6112)",
     })).status).toBeLessThan(400);
     // pass 4: rounds 1 >= cap 1 — the ladder exhausts, superseded with findings

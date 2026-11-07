@@ -34,7 +34,9 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
   it("a completed unblock round cannot suppress an already-satisfied execution prerequisite forever", async () => {
     const dependency = await task("Delivered prerequisite", {}, ["analysis"]);
     await call("transition", { id: dependency, to: "in_progress", actor: "dependency", session: "dependency" });
-    await call("transition", { id: dependency, to: "done", actor: "dependency", session: "dependency", note: "Analysis delivered" });
+    const dependencyDone = await call("transition", { id: dependency, to: "done", actor: "dependency", session: "dependency",
+      execution_result: { outcome: "Prerequisite analysis delivered", receipts: [dependency] }, note: "Analysis delivered" });
+    expect(dependencyDone.status, JSON.stringify(dependencyDone.body)).toBe(200);
     const parent = await task("Actual execution still required", { completion: { kind: "execution", outcome: "Run the post-delivery action" } });
     const parked = await call("transition", { id: parent, to: "blocked", actor: "author", note: "Waiting on prerequisite",
       await_event: { event: "br_done", id: dependency } });
@@ -45,6 +47,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(duty).toBeTruthy();
     await call("transition", { id: duty.id, to: "in_progress", actor: "unblocker", session: "unblocker" });
     const finished = await call("transition", { id: duty.id, to: "done", actor: "unblocker", session: "unblocker",
+      execution_result: { outcome: "Prerequisite verified; parent execution remains outstanding", receipts: [dependency] },
       note: `Unblocked prerequisite verified at https://hub.fleetbridge.run/card/${dependency.replace("#", "-")}; actual parent execution still required.` });
     expect(finished.status, JSON.stringify(finished.body)).toBe(200);
     await call("admin.unblock_proxy_sweep", { now: now + 60 * 60_000 });
@@ -66,7 +69,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
       question: "Can the executor keep its changes scoped to the assigned task?", options: ["Executor keeps assigned scope", "Executor reports overlap"], actor: "peer" });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     await call("transition", { id: subject, to: "in_progress", actor: "recipient", session: "recipient" });
-    const done = await call("transition", { id: subject, to: "done", actor: "recipient", session: "recipient", note: "Analysis completed" });
+    const done = await call("transition", { id: subject, to: "done", actor: "recipient", session: "recipient", execution_result: { outcome: "Analysis completed", receipts: [subject] }, note: "Analysis completed" });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     const resolved = await get(ask.body.id);
     expect(resolved.status).toBe("done");

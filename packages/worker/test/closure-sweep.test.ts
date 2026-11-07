@@ -206,10 +206,10 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
 
     // S1 — the stale-true specimen: the target card is ALREADY done at park
     // time (the BR#3358 shape — the atom is born true and can never flip).
-    const t1 = await kbJson("/create", { type: "task", title: "Canonical: stale-true target", qualified: true, session: "drill-exec-s1t" });
+    const t1 = await kbJson("/create", { type: "task", title: "Canonical: stale-true target", roles: ["analysis"], qualified: true, session: "drill-exec-s1t" });
     const t1id = String(t1.body.id);
     await kbJson("/transition", { id: t1id, to: "in_progress", actor: "drill-exec-s1t", session: "drill-exec-s1t" });
-    const t1done = await kbJson("/transition", { id: t1id, to: "done", actor: "drill-exec-s1t", note: "done BEFORE the park — the stale-true specimen" });
+    const t1done = await kbJson("/transition", { id: t1id, to: "done", actor: "drill-exec-s1t", execution_result: { outcome: "Analysis observation precedes the park", receipts: [t1id] }, note: "done BEFORE the park — the stale-true specimen" });
     expect(t1done.status, JSON.stringify(t1done.body)).toBe(200);
 
     const s1 = await kbJson("/create", { type: "task", title: "IMPL: stale-true dedup drill", qualified: true, session: "drill-exec-s1" });
@@ -248,7 +248,7 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     expect(s1meta.blocked).toBeUndefined();
 
     // S2 — a GENUINE false→true transition: the changed receipt spawns, once.
-    const t2 = await kbJson("/create", { type: "task", title: "Canonical: late-flip target", qualified: true, session: "drill-exec-s2t" });
+    const t2 = await kbJson("/create", { type: "task", title: "Canonical: late-flip target", roles: ["analysis"], qualified: true, session: "drill-exec-s2t" });
     const t2id = String(t2.body.id);
     await kbJson("/transition", { id: t2id, to: "in_progress", actor: "drill-exec-s2t", session: "drill-exec-s2t" });
     const s2 = await kbJson("/create", { type: "task", title: "IMPL: late-flip drill", qualified: true, session: "drill-exec-s2" });
@@ -274,7 +274,7 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
     expect((await sweepDutiesFor("Unblock: IMPL: late-flip drill")).length).toBe(0);
 
     // the flip: the target actually completes
-    const t2done = await kbJson("/transition", { id: t2id, to: "done", actor: "drill-exec-s2t", note: "real completion — the false→true transition" });
+    const t2done = await kbJson("/transition", { id: t2id, to: "done", actor: "drill-exec-s2t", execution_result: { outcome: "Late analysis observation recorded", receipts: [t2id] }, note: "real completion — the false→true transition" });
     expect(t2done.status, JSON.stringify(t2done.body)).toBe(200);
 
     // sweep on the flip: the CHANGED receipt spawns exactly once
@@ -292,10 +292,10 @@ describe("unblockProxySweep — degraded, board-state only (real DO)", () => {
   });
 
   it("BR#3668: a human-gated park never flips — a machine-shaped await_event contradicting the markers is ignored, no spawn, no migration ask", async () => {
-    const t3 = await kbJson("/create", { type: "task", title: "Canonical: human-gated target", qualified: true, session: "drill-exec-s3t" });
+    const t3 = await kbJson("/create", { type: "task", title: "Canonical: human-gated target", roles: ["analysis"], qualified: true, session: "drill-exec-s3t" });
     const t3id = String(t3.body.id);
     await kbJson("/transition", { id: t3id, to: "in_progress", actor: "drill-exec-s3t", session: "drill-exec-s3t" });
-    const t3done = await kbJson("/transition", { id: t3id, to: "done", actor: "drill-exec-s3t", note: "done — the machine leg reads true, the exit is still human-only" });
+    const t3done = await kbJson("/transition", { id: t3id, to: "done", actor: "drill-exec-s3t", execution_result: { outcome: "Board analysis observation recorded", receipts: [t3id] }, note: "done — the machine leg reads true, the exit is still human-only" });
     expect(t3done.status, JSON.stringify(t3done.body)).toBe(200);
 
     const s3 = await kbJson("/create", { type: "task", title: "IMPL: human-gated park drill", qualified: true, session: "drill-exec-s3" });
@@ -430,6 +430,7 @@ describe("done-close-legs auto-derivation (real DO)", () => {
   it("unreceipted done is rejected, derives the close-duty child once, and the child's receipted done unblocks the parent", async () => {
     const d = await kbJson("/create", {
       type: "task", title: "IMPL: close-leg drill", qualified: true, session: "drill-exec-parent",
+      meta: { completion: { kind: "execution", outcome: "Close the issue and verify the actual closure receipt" } },
       body_md: "work\n\n## Done when\n- close GH #2261 (the incident issue)\n",
     });
     expect(d.status).toBe(200);
@@ -437,7 +438,8 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     await kbJson("/transition", { id: dId, to: "in_progress", actor: "drill-exec-parent", session: "drill-exec-parent" });
 
     // done without a receipt → gate rejects, error names the rule
-    const rej = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "work complete" });
+    const execution_result = { outcome: "Closure leg inspected", receipts: [dId] };
+    const rej = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", execution_result, note: "work complete" });
     expect(rej.status).toBe(400);
     expect(String(rej.body.error)).toContain("terminal close leg(s) not receipted");
     expect(String(rej.body.error)).toContain("[rule: done-close-legs]");
@@ -454,7 +456,7 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     expect((await taskById(dId)).meta?.last_close_leg_spawn?.child).toBe(childId);
 
     // retry while the child is open → still rejected, no SECOND child (flood+cap)
-    const rej2 = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "work complete (retry)" });
+    const rej2 = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", execution_result, note: "work complete (retry)" });
     expect(rej2.status).toBe(400);
     const duties2 = (await unblockDuties()).filter((x: any) => x.title.startsWith("Close-leg duty: IMPL: close-leg drill"));
     expect(duties2.length).toBe(1);
@@ -470,8 +472,8 @@ describe("done-close-legs auto-derivation (real DO)", () => {
     expect(childDone.status, `child done failed: ${JSON.stringify(childDone.body)}`).toBe(200);
 
     // now the parent's done passes — the closed close-duty child owns the leg
-    const parentDone = await kbJson("/transition", { id: dId, to: "done", actor: "drill-exec-parent", note: "executed via the close-leg duty child" });
-    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
+    await completeExecutionReview(kbJson, dId, { outcome: "Issue closure and its closing comment verified", receipts: ["https://github.com/state-vector/superpositional/issues/2261#issuecomment-17623388240"] });
+    expect((await taskById(dId)).status).toBe("done");
   });
 });
 
@@ -695,7 +697,7 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
     expect(String(round.body_md)).toContain("MACHINE PROXY");
     expect(String(round.body_md)).toContain(sha.slice(0, 9));
     expect(String(round.body_md)).toContain("BR#4282");
-    expect(String(round.body_md)).toContain("close YOURSELF done");
+    expect(String(round.body_md)).toContain("Close YOURSELF done with execution_result");
 
     // 5. the contract executes: the duty closes ITSELF done first (receipts
     // cited — the done-open-children gate needs the child closed), then the
@@ -711,8 +713,8 @@ describe("BR#4282 — satisfied-atom route-to-exit on the stall sweep (real DO)"
       id, to: "done", actor: "drill-exec-closer4282",
       note: "closed via the unblock duty: PR https://github.com/state-vector/superpositional/pull/2400 merged as 4282feedf (board merge receipt)",
     });
-    expect(parentDone.status, `parent done failed: ${JSON.stringify(parentDone.body)}`).toBe(200);
-    expect((await taskById(id)).status).toBe("done");
+    expect(parentDone.status).toBe(400);
+    expect((await taskById(id)).status).toBe("in_progress");
   });
 });
 
@@ -1329,3 +1331,4 @@ describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (m
     expect(nAfter.meta?.proxy_check?.receipts.join(" ")).toContain("timer elapsed");
   });
 });
+import { completeExecutionReview } from "./completion-fixture";

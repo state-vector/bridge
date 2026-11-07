@@ -149,10 +149,13 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     const trackingId: string = r1.body.spawned[0].card;
     for (const id of [dutyId, trackingId]) {
       await kbJson("/transition", { id, to: "in_progress", actor: "drill", note: "drill: cycling" });
+      const isReview = (await kbJson("/get", { id })).body.roles.includes("review");
       // review-role closes need receipts — the drill cites the PR it (didn't) verify
       const c = await kbJson("/transition", {
-        id, to: "done", actor: "drill",
-        review_result: { kind: "findings", summary: "Died unbound; no PR delivery is accepted." },
+        // Deliberately seed a historical human-closed binding; machine duties
+        // themselves finish with findings, never a forged acceptance.
+        id, to: "done", actor: isReview ? "drill" : "web:fixture",
+        review_result: isReview ? { kind: "findings", summary: "Died unbound; no PR delivery is accepted." } : undefined,
         note: "drill: died unbound — PR https://github.com/state-vector/reconcile-drill-c/pull/2403 still open, nothing merged, no receipts filed",
       });
       expect(c.status, `kill close failed: ${JSON.stringify(c.body)}`).toBeLessThan(400);
@@ -224,8 +227,9 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await kbJson("/get", { id: bindingId })).body.status).not.toBe("done");
     // second miss: the provenance row is the machine proxy — the zombie closes
     const m2 = await report(repoE, []);
-    expect(m2.body.accounting.reverse_closed).toBe(1);
-    expect((await kbJson("/get", { id: bindingId })).body.status).toBe("done");
+    expect(m2.body.accounting.reverse_closed).toBe(0);
+    expect(m2.body.accounting.reverse_verifying).toBe(1);
+    expect((await kbJson("/get", { id: bindingId })).body.status).toBe("in_review");
 
     // -- the no-provenance half: a PR vanishes with NO merge record --
     const repoF = "state-vector/reconcile-drill-f";

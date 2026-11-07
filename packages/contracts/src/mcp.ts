@@ -128,7 +128,7 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   transition: z.looseObject({
     execution_result: ExecutionResultSchema.optional().describe("Required for analysis/diagnostic completion and execution outcomes: actual outcome plus per-action receipts. Process exit or a prerequisite PR merge is not completion. An unblock duty may use this for its observed findings instead of a reblocked result."),
-    review_result: ReviewResultSchema.optional().describe("Required when a review duty closes done. accepted_pr binds task_id plus exact repo/PR/head legs; accepted_direct_main carries verified commit and CI; findings is not acceptance. A runner cannot author a verdict."),
+    review_result: ReviewResultSchema.optional().describe("Required when a review duty closes done. Acceptance must echo subject_revision from this duty's captured review_subject (claim response or metadata), fencing the exact task submission. accepted_pr binds task_id plus exact repo/PR/head legs; accepted_direct_main carries verified commit and CI; findings is not acceptance. A runner cannot author a verdict."),
     unblock_result: UnblockResultSchema.optional().describe("An unblock duty finding a different blocker atomically replaces the parent's wait before closing. Supply this or an execution_result with observed findings."),
     id: z.string(),
     to: z.string(),
