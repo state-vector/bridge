@@ -81,7 +81,16 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
-        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1})),
+        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1,"worker_protocol":dispatch::WORKER_PROTOCOL})),
+        "internal-worker" => {
+            let path = args.get(2).map(PathBuf::from).unwrap_or_else(|| { eprintln!("worker manifest required"); std::process::exit(2); });
+            if let Err(error) = dispatch::worker_entry(&path) { eprintln!("independent worker: {error}"); std::process::exit(1); }
+        }
+        "workers" => {
+            let stop = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("stop") => true, _ => { eprintln!("usage: bridge workers status|stop [BR#task]"); std::process::exit(2); } };
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found"); std::process::exit(1); });
+            match dispatch::workers_command(&cfg, stop, args.get(3).map(String::as_str)) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workers: {error}"); std::process::exit(1); } }
+        }
         "update" => {
             if let Err(error) = update::command(&args[2..]) { eprintln!("update: {error}"); std::process::exit(1); }
         }

@@ -75,6 +75,16 @@ class UpdateTests(unittest.TestCase):
             service.assert_not_called()
         self.assertTrue(self.u.request.exists())
 
+    def test_live_worker_handoff_requires_negotiated_protocol_and_exact_pid_nonce(self):
+        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 123, "phase": "controller_ready", "worker_protocol": 1})
+        self.assertFalse(self.u.idle("n", 123), "legacy updates must not mistake live workers for quiescence")
+        self.u.state["handoff_protocol"] = 1
+        self.assertTrue(self.u.idle("n", 123))
+        self.assertFalse(self.u.idle("wrong", 123))
+        self.assertFalse(self.u.idle("n", 124))
+        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 123, "phase": "controller_ready", "worker_protocol": 2})
+        self.assertFalse(self.u.idle("n", 123), "unknown worker protocols require the safe full-drain path")
+
     def test_interrupted_install_rolls_back_under_hold_then_resumes_after_health(self):
         self.bin.write_text("candidate")
         self.u.backup.write_text("previous")
@@ -141,6 +151,26 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(m.read(self.u.request), {"nonce": "n"})
         service.assert_not_called()
         rollback.assert_not_called()
+
+    def test_already_running_candidate_requires_real_gates_without_install_or_budget_reset(self):
+        config = {"auto_update": {"enabled": True, "channel": "main"}}
+        for case in ("valid", "wrong_build", "wrong_nonce", "failed_health", "changed_pid"):
+            with self.subTest(case=case):
+                self.u.state = {"phase":"recovery_required", "from_commit":"old", "to_commit":"known-candidate", "next_attempt_at":20000000}
+                m.atomic(self.u.request, {"nonce":"n"})
+                m.atomic(self.u.root / "idle.json", {"nonce":"wrong" if case == "wrong_nonce" else "n", "pid":123, "phase":"idle"})
+                with patch.object(self.u, "config", return_value=config), patch.object(m.time, "time", return_value=10000), \
+                     patch.object(self.u, "build", return_value="known-candidate"), \
+                     patch.object(self.u, "pid", side_effect=[123,124] if case == "changed_pid" else None, return_value=123), \
+                     patch.object(self.u, "running_build", return_value="other" if case == "wrong_build" else "known-candidate"), \
+                     patch.object(self.u, "health", return_value=case != "failed_health"), \
+                     patch.object(self.u, "service") as service, patch.object(self.u, "notify"), \
+                     patch.object(m, "fetch", side_effect=AssertionError("known running install must not be downloaded/reinstalled")):
+                    self.u.reconcile()
+                service.assert_not_called()
+                self.assertEqual(self.u.state["next_attempt_at"], 20000000)
+                self.assertEqual(self.u.state["phase"], "confirmed" if case == "valid" else "recovery_required")
+                self.assertEqual(self.u.request.exists(), case != "valid")
 
     def test_recovery_never_retries_failed_candidate_or_uses_wrong_process_or_nonce(self):
         machine = type("Uname", (), {"machine": "aarch64"})()
@@ -285,9 +315,9 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(checked, [10000, 13600])
 
     def test_full_install_and_failed_candidate_rollback_keep_writers_held(self):
-        for fail_health, recovery in ((False, None), (True, None), (False, "recovery_required"), (False, "recovery_preparing"),
-                                      (False, "bad_digest"), (False, "changed_pid"), (False, "doctor_fault")):
-            with self.subTest(fail_health=fail_health, recovery=recovery):
+        for fail_health, recovery, adoption in ((False, None, False), (True, None, False), (False, "recovery_required", False), (False, "recovery_preparing", False),
+                                      (False, "bad_digest", False), (False, "changed_pid", False), (False, "doctor_fault", False), (False, None, True), (True, None, True)):
+            with self.subTest(fail_health=fail_health, recovery=recovery, adoption=adoption):
                 self.bin.write_bytes(b"old binary")
                 self.u.state = {}
                 sha = "c" * 40
@@ -308,9 +338,14 @@ class UpdateTests(unittest.TestCase):
                 config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
                 actions = []
                 def idle(nonce, pid):
+                    if adoption:
+                        m.atomic(self.u.root / "idle.json", {"nonce": nonce, "pid": pid, "phase": "controller_ready", "worker_protocol": 1})
+                        return m.Supervisor.idle(self.u, nonce, pid)
                     return True
                 def service(action):
                     self.assertTrue(self.u.request.exists(), "service mutation outside update hold")
+                    if adoption:
+                        self.assertEqual(m.read(self.u.request)["worker_protocol"], 1, "both update and rollback must preserve live-worker handoff")
                     actions.append(action)
                 def health(commit):
                     self.assertTrue(self.u.request.exists(), "writer hold lifted before health")
@@ -325,7 +360,8 @@ class UpdateTests(unittest.TestCase):
                 with patch.object(self.u, "config", return_value=config), \
                      patch.object(self.u, "pid", side_effect=[123, 124] if recovery == "changed_pid" else None, return_value=123), \
                      patch.object(self.u, "running_build", side_effect=lambda pid: "old" if self.bin.read_bytes() == b"old binary" else sha), \
-                     patch.object(self.u, "build", side_effect=lambda p: sha if Path(p).read_bytes() == b"new binary" else "old"), \
+                      patch.object(self.u, "build", side_effect=lambda p: sha if Path(p).read_bytes() == b"new binary" else "old"), \
+                      patch.object(self.u, "worker_protocol", return_value=1 if adoption else 0), \
                      patch.object(self.u, "idle", side_effect=idle), patch.object(self.u, "service", side_effect=service), \
                      patch.object(self.u, "health", side_effect=health), \
                      patch.object(self.u, "run", side_effect=m.subprocess.CalledProcessError(1, "doctor") if recovery == "doctor_fault" else None, return_value=""), \

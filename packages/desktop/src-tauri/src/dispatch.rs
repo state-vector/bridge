@@ -27,6 +27,12 @@ mod lifecycle;
 mod attempt_journal;
 #[path = "gateway_pipeline.rs"]
 mod gateway_pipeline;
+#[path = "worker_session.rs"]
+mod worker_session;
+
+pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
+pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
+pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
 
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
@@ -532,7 +538,7 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
 /// Otherwise running medium temporarily erases this host's large capability.
 fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_json::Value {
     if held {
-        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update is draining active workers before restart; new claims are paused".into() });
+        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update has paused new claims for controller handoff and health verification".into() });
         facts["availability"] = availability.clone();
         if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
             for model in models { model["availability"] = availability.clone(); }
@@ -712,6 +718,9 @@ impl RemoteExecution {
 }
 impl ExecutionRuntime {
     fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str, live: Arc<Mutex<String>>) {
+        self.start_maintenance_every(cfg, tid, live, Duration::from_secs(20));
+    }
+    fn start_maintenance_every(&mut self, cfg: &DispatchConfig, tid: &str, live: Arc<Mutex<String>>, interval: Duration) {
         let cfg = cfg.clone();
         let session = claim_session(&cfg, tid);
         let tid = tid.to_string();
@@ -721,7 +730,7 @@ impl ExecutionRuntime {
         let control = self.control.clone();
         let mut reported = String::new();
         let mut last_report = Instant::now();
-        self.maintenance = Some(Arc::new(LeaseMaintenance::start(Duration::from_secs(20), move || {
+        self.maintenance = Some(Arc::new(LeaseMaintenance::start(interval, move || {
             if control.stop.load(Ordering::SeqCst) || control.quiesced.load(Ordering::SeqCst) { return false; }
             let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
             match state {
@@ -2288,6 +2297,7 @@ struct InFlight {
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
     live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
     execution: ExecutionRuntime,
+    worker: Option<worker_session::Handle>,
 }
 
 impl InFlight {
@@ -4039,6 +4049,18 @@ fn spawn_opencode(
         )
     };
     let completed = Arc::new(AtomicBool::new(false));
+    if worker_session::supported() {
+        execution.stop_maintenance();
+        let spec = worker_session::Spec { protocol: WORKER_PROTOCOL,
+            owner: lifecycle::Ownership::Attempt { ticket: lifecycle::Ticket { task_id: tid.into(), session: claim_session(cfg, tid) }, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: execution.attempt_id.clone() },
+            cfg: cfg.clone(), title: title.into(), worktree: worktree.clone(), scratch: scratch.clone(), started_at: now_ms(),
+            agent: worker_session::Agent { workdir: run_dir.clone(), bin: bc.bin.clone().unwrap_or_else(|| cfg.opencode_bin.clone()), backend: if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" }.into(), agent: agent_profile.clone(), model: model_str.clone(), prompt: prompt.clone(), resume: resume_session.clone(), config: mcp_json.clone(), mode: bc_mode.clone() } };
+        match worker_session::launch(spec, cancel.clone()) {
+            Ok(worker) => in_flight.push(worker),
+            Err(error) => dlog(tid, &format!("independent worker launch held: {error}; retain exact attempt ownership")),
+        }
+        return;
+    }
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
@@ -4094,6 +4116,7 @@ fn spawn_opencode(
         rx: outcome,
         live,
         execution,
+        worker: None,
     });
     // ephemeral state file: headless observability (removed on completion)
     write_task_state(

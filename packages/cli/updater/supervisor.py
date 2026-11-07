@@ -113,7 +113,7 @@ class Supervisor:
     def record(self, phase, **fields):
         now = int(time.time() * 1000)
         if phase in (Phase.CONFIRMED, Phase.ROLLED_BACK, Phase.DEFERRED):
-            fields["next_attempt_at"] = now + USEFUL_WORK_SECONDS * 1000
+            fields.setdefault("next_attempt_at", now + USEFUL_WORK_SECONDS * 1000)
         self.state = {**self.state, **fields, "phase": phase.value, "at": now}
         atomic(self.state_path, self.state)
         print(json.dumps(self.state), flush=True)
@@ -136,6 +136,12 @@ class Supervisor:
         if info.get("update_protocol") != 1:
             raise ValueError("bootstrap an update-protocol-1 runner first")
         return info["commit"]
+
+    def worker_protocol(self, binary):
+        try:
+            return json.loads(self.run([str(binary), "build-info"])).get("worker_protocol", 0)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 0  # legacy producers require the original full-drain barrier
 
     def running_build(self, pid):
         """Bind recovery to the actual managed process and installed executable."""
@@ -168,7 +174,9 @@ class Supervisor:
 
     def idle(self, nonce, pid):
         ack = read(self.root / "idle.json", {})
-        return pid > 0 and ack.get("nonce") == nonce and ack.get("pid") == pid and ack.get("phase") == "idle"
+        phase = ack.get("phase")
+        proven = phase == "idle" or (phase == "controller_ready" and self.state.get("handoff_protocol") == 1 and ack.get("worker_protocol") == 1)
+        return pid > 0 and ack.get("nonce") == nonce and ack.get("pid") == pid and proven
 
     def health(self, commit, deadline=180):
         start = int(time.time() * 1000)
@@ -245,10 +253,41 @@ class Supervisor:
         elif self.request.exists():
             raise RuntimeError("unresolved update hold; inspect update/state.json before recovery")
 
+    def accept_running_candidate(self):
+        """Reconcile an already-applied known install, never perform another one.
+
+        An external managed restart may have restored the recorded candidate
+        while recovery still says the previous build is installed. Identity,
+        nonce, fresh health, stable PID and doctor remain the same real gates.
+        This observation neither resets nor bypasses the next-install budget.
+        """
+        if self.state.get("phase") not in (Phase.RECOVERY_REQUIRED, Phase.RECOVERY_PREPARING):
+            return False
+        candidate = self.state.get("to_commit")
+        if not candidate or candidate == self.state.get("from_commit"):
+            return False
+        if self.build(self.binary) != candidate:
+            return False
+        pid = self.pid()
+        nonce = read(self.request, {}).get("nonce")
+        if not nonce or self.running_build(pid) != candidate or not self.idle(nonce, pid):
+            return False
+        if not self.health(candidate):
+            return False
+        if self.pid() != pid or self.running_build(pid) != candidate or not self.idle(nonce, pid):
+            return False
+        message = f"Bridge verified the already-running candidate on {os.uname().nodename}: {candidate[:9]}; existing update recovered without another install/restart"
+        self.record(Phase.CONFIRMED, next_attempt_at=self.state.get("next_attempt_at", 0), pending_notification=message)
+        self.request.unlink(missing_ok=True)
+        self.notify(message)
+        return True
+
     def reconcile(self):
         self.flush_notification()
         config = self.config()
         if not opted_in(config):
+            return
+        if self.accept_running_candidate():
             return
         if time.time() * 1000 < self.state.get("next_attempt_at", 0):
             return  # no downloads, doctor, drain, or service changes in cooldown
@@ -303,9 +342,14 @@ class Supervisor:
                     self.record(Phase.RECOVERY_REQUIRED, reason="recovery opt-in changed; hold retained")
                 return
             nonce = recovery_request["nonce"] if recovering else uuid.uuid4().hex
+            # Both directions must understand adoption: rollback may replace
+            # the candidate while the same independent workers keep running.
+            handoff = 1 if self.worker_protocol(self.binary) == 1 and self.worker_protocol(executable) == 1 else 0
             if not recovering:
-                self.record(Phase.DRAINING, nonce=nonce)
-            atomic(self.request, {"nonce": nonce})
+                self.record(Phase.DRAINING, nonce=nonce, handoff_protocol=handoff)
+            else:
+                self.record(Phase.RECOVERY_PREPARING, handoff_protocol=handoff)
+            atomic(self.request, {"nonce": nonce, **({"worker_protocol": handoff} if handoff else {})})
             until = time.monotonic() + DRAIN_SECONDS
             while not self.idle(nonce, pid):
                 if not opted_in(self.config()) or self.pid() != pid or time.monotonic() > until:

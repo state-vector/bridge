@@ -245,6 +245,17 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
     }
     pub fn contains(&self, ticket: &Ticket) -> bool { self.entries.contains_key(ticket) }
     pub fn tickets(&self) -> Vec<Ticket> { self.entries.keys().cloned().collect() }
+    pub fn restore_running(&mut self, owner: Ownership, value: R) -> Result<(), R> {
+        let ticket = owner.ticket().clone();
+        if self.entries.contains_key(&ticket) { return Err(value); }
+        self.entries.insert(ticket, Entry { owner, charged: true, cancel: Arc::new(AtomicBool::new(false)), phase: Phase::Running(value) });
+        Ok(())
+    }
+    /// A controller can hand off only independently owned running transports.
+    /// Preparation, publication, held effects and queued results stay barriers.
+    pub fn handoff_ready(&self, adoptable: impl Fn(&R) -> bool) -> bool {
+        self.entries.values().all(|entry| matches!(&entry.phase, Phase::Running(value) if adoptable(value)))
+    }
     pub fn restore_finalization(&mut self, owner: Ownership, value: F) -> Result<(), F> {
         let ticket = owner.ticket().clone();
         if self.entries.contains_key(&ticket) { return Err(value); }

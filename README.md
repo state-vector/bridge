@@ -1,5 +1,42 @@
 # bridge — self-hosting
 
+## Gateway restarts preserve running workers
+
+On Linux with a user systemd manager, each new task runs in a separate
+`bridge-worker-<attempt>.service`. That process owns the agent's ACP/stdio
+connection, lease/mailbox renewal, latest output journal and terminal result.
+Restarting or replacing the gateway controller leaves these units running. The
+new controller discovers their original task/session/generation manifests and
+reattaches to the same workers; it does not start a new agent conversation or
+execution generation. A worker that itself died is reconciled from physical
+process identity and its durable result, never blindly relaunched under the
+same fence.
+
+Controller-only updates negotiate live-worker protocol support in both the new
+and rollback builds. They pause new admission, settle controller-owned work,
+join the train leg, and acknowledge **controller ready** while supervised agents
+continue. This is distinct from claiming that all workers are idle. Initial
+migration from older in-process workers, incompatible builds, and unsupported
+hosts retain the safe full-drain path. Existing update health checks and rollback
+fences remain mandatory.
+
+`bridge workers status [BR#task]` shows local worker identities and observations.
+`bridge workers stop [BR#task]` requests a fenced stop (omit the task for all
+local supervised workers). A stop request is not quiescence proof. Restarting or
+stopping only `bridge.service` preserves independently supervised workers; use
+the worker stop command when stopping the work itself. Worker units inherit the
+gateway PATH and `~/.bridge/env`, keeping provider configuration with the worker.
+
+The independent updater script must also be refreshed from this build using the
+documented updater installation procedure. Replacing the native binary alone
+does not upgrade an already-installed Python updater. Update availability now
+reports the admission hold for controller handoff/health verification rather
+than implying that zero-slot workers are still draining.
+If recovery observes that its recorded candidate is already the actual managed
+executable, it can finish that existing update after exact PID/nonce, fresh health,
+stable-process and doctor checks. It performs no reinstall/restart and preserves
+the existing next-install deadline.
+
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
 **Just want to use it?** The shared hub is live at `https://hub.fleetbridge.run` — sign in with GitHub at the same URL and `bridge pair https://hub.fleetbridge.run`; no deploy needed. The rest of this README is for self-hosting.
