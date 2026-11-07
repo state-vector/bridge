@@ -5488,10 +5488,17 @@ export class KnowledgeHub {
       workerTokenId = child.id;
       begunExecutor = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: [], inventory_revision: inventory.inventory_revision });
       this.state.storage.sql.exec(`DELETE FROM executor_start_barriers WHERE token_id = ?`, tokenId);
-    } else if (["poll", "restore", "checkpoint", "quiesce"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
+    } else if (["poll", "restore", "checkpoint", "quiesce", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
+    const finalizeCurrentClaim = command.kind === "finalize" && row.status === "in_progress" && meta.session === session;
+    const canRescheduleFinalized = finalizeCurrentClaim && !this.protectedExecution(req.id, meta, true)
+      && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
+      && ["none", "returned"].includes(next.handoff.phase)
+      && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
+    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") next.budget_exhaustions += 1;
+    if (canRescheduleFinalized && !next.attempt?.checkpoint) next.requirements = { ...next.requirements, host: actor };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;
       next.requirements.tier = maxTier(next.requirements.tier, begunExecutor.tier);
@@ -5509,7 +5516,17 @@ export class KnowledgeHub {
       meta.execution_requirements = next.requirements;
       const history = executionCommandHistory(current, next, command);
       if (history) this.version(req.id, actor, "execution", executionHistorySummary(history), history);
-      if (command.kind === "yield") {
+      if (canRescheduleFinalized) {
+        // One scheduling path for both fresh work and terminal reconciliation.
+        // Keep the exact captured outcome in execution_state; a fresh session
+        // reconciles it instead of guessing completion or reusing a conversation.
+        meta.execution_resume = { kind: "terminal_result", generation: next.generation, attempt_id: next.attempt?.attempt_id };
+        delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
+        this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',status_ts=?,updated_ts=?,meta=? WHERE id=?`, now, now, JSON.stringify(meta), req.id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+        this.version(req.id, actor, "execution_terminal", "Writer stopped; captured result awaits reconciliation through the hub scheduler, not inferred completion", { generation: next.generation, outcome: command.kind === "finalize" ? command.outcome.kind : "unknown" });
+      } else if (command.kind === "yield") {
         delete meta.session;
         const local = next.handoff.phase === "waiting" ? next.handoff : null;
         if (local) meta.blocked = { reason: `Pick up locally: ${local.action}`, unblock_condition: "Explicit human-authorised local acceptance of this handoff episode; answers/dismissals do not resume it", ts: now,
@@ -5522,6 +5539,7 @@ export class KnowledgeHub {
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
     else this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     if (command.kind === "yield") this.executionWork().sweep();
+    if (command.kind === "finalize") this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     return next;
   }
 
@@ -14863,7 +14881,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     if (!cfg) return line;
     if (["no_progress", "merge_failed"].includes(line.blocker)) {
       const entries: unknown[] = meta.lane?.queue_facts?.entries ?? [];
-      for (const raw of entries) {
+      // A failed candidate is not the cause of a stopped lane when independent
+      // candidates passed their gates. Keep recovery bound to merge execution,
+      // rather than hiding it behind the first unrelated candidate's duty.
+      const hasReady = entries.some(raw => raw && typeof raw === "object" && "cls" in raw && raw.cls === "ready");
+      for (const raw of hasReady ? [] : entries) {
         if (!raw || typeof raw !== "object" || !("repair_task" in raw) || typeof raw.repair_task !== "string") continue;
         const candidateRepair = this.enrichFixCardRow(raw.repair_task, now);
         if (!candidateRepair) continue;

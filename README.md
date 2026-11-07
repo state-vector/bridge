@@ -1956,6 +1956,24 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+records remaining lifecycle, completion, priority and recovery gaps at commit
+`4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
+
+**A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
+queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
+with elapsed time, main-check health, live executor presence and the number of
+candidates that passed initial queue gates. Bridge owns priority diagnosis and
+repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
+A single candidate's failed check must not be presented as the reason independent
+candidates cannot merge. Candidates waiting for current-base CI or integration
+repair are deferred while the executor continues the remaining independent batch;
+their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
+missing` is a failed execution configuration, never a successful diagnostic or
+review. The runner preserves its work and releases the failed claim for execution
+repair. Repeated missing-tool failures name that exact cause in the gateway's
+bounded cooldown; they cannot generate successful diagnostic or review receipts.
+
 Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
 original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
 share one dispatch core — spawns the train tick beside its dispatch loop and contends
@@ -3280,3 +3298,12 @@ alone is not evidence of top scheduling priority or unavailable agent capacity.
 Independent reviews of concrete/line recovery inherit the repair's scheduling
 class and urgency. They remain separate review sessions with the same acceptance
 gates, but cannot fall behind unrelated repair backlog as ordinary verification.
+### Fenced terminal-result capture
+
+The execution protocol supports `finalize` with the exact generation/attempt,
+`writers: "process_group_empty"`, and a typed process outcome (`completed`,
+`interrupted`, or `failed`). The hub atomically records the captured result,
+quiescence and its replay receipt. A successful process exit never closes a
+task or fabricates review acceptance. Unfinished claims return through the
+same scheduler with their prior result attached; independent waits, unknown
+operations, host affinity and the persistent retry budget remain enforced.

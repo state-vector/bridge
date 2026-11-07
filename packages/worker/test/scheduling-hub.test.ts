@@ -43,6 +43,38 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("atomically captures and replays a stopped result without guessing completion, then uses the same scheduler to reconcile it", async () => {
+    const project = "terminal-result-protocol", g = await gateway(project), peer = await gateway(project);
+    const id = await task(project), claim = await reserve(g);
+    if (claim.kind !== "reserved") throw new Error("no reservation");
+    await g.cmd({ kind: "begin", attempt_id: "terminal-one", worker: g.auth.agent, action_budget_ms: 60_000 }, "terminal-begin", id, claim.session);
+    const final = { kind: "finalize", generation: 1, attempt_id: "terminal-one", writers: "process_group_empty",
+      outcome: { kind: "completed", exit_code: 0, stdout_tail: "Work saved; explicit review still required", stderr_tail: "" } };
+    expect((await peer.cmd(final, "forged-final", id, claim.session)).error).toMatch(/executor authority|originating runner/);
+    const first = await g.cmd(final, "terminal-final", id, claim.session);
+    expect(first).toMatchObject({ attempt: { phase: "quiesced" }, terminal: { generation: 1, outcome: { kind: "completed" } } });
+    expect(await g.cmd(final, "terminal-final", id, claim.session)).toEqual(first);
+    const card = await post("get", { id });
+    expect(card.status).toBe("todo");
+    expect(card.meta.execution_resume).toMatchObject({ kind: "terminal_result", generation: 1 });
+    expect(card.meta.execution_requirements.host).toBe(g.host);
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
+    expect((await g.cmd(final, "old-final-not-replay", id, "wrong-session")).error).toMatch(/fenced|session/);
+  });
+  it("releases physical capacity but preserves unknown operations and independent waits on terminal capture", async () => {
+    const project = "terminal-unknown-effects", g = await gateway(project);
+    const id = await task(project), claim = await reserve(g);
+    if (claim.kind !== "reserved") throw new Error("no reservation");
+    await g.cmd({ kind: "begin", attempt_id: "unknown-one", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-begin", id, claim.session);
+    await g.cmd({ kind: "prepare", generation: 1, attempt_id: "unknown-one", operation_id: "publish", action: "Push exact ref", input_revision: "a", budget_ms: 60_000 }, "unknown-prepare", id, claim.session);
+    const final = await g.cmd({ kind: "finalize", generation: 1, attempt_id: "unknown-one", writers: "process_group_empty",
+      outcome: { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "network lost; preserve all work" } }, "unknown-final", id, claim.session);
+    expect(final.operations).toMatchObject([{ id: "publish", state: "prepared" }]);
+    expect((await post("get", { id })).status).toBe("in_progress");
+    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].occupancy.held).toBe(0);
+    expect((await g.cmd({ kind: "begin", attempt_id: "unsafe-retry", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-retry", id, claim.session)).error).toMatch(/unknown external operations/);
+  });
   it("backs off old-runner scratch ENOSPC without latching identity repair or extending cooldown on advertisements", async () => {
     const project = "scratch-resource-recovery", g = await gateway(project);
     const id = await task(project), reservation = await reserve(g);

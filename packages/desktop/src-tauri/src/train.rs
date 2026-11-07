@@ -3525,7 +3525,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // Re-evaluate for EACH member, including after this pass advanced base.
         match admit_current_base(ctx, repo, base, cand)? {
             IntegrationAdmission::Current => {},
-            IntegrationAdmission::RepairDispatched => break,
+            IntegrationAdmission::RepairDispatched => {
+                for entry in &mut qfacts {
+                    if entry.get("id").and_then(Value::as_str) == Some(cand.head_id.as_str()) {
+                        entry["cls"] = json!("blocked");
+                    }
+                }
+                ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }))?;
+                log(Some(key), &format!("PR #{pr}: integration repair dispatched; continuing independent batch members"));
+                continue;
+            }
             IntegrationAdmission::AwaitingCi { base_sha, head_sha: integrated_head } => {
                 for entry in &mut qfacts {
                     if entry.get("id").and_then(Value::as_str) == Some(cand.head_id.as_str()) {
@@ -3534,8 +3543,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     }
                 }
                 ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }))?;
-                log(Some(key), &format!("PR #{pr}: current base integrated; substance verdict carried, fresh integrated-head CI required"));
-                break;
+                log(Some(key), &format!("PR #{pr}: current base integrated; substance verdict carried, fresh integrated-head CI required; continuing independent batch members"));
+                continue;
             }
         }
         renew_lease(ctx, repo, base);
@@ -6592,6 +6601,83 @@ mod tests {
     impl Drop for Repo {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.base_dir);
+        }
+    }
+
+    #[test]
+    fn deferred_integration_never_blocks_an_independent_current_candidate_br7500() {
+        for worker_owned in [true, false] {
+            let repo = Repo::new(if worker_owned { "batch-ci" } else { "batch-repair" });
+            let stale = repo.side_commit("feature-one", "feature one");
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
+            repo.git(&["checkout", "-q", "main"]);
+            std::fs::write(repo.dir.join("base.txt"), "new base\n").unwrap();
+            repo.git(&["add", "base.txt"]);
+            repo.git(&["commit", "-qm", "base advances independently"]);
+            repo.git(&["push", "-q", "origin", "main"]);
+            let base = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["checkout", "-qb", "feature-two"]);
+            std::fs::write(repo.dir.join("second.txt"), "independent feature\n").unwrap();
+            repo.git(&["add", "second.txt"]);
+            repo.git(&["commit", "-qm", "current candidate"]);
+            let current = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+            repo.git(&["checkout", "-q", "feature-one"]);
+            repo.git(&["merge", "-q", "--no-edit", "main"]);
+            let integrated = repo.git(&["rev-parse", "HEAD"]);
+            let card = |pr: i64, head: &str| json!({ "id": format!("BR#{pr}"), "status": "blocked", "meta": {
+                "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": head }], "merge_train": { "state": "queued", "pr": pr }
+            } });
+            let (hub, calls) = mock_hub(vec![
+                ok(card(1, &stale)), ok(card(2, &current)), ok(json!({})), // classify and publish batch
+                ok(json!({})), ok(json!({})), ok(json!({})), // renew, carry/bounce first, publish its hold
+                ok(json!({})), ok(json!({})), ok(json!({})), ok(json!({ "events": [] })), ok(json!({ "decided": "pending" })), // merge second, ancestry and settle
+            ]);
+            let mut ctx = test_ctx(&hub);
+            ctx.workdir = repo.dir.to_string_lossy().to_string();
+            ctx.base_probe = true;
+            let merged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let merged_c = merged.clone();
+            let updated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let updated_c = updated.clone();
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                if cmd != "gh" { return None; }
+                if args.first() == Some(&"pr") {
+                    let pr = args[2];
+                    if args[1] == "merge" {
+                        assert_eq!(pr, "2", "the stale head must never merge before fresh CI");
+                        merged_c.store(true, Ordering::SeqCst);
+                        return Some(Ok(String::new()));
+                    }
+                    let head = if pr == "2" { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale };
+                    let done = pr == "2" && merged_c.load(Ordering::SeqCst);
+                    return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
+                        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "mergeCommit": if done { json!({ "oid": current }) } else { Value::Null }
+                    }).to_string()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint == "repos/o/r" { return Some(Ok(json!({ "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true }).to_string())); }
+                if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
+                if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.ends_with("/pulls/1/update-branch") {
+                    updated_c.store(true, Ordering::SeqCst);
+                    return Some(Ok("{}".into()));
+                }
+                if endpoint.contains("/pulls/") && endpoint.ends_with("/commits") {
+                    return Some(Ok(json!([{ "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]).to_string()));
+                }
+                panic!("unexpected gh command {args:?}");
+            }));
+            drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#1" }, { "id": "BR#2" }] }),
+                "o/r@main", "o/r", "main", 60_000, 10).unwrap_or_else(|e| panic!("{e}; calls: {:?}", calls.lock().unwrap().iter().map(call_name).collect::<Vec<_>>()));
+            assert!(merged.load(Ordering::SeqCst), "one candidate's CI/repair hold starved the independent current candidate");
+            let calls = calls.lock().unwrap();
+            let held = calls.iter().filter(|c| call_name(c) == "train_queue_facts").last().map(call_args).unwrap();
+            assert_eq!(held.pointer("/entries/0/cls"), Some(&json!(if worker_owned { "waiting" } else { "blocked" })));
+            assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 2));
+            assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 1));
         }
     }
 
