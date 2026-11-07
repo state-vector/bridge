@@ -1,6 +1,7 @@
 /** MCP OAuth authorization server. Public clients never receive a browser session
  * or the backing agent credential. All one-shot transitions live in one DO. */
 import { DEFAULT_WS_SLUG, doWs, hashAuthToken } from "./kb/core.ts";
+import { consentPage, consentError, consentFailure } from "./oauth-page.ts";
 
 type Env = { KB: DurableObjectNamespace; MCP_OAUTH: DurableObjectNamespace };
 type Client = { client_id: string; client_name: string; redirect_uris: string[] };
@@ -40,10 +41,6 @@ export async function resolveOAuthBearer(env: Env, bearer: string, resource: str
   if (!r.ok) return r;
   return ((await r.json()) as { bearer: string }).bearer;
 }
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
-
 /** Human authentication is supplied only by the worker's cookie-only path. */
 export async function handleOAuth(request: Request, env: Env,
   authenticate: () => Promise<Response | { login: string | null; ws: string }>): Promise<Response> {
@@ -68,7 +65,7 @@ export async function handleOAuth(request: Request, env: Env,
       if (!["GET", "POST"].includes(request.method)) return reply({ error: "invalid_request" }, 405);
       const auth = await authenticate();
       if (auth instanceof Response || !auth.login) {
-        if (request.method !== "GET") return reply({ error: "access_denied", error_description: "Sign in with GitHub first" }, 401);
+        if (request.method !== "GET") return consentError("Your sign-in has expired. Sign in to Bridge, then reconnect from your client.", 401);
         return new Response(null, { status: 302, headers: { Location: "/login", "cache-control": "no-store",
           "Set-Cookie": `bridge_mcp_return=${encodeURIComponent(url.pathname + url.search)}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax`,
         } });
@@ -76,18 +73,14 @@ export async function handleOAuth(request: Request, env: Env,
       const session = await hashAuthToken(request.headers.get("Cookie") ?? "");
       if (request.method === "GET") {
         const r = await oauthCall(env, "consent", { ...Object.fromEntries(url.searchParams), login: auth.login, ws: auth.ws, session, resource_expected: `${origin}/mcp` });
-        if (!r.ok) return r;
+        if (!r.ok) return consentFailure(r);
         const data = await r.json() as { id: string; client_name: string; redirect_uri: string };
-        return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>Connect to Bridge</title></head><body><h1>Connect to Bridge</h1><p>Authorize <strong>${escapeHtml(data.client_name)}</strong> to access workspace <strong>${escapeHtml(auth.ws)}</strong> as an interactive agent?</p><p>This allows reading and changing work and knowledge, including claiming tasks. Human-only approvals remain yours.</p><p>Client callback: <code>${escapeHtml(data.redirect_uri)}</code></p><form method="post" action="/oauth/authorize"><input type="hidden" name="id" value="${data.id}"><button name="decision" value="allow">Authorize agent</button><button name="decision" value="deny">Cancel</button></form></body></html>`, { headers: {
-          "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer",
-          "content-security-policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-          "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
-        } });
+        return consentPage(data, auth.ws);
       }
-      if (request.headers.get("Origin") !== origin) return reply({ error: "access_denied" }, 403);
+      if (request.headers.get("Origin") !== origin) return consentError("Bridge could not verify that this approval came from its connection page. Restart the connection from your client.", 403);
       const form = await request.formData();
       const r = await oauthCall(env, "approve", { id: form.get("id"), allow: form.get("decision") === "allow", login: auth.login, ws: auth.ws, session });
-      if (!r.ok) return r;
+      if (!r.ok) return consentFailure(r);
       const { redirect } = await r.json() as { redirect: string };
       return new Response(null, { status: 302, headers: { Location: redirect, "cache-control": "no-store", "referrer-policy": "no-referrer" } });
     }
@@ -103,7 +96,10 @@ export async function handleOAuth(request: Request, env: Env,
     const r = await oauthCall(env, op, { ...body, resource_expected: `${origin}/mcp`, rate_key: request.headers.get("CF-Connecting-IP") ?? "local" });
     const headers = new Headers(r.headers); headers.set("Access-Control-Allow-Origin", "*");
     return new Response(r.body, { status: r.status, headers });
-  } catch { return reply({ error: "server_error", error_description: "Authorization service temporarily unavailable" }, 503); }
+  } catch {
+    return path === "/oauth/authorize" ? consentError("Bridge is temporarily unavailable. Please try again in a moment.", 503)
+      : reply({ error: "server_error", error_description: "Authorization service temporarily unavailable" }, 503);
+  }
 }
 
 export class McpOAuth {
