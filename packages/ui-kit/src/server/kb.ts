@@ -1,5 +1,6 @@
 import { getKbHubConfig } from "./config";
 import type { ExecutionModelView } from "@bridge/contracts";
+import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
  *  Auth: the human session cookie — browser (webapp) sends it same-origin via
@@ -493,6 +494,7 @@ export const kbApi = {
   history: (id: string) => j<{ artefact_id: string; versions: KbVersion[] }>(`/api/kb/history?id=${encodeURIComponent(id)}`),
   // merge-train snapshot (all lanes) — lease holders + derived queue for the Top panel
   train: () => j<{ lanes: KbTrainLane[] }>("/api/kb/train"),
+  diagnostics: async () => HubDiagnosticsSchema.parse(await j<unknown>("/api/kb/diagnostics")),
   // human replies on a question thread — the same log_progress door agents use
   progress: (id: string, note: string, extra?: { will?: string; sentiment?: string }) =>
     j<{ ok: boolean }>("/api/kb/progress", { method: "POST", body: JSON.stringify({ id, note, ...extra }) }),

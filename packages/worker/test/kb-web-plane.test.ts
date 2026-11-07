@@ -66,6 +66,15 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
   });
 
 describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
+  it("exposes authenticated bounded request diagnostics without credentials or business mutations", async () => {
+    expect((await mf.dispatchFetch("https://main/api/kb/diagnostics")).status).toBe(401);
+    const res = await api("/api/kb/diagnostics");
+    expect(res.status).toBe(200);
+    const body = await res.json() as { instance_id: string; active: object[]; recent: object[] };
+    expect(body.instance_id).toBeTruthy();
+    expect(body.active.length).toBeGreaterThan(0);
+    expect(JSON.stringify(body)).not.toContain(SECRET);
+  });
   it("does not confuse workspace routing with authentication for an unknown bearer", async () => {
     const denied = await mf.dispatchFetch("https://main/api/kb/board", { headers: { authorization: "Bearer not-a-vended-credential" } });
     expect(denied.status).toBe(401);

@@ -178,8 +178,14 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       : action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing";
     return make("stopped", label, `${responseText ? `${responseText} ` : ""}${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
   }
-  if (q && !fresh) return make(
-    "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());
+  if (q && !fresh) {
+    const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
+      || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
+    const age = observedAt > 0 ? `${Math.max(0, Math.floor((now - observedAt) / 60_000))} minutes ago` : "at an unknown time";
+    return make("unknown", executorLive ? "Health checks overdue" : "Health checks paused",
+      `Main was last checked ${age}. ${executorLive ? "The active executor has not published fresh deployment evidence." : "No live merge executor is reporting GitHub/deployment health."} This does not establish that main is failing.`,
+      "stale_observation", [], repair());
+  }
   if (fresh && gatePending) return make("waiting", "Waiting for required checks",
     `The merge gate is waiting for: ${bs.gate_unsettled!.join(", ")}. No gate check has failed.`, "checks_running", [],
     { kind: "machine", text: "The executor rechecks automatically when these checks settle.", url: null });

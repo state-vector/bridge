@@ -65,7 +65,7 @@ describe("BR#6654 leg 2 — the owner-death release holds BEFORE attempting (sou
   };
 
   it("the in_progress owner-death branch runs releaseHold(meta) before its →todo transition", () => {
-    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     expect(sweepOpen).toBeGreaterThan(-1);
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
 
@@ -90,7 +90,7 @@ describe("BR#6654 leg 2 — the owner-death release holds BEFORE attempting (sou
   });
 
   it("the blocked/in_review ownership-lapse branch stays transition-free (notes only — no refusal storm surface)", () => {
-    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
     const ownerDeath = body.indexOf("(E) owner-death release");
     const elseOpen = body.indexOf("} else {", body.indexOf('if (r.status === "in_progress") {', ownerDeath));

@@ -177,7 +177,7 @@ async function handleAuthenticatedMcp(request: Request, env: any): Promise<Respo
   const call = async (op: string, payload: object) => {
     const r = await hub.fetch(`https://kb/${op}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-bridge-request-start": String(Date.now()) },
       body: JSON.stringify({ ...payload, actor: identity.label, token_id: identity.token_id,
         execution_scope: request.headers.get("x-bridge-task") ? {
           id: request.headers.get("x-bridge-task"),
@@ -286,7 +286,7 @@ function kbError(op: string, status: number, out: any): any {
 async function kb(hub: any, op: string, payload: object) {
   const r = await hub.fetch(`https://kb/${op}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "x-bridge-request-start": String(Date.now()) },
     body: JSON.stringify(payload),
   });
   const out = await r.json();

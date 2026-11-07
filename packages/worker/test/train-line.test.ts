@@ -8,6 +8,16 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("explains stale evidence and absent executor without declaring main failed", () => {
+    const present = now + 90 * 60_000;
+    const f = facts({ queue_facts: { at: now, base_state: { verdict: "green" } } });
+    const line = projectTrainLine(f, present);
+    expect(line).toMatchObject({ phase: "unknown", label: "Health checks paused", blocker: "stale_observation" });
+    expect(line.reason).toContain("90 minutes ago");
+    expect(line.reason).toContain("No live merge executor");
+    expect(line.reason).toContain("does not establish that main is failing");
+    expect(projectTrainLine({ ...f, lease: { holder: "runner", heartbeat_ts: present } }, present).label).toBe("Health checks overdue");
+  });
   it("withdraws the merge action immediately after a recorded response, then distinguishes observed merge from recovery", () => {
     const fix = { ...task, pr: 2965, pr_url: "https://github.com/o/r/pull/2965", merged: false, conflict: false };
     const f = facts({ stop: { reason: "Old main deployment failed" }, base_red_resolution: {

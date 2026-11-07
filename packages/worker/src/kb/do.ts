@@ -449,9 +449,12 @@ import {
   rootBlockerTitle,
 } from "./rollup.ts";
 
+import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
+
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
   private readonly schemaInitialization = new SchemaInitialization();
+  private readonly requestDiagnostics = new RequestDiagnostics();
 
   /** ensureSchema runs once per isolate, not per request — its migration
    *  queries are full-table scans, and the free-tier DO row-read quota
@@ -576,10 +579,19 @@ export class KnowledgeHub {
    *  that predates the mutation that triggered it. */
   private async boardPayload(force = false): Promise<any> {
     if (!force && this.boardCache && Date.now() - this.boardCache.at < 2000) return this.boardCache.body;
+    const trace = this.requestDiagnostics.begin("board.snapshot");
+    trace.stage("board");
+    let status = 503;
+    try {
     const body = await this.board();
     this.boardBuilds++;
     this.boardCache = { at: Date.now(), body };
+    status = 200;
     return body;
+    } finally {
+      const timing = trace.finish(status);
+      if (timing.elapsed_ms >= 250 || status >= 500) console.log(JSON.stringify({ type: "bridge.request", ...timing }));
+    }
   }
 
   /** Build once, send to every socket. Fire-and-forget on the mutation path —
@@ -642,6 +654,16 @@ export class KnowledgeHub {
    *  chain: a faulting tick is logged (alarm_error audit) and retried next
    *  tick at the 60s cadence. */
   async alarm() {
+    const trace = this.requestDiagnostics.begin("watchdog.alarm");
+    trace.stage("alarm");
+    try { await this.runAlarm(trace); }
+    finally {
+      const timing = trace.finish(200);
+      if (timing.elapsed_ms >= 250) console.log(JSON.stringify({ type: "bridge.request", ...timing }));
+    }
+  }
+
+  private async runAlarm(trace: RequestTrace) {
     try {
       await this.state.storage.setAlarm(Date.now() + 60_000);
     } catch (e) {
@@ -660,7 +682,7 @@ export class KnowledgeHub {
       this.pushBoardSnapshot();
     }
     try {
-      await this.alarmSweep();
+      await this.alarmSweep(trace);
     } catch (e) {
       try {
         this.audit("system:watchdog", "alarm_error", "watchdog", { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -668,13 +690,15 @@ export class KnowledgeHub {
     }
   }
 
-  private async alarmSweep() {
+  private async alarmSweep(trace?: RequestTrace) {
     await this.ensureSchema();
+    trace?.stage("capability.maintenance");
     this.executionWork().sweep();
     const now0 = Date.now();
     this.reconcileDispatchReservations(now0);
     this.reconcileSchedulingHealth(now0);
     // Readiness owns startup waits, not the task churn/timer machinery.
+    trace?.stage("startup.maintenance");
     this.reconcileStartupWaits(now0);
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
     // but an ask to an agent that never answers would pause its task FOREVER
@@ -708,6 +732,7 @@ export class KnowledgeHub {
     // (A) the in_progress stall sweep — BR#4282 moved the phase into its own
     // method (stallSweep below) so the admin.stall_sweep drill runs it in
     // isolation, mirroring admin.unblock_proxy_sweep.
+    trace?.stage("task.maintenance");
     await this.stallSweep(now0);
     // (A1) BR#5226 awaiting-park re-evaluation — the migration + steady-state
     // pass: every Awaiting park whose anchored accepted verdict covers the
@@ -733,6 +758,7 @@ export class KnowledgeHub {
     // queued lane with no merge-capable executor alarms even with zero
     // panel readers (the outage's silence failure).
     try {
+      trace?.stage("train.maintenance");
       await this.sweepLaneStarvation(now0);
     } catch (e) {
       this.audit("system:train", "starve_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -754,6 +780,7 @@ export class KnowledgeHub {
     // pattern above): every tick escalates, and an escalation error can't
     // mask (or ride) the starvation sweep's own audit.
     try {
+      trace?.stage("review.maintenance");
       await this.escalateStaleAsks(now0);
     } catch (e) {
       this.audit("system:watchdog", "ask_escalation_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -765,6 +792,7 @@ export class KnowledgeHub {
     // stranded car from a genuinely stalled train. One machine re-board per
     // episode + one alarm per episode (24h dedupe) to the train alarm sink.
     try {
+      trace?.stage("train.maintenance");
       await this.sweepStrandedTrainCards(now0);
     } catch (e) {
       this.audit("system:train", "strand_sweep_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -3711,9 +3739,10 @@ export class KnowledgeHub {
   //     last-resort catch → typed JSON 503. HTML never escapes this class.
   async fetch(request: Request): Promise<Response> {
     const route = `${request.method} ${new URL(request.url).pathname}`;
+    const trace = this.requestDiagnostics.begin(new URL(request.url).pathname.slice(1), Number(request.headers.get("x-bridge-request-start")));
     let status = 503;
     try {
-      const res = await this.doFetch(request);
+      const res = await this.doFetch(request, trace);
       status = res.status;
       return res;
     } catch (e) {
@@ -3724,15 +3753,19 @@ export class KnowledgeHub {
       );
     } finally {
       this.noteRoute(route, status < 500);
+      const timing = trace.finish(status);
+      if (timing.elapsed_ms >= 250 || timing.ingress_ms >= 250 || status >= 500
+        || ["execution.advertise", "worker.resolve", "agent.provision"].includes(timing.operation)) console.log(JSON.stringify({ type: "bridge.request", ...timing }));
     }
   }
 
-  private async doFetch(request: Request): Promise<Response> {
+  private async doFetch(request: Request, trace: RequestTrace): Promise<Response> {
     try {
       await this.ensureSchema();
     } catch (e) {
       return this.storageFaultResponse("ensure_schema", e);
     }
+    trace.stage("alarm");
     // alarm health: null = not scheduled; a timestamp far in the PAST = a stale
     // alarm the runtime dropped without invoking (observed live: getAlarm stuck
     // 42h in the past, so this arm-guard never re-armed and the watchdog went
@@ -3748,6 +3781,7 @@ export class KnowledgeHub {
       this.noteStorageFault("alarm_rearm", e);
     }
     const url = new URL(request.url);
+    trace.stage("dispatch");
 
     // realtime: hibernating WS fanout of audit events
     if (url.pathname === "/ws") return this.handleWs(request);
@@ -3821,6 +3855,7 @@ export class KnowledgeHub {
           case "/board": return this.limited("board", 30, 60_000, request)
             ?? this.json(await this.boardPayload());
           case "/stats": return this.json(await this.stats());
+          case "/diagnostics": return this.json(this.requestDiagnostics.snapshot());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
           case "/metrics.reports": return this.json(await this.metricsReports(url.searchParams));
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
@@ -3834,6 +3869,7 @@ export class KnowledgeHub {
     }
 
     const op = url.pathname.slice(1);
+    trace.stage("body");
     let body: any = {};
     if (request.method === "POST") {
       // BR#4212: a malformed body is a 400, not an entry-level throw (it used
@@ -3842,6 +3878,7 @@ export class KnowledgeHub {
     }
     const isAdmin = request.headers.get("x-kb-admin") === "1";
     const actor = String(body.actor ?? "mcp");
+    trace.stage("dispatch");
 
     try {
       // Public transports stamp the authenticated token id and actor. A
@@ -3857,7 +3894,7 @@ export class KnowledgeHub {
       }
       this.executionMutationGuard(op, body);
       switch (op) {
-        case "execution": return this.json(await this.executionCommand(body, actor));
+        case "execution": return this.json(await this.executionCommand(body, actor, trace));
         case "handoff.read": return this.json(this.executionWork().read(body, String(body.token_id ?? ""), String(body.session ?? "")));
         case "handoff.accept": return this.json(this.executionWork().accept(body, String(body.token_id ?? "")));
         case "handoff.checkpoint": return this.json(this.executionWork().checkpoint(HandoffCheckpointSchema.parse(body), String(body.token_id ?? "")));
@@ -5131,6 +5168,7 @@ export class KnowledgeHub {
       }
       return result;
     }
+    this.executionWork().sweep();
     const observation = this.one(`SELECT capabilities,observed_ts FROM execution_hosts WHERE token_id=?`, tokenId);
     const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
     const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
@@ -5314,7 +5352,7 @@ export class KnowledgeHub {
   /** No awaits between read/decide/write. State and replay receipt share one
    * SQLite transaction; replay after a lost response never authorises a second
    * Git/AWS effect. Those effects still require inspect-and-reconcile. */
-  private async executionCommand(raw: unknown, actor: string) {
+  private async executionCommand(raw: unknown, actor: string, trace?: RequestTrace) {
     const req = ExecutionRequestSchema.parse(raw);
     const body = raw as Record<string, unknown>;
     const tokenId = String(body.token_id ?? "");
@@ -5322,6 +5360,7 @@ export class KnowledgeHub {
     if (!token) throw new Error("gate: durable execution requires a live authenticated credential");
     const gateway = tagsSayGateway(parseTags(token.tags));
     const command = req.command;
+    trace?.operation(`execution.${command.kind.replaceAll("_", ".")}`);
     const now = Date.now();
     const effectKey = `gateway:${tokenId}`, effectRequest = JSON.stringify({ command, actor });
     if (command.kind === "gateway_control" || command.kind === "gateway_failure") {
@@ -5381,6 +5420,7 @@ export class KnowledgeHub {
       return result;
     }
     if (command.kind === "advertise") {
+      trace?.stage("readiness");
       if (!gateway) throw new Error("gate: only authenticated gateways advertise executor capabilities");
       if ([command.capabilities, ...command.capabilities.alternatives].some(c => c.backend === "interactive")) throw new Error("gate: interactive capability attestations belong to human-scoped grants, not gateway inventory");
       const existing = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, tokenId);
@@ -5394,12 +5434,11 @@ export class KnowledgeHub {
       // An obsolete GUI can drain existing work, but cannot overwrite the live
       // readiness of a corrected runner or borrow its proof to claim a card.
       const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
+      trace?.stage("inventory");
       if (!keepReady) this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(observedCapabilities), now);
-      this.reconcileDispatchReservations(now);
-      this.reconcileStartupWaits(now);
-      this.executionWork().sweep();
-      this.reconcileSchedulingHealth(now);
-      this.publishWorkerStatus(actor, now);
+      // Renewal is the control-plane liveness path. Backlog reconciliation and
+      // board construction must not delay its acknowledgement. The scheduler
+      // and alarm own bounded reconciliation and always recheck claim safety.
       return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000, lifecycle_protocol: 2 };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);

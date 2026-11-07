@@ -8,6 +8,41 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+### Operational diagnostics
+
+Open **Merge trains → Hub request diagnostics** for an on-demand snapshot of
+in-flight request stages and per-operation latency/error counts. The authenticated
+`GET /api/kb/diagnostics` endpoint exposes the same bounded, isolate-local data:
+up to 64 recent completions, 128 tracked active requests, and 64 operation groups.
+Timings reset when the hub instance restarts; the observation and instance-start
+timestamps make that scope explicit. Reading diagnostics performs no repair sweep.
+Slow hub requests also emit structured `bridge.request` stage timings to Cloudflare.
+
+From a registered checkout with dependencies installed and `wrangler whoami`
+authenticated, capture live traffic with:
+
+```sh
+npm run diagnose:hub -- --seconds 45
+npm run diagnose:hub -- --seconds 45 --json
+```
+
+The read-only tool reports request counts, server errors, cancellations, wall-time
+percentiles, edge CPU and slow hub stages. It excludes credentials, headers,
+payloads, query strings and arbitrary log messages. Wall time includes upstream
+and queue waits; edge CPU alone does not identify the bottleneck.
+
+Gateway capability renewal acknowledges the current inventory/readiness without
+running global backlog reconciliation or building a board snapshot. The scheduler
+and watchdog reconcile at most 25 capability-waiting tasks per pass with a durable
+fair cursor and one host/occupancy snapshot per synchronous pass. Reservations
+still check current capability, ownership and execution fences before starting work.
+
+**Health checks paused** means no live merge executor is reporting fresh deployment
+evidence. **Health checks overdue** means an executor is present but its evidence
+is stale. Both retain the existing unknown-health phase, show the actual last-check
+age, and do not assert that main is failing. The recorded gateway hold or readiness
+failure appears as the cause instead of a generic unavailable-model explanation.
+
 ### Knowledge-plane identity
 
 Knowledge REST bearer requests authenticate through the workspace's credential

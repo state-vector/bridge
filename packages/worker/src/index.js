@@ -239,6 +239,7 @@ export default {
           : sub === "artefact" ? "https://kb/artefact"
           : sub === "search" ? "https://kb/search"
           : sub === "stats" ? "https://kb/stats"
+          : sub === "diagnostics" ? "https://kb/diagnostics"
           : sub === "related" ? "https://kb/related"
           : sub === "history" ? "https://kb/history"
           : sub === "ask" ? "https://kb/ask"
@@ -254,6 +255,7 @@ export default {
         const rateKey = auth.login ? `web:${auth.login}` : `ip:${request.headers.get("cf-connecting-ip") ?? "anon"}`;
         const fwd = new Request(kbUrl + url.search, request);
         fwd.headers.set("x-kb-rate-key", rateKey);
+        fwd.headers.set("x-bridge-request-start", String(Date.now()));
         return kbCors(await kbGuard("kb." + sub, env.KB.get(kbId).fetch(fwd)));
       }
       if (request.method === "POST") {
