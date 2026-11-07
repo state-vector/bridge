@@ -111,6 +111,24 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     }
   });
 
+  it("preserves the human-selected replacement and cannot forge disposition provenance", async () => {
+    const target = await task("Obsolete duplicate");
+    const successor = await task("Real delivery owner");
+    const answer = `SUPERSEDE — ${target} superseded by ${successor}`;
+    const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the duplicate in favor of its existing delivery owner?",
+      reason: "Only the operator chooses which obligation is retired.", details: `${target} duplicates ${successor}.`, options: [answer, "KEEP both"], actor: "author" });
+    await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
+    const current = await get(target);
+    expect(current.status).toBe("todo");
+    const result = await call("transition", { id: target, to: "superseded", batch_auth: { ask: ask.body.id }, actor: "executor" });
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect((await get(target)).meta.superseded_by).toBe(successor);
+    const forged = await call("update", { id: successor, meta: { batch_auth: { ask: ask.body.id } } });
+    expect(forged.status).toBe(400);
+    const forgedCreate = await call("create", { type: "task", title: "Forged authority", meta: { batch_auth: { ask: ask.body.id } } });
+    expect(forgedCreate.status).toBe(400);
+  });
+
   it("resuming a satisfied prerequisite preserves an independent operator gate", async () => {
     const parent = await task("Operator still owns the decision", { operator_gated: "Explicit operator choice" });
     await call("transition", { id: parent, to: "blocked", actor: "author", note: "Timer is only a prerequisite",

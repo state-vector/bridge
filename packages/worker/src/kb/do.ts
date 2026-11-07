@@ -358,9 +358,9 @@ export function verifyDutyBody(parentId: string, rootTitle: string, prLink: stri
   const direct = !leg ? parseDirectCommitReceipt(prLink) : null;
   if (direct?.repo) return `Independent review of ${parentId} — "${rootTitle}".
 
-The change is already on main: ${prLink}. Check it in a fresh session; do not ask the human to arrange a reviewer.
+Commit receipt: ${prLink}. A commit URL does not prove main ancestry. Check it in a fresh session; do not ask the human to arrange a reviewer.
 
-1. Confirm this commit is an ancestor of current main, its GitHub signature is valid, and CI succeeded for this commit.
+1. Establish the actual delivery phase from the parent and GitHub. For a published prelanding candidate, check the signature and substance and record a prelanding recommendation; do not assert it is on main or return accepted_direct_main. After landing, confirm this commit is an ancestor of current main, its GitHub signature is valid, and CI succeeded for this commit.
 2. Check that the delivered behaviour meets the parent task, including current deployed behaviour where applicable. Cite the evidence and tests you actually checked.
 3. If accepted, close THIS duty done with review_result {kind:"accepted_direct_main",repo:"${direct.repo}",commit:"${direct.sha}",ci_run_url:"<green GitHub Actions run URL>"} and the evidence in your note. Bridge closes the parent automatically. There is no pending PR or merge step.
 4. If there are defects, bounce the parent to in_progress with concrete findings, then close this duty done with review_result {kind:"findings",summary:"<findings>"} and receipts. Cannot proceed is a findings result, never acceptance.
@@ -6200,15 +6200,16 @@ export class KnowledgeHub {
     const explicitRetire = !/^(?:NO|KEEP|HOLD|WAIT|RETAIN|DO\s+NOT|DON'T)\b/i.test(stripped)
       && [...stripped.matchAll(/(?:^|[;—–]\s*)retire\s+(BR#\d+)\b/gi)].some(m => m[1].toUpperCase() === id);
     const namedSupersede = /^SUPERSEDE\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
+    const recordedWebRetirement = /^GO\s*[—–-]\s*superseded\s+via\s+web\s+now\b/i.test(stripped);
     const single = subject === id && !am.ask?.decision && (!namedSupersede || namedSupersede === id)
-      && (/^SUPERSEDE\b(?!\s+(?:all|only|\d+)\b)/i.test(stripped) || explicitRetire);
+      && (/^SUPERSEDE\b(?!\s+(?:all|only|\d+)\b)/i.test(stripped) || explicitRetire || recordedWebRetirement);
     if (single) {
       const prior = JSON.parse(String(row.meta ?? "{}"));
       if (row.status === "superseded" && prior.batch_auth?.ask === askId) return { id, status: "superseded", batch_auth: prior.batch_auth };
       if (!["blocked", "todo"].includes(String(row.status))) refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}'; recorded retirement cannot interrupt active work`);
       if (prior.lane || this.isUnclaimableAnchor(row, prior) || parseTags(row.tags).includes("infrastructure")) refuse("batch-auth-target-protected", `target ${id} is standing infrastructure, outside recorded retirement scope`);
       const authorization = { ask: askId, answered_by: answeredBy, answered_ts: Number(am.ask.answered_ts), answer: answer.slice(0, 300), applied_by: actor, applied_session: body.session as string | undefined, applied_ts: ts };
-      const replacement = /\breplacement\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
+      const replacement = /\b(?:replacement|superseded\s+by)\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
       const result = await this.supersedeTask({ id, replacement_id: replacement, note: `Recorded human disposition ${askId}: ${stripped}` }, `system:question(${answeredBy})`, authorization);
       this.version(id, actor, "update", `Recorded per-card retirement applied from ${askId}; no new human decision`, { ask: askId, answered_by: answeredBy });
       return { ...result, batch_auth: authorization };
