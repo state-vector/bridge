@@ -93,6 +93,10 @@ evidence. **Health checks overdue** means an executor is present but its evidenc
 is stale. Both retain the existing unknown-health phase, show the actual last-check
 age, and do not assert that main is failing. The recorded gateway hold or readiness
 failure appears as the cause instead of a generic unavailable-model explanation.
+The merge executor publishes its newly checked base tip and deployment coverage
+before reporting tip-bound deployment observations or checking queued candidates.
+Slow or failed candidate work cannot withhold that health evidence; a failed health
+publication ends the walk instead of proceeding as though it had been recorded.
 
 `/__version` reports the web edge; `/__version?scope=stateful` reports the actual
 knowledge Durable Object build and lifecycle protocol without depending on SQL

@@ -32,6 +32,8 @@ checks explain missing evidence and executor state rather than declaring main re
 Maintenance yields between committed phases, and mutation acknowledgements do not
 run board aggregation synchronously. Indexed current-review lookups preserve exact
 review authority without repeatedly scanning unrelated retained history.
+Merge executors publish current-base health before deployment observations and
+candidate checks, so a stuck candidate cannot suppress newly observed main health.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 

@@ -2064,27 +2064,11 @@ fn reconcile_base_deploy(
     base_class: &mut CheckVerdict,
     required: &[String],
     pass_merged: u32,
-) -> Value {
+) -> Result<Value, String> {
     if tip_sha.is_empty() || !ctx.base_probe {
-        return build_base_state(base_class, required, pass_merged);
+        return Ok(build_base_state(base_class, required, pass_merged));
     }
     let wf_runs = ctx.workflow_runs(repo, base, tip_sha);
-    // Observation is not a merger action. Keep the hub's durable recovery
-    // proof current on every normal base probe, including matching reruns.
-    if pass_merged == 0 && tip_sha.len() == 40 {
-        let reportable: Vec<&DeployWorkflowRun> = wf_runs.iter().filter(|r|
-            crate::train_gate::is_deploy_workflow_run(r, required) && r.head_sha.len() == 40 && r.html_url.is_some()
-        ).collect();
-        if reportable.iter().any(|r| r.head_sha == tip_sha) {
-            if let Err(e) = ctx.mcp("train_observe_deploy", json!({ "repo": repo, "base": base,
-                "observation": { "tip_sha": tip_sha, "observed_at": now_ms(), "runs": reportable } })) {
-                // 600 chars keeps the zod issue's `path` + `message` visible —
-                // 200 cut the error inside the enum values list and hid the
-                // failing field entirely during the 2026-11-05 incident.
-                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 600)));
-            }
-        }
-    }
     let auto_key = format!("{key}:{tip_sha}");
     let manual_redispatch = lane.get("dispatch_deploy").filter(|v| !v.is_null()).is_some();
     let hub_dispatched_at = if manual_redispatch {
@@ -2159,7 +2143,29 @@ fn reconcile_base_deploy(
         }
     }
     *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
-    build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok)
+    let base_state = build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok);
+    if pass_merged == 0 {
+        // Current main evidence is independent of candidate admission. Publish
+        // it BEFORE any candidate fetch/check/repair can fail or take minutes,
+        // and before the deploy observation's exact-tip guard reads the lane.
+        // A failed publication ends this walk; a heartbeat cannot replace it.
+        let mut facts = json!({ "repo": repo, "base": base, "base_state": base_state });
+        if lane.get("queue").and_then(Value::as_array).map_or(false, |q| q.is_empty()) {
+            facts["entries"] = json!([]);
+        }
+        ctx.mcp("train_queue_facts", facts)
+            .map_err(|error| format!("base health publication failed before candidate admission: {error}"))?;
+        let reportable: Vec<&DeployWorkflowRun> = wf_runs.iter().filter(|r|
+            crate::train_gate::is_deploy_workflow_run(r, required) && r.head_sha.len() == 40 && r.html_url.is_some()
+        ).collect();
+        if reportable.iter().any(|r| r.head_sha == tip_sha) {
+            if let Err(e) = ctx.mcp("train_observe_deploy", json!({ "repo": repo, "base": base,
+                "observation": { "tip_sha": tip_sha, "observed_at": now_ms(), "runs": reportable } })) {
+                log(Some(key), &format!("deployment observation not accepted: {}", trunc(&e, 600)));
+            }
+        }
+    }
+    Ok(base_state)
 }
 
 fn request_main_recovery_retry(ctx: &mut Ctx, lane: &Value, repo: &str, base: &str, head: &str) -> Option<Value> {
@@ -2392,7 +2398,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let (base_sha, base_age_secs) = ctx.base_tip_facts(repo, base)?;
         let base_runs = ctx.check_runs(repo, &base_sha);
         let mut v = classify_base_check_runs(&base_runs, &required);
-        let observed = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut v, &required, 0);
+        let observed = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut v, &required, 0)?;
         let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": observed }));
         if v.verdict == MainVerdict::Green {
             renew_lease(ctx, repo, base);
@@ -2473,7 +2479,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 } else {
                     v.clone()
                 };
-                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut effective_v, &required, 0);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut effective_v, &required, 0)?;
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 let _ = settle_window_rebase(ctx, key, repo, base, lane);
             }
@@ -2536,7 +2542,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     ctx.check_runs(repo, &live_base_sha)
                 };
                 let mut live_base_class = classify_base_check_runs(&live_runs, &required);
-                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &mut live_base_class, &required, 0);
+                let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &live_base_sha, live_base_age_secs, &mut live_base_class, &required, 0)?;
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
                 // If merge_sha's own runs are all completed with a cancelled required run
                 // or missing/startup_failure required runs (superseded because a hotfix
@@ -2718,7 +2724,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         &mut base_class,
         &required,
         if from_awaiting_ci { 0 } else { pass_merged },
-    );
+    )?;
     if let Some(ref alarm) = base_class.alarm {
         log(Some(key), &format!("base check alarm (BR#5674 P1): {alarm}"));
     }
@@ -2726,7 +2732,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // Publish before releasing the lease, even when main is pending or
         // failed. Propagate delivery failure; a heartbeat is not a health
         // observation and must not be reported as one.
-        ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "base_state": base_state }))?;
+        if !ctx.base_probe || probed_base_sha.is_empty() {
+            ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": [], "base_state": base_state }))?;
+        }
         let msg = format!("idle main-health observation: {}", base_class.verdict.as_str());
         ctx.note(&msg);
         log(Some(key), &msg);
@@ -6629,6 +6637,7 @@ mod tests {
                 "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": head }], "merge_train": { "state": "queued", "pr": pr }
             } });
             let (hub, calls) = mock_hub(vec![
+                ok(json!({})), // fresh base facts precede candidate classification
                 ok(card(1, &stale)), ok(card(2, &current)), ok(json!({})), // classify and publish batch
                 ok(json!({})), ok(json!({})), ok(json!({})), // renew, carry/bounce first, publish its hold
                 ok(json!({})), ok(json!({})), ok(json!({})), ok(json!({ "events": [] })), ok(json!({ "decided": "pending" })), // merge second, ancestry and settle
@@ -7292,6 +7301,51 @@ mod tests {
     }
 
     #[test]
+    fn queued_base_health_is_published_before_observation_and_candidate_failure() {
+        for reject_publication in [false, true] {
+            let tip = "a".repeat(40);
+            let (hub, calls) = mock_hub(if reject_publication {
+                vec![Err("health publication unavailable".into())]
+            } else {
+                vec![ok(json!({})), ok(json!({})), Err("candidate fetch unavailable".into())]
+            });
+            let mut ctx = test_ctx(&hub);
+            ctx.base_probe = true;
+            let observed_tip = tip.clone();
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                assert_eq!(cmd, "gh");
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint.ends_with("/commits/main") {
+                    return Some(Ok(json!({"sha":observed_tip,"committed_at":crate::logging::iso(now_ms())}).to_string()));
+                }
+                if endpoint.contains("/check-runs?") {
+                    return Some(Ok(json!([{"name":"deploy / Deploy to dev","status":"completed","conclusion":"success"}]).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") {
+                    return Some(Ok(json!([{"id":100,"name":"Deploy Dev","path":".github/workflows/deploy-dev.yml",
+                        "head_sha":observed_tip,"status":"completed","conclusion":"success",
+                        "html_url":"https://github.com/o/r/actions/runs/100"}]).to_string()));
+                }
+                panic!("unexpected shell action: {cmd} {args:?}");
+            }));
+            let lane = json!({"queue":[{"id":"BR#1"}],"required_workflows":["deploy / Deploy to dev"],
+                "queue_facts":{"base_state":{"tip_sha":"old"}}});
+            let error = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10).unwrap_err();
+            let calls = calls.lock().unwrap();
+            assert_eq!(call_name(&calls[0]), "train_queue_facts", "fresh main evidence must not wait behind candidate work");
+            assert_eq!(call_args(&calls[0]).pointer("/base_state/tip_sha"), Some(&json!(tip)));
+            if reject_publication {
+                assert!(error.contains("health publication unavailable"));
+                assert_eq!(calls.len(), 1, "a failed publication must not admit observation or candidate work");
+            } else {
+                assert!(error.contains("candidate fetch unavailable"));
+                assert_eq!(calls.iter().map(call_name).collect::<Vec<_>>(), ["train_queue_facts", "train_observe_deploy", "get_artefact"]);
+                assert_eq!(call_args(&calls[1]).pointer("/observation/tip_sha"), Some(&json!(tip)));
+            }
+        }
+    }
+
+    #[test]
     fn idle_lane_observes_pending_green_red_recovery_and_probe_failure_br6901() {
         let repo = "state-vector/superpositional";
         let key = "state-vector/superpositional@main";
@@ -7435,12 +7489,14 @@ mod tests {
         let (hub, calls) = mock_hub(vec![
             // ---- Tick 1 (dark tip -> auto-dispatch deploy-dev.yml, hold car) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // fresh base facts before candidate work
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // train_queue_facts
             ok(json!({ "lanes": [{ "lane": "state-vector/superpositional@main", "queue": [{ "id": "BR#6165" }], "currently": null, "stop": null }] })), // release_if_idle status
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // fresh base facts before observation
             ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // train_queue_facts
@@ -7448,6 +7504,7 @@ mod tests {
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "ok": true })),                   // fresh base facts before observation
             ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // renew_lease (Merge candidate arm)
@@ -7608,11 +7665,13 @@ mod tests {
         assert_eq!(merges.len(), 1, "PR #2880 must merge automatically on tick 3 once deploy settles green");
 
         let hub_calls = calls.lock().unwrap().clone();
+        assert_eq!(hub_calls.iter().filter(|c| call_name(c) == "train_queue_facts").count(), 6,
+            "each tick publishes base health independently, then the candidate queue");
         let qf_calls: Vec<&Value> = hub_calls
             .iter()
-            .filter(|c| call_name(c) == "train_queue_facts")
+            .filter(|c| call_name(c) == "train_queue_facts" && call_args(c).get("entries").is_none())
             .collect();
-        assert_eq!(qf_calls.len(), 3, "each tick stamps train_queue_facts");
+        assert_eq!(qf_calls.len(), 3, "each tick publishes base health before candidate work");
 
         // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
         let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
