@@ -370,27 +370,6 @@ export const UNBLOCK_SPAWN_CAP = 3;
 
 export const RULES: Rule[] = [
   {
-    name: "gateway-cannot-author-completion",
-    when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
-    guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
-  },
-  {
-    name: "verdict-no-in_review",
-    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
-  },
-  {
-    name: "verdict-no-blocked",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "blocked" &&
-      VERDICT_ROLES.includes(role(i)) &&
-      !i.body?.awaiting_ask_id, // an ask-gate pauses the duty; it auto-resumes on the answer
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
-  },
-  {
     // BR#6135 interactive claim takeover — the stand-down half. A takeover
     // atomically flips meta.session to the taker; the EX-holder (the
     // dispatched runner session named in meta.taken_over.from_session) must
@@ -416,6 +395,21 @@ export const RULES: Rule[] = [
     guard: (i) =>
       `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. ` +
       "STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish.",
+  },
+  {
+    name: "gateway-cannot-author-completion",
+    when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
+    guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
+  },
+  {
+    name: "verdict-no-in_review",
+    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
+  },
+  {
+    name: "verdict-no-blocked",
+    when: (i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id,
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
   },
   {
     name: "release-needs-ownership",
@@ -534,18 +528,6 @@ export const RULES: Rule[] = [
     },
   },
   {
-    name: "done-unreviewed",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "done" &&
-      !["analysis", "review", "unblock"].includes(role(i)),
-    guard: async (i, c) => {
-      const r = await c.qualify("review");
-      if (r.ok) return null;
-      return `task ${i.id} cannot be completed unreviewed — complete a verify (review-role) child task or link an accepted decision (e.g. a Superpositional verdict) first`;
-    },
-  },
-  {
     name: "question-not-claimable",
     when: (i) => i.type === "question" && i.to === "in_progress",
     guard: (i) =>
@@ -564,6 +546,18 @@ export const RULES: Rule[] = [
       noteOf(i)
         ? null
         : `moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`,
+  },
+  {
+    name: "execution-submission-needs-outcome",
+    when: (i) => isTask(i) && i.to === "in_review" && !mergeCompletesTask(i.meta ?? {}),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result).success ? null
+      : `execution submission for ${i.id} requires execution_result {outcome,receipts} from this submission. A commit link, old result or process exit cannot establish the actual outcome.`,
+  },
+  {
+    name: "execution-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && !mergeCompletesTask(i.meta ?? {}) && !VERDICT_ROLES.includes(role(i)),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success ? null
+      : `execution completion for ${i.id} requires execution_result {outcome,receipts}; prerequisite delivery is not task completion.`,
   },
   {
     name: "review-needs-pr",
@@ -714,6 +708,12 @@ export const RULES: Rule[] = [
       const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
       return `terminal close leg(s) not receipted: ${labeled} — a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
     },
+  },
+  {
+    name: "done-unreviewed",
+    when: (i) => isTask(i) && i.to === "done" && !["analysis", "review", "unblock"].includes(role(i)),
+    guard: async (i, c) => (await c.qualify("review")).ok ? null
+      : `task ${i.id} cannot be completed unreviewed — require an independent typed acceptance of its actual delivered code or execution outcome; a findings close, decision note or absent claim bars is not acceptance`,
   },
 ];
 

@@ -10,43 +10,40 @@ import { verifyDutyBody } from "../src/kb/do.ts";
 // the same payload: 3 transition_rejected events, breach class
 // gate:multi-atom-condition (specimens BR#4425 on BR#4400, BR#4303 on BR#4297).
 
-describe("verifyDutyBody — the merge-train park carries its typed leg (BR#4425)", () => {
-  it("renders the concrete typed await_event when the PR stamp resolves", () => {
+describe("verifyDutyBody — one explicit acceptance authority", () => {
+  it("renders the exact subject and PR leg in the typed review result", () => {
     const body = verifyDutyBody(
       "BR#4400",
       "IMPL: single logging mechanism",
       "https://github.com/state-vector/bridge/pull/287",
       { repo: "state-vector/bridge", n: 287 },
     );
-    expect(body).toContain('await_event {event:"pr_merged", repo:"state-vector/bridge", n:287}');
-    // the refusal law is taught, not just the shape
-    expect(body).toContain("One typed leg per park (BR#3986)");
-    expect(body).toContain("parses to 2 machine atoms");
-    // the park note and the conjunction-as-prose instruction stay
-    expect(body).toContain("`merge-train: queued`");
-    expect(body).toContain("carry the conjunction as plain prose in unblock_condition");
+    expect(body).toContain('review_result {kind:"accepted_pr",task_id:"BR#4400"');
+    expect(body).toContain('repo:"state-vector/bridge",number:287,head_sha_at_acceptance:');
+    expect(body).toContain("Do not separately park the parent");
+    expect(body).toContain("waits for required CI");
   });
 
   // BR#6343 residual (answered ask BR#6354): the parser dedupes duplicate
   // PR citations (BR#6349), but the ACCEPT step must still TEACH the
   // convention — one citation per PR, head adjacent, /commit/<sha> receipts
   // — so a hand-written note cannot re-arm the livelock on a pre-dedupe hub.
-  it("teaches the close-note citation convention (BR#6343): one citation per PR, /commit/<sha> receipts, never a /pull/N/commits deep-link", () => {
+  it("requires explicit accepted heads instead of citation/prose parsing", () => {
     const body = verifyDutyBody(
       "BR#1",
       "some impl",
       "https://github.com/state-vector/bridge/pull/287",
       { repo: "state-vector/bridge", n: 287 },
     );
-    expect(body).toContain("Cite each PR exactly ONCE");
-    expect(body).toContain("never /pull/N/commits/");
-    expect(body).toContain("BR#6343");
+    expect(body).toContain("live full-40-hex head for EVERY accepted PR");
+    expect(body).toContain("Include every accepted leg explicitly");
+    expect(body).toContain("Findings are not acceptance");
     expect(body).not.toContain("undefined");
   });
 
   it("falls back to the generic form when the stamp is unresolvable (repo-less dispatch)", () => {
     const body = verifyDutyBody("BR#1", "some impl", "see note");
-    expect(body).toContain('{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}');
+    expect(body).toContain('repo:"<owner/name>",number:<PR number>');
     expect(body).not.toContain("undefined");
   });
 });

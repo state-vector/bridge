@@ -131,6 +131,8 @@ describe("BR#6349: the double-cited deep-link re-park stamps the note's head, ne
       await_event: { event: "pr_merged", repo: REPO, n: 30911 },
     });
     expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    expect((await getOne(id)).meta.pr.head_sha_at_acceptance).toBe(OLD);
+    await completePrReview(post, id, [{ repo: REPO, number: 30911, head_sha_at_acceptance: NEW }]);
     const now = await getOne(id);
     expect(now.status).toBe("blocked");
     // the stamp MOVED — one deduped leg, bound by the lenient single-PR rule;
@@ -142,7 +144,7 @@ describe("BR#6349: the double-cited deep-link re-park stamps the note's head, ne
     expect(now.meta?.merge_train?.unbound).toBeUndefined();
   });
 
-  it("drill 2 — a re-park whose head binds to NO stamped leg and moves nothing fails CLOSED to merge_train=unbound (no stale fold)", async () => {
+  it("drill 2 — ambiguous prose cannot mutate either accepted head or its queue binding", async () => {
     const id = await queuedMulti("BR#6349 fail-closed specimen", 30912, OLD, 30913, OLD_B);
     const park = await post("/transition", {
       id, to: "blocked",
@@ -152,11 +154,9 @@ describe("BR#6349: the double-cited deep-link re-park stamps the note's head, ne
     expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
     const now = await getOne(id);
     expect(now.status).toBe("blocked");
-    // the typed unbound phase — the stale entry must NOT ride the drain walk
-    expect(now.meta?.merge_train?.state).toBe("unbound");
-    expect(now.meta?.merge_train?.note_head).toBe(NEW);
-    expect(now.meta?.merge_train?.stale_head).toBe(OLD);
-    expect(now.meta?.merge_train?.unbound).toEqual([30912, 30913]);
+    expect(now.meta?.merge_train?.state).toBe("queued");
+    expect(now.meta?.merge_train?.note_head).toBeUndefined();
+    expect(now.meta?.merge_train?.unbound).toBeUndefined();
     // the stamps were NOT folded forward — they still name the old heads
     expect(now.meta?.pr?.head_sha_at_acceptance).toBe(OLD);
     expect(now.meta?.prs?.[0]?.head_sha_at_acceptance).toBe(OLD);
@@ -178,3 +178,4 @@ describe("BR#6349: the double-cited deep-link re-park stamps the note's head, ne
     expect(now.meta?.pr?.head_sha_at_acceptance).toBe(OLD);
   });
 });
+import { completePrReview } from "./completion-fixture";

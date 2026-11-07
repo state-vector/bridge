@@ -716,11 +716,11 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
     expect(linked.status).toBe(200);
     const claim = await kbJson("/transition", { id: child.id, to: "in_progress", note: "claim verify duty", actor: "verifier-opencode" });
     expect(claim.status).toBe(200);
-    const done = await kbJson("/transition", { id: child.id, to: "done", note: "verified PR https://github.com/state-vector/bridge/pull/0 — no-refold control", actor: "verifier-opencode" });
+    const done = await kbJson("/transition", { id: child.id, to: "done", review_result: { kind: "findings", summary: "No-refold control investigated" }, note: "verified PR https://github.com/state-vector/bridge/pull/0 — no-refold control", actor: "verifier-opencode" });
     expect(done.status).toBe(200);
     const take = await kbJson("/transition", { id: cardId, to: "in_progress", note: "claim breach investigation", actor: "investigator-opencode" });
     expect(take.status).toBe(200);
-    const close = await kbJson("/transition", { id: cardId, to: "done", note: "investigated and adjudicated", actor: "investigator-opencode" });
+    const close = await kbJson("/transition", { id: cardId, to: "done", execution_result: { outcome: "Investigated and adjudicated breach evidence", receipts: [cardId, child.id] }, note: "investigated and adjudicated", actor: "investigator-opencode" });
     expect(close.status).toBe(200);
   };
 

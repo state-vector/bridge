@@ -26,12 +26,13 @@ async function gateway(project: string, capacity = 1) {
   const host = `scheduler-${++serial}`;
   const token = await post("admin.mint", { label: host, tags: ["gateway"] });
   const identity = await post("auth.identify", { bearer: token.secret });
-  await post("agent.provision", { label: `${host}/worker`, actor: host });
+  const provisioned = await post("agent.provision", { label: `${host}/worker`, actor: host });
+  const worker = { actor: `${host}/worker`, token_id: provisioned.id, gateway: false };
   const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `gateway-${serial}` };
   const capabilities = { tier: "small", tools: ["git"], environment: ["linux"], backend: "opencode", model: "test/small", config_revision: "one", capacity, projects: [project], worker: { kind: "provisioned", label: `${host}/worker` } };
   const cmd = (command: object, command_id = `command-${++serial}`, id = "gateway", session = auth.session) => post("execution", { ...auth, id, session, command_id, command });
   expect((await cmd({ kind: "advertise", capabilities })).ok).toBe(true);
-  return { auth, capabilities, cmd, host };
+  return { auth, worker, capabilities, cmd, host };
 }
 async function task(project: string, meta: object = {}) {
   const result = await post("create", { actor: "author", type: "task", title: `Scheduler repair ${++serial}`, body_md: "Repair repository input", project, qualified: true, meta });
@@ -244,7 +245,9 @@ describe("priority line recovery capacity", () => {
     const repair = await task(project, { boosted: Date.now(), machine_duty: { kind: "task-recovery", reason: "head_checks" } });
     const claim = await reserve(g);
     if (claim.kind !== "reserved" || claim.task_id !== repair) throw new Error("urgent repair not reserved");
-    const handoff = await post("transition", { ...g.auth, id: repair, session: claim.session, to: "in_review",
+    expect((await g.cmd({ kind: "begin", attempt_id: "urgent-repair", worker: g.auth.agent, action_budget_ms: 60_000 }, "urgent-begin", repair, claim.session)).error).toBeUndefined();
+    const handoff = await post("transition", { ...g.worker, id: repair, session: claim.session,
+      execution_scope: { id: repair, generation: 1, attempt_id: "urgent-repair" }, to: "in_review",
       note: "PR https://github.com/state-vector/bridge/pull/6998 — repair delivered, independent review required" });
     expect(handoff.error).toBeUndefined();
     const review = await post("get", { id: handoff.verify_task });

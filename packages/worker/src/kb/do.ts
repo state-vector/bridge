@@ -374,10 +374,23 @@ Use answer_ask for any coordination question you answer; progress notes do not r
   const fastLane = rootFix
     ? `\n\nROOT-FIX FAST LANE (BR#5189): this parent is THE bound main-breakage fix (${rootFix.repo}#${rootFix.pr} — tags root_blocker + main-red, meta.root_fix binding to the failing main-HEAD run). Verify as usual; on accept it queues tier 0 — a stopped lane offers NOTHING else until it merges. If the base red is the circular deploy-health class (the gate red because main itself is red), the train's deterministic one-click human merge ask is the fast lane — you neither merge nor file it; the train owns both.`
     : "";
-  const directMain = !leg && /\/commit\/[0-9a-f]{7,40}\b/i.test(prLink)
-    ? `\n\nDIRECT-TO-MAIN LANDING (AGENTS.md Rule 7 — commit receipt ${prLink}, no PR): verify the commit is an ancestor of main, signed (isValid=true), with green CI and substance matching the task. On ACCEPT: close yourself done citing \`commit <full-40-hex>\` and the green CI run URL — the hub automatically closes ${parentId} done (do NOT transition ${parentId} to blocked with \`merge-train: queued\` when there is no PR).`
-    : "";
-  return `Verification duty for ${parentId} — "${rootTitle}".\n\nYour duty is the DOUBLE-CHECK, not the delivery — the serialized merge train owns the merge (BR#3516). You never merge, never close the parent done.\n\nVERIFY GATE — mergeability is a precondition, NOT a finding (2026-10-23 unsigned-PR incident):\n1. FIRST, before any substance check: gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true. If mergeable=false / CONFLICTING / any unsigned commit: STOP — zero substance checks, NO ask to the human.\n2. Bounce to impl: transition ${parentId} in_progress with the mechanical defect ("PR #N unmergeable — unsigned commits | conflicts | failing check X. Re-sign/rebase/resolve and re-push.").\n3. Broken signing environment (key unavailable / NO_USER): file ONE ask for the whole class, never per PR.\n\nThen double-check, don't reimplement: confirm the receipts (PR: ${prLink}, merge state, findings) and that the work matches the task.${fastLane}${directMain}\n\nACCEPT (substance AND mergeability both hold):\n1. Record the LIVE head: gh pr view <N> --json headRefOid, then put \`head <full-40-hex>\` in your close note — the hub stamps head_sha_at_acceptance from it (zero hub GitHub calls). Cite each PR exactly ONCE — the /pull/ URL or \`owner/name#N\`, never both, with \`head <sha>\` adjacent — and cite commit receipts as /commit/<sha> URLs, never /pull/N/commits/… deep-links: a second citation of the same PR mints a phantom leg, breaks head pairing, and drops the bound head (the BR#4684/PR#309 livelock — BR#6349 parser dedupe + BR#6343 convention; keep the note clean on any build).\n2. Transition the parent ${parentId} to blocked with note \`merge-train: queued\` AND the ONE typed machine leg on the same call — pass await_event ${leg ? `{event:"pr_merged", repo:"${leg.repo}", n:${leg.n}}` : `{event:"pr_merged", repo:"<owner/name>", n:<PR you verified>}`}. One typed leg per park (BR#3986): conjunction prose ("…merges (mergeCommit non-null) AND main CI green after") parses to 2 machine atoms and is refused loud at the door (breach class gate:multi-atom-condition — specimens BR#4425, BR#4303); carry the conjunction as plain prose in unblock_condition — the typed leg is the gate the train flips. The train gates it, merges it, waits out main CI, and closes it citing the mergeCommit.\n3. Close yourself done citing the receipts. A conflicted PR bounces off the train back here with the conflict file list — resolution invalidates the verdict, re-verify at the new head, re-queue.\n\nProblems found → bounce the parent back to impl with findings (in_review → in_progress, one round, N bounces).`;
+  return `Verification duty for ${parentId} — "${rootTitle}".
+
+Your duty is the independent DOUBLE-CHECK. The serialized merge train owns merging and delivery; never merge or close the parent yourself.
+
+VERIFY GATE — mergeability is a precondition, NOT a finding:
+1. Before substance checks, run gh pr view <N> --json mergeable,mergeStateStatus,reviewDecision and confirm every commit signature isValid=true.
+2. Conflicts, unsigned commits or failing mechanical gates: stop substance checks and bounce ${parentId} to in_progress with the exact repair. Do not ask the human to waive a mechanical defect.
+3. A broken signing environment warrants ONE environment-level ask.
+
+Then check the actual task and receipts (PR: ${prLink}), not process output or a prerequisite merge.${fastLane}
+
+ACCEPT only after substance AND mergeability hold:
+1. Read the live full-40-hex head for EVERY accepted PR.
+2. Close THIS duty done with review_result {kind:"accepted_pr",task_id:"${parentId}",legs:[{repo:"${leg?.repo ?? "<owner/name>"}",number:${leg?.n ?? "<PR number>"},head_sha_at_acceptance:"<verified full-40-hex>"}]} and evidence in the note. Include every accepted leg explicitly.
+3. Bridge durably records that exact acceptance and queues the parent. Do not separately park the parent or infer acceptance from a note. The train checks the current head/base, merges, waits for required CI, and closes the delivery.
+
+Problems or cannot proceed: bounce the parent with concrete findings, then close THIS duty done with review_result {kind:"findings",summary:"<specific missing evidence or defect>"}. Findings are not acceptance. A stronger-implementation verdict must name this exact parent. A repaired or changed head needs fresh head-specific verification.`;
 }
 
 function executionDutyBody(id: string, title: string): string {
@@ -5997,7 +6010,7 @@ export class KnowledgeHub {
 
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
-  private ruleCtx(row: any, body: any, id: string, tTags: string[]): RuleCtx {
+  private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
     const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.meta FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
       const meta = JSON.parse(String(child.meta ?? "{}"));
       if (meta.machine_duty || meta.ask?.review_leg) return false;
@@ -6007,6 +6020,26 @@ export class KnowledgeHub {
     });
     return {
       qualify: (kind) => {
+        if (kind === "review") {
+          // Claim readiness is not completion authority. A task with no claim
+          // bars still needs a positive, subject-bound delivery/outcome verdict.
+          if (HUMAN_ACTOR_RX.test(actor)) return { ok: true, via: "human" };
+          const taskMeta = JSON.parse(row.meta ?? "{}");
+          const landed = trainLegs(taskMeta).length > 0 && trainLegs(taskMeta).every(l => trainLegLanded(taskMeta, l));
+          const reviews = this.state.storage.sql.exec(`SELECT c.id,c.meta FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%"review"%' AND (json_extract(c.meta,'$.execution_review_of')=? OR EXISTS(SELECT 1 FROM relations r WHERE r.src_id=c.id AND r.relation='child_of' AND r.dst_id=?)) ORDER BY c.status_ts DESC`, id, id).toArray();
+          for (const review of reviews) {
+            const parsed = ReviewResultSchema.safeParse(JSON.parse(String(review.meta ?? "{}")).review_result);
+            if (!parsed.success) continue;
+            const result = parsed.data;
+            if (result.kind === "accepted_direct_main" && mergeCompletesTask(taskMeta)
+              || result.kind === "accepted_execution" && result.task_id === id && !mergeCompletesTask(taskMeta)
+              || result.kind === "accepted_pr" && result.task_id === id && mergeCompletesTask(taskMeta) && landed) return { ok: true, via: String(review.id) };
+          }
+          // Historical acceptances may already have been sealed in the durable
+          // admission ledger. Preserve those exact receipts, never their prose.
+          if (landed && this.one(`SELECT review_id FROM delivery_admissions WHERE json_extract(record,'$.state.task_id')=? AND json_extract(record,'$.state.phase')='admitted' LIMIT 1`, id)) return { ok: true, via: "historical-admission" };
+          return { ok: false };
+        }
         // Bar-based claim gate: a claim is legal unless the task DECLARES
         // enforceable bars that are unmet. Task tags declare the KIND of work
         // (analysis/impl/review) for the dispatched session's delivery
@@ -6282,7 +6315,7 @@ export class KnowledgeHub {
     const ts0 = Date.now();
     const verdict = await decide(
       { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
-      this.ruleCtx(row, body, id, tTags),
+      this.ruleCtx(row, body, id, tTags, actor),
     );
     const freshClaim = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
     if (freshClaim.status !== row.status || freshClaim.owner !== row.owner || JSON.parse(freshClaim.meta ?? "{}").session !== JSON.parse(row.meta ?? "{}").session
@@ -6323,6 +6356,19 @@ export class KnowledgeHub {
     if (reviewResult) {
       if (row.type !== "task" || !parseTags(row.roles ?? "").includes("review") || body.to !== "done") throw new Error("review_result is only valid on a review duty closing done");
       if (reviewResult.kind === "accepted_direct_main" && !reviewResult.ci_run_url.startsWith(`https://github.com/${reviewResult.repo}/actions/runs/`)) throw new Error("review CI receipt must belong to the delivered repository");
+      if (reviewResult.kind === "accepted_pr" || reviewResult.kind === "accepted_execution" || reviewResult.kind === "accepted_direct_main") {
+        const subjects = new Set(this.state.storage.sql.exec(`SELECT dst_id FROM relations WHERE src_id=? AND relation='child_of'`, id).toArray().map(r => String(r.dst_id)));
+        if (typeof meta.execution_review_of === "string") subjects.add(meta.execution_review_of);
+        // Standalone historical PR reviews can bind their exact named task,
+        // but may never override a duty's already-declared subject.
+        const subject = reviewResult.kind === "accepted_direct_main" ? [...subjects][0] : reviewResult.task_id;
+        if (!subject || subjects.size > 1 || (subjects.size === 1 && !subjects.has(subject))) throw new Error("gate: review acceptance must name this duty's exact subject");
+        const target = this.one(`SELECT type,meta FROM artefacts WHERE id=?`, subject);
+        if (target?.type !== "task") throw new Error("gate: review acceptance subject must be an existing task");
+        const targetMeta = JSON.parse(target.meta ?? "{}");
+        if (!mergeCompletesTask(targetMeta) && reviewResult.kind !== "accepted_execution") throw new Error("gate: execution outcomes require accepted_execution; prerequisite or code delivery is not outcome acceptance");
+        if (reviewResult.kind === "accepted_execution" && (mergeCompletesTask(targetMeta) || !ExecutionResultSchema.safeParse(targetMeta.execution_result).success)) throw new Error("gate: execution acceptance requires an execution contract and the subject's submitted execution_result");
+      }
       meta.review_result = reviewResult;
       if (reviewResult.kind === "stronger_implementation_required") {
         const subject = meta.execution_review_of;
@@ -6987,7 +7033,7 @@ export class KnowledgeHub {
               title: `Unblock: ${rootTitle.slice(0, 200)}`,
               session: "", // session-less spawn: the unblock contract is "then a
               // FRESH session" — a pre-attributed child would trip review-separation against the legitimate closer
-              body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${fx.reason || "see parent"}.\nExit condition: ${fx.exit_condition || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nContract: check whether the exit condition now holds (live receipts, GitHub state, answered decision). If it holds: transition ${id} to in_progress with the resolution note, then close yourself done citing what unblocked it (the done note must cite receipts — ${RECEIPTS_DOC}). If it does not: record findings via log_progress and close yourself done with the findings — the done note still must cite receipts (the findings count: ${RECEIPTS_DOC}) — do NOT respawn an unblock task, do not leave yourself open.`,
+              body_md: `Unblock duty for ${id} — "${rootTitle}".\n\nBlocked why: ${fx.reason || "see parent"}.\nExit condition: ${fx.exit_condition || "none recorded — read the card and history, then decide: clear the block, re-scope the task, or escalate via ask_agent"}.\n\nCheck the actual exit condition using live receipts. If it holds, resume ${id} to in_progress with the resolution; do not close its business outcome. Close THIS duty done with execution_result {outcome:"<what you actually observed>",receipts:["<per-action evidence>"]}. If the condition does not hold, the same typed result records findings without claiming recovery. If a different wait now owns the parent, use unblock_result {kind:"reblocked",parent_id:"${id}",reason:"<current blocker>",next:"<executable next step>",await_event:<one valid typed event>}; Bridge replaces the wait atomically. Notes and transcripts alone cannot close a duty. Never respawn another unblock task or leave this verdict duty open.`,
               // BR#5370: machine-duty marker — the done-open-children gate ignores it.
               meta: { machine_duty: { by: actor, kind: "unblock", subject: id } },
               roles: ["unblock"],
@@ -7859,10 +7905,11 @@ export class KnowledgeHub {
   }
 
   /** Runs inside the SAME SQLite transaction that closes the independent review.
-   * A findings close is never acceptance. Legacy explicit ACCEPT notes are
-   * adapted once; absent/ambiguous heads are never borrowed from old verdicts. */
-  private persistDeliveryAdmission(reviewId: string, note: string, result: ReviewResult | undefined, actor: string, ts: number): void {
+   * A findings close is never acceptance. Prose adaptation is restricted to
+   * the historical backfill; new transitions require a typed result. */
+  private persistDeliveryAdmission(reviewId: string, note: string, result: ReviewResult | undefined, actor: string, ts: number, historical = false): void {
     if (result && result.kind !== "accepted_pr") return;
+    if (!result && !historical) return;
     if (!result && !/^\s*(?:(?:VERDICT|VERIFY)\s*:\s*)?(?:VERIFY\s+ACCEPT|ACCEPT(?:ED)?|VERIFIED)\b/i.test(note)) return;
     const parsedLegs = trainParseNoteLegs(note);
     let parent = this.one(`SELECT p.* FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=? AND r.relation='child_of' AND p.type='task' LIMIT 1`, reviewId);
@@ -7974,7 +8021,7 @@ export class KnowledgeHub {
     const accepted = this.state.storage.sql.exec(`SELECT c.id,c.meta,c.status_ts FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%review%' AND NOT EXISTS(SELECT 1 FROM delivery_admissions a WHERE a.review_id=c.id) AND NOT EXISTS(SELECT 1 FROM delivery_review_backfill b WHERE b.review_id=c.id AND b.status_ts=c.status_ts) ORDER BY c.rowid LIMIT 10`).toArray();
     for (const r of accepted) {
       const receipt = this.one(`SELECT actor,data FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, r.id);
-      if (receipt) this.persistDeliveryAdmission(String(r.id), String(JSON.parse(String(receipt.data ?? "{}")).note ?? ""), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
+      if (receipt) this.persistDeliveryAdmission(String(r.id), String(JSON.parse(String(receipt.data ?? "{}")).note ?? ""), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts), true);
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
     await this.replayDeliveryAdmissions();
@@ -12289,10 +12336,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           continue;
         }
         const note = `Burst-settle close (BR#4934): PR #${leg.number} merged as ${String(legRec.merge_sha).slice(0, 9)} — its runs were cancelled-by-next-push (GH#2261: cancelled says nothing); the pass settled GREEN at ${settledSha.slice(0, 9)} and this sha is a fed git ancestor of it. Closed by the merge train's burst-drain settle, zero hub GitHub calls.`;
+        // Persist the decisive leg receipt before asking the completion gate.
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(cm), row.id);
         if (row.status === "blocked") await this.transition({ id: row.id, to: "in_progress", session: "", note: `merge-train: landed — closing on the burst pass's green settle (evidence ${settledSha.slice(0, 9)})`, merge_train: true }, actor);
         await this.transition({ id: row.id, to: "done", session: "", note }, actor);
-        cm.merge_train = { ...cm.merge_train, state: "landed", pr: leg.number, merge_sha: legRec.merge_sha, landed_at: now, burst_evidence: settledSha };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, row.id);
+        const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, row.id).meta ?? "{}");
+        completed.merge_train = { ...cm.merge_train, state: "landed", pr: leg.number, merge_sha: legRec.merge_sha, landed_at: now, burst_evidence: settledSha };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(completed), now, row.id);
         this.audit(actor, "train:burst_park_closed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: leg.number, task: row.id, merge_sha: legRec.merge_sha, evidence_sha: settledSha });
         this.version(row.id, actor, "train:landed", `burst-settle: card closed — merge sha ${String(legRec.merge_sha).slice(0, 9)} is an ancestor of the green-settled pass head ${settledSha.slice(0, 9)}`, {});
         closed += 1;
@@ -12465,11 +12515,13 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
           mergeSha: String(legsMap[String(l.number)]?.merge_sha ?? p.mergeSha),
         }));
         const note = trainLandedCloseNote({ repo: laneSpec.repo, prNumber: p.pr, mergeSha: p.mergeSha, gateway: actor, greenRunUrl: p.greenRunUrl, legs: allLegs });
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(cm), taskId);
         if (card.status === "blocked")
           await this.transition({ id: taskId, to: "in_progress", session: "", note: `merge-train: landed — closing on the machine proxy (mergeCommit ${p.mergeSha.slice(0, 9)} non-null + main green)`, merge_train: true }, actor);
         await this.transition({ id: taskId, to: "done", session: "", note }, actor);
-        cm.merge_train = { ...cm.merge_train, state: "landed", pr: p.pr, merge_sha: p.mergeSha, landed_at: now };
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), taskId);
+        const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, taskId).meta ?? "{}");
+        completed.merge_train = { ...cm.merge_train, state: "landed", pr: p.pr, merge_sha: p.mergeSha, landed_at: now };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(completed), taskId);
       }
     }
     // BR#4934: the pass settled green — parked intermediate cards whose fed
@@ -13402,10 +13454,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
   private async trainQueueOnAccept(parentId: string, src: { note?: string; dutyBody?: string; review_result?: ReviewResult }, actor: string): Promise<void> {
     const parent = this.one(`SELECT id, type, status, meta, body_md, roles FROM artefacts WHERE id = ?`, parentId);
     if (!parent || parent.type !== "task" || parent.status === "done" || parent.status === "superseded") return;
+    if (!src.review_result) {
+      this.audit("system:completion", "typed_acceptance_required", parentId, { reason: "A note, park or decision cannot author acceptance; complete the independent review with review_result." });
+      return;
+    }
     const meta = JSON.parse(parent.meta ?? "{}");
     if (!mergeCompletesTask(meta)) {
       if (parent.status === "in_review" && src.review_result?.kind === "accepted_execution" && src.review_result.task_id === parentId && ExecutionResultSchema.safeParse(meta.execution_result).success) {
-        await this.transition({ id: parentId, to: "done", session: "", note: `Independent execution acceptance: ${src.review_result.receipts.join("; ")}` }, actor);
+        await this.transition({ id: parentId, to: "done", session: "", execution_result: meta.execution_result, note: `Independent execution acceptance: ${src.review_result.receipts.join("; ")}` }, actor);
         this.completeDeliveryClosure(parentId, src.review_result.receipts);
         return;
       }
@@ -13423,11 +13479,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     // without a typed result must be reconciled by an independent reviewer.
     const acceptedCommit = typedAccept ? { sha: typedAccept.commit, repo: typedAccept.repo } : null;
     if (parent.status === "in_review" && acceptedCommit) {
-      const analysisResult = parseTags(parent.roles).includes("analysis") ? {
-        outcome: `Independent review accepted the submitted analysis artifact at ${acceptedCommit.sha}`,
-        receipts: [`https://github.com/${acceptedCommit.repo}/commit/${acceptedCommit.sha}`, typedAccept!.ci_run_url],
-      } : undefined;
-      await this.transition({ id: parentId, to: "done", session: "", execution_result: analysisResult,
+      await this.transition({ id: parentId, to: "done", session: "",
         note: `Verified direct-to-main commit ${acceptedCommit.sha}; ${note}` }, actor);
       // Read the completed row again: terminal-transition cleanup owns its
       // metadata. Never overwrite that cleanup with the pre-transition copy.

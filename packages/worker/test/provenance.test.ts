@@ -173,6 +173,7 @@ async function stampViaTrain(opts: {
     await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "drill: verifying" });
     const closed = await kbJson("/transition", {
       id: verifyId, to: "done", actor: "drill-verifier",
+      review_result: { kind: "accepted_pr", task_id: taskId, legs: [{ repo: REPO, number: opts.pr, head_sha_at_acceptance: opts.headSha ?? HEAD_SHA }] },
       note: `verified head ${opts.headSha ?? HEAD_SHA} (drill) — PR https://github.com/${REPO}/pull/${opts.pr}`,
     });
     expect(closed.status, `verify close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);

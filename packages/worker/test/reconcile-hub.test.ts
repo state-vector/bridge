@@ -152,6 +152,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
       // review-role closes need receipts — the drill cites the PR it (didn't) verify
       const c = await kbJson("/transition", {
         id, to: "done", actor: "drill",
+        review_result: { kind: "findings", summary: "Died unbound; no PR delivery is accepted." },
         note: "drill: died unbound — PR https://github.com/state-vector/reconcile-drill-c/pull/2403 still open, nothing merged, no receipts filed",
       });
       expect(c.status, `kill close failed: ${JSON.stringify(c.body)}`).toBeLessThan(400);

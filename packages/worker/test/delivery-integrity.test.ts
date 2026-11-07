@@ -111,14 +111,14 @@ describe("delivery responsibility (real SQLite hub)", () => {
   });
 
   it("a standalone historical ACCEPT restores delivery even when its exact bound parent is already done", async () => {
-    const original = await call("create", { type: "task", title: "Historical done parent", roles: ["analysis"], actor: "old-impl", meta: { pr: { repo, number: 2329 } } });
+    const original = await call("create", { type: "task", title: "Historical done parent", roles: ["analysis"], actor: "old-impl", meta: { completion: { kind: "delivery" }, pr: { repo, number: 2329 } } });
     const id = original.body.id;
     expect((await call("transition", { id, to: "in_progress", actor: "old-impl" })).status).toBe(200);
-    expect((await call("transition", { id, to: "done", actor: "old-impl", note: "Analysis outcome complete" })).status).toBe(200);
+    expect((await call("transition", { id, to: "done", actor: "old-impl", execution_result: { outcome: "Historical analysis outcome", receipts: [id] }, note: "Analysis outcome complete" })).status).toBe(200);
     await call("reconcile.report", { repo, prs: [{ number: 2329, state: "OPEN", headRefOid: head, updatedAt: new Date().toISOString() }] });
     const review = (await call("create", { type: "task", title: "Standalone review", roles: ["review"], actor: "fresh-reviewer" })).body.id;
     expect((await call("transition", { id: review, to: "in_progress", actor: "fresh-reviewer", session: "fresh-2329" })).status).toBe(200);
-    const accepted = await call("transition", { id: review, to: "done", actor: "fresh-reviewer", session: "fresh-2329", note: `VERDICT: ACCEPT — head ${head}. PR https://github.com/${repo}/pull/2329. Scope ${id}. A prior attempt was rejected; this acceptance is at the live head.` });
+    const accepted = await call("transition", { id: review, to: "done", actor: "fresh-reviewer", session: "fresh-2329", review_result: { kind: "accepted_pr", task_id: id, legs: [{ repo, number: 2329, head_sha_at_acceptance: head }] }, note: `VERDICT: ACCEPT — head ${head}. PR https://github.com/${repo}/pull/2329. Scope ${id}. A prior attempt was rejected; this acceptance is at the live head.` });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await get(id)).status).toBe("done");
     // Fresh observation AFTER the acceptance seals the historical handoff.
@@ -146,7 +146,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     await call("admin.unblock_proxy_sweep", { now: Date.now() + 60 * 60_000 });
     expect((await get(dependent)).meta.proxy_check.verdict).toBe("false");
     await call("transition", { id: successor, to: "in_progress", actor: "successor" });
-    await call("transition", { id: successor, to: "done", actor: "successor", note: "Replacement outcome completed" });
+    await call("transition", { id: successor, to: "done", actor: "successor", execution_result: { outcome: "Replacement outcome completed", receipts: [successor] }, note: "Replacement outcome completed" });
     await call("admin.unblock_proxy_sweep", { now: Date.now() + 90 * 60_000 });
     expect((await get(dependent)).meta.proxy_check.verdict).toBe("true");
   });

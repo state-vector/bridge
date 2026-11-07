@@ -497,6 +497,8 @@ describe("loop regressions", () => {
         "done-close-legs",
         "done-open-children",
         "done-unreviewed",
+        "execution-done-needs-outcome",
+        "execution-submission-needs-outcome",
         "human-signoff-done",
         "infrastructure-close-protection",
         "operator-gated",

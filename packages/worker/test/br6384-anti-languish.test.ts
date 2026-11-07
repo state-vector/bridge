@@ -319,6 +319,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect((await kbJson("/transition", { id: duty, to: "in_progress", actor: "rig", note: "ruling the round" })).status).toBeLessThan(400);
     expect((await kbJson("/transition", {
       id: duty, to: "done", actor: "rig",
+      execution_result: { outcome: "PR remains open and advancing", receipts: [duty] },
       note: "re-verified first-hand: PR still OPEN and advancing — re-queued the car (https://github.com/x/pull/6112)",
     })).status).toBeLessThan(400);
     // pass 4: rounds 1 >= cap 1 — the ladder exhausts, superseded with findings

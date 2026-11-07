@@ -27,7 +27,7 @@ verifying, held and stranded counts. A binding without executable progress is
 stranded, not healthy accounting. Completed reconcile duties cover their observed
 head rather than the lifetime of a PR.
 
-Independent PR acceptance can use `review_result: {kind:"accepted_pr", task_id,
+Independent PR acceptance must use `review_result: {kind:"accepted_pr", task_id,
 legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
 queue admission are committed together; the existing repair passes replay the
 handoff until admitted or explicitly held behind a newer blocker. Explicit
@@ -38,6 +38,31 @@ accepted head; missing, closed or changed-head observations retain a visible hol
 Historical intake and admission replay are bounded to ten records per pass.
 A durable round-robin cursor keeps held records from starving later admissions;
 overlapping ingress shares one historical reconciliation pass.
+
+### Explicit completion authority
+
+Gateway credentials report process facts through the fenced execution protocol;
+they cannot submit a task for review or mark one done. The running task agent
+uses its own provisioned credential and exact execution scope to submit work.
+Exit zero, an empty/error transcript, a commit link and a finished review process
+are not business outcomes.
+
+Analysis/diagnostic tasks close with `execution_result: {outcome, receipts}`
+describing actual findings. Execution submissions supply that result on the
+submission itself; a previously stored result cannot substitute for a new one.
+Unblock duties use that same observed-findings result or `unblock_result` for an
+atomic replacement wait. New analysis and unblock tasks have execution completion
+contracts; ordinary metadata edits cannot delete a contract or weaken execution
+into delivery.
+
+Review duties close with a typed `review_result`. Findings finish the review
+without accepting its parent. Acceptance must match the duty's exact task and
+completion contract: `accepted_execution` verifies actual execution receipts;
+`accepted_direct_main` verifies signed main ancestry and green CI;
+`accepted_pr` records exact reviewed heads, with delivery still waiting for the
+train's decisive required checks. Claim readiness and absent qualification bars
+never imply completion acceptance. Notes, parks and decision text do not create
+new acceptance; legacy prose is confined to historical receipt reconciliation.
 
 `await_event: {event:"lane_health", repo, base, head?}` follows observed deployment
 health at the lane tip. Retiring a `br_done` dependency is not success: a live
