@@ -2,13 +2,13 @@
 //! lives only in bounded preparation/finalization/admission jobs.
 use super::*;
 use super::attempt_journal::{self as journal, Disposition, Outcome, OutcomeKind, Record, Step, Work, WriterProof};
-use super::lifecycle::{self, Ownership, Prepared, Finished, Pipeline, Reporter, Released, Ticket};
+use super::lifecycle::{self, Ownership, Prepared, Finished, Pipeline, Reporter, Released, Ticket, WriterReceipt};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Task { id: String, title: String, body_md: String, project: String, meta: serde_json::Value, roles: Vec<String> }
 #[derive(Clone, Serialize, Deserialize)]
 struct Input { ticket: Ticket, task: Option<Task> }
-enum FinalWork { Active(Record, ExecutionRuntime), Fresh(Record), Journal(Record), ObserveReservation(Record), Legacy(stopped_outbox::StoppedReceipt) }
+enum FinalWork { Active(Record, ExecutionRuntime), Fresh(Record), Journal(Record), ObserveReservation(Record), ObserveWriter(Record), Legacy(stopped_outbox::StoppedReceipt) }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AdmissionReply {
@@ -294,6 +294,108 @@ fn reservation_release(cfg: &DispatchConfig, record: &Record) -> Result<Released
     Released::reservation_reconciled(&record.owner, &task)
 }
 
+fn writer_observable(record: &Record) -> bool {
+    matches!(record.owner, Ownership::Attempt { .. }) && match &record.work {
+        Work::UnknownWriter { .. } => true,
+        Work::Unproven { outcome, .. } => matches!(outcome.kind, OutcomeKind::ResultUnavailable),
+        // A captured real result still owns its checkpoint/delivery work.
+        _ => false,
+    }
+}
+
+fn writer_release(cfg: &DispatchConfig, record: &Record) -> Result<(Released, WriterReceipt), String> {
+    record.validate()?;
+    if !writer_observable(record) || record.url != cfg.url.trim_end_matches('/')
+        || cfg.label.as_deref() != Some(record.host.as_str()) { return Err("Stopped-job observation has the wrong original scope".into()); }
+    let Ownership::Attempt { generation, attempt_id, ticket, .. } = &record.owner else { unreachable!() };
+    let receipt: WriterReceipt = serde_json::from_value(execution_request(cfg, &ticket.task_id, &ticket.session,
+        &record.command_id("writer-lookup"), json!({"kind":"writer_receipt","generation":generation,"attempt_id":attempt_id}))?)
+        .map_err(|e| format!("Stopped-job receipt format changed; preserve ownership: {e}"))?;
+    let released = Released::from_writer_receipt(&record.owner, &receipt)?;
+    Ok((released, receipt))
+}
+
+fn retire_proved_writer(cfg: &DispatchConfig, record: &Record, receipt: &WriterReceipt) -> Result<(), String> {
+    Released::from_writer_receipt(&record.owner, receipt)?;
+    let terminal = terminal_root(cfg)?;
+    let path = terminal.join(record.name());
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::read(terminal.join("archive").join(record.name())).map_err(|e| e.to_string())?,
+        Err(e) => return Err(e.to_string()),
+    };
+    let saved: Record = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    saved.validate()?;
+    if saved.owner != record.owner || saved.host != record.host || saved.url != record.url || !writer_observable(&saved) {
+        return Err("Saved result changed; preserve it for normal delivery".into());
+    }
+    let launch_path = root(cfg)?.join("launches").join(saved.name());
+    let launch = match std::fs::read_to_string(&launch_path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let proof_path = root(cfg)?.join("reconciled-writer-proofs").join(record.name());
+    if !proof_path.exists() {
+        journal::write_file(&proof_path, &serde_json::to_vec(&json!({"record":saved,"launch_record":launch,"receipt":receipt})).map_err(|e| e.to_string())?)?;
+    }
+    writer_release(cfg, &saved)?; // proof and authority rechecked immediately before cleanup
+    if path.exists() && std::fs::read(&path).map_err(|e| e.to_string())? != raw { return Err("Saved result changed during recovery; preserve it".into()); }
+    worker_session::retire(cfg, &saved)?; // an actual live worker lock still prevents retirement
+    remove_launch(cfg, &saved)?;
+    journal::remove(&terminal, &saved)?; // keeps the complete original record in archive
+    // Reservations are keyed only by task/session, not generation. Do not
+    // remove one here: a newer attempt may use the same session. Its existing
+    // unstarted-reservation observer owns that separate, fresh decision.
+    Ok(())
+}
+
+fn observe_writer(shared: &Config, record: Record, report: Reporter) -> Finished<FinalWork> {
+    let cfg = config(shared);
+    // Reload the actual record rather than discarding a late captured result.
+    let record = match terminal_root(&cfg).and_then(|root| match std::fs::read(root.join(record.name())) {
+        Ok(raw) => serde_json::from_slice::<Record>(&raw).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(record.clone()),
+        Err(e) => Err(e.to_string()),
+    }) {
+        Ok(current) if current.owner == record.owner => current,
+        _ => return Finished::Held { value: FinalWork::ObserveWriter(record), reason: "Saved stopped-job identity changed; preserve ownership".into() },
+    };
+    if !writer_observable(&record) { return Finished::Retry { value: FinalWork::Journal(record), after: Duration::ZERO }; }
+    let result = writer_release(&cfg, &record).and_then(|(released, receipt)| {
+        retire_proved_writer(&cfg, &record, &receipt)?;
+        report.released(released);
+        Ok(())
+    });
+    match result {
+        Ok(()) => Finished::Complete,
+        Err(_) => Finished::Retry { value: FinalWork::ObserveWriter(record), after: RESERVATION_OBSERVATION_INTERVAL },
+    }
+}
+
+pub(super) fn reconcile_stopped(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
+    reconcile_stopped_locked(cfg, apply, task, &home.join(CONTROLLER_LOCK_FILE))
+}
+fn reconcile_stopped_locked(cfg: &DispatchConfig, apply: bool, task: Option<&str>, lock_path: &Path) -> Result<serde_json::Value, String> {
+    let _lock = worker_session::Lock::acquire(lock_path)?.ok_or("Stop only the gateway controller first; its live lock is held")?;
+    let host = cfg.label.as_deref().ok_or("gateway host missing")?;
+    let mut eligible = Vec::new(); let mut waiting = Vec::new(); let mut protected = 0;
+    for record in journal::pending(&terminal_root(cfg)?, host, cfg.url.trim_end_matches('/'))? {
+        if task.is_some_and(|task| task != record.ticket().task_id) { continue; }
+        if !writer_observable(&record) { protected += 1; continue; }
+        match writer_release(cfg, &record) {
+            Ok((_, receipt)) => {
+                if apply { retire_proved_writer(cfg, &record, &receipt)?; }
+                eligible.push(json!({"owner":record.owner,"receipt":receipt,"applied":apply}));
+            },
+            Err(reason) => waiting.push(json!({"owner":record.owner,"reason":reason})),
+        }
+    }
+    Ok(json!({"kind":"stopped_writer_reconciliation","apply":apply,"eligible":eligible,"waiting":waiting,"protected":protected,
+        "note":"Only exact authenticated old stop receipts retire local ownership. Original records, results and worktrees remain preserved; no task is declared complete."}))
+}
+
 /// Offline bootstrap for an old controller that cannot reconsider its durable
 /// holds. The SAME controller flock excludes live/restarting controllers; only
 /// ended, rejected, never-launched reservations are eligible. Default is a drill.
@@ -359,6 +461,7 @@ fn finalize(shared: &Config, work: FinalWork, report: Reporter) -> Finished<Fina
     match work {
         FinalWork::Active(_, _) => unreachable!(),
         FinalWork::ObserveReservation(record) => observe_reservation(shared, record, report),
+        FinalWork::ObserveWriter(record) => observe_writer(shared, record, report),
         FinalWork::Legacy(receipt) => {
             let cfg = config(shared);
             let result = stopped_outbox_root().ok_or("legacy outbox missing".into()).and_then(|root| {
@@ -372,6 +475,7 @@ fn finalize(shared: &Config, work: FinalWork, report: Reporter) -> Finished<Fina
         },
         work @ (FinalWork::Fresh(_) | FinalWork::Journal(_)) => {
         let (record, fresh) = match work { FinalWork::Fresh(record) => (record, true), FinalWork::Journal(record) => (record, false), _ => unreachable!() };
+        if writer_observable(&record) { return observe_writer(shared, record, report); }
         // Older builds persisted this wait as a terminal Rejected disposition.
         // Migrate only provably unstarted reservations to observation-only work;
         // all attempts, process identities and unknown effects retain their gate.
@@ -682,7 +786,7 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
                     update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"}));
                 }
             }
-            if readiness.data.lock().map(|d| match &d.state { GatewayReadinessState::Ready(p) => p.observed.elapsed() < Duration::from_secs(60), GatewayReadinessState::Connected { observed } => observed.elapsed() < Duration::from_secs(60), _ => false }).unwrap_or(false) {
+            if readiness.data.lock().map(|d| d.state.connection_fresh(Duration::from_secs(60))).unwrap_or(false) {
                 update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
             }
             last_update_receipt = Instant::now();
@@ -749,6 +853,108 @@ pub(crate) mod tests {
         let label = format!("{}/worker", cfg.label.as_ref().unwrap());
         let ready = GatewayReadiness::with_probe(&cfg, Duration::from_secs(3600), move |_| Ok(WorkerCredential { label: label.clone(), secret: "fixture-only".into() }));
         (cfg, ready, Arc::new(Mutex::new(DispatchSnapshot::default())))
+    }
+
+    fn writer_proof_reply(owner: &Ownership) -> serde_json::Value {
+        let Ownership::Attempt { ticket, host, generation, attempt_id } = owner else { panic!("attempt required") };
+        json!({"kind":"writer_receipt_found","task_id":ticket.task_id,"command_id":"actual-physical-proof","source":"quiesce",
+            "proof":{"host":host,"session":ticket.session,"generation":generation,"attempt_id":attempt_id,"phase":"quiesced","writers":"process_group_empty"}})
+    }
+
+    #[test]
+    fn historical_writer_proof_releases_only_old_unknown_ownership_and_keeps_all_evidence() {
+        let proof = Arc::new(Mutex::new(json!({"kind":"writer_receipt_missing"}))); let response = proof.clone();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let seen = reads.clone();
+        let hub = Hub::new(move |request| {
+            assert_eq!(request["params"]["arguments"]["command"]["kind"],"writer_receipt","recovery may only observe canonical stop proof");
+            seen.fetch_add(1,Ordering::SeqCst); Some(response.lock().unwrap().clone())
+        });
+        let (cfg,ready,snap) = fixture(&hub);
+        let terminal = terminal_root(&cfg).unwrap();
+        let wip = root(&cfg).unwrap().join("retained-work"); journal::write_file(&wip,b"unpublished work").unwrap();
+        let ticket = Ticket {task_id:"old-task".into(),session:"old-session".into()};
+        let record = Record {owner:Ownership::Attempt {ticket:ticket.clone(),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"old-attempt".into()},
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,disposition:Disposition::Rejected {reason:"old missing proof".into()},
+            work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into()},worktree:Some(wip.clone())}};
+        journal::insert(&terminal,record.clone()).unwrap();
+        let launch_path=root(&cfg).unwrap().join("launches").join(record.name());
+        let launch=serde_json::to_vec(&Launch {record:record.clone(),worktree:Some(wip.clone())}).unwrap();
+        journal::write_file(&launch_path,&launch).unwrap();
+        let original = std::fs::read(terminal.join(record.name())).unwrap();
+        let reservation = reservation_path(&cfg,&ticket).unwrap(); journal::write_file(&reservation,b"newer attempt with the SAME session").unwrap();
+        let mut controller=Controller::new(&cfg,&ready,&snap);
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(12);
+        while reads.load(Ordering::SeqCst)==0 {controller.registry.poll(|_|None);assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(1));}
+        assert_eq!(controller.registry.counts().charged,1,"missing proof cannot release a writer");
+        assert_eq!(std::fs::read(terminal.join(record.name())).unwrap(),original);
+        *proof.lock().unwrap()=writer_proof_reply(&record.owner);
+        while !controller.registry.is_idle() {controller.registry.poll(|_|None);assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(1));}
+        assert_eq!(controller.registry.counts().charged,0);
+        assert!(!terminal.join(record.name()).exists());
+        assert_eq!(std::fs::read(terminal.join("archive").join(record.name())).unwrap(),original);
+        assert_eq!(std::fs::read(&wip).unwrap(),b"unpublished work");
+        assert_eq!(std::fs::read(reservation).unwrap(),b"newer attempt with the SAME session");
+        let archived:serde_json::Value=serde_json::from_slice(&std::fs::read(root(&cfg).unwrap().join("reconciled-writer-proofs").join(record.name())).unwrap()).unwrap();
+        assert_eq!(archived["record"]["work"]["outcome"]["stdout_tail"],"original captured tail");
+        assert_eq!(archived["receipt"]["kind"],"writer_receipt_found");
+        assert_eq!(archived["launch_record"].as_str().unwrap().as_bytes(),launch);
+        assert!(!launch_path.exists());
+        drop(controller);drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn stopped_recovery_is_locked_dry_by_default_and_preserves_newer_or_unproved_work() {
+        let owner=Arc::new(Mutex::new(None::<Ownership>));let expected=owner.clone();
+        let hub=Hub::new(move |request| {
+            let c=&request["params"]["arguments"]["command"];
+            assert_eq!(c["kind"],"writer_receipt","offline recovery cannot replay a mutation");
+            Some(match c["generation"].as_u64().unwrap() {
+                1=>writer_proof_reply(expected.lock().unwrap().as_ref().unwrap()),
+                3=>json!({"kind":"writer_receipt_held","reason":"outside action result unknown"}),
+                _=>json!({"kind":"writer_receipt_missing"}),
+            })
+        });
+        let (cfg,ready,_)=fixture(&hub);let terminal=terminal_root(&cfg).unwrap();
+        let record=|generation|Record {owner:Ownership::Attempt {ticket:Ticket {task_id:"same-task".into(),session:"same-session".into()},host:cfg.label.clone().unwrap(),generation,attempt_id:format!("attempt-{generation}")},
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:generation,process:None,disposition:Disposition::Rejected {reason:"retained".into()},work:Work::UnknownWriter {reason:"old uncertain writer".into()}};
+        let old=record(1);*owner.lock().unwrap()=Some(old.owner.clone());
+        let newer=record(2);let uncertain=record(3);
+        let captured=Record {work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::Completed,exit_code:Some(0),stdout_tail:"real result still needs delivery".into(),stderr_tail:String::new()},worktree:Some(root(&cfg).unwrap().join("captured-work"))},..record(4)};
+        for r in [&old,&newer,&uncertain,&captured] {journal::insert(&terminal,r.clone()).unwrap();}
+        let bytes=|r:&Record|std::fs::read(terminal.join(r.name())).unwrap();
+        let old_bytes=bytes(&old);let newer_bytes=bytes(&newer);let uncertain_bytes=bytes(&uncertain);let captured_bytes=bytes(&captured);
+        let lock_path=root(&cfg).unwrap().join("test-controller.lock");
+        let lock=worker_session::Lock::acquire(&lock_path).unwrap().unwrap();
+        assert!(reconcile_stopped_locked(&cfg,true,None,&lock_path).unwrap_err().contains("live lock"));drop(lock);
+        let dry=reconcile_stopped_locked(&cfg,false,None,&lock_path).unwrap();
+        assert_eq!(dry["eligible"].as_array().unwrap().len(),1);assert_eq!(dry["waiting"].as_array().unwrap().len(),2);assert_eq!(dry["protected"],1);
+        assert_eq!(bytes(&old),old_bytes);assert!(!root(&cfg).unwrap().join("reconciled-writer-proofs").exists());
+        let worker_root=root(&cfg).unwrap().join("workers").join(old.name().trim_end_matches(".json"));
+        journal::write_file(&worker_root.join("retained-output"),b"live worker's result").unwrap();
+        let live_worker=worker_session::Lock::acquire(&worker_root.join("worker.lock")).unwrap().unwrap();
+        assert!(reconcile_stopped_locked(&cfg,true,None,&lock_path).unwrap_err().contains("Independent worker"));
+        assert_eq!(bytes(&old),old_bytes);assert!(worker_root.exists());drop(live_worker);
+        let applied=reconcile_stopped_locked(&cfg,true,None,&lock_path).unwrap();assert_eq!(applied["eligible"][0]["applied"],true);
+        assert_eq!(std::fs::read(terminal.join("archive").join(old.name())).unwrap(),old_bytes);
+        assert_eq!(bytes(&newer),newer_bytes);assert_eq!(bytes(&uncertain),uncertain_bytes);assert_eq!(bytes(&captured),captured_bytes);
+        assert!(reconcile_stopped_locked(&cfg,true,None,&lock_path).unwrap()["eligible"].as_array().unwrap().is_empty(),"repeat cannot replay a write or discard protected records");
+        drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn stopped_recovery_rechecks_authority_before_archiving_the_active_record() {
+        let owner=Arc::new(Mutex::new(None::<Ownership>));let expected=owner.clone();
+        let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));let seen=reads.clone();
+        let hub=Hub::new(move |_|Some(if seen.fetch_add(1,Ordering::SeqCst)==0 {writer_proof_reply(expected.lock().unwrap().as_ref().unwrap())} else {json!({"kind":"writer_receipt_missing"})}));
+        let (cfg,ready,_)=fixture(&hub);let terminal=terminal_root(&cfg).unwrap();
+        let record=Record {owner:Ownership::Attempt {ticket:Ticket {task_id:"old-task".into(),session:"old-session".into()},host:cfg.label.clone().unwrap(),generation:1,attempt_id:"one".into()},
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,disposition:Disposition::Rejected {reason:"old failure".into()},work:Work::UnknownWriter {reason:"unknown".into()}};
+        *owner.lock().unwrap()=Some(record.owner.clone());journal::insert(&terminal,record.clone()).unwrap();
+        let before=std::fs::read(terminal.join(record.name())).unwrap();
+        assert!(reconcile_stopped_locked(&cfg,true,None,&root(&cfg).unwrap().join("test.lock")).is_err());
+        assert_eq!(reads.load(Ordering::SeqCst),2);assert_eq!(std::fs::read(terminal.join(record.name())).unwrap(),before);
+        drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
     }
     #[test]
     fn actual_controller_keeps_polling_while_admission_rpc_is_blocked() {
@@ -899,9 +1105,11 @@ pub(crate) mod tests {
 
     #[test]
     fn rejected_unknown_attempt_never_becomes_reservation_observation() {
-        let hub=Hub::new(|request| {
-            assert_eq!(request["params"]["arguments"]["command"]["kind"],"receipt","unknown writer/effect cannot be turned into reservation cleanup");
-            Some(json!({"kind":"receipt_missing"}))
+        let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));let seen=reads.clone();
+        let hub=Hub::new(move |request| {
+            assert_eq!(request["params"]["arguments"]["command"]["kind"],"writer_receipt","unknown writer/effect cannot be turned into reservation cleanup");
+            seen.fetch_add(1,Ordering::SeqCst);
+            Some(json!({"kind":"writer_receipt_held","reason":"outside action result unknown"}))
         });
         let (cfg,ready,snap)=fixture(&hub);
         let record=Record { owner:Ownership::Attempt { ticket:Ticket { task_id:"unknown".into(),session:"session".into() },host:cfg.label.clone().unwrap(),generation:1,attempt_id:"unknown-one".into() },
@@ -911,8 +1119,8 @@ pub(crate) mod tests {
         let before=std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap();
         let mut controller=Controller::new(&cfg,&ready,&snap);
         controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
-        let deadline=Instant::now()+Duration::from_secs(3);
-        while controller.registry.counts().held==0 { controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1)); }
+        let deadline=Instant::now()+Duration::from_secs(12);
+        while reads.load(Ordering::SeqCst)<2 { controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1)); }
         assert_eq!(controller.registry.counts().charged,1);
         assert!(!controller.controller_ready());
         assert_eq!(std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap(),before);

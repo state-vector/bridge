@@ -34,6 +34,7 @@ pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(p
 pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
 pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
 pub fn reconcile_reservations(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_reservations(cfg, apply, task) }
+pub fn reconcile_stopped(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_stopped(cfg, apply, task) }
 
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
@@ -306,8 +307,32 @@ enum GatewayReadinessState {
     Unavailable(String),
     Ready(GatewayReadyProof),
     Connected { observed: Instant },
+    AdmissionHeld { observed: Instant, reason: String },
 }
-enum GatewayProbe { Worker(WorkerCredential), Connection }
+impl GatewayReadinessState {
+    fn connection_fresh(&self, age: Duration) -> bool {
+        match self {
+            Self::Ready(proof) => proof.observed.elapsed() < age,
+            Self::Connected { observed } | Self::AdmissionHeld { observed, .. } => observed.elapsed() < age,
+            Self::Unavailable(_) => false,
+        }
+    }
+}
+enum GatewayProbe { Worker(WorkerCredential), Connection, AdmissionHeld { reason: String } }
+#[derive(Deserialize)]
+#[serde(tag="kind",rename_all="snake_case")]
+enum HubAdmissionReadiness { Ready { worker_id: String, fingerprint: String }, Paused { reason: String, until_ts: u64 }, Updating { reason: String } }
+enum WorkerAdmission { Ready, Held { reason: String } }
+fn worker_connection_proof(reply: &serde_json::Value, backend_ready: bool) -> Result<WorkerAdmission, String> {
+    if reply["lifecycle_protocol"] != 2 { return Err("serving hub has not adopted the fenced lifecycle protocol; no fresh connection proof".into()); }
+    if !backend_ready { return Err("configured backend has no verified usable model".into()); }
+    match serde_json::from_value::<HubAdmissionReadiness>(reply["readiness"].clone()) {
+        Ok(HubAdmissionReadiness::Ready { worker_id, fingerprint }) if reply["ok"] == true && !worker_id.is_empty() && !fingerprint.is_empty() => Ok(WorkerAdmission::Ready),
+        Ok(HubAdmissionReadiness::Paused { reason, until_ts }) if !reason.is_empty() && until_ts > now_ms() => Ok(WorkerAdmission::Held { reason }),
+        Ok(HubAdmissionReadiness::Updating { reason }) if !reason.is_empty() => Ok(WorkerAdmission::Held { reason }),
+        _ => Err(format!("executor readiness held: {}",reply["readiness"])),
+    }
+}
 
 struct GatewayReadinessData {
     cfg: DispatchConfig,
@@ -345,7 +370,12 @@ impl GatewayReadiness {
                 }
                 return Err("no runnable configured backend".into());
             }
-            prepare_worker(cfg, &available).map(|(worker, _)| GatewayProbe::Worker(worker))
+            let (worker, _, admission) = probe_worker_with_progress(cfg, &available, &|_| {})?;
+            match admission {
+                WorkerAdmission::Ready if update_request().is_none() => Ok(GatewayProbe::Worker(worker)),
+                WorkerAdmission::Ready => Ok(GatewayProbe::AdmissionHeld { reason:"Managed update has paused new admission".into() }),
+                WorkerAdmission::Held { reason } => Ok(GatewayProbe::AdmissionHeld { reason }),
+            }
         }, true)
     }
 
@@ -358,6 +388,7 @@ impl GatewayReadiness {
         let initial = match probe(cfg) {
             Ok(GatewayProbe::Worker(worker)) => GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() }),
             Ok(GatewayProbe::Connection) => GatewayReadinessState::Connected { observed: Instant::now() },
+            Ok(GatewayProbe::AdmissionHeld { reason }) => GatewayReadinessState::AdmissionHeld { observed: Instant::now(), reason },
             Err(error) => GatewayReadinessState::Unavailable(error),
         };
         let data = Arc::new(Mutex::new(GatewayReadinessData { cfg: cfg.clone(), key: gateway_readiness_key(cfg), state: initial }));
@@ -387,6 +418,7 @@ impl GatewayReadiness {
                         GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() })
                     }
                     Ok(GatewayProbe::Connection) => GatewayReadinessState::Connected { observed: Instant::now() },
+                    Ok(GatewayProbe::AdmissionHeld { reason }) => GatewayReadinessState::AdmissionHeld { observed: Instant::now(), reason },
                     Err(error) => {
                         dlog("gateway", &format!("readiness renewal failed: {error}; no fresh local admission proof"));
                         GatewayReadinessState::Unavailable(error)
@@ -420,6 +452,7 @@ impl GatewayReadiness {
             GatewayReadinessState::Ready(proof) if proof.observed.elapsed() < max_age => Ok(proof.clone()),
             GatewayReadinessState::Ready(_) => Err("local gateway readiness proof expired".into()),
             GatewayReadinessState::Connected { .. } => Err("connection-only gateway has no worker readiness proof".into()),
+            GatewayReadinessState::AdmissionHeld { reason, .. } => Err(format!("new admission held: {reason}")),
             GatewayReadinessState::Unavailable(error) => Err(error.clone()),
         }
     }
@@ -439,6 +472,13 @@ fn begin_with_fresh_readiness<T>(
 }
 
 fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value), String> {
+    let (worker, reply, admission) = probe_worker_with_progress(cfg, avail, report)?;
+    if !matches!(admission,WorkerAdmission::Ready) || update_request().is_some() {
+        return Err(format!("executor readiness held: {}", reply["readiness"]));
+    }
+    Ok((worker, reply))
+}
+fn probe_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value, WorkerAdmission), String> {
     let backend = avail.iter().max_by_key(|b| {
         let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
         cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
@@ -447,14 +487,13 @@ fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend
     report("ready: checking the gateway worker credential");
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
     report("ready: probing local tools and configured model inventory (2s limit per probe)");
-    let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
+    let raw = capability_inventory_unheld(cfg, avail, Some(&worker), name);
+    let backend_ready = inventory_has_usable_model(&raw);
+    let capabilities = inventory_dispatch_hold(raw, update_request().is_some());
     report("ready: advertising capabilities to the hub (8s limit per request)");
     let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
-    if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
-        return Err(format!("executor readiness held: {}", reply["readiness"]));
-    }
-    if reply["lifecycle_protocol"] != 2 { return Err("serving hub has not adopted the fenced lifecycle protocol; no new claims".into()); }
-    Ok((worker, reply))
+    let admission = worker_connection_proof(&reply, backend_ready)?;
+    Ok((worker, reply, admission))
 }
 
 /// A bounded paired-operator preflight; never claims or launches a task.
@@ -539,16 +578,26 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
 /// Otherwise running medium temporarily erases this host's large capability.
 fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_json::Value {
     if held {
+        facts["admission_hold"] = json!({"kind":"update_handoff","reason":"Managed update has paused new claims for controller handoff and health verification"});
+        // Keep older hubs fail-closed while the typed admission-hold protocol
+        // rolls out. Backend health uses the unheld inventory, never this mask.
         let availability = json!(ModelAvailability::Unavailable { reason: "Managed update has paused new claims for controller handoff and health verification".into() });
-        facts["availability"] = availability.clone();
+        if facts["availability"]["kind"] != "disabled" { facts["availability"] = availability.clone(); }
         if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
-            for model in models { model["availability"] = availability.clone(); }
+            for model in models { if model["availability"]["kind"] != "disabled" { model["availability"] = availability.clone(); } }
         }
     }
     facts
 }
 
 fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
+    inventory_dispatch_hold(capability_inventory_unheld(cfg, avail, worker, primary), update_request().is_some())
+}
+fn inventory_has_usable_model(facts: &serde_json::Value) -> bool {
+    let usable = |model: &serde_json::Value| model["availability"]["kind"] == "usable" && model["model"].as_str().is_some_and(|m| !m.is_empty());
+    usable(facts) || facts["alternatives"].as_array().is_some_and(|models| models.iter().any(usable))
+}
+fn capability_inventory_unheld(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
     let mut inventory = Vec::new();
     for (name, bc) in &cfg.backends {
         let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(name)) == *b);
@@ -561,9 +610,9 @@ fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worke
         } }
     }
     let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
-    if inventory.is_empty() { return inventory_dispatch_hold(backend_capabilities(cfg, primary, false, worker), update_request().is_some()); }
+    if inventory.is_empty() { return backend_capabilities(cfg, primary, false, worker); }
     let mut main = inventory.remove(index); main["alternatives"] = json!(inventory);
-    inventory_dispatch_hold(main, update_request().is_some())
+    main
 }
 
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
@@ -4544,6 +4593,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(12));
     }
     #[test]
+    fn admission_hold_is_fresh_connection_health_but_never_worker_admission() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://fixture","label":"hold-proof","token":"fixture"})).unwrap();
+        let ready = GatewayReadiness::with_probe_and_repair(&cfg,Duration::from_secs(3600),|_|Ok(GatewayProbe::AdmissionHeld {reason:"operator paused".into()}),false);
+        assert!(ready.data.lock().unwrap().state.connection_fresh(Duration::from_secs(60)));
+        assert!(ready.proof(&cfg).err().unwrap().contains("new admission held"));
+        let expired=GatewayReadinessState::AdmissionHeld {observed:Instant::now()-Duration::from_secs(61),reason:"old".into()};
+        assert!(!expired.connection_fresh(Duration::from_secs(60)));
+        assert!(!GatewayReadinessState::Unavailable("transport failed".into()).connection_fresh(Duration::from_secs(60)));
+        ready.maintenance.stop();
+    }
+    #[test]
+    fn worker_connection_proof_requires_backend_auth_protocol_and_typed_hold() {
+        let paused=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"paused","reason":"operator","until_ts":now_ms()+60_000}});
+        assert!(matches!(worker_connection_proof(&paused,true),Ok(WorkerAdmission::Held {..})));
+        assert!(worker_connection_proof(&paused,false).is_err(),"a pause cannot hide an unavailable backend");
+        let updating=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"updating","reason":"handoff"}});
+        assert!(matches!(worker_connection_proof(&updating,true),Ok(WorkerAdmission::Held {..})));
+        for readiness in [json!({"kind":"cooldown","reason":"real failure","until_ts":now_ms()+60_000}),json!({"kind":"repair_required","reason":"identity"}),json!({"kind":"paused","reason":"expired","until_ts":1}),json!({"kind":"updating"}),json!({"kind":"ready"})] {
+            assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":2,"readiness":readiness}),true).is_err());
+        }
+        assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":1,"readiness":{"kind":"ready","worker_id":"worker","fingerprint":"proof"}}),true).is_err());
+    }
+    #[test]
     fn managed_update_hold_cannot_advertise_usable_spare_models() {
         let supply = json!({"tier":"large","model":"large-model","availability":{"kind":"usable"},
             "alternatives":[{"tier":"small","model":"small-model","availability":{"kind":"usable"}},
@@ -4553,6 +4625,9 @@ mod tests {
         assert!(held["availability"]["reason"].as_str().unwrap().contains("Managed update"));
         assert!(held["alternatives"].as_array().unwrap().iter().all(|m| m["availability"]["kind"] == "unavailable"));
         assert_eq!(held["model"], supply["model"]);
+        assert_eq!(held["admission_hold"]["kind"],"update_handoff");
+        assert!(inventory_has_usable_model(&supply));
+        assert!(!inventory_has_usable_model(&held),"masked legacy inventory is not backend-health proof");
         assert_eq!(inventory_dispatch_hold(supply.clone(), false), supply, "fresh inventory resumes without changing model identity");
     }
     #[test]
