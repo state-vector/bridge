@@ -99,7 +99,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
   },
   execution: {
-    description: "Durable executor protocol v1: eligibility-first schedule (inspect/reserve/request_capacity), read-only schedule_status, full-agent gateway_control (draining/enabled), inspect/advertise, fenced begin/poll, checkpoint/restore/quiesce, mailbox, escalation and effect receipts. request_capacity arranges safe recovery preemption without reserving work. Reservations count against gateway capacity; lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
+    description: "Durable executor protocol: eligibility-first schedule (inspect/reserve/request_capacity), schedule_status, gateway_control, inspect/advertise, fenced begin/poll, checkpoint/restore, stopped/finalize and immutable receipt lookup, cancel_start, mailbox, escalation and effect receipts. Lifecycle v2 requires stopped-writer proof before finalization: execution capacity is released while result delivery remains exclusively owned. Legacy quiesce remains supported. request_capacity arranges safe recovery preemption without reserving work. Lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
     schema: TOOL_ARG_SCHEMAS.execution,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("execution", { ...args, session: args.session ?? ctx.sessionName }))),
   },

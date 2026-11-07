@@ -124,12 +124,19 @@ impl Ownership {
 /// subprocess exit, local stop request or successful checkpoint does not.
 pub struct Released(Ownership);
 impl Released {
+    pub fn reservation_reconciled(owner: &Ownership, task: &serde_json::Value) -> Result<Self, String> {
+        let Ownership::Reservation { ticket } = owner else { return Err("not an unlaunched reservation".into()); };
+        if task["id"] == ticket.task_id && (task["status"] != "in_progress" || task["meta"]["session"] != ticket.session) {
+            Ok(Self(owner.clone()))
+        } else { Err("reservation still belongs to this executor".into()) }
+    }
     pub fn from_hub(owner: &Ownership, reply: &serde_json::Value) -> Result<Self, String> {
         let matches = match owner {
             Ownership::Reservation { ticket } => reply["kind"] == "released" && reply["task_id"] == ticket.task_id,
             Ownership::Attempt { ticket, host, generation, attempt_id } => {
                 let a = &reply["attempt"];
-                a["phase"] == "quiesced" && a["host"] == *host && a["session"] == ticket.session
+                (a["phase"] == "quiesced" || (a["phase"] == "finalizing" && matches!(a["writers"].as_str(), Some("process_group_empty" | "no_live_group_members"))))
+                    && a["host"] == *host && a["session"] == ticket.session
                     && a["generation"] == *generation && a["attempt_id"] == *attempt_id
             }
         };
@@ -150,9 +157,9 @@ pub struct Reporter(mpsc::Sender<FinalEvent>);
 impl Reporter { pub fn released(&self, receipt: Released) { let _ = self.0.send(FinalEvent::Released(receipt.0)); } }
 enum FinalEvent { Released(Ownership) }
 
-struct Job<T> { rx: mpsc::Receiver<Result<T, String>>, thread: Option<std::thread::JoinHandle<()>> }
+pub(super) struct Job<T> { rx: mpsc::Receiver<Result<T, String>>, thread: Option<std::thread::JoinHandle<()>> }
 impl<T: Send + 'static> Job<T> {
-    fn start(work: impl FnOnce() -> T + Send + 'static) -> Self {
+    pub(super) fn start(work: impl FnOnce() -> T + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
@@ -161,7 +168,7 @@ impl<T: Send + 'static> Job<T> {
         });
         Self { rx, thread: Some(thread) }
     }
-    fn poll(&mut self) -> Option<Result<T, String>> {
+    pub(super) fn poll(&mut self) -> Option<Result<T, String>> {
         match self.rx.try_recv() {
             Ok(result) => { if let Some(thread) = self.thread.take() { let _ = thread.join(); } Some(result) },
             Err(mpsc::TryRecvError::Empty) => None,
@@ -192,11 +199,13 @@ pub struct Counts {
     pub reserved: usize, pub preparing: usize, pub running: usize,
     pub finalizing: usize, pub delivering: usize, pub held: usize, pub charged: usize,
 }
+#[derive(PartialEq, Eq)]
+enum Mode { Open, Draining, Stopping }
 
 pub struct Pipeline<P, R, F> {
     entries: BTreeMap<Ticket, Entry<P, R, F>>,
     capacity: usize, preparations: usize, finalizations: usize,
-    draining: bool,
+    mode: Mode,
     prepare: Arc<dyn Fn(P, Arc<AtomicBool>) -> Prepared<R, F> + Send + Sync>,
     finalize: Arc<dyn Fn(F, Reporter) -> Finished<F> + Send + Sync>,
     pub faults: Vec<String>,
@@ -206,7 +215,7 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
         prepare: impl Fn(P, Arc<AtomicBool>) -> Prepared<R, F> + Send + Sync + 'static,
         finalize: impl Fn(F, Reporter) -> Finished<F> + Send + Sync + 'static) -> Self {
         assert!(capacity > 0 && preparations > 0 && finalizations > 0);
-        Self { entries: BTreeMap::new(), capacity, preparations, finalizations, draining: false,
+        Self { entries: BTreeMap::new(), capacity, preparations, finalizations, mode: Mode::Open,
             prepare: Arc::new(prepare), finalize: Arc::new(finalize), faults: vec![] }
     }
     pub fn counts(&self) -> Counts {
@@ -225,7 +234,7 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
         n
     }
     pub fn can_admit(&self) -> bool {
-        !self.draining && self.counts().charged < self.capacity
+        self.mode == Mode::Open && self.counts().charged < self.capacity
             && self.entries.len() < self.capacity + self.finalizations
     }
     pub fn admit(&mut self, ticket: Ticket, value: P) -> Result<(), P> {
@@ -234,15 +243,32 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
             cancel: Arc::new(AtomicBool::new(false)), phase: Phase::Reserved(value) });
         Ok(())
     }
+    pub fn contains(&self, ticket: &Ticket) -> bool { self.entries.contains_key(ticket) }
+    pub fn tickets(&self) -> Vec<Ticket> { self.entries.keys().cloned().collect() }
+    pub fn restore_finalization(&mut self, owner: Ownership, value: F) -> Result<(), F> {
+        let ticket = owner.ticket().clone();
+        if self.entries.contains_key(&ticket) { return Err(value); }
+        self.entries.insert(ticket, Entry { owner, charged: true, cancel: Arc::new(AtomicBool::new(self.mode != Mode::Open)),
+            phase: Phase::FinalizationQueued { value, not_before: Instant::now() } });
+        Ok(())
+    }
     pub fn drain(&mut self) {
-        self.draining = true;
+        self.mode = Mode::Stopping;
         for e in self.entries.values() { e.cancel.store(true, Ordering::SeqCst); }
     }
+    pub fn natural_drain(&mut self) {
+        if self.mode == Mode::Stopping { return; }
+        self.mode = Mode::Draining;
+        for e in self.entries.values() {
+            if matches!(e.phase, Phase::Reserved(_) | Phase::Preparing(_)) { e.cancel.store(true, Ordering::SeqCst); }
+        }
+    }
+    pub fn resume_admission(&mut self) { if self.mode == Mode::Draining { self.mode = Mode::Open; } }
     /// Idle includes all local jobs/effects, not merely zero agent subprocesses.
     pub fn is_idle(&self) -> bool { self.entries.is_empty() }
     pub fn visit_running(&mut self, mut visit: impl FnMut(&Ticket, &mut R, bool)) {
         for (ticket, entry) in &mut self.entries {
-            if let Phase::Running(value) = &mut entry.phase { visit(ticket, value, self.draining); }
+            if let Phase::Running(value) = &mut entry.phase { visit(ticket, value, self.mode == Mode::Stopping); }
         }
     }
     pub fn poll(&mut self, mut completed: impl FnMut(&mut R) -> Option<F>) {
@@ -295,6 +321,8 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
         let tickets: Vec<_> = self.entries.keys().cloned().collect();
         for ticket in tickets {
             let same_task_busy = self.entries.iter().any(|(other, e)| other != &ticket && other.task_id == ticket.task_id && !matches!(e.phase, Phase::Reserved(_)));
+            let resource_busy = self.entries.iter().any(|(other, e)| other != &ticket && other.task_id == ticket.task_id
+                && matches!(e.phase, Phase::Preparing(_) | Phase::Running(_) | Phase::Finalizing { .. } | Phase::Held { .. }));
             let e = self.entries.get_mut(&ticket).unwrap();
             let old = std::mem::replace(&mut e.phase, Phase::Held { value: None, reason: "phase transition in progress".into() });
             e.phase = match old {
@@ -302,7 +330,7 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
                     let work = self.prepare.clone(); let cancel = e.cancel.clone(); preparing += 1;
                     Phase::Preparing(Job::start(move || work(value, cancel)))
                 },
-                Phase::FinalizationQueued { value, not_before } if finalizing < self.finalizations && not_before <= now => {
+                Phase::FinalizationQueued { value, not_before } if finalizing < self.finalizations && not_before <= now && !resource_busy => {
                     let work = self.finalize.clone(); let (tx, events) = mpsc::channel(); finalizing += 1;
                     Phase::Finalizing { job: Job::start(move || work(value, Reporter(tx))), events }
                 },

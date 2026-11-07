@@ -20,6 +20,13 @@ pub struct StoppedReceipt {
     delivery: Delivery,
 }
 impl StoppedReceipt {
+    pub fn ready_for_replay(&self, now: u64) -> bool {
+        match self.delivery {
+            Delivery::Pending { retry_after } => retry_after <= now,
+            Delivery::Finalizing { owner_pid } => process_absent(owner_pid),
+            Delivery::Rejected { .. } => false,
+        }
+    }
     pub fn capture(host: &str, url: &str, task_id: &str, session: &str, generation: u64, attempt_id: &str, observed_at: u64, group_empty: bool) -> Result<Self, String> {
         if !group_empty || host.is_empty() || generation == 0 || attempt_id.is_empty() {
             return Err("no process-group-empty proof; retain capacity".into());

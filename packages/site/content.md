@@ -1,5 +1,24 @@
 # bridge
 
+### One gateway lifecycle, durable outcomes
+
+The gateway prepares and finalizes tasks in bounded independent jobs, so one slow
+launch or checkpoint does not serialize other slots. One local registry tracks
+every reservation, writer, delivery and hold. The hub acknowledges exact
+stopped-writer proof and releases execution capacity before slow checkpoint
+publication; the task remains exclusively finalizing until its result is delivered.
+Backlog bounds prevent unbounded queued finalization. Snapshots distinguish these
+phases, and managed updates wait for outstanding delivery as well as writers.
+
+Admission identities, launch identities and terminal outcomes survive restart;
+retries reuse immutable command receipts. Unverifiable writers remain held.
+Normal coordination does not interrupt execution. Explicit interrupts and expired
+leases stop safely, preserving WIP. Process exit never manufactures task completion
+or review acceptance; unfinished results reconcile through the same hub scheduler.
+New controllers require serving lifecycle protocol 2 before claiming work.
+Hygiene waits for an idle workspace and rechecks terminal status and stopped
+writers before removing a tree; age alone cannot revoke retained execution work.
+
 ### Delivery obligations survive card retirement
 
 PR-bound work keeps a delivery owner until it is delivered, transferred to a
