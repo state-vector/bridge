@@ -20,6 +20,9 @@ use crate::scm;
 #[path = "stopped_outbox.rs"]
 mod stopped_outbox;
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
