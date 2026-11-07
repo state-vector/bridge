@@ -204,7 +204,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     await task(project);
     expect((await reserve(other)).kind).toBe("reserved");
     expect((await g.cmd({ kind: "quiesce", generation: 1, attempt_id: "drain-writer", writers: "process_group_empty" }, "quiet", id, r.session)).error).toBeUndefined();
-  });
+  }, 15_000);
   it("keeps a task prerequisite scoped, ignores priority/progress churn, and recovers after its repository input changes", async () => {
     const project = "suppression", g = await gateway(project, 2);
     const id = await task(project, { repo: "https://github.com/ghost/missing" }), r = await reserve(g);

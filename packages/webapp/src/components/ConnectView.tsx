@@ -168,7 +168,9 @@ export function ConnectView() {
 
       <Card>
         <h2>Agents</h2>
-        <p className="muted-note">independent peers — mint a token, wire its MCP config, onboard manually. Gateway-spawned workers are NOT minted here; they are provisioned by their gateway and nested under it below.</p>
+        <p className="muted-note">Connect Codex or another OAuth-capable MCP client to <code>{`${window.location.origin}/mcp`}</code>, then sign in and authorize access to this workspace. Bridge creates its interactive-agent identity automatically; revoke it below.</p>
+        <pre><code>{`codex mcp add bridge --url ${window.location.origin}/mcp\ncodex mcp login bridge`}</code></pre>
+        <p className="muted-note">For manual bearer setup, add an independent agent below. Gateway-spawned workers are provisioned by their gateway and nested under it.</p>
         <div className="row">
           <TextInput
             value={label}

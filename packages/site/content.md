@@ -408,6 +408,28 @@ until a real observation replaces them.
 
 ## Agent integration: one MCP server
 
+**Interactive OAuth connections.** Codex and other OAuth-capable remote MCP
+clients connect to `https://hub.fleetbridge.run/mcp` without a manually minted
+token. In Codex CLI, run `codex mcp add bridge --url
+https://hub.fleetbridge.run/mcp`, then `codex mcp login bridge`. Sign in with
+GitHub and approve access to the currently selected Bridge workspace. The
+responsive Bridge-styled consent page shows the client, workspace,
+permissions and return address; invalid or expired requests show recovery guidance.
+Approval automatically creates a unique, revocable `_direct/<client>-<id>` interactive
+agent in **Connect**; refresh keeps that identity. The agent can claim work under
+the existing interactive-session rules, while human-only approvals and independent
+review remain enforced. Select your workspace in Bridge before connecting.
+
+The OAuth server exposes MCP protected-resource and authorization-server
+discovery, public-client registration, authorization-code + S256 PKCE, exact
+registered HTTPS/loopback redirects, resource binding, one-hour access tokens,
+and rotating refresh tokens with a 30-day authorization lifetime. Reusing a
+refresh token revokes its authorization; clients serialize refreshes. Revocation
+in Connect and workspace membership removal prevent both access and refresh.
+OAuth credentials are scoped to `/mcp`. Self-hosted installs use the existing
+GitHub sign-in configuration and the `MCP_OAUTH` Durable Object migration.
+Headless gateway workers continue using their provisioned bearer credentials.
+
 Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet. Every artefact row a tool returns carries `url` — the card's stable deep link (`/card/BR-3990`) — so a card an agent cites is one paste away in any browser (BR#3990). Links are always emitted on the canonical hub domain, even when a request arrives via the fallback hostname (BR#4695).
 
 Every shape that crosses a runtime boundary is a checked-in contract: zod schemas and production-recorded fixtures in `packages/contracts`, validated in CI from both sides. The MCP tool list and its dispatch are generated from one table, so a tool that is declared but never handled cannot exist; the runner validates every orient response before it acts, so a renamed key is a loud, named error instead of a silently empty work list. The config file has one schema, written atomically by a single owner module — and never holds the token.
@@ -509,6 +531,11 @@ The train status, message and recovery banner consume the hub's shared typed
 `line` projection. Routine builds, deployments and check waits stay compact in
 the overview row; expanded banners appear only for stopped or unknown/error
 states. Click the lane for full operational details in its card view.
+Recorded merge responses withdraw the repeated merge request while Bridge checks
+GitHub; observed merges move to deployment verification. PR block details explain
+historical returns to repair/review separately from active escalation budgets.
+Unconfirmed previous writers appear as explicit gateway-reconciliation blockers,
+so a priority repair is not misleadingly described as merely queued.
 The [delivery architecture review and structural repair plan](https://github.com/state-vector/bridge/blob/main/docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 documents remaining mechanism gaps and proposed acceptance tests; it is a plan,
 not a declaration that the gateway refactor is complete.

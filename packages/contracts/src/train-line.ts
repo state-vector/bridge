@@ -107,6 +107,10 @@ export const TrainLineFactsSchema = z.object({
   base_red_resolution: BaseRedResolutionSchema.nullable().optional(),
   diagnostic: TrainFixCardSchema.nullable().optional(),
   diagnostic_ask: ActionSchema.nullable().optional(),
+  merge_response: z.discriminatedUnion("phase", [
+    z.object({ phase: z.literal("recorded"), pr: z.number().int().positive(), at: z.number() }),
+    z.object({ phase: z.literal("observed_merged"), pr: z.number().int().positive(), at: z.number(), receipt: z.string().min(1) }),
+  ]).nullable().optional(),
   starved: z.object({ since: z.number() }).nullable().optional(),
   bypass_wait: z.object({ pr: z.number() }).nullable().optional(),
   attempt: z.object({ note: z.string(), hold: z.string() }).nullable().optional(),
@@ -133,12 +137,18 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
   // deployment. Prefer the cause-bound repair's actual human action only.
   const mainFailed = bs?.verdict === "red" || (bs?.gate_blocked && !gatePending) || cov?.phase === "failed" || !!f.stop;
   const ask = f.base_red_resolution?.ask ?? (mainFailed ? null : f.diagnostic_ask);
+  const mergeResponse = f.merge_response;
+  const matchingResponse = mergeResponse && task?.pr === mergeResponse.pr ? mergeResponse : null;
+  const responseText = mergeResponse ? mergeResponse.phase === "observed_merged"
+    ? `PR #${mergeResponse.pr} is merged. Bridge is verifying deployment; a merge receipt is not a green deployment.`
+    : `Your merge response for PR #${mergeResponse.pr} is recorded. Bridge is checking GitHub before verifying deployment.` : "";
   const make = (phase: TrainLineProjection["phase"], label: string, reason: string,
     blocker: TrainLineProjection["blocker"] = null, evidence: TrainLineProjection["evidence"] = [],
     remediation: LineRemediation | null = null): TrainLineProjection => ({
     ...TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: observedAt, remediation }),
   });
   const repair = (): LineRemediation => {
+    if (matchingResponse) return { kind: "machine", text: responseText, url: task?.pr_url ?? null };
     if (f.base_red_resolution?.phase === "cure_pr_awaiting_force_merge" && task?.pr && task.pr_url && !task.merged && !task.conflict) return {
       kind: "merge", text: `Bypass-merge fix PR #${task.pr} to unblock this line. Main's failing deployment check prevents the automatic merge.`,
       pr: task.pr, url: task.pr_url, request: ask ?? null,
@@ -164,7 +174,9 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];
     const names = evidence.map((e) => e.name).join(", ");
     const action = repair();
-    return make("stopped", action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing", `${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
+    const label = matchingResponse ? matchingResponse.phase === "observed_merged" ? "Fix merged — verifying deployment" : "Merge response received — checking GitHub"
+      : action.kind === "merge" ? "Fix ready — your merge is needed" : "STOP THE LINE — main is failing";
+    return make("stopped", label, `${responseText ? `${responseText} ` : ""}${names ? `Main failed: ${names}. ` : ""}New changes are held until main passes its required checks.`, "main_failed", evidence, action);
   }
   if (q && !fresh) return make(
     "unknown", "Status is out of date", "The last check is over 15 minutes old. Main has not been confirmed healthy.", "stale_observation", [], repair());

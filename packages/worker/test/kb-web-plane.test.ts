@@ -326,14 +326,14 @@ describe("Top view renders the merge-train panel first (train panel legs 2+3)", 
     expect(trainPanelSrc).toContain("line.observed_at");
   });
 
-  it("shows the bounce budget: a ×N ledger-bounce chip per queued PR (err tone over budget) + the escalation clock chips (BR#4688)", () => {
+  it("keeps historical return counts in readable details and active escalation clocks separate", () => {
     const kbServerSrc = readFileSync(new URL("../../ui-kit/src/server/kb.ts", import.meta.url).pathname, "utf8");
     // queue chips carry the ledger bounce count; over budget reads as an error, never a green chip
     expect(trainPanelSrc).toMatch(/q\.over_budget/);
-    expect(trainPanelSrc).toContain("train-bounce-chip");
-    expect(trainPanelSrc).toMatch(/×\{q\.bounces\}/);
-    expect(trainPanelSrc).toContain("OVER bounce budget");
-    expect(trainPanelSrc).toContain("budget 5 same-kind — BR#4688");
+    expect(trainPanelSrc).not.toContain("train-bounce-chip");
+    expect(trainPanelSrc).not.toMatch(/×\{q\.bounces\}/);
+    expect(trainPanelSrc).toContain("Returned to repair/review");
+    expect(trainPanelSrc).toContain("active bounce-budget escalation");
     // de-queued escalations ride their own clock chips: ⏳ pr ×bounce_no, err once expired
     expect(trainPanelSrc).toMatch(/l\.escalations/);
     expect(trainPanelSrc).toContain("⏳");

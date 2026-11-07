@@ -178,6 +178,11 @@ export class ExecutionWork {
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
+    if (state.attempt && state.attempt.phase !== "quiesced" && !["in_progress", "in_review"].includes(task.status)
+        && !blockers.some(b => b.kind === "writer_quiescence_required")) blockers.push({
+      kind: "writer_quiescence_required", episode_id: `writer:${task.id}:${state.attempt.generation}:${state.attempt.attempt_id}`,
+      text: `The previous execution on ${state.attempt.host} has no stopped-writer proof. The gateway must reconcile generation ${state.attempt.generation} before this repair can start; priority cannot safely replace an unconfirmed writer.`,
+    });
     const direct = InteractiveClaimSchema.safeParse(meta.interactive_execution);
     // Missing unattended capacity is not a blocker on an authenticated interactive owner.
     // Its actual model remains unreported rather than borrowing the old runner's identity.

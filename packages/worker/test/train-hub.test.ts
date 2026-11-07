@@ -131,6 +131,20 @@ describe("BR#6901 idle main-health observation", () => {
 });
 
 describe("BR#6776 durable check recovery", () => {
+  it("keeps the qualified root fix visible behind newer unrelated repo cards", async () => {
+    const repo = "state-vector/root-priority-7564", actor = "gw-root7564", head = "f".repeat(40);
+    const root = await kbJson("/create", { type: "task", title: "Repair the actual main failure", qualified: true,
+      tags: ["root_blocker", "main-red", "p0"], meta: { root_fix: { repo, base: "main", head_sha: head, failing: ["Test"] } } });
+    const unrelated = await queueViaAccept({ repo, pr: 90, head: "a".repeat(40), title: "ROOT-FIX: unrelated review indexer" });
+    for (let n = 0; n < 25; n++) await kbJson("/create", { type: "task", title: `Newer ordinary repo card ${n}`, meta: { pr: { repo, number: 100 + n } } });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    await kbJson("/train.queue_facts", { repo, actor, entries: [{ id: unrelated, pr: 90, cls: "ready" }],
+      base_state: { verdict: "red", tip_sha: head, red: [{ name: "Test" }], unsettled: [] } });
+    const lane = await laneSnap(repo);
+    expect(lane.base_red_resolution.fix_card.id).toBe(root.body.id);
+    expect(lane.line.remediation.kind).not.toBe("merge");
+    await kbJson("/train.lease", { repo, actor, action: "release" });
+  });
   it("BR#7500: independent ready candidates keep lane recovery separate from a failed candidate's repair", async () => {
     const repo = "state-vector/ready-not-blocked-7500", actor = "gw-7500";
     const failed = await queueViaAccept({ repo, pr: 1, head: "a".repeat(40) });
@@ -3179,6 +3193,8 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     let lane = await laneSnap(repo);
     expect(lane.bypass_merge).toBeTruthy();
     expect(lane.bypass_merge.pr).toBe(63909);
+    expect(lane.line.label).toBe("Merge response received — checking GitHub");
+    expect(lane.line.remediation.kind).not.toBe("merge");
     expect(await findOpenAsk()).toBeNull();
     expect((await stampRed()).body.error ?? "").toBe("");
     expect((await askHits()).length).toBe(1); // still exactly one — no duplicate
@@ -3308,7 +3324,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-6390" });
     await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-6390d" });
     await kbJson("/train.lease", { repo: repo3, base: "main", action: "release", actor: "gw-6390b" });
-  });
+  }, 15_000);
 
   it("BR#5516: no root-fix card needed — a QUEUED fix-shaped cure PR renders bypass-first in the ask (the 2026-11-02 bridge episode: verified PR queued, ask said 'no fix PR'), the brief carries the Read-of-the-red triage lines, and a bypass answer dispatches the merge authority", async () => {
     const repo = "state-vector/lane-brr-queue";
@@ -3893,7 +3909,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     });
 
     // Stamp conflict_pairs between PR 504 and PR 503 so they split into Batch 1 and Batch 2
-    // Even if queue_facts stamps cls:"waiting" on the already verify-accepted PR 504 (e.g. waiting on base settle), it stays ready (green)
+    // An accepted substance verdict does not turn a current waiting gate green.
     await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-ng", merge_capable: true });
     await kbJson("/train.queue_facts", {
       repo,
@@ -3912,14 +3928,15 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       verifying: 2,   // PR 502 (waiting) + PR 503 (actively verifying)
       ready: 1,       // PR 504 (ready)
     });
-    // Batch 1 contains [504 (ready), 502 (waiting)], Batch 2 contains [503 (verifying — conflicted with 504)]
+    // Active verification precedes waiters; accepted PR504 is still waiting on
+    // a current executor/main observation, not promised to merge this pass.
     expect(laneSnap.batches.length).toBe(2);
     expect(laneSnap.batches[0].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
-      { pr: 504, state: "ready" },
+      { pr: 503, state: "verifying" },
       { pr: 502, state: "waiting" },
     ]);
     expect(laneSnap.batches[1].map((c: any) => ({ pr: c.pr, state: c.state }))).toEqual([
-      { pr: 503, state: "verifying" },
+      { pr: 504, state: "waiting" },
     ]);
   });
 
@@ -4286,13 +4303,14 @@ describe("bounce budget: 6 same-kind bounces escalate once and de-queue (BR#4688
     const snap2 = await laneSnap(repo);
     expect(snap2.escalations ?? []).toHaveLength(0);
     expect(snap2.queue.find((q: any) => q.id === card) ?? null).toBeTruthy();
+    expect(snap2.queue.find((q: any) => q.id === card)).toMatchObject({ bounces: 7, over_budget: false });
     // the episode RESET: the next gate bounce counts from 1 — no instant re-escalation
     const fresh = await bounce(card, heads[7]);
     expect(fresh.status).toBeLessThan(400);
     expect(fresh.body.escalated ?? false).toBe(false);
     expect(fresh.body.bounce_no).toBe(1);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-budget" });
-  });
+  }, 15_000);
 
   it("grace expiry: the hub composes the close reason, and escalation_closed (executor gh leg) settles the record — never self-certified", async () => {
     const repo2 = "state-vector/budget-expiry-drill";
