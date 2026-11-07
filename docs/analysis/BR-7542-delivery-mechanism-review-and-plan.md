@@ -71,6 +71,15 @@ claim, process, merge gate or required check was altered by this review.
   and matching starvation receipts are confirmed; a complete causal performance
   attribution still needs phase timing from the running controller.
 
+**Subsequent independent runtime receipt:** BR#7510's completed review, history
+sequence 573627, reports that the actual `bridge run` daemon on
+`ip-172-31-1-230`, PID 423741, and its on-disk executable both identify as
+`a4732fe82d08c019dd5a108293e33a01756e09d1`, while the hub served `4c1f82416`.
+The reviewer accepted the targeted code delivery and explicitly did not claim
+native adoption or recovered Superpositional flow. This independently confirms
+the adoption gap in F10; it does not complete the operational repair. No further
+runtime change was performed for this review.
+
 Existing work: BR#7501 owns the bounded gateway refactor, BR#6992 its operational
 recovery, BR#7500/7510 the recent merge repair/review, and BR#7495 backlog lifecycle
 repair. At the review snapshot BR#7501 was todo after a watchdog release, with
