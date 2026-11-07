@@ -183,7 +183,14 @@ pub fn discover(cfg: &DispatchConfig, skip: &[Ticket]) -> Result<Vec<InFlight>, 
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
         if !path.is_dir() { continue; }
-        let spec: Spec = serde_json::from_slice(&fs::read(path.join("request.json")).map_err(|e| e.to_string())?).map_err(|e| format!("gate: worker manifest corrupt: {e}"))?;
+        let bytes = match fs::read(path.join("request.json")) {
+            Ok(bytes) => bytes,
+            // A crash before manifest publication is still owned by the
+            // existing launch/reservation WAL. Do not freeze every other task.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let spec: Spec = serde_json::from_slice(&bytes).map_err(|e| format!("gate: worker manifest corrupt: {e}"))?;
         spec.validate()?;
         if spec.root()? != path || spec.cfg.url.trim_end_matches('/') != cfg.url.trim_end_matches('/') || spec.cfg.label != cfg.label { return Err("gate: worker belongs to another host/hub".into()); }
         if skip.contains(spec.owner.ticket()) { continue; }
@@ -398,6 +405,17 @@ mod tests {
             if !spent { assert!(!root.join("started.json").exists()); }
             let _ = fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
         }
+    }
+    #[test]
+    fn incomplete_manifest_publication_does_not_freeze_unrelated_recovery() {
+        let hub = Hub::new(|_| panic!("discovery cannot manufacture a lease or launch"));
+        let (cfg, _, _) = fixture(&hub);
+        let scope = gateway_pipeline::root(&cfg).unwrap();
+        let partial = scope.join("workers/partial-publication"); fs::create_dir_all(&partial).unwrap();
+        assert!(discover(&cfg, &[]).unwrap().is_empty(), "uncommitted manifests remain in launch-intent recovery");
+        fs::write(partial.join("request.json"), "{}").unwrap();
+        assert!(discover(&cfg, &[]).err().unwrap().contains("gate: worker manifest corrupt"), "committed corrupt identities must remain fail-closed");
+        let _ = fs::remove_dir_all(scope);
     }
     #[cfg(unix)]
     fn restart_drill(acp: bool) {

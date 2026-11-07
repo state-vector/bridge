@@ -17,6 +17,8 @@ not an invented active drain. Refresh the separately installed updater script
 as documented in the README to enable the negotiated handoff.
 Explicit stops remain fenced through handoff; an older health check cannot clear
 a newer update request.
+Interrupted manifest publication remains in launch-intent recovery without
+freezing unrelated work; corrupt published identities are retained for diagnosis.
 
 ### Operational diagnostics
 
