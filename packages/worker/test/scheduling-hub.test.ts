@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SchedulingOutcomeSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
@@ -11,13 +11,16 @@ async function post(op: string, body: object) {
   const response = await stub.fetch(`https://kb/${op}`, { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(executorRequest(body)) });
   return await response.json() as Record<string, any>; // JSON transport boundary, schemas validate outcomes
 }
-beforeAll(async () => {
+// Every scenario gets its own real SQLite hub. Sharing one growing backlog
+// made later eligibility/maintenance scans depend on unrelated earlier tests
+// and exceed the CI budget; suite order must not be a scheduler input.
+beforeEach(async () => {
   const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
   mf = new Miniflare({ workers: [{ name: "main", scriptPath: bundle, modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")), modules: true, compatibilityDate: "2025-09-06", durableObjects: { HUB: { className: "FlowsHub", useSQLite: true }, KB: { className: "KnowledgeHub", useSQLite: true } } }] });
   const ns = await mf.getDurableObjectNamespace("KB");
   stub = await ns.get(ns.idFromName("scheduler")) as unknown as typeof stub;
 });
-afterAll(async () => { await mf?.dispose(); });
+afterEach(async () => { await mf?.dispose(); });
 
 const publishedCheckpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/recovery-priority",
   commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Resume the preserved verification", tests: [] };
