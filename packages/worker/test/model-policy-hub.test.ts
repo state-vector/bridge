@@ -30,7 +30,8 @@ it("atomically closes a stronger-implementation verdict and requeues its idle su
   const label = "review-models";
   const minted = await post("admin.mint", { label, tags: ["gateway"] });
   const identity = await post("auth.identify", { bearer: minted.secret });
-  await post("agent.provision", { actor: label, label: `${label}/worker` });
+  const provisioned = await post("agent.provision", { actor: label, label: `${label}/worker` });
+  const worker = { actor: `${label}/worker`, token_id: provisioned.id, gateway: false };
   const base = { actor: label, token_id: identity.token_id, gateway: true, agent: `${label}/worker`, session: "dispatch-impl-models" };
   const medium = { tier: "medium", backend: "opencode", model: "test/medium", tools: [], environment: [], projects: ["bridge"] };
   expect((await post("execution", { ...base, id: "gateway", command_id: "review-inventory", command: { kind: "advertise", capabilities: { ...medium, worker: { kind: "provisioned", label: `${label}/worker` }, alternatives: [{ ...medium, tier: "large", model: "test/large" }] } } })).ok).toBe(true);
@@ -38,13 +39,18 @@ it("atomically closes a stronger-implementation verdict and requeues its idle su
   const auth = { ...base, id: parent.id };
   expect((await post("transition", { ...auth, to: "in_progress" })).error).toBeUndefined();
   expect((await post("execution", { ...auth, command_id: "impl-begin", command: { kind: "begin", attempt_id: "impl", worker: `${label}/worker`, action_budget_ms: 60_000 } })).error).toBeUndefined();
-  await post("execution", { ...auth, command_id: "impl-quiet", command: { kind: "quiesce", generation: 1, attempt_id: "impl", writers: "process_group_empty" } });
-  const delivery = await post("transition", { ...auth, to: "in_review", note: "PR https://github.com/state-vector/bridge/pull/123 — implementation delivered; request independent verification" });
+  const delivery = await post("transition", { ...worker, id: parent.id, session: base.session,
+    execution_scope: { id: parent.id, generation: 1, attempt_id: "impl" },
+    to: "in_review", note: "PR https://github.com/state-vector/bridge/pull/123 — implementation delivered; request independent verification" });
   expect(delivery.error).toBeUndefined();
   expect(delivery.verify_task).toBeTruthy();
+  await post("execution", { ...auth, command_id: "impl-quiet", command: { kind: "quiesce", generation: 1, attempt_id: "impl", writers: "process_group_empty" } });
   const reviewer = { ...base, id: delivery.verify_task, session: "dispatch-review-models" };
   expect((await post("transition", { ...reviewer, to: "in_progress" })).error).toBeUndefined();
-  const result = await post("transition", { ...reviewer, to: "done", note: "Findings for https://github.com/state-vector/bridge/pull/123: deeper cross-system reasoning required; implementation is not accepted.", review_result: { kind: "stronger_implementation_required", task_id: parent.id, summary: "The implementation misses the cross-system invariant; retry with stronger reasoning." } });
+  expect((await post("execution", { ...reviewer, command_id: "review-begin", command: { kind: "begin", attempt_id: "review", worker: `${label}/worker`, action_budget_ms: 60_000 } })).error).toBeUndefined();
+  const result = await post("transition", { ...worker, id: delivery.verify_task, session: reviewer.session,
+    execution_scope: { id: delivery.verify_task, generation: 1, attempt_id: "review" },
+    to: "done", note: "Findings for https://github.com/state-vector/bridge/pull/123: deeper cross-system reasoning required; implementation is not accepted.", review_result: { kind: "stronger_implementation_required", task_id: parent.id, summary: "The implementation misses the cross-system invariant; retry with stronger reasoning." } });
   expect(result.error).toBeUndefined();
   const escalated = await post("get", { id: parent.id });
   expect(escalated.status).toBe("todo");

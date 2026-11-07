@@ -35,14 +35,14 @@ export const VERDICT_ROLES: Role[] = ["review", "unblock"];
 
 // BR#6432: exported for the batch-auth application leg in do.ts — the same
 // human-principal test the answer dispatch's authority rests on.
-const HUMAN_ACTOR = /^web(:|$)|^human:/;
+const HUMAN_ACTOR = /^(web:|human:)/;
 export { HUMAN_ACTOR };
 // system actors (watchdog, churn-guard, separation) act ON claims — releases
 // they perform are the machinery working, not agents dumping each other's work.
 // Exported for the BR#5807 meta-integrity guard (do.ts update): the same
 // human/machinery authority that protects lane cards from closing protects
 // their lane-config meta keys from meta_delete.
-export const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
+export const OWNER_RELEASE_EXEMPT = /^(web:|human:|system:)/;
 
 export interface RuleInput {
   id: string;
@@ -413,6 +413,11 @@ export const RULES: Rule[] = [
     guard: (i) =>
       `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. ` +
       "STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish.",
+  },
+  {
+    name: "gateway-cannot-author-completion",
+    when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
+    guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
   },
   {
     name: "release-needs-ownership",

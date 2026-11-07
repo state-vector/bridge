@@ -1,5 +1,11 @@
 # bridge
 
+Knowledge REST and MCP use authenticated credential identity rather than
+caller-supplied actor or gateway flags. Workspace routing is not authentication.
+Gateway infrastructure reports process facts; task submission and acceptance
+belong to task agents and independent reviewers.
+Display labels cannot confer human authority on a machine credential.
+
 ### One gateway lifecycle, durable outcomes
 
 The gateway prepares and finalizes tasks in bounded independent jobs, so one slow

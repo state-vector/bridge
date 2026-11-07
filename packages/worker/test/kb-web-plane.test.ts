@@ -25,7 +25,7 @@ import { ExecutionAttentionSchema } from "@bridge/contracts";
 
 const SECRET = "test-gh-secret";
 
-function sessionCookie(login = "ray", ws = "global") {
+function sessionCookie(login = "ray", ws = "state-vector") {
   const exp = String(Date.now() + 60_000);
   const sig = createHmac("sha256", SECRET).update(`${exp}.${login}.${ws}`).digest("hex");
   return `bridge_session=${exp}.${login}.${ws}.${sig}`;
@@ -66,6 +66,59 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
   });
 
 describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
+  it("does not confuse workspace routing with authentication for an unknown bearer", async () => {
+    const denied = await mf.dispatchFetch("https://main/api/kb/board", { headers: { authorization: "Bearer not-a-vended-credential" } });
+    expect(denied.status).toBe(401);
+  });
+
+  it.each(["REST", "MCP"])("a reserved display label cannot confer human authority over %s", async transport => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "web", tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: `Reserved-label authority ${transport}` }) }).then(r => r.json() as Promise<{ id: string }>);
+    expect((await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "blocked", note: "Human-only terminal disposition remains pending",
+      await_event: { event: "time", until_ts: Date.now() + 3_600_000 } }) })).status).toBe(200);
+    const args = { id: created.id, to: "superseded", session: "reserved-label-proof" };
+    const denied = await mf.dispatchFetch(`https://main${transport === "REST" ? "/api/kb/transition" : "/mcp"}`, { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify(transport === "REST" ? args : { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "transition", arguments: args } }) });
+    const text = await denied.text();
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(denied.status, JSON.stringify({ text, status: row.status })).toBe(transport === "REST" ? 400 : 200);
+    if (transport === "MCP") expect((JSON.parse(text) as { result: { isError: boolean } }).result.isError).toBe(true);
+    expect(text).toContain("human-authority");
+    expect(row.status).toBe("blocked");
+  });
+
+  it("derives gateway completion authority from the authenticated bearer, not forged REST fields", async () => {
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label: "rest-completion-gateway", tags: ["gateway"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "REST gateway cannot author an outcome", roles: ["analysis"] }) }).then(r => r.json() as Promise<{ id: string }>);
+    expect((await api("/api/kb/transition", { method: "POST", body: JSON.stringify({ id: created.id, to: "in_progress", session: "rest-gateway-proof" }) })).status).toBe(200);
+    const refused = await mf.dispatchFetch("https://main/api/kb/transition", { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: created.id, to: "done", session: "rest-gateway-proof", actor: "web:forged", gateway: false, token_id: "forged-token",
+        execution_result: { outcome: "Process exited zero", receipts: [created.id] } }) });
+    expect(refused.status).toBe(400);
+    expect((await refused.json() as { error: string }).error).toContain("gateway infrastructure cannot");
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string }>);
+    expect(row.status).toBe("in_progress");
+  });
+
+  it("preserves a real agent's REST identity and strips forged infrastructure attribution", async () => {
+    const label = "rest-completion-agent";
+    const minted = await api("/api/kb/admin/tokens", { method: "POST", body: JSON.stringify({ label, tags: ["agent"] }) }).then(r => r.json() as Promise<{ secret: string }>);
+    const created = await api("/api/kb/create", { method: "POST", body: JSON.stringify({ type: "task", title: "REST agent authors its explicit finding", roles: ["analysis"] }) }).then(r => r.json() as Promise<{ id: string }>);
+    const transition = (to: string) => mf.dispatchFetch("https://main/api/kb/transition", { method: "POST",
+      headers: { authorization: `Bearer ${minted.secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: created.id, to, session: "rest-agent-proof", gateway: true, agent: "pretend-other-agent",
+        execution_result: { outcome: "Analysis findings recorded", receipts: [created.id] } }) });
+    const claimed = await transition("in_progress");
+    expect(claimed.status, await claimed.text()).toBe(200);
+    const finished = await transition("done");
+    expect(finished.status, await finished.text()).toBe(200);
+    const row = await api(`/api/kb/artefact?id=${encodeURIComponent(created.id)}`).then(r => r.json() as Promise<{ status: string; owner: string }>);
+    expect(row.status).toBe("done");
+    expect(row.owner).toBe(label);
+  });
+
   it("posts a web comment through to progress.log (200, logged, visible in history)", async () => {
     // verdict-duty tasks are claimable without qualification (role:review) —
     // same rig the throughput route test uses. The task must be in_progress:

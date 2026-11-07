@@ -8,6 +8,21 @@ Everything runs on the Cloudflare **free tier**: one Worker, one SQLite-backed D
 
 ## Quick card lookup
 
+### Knowledge-plane identity
+
+Knowledge REST bearer requests authenticate through the workspace's credential
+validator; routing a token to a workspace alone is not authentication. Unknown
+credentials are rejected, while identity infrastructure failures stay retryable.
+REST mutations and MCP derive actor, token binding and gateway class from the
+authenticated credential, overriding caller-supplied attribution. Gateway tokens
+report fenced process facts; they cannot submit a task for review or mark one
+done. Task agents and independent reviewers retain those business actions.
+Human authority uses the `web:<login>` / `human:<identity>` actor namespaces,
+outside the credential-label grammar. A bare display label such as `web` is an
+ordinary agent name. Legacy credentials conflicting with a human namespace may
+drain writers through gateway execution control and self-rename through the
+existing machine endpoint; they cannot use the conflict as human authority.
+
 ### Delivery responsibility
 
 An open PR remains a delivery obligation even when an old card is retired.
