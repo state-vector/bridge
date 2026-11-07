@@ -15,6 +15,7 @@
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
 import { mergeCompletesTask, ExecutionResultSchema, dutyOutcome } from "@bridge/contracts";
+import { ownsInteractiveClaim } from "./execution-work";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
 export type Role = "impl" | "analysis" | "review" | "unblock" | "human" | "plain";
@@ -264,6 +265,7 @@ export type Effect =
   | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean }
   | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
+  | { kind: "interactive_handoff"; previous_attempt: unknown }
   | { kind: "release_redirect"; attempts: number; silent_cycles: number };
 
 /** meta_patch: entries with value `undefined` DELETE the key (typed stamping). */
@@ -817,8 +819,18 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   let ownerClear = false;
 
   // release to the pool: attempt stamp, churn escalate/redirect — decided, not improvised
-  if (trainRepairRelease) {
+  const interactiveHandoff = i.status === "in_progress" && i.to === "todo" && !!noteOf(i)
+    && !i.actor.startsWith("system:")
+    && ownsInteractiveClaim(meta, String(i.body?.token_id ?? ""), String(i.body?.session ?? ""));
+  if (trainRepairRelease || interactiveHandoff) {
     ownerClear = true;
+    if (interactiveHandoff) {
+      // This is an authenticated owner's deliberate preserved-work handoff,
+      // not another failed automated attempt. Keep its old retry history in
+      // an explicit event while starting the new execution round honestly.
+      effects.push({ kind: "interactive_handoff", previous_attempt: meta.attempt ?? null });
+      patch.attempt = meta.attempt ? { ...meta.attempt, attempts: 0 } : undefined;
+    }
   } else if (i.to === "todo") {
     // PROVEN-UNBLOCK RELEASE: an unblock duty releasing a parked card with
     // proof is a FRESH START, not a churn attempt — the attempts counter

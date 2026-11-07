@@ -150,22 +150,24 @@ const AttemptFields = {
   action_deadline: z.number().int(),
   executor: ExecutorCapabilitiesSchema.nullable().default(null),
 };
+export const WriterProofSchema = z.enum(["process_group_empty", "no_live_group_members"]);
 export const AttemptSchema = z.discriminatedUnion("phase", [
   z.object({ ...AttemptFields, phase: z.literal("restoring"), checkpoint: CheckpointSchema, restored_tree: z.null() }),
   z.object({ ...AttemptFields, phase: z.literal("running"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
   z.object({ ...AttemptFields, phase: z.literal("stopping"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
+  z.object({ ...AttemptFields, phase: z.literal("finalizing"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable(), writers: WriterProofSchema }),
   z.object({ ...AttemptFields, phase: z.literal("quiesced"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
 ]);
 export type ExecutionAttempt = z.infer<typeof AttemptSchema>;
 /** Process outcome is evidence, never business acceptance. The agent/hub owns
  * task completion; exit 0 cannot manufacture a review or close a diagnostic. */
 export const TerminalOutcomeSchema = z.object({
-  kind: z.enum(["completed", "interrupted", "failed"]),
+  kind: z.enum(["completed", "interrupted", "failed", "timed_out", "result_unavailable"]),
   exit_code: z.number().int().nullable(),
   stdout_tail: z.string().max(16_000),
   stderr_tail: z.string().max(8_000),
 });
-export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema });
+export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -192,17 +194,20 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("pause_claims"), reason: text, budget_ms: z.number().int().min(10_000).max(300_000) }),
   z.object({ kind: z.literal("resume_claims") }),
   z.object({ kind: z.literal("inspect") }),
+  z.object({ kind: z.literal("receipt"), target_command_id: text }),
   z.object({ kind: z.literal("availability") }),
   z.object({ kind: z.literal("advertise"), capabilities: ExecutorCapabilitiesSchema }),
   z.object({ kind: z.literal("begin"), attempt_id: text, worker: text, action_budget_ms: z.number().int().min(10_000).max(3_600_000),
     selection: z.object({ backend: z.enum(["opencode", "kiro"]), model: text, tier: ReasoningTierSchema }).optional() }),
   z.object({ kind: z.literal("start_failed"), stage: z.enum(["inspect", "begin"]), reason: text, retained_work: z.boolean(), failure_class: z.enum(["transport", "prerequisite", "resource"]).default("prerequisite") }),
   z.object({ kind: z.literal("recover_unstarted"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
+  z.object({ kind: z.literal("cancel_start"), writers: z.literal("not_launched"), retained_work: z.literal(true) }),
   z.object({ kind: z.literal("poll"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
   z.object({ kind: z.literal("checkpoint"), ...FenceSchema.shape, checkpoint: CheckpointSchema }),
   z.object({ kind: z.literal("quiesce"), ...FenceSchema.shape, writers: z.literal("process_group_empty") }),
-  z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: z.literal("process_group_empty"), outcome: TerminalOutcomeSchema }),
+  z.object({ kind: z.literal("stopped"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
+  z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]) }),
   z.object({ kind: z.literal("ack"), ...FenceSchema.shape, message_id: text, state: z.enum(["acknowledged", "acted"]) }),
@@ -230,14 +235,18 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     if (!("generation" in command) || !a || command.generation !== a.generation || command.attempt_id !== a.attempt_id || a.host !== host || a.session !== session) {
       throw new Error("gate: execution attempt fenced — stop, preserve local work, do not push");
     }
-    if (!allowExpired && (a.lease_until <= now || a.phase === "quiesced")) throw new Error("gate: execution lease expired or quiesced");
+    if (!allowExpired && (a.lease_until <= now || a.phase === "quiesced" || a.phase === "finalizing")) throw new Error("gate: execution lease expired or writer stopped");
     return a;
   };
   switch (command.kind) {
-    case "schedule": case "schedule_status": case "gateway_control": case "gateway_failure": case "inspect": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "schedule": case "schedule_status": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
     case "start_failed": {
       if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
       return s; // the authenticated coordinator owns the atomic task release
+    }
+    case "cancel_start": {
+      if (a && a.phase !== "quiesced") throw new Error("gate: startup cancellation cannot discard an unquiesced writer");
+      return s;
     }
     case "recover_unstarted": {
       if (a) throw new Error("gate: legacy unstarted recovery cannot erase an execution attempt");
@@ -263,7 +272,9 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       break;
     }
     case "poll": {
-      const current = requireAttempt();
+      const current = requireAttempt(true);
+      if (current.phase === "finalizing") return s; // stopped writers cannot renew or become running again
+      if (current.phase === "quiesced" || current.lease_until <= now) throw new Error("gate: execution lease expired or quiesced");
       if (current.action_deadline <= now && current.phase !== "stopping") {
         s.budget_exhaustions += 1;
         // The budget belongs to the task, not a session/host/model. Exhaustion
@@ -289,12 +300,27 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       break;
     }
     case "quiesce": requireAttempt(true).phase = "quiesced"; break;
+    case "stopped": {
+      const current = requireAttempt(true);
+      if (s.terminal?.generation === command.generation && s.terminal.attempt_id === command.attempt_id
+        && (JSON.stringify(s.terminal.outcome) !== JSON.stringify(command.outcome) || s.terminal.writers !== command.writers)) throw new Error("gate: captured terminal evidence is immutable");
+      if (current.phase !== "quiesced") s.attempt = { ...current, phase: "finalizing", writers: command.writers };
+      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome, writers: command.writers };
+      break;
+    }
     case "finalize": {
-      requireAttempt(true).phase = "quiesced";
-      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome };
+      const current = requireAttempt(true);
+      if (!["finalizing", "quiesced"].includes(current.phase)) throw new Error("gate: finalization requires an acknowledged stopped-writer receipt");
+      if (!s.terminal || s.terminal.generation !== command.generation || s.terminal.attempt_id !== command.attempt_id
+        || JSON.stringify(s.terminal.outcome) !== JSON.stringify(command.outcome) || s.terminal.writers !== command.writers) throw new Error("gate: finalization must preserve the captured terminal evidence");
+      current.phase = "quiesced";
+      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome, writers: command.writers };
       // Receipt of stop/interrupt does not mean its requested business action
       // was completed. Keep it acknowledged for the next executor to reconcile.
       for (const message of s.messages) if (message.state === "delivered") message.state = "acknowledged";
+      if (s.handoff.phase === "preparing" && current.checkpoint && !s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
+        s.handoff = { ...s.handoff, phase: "waiting", checkpoint: current.checkpoint, quiescence: { kind: "runner", host, generation: current.generation } };
+      }
       break;
     }
     case "yield": {
@@ -310,7 +336,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         if (s.messages.length >= 1000) throw new Error("gate: mailbox history budget exhausted; reconcile before adding messages");
         s.messages.push({ id: command.message_id, text: command.text, priority: command.priority, state: "queued" });
       }
-      if (a && a.phase !== "quiesced" && command.priority === "interrupt") a.phase = "stopping";
+      if (a && a.phase !== "quiesced" && a.phase !== "finalizing" && command.priority === "interrupt") a.phase = "stopping";
       break;
     }
     case "ack": {

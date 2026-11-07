@@ -26,6 +26,18 @@ beforeAll(async () => {
 afterAll(async () => { await mf?.dispose(); });
 
 describe("delivery responsibility (real SQLite hub)", () => {
+  it("verified closed PRs and malformed historical pseudo-repos do not invent outstanding delivery", async () => {
+    const source = await call("create", { type: "task", title: "Historical closed delivery", qualified: true, actor: "author",
+      meta: { prs: [{ repo, number: 40 }, { repo: "5299/BR", number: 4728 }] } });
+    expect(source.status, JSON.stringify(source.body)).toBe(200);
+    const before = await call("supersede.task", { id: source.body.id, actor: "web:rayh" });
+    expect(before.status).toBe(400); // the real OPEN/unobserved obligation is protected
+    await call("reconcile.report", { repo, prs: [{ number: 40, state: "CLOSED", headRefOid: head, updatedAt: new Date().toISOString() }] });
+    const retired = await call("supersede.task", { id: source.body.id, actor: "web:rayh", note: "Human retires the receipt-backed closed PR wrapper" });
+    expect(retired.status, JSON.stringify(retired.body)).toBe(200);
+    expect((await get(source.body.id)).status).toBe("superseded");
+    expect((await get(source.body.id)).meta.prs).toContainEqual({ repo: "5299/BR", number: 4728 }); // historical evidence retained
+  });
   it("refuses a bare terminal drop without mutating source; replacement transfers bindings atomically", async () => {
     const id = await create(1);
     const before = await get(id);

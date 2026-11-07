@@ -51,7 +51,7 @@ export class RecoveryCapacity {
     if (!row) return null;
     const pending = RecoveryPreemptionSchema.parse(JSON.parse(String(row.state)));
     const attempt = this.state(pending.victim_id)?.attempt;
-    return { ...pending, phase: attempt && (attempt.generation > pending.generation || attempt.generation === pending.generation && attempt.attempt_id === pending.attempt_id && attempt.phase === "quiesced")
+    return { ...pending, phase: attempt && (attempt.generation > pending.generation || attempt.generation === pending.generation && attempt.attempt_id === pending.attempt_id && ["quiesced", "finalizing"].includes(attempt.phase))
       ? "slot_available" : "stopping_verification" };
   }
   forRecovery(id: string): RecoveryPreemption | null {

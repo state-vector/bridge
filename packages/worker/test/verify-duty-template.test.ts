@@ -11,6 +11,14 @@ import { verifyDutyBody } from "../src/kb/do.ts";
 // gate:multi-atom-condition (specimens BR#4425 on BR#4400, BR#4303 on BR#4297).
 
 describe("verifyDutyBody — one explicit acceptance authority", () => {
+  it("a published commit receipt never fabricates main ancestry or prelanding acceptance", () => {
+    const body = verifyDutyBody("BR#7522", "Prelanding lifecycle candidate", "https://github.com/state-vector/bridge/commit/" + "a".repeat(40));
+    expect(body).not.toContain("already on main");
+    expect(body).toContain("A commit URL does not prove main ancestry");
+    expect(body).toContain("published prelanding candidate");
+    expect(body).toContain("do not assert it is on main or return accepted_direct_main");
+    expect(body).toContain("After landing, confirm this commit is an ancestor");
+  });
   it("renders the exact subject and PR leg in the typed review result", () => {
     const body = verifyDutyBody(
       "BR#4400",
