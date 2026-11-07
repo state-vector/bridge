@@ -1,5 +1,7 @@
 import { Miniflare } from "miniflare";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readyGateway, executorRequest } from "./executor-fixture";
 
@@ -19,7 +21,13 @@ import { readyGateway, executorRequest } from "./executor-fixture";
 let mf: Miniflare;
 let kb: (path: string, init?: RequestInit) => Promise<Response>;
 
-beforeAll(async () => {
+/**
+ * Boot a fresh workerd runtime hosting the bundled hub, and return a fetcher
+ * bound to the KnowledgeHub DO's "global" instance. `persist` points storage
+ * at a directory so a SECOND boot over the SAME directory is the warm-isolate
+ * shape: a brand-new isolate (the prod deploy shape) over an existing database.
+ */
+async function bootKb(persist?: string) {
   // miniflare 3 API (direct devDep; the v4 bundled with wrangler changed
   // its options schema). scriptPath MUST be absolute — it resolves against
   // the process cwd, not the config.
@@ -34,7 +42,11 @@ beforeAll(async () => {
   if (!existsSync(bundle)) {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (the npm test script does this before vitest)");
   }
-  mf = new Miniflare({
+  const instance = new Miniflare({
+    // Miniflare 3's DO storage persistence is the SHARED `durableObjectsPersist`
+    // option (a bare `persist` key is silently ignored) — a directory gives a
+    // second boot over the same dir the exact existing-database warm shape.
+    durableObjectsPersist: persist,
     workers: [{
       name: "main",
       scriptPath: bundle,
@@ -46,9 +58,16 @@ beforeAll(async () => {
         KB: { className: "KnowledgeHub", useSQLite: true },
       },
     }],
-  });  const ns = await mf.getDurableObjectNamespace("KB");
+  });
+  const ns = await instance.getDurableObjectNamespace("KB");
   const stub = await ns.get(ns.idFromName("global"));
-  kb = (path, init) => stub.fetch(`https://kb${path}`, init);
+  return { instance, kb: (path: string, init?: RequestInit) => stub.fetch(`https://kb${path}`, init) };
+}
+
+beforeAll(async () => {
+  const booted = await bootKb();
+  mf = booted.instance;
+  kb = booted.kb;
   // warm + cold ensureSchema paths both exercised
   await kb("/orient", { actor: "test" });
   await kb("/orient", { actor: "test" });
@@ -128,6 +147,70 @@ describe("auth token SQL paths (real storage)", () => {
     expect(second.status).toBeLessThan(500);
     expect(second.body.secret).toBeTruthy();
     expect(second.body.id).toBe(first.body.id);
+  });
+});
+
+// ---------- BR#2841: the warm-isolate class ----------
+// A frozen migration or a non-idempotent ensureSchema only breaks on an
+// EXISTING database — the shared beforeAll isolate never presents one (every
+// test above runs on a single cold boot). This spins TWO sequential workerd
+// runtimes over ONE persisted SQLite directory: the cold boot creates the
+// schema, then a brand-new isolate (the deploy/restart shape) must re-run
+// ensureSchema over the live database and keep every feature working.
+describe("warm isolate over an existing database (BR#2841 — frozen-migration class)", () => {
+  const post = async (
+    call: (path: string, init?: RequestInit) => Promise<Response>,
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; body: any }> => {
+    const r = await call(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-kb-admin": "1" },
+      body: JSON.stringify(executorRequest(body)),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+
+  it("ensureSchema runs cold then warm — a new isolate over the persisted DB re-applies it idempotently and features still work", async () => {
+    const dir = mkdtempSync(join(realpathSync(tmpdir()), "br2841-warm-"));
+    try {
+      // COLD isolate: empty storage — ensureSchema creates every table, then
+      // mint and session touch work on the fresh schema.
+      const cold = await bootKb(dir);
+      const first = await post(cold.kb, "/admin.mint", { label: "br2841-warm-isolate", tags: [] });
+      expect(first.status).toBeLessThan(500);
+      expect(first.body.error).toBeUndefined();
+      expect(first.body.secret).toBeTruthy();
+      await cold.instance.dispose();
+
+      // WARM isolate: a NEW isolate boots over the SAME storage — exactly what
+      // a prod deploy does. ensureSchema re-runs against an existing database
+      // (idempotent DDL + migrations), then every feature still works.
+      const warm = await bootKb(dir);
+      // INSERT on the warm schema — a frozen migration would leave a column
+      // missing and 500 here (the session.kind class)
+      const second = await post(warm.kb, "/admin.mint", { label: "br2841-warm-second", tags: [] });
+      expect(second.status).toBeLessThan(500);
+      expect(second.body.error).toBeUndefined();
+      expect(second.body.secret).toBeTruthy();
+      // REPLACE on the warm database (the binding-count branch that shipped a
+      // production failure once): re-minting the COLD isolate's label must find
+      // and rotate the EXISTING row — same id. A different id would mean the
+      // warm isolate is looking at a fresh database, not the persisted one.
+      const re = await post(warm.kb, "/admin.mint", { label: "br2841-warm-isolate", tags: [] });
+      expect(re.status).toBeLessThan(500);
+      expect(re.body.error).toBeUndefined();
+      expect(re.body.secret).toBeTruthy();
+      expect(re.body.id).toBe(first.body.id);
+      // the migration that never ran in prod: session touch writes the kind
+      // column, exercised on the warm isolate's schema
+      const touch = await post(warm.kb, "/session.touch", { token_id: re.body.id ?? second.body.id, session: "warm-isolate-s" });
+      expect(touch.status).toBeLessThan(500);
+      expect(touch.body.session).toBeTruthy();
+      await warm.instance.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
