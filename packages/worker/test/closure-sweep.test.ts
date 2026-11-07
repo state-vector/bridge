@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 
 /**
  * Closure-tier duty scheduling (BR#3361) — real DO drill against the bundled
@@ -519,12 +520,14 @@ describe("duplicate-executor fence (real DO)", () => {
 
 describe("askInbox addressee routing (real DO)", () => {
   it("an agent's inbox carries only asks addressed to it: any | label | label@session | tag:<capability> — never human-directed asks", async () => {
+    const subject = (await kbJson("/create", { type: "task", title: "Human routing policy" })).body.id;
     // three asks: one to the human, one to any agent, one to a capability tag
     const toHuman = await kbJson("/ask.create", {
       to: "ray", question: "Human ruling drill?",
       reason: "drill — human-directed ask must never land in an agent inbox",
       details: "Inbox-routing drill: a ray-directed ask must surface on the human planes only, never in agent inboxes.",
       options: ["(Recommended) GO", "NO-GO"], artefact_id: null,
+      decision: decisionFixture(subject, ["(Recommended) GO", "NO-GO"]),
     });
     expect(toHuman.status, JSON.stringify(toHuman.body)).toBe(200);
     const toAny = await kbJson("/ask.create", {
@@ -596,7 +599,7 @@ describe("BR#4062 — ask/time prose parks type at the door and sweep first-clas
     const pid = String(r.body.id);
     await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-4062-ask", session: "drill-4062-ask" });
     const ask = await kbJson("/ask.create", {
-      to: "ray", question: "4062 drill ruling?", reason: "drill",
+      to: "legacy-peer", question: "4062 drill ruling?", reason: "drill",
       options: ["GO", "NO-GO"], artefact_id: null,
       details: "drill brief: fixture ask for the BR#4062 ask-leg sweep-waits-while-open behavior.",
     });

@@ -79,6 +79,13 @@ pub fn persist(root: &Path, receipt: &StoppedReceipt) -> Result<PathBuf, String>
     write(&path, receipt)?;
     Ok(path)
 }
+pub fn retained(root:&Path,receipt:&StoppedReceipt)->bool {
+    // Legacy filename hashes were compiler-dependent. Match the full saved
+    // receipt, never infer continuation authority from a filename.
+    fs::read_dir(root).ok().is_some_and(|entries|entries.filter_map(Result::ok).any(|entry|
+        fs::read(entry.path()).ok().and_then(|bytes|serde_json::from_slice::<StoppedReceipt>(&bytes).ok()).is_some_and(|saved|
+            saved.host==receipt.host && saved.url==receipt.url && saved.request()==receipt.request())))
+}
 pub fn deliver(path: &Path, receipt: &StoppedReceipt, now: u64, mut send: impl FnMut(&StoppedReceipt) -> Result<(), String>) -> Result<(), String> {
     match send(receipt) {
         Ok(()) => { fs::remove_file(path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())?; Ok(()) }

@@ -94,6 +94,18 @@ Rules, in force:
     - **Self-heal mechanical work:** Conflicts, rebases, stale gate re-runs,
       and landing a verified root-fix PR through a circular base-red gate
       are 100% machine work — never punt them to the human.
+ 9. **Architecture-first repair is the default, not something the human must
+    request.** Before adding a retry, recovery branch, watchdog or state store:
+    identify the existing authoritative owner and trace its whole production
+    path. Multiple competing owners or parallel recovery paths are a design
+    defect to consolidate, not a reason to add another exception. State the
+    surviving owner and the code being replaced; delete the superseded decision
+    paths in the same change. Keep only evidence-preserving migration adapters,
+    never two active authorities. Prove the complete workflow, including crash,
+    restart and lost acknowledgements, rather than stopping at green component
+    tests. Repeated incidents require a category-level repair before another
+    symptom patch. Ask the human only for genuinely missing authority or a user
+    preference, not whether to perform this engineering discipline.
 
 The signature failure mode of this repo is not bugs in code — it is two
 sessions each holding a stale model of the tree. Every rule above exists

@@ -328,10 +328,16 @@ impl<P: Send + 'static, R: Send + 'static, F: Send + 'static> Pipeline<P, R, F> 
         self.entries.insert(ticket, Entry { owner, charged: true, cancel: Arc::new(AtomicBool::new(false)), phase: Phase::Running(value) });
         Ok(())
     }
-    /// A controller can hand off only independently owned running transports.
-    /// Preparation, publication, held effects and queued results stay barriers.
-    pub fn handoff_ready(&self, adoptable: impl Fn(&R) -> bool) -> bool {
-        self.entries.values().all(|entry| matches!(&entry.phase, Phase::Running(value) if adoptable(value)))
+    /// Controller quiescence is distinct from job completion. Queued/held
+    /// delivery may hand off only through its verified durable continuation;
+    /// in-flight preparation/publication/effects remain barriers.
+    pub fn handoff_ready(&self, adoptable: impl Fn(&R) -> bool,
+        durable:impl Fn(&Ownership,&F,bool)->bool) -> bool {
+        self.entries.values().all(|entry| match &entry.phase {
+            Phase::Running(value)=>adoptable(value),
+            Phase::FinalizationQueued {value,..} | Phase::Held {value:Some(value),..}=>durable(&entry.owner,value,entry.cancel.load(Ordering::SeqCst)),
+            _=>false,
+        })
     }
     pub fn restore_finalization(&mut self, owner: Ownership, value: F) -> Result<(), F> {
         let ticket = owner.ticket().clone();

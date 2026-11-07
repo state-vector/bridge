@@ -137,7 +137,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repo)).map((d: any) => d.kind)).toEqual(["verify"]);
   });
 
-  it("a dead duty on an unbound actionable PR fails the run, alarms the drill sink, and dedupes the ask", async () => {
+  it("a dead duty on an unbound actionable PR fails the report and schedules one durable agent repair", async () => {
     const repo = "state-vector/reconcile-drill-c";
     // cycle 1: orphan → projection + verify duty
     const r1 = await report(repo, [prRow(2403)]);
@@ -169,17 +169,16 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect(r2.body.line).toContain("ALARM: 1 unaccounted");
     const found = await kbJson("/search", { q: "reconcile ALARM", limit: 50 });
     const asks = (found.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo));
-    expect(asks.length).toBe(1);
-    const ask = (await kbJson("/get", { id: asks[0].id })).body;
-    expect(ask.meta?.ask?.artefact_id).toBe(sinkId);
-    expect(ask.meta?.ask?.urgency).toBe("time-sensitive");
-    expect(String(ask.title)).toContain("#2403");
-    expect(String(ask.title).endsWith("?")).toBe(true);
-    // the identical re-report dedupes the ask (one per class), still failing
+    expect(asks.length).toBe(0);
+    const recovery = (await kbJson("/get", { id: r2.body.spawned[0].card })).body;
+    expect(recovery.meta.machine_duty).toEqual({ kind: "reconcile-accounting", subject: repo });
+    expect(recovery.body_md).toContain(`https://github.com/${repo}/pull/2403`);
+    // The identical re-report reuses the repair rather than duplicating it.
     const r3 = await report(repo, [prRow(2403)]);
     expect(r3.body.ok).toBe(false);
     const again = await kbJson("/search", { q: "reconcile ALARM", limit: 50 });
-    expect((again.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo)).length).toBe(1);
+    expect((again.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo)).length).toBe(0);
+    expect(r3.body.spawned).toHaveLength(0);
     // and the report history is the alarm's receipt
     const st = (await kbJson("/reconcile.status", { repo })).body;
     expect(st.reports.length).toBe(3);
