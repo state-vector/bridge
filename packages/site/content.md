@@ -529,6 +529,11 @@ The train status, message and recovery banner consume the hub's shared typed
 `line` projection. Routine builds, deployments and check waits stay compact in
 the overview row; expanded banners appear only for stopped or unknown/error
 states. Click the lane for full operational details in its card view.
+Recorded merge responses withdraw the repeated merge request while Bridge checks
+GitHub; observed merges move to deployment verification. PR block details explain
+historical returns to repair/review separately from active escalation budgets.
+Unconfirmed previous writers appear as explicit gateway-reconciliation blockers,
+so a priority repair is not misleadingly described as merely queued.
 The [delivery architecture review and structural repair plan](https://github.com/state-vector/bridge/blob/main/docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 documents remaining mechanism gaps and proposed acceptance tests; it is a plan,
 not a declaration that the gateway refactor is complete.
