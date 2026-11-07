@@ -632,6 +632,8 @@ terminal, even if the request was unbound. A recorded human per-card `SUPERSEDE`
 or explicit `retire BR#N` decision can be replayed on that exact unclaimed task,
 without another approval; KEEP/NO decisions and live delivery responsibility are
 preserved, and replaying the completed retirement is idempotent.
+Verified CLOSED/MERGED PR observations satisfy retirement's delivery-conservation
+check; malformed legacy PR references are audited and retained as history.
 
 **Bridge owns agent coordination (BR#6455).** Explicit request routes distinguish
 `human_decision`, `agent_coordination`, `executor_coordination` (with a task id, following

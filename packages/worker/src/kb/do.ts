@@ -5814,7 +5814,14 @@ export class KnowledgeHub {
    * bindings are conservatively obligations until proven merged/closed. */
   private conserveDelivery(row: any, successorId: string, transfer: boolean): void {
     const meta = JSON.parse(String(row.meta ?? "{}"));
-    const legs = trainLegs(meta).filter(l => !this.one(`SELECT merge_sha FROM provenance WHERE repo=? AND pr=?`, l.repo, l.number));
+    const legs = trainLegs(meta).filter(l => {
+      if (!validateAwaitEvent({ event: "pr_merged", repo: l.repo, n: l.number })) {
+        this.audit("system:delivery", "invalid_delivery_binding", String(row.id), { leg: l, reason: "Historical binding is outside the closed PR-event grammar; it cannot represent a delivery obligation" });
+        return false;
+      }
+      return !this.one(`SELECT merge_sha FROM provenance WHERE repo=? AND pr=?`, l.repo, l.number)
+        && !this.one(`SELECT receipt FROM delivery_pr_outcomes WHERE repo=? AND pr=? AND state IN ('CLOSED','MERGED')`, l.repo, l.number);
+    });
     if (!legs.length) return;
     const disposition = meta.delivery_disposition as DeliveryDisposition | undefined;
     if (disposition?.kind === "abandon" && disposition.closure.phase === "closed" && disposition.closure.receipts.length) return;

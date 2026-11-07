@@ -1314,6 +1314,9 @@ gate: an explicit `SUPERSEDE` answer, or a `retire BR#N` clause naming the ask's
 bound task, can retire its still-unclaimed `todo`/`blocked` card. KEEP/NO answers,
 unrelated targets, active writers and outstanding PR responsibility remain
 protected. Replaying the same completed retirement is an idempotent acknowledgement.
+Executor-observed CLOSED/MERGED PR receipts satisfy delivery conservation for a
+retirement; a closed PR is not an outstanding open obligation. Malformed legacy
+PR bindings are audited against the typed event grammar and retained as history.
 
 A satisfied typed prerequisite must have a continuation. If its unblock round
 finishes while the parent remains parked, the next proxy pass atomically consumes
