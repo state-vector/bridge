@@ -421,17 +421,27 @@ class Supervisor:
             raise RuntimeError("legacy recovery identity is unproved; original record and hold retained")
         op = Operation(nonce, old["from_commit"], old["to_commit"], old.get("channel", "main"), current,
                        old.get("attempt_started_at", old.get("at", 0)), old.get("at", 0) + DRAIN_SECONDS * 1000, budget, old.get("handoff_protocol", 0))
+        if phase=="draining" and installed==op.source:
+            # v1 committed no installation intent. Its own interrupted hold
+            # can be released without requiring the old code to settle jobs.
+            self.release_request(op)
+            self.save(Idle(budget,old.get("rejected_commit","")))
+            return
+        if phase=="recovery_preparing" and current and installed==op.source:
+            if int(time.time()*1000)<budget:return
+            config=self.config()
+            if not opted_in(config):return
+            target={"x86_64":"x86_64","aarch64":"aarch64"}[os.uname().machine]+"-unknown-linux-gnu"
+            with fetch(config["url"].rstrip("/")+"/api/runner-updates/manifest?channel="+op.channel,30) as response:
+                manifest=json.load(response)
+            artifact=validate_manifest(manifest,op.channel,target)
+            if manifest["commit"] in (op.source,old.get("rejected_commit")):return
+            self.save(Preparing(replace(op,target=manifest["commit"],intent=Intent.RESTORE_RECOVERY),artifact["url"],artifact["sha256"]))
+            return
         if current and current.commit == op.target:
             self.save(Verifying(op, int(time.time() * 1000), Verification.ALREADY_RUNNING))
         elif phase in ("draining", "recovery_preparing", "recovery_required", "installing", "checking", "rolling_back"):
-            if current and not self.idle(op, current):
-                raise RuntimeError("legacy recovery still needs its exact managed-process acknowledgement")
-            if phase == "draining":
-                # No install intent was committed. Release only this old hold;
-                # the same coordinator plans again without adding a new hour.
-                self.release_request(op)
-                self.save(Idle(budget, old.get("rejected_commit", "")))
-            elif current:
+            if current:
                 self.save(VerifyingRestored(op, int(time.time() * 1000)))
             else:
                 self.save(Restoring(op, InstallStep.SWAP))
@@ -471,7 +481,7 @@ class Supervisor:
                     op = state.resume.operation
                     current = self.process()
                     config = self.config()
-                    if now >= max(op.next_attempt_at, op.started_at + USEFUL_WORK_SECONDS * 1000) and opted_in(config) and current and current.commit == op.source and self.idle(op, current):
+                    if now >= max(op.next_attempt_at, op.started_at + USEFUL_WORK_SECONDS * 1000) and opted_in(config) and current and current.commit == op.source:
                         target = {"x86_64":"x86_64", "aarch64":"aarch64"}[os.uname().machine] + "-unknown-linux-gnu"
                         with fetch(config["url"].rstrip("/") + "/api/runner-updates/manifest?channel=" + op.channel, 30) as response:
                             manifest = json.load(response)
@@ -527,11 +537,14 @@ class Supervisor:
                 with self.backup.open("rb") as stream:
                     os.fsync(stream.fileno())
                 self.save(Installing(op, state.candidate_digest, InstallStep.STOP))
-            elif now >= op.deadline:
-                self.release_request(op)
-                self.save(Idle(max(op.next_attempt_at, now + USEFUL_WORK_SECONDS * 1000)))
             elif op.worker_protocol == 1 and self.info(self.candidate(op)).get("recovery_protocol") == 1:
                 self.save(Reconciling(replace(op, controller=current), state.candidate_digest, ReconcileStep.FREEZE))
+            elif now >= op.deadline:
+                if op.intent is Intent.RESTORE_RECOVERY:
+                    self.wait(Reason.HANDOFF,"Restored controller still needs a safe handoff; hold retained",state,30)
+                else:
+                    self.release_request(op)
+                    self.save(Idle(max(op.next_attempt_at, now + USEFUL_WORK_SECONDS * 1000)))
             else:
                 self.wait(Reason.HANDOFF, "Waiting for the original controller's handoff facts", state)
         elif isinstance(state, Reconciling):
@@ -553,7 +566,11 @@ class Supervisor:
                 facts = json.loads(self.run([str(self.candidate(op)), "recovery", "boundary", str(op.controller.pid), op.nonce, op.source]))
                 if facts.get("kind") != "controller_only":
                     self.service("thaw")
-                    self.wait(Reason.HANDOFF, "Controller still owns active work; preserving it", Handoff(op, state.candidate_digest))
+                    if now>=op.deadline and op.intent is Intent.UPDATE:
+                        self.release_request(op)
+                        self.save(Idle(max(op.next_attempt_at,now+USEFUL_WORK_SECONDS*1000)))
+                    else:
+                        self.wait(Reason.HANDOFF, "Controller still owns active work; preserving it", Handoff(op, state.candidate_digest),30)
                     return
                 if self.process() != op.controller:
                     raise RuntimeError("frozen controller identity changed")
