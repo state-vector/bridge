@@ -75,7 +75,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
   });
 
   it("replays a human's exact per-card retirement instead of asking again, including an unclaimed operator gate", async () => {
-    const target = await task("Obsolete operator purge", { operator_gated: "Ray go before execution" });
+    const target = await task("Obsolete operator purge", { operator_gated: "Ray go before execution", execution_requirements: { tier: "large", environment: ["retired-host"] } });
     const answer = `Close the overtaken issue — retire ${target}`;
     const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the obsolete purge whose target no longer exists?",
       reason: "The operator must choose whether this obsolete operation is retired.", details: `The purge target is gone; retire ${target}.`,
@@ -83,6 +83,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     const answered = await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
     expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    expect((await get(target)).meta.blocked.await_event.event).toBe("executor_capability");
     const applied = await call("transition", { id: target, to: "superseded", batch_auth: { ask: ask.body.id }, actor: "executor", session: "cleanup" });
     expect(applied.status, JSON.stringify(applied.body)).toBe(200);
     const retired = await get(target);

@@ -689,6 +689,9 @@ terminal, even if the request was unbound. A recorded human per-card `SUPERSEDE`
 or explicit `retire BR#N` decision can be replayed on that exact unclaimed task,
 without another approval; KEEP/NO decisions and live delivery responsibility are
 preserved, and replaying the completed retirement is idempotent.
+An exact recorded retirement may cancel an unstarted capability wait, while
+local pickup, interactive ownership, live writers and uncertain operations stay
+protected.
 Verified CLOSED/MERGED PR observations satisfy retirement's delivery-conservation
 check; malformed legacy PR references are audited and retained as history.
 An authenticated interactive owner's preserved-work handoff archives the old

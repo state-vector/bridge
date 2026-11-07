@@ -5809,12 +5809,19 @@ export class KnowledgeHub {
     // Preserve execution fences without releasing to the pool between the
     // authority check and the atomic source/successor update.
     const execution = this.executionState(id);
-    if (this.protectedExecution(id, JSON.parse(String(row.meta ?? "{}"))) || execution?.attempt && execution.attempt.phase !== "quiesced") throw new Error("gate: explicit execution wait or unquiesced writer owns this disposition exit");
+    const retirementMeta = JSON.parse(String(row.meta ?? "{}"));
+    const wait = validateAwaitEvent(retirementMeta.blocked?.await_event);
+    const authorisedUnstartedCancellation = !!authorization && !retirementMeta.interactive_execution
+      && wait?.event === "executor_capability" && wait.id === id
+      && (!execution || ["none", "returned"].includes(execution.handoff.phase))
+      && !execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
+    if (this.protectedExecution(id, retirementMeta) && !authorisedUnstartedCancellation
+      || execution?.attempt && execution.attempt.phase !== "quiesced") throw new Error("gate: explicit execution wait or unquiesced writer owns this disposition exit");
     // leg 2 — todo → superseded by direct write, exactly how the machine's
     // own supersede_children effect terminates duty children (do.ts): there
     // is no lifecycle edge by design (agents can never supersede), so the
     // server composes it under the verified human actor with full audit.
-    const meta = JSON.parse(row.meta ?? "{}");
+    const meta = retirementMeta;
     if (authorization) { meta.batch_auth = authorization; delete meta.disposition_request; }
     meta.superseded_reason = note;
     if (replacementId) meta.superseded_by = replacementId;
@@ -6324,6 +6331,12 @@ export class KnowledgeHub {
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const executionMeta = JSON.parse(row.meta ?? "{}");
+    // Validate the recorded human authority before applying execution-wait
+    // restrictions. Its exact per-card adapter still enforces writer, local
+    // handoff, unknown-effect and delivery conservation fences itself.
+    const savedDisposition = executionMeta.disposition_request;
+    if (to === "superseded" && savedDisposition && body.batch_auth == null && !body.human_verdict) body = { ...body, batch_auth: { ask: DispositionRequestSchema.parse(savedDisposition).ask } };
+    if (body?.batch_auth != null && to === "superseded" && row.type === "task") return await this.applyBatchAuthorization(body, actor, row);
     const startupAtStart = this.startupWait(id);
     const localMode = this.executionState(id)?.handoff;
     const directInteractiveClaim = row.type === "task" && to === "in_progress" && ["todo", "blocked"].includes(row.status)
@@ -6351,11 +6364,6 @@ export class KnowledgeHub {
     // (system:question(<answered_by>)), receipt-scoped to the card ids the
     // authorization body names, with the target's current state rechecked
     // first. Refusals are typed gate_rejected (BR#4390).
-    const savedDisposition = JSON.parse(String(row.meta ?? "{}")).disposition_request;
-    if (to === "superseded" && savedDisposition && body.batch_auth == null && !body.human_verdict) body = { ...body, batch_auth: { ask: DispositionRequestSchema.parse(savedDisposition).ask } };
-    if (body?.batch_auth != null && to === "superseded" && row.type === "task") {
-      return await this.applyBatchAuthorization(body, actor, row);
-    }
     // ---- the law: one table, one executor (machine.ts). Legality AND every
     // spawn/escalate/supersede decision come back as a typed Verdict
     // (Applied | Rejection); this function persists and executes the effects,
