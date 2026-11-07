@@ -1939,6 +1939,19 @@ unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
 
+**A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
+queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
+with elapsed time, main-check health, live executor presence and the number of
+candidates that passed initial queue gates. Bridge owns priority diagnosis and
+repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
+A single candidate's failed check must not be presented as the reason independent
+candidates cannot merge. Candidates waiting for current-base CI or integration
+repair are deferred while the executor continues the remaining independent batch;
+their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
+missing` is a failed execution configuration, never a successful diagnostic or
+review. The runner preserves its work, releases the failed claim for repair and
+stops repeating the unchanged launch on that host.
+
 Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
 original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
 share one dispatch core — spawns the train tick beside its dispatch loop and contends

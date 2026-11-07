@@ -14779,7 +14779,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     if (!cfg) return line;
     if (["no_progress", "merge_failed"].includes(line.blocker)) {
       const entries: unknown[] = meta.lane?.queue_facts?.entries ?? [];
-      for (const raw of entries) {
+      // A failed candidate is not the cause of a stopped lane when independent
+      // candidates passed their gates. Keep recovery bound to merge execution,
+      // rather than hiding it behind the first unrelated candidate's duty.
+      const hasReady = entries.some(raw => raw && typeof raw === "object" && "cls" in raw && raw.cls === "ready");
+      for (const raw of hasReady ? [] : entries) {
         if (!raw || typeof raw !== "object" || !("repair_task" in raw) || typeof raw.repair_task !== "string") continue;
         const candidateRepair = this.enrichFixCardRow(raw.repair_task, now);
         if (!candidateRepair) continue;
