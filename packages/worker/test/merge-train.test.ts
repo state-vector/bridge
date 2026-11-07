@@ -2275,6 +2275,20 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
         required,
       ),
     ).toBe(false);
+    expect(
+      isDeployWorkflowRun(
+        // renamed display on the genuine path: the path identifies the workflow file
+        { id: 42361588979, name: "dev-build canary", path: ".github/workflows/dev-build.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        // lookalike on its own path stays unrecognized (not "/dev-build.yml")
+        { id: 42361588980, name: "dev-build canary", path: ".github/workflows/dev-build-canary.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(false);
 
     // 2. Inside grace window (age 120s < 300s): uncovered_grace, no dispatch yet
     const planGrace = reconcileDeployCoverage({

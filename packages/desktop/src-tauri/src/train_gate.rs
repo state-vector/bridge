@@ -3733,8 +3733,17 @@ mod tests {
             ..dev_build_run.clone()
         };
         assert!(is_deploy_workflow_run(&dev_build_name_only, &required));
+        // renamed display on the genuine path: the path identifies the workflow file
+        let dev_build_renamed = DeployWorkflowRun {
+            name: "dev-build canary".into(),
+            ..dev_build_run.clone()
+        };
+        assert!(is_deploy_workflow_run(&dev_build_renamed, &required));
+        // a differently-named lookalike on its own path stays unrecognized
+        // (dev-build-canary.yml does not end with "/dev-build.yml")
         let dev_build_lookalike = DeployWorkflowRun {
             name: "dev-build canary".into(),
+            path: Some(".github/workflows/dev-build-canary.yml".into()),
             ..dev_build_run.clone()
         };
         assert!(!is_deploy_workflow_run(&dev_build_lookalike, &required));
