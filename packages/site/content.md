@@ -13,8 +13,9 @@ unknown-effect fencing and result acknowledgments remain enforced.
 Use `bridge workers status [BR#task]` to inspect local workers and
 `bridge workers stop [BR#task]` to request a scoped stop. Controller service
 restarts preserve workers. Update holds describe handoff/health verification,
-not an invented active drain. Refresh the separately installed updater script
-as documented in the README to enable the negotiated handoff.
+not an invented active drain. The independently supervised recovery owner resumes
+one saved operation across restarts and upgrades its own shipped source after a
+confirmed native update.
 Explicit stops remain fenced through handoff; an older health check cannot clear
 a newer update request.
 Interrupted manifest publication remains in launch-intent recovery without
@@ -23,18 +24,16 @@ Held, never-launched reservations observe fresh authoritative claim facts on a
 bounded cadence and clear when that claim ends, without replaying rejected writes.
 Unknown writers and external effects remain protected, and rollback journal
 compatibility is preserved.
-An offline `bridge workers reconcile-reservations` recovery command supports
-older stuck controllers: controller-lock fenced, read-only by default, with
-explicit `--apply`, fresh claim rechecks and retained original-record archives.
-Only the controller is stopped; supervised workers continue independently.
-Confirmed stopped jobs use saved hub confirmations for the exact original server,
-session and attempt. The runner retains the original result and worktree location
-before archiving old ownership; uncertain outside actions stay protected and real
-captured results still need their normal delivery. An older stuck controller can
-use `bridge workers reconcile-stopped [BR#task]`: read-only by default, with an
-explicit `--apply`, the same controller lock, and fresh proof and record checks.
-A live worker lock prevents cleanup. Neither command marks tasks complete,
-removes worktrees, installs updates or changes update deadlines or health checks.
+The recovery supervisor owns checking, handoff, reconciliation, installation and
+health verification through one journal. A planned controller reconnect does not
+become another failed-update cooldown. The runner reports facts and executes one
+shared reconciliation operation; the hub remains authoritative about job ownership
+and completion. `bridge recovery inspect` is read-only. Its guarded `reconcile
+--apply` adapter requires the controller lock and preserves original records and
+worktrees. Busy controller boundaries are thawed, independent workers continue,
+and uncertain writers or outside actions remain protected. An unproved record
+creates one explicit wait instead of another restart loop. The separate old cleanup
+commands and independent recovery ladders have been removed.
 
 ### Operational diagnostics
 

@@ -29,12 +29,13 @@ mod attempt_journal;
 mod gateway_pipeline;
 #[path = "worker_session.rs"]
 mod worker_session;
+#[path = "recovery.rs"]
+mod recovery;
 
 pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
 pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
 pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
-pub fn reconcile_reservations(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_reservations(cfg, apply, task) }
-pub fn reconcile_stopped(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_stopped(cfg, apply, task) }
+pub fn recovery_command(cfg: &DispatchConfig, args: &[String]) -> Result<serde_json::Value, String> { recovery::command(cfg, args) }
 
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
@@ -173,12 +174,39 @@ pub enum UpdateChannel { Main, Stable, Pinned }
 
 /// Local request is written only by the separately supervised updater. It is
 /// deliberately fail-closed across crashes: only its owner removes the hold.
-fn update_request() -> Option<serde_json::Value> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateHandoff { FullDrain, AdoptWorkerV1 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateRequest { Handoff { nonce:String, mode:UpdateHandoff }, Held { reason:String } }
+impl UpdateRequest {
+    fn parse(bytes:&[u8])->Self {
+        #[derive(Deserialize)] struct Wire { nonce:String, #[serde(default)] worker_protocol:Option<u32> }
+        match serde_json::from_slice::<Wire>(bytes) {
+            Ok(Wire { nonce, worker_protocol }) if !nonce.is_empty() => Self::Handoff {nonce, mode:if worker_protocol==Some(worker_session::PROTOCOL) {UpdateHandoff::AdoptWorkerV1} else {UpdateHandoff::FullDrain}},
+            _=>Self::Held {reason:"Recovery request is unreadable; preserve admission hold".into()},
+        }
+    }
+}
+#[cfg(test)]
+mod recovery_request_tests {
+    use super::*;
+    #[test]
+    fn malformed_request_retains_hold_instead_of_reopening_admission() {
+        for bytes in [b"{".as_slice(),b"{}",b"{\"nonce\":\"\"}",b"{\"nonce\":\"n\",\"worker_protocol\":\"bad\"}"] {
+            assert!(matches!(UpdateRequest::parse(bytes),UpdateRequest::Held {..}));
+        }
+        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\",\"worker_protocol\":1}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::AdoptWorkerV1});
+        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\"}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::FullDrain});
+    }
+}
+fn update_request() -> Option<UpdateRequest> {
     if std::env::var("BRIDGE_MANAGED_UPDATES").as_deref() != Ok("1") { return None; }
     let home = std::env::var("HOME").ok()?;
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(home).join(".bridge/update/request.json")).ok()?).ok()?;
-    value["nonce"].as_str().filter(|s| !s.is_empty())?;
-    Some(value)
+    match std::fs::read(PathBuf::from(home).join(".bridge/update/request.json")) {
+        Ok(bytes)=>Some(UpdateRequest::parse(&bytes)),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,
+        Err(e)=>Some(UpdateRequest::Held {reason:format!("Recovery request is not visible; preserve admission hold: {e}")}),
+    }
 }
 
 fn update_receipt(name: &str, value: &serde_json::Value) {
