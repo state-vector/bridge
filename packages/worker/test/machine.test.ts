@@ -2013,6 +2013,45 @@ describe("breachClass: execution_fence (BR#7008/BR#7028)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#7684 — the review round's revision fence refuses a verdict whose echoed
+// review_subject revision is missing or does not match the subject's live
+// work_revision ("gate: stale or missing review subject_revision — echo this
+// duty's captured review_subject revision and re-verify changed work in a
+// fresh review round", do.ts review-result guard). The fence refusing IS the
+// system working (BR#4562/BR#6654/BR#7008 pricing law): verdicts stay fenced
+// to the exact reviewed submission and the refusal's own instruction names
+// the cure — lifecycle auto-spawns the fresh round with the correct binding.
+// The specimen complied: 3 fence events on BR#7509 (2026-11-07 08:35–08:49Z,
+// a duty captured at the attempt-1 'legacy' sentinel while the parent
+// re-submitted attempt-2) folded "unclassified" and raised BR#7684; the
+// round closed in the auto-spawned successor duty and the parent landed
+// done. The class is named so the Log says WHAT fenced, and priced
+// never-a-breach so compliance can never arm a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: review_fence (BR#7684)", () => {
+  // the exact audited reason shape (do.ts review-result guard, no [rule:] tag)
+  const FENCE = "gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round";
+
+  it("the fence refusal classifies review_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("review_fence");
+    // the stem sits ~7 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("review_fence");
+  });
+
+  it("a fence-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#7509", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["review_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
