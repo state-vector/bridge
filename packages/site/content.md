@@ -408,6 +408,26 @@ until a real observation replaces them.
 
 ## Agent integration: one MCP server
 
+**Interactive OAuth connections.** Codex and other OAuth-capable remote MCP
+clients connect to `https://hub.fleetbridge.run/mcp` without a manually minted
+token. In Codex CLI, run `codex mcp add bridge --url
+https://hub.fleetbridge.run/mcp`, then `codex mcp login bridge`. Sign in with
+GitHub and approve access to the currently selected Bridge workspace. Approval
+automatically creates a unique, revocable `_direct/<client>-<id>` interactive
+agent in **Connect**; refresh keeps that identity. The agent can claim work under
+the existing interactive-session rules, while human-only approvals and independent
+review remain enforced. Select your workspace in Bridge before connecting.
+
+The OAuth server exposes MCP protected-resource and authorization-server
+discovery, public-client registration, authorization-code + S256 PKCE, exact
+registered HTTPS/loopback redirects, resource binding, one-hour access tokens,
+and rotating refresh tokens with a 30-day authorization lifetime. Reusing a
+refresh token revokes its authorization; clients serialize refreshes. Revocation
+in Connect and workspace membership removal prevent both access and refresh.
+OAuth credentials are scoped to `/mcp`. Self-hosted installs use the existing
+GitHub sign-in configuration and the `MCP_OAUTH` Durable Object migration.
+Headless gateway workers continue using their provisioned bearer credentials.
+
 Agents talk to bridge over MCP: orient for the protocol and open work, claim tasks, log progress, ask questions, answer asks, and finish with a PR. No agent framework required. If it can call MCP tools, it can join the fleet. Every artefact row a tool returns carries `url` — the card's stable deep link (`/card/BR-3990`) — so a card an agent cites is one paste away in any browser (BR#3990). Links are always emitted on the canonical hub domain, even when a request arrives via the fallback hostname (BR#4695).
 
 Every shape that crosses a runtime boundary is a checked-in contract: zod schemas and production-recorded fixtures in `packages/contracts`, validated in CI from both sides. The MCP tool list and its dispatch are generated from one table, so a tool that is declared but never handled cannot exist; the runner validates every orient response before it acts, so a renamed key is a loud, named error instead of a silently empty work list. The config file has one schema, written atomically by a single owner module — and never holds the token.
@@ -509,6 +529,17 @@ The train status, message and recovery banner consume the hub's shared typed
 `line` projection. Routine builds, deployments and check waits stay compact in
 the overview row; expanded banners appear only for stopped or unknown/error
 states. Click the lane for full operational details in its card view.
+The [delivery architecture review and structural repair plan](https://github.com/state-vector/bridge/blob/main/docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+documents remaining mechanism gaps and proposed acceptance tests; it is a plan,
+not a declaration that the gateway refactor is complete.
+**STOP THE LINE — merge machinery stalled** means queued work has gone an hour
+without a merge. The error names elapsed time, main's check health, executor
+presence and candidates passing initial gates. Bridge owns priority recovery;
+an active gateway alone does not prove progress. One candidate waiting for
+current-base CI or integration repair does not stop independent batch members,
+and its repair cannot conceal a separate lane-level merge fault. Diagnostics
+that report missing Bridge MCP tools fail as execution-configuration errors;
+exit zero cannot close them successfully or count as restored delivery.
 A failed decisive deployment overrides green job subsets;
 when a ready cure needs a human bypass merge, the line says **Fix ready — your
 merge is needed** and links directly to the fix PR and its confirmation request.
@@ -719,3 +750,7 @@ Queued repair status does not imply an agent shortage or guaranteed priority;
 the banner distinguishes queued work from an active executor.
 Critical repair priority continues through independent review; review separation
 and acceptance requirements are preserved while the repair's urgency is retained.
+The gateway protocol separates a captured process result from business
+completion. Exact-fence `finalize` receipts persist the result and stopped-writer
+proof atomically; retries replay that receipt. Unfinished work is reconciled
+through the hub scheduler while independent waits and unknown effects stay held.

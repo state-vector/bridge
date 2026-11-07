@@ -995,6 +995,42 @@ Notes:
 
 ## 4 · Connect agents (MCP)
 
+### Interactive clients: OAuth (Codex and other remote MCP clients)
+
+Point an OAuth-capable client at **`https://hub.fleetbridge.run/mcp`**.
+For Codex CLI:
+
+```sh
+codex mcp add bridge --url https://hub.fleetbridge.run/mcp
+codex mcp login bridge
+```
+
+The client discovers Bridge's OAuth endpoints, opens browser sign-in, and asks
+you to authorize interactive-agent access to your **currently selected workspace**.
+Select the workspace in Bridge before connecting. Approving automatically
+allocates a unique `_direct/<client>-<id>` agent, visible and revocable under
+**Connect**; no manual token minting or bearer header is needed. Each authorization
+gets its own identity, while token refresh keeps that identity. The agent can
+claim work using its named `orient` session under the existing interactive rules;
+human-only decisions and independent-review separation still apply.
+
+Bridge supports public-client registration, authorization code with mandatory
+S256 PKCE, exact registered redirect URIs (HTTPS or loopback HTTP), MCP resource
+binding, one-hour access tokens, and rotating refresh tokens. Authorization lasts
+up to 30 days; reconnect after expiry or revocation. Refresh-token reuse revokes
+the entire authorization, so clients must serialize refreshes. Revoking the agent
+in Connect or removing workspace membership immediately prevents access and
+refresh. OAuth credentials are valid only at `/mcp`, not the human/gateway REST
+planes. A cancelled consent allocates no agent.
+
+Self-hosting uses the existing GitHub login secrets and workspace membership;
+the worker deploy creates the `MCP_OAUTH` SQLite Durable Object via migration
+`v4-mcp-oauth`. Discovery is served at `/.well-known/oauth-protected-resource/mcp`
+and `/.well-known/oauth-authorization-server`. Use the same hub origin throughout
+login and token exchange; authorizations are bound to that origin's `/mcp` URL.
+
+### Headless clients: provisioned bearer credentials
+
 Agents join the fleet by pointing their MCP config at the hub. The config
 format is per-client — the Connect tab's **setup** modal emits the right
 snippet with your token slotted in.
@@ -1938,6 +1974,24 @@ GitHub cannot lie about GitHub. The pure decision tables survive, pinned
 unit-pinned in `packages/worker/test/merge-train.test.ts`.
 
 ### The executor
+
+The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
+records remaining lifecycle, completion, priority and recovery gaps at commit
+`4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
+
+**A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
+queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
+with elapsed time, main-check health, live executor presence and the number of
+candidates that passed initial queue gates. Bridge owns priority diagnosis and
+repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
+A single candidate's failed check must not be presented as the reason independent
+candidates cannot merge. Candidates waiting for current-base CI or integration
+repair are deferred while the executor continues the remaining independent batch;
+their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
+missing` is a failed execution configuration, never a successful diagnostic or
+review. The runner preserves its work and releases the failed claim for execution
+repair. Repeated missing-tool failures name that exact cause in the gateway's
+bounded cooldown; they cannot generate successful diagnostic or review receipts.
 
 Since BR#4104 the executor ships **inside the gateway** (Ray-directed completion of the
 original BR#3516 spec): the daemon — the desktop app and the headless `bridge` runner
@@ -3263,3 +3317,12 @@ alone is not evidence of top scheduling priority or unavailable agent capacity.
 Independent reviews of concrete/line recovery inherit the repair's scheduling
 class and urgency. They remain separate review sessions with the same acceptance
 gates, but cannot fall behind unrelated repair backlog as ordinary verification.
+### Fenced terminal-result capture
+
+The execution protocol supports `finalize` with the exact generation/attempt,
+`writers: "process_group_empty"`, and a typed process outcome (`completed`,
+`interrupted`, or `failed`). The hub atomically records the captured result,
+quiescence and its replay receipt. A successful process exit never closes a
+task or fabricates review acceptance. Unfinished claims return through the
+same scheduler with their prior result attached; independent waits, unknown
+operations, host affinity and the persistent retry budget remain enforced.

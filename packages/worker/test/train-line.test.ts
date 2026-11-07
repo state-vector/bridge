@@ -8,6 +8,21 @@ const task = { id: "BR#1", title: "Repair deployment", status: "in_progress", ur
 const facts = (extra: Record<string, unknown>) => TrainLineFactsSchema.parse({ queue: [], ...extra });
 
 describe("one line status and recovery contract", () => {
+  it("names stalled merge machinery, actual elapsed time and a live gateway instead of implying capacity shortage", () => {
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#1" }, { id: "BR#2" }], starved: { since: now - 87 * 60_000 },
+      lease: { holder: "gateway", heartbeat_ts: now }, queue_facts: { at: now, base_state: { verdict: "green" },
+        entries: [{ id: "BR#1", cls: "blocked" }, { id: "BR#2", cls: "ready" }] },
+      diagnostic: { ...task, active_agent: false, status: "done" },
+    }), now);
+    expect(line).toMatchObject({ phase: "stopped", blocker: "no_progress", label: "STOP THE LINE — merge machinery stalled" });
+    expect(line.reason).toContain("87 minutes");
+    expect(line.reason).toContain("required checks are green");
+    expect(line.reason).toContain("gateway is active");
+    expect(line.reason).toContain("1 candidate(s) passed the initial queue gates");
+    expect(line.remediation).toMatchObject({ kind: "attention", text: expect.stringContaining("ended without restoring merges") });
+    const absent = projectTrainLine(facts({ queue: [{ id: "BR#1" }], starved: { since: 1 } }), now);
+    expect(absent.reason).toContain("No live merge executor is confirmed");
+  });
   it("shows the actual priority capacity handoff rather than passively waiting for an executor", () => {
     const repair = { ...task, status: "todo", active_agent: false, execution_blockers: [{ kind: "capacity_wait" as const, episode_id: "capacity", text: "Full" }],
       preemption: { phase: "stopping_verification" as const, recovery_id: task.id, victim_id: "BR#2", generation: 1, attempt_id: "one", session: "verify", requested_at: now, checkpoint_commit: "a".repeat(40) } };
