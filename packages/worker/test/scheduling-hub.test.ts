@@ -370,18 +370,21 @@ describe("priority line recovery capacity", () => {
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: repair });
     expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0]).toMatchObject({ active: 0, reserved: 1 });
   });
-  it("does not interrupt uncheckpointed verification, recovery verification or pending external operations", async () => {
-    const project = "repair-protection", g = await gateway(project);
-    const victim = await task(project); await post("update", { id: victim, roles: ["review"] });
+  it.each(["uncheckpointed", "recovery-review", "pending-effect"])("does not interrupt protected verification: %s", async protection => {
+    const project = `repair-protection-${protection}`, g = await gateway(project);
+    let reviewMeta = {};
+    if (protection === "recovery-review") {
+      const subject = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+      expect((await post("transition", { id: subject, to: "blocked", note: "Repair waits on an independent prerequisite",
+        await_event: { event: "time", until_ts: Date.now() + 3_600_000 } })).error).toBeUndefined();
+      reviewMeta = { execution_review_of: subject };
+    }
+    const victim = await task(project, reviewMeta); await post("update", { id: victim, roles: ["review"] });
     const r = await reserve(g); if (r.kind !== "reserved") throw new Error("no verification reservation");
     await g.cmd({ kind: "begin", attempt_id: "protected", worker: g.auth.agent, action_budget_ms: 60_000 }, "protected-begin", victim, r.session);
-    const repair = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
-    expect((await reserve(g)).preemption).toBeUndefined();
-    await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "protected", checkpoint: publishedCheckpoint }, "protected-checkpoint", victim, r.session);
-    await post("update", { id: victim, meta: { execution_review_of: repair } });
-    expect((await reserve(g)).preemption).toBeUndefined();
-    await post("update", { id: victim, meta_delete: ["execution_review_of"] });
-    await g.cmd({ kind: "prepare", generation: 1, attempt_id: "protected", operation_id: "external", action: "publish", input_revision: "head", budget_ms: 60_000 }, "protected-effect", victim, r.session);
+    if (protection !== "uncheckpointed") await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "protected", checkpoint: publishedCheckpoint }, "protected-checkpoint", victim, r.session);
+    if (protection === "pending-effect") await g.cmd({ kind: "prepare", generation: 1, attempt_id: "protected", operation_id: "external", action: "publish", input_revision: "head", budget_ms: 60_000 }, "protected-effect", victim, r.session);
+    await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
     expect((await reserve(g)).preemption).toBeUndefined();
     expect((await g.cmd({ kind: "inspect" }, "still-protected", victim, r.session)).messages).toHaveLength(0);
   });

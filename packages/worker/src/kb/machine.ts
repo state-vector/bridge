@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
-import { mergeCompletesTask, ExecutionResultSchema } from "@bridge/contracts";
+import { mergeCompletesTask, ExecutionResultSchema, dutyOutcome } from "@bridge/contracts";
 import { ownsInteractiveClaim } from "./execution-work";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
@@ -372,22 +372,6 @@ export const UNBLOCK_SPAWN_CAP = 3;
 
 export const RULES: Rule[] = [
   {
-    name: "verdict-no-in_review",
-    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
-  },
-  {
-    name: "verdict-no-blocked",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "blocked" &&
-      VERDICT_ROLES.includes(role(i)) &&
-      !i.body?.awaiting_ask_id, // an ask-gate pauses the duty; it auto-resumes on the answer
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
-  },
-  {
     // BR#6135 interactive claim takeover — the stand-down half. A takeover
     // atomically flips meta.session to the taker; the EX-holder (the
     // dispatched runner session named in meta.taken_over.from_session) must
@@ -418,6 +402,16 @@ export const RULES: Rule[] = [
     name: "gateway-cannot-author-completion",
     when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
     guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
+  },
+  {
+    name: "verdict-no-in_review",
+    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
+  },
+  {
+    name: "verdict-no-blocked",
+    when: (i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id,
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
   },
   {
     name: "release-needs-ownership",
@@ -536,18 +530,6 @@ export const RULES: Rule[] = [
     },
   },
   {
-    name: "done-unreviewed",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "done" &&
-      !["analysis", "review", "unblock"].includes(role(i)),
-    guard: async (i, c) => {
-      const r = await c.qualify("review");
-      if (r.ok) return null;
-      return `task ${i.id} cannot be completed unreviewed — complete a verify (review-role) child task or link an accepted decision (e.g. a Superpositional verdict) first`;
-    },
-  },
-  {
     name: "question-not-claimable",
     when: (i) => i.type === "question" && i.to === "in_progress",
     guard: (i) =>
@@ -566,6 +548,18 @@ export const RULES: Rule[] = [
       noteOf(i)
         ? null
         : `moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`,
+  },
+  {
+    name: "execution-submission-needs-outcome",
+    when: (i) => isTask(i) && i.to === "in_review" && (role(i) === "analysis" || !mergeCompletesTask(i.meta ?? {})),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result).success ? null
+      : `execution submission for ${i.id} requires execution_result {outcome,receipts} from this submission. A commit link, old result or process exit cannot establish the actual outcome.`,
+  },
+  {
+    name: "execution-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && !i.meta?.lane && !mergeCompletesTask(i.meta ?? {}) && !VERDICT_ROLES.includes(role(i)),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success ? null
+      : `execution completion for ${i.id} requires execution_result {outcome,receipts}; prerequisite delivery is not task completion.`,
   },
   {
     name: "review-needs-pr",
@@ -638,9 +632,15 @@ export const RULES: Rule[] = [
     name: "verdict-done-needs-receipts",
     when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
     guard: (i) =>
-      hasReceipts(noteOf(i))
+      dutyOutcome(role(i), i.body ?? {})
         ? null
-        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — the note must cite receipts: ${RECEIPTS_DOC}.`,
+        : `${role(i)} ${i.id} cannot complete without a typed outcome: ${role(i) === "review" ? "supply review_result (accepted_pr, accepted_direct_main, accepted_execution, findings, or stronger_implementation_required)" : "supply execution_result {outcome,receipts} or unblock_result {kind:reblocked,parent_id,reason,next,await_event}"}. Notes, exit zero and transcripts are not outcome receipts.`,
+  },
+  {
+    name: "analysis-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && role(i) === "analysis",
+    guard: (i) => dutyOutcome("analysis", i.body ?? {}) ? null
+      : `analysis ${i.id} requires execution_result {outcome,receipts} describing its actual findings. A process exit or a completed diagnostic does not prove the incident recovered.`,
   },
   {
     name: "review-separation-of-duties",
@@ -710,6 +710,12 @@ export const RULES: Rule[] = [
       const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
       return `terminal close leg(s) not receipted: ${labeled} — a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
     },
+  },
+  {
+    name: "done-unreviewed",
+    when: (i) => isTask(i) && i.to === "done" && !["analysis", "review", "unblock"].includes(role(i)),
+    guard: async (i, c) => (await c.qualify("review")).ok ? null
+      : `task ${i.id} cannot be completed unreviewed — require an independent typed acceptance of its actual delivered code or execution outcome; a findings close, decision note or absent claim bars is not acceptance`,
   },
 ];
 

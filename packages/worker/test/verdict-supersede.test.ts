@@ -128,7 +128,7 @@ async function proposedStraggler(target: string, verdict: string, pr: string): P
 }
 
 describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", () => {
-  it("an ACCEPT verdict machine-applies at create: impl card queues on the train, no round, canonical title", async () => {
+  it("records an ACCEPT decision without manufacturing a typed review or queue admission", async () => {
     const { body: t } = await kbJson("/create", { type: "task", title: "F1 accept target", qualified: true });
     const target = t.id;
     await kbJson("/transition", { id: target, to: "in_progress", note: "claim" });
@@ -143,7 +143,8 @@ describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", 
 
     // the verdict itself: ACCEPTED on filing, machine-applied, NO round
     expect(v.status).toBe("accepted");
-    expect(v.machine_applied).toBe(true);
+    expect(v.machine_applied).toBeUndefined();
+    expect(v.outcome_required).toBe(true);
     expect(v.feedback_round, "a machine verdict is not a proposal — it spawns no consensus round").toBeUndefined();
     expect(await decision(v.id).then((d) => d.status)).toBe("accepted");
     expect(await feedbackRoundsFor(v.id)).toEqual([]);
@@ -153,7 +154,7 @@ describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", 
     expect((await decision(v.id)).title).toBe(`Verify verdict — ACCEPT — PR state-vector/bridge#9102 → ${target}`);
     const body = (await decision(v.id)).body_md ?? "";
     expect(body).toContain("> **Verifier's title:** BR#5377 verify verdict");
-    expect(body).toContain("machine-applied");
+    expect(body).toContain("recorded decision");
 
     // the verdict IS the acceptance evidence: the supports link was auto-laid
     const { body: rel } = await kbJson("/relations", { id: v.id });
@@ -164,10 +165,9 @@ describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", 
     // delivery), stamped with the PR + the covered head parsed from the
     // verdict body — no human click happened anywhere in this test
     const { body: tNow } = await kbJson("/get", { id: target });
-    expect(tNow.status).toBe("blocked");
-    expect(tNow.meta?.merge_train?.state).toBe("queued");
-    expect(tNow.meta?.pr?.number).toBe(9102);
-    expect(tNow.meta?.pr?.head_sha_at_acceptance).toBe(HEAD);
+    expect(tNow.status).toBe("in_progress");
+    expect(tNow.meta?.merge_train).toBeUndefined();
+    expect(tNow.meta?.pr).toBeUndefined();
   });
 
   it("a BOUNCE verdict machine-applies: the target re-enters work with the findings", async () => {
@@ -191,7 +191,7 @@ describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", 
     expect((await decision(v.id)).title).toBe(`Verify verdict — BOUNCE — PR #9201 → ${target}`);
   });
 
-  it("a verify-duty target closes done on the machine apply — the receipts token passes verdict-done-needs-receipts", async () => {
+  it("a legacy decision cannot close a review duty using a synthesised receipts token", async () => {
     // analysis/impl close gates differ for review-role cards: the closing note
     // must carry a receipts token ("verify passed") or the done is refused
     const { body: duty } = await kbJson("/create", { type: "task", title: "F1 verify duty", roles: ["review"], qualified: true });
@@ -205,14 +205,12 @@ describe("BR#5377 F1 — machine verdicts apply on filing (no human GO/NO-GO)", 
       body_md: `verified head ${HEAD} — https://github.com/state-vector/bridge/pull/9301`,
     });
     expect(v.status).toBe("accepted");
-    expect(v.machine_applied).toBe(true);
+    expect(v.machine_applied).toBeUndefined();
+    expect(v.outcome_required).toBe(true);
 
     const dNow = await decision(target);
-    expect(dNow.status, "the machine apply closed the verify duty done (done-unreviewed passes via the auto-laid supports link)").toBe("done");
-    const note = await noteOf(target);
-    expect(note).toContain("machine-applied (system:verifier)");
-    expect(note).toContain("verify passed");
-    expect(note).toContain(`receipts on verdict card ${v.id}`);
+    expect(dNow.status).toBe("in_progress");
+    expect(await noteOf(v.id)).toContain("No task was closed or queued");
   });
 });
 
@@ -281,9 +279,9 @@ describe("BR#5377 F4 — the adoption sweep machine-applies legacy verdicts", ()
     // THE EFFECT: the impl card queued on the train, stamped from the
     // verdict's receipts — no human click anywhere in this test
     const { body: tNow } = await kbJson("/get", { id: target });
-    expect(tNow.status).toBe("blocked");
-    expect(tNow.meta?.merge_train?.state).toBe("queued");
-    expect(tNow.meta?.pr?.number).toBe(9501);
+    expect(tNow.status).toBe("in_progress");
+    expect(tNow.meta?.merge_train).toBeUndefined();
+    expect(tNow.meta?.pr).toBeUndefined();
     // the plain decision's orphan Feedback: round collapsed with the adoption
     expect(await decision(round!).then((r) => r.status)).toBe("superseded");
     expect(await proposedVerdictsFor(target)).toEqual([]);
@@ -330,7 +328,7 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
     expect(sup).toBeTruthy();
     expect(await proposedVerdictsFor(target)).toEqual([]);
     const { body: tNow } = await kbJson("/get", { id: target });
-    expect(tNow.meta?.merge_train?.state).toBe("queued");
+    expect(tNow.meta?.merge_train).toBeUndefined();
   });
 
   it("a human SUPERSEDE of a machine-applied verdict routes to superseded; sibling accepted verdicts stay", async () => {
@@ -383,9 +381,11 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
       body_md: `verified head ${"d".repeat(40)} — https://github.com/state-vector/bridge/pull/9901`,
     });
     expect(v1.status).toBe("accepted");
-    expect(v1.machine_applied).toBe(true);
+    expect(v1.machine_applied).toBeUndefined();
+    expect(v1.outcome_required).toBe(true);
     const queued = await decision(target);
-    expect(queued.meta?.merge_train?.state).toBe("queued");
+    expect(queued.status).toBe("in_progress");
+    expect(queued.meta?.merge_train).toBeUndefined();
 
     const dup = await kbJson("/create", {
       type: "decision",
@@ -395,11 +395,13 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
     });
     expect(dup.body.deduped, "the proposed-only dedup does not fire against an ACCEPTED prev (F1 world)").toBeUndefined();
     expect(dup.body.status).toBe("accepted");
-    expect(dup.body.machine_applied).toBe(true);
+    expect(dup.body.machine_applied).toBeUndefined();
+    expect(dup.body.outcome_required).toBe(true);
     expect(await proposedVerdictsFor(target)).toEqual([]);
     // the repeat's apply was a ratifying no-op: the train state did not churn
     const again = await decision(target);
-    expect(again.meta?.merge_train?.state).toBe("queued");
+    expect(again.status).toBe("in_progress");
+    expect(again.meta?.merge_train).toBeUndefined();
   });
 
   it("BR#1782 dedup, legacy lane: an identical repeat against a PROPOSED straggler is still deduped (no card, auto-applied)", async () => {
@@ -420,9 +422,8 @@ describe("BR#3457 — verdict stacks never regrow (one actionable verdict per ta
     });
     expect(dup.body.deduped, JSON.stringify(dup.body)).toBe(true);
     expect(await proposedVerdictsFor(target)).toEqual([straggler]);
-    // the flood fix's direct apply closed the target (analysis lane)
-    expect(await decision(target).then((d) => d.status)).toBe("done");
-    const note = await noteOf(target);
-    expect(note).toContain("auto-applied (For Me flood fix");
+    expect(dup.body.applied).toBe(false);
+    expect(dup.body.outcome_required).toBe(true);
+    expect(await decision(target).then((d) => d.status)).toBe("in_progress");
   });
 });

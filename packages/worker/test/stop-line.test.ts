@@ -401,6 +401,7 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
   it("green required runs land through the machine proxy and close the card; the lane idles and the queue advances", async () => {
     const repo = "state-vector/lane-land";
     const card = await parkQueued("IMPL: stop-line drill — green landing");
+    await completePrReview(kbJson, card, [{ repo, number: 2703, head_sha_at_acceptance: "b".repeat(40) }]);
     await acquire(repo, "gw-mint", { required_workflows: ["Test", "Deploy"] });
     const M = "c".repeat(40);
     const merged = await kbJson("/train.event", {
@@ -605,3 +606,4 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(snapGreen.base_red_resolution ?? null).toBeNull();
   });
 });
+import { completePrReview } from "./completion-fixture";

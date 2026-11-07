@@ -101,7 +101,7 @@ describe("request audience and lifecycle", () => {
     const ask = await call("ask.create", { to: "peer", question: "Can you arrange the independent check?", options: ["Arrange review", "Wait"], artefact_id: task.id });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     await call("transition", { id: task.review, to: "in_progress", actor: "reviewer", session: "reviewer" });
-    const done = await call("transition", { id: task.review, to: "done", actor: "reviewer", session: "reviewer", review_result: { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }, note: `Verified https://github.com/state-vector/bridge/commit/${sha} ${ci}` });
+    const done = await call("transition", { id: task.review, to: "done", actor: "reviewer", session: "reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), task.review, { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }), note: `Verified https://github.com/state-vector/bridge/commit/${sha} ${ci}` });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     const parent = (await call("get", { id: task.id })).body;
     expect(parent.status, JSON.stringify((await call("events?since=0&limit=500")).body)).toBe("done");
@@ -124,7 +124,7 @@ describe("request audience and lifecycle", () => {
     const task = await submit("Recover interrupted acceptance", true);
     const ask = await call("ask.create", { to: "human", question: "Should Bridge retain the historical records?", reason: "Only you can choose the retention policy.", details: "The implementation is delivered. The retention policy still needs your decision.", options: ["Retain records", "Delete records"], artefact_id: task.id });
     await call("transition", { id: task.review, to: "in_progress", actor: "healing-reviewer", session: "healing-reviewer" });
-    const done = await call("transition", { id: task.review, to: "done", actor: "healing-reviewer", session: "healing-reviewer", review_result: { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }, note: `Verified commit ${sha} ${ci}` });
+    const done = await call("transition", { id: task.review, to: "done", actor: "healing-reviewer", session: "healing-reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), task.review, { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }), note: `Verified commit ${sha} ${ci}` });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     expect((await call("get", { id: task.id })).body.status).toBe("in_review");
     expect((await call("get", { id: ask.body.id })).body.status).toBe("todo");
@@ -198,7 +198,7 @@ describe("request audience and lifecycle", () => {
     expect(duty.body_md).toContain("actual execution_result");
     expect(duty.body_md).not.toContain("gh pr view");
     await call("transition", { id: verify, to: "in_progress", actor: "outcome-reviewer", session: "outcome-reviewer" });
-    const accepted = await call("transition", { id: verify, to: "done", actor: "outcome-reviewer", session: "outcome-reviewer", review_result: { kind: "accepted_execution", task_id: execution, receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] }, note: "Verified every applied target; passed execution outcome checks." });
+    const accepted = await call("transition", { id: verify, to: "done", actor: "outcome-reviewer", session: "outcome-reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), verify, { kind: "accepted_execution", task_id: execution, receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] }), note: "Verified every applied target; passed execution outcome checks." });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await call("get", { id: execution })).body.status).toBe("done");
   });
@@ -227,3 +227,4 @@ describe("request audience and lifecycle", () => {
     expect((await call("get", { id: ask.body.id })).body.meta.ask.resolution.kind).toBe("cancelled");
   });
 });
+import { reviewOutcome } from "./completion-fixture";

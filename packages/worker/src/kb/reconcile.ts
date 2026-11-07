@@ -176,7 +176,7 @@ export type ReconcileDecision =
   | { action: "mark_missing"; card: string }
   /** Second consecutive miss + a provenance row: close the card (machine
    *  proxy — the train stamped the merge). */
-  | { action: "reverse_close"; card: string; merge_sha: string; signer: string }
+  | { action: "reverse_verify"; card: string; merge_sha: string; signer: string }
   /** Second consecutive miss, no provenance: the PR left open state without
    *  a merge record — spawn a ruling duty, never a silent close. */
   | { action: "spawn_reverse" }
@@ -185,7 +185,7 @@ export type ReconcileDecision =
    *  citing the live mergeCommit. No provenance row and no ruling duty are
    *  needed: the observation IS the receipt (extends BR#6330's
    *  provenance-only close to every merge path). */
-  | { action: "observed_merge_close"; card: string; merge_sha: string }
+  | { action: "observed_merge_verify"; card: string; merge_sha: string }
   /** A duty already exists for this PR but the PR is STILL unbound past the
    *  actionable age (the duty died without binding it) — the drift alarm. */
   | { action: "alarm_unaccounted"; why: string };
@@ -221,6 +221,8 @@ export interface ReconcileAccounting {
   /** Reverse reconcile: bindings whose PR left the open list. */
   reverse_missing: number;
   reverse_closed: number;
+  /** Merge receipts requiring independent decisive-delivery verification. */
+  reverse_verifying: number;
   reverse_dutied: number;
   /** BR#5151: standing lane bindings — accounted, exempt from the reverse
    *  legs entirely (no close, no duty, no missing clock). */
@@ -229,8 +231,7 @@ export interface ReconcileAccounting {
    *  them (queued/mid-rebase is not vanished); the missing clock is cleared
    *  and no ruling duty spawns (BR#4894 Finding A). */
   reverse_train_exempt: number;
-  /** BR#6384: bindings whose bound PR was observed MERGED by this cycle's
-   *  feed — each one is a card closed citing the live mergeCommit. */
+  /** Bound PRs observed merged; observation does not certify delivery. */
   observed_merged: number;
   accounted: number;
   /** false ⇒ the run FAILED — alarm to the sink. */
@@ -256,8 +257,8 @@ export function accountingLine(a: ReconcileAccounting): string {
   const base = `${a.open_reviewed} open reviewed / ${a.bound} bound / ${a.ignored} ignored-with-reason / ${inflight} in-flight — ${a.accounted} accounted`;
   const alarm = a.ok ? "" : ` — ALARM: ${a.unaccounted} unaccounted`;
   const info = a.grace || a.unreviewed ? ` (+${a.grace} in age grace, +${a.unreviewed} unreviewed)` : "";
-  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? `, ${a.reverse_train_exempt} train-owned` : ""}]` : a.reverse_lane_exempt || a.reverse_train_exempt ? ` [reverse:${a.reverse_lane_exempt ? ` ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? ` ${a.reverse_train_exempt} train-owned` : ""}]` : "";
-  const observed = a.observed_merged ? ` [observed-merge: ${a.observed_merged} observed-merged closed]` : "";
+  const reverse = a.reverse_missing ? ` [reverse: ${a.reverse_missing} missing, ${a.reverse_closed} closed, ${a.reverse_dutied} dutied${a.reverse_verifying ? `, ${a.reverse_verifying} awaiting verification` : ""}${a.reverse_lane_exempt ? `, ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? `, ${a.reverse_train_exempt} train-owned` : ""}]` : a.reverse_lane_exempt || a.reverse_train_exempt ? ` [reverse:${a.reverse_lane_exempt ? ` ${a.reverse_lane_exempt} lane-exempt` : ""}${a.reverse_train_exempt ? ` ${a.reverse_train_exempt} train-owned` : ""}]` : "";
+  const observed = a.observed_merged ? ` [observed-merge: ${a.observed_merged} awaiting delivery verification]` : "";
   return base + alarm + info + reverse + observed + ` [all-open: ${a.open_total}; progress: ${a.queued} queued, ${a.repairing} repairing, ${a.verifying} verifying, ${a.held} held, ${a.stranded} stranded]`;
 }
 
@@ -296,6 +297,7 @@ export function reconcileJoin(args: {
     unreviewed: 0,
     reverse_missing: 0,
     reverse_closed: 0,
+    reverse_verifying: 0,
     reverse_dutied: 0,
     reverse_lane_exempt: 0,
     reverse_train_exempt: 0,
@@ -452,7 +454,7 @@ export function reconcileJoin(args: {
     }
     observedClosed.add(p.number);
     acc.observed_merged++;
-    judgements.push({ pr: p.number, decision: { action: "observed_merge_close", card: b.card, merge_sha: p.mergeCommit }, reason: `the feed observed the bound PR MERGED (${p.mergeCommit.slice(0, 9)}) — closing citing the live mergeCommit (BR#6384), no provenance row or ruling duty needed` });
+    judgements.push({ pr: p.number, decision: { action: "observed_merge_verify", card: b.card, merge_sha: p.mergeCommit }, reason: `The feed observed MERGED (${p.mergeCommit.slice(0, 9)}); verify actual delivery and decisive CI independently before completion.` });
   }
 
   acc.accounted = acc.bound + acc.ignored + acc.inflight + acc.spawned + acc.observed_merged;
@@ -506,8 +508,8 @@ export function reconcileJoin(args: {
       continue;
     }
     if (b.provenance) {
-      acc.reverse_closed++;
-      judgements.push({ pr: b.pr, decision: { action: "reverse_close", card: b.card, merge_sha: b.provenance.merge_sha, signer: b.provenance.signer }, reason: `PR left the open list and the train stamped the merge (${b.provenance.merge_sha.slice(0, 9)}) — closing via provenance, no zombie card` });
+      acc.reverse_verifying++;
+      judgements.push({ pr: b.pr, decision: { action: "reverse_verify", card: b.card, merge_sha: b.provenance.merge_sha, signer: b.provenance.signer }, reason: `PR left the open list with a merge receipt (${b.provenance.merge_sha.slice(0, 9)}); independent delivery verification is still required.` });
       continue;
     }
     const ruled = (dutiesByPr.get(b.pr) ?? []).some((d) => d.kind === "reverse");
