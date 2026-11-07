@@ -102,7 +102,7 @@ class ReconcileStep(str, Enum):
     PROVE = "prove"
     STOP = "stop"
     APPLY = "apply"
-    START = "start"
+    LEGACY_START = "start"  # read-only continuation adapter for early v2 journals
 
 
 class Reason(str, Enum):
@@ -263,6 +263,9 @@ def decode(data):
         fields["resume"] = decode(fields["resume"])
         if not isinstance(fields["resume"], (Preparing, Handoff, Reconciling, Installing, Verifying, Restoring, VerifyingRestored)):
             raise ValueError("invalid recovery continuation")
+        if fields["reason"] is Reason.RECONCILIATION and isinstance(fields["resume"],Handoff):
+            saved=fields["resume"]
+            return Reconciling(saved.operation,saved.candidate_digest,ReconcileStep.LEGACY_START)
     if cls is Reconciling:
         fields["step"] = ReconcileStep(fields["step"])
     if cls in (Installing, Restoring):
@@ -316,6 +319,12 @@ class Supervisor:
 
     def pid(self):
         return int(self.run(["systemctl", "--user", "show", "bridge.service", "-p", "MainPID", "--value"]) or 0)
+
+    def stopped(self):
+        # PID zero during an activating/queued start is not a stopped boundary.
+        state=self.run(["systemctl","--user","show","bridge.service","-p","ActiveState","--value"])
+        job=self.run(["systemctl","--user","show","bridge.service","-p","Job","--value"])
+        return state in ("inactive","failed") and job in ("","0") and self.pid()==0
 
     def info(self, binary):
         info = json.loads(self.run([str(binary), "build-info"]))
@@ -458,13 +467,6 @@ class Supervisor:
             self.save(Preparing(op, artifact["url"], artifact["sha256"]))
         elif isinstance(state, Waiting):
             if now >= state.retry_at:
-                if state.reason is Reason.RECONCILIATION:
-                    # Observing changed facts does not restart the controller.
-                    # Remain on this one wait until actual proof is available.
-                    facts = json.loads(self.run([str(self.candidate(state.resume.operation)), "recovery", "inspect"], timeout=180))
-                    if facts.get("waiting"):
-                        self.wait(state.reason, state.detail, state.resume, 30)
-                        return
                 if state.reason is Reason.RESTORED_HEALTH:
                     op = state.resume.operation
                     current = self.process()
@@ -535,7 +537,13 @@ class Supervisor:
         elif isinstance(state, Reconciling):
             op = state.operation
             self.own_request(op)
-            if state.step is ReconcileStep.FREEZE:
+            if state.step is ReconcileStep.LEGACY_START:
+                current=self.process()
+                if current is None:self.save(replace(state,step=ReconcileStep.APPLY))
+                elif current.commit==op.source:self.save(Handoff(replace(op,controller=current),state.candidate_digest))
+                elif current.commit==op.target:self.save(Verifying(op,now,Verification.ALREADY_RUNNING))
+                else:raise RuntimeError("Legacy continuation refers to a different running build")
+            elif state.step is ReconcileStep.FREEZE:
                 if self.process() != op.controller:
                     self.save(Handoff(op, state.candidate_digest))
                     return
@@ -560,19 +568,23 @@ class Supervisor:
                     self.service("stop")
                 self.save(replace(state, step=ReconcileStep.APPLY))
             elif state.step is ReconcileStep.APPLY:
-                if self.pid():
-                    raise RuntimeError("reconciliation requires the controller's exclusive lock")
+                if not self.stopped():
+                    current=self.process()
+                    if current and current.commit==op.source:self.save(Handoff(replace(op,controller=current),state.candidate_digest));return
+                    if current and current.commit==op.target:self.save(Verifying(op,now,Verification.ALREADY_RUNNING));return
+                    raise RuntimeError("Reconciliation waits for the original service stop to settle")
                 result = json.loads(self.run([str(self.candidate(op)), "recovery", "reconcile", "--apply"], timeout=180))
-                self.save(replace(state, step=ReconcileStep.START))
-                if result.get("waiting"):
-                    # Restore useful work even when an unrelated old record
-                    # cannot be proved. Never discard it or invent completion.
-                    self.service("start")
-                    self.wait(Reason.RECONCILIATION, "Unconfirmed original jobs remain protected", Handoff(op, state.candidate_digest), 30)
-            else:
-                if not self.pid():
-                    self.service("start")
-                self.save(Handoff(op, state.candidate_digest))
+                if result.get("kind") != "reconciliation" or not isinstance(result.get("waiting"), list):
+                    raise RuntimeError("Reconciliation facts are unreadable; preserve the saved operation")
+                if not self.stopped() or self.build(self.binary) != op.source:
+                    raise RuntimeError("Proved controller boundary changed during reconciliation")
+                # Job-specific waits retain their original WAL/ownership. They
+                # are NOT controller writers and cannot require restarting the
+                # old code before installing the code that can reconcile them.
+                shutil.copy2(self.binary, self.backup)
+                with self.backup.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                self.save(Installing(op, state.candidate_digest, InstallStep.SWAP))
         elif isinstance(state, Installing):
             op = state.operation
             self.own_request(op)
@@ -591,8 +603,11 @@ class Supervisor:
                 else:
                     self.save(replace(state, step=InstallStep.SWAP))
             elif state.step is InstallStep.SWAP:
-                if self.pid():
-                    raise RuntimeError("runner is not stopped at the installation boundary")
+                if not self.stopped():
+                    current=self.process()
+                    if current and current.commit==op.source:self.save(Handoff(replace(op,controller=current),state.candidate_digest));return
+                    if current and current.commit==op.target:self.save(Verifying(op,now,Verification.ALREADY_RUNNING));return
+                    raise RuntimeError("Runner service is still activating at the installation boundary")
                 if digest(self.binary) != state.candidate_digest:
                     if self.build(self.binary) != op.source or digest(self.candidate(op)) != state.candidate_digest:
                         raise RuntimeError("installation bytes do not match the saved operation")
@@ -627,8 +642,9 @@ class Supervisor:
                     self.service("stop")
                 self.save(replace(state, step=InstallStep.SWAP))
             elif state.step is InstallStep.SWAP:
-                if self.pid():
-                    raise RuntimeError("rollback boundary still has a running controller")
+                if not self.stopped():
+                    if current and current.commit==op.target:self.save(replace(state,step=InstallStep.STOP));return
+                    raise RuntimeError("Rollback waits for the original service stop to settle")
                 staged = self.binary.with_name(self.binary.name + ".rollback")
                 shutil.copy2(self.backup, staged)
                 os.replace(staged, self.binary)

@@ -616,8 +616,10 @@ impl Controller {
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
     pub fn controller_ready(&self) -> bool {
+        let cfg=config(&self.shared);
         self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
-            && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| !worker.stop.load(Ordering::SeqCst) && worker.reattachable.load(Ordering::SeqCst)))
+            && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| !worker.stop.load(Ordering::SeqCst) && worker.reattachable.load(Ordering::SeqCst)),
+                |owner,value,stop| durable_handoff(&cfg,owner,value,stop))
     }
     pub fn tick(&mut self, snap: &SharedSnapshot, stop: bool, update: bool) -> Result<(), String> {
         if stop { self.registry.drain(); } else if update { self.registry.natural_drain(); } else { self.registry.resume_admission(); }
@@ -749,6 +751,27 @@ impl Controller {
     }
 }
 
+fn durable_handoff(cfg:&DispatchConfig,owner:&Ownership,value:&FinalWork,stop:bool)->bool {
+    match value {
+        FinalWork::Fresh(record)|FinalWork::Journal(record)|FinalWork::Observe(record)=>{
+            let Ok(root)=terminal_root(cfg) else {return false};
+            for path in [root.join(record.name()),root.join("archive").join(record.name())] {
+                let saved=std::fs::read(path).ok().and_then(|bytes|serde_json::from_slice::<Record>(&bytes).ok());
+                if let Some(saved)=saved {
+                    if saved.validate().is_ok() && &saved.owner==owner && saved.host==cfg.label.as_deref().unwrap_or("") && saved.url==cfg.url.trim_end_matches('/')
+                        && (!stop || matches!(saved.work,Work::Stopped {..}|Work::Unstarted {..})) {return true;}
+                }
+            }
+            false
+        },
+        FinalWork::Legacy(receipt)=>!stop && matches!(owner,Ownership::Attempt {ticket,host,generation,attempt_id}
+            if ticket.task_id==receipt.task_id && ticket.session==receipt.session && host==&receipt.host && *generation==receipt.generation && attempt_id==&receipt.attempt_id)
+            && cfg.label.as_deref()==Some(receipt.host.as_str()) && cfg.url.trim_end_matches('/')==receipt.url
+            && stopped_outbox_root().is_some_and(|root|stopped_outbox::retained(&root,receipt)),
+        FinalWork::Active(_,_)=>false,
+    }
+}
+
 pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>, snap: SharedSnapshot) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
     std::fs::create_dir_all(home.join(".bridge")).map_err(|e| e.to_string())?;
@@ -824,6 +847,25 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    #[test]
+    fn durable_job_wait_can_handoff_without_releasing_charge_or_losing_unknown_work() {
+        let hub=Hub::new(|_|Some(json!({"kind":"writer_receipt_held","reason":"outside action unknown"})));
+        let (cfg,ready,snap)=fixture(&hub);
+        let record=Record {owner:Ownership::Attempt {ticket:Ticket {task_id:"durable-wait".into(),session:"original".into()},host:cfg.label.clone().unwrap(),generation:1,attempt_id:"one".into()},
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,disposition:Disposition::Rejected {reason:"outside action unknown".into()},work:Work::UnknownWriter {reason:"protected".into()}};
+        let mut controller=Controller::new(&cfg,&ready,&snap);
+        controller.recovery=Recovery::Ready {next:Instant::now()+Duration::from_secs(300)};
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
+        assert!(!controller.controller_ready(),"an in-memory result cannot be handed off");
+        journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
+        let before=std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap();
+        assert!(controller.controller_ready(),"durable job ownership is not an active controller writer");
+        assert_eq!(controller.registry.counts().charged,1,"handoff must not release uncertain execution capacity");
+        controller.registry.drain();
+        assert!(!controller.controller_ready(),"an undelivered explicit stop remains a barrier");
+        assert_eq!(std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap(),before);
+        drop(controller);drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
     pub(crate) struct Hub { url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
     impl Hub {
         pub(crate) fn new(mut answer: impl FnMut(serde_json::Value) -> Option<serde_json::Value> + Send + 'static) -> Self {
@@ -1078,13 +1120,13 @@ pub(crate) mod tests {
             if retained.iter().any(|r| matches!(r.disposition,Disposition::Rejected { .. })) { break; }
             assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!controller.controller_ready(),"an unchanged claim cannot release the handoff barrier");
+        assert!(!controller.registry.is_idle(),"an unchanged claim cannot retire job ownership");
         assert_eq!(controller.registry.counts().charged,1);
         assert_eq!(cancels.load(Ordering::SeqCst),1);
         assert!(reads.load(Ordering::SeqCst) as u64<=1+started.elapsed().as_secs()/RESERVATION_OBSERVATION_INTERVAL.as_secs(),"a wait must be paced, not a foreground polling storm");
         assert!(matches!(journal::pending(&terminal_root(&cfg).unwrap(),cfg.label.as_ref().unwrap(),&cfg.url).unwrap()[0].disposition,Disposition::Rejected { .. }),"rollback builds must still understand the retained journal");
         released.store(true,Ordering::SeqCst);
-        while !controller.controller_ready() {
+        while controller.registry.counts().charged>0 {
             controller.tick(&snap,false,true).unwrap(); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(controller.registry.counts().charged,0);

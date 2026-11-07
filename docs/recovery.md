@@ -36,6 +36,10 @@ Unknown versions and malformed recovery requests retain their holds.
   processes. Any visibility gap or busy boundary prevents the stop.
 - Native reconciliation requires the same controller lock. Real result delivery
   continues through its original stopped/checkpoint/finalize protocol.
+- A proved stopped controller proceeds directly to installation. Queued or held
+  job continuations can transfer only from verified durable records; doing so
+  does not complete a job, release its charge or clear an unknown outside action.
+  Restarting old code and waiting for those jobs to complete is not an update step.
 - Missing result recovery needs the exact original stopping fence, no uncertain
   outside actions, the immutable worker manifest, a held original-worker lock and
   complete empty-unit kernel evidence. It records `result_unavailable`, preserves

@@ -74,6 +74,9 @@ class Harness(m.Supervisor):
     def pid(self):
         return self.machine.current.pid if self.machine.current else 0
 
+    def stopped(self):
+        return self.machine.current is None
+
     def info(self, binary):
         data = Path(binary).read_bytes()
         return {"commit": self.machine.target if data == self.machine.binary else OLD,
@@ -108,6 +111,7 @@ class Harness(m.Supervisor):
             self.machine.current = None
         elif action == "start":
             self.machine.current = m.Process(124 + len(self.machine.actions), "boot", str(200 + len(self.machine.actions)), self.build(self.binary))
+            if self.machine.current.commit==self.machine.target:self.machine.ack=True
         elif action == "freeze":
             self.machine.frozen = True
         elif action == "thaw":
@@ -127,7 +131,7 @@ class Harness(m.Supervisor):
                 self.machine.actions.append("reconcile")
                 if not self.machine.waiting:
                     self.machine.ack = True
-            return json.dumps({"waiting": ["protected original record"] if self.machine.waiting else []})
+            return json.dumps({"kind":"reconciliation","waiting": ["protected original record"] if self.machine.waiting else []})
         elif args[1:3] == ["recovery", "source"]:
             return self.machine.export_source
         elif args[1] == "alarm":
@@ -209,6 +213,18 @@ class RecoveryTests(unittest.TestCase):
         with patch.object(m.os,"replace",side_effect=after_swap):self.drive()
         self.assertEqual(self.machine.actions,["stop","start","notify"])
 
+    def test_pid_zero_with_queued_service_start_cannot_authorise_swap(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        candidate=self.u.candidate(op);candidate.parent.mkdir(parents=True);candidate.write_bytes(self.machine.binary)
+        self.machine.current=None
+        self.u.save(m.Installing(op,m.digest(candidate),m.InstallStep.SWAP))
+        with patch.object(self.u,"run",side_effect=["activating","12 /org/freedesktop/systemd1/job/12"]):
+            self.assertFalse(m.Supervisor.stopped(self.u))
+        with patch.object(self.u,"stopped",return_value=False):self.u.reconcile()
+        self.assertEqual(self.u.binary.read_bytes(),b"old binary")
+        self.assertEqual(self.machine.actions,[])
+        self.drive()
+
     def test_expected_controller_restart_uses_fresh_ack_without_resetting_deadline(self):
         self.machine.crash_state="Handoff:"
         with self.assertRaises(Crash):self.u.reconcile()
@@ -225,6 +241,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_all_reconciliation_phases_restart_and_keep_independent_work(self):
         for step in m.ReconcileStep:
+            if step is m.ReconcileStep.LEGACY_START:continue
             with self.subTest(step=step):
                 self.setUp();self.machine.ack=False
                 self.machine.crash_state="Reconciling:"+str(step)
@@ -232,21 +249,24 @@ class RecoveryTests(unittest.TestCase):
                 self.drive()
                 self.assertEqual(protected.read_bytes(),b"unpublished work and output")
                 self.assertEqual(self.machine.actions.count("reconcile"),1)
-                self.assertEqual(self.machine.actions.count("stop"),2)
-                self.assertEqual(self.machine.actions.count("start"),2)
+                self.assertEqual(self.machine.actions.count("stop"),1)
+                self.assertEqual(self.machine.actions.count("start"),1)
 
-    def test_unproved_records_wait_without_restarting_every_retry(self):
+    def test_unproved_job_records_remain_protected_without_blocking_controller_upgrade(self):
         self.machine.ack=False;self.machine.waiting=True
-        self.u.reconcile()
-        self.assertIsInstance(self.u.state,m.Waiting)
-        self.assertEqual(self.u.state.reason,m.Reason.RECONCILIATION)
-        actions=list(self.machine.actions)
-        for _ in range(10):
-            self.machine.clock+=31;self.u=Harness(self.machine);self.u.reconcile()
-        self.assertEqual(self.machine.actions,actions)
-        self.assertTrue(self.u.request.exists())
-        self.machine.waiting=False
         self.drive()
+        self.assertTrue(self.machine.waiting,"job-specific uncertainty must not be cleared by an update")
+        self.assertEqual(self.machine.actions.count("stop"),1)
+        self.assertEqual(self.machine.actions.count("start"),1)
+
+    def test_early_v2_start_continuation_resumes_without_restarting_old_code(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        path=self.u.candidate(op);path.parent.mkdir(parents=True);path.write_bytes(self.machine.binary)
+        m.atomic(self.u.request,{"nonce":NONCE,"worker_protocol":1})
+        self.machine.current=None
+        self.u.save(m.Reconciling(op,m.digest(path),m.ReconcileStep.LEGACY_START))
+        self.u=Harness(self.machine);self.drive()
+        self.assertEqual(self.machine.actions,["reconcile","start","notify"])
 
     def test_busy_frozen_boundary_is_thawed_without_stopping_writers(self):
         self.machine.ack=False;self.machine.children=True
@@ -407,6 +427,8 @@ else:
                     return m.Process(p.pid,"fixture-boot",str(p.pid),hardware["commit"]) if p and p.poll() is None else None
                 def pid(self):
                     current=self.process();return current.pid if current else 0
+                def stopped(self):
+                    return self.process() is None
                 def service(self,action):
                     if action=="stop":
                         hardware["process"].terminate();hardware["process"].wait(timeout=2)
