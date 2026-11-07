@@ -22,6 +22,10 @@ outside the credential-label grammar. A bare display label such as `web` is an
 ordinary agent name. Legacy credentials conflicting with a human namespace may
 drain writers through gateway execution control and self-rename through the
 existing machine endpoint; they cannot use the conflict as human authority.
+The legacy machine `stats`, `list` and `search` mirrors validate bearers through
+the same credential boundary. The desktop decision action at
+`/api/kb-machine/act` requires a signed human session cookie and verifies that the
+stored target is a decision; a paired gateway token cannot approve decisions.
 
 ### Delivery responsibility
 

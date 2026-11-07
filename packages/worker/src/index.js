@@ -60,8 +60,8 @@ export default {
     if (url.pathname === "/api/kb-machine/stats") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.stats", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/stats"));
     }
     // machine-plane list mirror (bearer): lets runners/scripts enumerate artefacts
@@ -81,25 +81,30 @@ export default {
     if (url.pathname === "/api/kb-machine/list") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.artefacts", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" }));
     }
-    // machine-plane transition (bearer): bounded — only decisions may move, and
-    // only between proposed/accepted/rejected/superseded. Human-authoritative
-    // accept still routes as actor "web:*" from the paired gateway identity.
+    // Legacy desktop decision action: human authority requires a real session,
+    // never a paired gateway bearer. Check the stored target, not caller type.
     if (url.pathname === "/api/kb-machine/act") {
-      const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-      if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+      const auth = await checkAuth(request, env);
+      if (auth instanceof Response) return auth;
       const body = await request.json().catch(() => ({}));
-      if (body.op !== "transition" || body.type !== undefined)
+      if (body.op !== "transition" || body.type !== undefined
+        || !["proposed", "accepted", "rejected", "superseded"].includes(body.to))
         return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
-      return kbGuard("kb.transition", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/transition", {
+      if (typeof body.id !== "string" || !body.id) return json({ error: "decision id required" }, 400);
+      const kb = env.KB.get(env.KB.idFromName(doWs(auth.ws)));
+      const target = await kbGuard("kb.artefact", kb.fetch(`https://kb/artefact?id=${encodeURIComponent(body.id)}`));
+      if (!target.ok) return target;
+      if ((await target.json()).type !== "decision")
+        return json({ error: "only decision transitions allowed via kb-machine/act" }, 403);
+      return kbGuard("kb.transition", kb.fetch("https://kb/transition", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...body, actor: "web:desktop" }),
+        body: JSON.stringify(kbMutationIdentity(body, auth)),
       }));
     }
 
@@ -109,8 +114,8 @@ export default {
     if (url.pathname === "/api/kb-machine/search") {
       const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
       if (!bearer) return new Response("unauthorized", { status: 401 });
-      const r = await kbMachineResolveWs(env, bearer);
-      if (r.err) return r.err;
+      const r = await kbAuthenticateBearer(env, bearer);
+      if (r instanceof Response) return r;
       return kbGuard("kb.search", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/search" + new URL(request.url).search, { method: "GET" }));
     }
 
@@ -674,14 +679,19 @@ async function authKb(request, env) {
   const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "")
     || new URL(request.url).searchParams.get("token") || "";
   if (!bearer) return session;
+  return kbAuthenticateBearer(env, bearer);
+}
+
+/** Shared bearer validation for REST and legacy machine read mirrors. */
+async function kbAuthenticateBearer(env, bearer) {
   const { resolveTokenWs } = await import("./mcp.ts");
   try {
     const ws = await resolveTokenWs(env, bearer);
-    if (!ws) return session;
+    if (!ws) return json({ error: "unauthorized" }, 401);
     // Routing an unknown token to the default workspace is not authentication.
-    const identified = await env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/auth.identify", {
+    const identified = await kbGuard("kb.auth.identify", env.KB.get(env.KB.idFromName(doWs(ws))).fetch("https://kb/auth.identify", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bearer }),
-    });
+    }));
     if (!identified.ok) return identified.status >= 500 ? identified : json({ error: "unauthorized" }, 401);
     const identity = await identified.json();
     if (typeof identity.token_id !== "string" || !identity.token_id || typeof identity.label !== "string" || !identity.label
@@ -760,7 +770,7 @@ async function checkAuth(request, env) {
     if (!env.BRIDGE_UI_PASSWORD) {
       return json({ error: "auth not configured: set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET (or legacy BRIDGE_UI_PASSWORD)" }, 503);
     }
-    const legacy = parseLegacyPasswordCookie(request, env);
+    const legacy = await parseLegacyPasswordCookie(request, env);
     return legacy ? { login: null, ws: DEFAULT_WS_SLUG, legacy: true } : loginResponse(request);
   }
   const cookie = request.headers.get("Cookie") || "";

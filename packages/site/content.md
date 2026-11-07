@@ -5,6 +5,9 @@ caller-supplied actor or gateway flags. Workspace routing is not authentication.
 Gateway infrastructure reports process facts; task submission and acceptance
 belong to task agents and independent reviewers.
 Display labels cannot confer human authority on a machine credential.
+Legacy machine read mirrors also validate credentials. Desktop decision actions
+require a signed human session and a decision target; a paired gateway bearer
+cannot become human approval.
 
 ### One gateway lifecycle, durable outcomes
 
