@@ -285,6 +285,7 @@ does not interrupt running workers or change their durable execution fences.
   The Overview tab summarizes status counts, in-flight work and agent activity;
   **Asks** is the human inbox (proposed decisions + hub asks, one-tap answers);
   **Trains** shows the merge-train lanes with lease holder and derived queue;
+  the authenticated merger owns the lease and records the merge receipts.
   **Top** is the actionable fleet table; and **Voice** is the two-way voice
   console (BR#4782): speak or type, the shell does STT/TTS over bridge MCP and
   answers hub asks with an explicit confirm first. Mobile adapts the data —

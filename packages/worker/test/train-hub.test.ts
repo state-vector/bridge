@@ -308,6 +308,21 @@ describe("BR#6776 durable check recovery", () => {
 });
 
 describe("merge train DO drill (real bundled worker)", () => {
+  it("rejects a holder override on acquire, renew, and release", async () => {
+    const repo = "state-vector/lease-holder-identity";
+    const actor = "authenticated-merger";
+    const acquireOverride = await kbJson("/train.lease", { repo, actor, action: "acquire", holder: "session-label" });
+    expect(acquireOverride.status).toBe(400);
+    expect(acquireOverride.body.error).toContain("holder must match the authenticated actor");
+    await acquire(repo, actor);
+    for (const action of ["renew", "release"]) {
+      const result = await kbJson("/train.lease", { repo, actor: "other-actor", action, holder: actor });
+      expect(result.status).toBe(400);
+      expect(result.body.error).toContain("holder must match the authenticated actor");
+    }
+    expect((await laneSnap(repo)).lease.holder).toBe(actor);
+  });
+
   it("out-of-band repair merge observations require the accepted PR/head and do not certify live recovery", async () => {
     const repo = "state-vector/repair-delivery-6522", baseline = "7".repeat(40), acceptedHead = "9".repeat(40);
     const task = await queueViaAccept({ repo, pr: 991, head: acceptedHead });

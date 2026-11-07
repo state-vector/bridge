@@ -11356,13 +11356,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   /** train.lease — the CAS op. The DO is single-threaded, so the
    *  read-check-write is atomic by construction; leaseDecide is the check.
-   *  holder defaults to the authenticated actor (the acting gateway). */
+   *  The authenticated actor owns the lease and records train events. */
   private async trainLease(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const action: LeaseAction = ["acquire", "renew", "release"].includes(String(body.action)) ? body.action : null;
     if (!action) throw new Error("action must be acquire | renew | release");
-    const holder = String(body.holder ?? actor).trim() || actor;
+    const requestedHolder = String(body.holder ?? "").trim();
+    if (requestedHolder && requestedHolder !== actor) {
+      throw new Error("train lease holder must match the authenticated actor");
+    }
+    const holder = actor;
     const lane = await this.laneEnsure(repo, base, actor);
     const outcome = this.atomicLaneMutation(() => {
     const meta = JSON.parse(lane.meta ?? "{}");

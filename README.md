@@ -2237,6 +2237,8 @@ does a hub that never answers. A failing main-tip lookup never turns a mismatch 
 
 ## The merge train: serialized merges, credential-free hub (BR#3516)
 
+Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
+
 Accepted decision BR#3516 re-divisioned the merge machinery: **the hub holds no VCS
 credentials, ever.** Every GitHub fact is fed to it by an executor running on your own
 machine; the hub decides (lease CAS, classification, events, queue) and only the
