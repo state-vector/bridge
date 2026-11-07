@@ -1614,6 +1614,15 @@ pub fn is_deploy_workflow_run(r: &DeployWorkflowRun, required: &[String]) -> boo
     {
         return true;
     }
+    // The bridge repo's own deploy pipeline is `dev-build` (dev-build.yml, on:
+    // push to main): it builds every CLI target and publishes the Cloudflare
+    // Worker + manifest — the decisive deployment this lane actually waits on.
+    // Without recognizing it, deploy coverage stamps `covered` with no run id
+    // and recovery episodes on this lane can never verify (BR#7572). Mirrors
+    // core.ts isDeployWorkflowRun.
+    if path_lower.ends_with("/dev-build.yml") || path_lower == "dev-build.yml" || name_lower == "dev-build" {
+        return true;
+    }
     if name_lower == "deploy dev" || name_lower == "deploy" || name_lower.starts_with("deploy to ") {
         return true;
     }
@@ -3702,6 +3711,42 @@ mod tests {
         assert!(is_deploy_workflow_run(&wf_runs_with_dhr[1], &required));
         assert_eq!(infer_deploy_workflow(&required, &wf_runs_with_dhr), Some("deploy-dev.yml".into()));
         assert_eq!(infer_deploy_workflow(&required, &[]), Some("deploy-dev.yml".into()));
+
+        // BR#7572: the bridge repo's own deploy pipeline `dev-build`
+        // (dev-build.yml, push-to-main Workers + CLI binaries) is the decisive
+        // deploy workflow — recognized by name alone and by path; a
+        // differently-named lookalike stays unrecognized.
+        let dev_build_run = DeployWorkflowRun {
+            id: 42361588979,
+            run_attempt: Some(1),
+            name: "dev-build".into(),
+            path: Some(".github/workflows/dev-build.yml".into()),
+            head_sha: dark_tip.into(),
+            event: Some("push".into()),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            html_url: None,
+        };
+        assert!(is_deploy_workflow_run(&dev_build_run, &required));
+        let dev_build_name_only = DeployWorkflowRun {
+            path: None,
+            ..dev_build_run.clone()
+        };
+        assert!(is_deploy_workflow_run(&dev_build_name_only, &required));
+        // renamed display on the genuine path: the path identifies the workflow file
+        let dev_build_renamed = DeployWorkflowRun {
+            name: "dev-build canary".into(),
+            ..dev_build_run.clone()
+        };
+        assert!(is_deploy_workflow_run(&dev_build_renamed, &required));
+        // a differently-named lookalike on its own path stays unrecognized
+        // (dev-build-canary.yml does not end with "/dev-build.yml")
+        let dev_build_lookalike = DeployWorkflowRun {
+            name: "dev-build canary".into(),
+            path: Some(".github/workflows/dev-build-canary.yml".into()),
+            ..dev_build_run.clone()
+        };
+        assert!(!is_deploy_workflow_run(&dev_build_lookalike, &required));
 
         // 2. Inside grace window (age 120s < 300s): UncoveredGrace, no dispatch yet
         let plan_grace = reconcile_deploy_coverage(
