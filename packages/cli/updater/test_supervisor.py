@@ -349,6 +349,23 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.machine.actions,["notify"])
         self.assertEqual(self.u.state.next_attempt_at,20000000)
 
+    def test_legacy_interrupted_drain_migrates_without_old_job_ack_or_new_hour(self):
+        self.machine.ack=False
+        m.atomic(self.u.state_path,{"phase":"draining","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":13600000})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertEqual(self.u.state.next_attempt_at,13600000)
+        self.assertFalse(self.u.request.exists());self.assertEqual(self.machine.actions,[])
+
+    def test_legacy_recovery_preparation_resumes_pinned_work_under_same_hold(self):
+        self.machine.ack=False
+        m.atomic(self.u.state_path,{"phase":"recovery_preparing","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":0,"at":10000000})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.drive()
+        self.assertEqual(self.machine.current.commit,NEW)
+        self.assertEqual(self.machine.actions.count("stop"),1)
+
     def test_legacy_install_with_stopped_controller_restores_without_inventing_pid(self):
         self.u.backup.write_bytes(b"old binary");self.u.binary.write_bytes(self.machine.binary);self.machine.current=None
         m.atomic(self.u.state_path,{"phase":"installing","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":0})
