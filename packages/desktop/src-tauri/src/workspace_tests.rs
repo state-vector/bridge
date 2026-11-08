@@ -207,7 +207,16 @@ fn a_legacy_standalone_build_cache_is_adopted_from_its_standard_disposal_marker(
     let cache=PathBuf::from(&owner.cfg.workdir).join("old-standalone-target");fs::create_dir_all(&cache).unwrap();
     fs::write(cache.join("CACHEDIR.TAG"),"Signature: 8a477f597d28d172789f06886806bc55\n# Cargo cache\n").unwrap();
     fs::write(cache.join("compiled-object"),vec![5u8;512*1024]).unwrap();
-    let status=owner.reconcile(&[]).unwrap();assert!(!cache.exists());assert!(status.reclaimed_bytes>=512*1024);
+    let visibility=legacy::no_readers(&cache,legacy::ReaderAuthority::UnattributedLegacy);
+    let status=owner.reconcile(&[]).unwrap();
+    match visibility {
+        Ok(())=>{assert!(!cache.exists());assert!(status.reclaimed_bytes>=512*1024);},
+        Err(error)=>{
+            assert!(error.contains("incomplete"),"unexpected reader outside the capability case: {error}");
+            assert!(cache.exists(),"an unattributed legacy cache needs complete host visibility");assert_eq!(status.reclaimed_bytes,0);
+            assert!(owner.records().unwrap().iter().any(|r|r.error.as_ref().is_some_and(|error|error.contains("incomplete"))));
+        },
+    }
 }
 
 #[test]
@@ -237,4 +246,20 @@ fn ignored_evidence_arriving_after_checkpoint_publication_is_rechecked_before_re
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);
     assert_eq!(fs::read_to_string(root.join("work/.secret-output")).unwrap(),"new unique evidence");
     assert!(owner.read(&id).unwrap().error.unwrap().contains("ignored input"));
+}
+
+#[cfg(target_os="linux")]
+#[test]
+fn an_unrelated_real_non_dumpable_daemon_does_not_own_a_released_execution_workspace() {
+    use std::io::BufRead;
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {fn drop(&mut self) {let _=self.0.kill();let _=self.0.wait();}}
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let mut daemon=Daemon(Command::new("python3").args(["-c","import ctypes,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('ready',flush=True); time.sleep(60)"])
+        .current_dir(&sandbox.0).stdout(std::process::Stdio::piped()).spawn().unwrap());
+    let mut ready_line=String::new();std::io::BufReader::new(daemon.0.stdout.take().unwrap()).read_line(&mut ready_line).unwrap();assert_eq!(ready_line.trim(),"ready");
+    let t=ticket("fenced-with-private-daemon");let a=owner.allocate(&t,None).unwrap();fs::write(a.root.join("tmp/object"),vec![2u8;8192]).unwrap();
+    a.bind(&attempt(&t)).unwrap();let root=a.root.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    assert!(owner.reconcile(&[]).unwrap().reclaimed_bytes>=8192);assert!(!root.exists());
+    assert!(daemon.0.try_wait().unwrap().is_none(),"reconciliation must not stop the unrelated daemon");
 }

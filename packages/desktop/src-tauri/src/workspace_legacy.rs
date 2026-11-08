@@ -3,6 +3,9 @@
 //! remotely preserved content and no dependent worktree before retirement.
 use super::*;
 
+#[derive(Clone,Copy)]
+pub(super) enum ReaderAuthority { FencedAllocation, UnattributedLegacy }
+
 pub(super) fn allocation_id(prefix: &str, path: &Path) -> Result<String, String> {
     #[cfg(unix)] {
         use std::os::unix::fs::MetadataExt;
@@ -34,7 +37,15 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
         let entries = match fs::read_dir(&root) { Ok(e) => e, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(e.to_string()) };
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().map_err(|e| e.to_string())?.is_dir() && !entry.file_name().to_string_lossy().starts_with(".bridge-reclaim-") { paths.push((entry.path(), None)); }
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() && !entry.file_name().to_string_lossy().starts_with(".bridge-reclaim-") {
+                // This exact basename is the retired runner's allocation
+                // protocol, not a task-title guess. Other tmp names stay unbound.
+                let name=entry.file_name().to_string_lossy().into_owned();
+                let task=if root==PathBuf::from(&owner.cfg.workdir).join("sessions") {
+                    name.strip_prefix("bridge-BR-").filter(|n|!n.is_empty()&&n.chars().all(|c|c.is_ascii_digit())).map(|n|format!("BR#{n}"))
+                } else {None};
+                paths.push((entry.path(), task));
+            }
         }
     }
     paths.sort_by_key(|(path, task)| (path.components().count(), path.clone(), task.is_none()));
@@ -59,7 +70,7 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
             let id = format!("cache-{}", journal::stable_key(&[&path.to_string_lossy()]));
             let Some(_lock) = owner.lock(&id)? else { continue; };
             if !owner.file(&id).exists() {
-                owner.save(&Resource { version: 1, id, location: Location::RepositoryCache { root: path },
+                owner.save(&Resource { version: 1, id, location: Location::RepositoryCache { root: path, authority:CacheAuthority::LegacyDiscovery },
                     phase: Phase::Cached { last_used_at: 0 }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None })?;
             }
         }
@@ -85,24 +96,25 @@ fn cache_tag(path: &Path) -> bool {
 }
 
 pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String> {
-    let (root, task) = match &resource.location { Location::Legacy { root, task } => (root, task.as_ref()), Location::RepositoryCache { root } | Location::GeneratedCache { root } => (root, None), _ => return Err("legacy resource location missing".into()) };
+    let (root, task) = match &resource.location { Location::Legacy { root, task } => (root.clone(), task.clone()), Location::RepositoryCache { root, .. } | Location::GeneratedCache { root } => (root.clone(), None), _ => return Err("legacy resource location missing".into()) };
     if !root.exists() {
         resource.phase = Phase::Removed { reclaimed_bytes: 0, at: now_ms() };
         return Ok(());
     }
-    no_readers(root)?;
     // A pending launch/result or unknown effect protects its exact path even
     // when a historical task has been moved/closed by another session.
     for directory in ["launches", "terminal", "workers"] {
         let directory = gateway_pipeline::root(&owner.cfg)?.join(directory);
-        if journal_references(&directory, root)? { return Err("legacy workspace is referenced by an active execution journal".into()); }
+        if journal_references(&directory, &root)? { return Err("legacy workspace is referenced by an active execution journal".into()); }
     }
     if matches!(resource.location, Location::GeneratedCache { .. }) {
-        if !cache_tag(root) { return Err("generated cache lost its disposal marker; retained".into()); }
+        no_readers(&root,ReaderAuthority::UnattributedLegacy)?;
+        if !cache_tag(&root) { return Err("generated cache lost its disposal marker; retained".into()); }
         resource.phase = Phase::Reclaimable { snapshots:vec![] };
         return owner.save(resource);
     }
-    let retirement = if let Some(task) = task {
+    let mut adopted_execution=None;
+    let retirement = if let Some(task) = &task {
         let state = execution_call(&owner.cfg, task, json!({"kind":"inspect"}))?;
         let a = &state["attempt"];
         if !a.is_null() && a["phase"] != "quiesced" { return Err("legacy execution writers are not confirmed stopped".into()); }
@@ -110,12 +122,17 @@ pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String
         if !matches!(state["handoff"]["phase"].as_str(), Some("none" | "returned")) { return Err("legacy workspace belongs to a protected local handoff".into()); }
         let card = mcp_call(&owner.cfg, &mut 0, "get_artefact", json!({"id":task}))?;
         if !matches!(card["status"].as_str(), Some("done" | "superseded" | "todo" | "in_review" | "blocked")) { return Err("legacy workspace still has a claimed executor".into()); }
-        Ownership::Reservation { ticket: Ticket { task_id: task.clone(), session: resource.id.clone() } }
+        if !a.is_null() && a["host"].as_str()==owner.cfg.label.as_deref() {
+            let confirmed=Ownership::Attempt {ticket:Ticket {task_id:task.clone(),session:a["session"].as_str().filter(|s|!s.is_empty()).ok_or("legacy stop receipt lacks session")?.into()},host:a["host"].as_str().unwrap().into(),generation:a["generation"].as_u64().filter(|g|*g>0).ok_or("legacy stop receipt lacks generation")?,attempt_id:a["attempt_id"].as_str().filter(|s|!s.is_empty()).ok_or("legacy stop receipt lacks attempt")?.into()};
+            lifecycle::Released::from_hub(&confirmed,&state)?;
+            adopted_execution=Some(task.clone());
+            confirmed
+        } else {Ownership::Reservation { ticket: Ticket { task_id: task.clone(), session: resource.id.clone() } }}
     } else {
         // Unknown provenance is never a licence to destroy unpublished work.
         // Clean, remotely reachable repositories can be checkpointed; dirty
         // legacy inputs remain explicit retained resources in the disk budget.
-        let mut repos = Vec::new(); repositories(root, &mut repos)?;
+        let mut repos = Vec::new(); repositories(&root, &mut repos)?;
         for repo in repos {
             if !git(&repo, &["status", "--porcelain"])?.is_empty() || git(&repo, &["branch", "-r", "--contains", "HEAD"])?.is_empty() {
                 return Err("unattributed legacy source is dirty/unpublished; retained for preservation".into());
@@ -123,6 +140,9 @@ pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String
         }
         Ownership::Reservation { ticket: Ticket { task_id: format!("workspace-{}", resource.id), session: resource.id.clone() } }
     };
+    let authority=if adopted_execution.is_some() {ReaderAuthority::FencedAllocation} else {owner.reader_authority(resource)?};
+    no_readers(&root,authority)?;
+    if let Some(task)=adopted_execution {resource.location=Location::AdoptedExecution {root,task};}
     resource.phase = Phase::Released { owner: retirement };
     owner.save(resource)
 }
@@ -161,16 +181,17 @@ pub(super) fn no_external_worktrees(repository: &Path, root: &Path) -> Result<()
     Ok(())
 }
 
-pub(super) fn no_readers(root: &Path) -> Result<(), String> {
+pub(super) fn no_readers(root: &Path, authority: ReaderAuthority) -> Result<(), String> {
     if !root.exists() { return Ok(()); }
     if fs::symlink_metadata(root).map_err(|e| e.to_string())?.file_type().is_symlink() { return Err("workspace root is a symlink; retained".into()); }
     #[cfg(target_os = "linux")] {
         use std::os::unix::fs::MetadataExt;
+        let uid=fs::metadata(root).map_err(|e|e.to_string())?.uid();
         for process in fs::read_dir("/proc").map_err(|e| e.to_string())? {
             let process = process.map_err(|e| e.to_string())?.path();
             if !process.file_name().is_some_and(|p| p.to_string_lossy().chars().all(|c| c.is_ascii_digit())) { continue; }
             let metadata = match fs::metadata(&process) { Ok(m) => m, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(e.to_string()) };
-            if metadata.uid() != unsafe { libc::getuid() } { continue; }
+            if metadata.uid() != uid { continue; }
             // Exited processes can remain as zombies while their parent reaps
             // them. Linux denies their ptrace-gated cwd/exe links, but their
             // kernel state proves they cannot hold files or perform writes.
@@ -180,14 +201,16 @@ pub(super) fn no_readers(root: &Path) -> Result<(), String> {
             for link in ["cwd", "exe"] {
                 match fs::read_link(process.join(link)) {
                     Ok(path) if path.starts_with(root) => return Err(format!("workspace is held by process {}", process.display())),
-                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(format!("workspace process visibility incomplete at {}/{} (state {state}): {e}",process.display(),link)),
+                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                    Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{},
+                    Err(e) => return Err(format!("workspace process visibility incomplete at {}/{} (state {state}): {e}",process.display(),link)),
                 }
             }
             // A compiler can be between opens while still owning its target
             // directory. Its declared environment/argv and mapped files count
             // as readers too; checking only cwd/fds would miss that interval.
             for name in ["cmdline", "environ"] {
-                let bytes = match fs::read(process.join(name)) { Ok(b) => b, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(format!("workspace process scope incomplete: {e}")) };
+                let bytes = match fs::read(process.join(name)) { Ok(b) => b, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace process scope incomplete: {e}")) };
                 for value in bytes.split(|b| *b == 0) {
                     let value = String::from_utf8_lossy(value);
                     let path = value.split_once('=').map(|(_, value)| value).unwrap_or(&value);
@@ -196,26 +219,29 @@ pub(super) fn no_readers(root: &Path) -> Result<(), String> {
             }
             match fs::read_to_string(process.join("maps")) {
                 Ok(maps) if maps.lines().filter_map(|line| line.split_whitespace().nth(5)).any(|path| path.starts_with('/') && Path::new(path).starts_with(root)) => return Err(format!("workspace is mapped by process {}", process.display())),
-                Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(format!("workspace mapping visibility incomplete: {e}")),
+                Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(format!("workspace mapping visibility incomplete: {e}")),
             }
-            let descriptors = match fs::read_dir(process.join("fd")) { Ok(fd) => fd, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(format!("workspace FD visibility incomplete: {e}")) };
+            let descriptors = match fs::read_dir(process.join("fd")) { Ok(fd) => fd, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace FD visibility incomplete: {e}")) };
             for fd in descriptors {
                 let fd = fd.map_err(|e| e.to_string())?;
                 match fs::read_link(fd.path()) {
                     Ok(path) if path.starts_with(root) => return Err(format!("workspace has an open process descriptor: {}", fd.path().display())),
-                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(e.to_string()),
+                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(e.to_string()),
                 }
             }
         }
         Ok(())
     }
     #[cfg(target_os = "macos")] {
+        use std::os::unix::fs::MetadataExt;
+        let _=authority;
+        let uid=fs::metadata(root).map_err(|e|e.to_string())?.uid();
         // lsof's kernel inventory is expensive when multiple test controllers
         // probe at once. The real gateway has one owner; keep that same bound
         // here and restrict observation to this Unix user's readers.
         static PROBE: Mutex<()> = Mutex::new(());
         let _probe = PROBE.lock().map_err(|_| "workspace reader probe poisoned")?;
-        let mut command = Command::new("lsof"); command.args(["-nP", "-t", "-a", "-u", &unsafe { libc::getuid() }.to_string(), "+D"]).arg(root);
+        let mut command = Command::new("lsof"); command.args(["-nP", "-t", "-a", "-u", &uid.to_string(), "+D"]).arg(root);
         let output = run_with_timeout(command, 10)?;
         if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() { Ok(()) }
         else { Err("workspace still has readers or process visibility is incomplete".into()) }

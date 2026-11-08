@@ -107,8 +107,11 @@ pub fn matches_working_tree(path: &Path, checkpoint: &Checkpoint) -> Result<bool
 /// not disposable residue. A restoring runner must preserve it first.
 pub fn restore(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
     if repository_identity(&git(path, &["remote", "get-url", "origin"], None)?) != checkpoint.repo { return Err("checkpoint repository mismatch".into()); }
-    git(path, &["fetch", "--no-tags", "origin", &checkpoint.remote_ref], None)?;
-    if git(path, &["rev-parse", "FETCH_HEAD"], None)? != checkpoint.commit { return Err("checkpoint remote commit mismatch".into()); }
+    verify_published(path,checkpoint)?;
+    // Linked worktrees share FETCH_HEAD. Fetch this immutable object without
+    // publishing a shared mutable selector that another preparation can race.
+    git(path, &["fetch", "--no-write-fetch-head", "--no-tags", "origin", &checkpoint.commit], None)?;
+    if git(path, &["rev-parse", &format!("{}^{{commit}}",checkpoint.commit)], None)? != checkpoint.commit { return Err("checkpoint remote commit mismatch".into()); }
     if git(path, &["rev-parse", &format!("{}^{{tree}}", checkpoint.commit)], None)? != checkpoint.tree { return Err("checkpoint tree digest mismatch".into()); }
     git(path, &["merge-base", "--is-ancestor", &checkpoint.base, &checkpoint.commit], None)?;
     let dirty = git(path, &["status", "--porcelain"], None)?;
@@ -195,5 +198,24 @@ pub(crate) mod tests {
         git(&source, &["remote", "set-url", "origin", sandbox.0.join("offline.git").to_str().unwrap()], None).unwrap();
         assert!(publish(&source, "BR#2", 2, "Test", vec![]).is_err());
         assert_eq!(std::fs::read_to_string(source.join("tracked")).unwrap(), "newer repair — keep me\n");
+    }
+
+    #[test]
+    fn linked_worktrees_restore_their_own_immutable_checkpoint_without_mutating_shared_fetch_head() {
+        let sandbox=Sandbox::new();let source=init(&sandbox.0);
+        std::fs::write(source.join("tracked"),"first repair\n").unwrap();
+        let first=publish(&source,"first",1,"restore",vec![]).unwrap();
+        std::fs::write(source.join("tracked"),"second repair\n").unwrap();
+        let second=publish(&source,"second",1,"restore",vec![]).unwrap();
+        let cache=sandbox.0.join("cache");git(&sandbox.0,&["clone",&first.repo,cache.to_str().unwrap()],None).unwrap();
+        let a=sandbox.0.join("a");let b=sandbox.0.join("b");
+        for path in [&a,&b] {git(&cache,&["worktree","add","--detach",path.to_str().unwrap(),"HEAD"],None).unwrap();}
+        let fetch_head=cache.join(".git/FETCH_HEAD");std::fs::write(&fetch_head,"another execution's immutable observation\n").unwrap();
+        let pa=a.clone();let pb=b.clone();
+        let one=std::thread::spawn(move ||restore(&pa,&first));let two=std::thread::spawn(move ||restore(&pb,&second));
+        one.join().unwrap().unwrap();two.join().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(a.join("tracked")).unwrap(),"first repair\n");
+        assert_eq!(std::fs::read_to_string(b.join("tracked")).unwrap(),"second repair\n");
+        assert_eq!(std::fs::read_to_string(fetch_head).unwrap(),"another execution's immutable observation\n");
     }
 }

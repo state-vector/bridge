@@ -13,17 +13,23 @@ const GIB: u64 = 1024 * 1024 * 1024;
 pub(super) const INTERVAL: Duration = Duration::from_secs(30);
 const BATCH: usize = 4;
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all="snake_case")]
+enum CacheAuthority { ExclusiveAllocation, #[default] LegacyDiscovery }
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Location {
     Managed { root: PathBuf },
     Legacy { root: PathBuf, task: Option<String> },
-    RepositoryCache { root: PathBuf },
+    AdoptedExecution { root: PathBuf, task: String },
+    RepositoryCache { root: PathBuf, #[serde(default)] authority:CacheAuthority },
     GeneratedCache { root: PathBuf },
+    OwnedDisposable { root: PathBuf, parent_id: String },
 }
 impl Location {
-    fn root(&self) -> &Path { match self { Self::Managed { root } | Self::Legacy { root, .. } | Self::RepositoryCache { root } | Self::GeneratedCache { root } => root } }
-    fn work(&self) -> PathBuf { match self { Self::Managed { root } => root.join("work"), Self::Legacy { root, .. } | Self::RepositoryCache { root } | Self::GeneratedCache { root } => root.clone() } }
+    fn root(&self) -> &Path { match self { Self::Managed { root } | Self::Legacy { root, .. } | Self::AdoptedExecution {root,..} | Self::RepositoryCache { root, .. } | Self::GeneratedCache { root } | Self::OwnedDisposable {root,..} => root } }
+    fn work(&self) -> PathBuf { match self { Self::Managed { root } => root.join("work"), _=>self.root().to_path_buf() } }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -166,7 +172,16 @@ impl Owner {
             let cache_path = repo_cache_path(&self.cfg.workdir, repo);
             let cache_id = format!("cache-{}", journal::stable_key(&[&cache_path.to_string_lossy()]));
             let _cache_lock = self.lock(&cache_id)?.ok_or("repository cache is being reclaimed; retry preparation")?;
-            let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path },
+            let authority=if self.file(&cache_id).exists() {
+                let previous=self.read(&cache_id)?;
+                match (previous.phase,previous.location) {
+                    (Phase::Cached { .. },Location::RepositoryCache {authority,..})=>authority,
+                    (Phase::Removed { .. },_) if !cache_path.exists()=>CacheAuthority::ExclusiveAllocation,
+                    (Phase::Removed { .. },_)=>CacheAuthority::LegacyDiscovery,
+                    _=>return Err("repository cache retirement is still pending".into()),
+                }
+            } else if cache_path.exists() {CacheAuthority::LegacyDiscovery} else {CacheAuthority::ExclusiveAllocation};
+            let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path, authority },
                 phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
@@ -262,7 +277,7 @@ impl Owner {
             _ => true,
         };
         if original_is_owned {
-            let prefix = match &record.location { Location::Legacy { .. }=>Some("legacy"),Location::GeneratedCache { .. }=>Some("generated"),_=>None };
+            let prefix = match &record.location { Location::Legacy { .. } | Location::AdoptedExecution { .. }=>Some("legacy"),Location::GeneratedCache { .. } | Location::OwnedDisposable { .. }=>Some("generated"),_=>None };
             if let Some(prefix)=prefix {
                 if !record.location.root().exists() || legacy::allocation_id(prefix,record.location.root())?!=record.id {
                     // A recycled legacy pathname is a new allocation, imported
@@ -290,7 +305,7 @@ impl Owner {
             _ => {},
         }
         if let Phase::Released { owner } = record.phase.clone() {
-            legacy::no_readers(record.location.root())?;
+            legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
             verify_layout(record)?;
             let mut paths = Vec::new();
             repositories(&record.location.work(), &mut paths)?;
@@ -313,7 +328,7 @@ impl Owner {
             record.phase = Phase::Reclaimable { snapshots }; self.save(record)?;
         }
         if let Phase::Reclaimable { snapshots } = &record.phase {
-            legacy::no_readers(record.location.root())?;
+            legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
             verify_inputs(record,snapshots)?;
             for snapshot in snapshots {
                 if !crate::checkpoint::matches_working_tree(&snapshot.path, &snapshot.checkpoint)? { return Err("newer local inputs differ from the verified checkpoint; retained".into()); }
@@ -333,7 +348,7 @@ impl Owner {
         }
         if let Phase::Removing { operation_id, bytes_before, repositories, snapshots, trash } = record.phase.clone() {
             if !trash.exists() {
-                legacy::no_readers(record.location.root())?;
+                legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
                 verify_inputs(record,&snapshots)?;
                 for snapshot in snapshots {
                     if !crate::checkpoint::matches_working_tree(&snapshot.path, &snapshot.checkpoint)? { return Err("newer local inputs arrived before retirement rename; retained".into()); }
@@ -348,7 +363,7 @@ impl Owner {
         if let Phase::Deleting { operation_id, bytes_before, repositories, trash } = record.phase.clone() {
             // A newly created directory at the original path is never touched.
             // Only the journalled atomic-rename destination is ours to delete.
-            legacy::no_readers(&trash)?;
+            legacy::no_readers(&trash,self.reader_authority(record)?)?;
             remove_tree(&trash)?;
             if trash.exists() { return Err("workspace removal incomplete; retry retained".into()); }
             for repository in repositories { let _ = git(&repository, &["worktree", "prune"]); }
@@ -369,12 +384,27 @@ impl Owner {
         let floor = std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB);
         self.measure_with_limits(budget, floor)
     }
+    fn reader_authority(&self,record:&Resource)->Result<legacy::ReaderAuthority,String> {
+        match &record.location {
+            // These paths were granted only to fenced executions, or to the
+            // repository cache's locked provisioning/dependency protocol. An
+            // unrelated non-dumpable daemon is not another workspace owner.
+            Location::Managed { .. } | Location::RepositoryCache {authority:CacheAuthority::ExclusiveAllocation,..} | Location::AdoptedExecution { .. }=>Ok(legacy::ReaderAuthority::FencedAllocation),
+            Location::OwnedDisposable {parent_id,..}=>{
+                let parent=self.read(parent_id)?;
+                if matches!(parent.location,Location::OwnedDisposable { .. }) {return Err("disposable parent is not an execution allocation".into());}
+                if matches!(parent.phase,Phase::InUse { .. }|Phase::Cached { .. }|Phase::LegacyUnproved) {return Err("disposable allocation's original owner is not released".into());}
+                self.reader_authority(&parent)
+            },
+            _=>Ok(legacy::ReaderAuthority::UnattributedLegacy),
+        }
+    }
     fn retire_disposable_children(&self, parent: &Resource, repositories: &[PathBuf]) -> Result<(), String> {
         // Disposable allocations can retire even when valuable source must be
         // retained (for example an ignored .env or unique measurement output).
         // They use this same journal/state machine, including crash receipts.
         for old in self.records()? {
-            if old.id==parent.id || !matches!(old.location,Location::GeneratedCache { .. }) || !old.location.root().starts_with(parent.location.root()) || matches!(old.phase,Phase::Removed { .. }) {continue;}
+            if old.id==parent.id || !matches!(old.location,Location::OwnedDisposable { .. }) || !old.location.root().starts_with(parent.location.root()) || matches!(old.phase,Phase::Removed { .. }) {continue;}
             let _lock=self.lock(&old.id)?.ok_or("disposable child still has a workspace owner")?;
             let mut child=self.read(&old.id)?;self.advance(&mut child)?;self.save(&child)?;
         }
@@ -392,7 +422,7 @@ impl Owner {
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
             let mut child=if self.file(&id).exists() {self.read(&id)?} else {
-                Resource {version:1,id,location:Location::GeneratedCache {root:path},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None}
+                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None}
             };
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }
@@ -517,7 +547,7 @@ fn verify_layout(record:&Resource)->Result<(),String> {
     Ok(())
 }
 fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
-    if matches!(record.location,Location::GeneratedCache { .. }) {return Ok(());}
+    if matches!(record.location,Location::GeneratedCache { .. } | Location::OwnedDisposable { .. }) {return Ok(());}
     verify_layout(record)?;
     let paths:Vec<_>=snapshots.iter().map(|s|s.path.clone()).collect();
     if uncovered_inputs(&record.location.work(),&paths)? {return Err("new uncheckpointed scratch inputs arrived before retirement; retained".into());}

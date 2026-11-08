@@ -17,6 +17,9 @@ waiting for an update, and resumes durable preservation/deletion stages after
 restart. Active readers, newer source, unknown writers/effects and publication
 failures retain their own resources with explicit retry reasons. Unpublished
 non-Git scratch inputs remain protected until delivered or preserved.
+Exact allocation ownership and stopped execution authorize fenced cleanup;
+unrelated non-dumpable daemons cannot globally veto it. Unattributed legacy
+directories still require complete host visibility before adoption.
 
 The default budget is 100 GiB of owned disk with 5 GiB filesystem headroom;
 `BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` configure it.
