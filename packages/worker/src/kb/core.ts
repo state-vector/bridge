@@ -1894,7 +1894,8 @@ export function selectBatch(clean: boolean[], conflictPairs: [number, number][],
 
 /** BR#5658 (Ray 2026-11-03): one verifying or ready PR car in a merge batch.
  *  `state` drives the verification colour law:
- *  - "ready"     → green solid (.tb-ready): verified & ready to merge
+ *  - "ready"     → green solid (.tb-ready): verified, no conflicts with base;
+ *                 independent of lane stops or main CI/deploy holds
  *  - "verifying" → orange pulsing (.tb-verifying): actively being verified now
  *  - "waiting"   → orange solid (.tb-wait): waiting to be verified */
 export interface TrainBatchCar {
@@ -1945,7 +1946,11 @@ export function partitionMergeBatches<T extends { id: string; pr?: number; state
         if (prConflict(remaining[a], remaining[b])) subPairs.push([a, b]);
       }
     }
-    const chosenSub = selectBatch(clean, subPairs, cap);
+    let chosenSub = selectBatch(clean, subPairs, cap);
+    // A conflict between ready PRs can spread them across batches. Do not
+    // let an unverified PR in an earlier batch overtake a deferred ready PR.
+    const hasDeferredReady = remaining.some((idx, si) => ordered[idx].state === "ready" && !chosenSub.includes(si));
+    if (hasDeferredReady) chosenSub = chosenSub.filter(si => ordered[remaining[si]].state === "ready");
     if (!chosenSub.length) {
       // safety fallback (clean is all-true so selectBatch always picks >=1)
       batches.push([ordered[remaining.shift()!]]);

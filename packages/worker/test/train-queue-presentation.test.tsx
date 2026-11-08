@@ -17,5 +17,6 @@ it("renders actual PR blocks without overlapping multiplication labels and expla
   expect(html).not.toContain("×34");
   expect(html).not.toContain("train-bounce-chip");
   expect(html).not.toContain("de-queued");
-  expect(html).toContain("verified");
+  expect(html).toContain("Ready to merge: verified, no conflicts with base");
+  expect(html).toContain(">1 ready</span>");
 });

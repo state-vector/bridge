@@ -29,12 +29,27 @@ mod attempt_journal;
 mod gateway_pipeline;
 #[path = "worker_session.rs"]
 mod worker_session;
+#[path = "workspace.rs"]
+mod workspace;
+#[path = "recovery.rs"]
+mod recovery;
+
+pub fn workspaces_command(cfg: &DispatchConfig, reconcile: bool) -> Result<serde_json::Value, String> {
+    let owner = workspace::Owner::open(cfg)?;
+    if reconcile {
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
+        let Some(_lock) = worker_session::Lock::acquire(&home.join(".bridge/gateway-runtime.lock"))? else {
+            return Err("running gateway owns workspace reconciliation; read bridge workspaces status".into());
+        };
+        owner.reconcile(&[])?;
+    }
+    owner.report()
+}
 
 pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
 pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
 pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
-pub fn reconcile_reservations(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_reservations(cfg, apply, task) }
-pub fn reconcile_stopped(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> { gateway_pipeline::reconcile_stopped(cfg, apply, task) }
+pub fn recovery_command(cfg: &DispatchConfig, args: &[String]) -> Result<serde_json::Value, String> { recovery::command(cfg, args) }
 
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
@@ -173,12 +188,39 @@ pub enum UpdateChannel { Main, Stable, Pinned }
 
 /// Local request is written only by the separately supervised updater. It is
 /// deliberately fail-closed across crashes: only its owner removes the hold.
-fn update_request() -> Option<serde_json::Value> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateHandoff { FullDrain, AdoptWorkerV1 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateRequest { Handoff { nonce:String, mode:UpdateHandoff }, Held { reason:String } }
+impl UpdateRequest {
+    fn parse(bytes:&[u8])->Self {
+        #[derive(Deserialize)] struct Wire { nonce:String, #[serde(default)] worker_protocol:Option<u32> }
+        match serde_json::from_slice::<Wire>(bytes) {
+            Ok(Wire { nonce, worker_protocol }) if !nonce.is_empty() => Self::Handoff {nonce, mode:if worker_protocol==Some(worker_session::PROTOCOL) {UpdateHandoff::AdoptWorkerV1} else {UpdateHandoff::FullDrain}},
+            _=>Self::Held {reason:"Recovery request is unreadable; preserve admission hold".into()},
+        }
+    }
+}
+#[cfg(test)]
+mod recovery_request_tests {
+    use super::*;
+    #[test]
+    fn malformed_request_retains_hold_instead_of_reopening_admission() {
+        for bytes in [b"{".as_slice(),b"{}",b"{\"nonce\":\"\"}",b"{\"nonce\":\"n\",\"worker_protocol\":\"bad\"}"] {
+            assert!(matches!(UpdateRequest::parse(bytes),UpdateRequest::Held {..}));
+        }
+        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\",\"worker_protocol\":1}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::AdoptWorkerV1});
+        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\"}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::FullDrain});
+    }
+}
+fn update_request() -> Option<UpdateRequest> {
     if std::env::var("BRIDGE_MANAGED_UPDATES").as_deref() != Ok("1") { return None; }
     let home = std::env::var("HOME").ok()?;
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(home).join(".bridge/update/request.json")).ok()?).ok()?;
-    value["nonce"].as_str().filter(|s| !s.is_empty())?;
-    Some(value)
+    match std::fs::read(PathBuf::from(home).join(".bridge/update/request.json")) {
+        Ok(bytes)=>Some(UpdateRequest::parse(&bytes)),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,
+        Err(e)=>Some(UpdateRequest::Held {reason:format!("Recovery request is not visible; preserve admission hold: {e}")}),
+    }
 }
 
 fn update_receipt(name: &str, value: &serde_json::Value) {
@@ -1984,6 +2026,7 @@ pub struct DispatchSnapshot {
     /// Derived solely from the lifecycle registry; stopped/delivering work is
     /// never relabelled as an actively running agent.
     pub lifecycle: Option<lifecycle::Counts>,
+    pub workspaces: Option<workspace::Status>,
     pub activity: Vec<DispatchActivity>, // newest first, capped
     // BR#2532: set when the runner INVOLUNTARILY signs the desktop out
     // (identity-law run gate). The pair screen renders it
@@ -2208,6 +2251,7 @@ fn write_runner_state(snap: &SharedSnapshot) {
             "max_sessions": s.max_sessions,
             "in_flight": s.in_flight,
             "lifecycle": s.lifecycle,
+            "workspaces": s.workspaces,
             "activity": s.activity.iter().take(10).collect::<Vec<_>>(),
             // BR#2532: an auto-logout in a HEADLESS runner must reach the
             // desktop UI too — it observes this file from another process and
@@ -2506,18 +2550,6 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
 // never encodes gate verdicts as state — it releases claims and skips
 // candidates. The drift-alarm test at the bottom of this file enforces it.
 
-/// BR#2460 scratch session dir for repo-less dispatches:
-/// <workdir>/sessions/bridge-<tid>/. Litter control and a deterministic cwd,
-/// NOT a sandbox — agents hold full user permissions. Removed when the run
-/// outcome lands; runner startup sweeps orphans.
-fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(workdir)
-        .join("sessions")
-        .join(format!("bridge-{}", slugify(tid)));
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
 /// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2571,7 +2603,7 @@ fn classify_clone_failure(stderr: &str) -> CloneFailure {
     }
 }
 
-fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
+fn repo_cache_path(workdir: &str, repo_url: &str) -> PathBuf {
     let tail: String = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -2583,13 +2615,27 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
         .collect::<Vec<_>>()
         .join("-");
     let slug = slugify(&tail);
-    let repos_dir = PathBuf::from(workdir).join("repos");
+    let identity=attempt_journal::stable_key(&[repo_url.trim_end_matches('/').trim_end_matches(".git")]);
+    PathBuf::from(workdir).join("repos").join(format!("{slug}-{identity}"))
+}
+
+fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
+    let path = repo_cache_path(workdir, repo_url);
+    let repos_dir = path.parent().expect("repository cache has a parent");
     std::fs::create_dir_all(&repos_dir).map_err(|e| CloneFailure::Transient(e.to_string()))?;
-    let path = repos_dir.join(&slug);
     if path.join(".git").exists() {
+        let remote=Command::new("git").current_dir(&path).args(["remote","get-url","origin"]).output().map_err(|e|CloneFailure::Transient(e.to_string()))?;
+        if !remote.status.success() || String::from_utf8_lossy(&remote.stdout).trim().trim_end_matches('/').trim_end_matches(".git")!=repo_url.trim_end_matches('/').trim_end_matches(".git") {
+            return Err(CloneFailure::Transient("repository cache identity changed; retained".into()));
+        }
+        let default = Command::new("git").current_dir(&path).args(["symbolic-ref", "refs/remotes/origin/HEAD"]).output()
+            .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+        if !default.status.success() { return Err(CloneFailure::Transient("repository default branch unavailable".into())); }
+        let default = String::from_utf8_lossy(&default.stdout).trim().to_string();
+        let branch = default.strip_prefix("refs/remotes/origin/").ok_or_else(|| CloneFailure::Transient("repository default ref invalid".into()))?;
         let out = Command::new("git")
             .current_dir(&path)
-            .args(["fetch", "--all", "--prune"])
+            .args(["fetch", "origin", &format!("+refs/heads/{branch}:{default}")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -2601,7 +2647,7 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
         };
     }
     let out = Command::new("git")
-        .args(["clone", repo_url])
+        .args(["clone", "--single-branch", repo_url])
         .arg(&path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2632,163 +2678,6 @@ fn worktree_owner(path: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/// YYYY-MM-DD (UTC) — civil-from-days, no chrono dependency. Suffix for the
-/// WIP preservation branches the teardown sweep writes.
-fn iso_date_utc() -> String {
-    let secs = (now_ms() / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
-/// BR#3204 teardown sweep: a worktree being torn down must not take
-/// uncommitted work with it — that is exactly the 10-24 failure mode (a
-/// 32-file WIP pile frozen in the shared checkout, preserved only afterwards
-/// as `wip/preserved-2026-10-24`, whose diffs turned out to be stale tree
-/// state). If the tree is dirty, commit everything onto a preservation branch
-/// `wip/<task>-<date>` (branch, never main) and push it best-effort so
-/// preservation survives host loss. Returns the branch name when preservation
-/// happened, None when the tree was clean.
-///
-/// `git add -A` here is the documented teardown-sweep exception to the no-`add
-/// -A` rule: this worktree is being destroyed and the branch is its only
-/// record; no shared checkout is touched.
-fn preserve_wip(worktree_path: &Path, task_id: &str) -> Option<String> {
-    let dirty = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
-    if !dirty {
-        return None;
-    }
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .current_dir(worktree_path)
-            .args(args)
-            .output()
-    };
-    let slug = slugify(task_id);
-    let date = iso_date_utc();
-    // branch at the current HEAD — the dirty tree carries over unchanged.
-    // A same-day preservation name collision gets a -2/-3… suffix.
-    let mut branch = format!("wip/{slug}-{date}");
-    let mut created = false;
-    for n in 1..10 {
-        let name = if n == 1 { branch.clone() } else { format!("wip/{slug}-{date}-{n}") };
-        if git(&["switch", "-c", &name]).map(|o| o.status.success()).unwrap_or(false) {
-            branch = name;
-            created = true;
-            break;
-        }
-    }
-    if !created {
-        return None; // mid-merge or branch lock — best-effort only, teardown proceeds
-    }
-    let _ = git(&["add", "-A"]);
-    let committed = git(&[
-        "commit",
-        "-m",
-        &format!("WIP preservation sweep: {task_id} teardown (BR#3204 — branch, never main; {date})"),
-    ])
-    .map(|o| o.status.success())
-    .unwrap_or(false);
-    if !committed {
-        // race or nothing actually committable — undo the empty branch
-        let _ = git(&["switch", "--detach"]);
-        let _ = git(&["branch", "-D", &branch]);
-        return None;
-    }
-    // preservation should survive host loss: best-effort push, failures ignored
-    let _ = git(&["push", "--set-upstream", "origin", &branch]);
-    Some(branch)
-}
-
-/// Provision (or reuse) an isolated worktree for a task on branch bridge/<slug>,
-/// branched from the task repo's default branch. Location (BR#3204): inside
-/// the checkout at <repo>/.worktrees/<slug> — the per-session tree convention
-/// (the repo's .gitignore carries `.worktrees/`, so the checkout stays clean).
-/// The legacy ~/.bridge/worktrees/<slug> location is checked and kept as the
-/// fallback so pre-change worktrees re-attach on resume and repos whose
-/// clone predates the convention still isolate.
-/// On resume the branch already exists — attach to it.
-/// 2026-11-02: every provisioned tree is REGISTERED (the machine-local
-/// worktree registry) so the sweep knows it mechanically — see
-/// worktree_registry_append.
-fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<PathBuf> {
-    let slug = slugify(task_id);
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let nested = repo_path.join(".worktrees").join(&slug);
-    let legacy = home.as_ref().map(|h| {
-        h.join(".bridge").join("worktrees").join(&slug)
-    });
-    // reuse: nested first (the convention), legacy second (resume compat)
-    if nested.exists() {
-        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
-        return Some(nested);
-    }
-    if legacy.as_ref().map(|p| p.exists()).unwrap_or(false) {
-        worktree_registry_append(home.as_deref(), legacy.as_ref().unwrap(), &repo_path.to_string_lossy(), task_id);
-        return legacy;
-    }
-    std::fs::create_dir_all(nested.parent()?).ok()?;
-    // Self-heal stale registrations: a worktree dir deleted without
-    // deregistration leaves a "prunable" ghost whose branch lock fails both
-    // worktree adds below, and the isolation guard then refuses dispatch —
-    // churning the task through the watchdog (BR#2421 class). Prune is
-    // idempotent and cheap.
-    let _ = Command::new("git")
-        .current_dir(repo_path)
-        .args(["worktree", "prune"])
-        .output();
-    let branch = format!("bridge/{slug}");
-    // Base = the clone's default branch. `origin/HEAD` is set by clone.
-    let add_at = |path: &PathBuf| {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(repo_path);
-        if resume {
-            cmd.args(["worktree", "add"]).arg(path).arg(&branch);
-        } else {
-            cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(path).arg("origin/HEAD");
-        }
-        cmd.output().map(|o| o.status.success()).unwrap_or(false)
-    };
-    if add_at(&nested) {
-        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
-        return Some(nested);
-    }
-    // nested add refused (clone predates the .gitignore convention) — fall
-    // back to the legacy location so isolation still holds.
-    let Some(path) = legacy else { return None };
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    if add_at(&path) {
-        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
-        return Some(path);
-    }
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo_path)
-        .args(["worktree", "add"])
-        .arg(&path)
-        .arg(&branch);
-    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
-    if ok {
-        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
-    }
-    ok.then_some(path)
-}
-
 /// Run a command with a hard deadline: kill on expiry and report. The sign
 /// check must never hang the dispatch loop (a misconfigured signingProgram —
 /// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
@@ -2813,7 +2702,7 @@ pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::proce
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "timed out after {secs}s — a signing program that blocks (locked agent, hung bridge) must fail loudly, never stall dispatch"
+                        "timed out after {secs}s — bounded host operation retained for retry"
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2915,78 +2804,6 @@ fn sign_check(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), Str
     result
 }
 
-/// Tear down a worktree: preserve any WIP onto `wip/<task>-<date>` first
-/// (the teardown sweep — losing tree state is the 10-24 incident), then
-/// deregister + remove it, and optionally drop the task branch.
-/// drop_branch=true is terminal (done): the work is merged or rejected and
-/// bridge/<slug> has no future — the preservation branch survives it, since
-/// the WIP commit is reachable from it. On todo releases the branch is KEPT:
-/// a re-claim attaches to it (committed-but-unpushed stall work survives;
-/// uncommitted WIP went to the wip branch). Returns the preservation branch
-/// when one was written.
-fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Option<String> {
-    if !path.exists() { return None; }
-    // No lossy best-effort teardown. A failed status/publication probe retains
-    // the registered tree; only remotely reachable committed content is swept.
-    let mut status = Command::new("git"); status.current_dir(path).args(["status", "--porcelain"]);
-    let status = run_with_timeout(status, 5);
-    if !matches!(&status, Ok(o) if o.status.success() && o.stdout.is_empty()) {
-        return Some(format!("retained {}: local WIP requires a published checkpoint before cleanup", path.display()));
-    }
-    let mut remote = Command::new("git"); remote.current_dir(path).args(["branch", "-r", "--contains", "HEAD"]);
-    let remote = run_with_timeout(remote, 5);
-    if !matches!(&remote, Ok(o) if o.status.success() && !o.stdout.is_empty()) {
-        return Some(format!("retained {}: unpublished committed work", path.display()));
-    }
-    if !path.exists() {
-        return None;
-    }
-    let slug = slugify(task_id);
-    // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
-    let owner = worktree_owner(path, &path.to_string_lossy());
-    let mut remove = Command::new("git"); remove.current_dir(&owner).args(["worktree", "remove"]).arg(path);
-    if !run_with_timeout(remove, 5).is_ok_and(|out| out.status.success()) {
-        return Some(format!("retained {}: Git refused worktree removal; newer work may exist", path.display()));
-    }
-    worktree_registry_remove(std::env::var("HOME").ok().map(PathBuf::from).as_deref(), path);
-    if drop_branch {
-        // terminal (done): bridge/<slug> has no future. The WIP commit survives
-        // on the preservation branch — deleting this branch does not orphan it.
-        let mut branch = Command::new("git"); branch.current_dir(&owner).args(["branch", "-D"]).arg(format!("bridge/{slug}"));
-        let _ = run_with_timeout(branch, 5);
-    }
-    None
-}
-
-/// Reconcile on-disk worktrees with live task status. Terminal tasks (done,
-/// superseded) and released tasks (todo) must not hold worktrees on disk — the
-/// finalize path cleans `done` handoffs, but yielded runs, pre-sweep history
-/// and handoff-rejections leave stragglers. Fresh in_progress/in_review/blocked
-/// worktrees are kept: they are the session's resume assets — but nothing
-/// parks forever (BR#3633): a tree not held by an in-flight session that is
-/// older than WORKTREE_STALE_SECS is swept regardless of status or id
-/// resolvability (WIP preserved first, branch kept, so a re-claim re-attaches).
-/// Capped per tick, oldest first, so a large backlog always drains the worst
-/// offenders.
-/// Scans BOTH locations (BR#3204): the nested <repo>/.worktrees/<slug> trees
-/// and the legacy ~/.bridge/worktrees/<slug> roots — a missing root is a
-/// scoped skip, never a sweep abort (the old early-return there silently
-/// disabled the entire sweep on hosts where the legacy root never existed:
-/// post-BR#3204 hosts provision nested-only, so the reconciler was dead code
-/// while provisioning kept allocating — the BR#3618/BR#3633 leak). Before any
-/// teardown the sweep preserves uncommitted state onto wip/<task>-<date>
-/// (never main).
-const WORKTREE_SWEEP_CAP: usize = 4;
-const WORKTREE_SWEEP_PROBE_BUDGET: Duration = Duration::from_secs(3);
-const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
-/// Eventual-consistency horizon (BR#3633): a worktree not held by an in-flight
-/// session is swept once older than this, whatever its board status — an id
-/// that no longer resolves, a hub outage, or a parked blocked task all drain
-/// eventually instead of pinning disk forever. Branch is kept on the age path
-/// so re-claims re-attach; drop-branch stays the explicit terminal-status path.
-const WORKTREE_STALE_SECS: u64 = 7 * 24 * 3600;
-static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// BR#3787 — negotiated token catch-up. The hub stamps every authenticated
 /// /mcp response with the row's epoch (bumped at each rotation);
 /// TOKEN_EPOCH_VEND is the epoch of the secret this runner holds. 0 = unknown
@@ -3008,40 +2825,6 @@ struct WorktreeCandidate {
     slug: String,
     path: PathBuf,
     mtime: std::time::SystemTime,
-}
-
-/// Persist a round's remaining paths, rather than starting from the same kept
-/// trees every tick. Newly registered paths enter at the next oldest-first round.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct WorktreeSweepCursor {
-    remaining: std::collections::VecDeque<PathBuf>,
-}
-
-fn sweep_candidate_batch(
-    candidates: Vec<WorktreeCandidate>,
-    cursor: &mut WorktreeSweepCursor,
-    budget: Duration,
-    mut status: impl FnMut(&WorktreeCandidate, Duration) -> Option<String>,
-    mut cleanup: impl FnMut(&WorktreeCandidate, bool, &str),
-) -> (usize, usize) {
-    if cursor.remaining.is_empty() {
-        cursor.remaining.extend(candidates.iter().map(|c| c.path.clone()));
-    }
-    let mut by_path: HashMap<_, _> = candidates.into_iter().map(|c| (c.path.clone(), c)).collect();
-    let deadline = Instant::now() + budget;
-    let (mut inspected, mut swept) = (0, 0);
-    while inspected < WORKTREE_SWEEP_CAP && Instant::now() < deadline {
-        let Some(path) = cursor.remaining.pop_front() else { break; };
-        let Some(candidate) = by_path.remove(&path) else { continue; };
-        inspected += 1; // retained/unresolvable trees consume the budget too
-        let age = std::time::SystemTime::now().duration_since(candidate.mtime).map(|d| d.as_secs()).unwrap_or(u64::MAX);
-        let state = if age < WORKTREE_STALE_SECS {
-            status(&candidate, WORKTREE_STATUS_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
-        } else { None };
-        let (remove, drop_branch, reason) = sweep_disposition(age, state.as_deref());
-        if remove { cleanup(&candidate, drop_branch, &reason); swept += 1; }
-    }
-    (inspected, swept)
 }
 
 // ---- worktree registry (2026-11-02, Ray: "you can both direct agents AND
@@ -3081,6 +2864,7 @@ fn worktree_registry_load(home: &Path) -> Vec<WorktreeRegEntry> {
 /// Best-effort registration — the path IS the record; a failed append never
 /// blocks provisioning (the sweep's dir scans still cover the runner's own
 /// trees). Home comes from the caller so tests inject a scratch root.
+#[cfg(test)]
 fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: &str) {
     use std::io::Write;
     let Some(home) = home else { return };
@@ -3107,6 +2891,7 @@ fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: 
 /// Deregistration: drop every line naming this path — the teardown owns the
 /// tree, the registry must not outlive it. Home comes from the caller so
 /// tests inject a scratch root.
+#[cfg(test)]
 fn worktree_registry_remove(home: Option<&Path>, path: &Path) {
     let Some(home) = home else {
         return;
@@ -3135,35 +2920,6 @@ fn reverse_task_slug(slug: &str) -> String {
     match slug.strip_prefix("BR-") {
         Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
         _ => slug.to_string(),
-    }
-}
-
-/// Sweep decision for one candidate — pure so it is unit-testable. `status`
-/// is the board status when it could be fetched (None = unresolvable id or
-/// MCP/network error). Returns (sweep, drop_branch, reason).
-fn sweep_disposition(age_secs: u64, status: Option<&str>) -> (bool, bool, String) {
-    match status {
-        // explicit terminal statuses sweep at any age — the board is the
-        // authority and these trees hold nothing the board doesn't have
-        Some(s @ ("done" | "superseded")) => (true, true, format!("task is {s}")),
-        Some("todo") => (
-            true,
-            false,
-            "task released to todo (branch kept for re-claim)".into(),
-        ),
-        // fresh non-terminal trees are resume assets — keep
-        _ if age_secs < WORKTREE_STALE_SECS => (false, false, String::new()),
-        // stale non-terminal (in_progress/blocked/in_review/unknown id/MCP
-        // outage): eventual sweep — WIP preserved, branch kept for re-claim
-        _ => (
-            true,
-            false,
-            format!(
-                "stale ≥{}d — swept regardless of status ({})",
-                WORKTREE_STALE_SECS / 86_400,
-                status.unwrap_or("id unresolvable or status unknown")
-            ),
-        ),
     }
 }
 
@@ -3251,7 +3007,7 @@ fn collect_worktree_candidates(
                 continue;
             };
             let path = PathBuf::from(p);
-            if path == root {
+            if path == root || path.canonicalize().ok().zip(root.canonicalize().ok()).is_some_and(|(path, root)| path == root) {
                 continue; // the repo's own main worktree is not a candidate
             }
             let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -3277,11 +3033,9 @@ fn collect_worktree_candidates(
     // `active` set above; the disposition rules then apply as usual.
     if let Some(home) = home {
         let entries = worktree_registry_load(home);
-        let mut dead = false;
         for e in &entries {
             let p = PathBuf::from(&e.path);
             if !p.exists() {
-                dead = true;
                 continue;
             }
             let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -3298,87 +3052,11 @@ fn collect_worktree_candidates(
                 .unwrap_or(std::time::UNIX_EPOCH);
             found.push(WorktreeCandidate { slug: name, path: p, mtime });
         }
-        if dead {
-            let kept: Vec<String> = entries
-                .iter()
-                .filter(|e| PathBuf::from(&e.path).exists())
-                .filter_map(|e| serde_json::to_string(e).ok())
-                .collect();
-            let _ = std::fs::write(
-                worktree_registry_path(home),
-                if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
-            );
-        }
+        // Read-only migration input: rewriting this JSONL can erase a live
+        // interactive session's concurrent append. New ownership lives solely
+        // in the workspace journal; absent paths contribute no allocations.
     }
     found
-}
-
-fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
-    let active: HashSet<String> = in_flight
-        .iter()
-        .filter_map(|inf| inf.worktree.as_ref())
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .collect();
-    let mut found = collect_worktree_candidates(
-        Path::new(&cfg.workdir),
-        std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
-        &active,
-        &cfg.sweep_repos,
-    );
-    // dedup by slug (same name in both roots → nested wins), then drain
-    // oldest-first: the cap must always bite the worst offenders
-    found.sort_by(|a, b| a.slug.cmp(&b.slug));
-    found.dedup_by(|a, b| a.slug == b.slug);
-    found.sort_by(|a, b| a.mtime.cmp(&b.mtime).then(a.path.cmp(&b.path)));
-    let cursor_path = dispatch_dir().map(|p| p.join("worktree-sweep-cursor.json"));
-    let mut cursor: WorktreeSweepCursor = cursor_path.as_ref().and_then(|p| std::fs::read(p).ok())
-        .and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default();
-    let (inspected, swept) = sweep_candidate_batch(found, &mut cursor, WORKTREE_SWEEP_PROBE_BUDGET,
-        |candidate, timeout| {
-            mcp_call_session_with_timeout(cfg, id, "get_artefact", json!({ "id": reverse_task_slug(&candidate.slug) }), None, timeout)
-                .ok().and_then(|v| v["status"].as_str().map(String::from))
-        },
-        |candidate, drop_branch, reason| {
-            let task = reverse_task_slug(&candidate.slug);
-            let terminal = mcp_call_session_with_timeout(cfg, &mut 0, "get_artefact", json!({"id":task}), None, WORKTREE_STATUS_TIMEOUT)
-                .is_ok_and(|card| matches!(card["status"].as_str(), Some("done" | "superseded")));
-            if !terminal { return; } // age alone cannot revoke another executor's work
-            let stopped = mcp_call_session_with_timeout(cfg, &mut 0, "execution", json!({"id":task,"command_id":format!("hygiene-inspect-{}",now_ms()),"command":{"kind":"inspect"}}), None, WORKTREE_STATUS_TIMEOUT)
-                .is_ok_and(|state| (state["attempt"].is_null() || state["attempt"]["phase"] == "quiesced")
-                    && state["operations"].as_array().is_some_and(|ops| !ops.iter().any(|op| matches!(op["state"].as_str(), Some("prepared" | "outcome_unknown")))));
-            if !stopped { return; }
-            let preserved = cleanup_worktree_at(&candidate.path, &reverse_task_slug(&candidate.slug), drop_branch);
-            msgs.push(format!("swept worktree {} — {}{}", candidate.slug, reason,
-                preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()));
-        });
-    if let Some(path) = cursor_path {
-        if let Ok(data) = serde_json::to_vec(&cursor) {
-            let staged = path.with_extension("tmp");
-            if std::fs::write(&staged, data).is_ok() { let _ = std::fs::rename(staged, path); }
-        }
-    }
-    dlog("", &format!("worktree hygiene: inspected {inspected}, swept {swept}, {} pending in round", cursor.remaining.len()));
-    if swept > 0 {
-        // prune the clones that actually own the registrations. cfg.workdir is
-        // scratch space, NOT a repo — the old prune against it was a silent
-        // no-op that left ghost registrations in the owning clones (BR#2421).
-        let mut prune_roots: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos"))
-            .map(|it| it.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
-        prune_roots.extend(
-            cfg.sweep_repos
-                .iter()
-                .map(PathBuf::from)
-                .filter(|p| p.join(".git").exists()),
-        );
-        for repo in prune_roots {
-            let _ = Command::new("git")
-                .current_dir(repo)
-                .arg("worktree")
-                .arg("prune")
-                .output();
-        }
-    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -3721,11 +3399,6 @@ fn spawn_opencode(
     // declined repo-less tasks parked claimed cards with no session
     // (BR#2456 class).
     let repo_url = source_repo(body_md, task_meta);
-    let scratch = if repo_url.is_none() {
-        ensure_scratch_dir(&cfg.workdir, tid)
-    } else {
-        None
-    };
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
@@ -3749,124 +3422,22 @@ fn spawn_opencode(
         resume_session
     };
     let resume = resume_session.is_some();
-    // BR#3204 exemptions: some dispatches must NOT get a per-task worktree.
-    //   1. Surgical-by-declaration tasks — meta.surgical (or meta.surgical_by_
-    //      declaration): short, surgical changes to the shared checkout are the
-    //      declared deliverable, and a fresh worktree would orphan them.
-    //   2. Exempt repos (cfg.worktree_exempt_repos) — the webapp-only checkout
-    //      class, where the checkout itself is the deploy surface and shared-
-    //      tree editing is the design. Matched case-insensitively against the
-    //      repo URL and its tail (owner/name, with or without .git).
-    let surgical = task_meta
-        .get("surgical")
-        .or_else(|| task_meta.get("surgical_by_declaration"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || body_md.contains("surgical-by-declaration");
-    let repo_exempt = match &repo_url {
-        Some(url) => {
-            let u = url.to_ascii_lowercase();
-            let tail = u.rsplit('/').next().unwrap_or(&u).trim_end_matches(".git");
-            cfg.worktree_exempt_repos.iter().any(|r| {
-                let r = r.trim().trim_end_matches(".git").to_ascii_lowercase();
-                !r.is_empty() && (u.contains(&r.as_str()) || tail == r.as_str())
-            })
-        }
-        None => false,
+    let ticket = lifecycle::Ticket { task_id: tid.into(), session: claim_session(cfg, tid) };
+    let allocation = match workspace::Owner::open(cfg).and_then(|owner| owner.allocate(&ticket, repo_url.as_deref())) {
+        Ok(allocation) => allocation,
+        Err(error) => { dlog(tid, &format!("workspace allocation deferred: {error}")); return; },
     };
-    let skip_worktree = surgical || repo_exempt;
-    if skip_worktree {
-        dlog(
-            tid,
-            &format!(
-                "per-task worktree skipped — {}",
-                if surgical {
-                    "task is surgical-by-declaration"
-                } else {
-                    "repo is worktree-exempt"
-                }
-            ),
-        );
-    }
-    let worktree = if let Some(url) = &repo_url {
-        let repo_path = match ensure_repo_clone(&cfg.workdir, url) {
-            Ok(p) => p,
-            Err(e) => {
-                dlog(
-                    tid,
-                    &format!(
-                        "error: clone failed for {url} — {} — skipping spawn",
-                        e.detail()
-                    ),
-                );
-                snap_activity(
-                    snap,
-                    "error",
-                    &format!("{tid}: clone failed ({url}): {}", e.detail()),
-                );
-                let reason = format!("{}clone of {url} failed: {}", if e.fatal() { "gate: " } else { "" }, e.detail());
-                failed_start(cfg, tid, StartStage::Begin, &reason, None, None);
-                return;
-            }
-        };
-        let worktree = if cfg.isolate && !skip_worktree {
-            ensure_worktree(&repo_path, tid, resume)
-        } else {
-            None
-        };
-        // isolation guard: a shared checkout is a shared branch and a shared git
-        // index — dispatched sessions have switched branches under humans and
-        // reverted committed work (three times). If isolation was requested and
-        // failed, refuse: never dispatch into cfg.workdir. Exempt dispatches
-        // (surgical / exempt-repo) opted into the shared tree knowingly, so the
-        // guard does not apply to them.
-        if cfg.isolate && !skip_worktree && worktree.is_none() {
-            let detail =
-                "worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)";
-            dlog(tid, &format!("error: {detail}"));
-            snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
-            failed_start(cfg, tid, StartStage::Begin, &format!("gate: {detail}"), None, Some(&repo_path));
+    let worktree = allocation.checkout.clone();
+    let scratch = worktree.is_none().then(|| allocation.work.clone());
+    let run_dir = allocation.work.to_string_lossy().to_string();
+    let branch = "detached checkpoint";
+    if let Some(wt) = &worktree {
+        let profile = cfg.identity_profile();
+        if let Err(error) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
+            failed_start(cfg, tid, StartStage::Inspect, &format!("gate: identity profile failed: {error}"), None, Some(wt));
             return;
         }
-        // Identity leg (BR#3185): write the profile's repo-local git config and
-        // prove it can sign BEFORE dispatching. A failed sign check refuses the
-        // dispatch loudly — killing the unsigned-PR bounce class at source
-        // (BR#3042/BR#3134). Global git config is never touched: `git config`
-        // inside a linked worktree writes at repo scope into the runner's own
-        // clone (shared by that clone's worktrees) — the host checkout, the
-        // shared checkout, and the host's global config stay exactly as they were.
-        if let Some(wt) = &worktree {
-            let profile = cfg.identity_profile();
-            if let Err(e) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
-                let detail = format!(
-                    "identity profile failed — refusing to dispatch ({e}). Fix the runner's identity config or provision the signing key."
-                );
-                dlog(tid, &format!("error: {detail}"));
-                snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
-                note_task(
-                    cfg,
-                    tid,
-                    &format!(
-                        "runner: identity profile failed — {} (task not dispatched; will retry next cycle)",
-                        e
-                    ),
-                );
-                failed_start(cfg, tid, StartStage::Inspect, &format!("gate: {detail}"), None, Some(wt));
-                return;
-            }
-        }
-        worktree
-    } else {
-        None
-    };
-    let run_dir = if let Some(wt) = &worktree {
-        wt.to_string_lossy().to_string()
-    } else if let Some(s) = &scratch {
-        s.to_string_lossy().to_string()
-    } else {
-        cfg.workdir.clone()
-    };
-    let branch = format!("bridge/{}", slugify(tid));
+    }
     let resume_note = resume_session
         .as_ref()
         .map(|s| format!("\n\nYou are resuming opencode session `{s}` — an opencode id, NOT a bridge session name; your bridge session is stated under # Environment. Pick up where you left off; do not restart the task from scratch."))
@@ -3928,7 +3499,7 @@ fn spawn_opencode(
         }
     } else {
         format!(
-            "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
+            "- You are working in {run_dir}, a gateway-owned scratch workspace. Clone any required repositories inside this directory. The workspace owner checkpoints source and reclaims local disk after confirmed writer stop; deliver findings and receipts to the board."
         )
     };
     let bridge_session = claim_session(cfg, tid);
@@ -4033,6 +3604,9 @@ fn spawn_opencode(
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
+    if let Err(error) = allocation.bind(&lifecycle::Ownership::Attempt { ticket, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: attempt_id.clone() }) {
+        dlog(tid, &format!("workspace exact ownership could not be persisted; no writer launched: {error}")); return;
+    }
     let control = match gateway_pipeline::arm_launch(cfg, tid, generation, &attempt_id, worktree.clone(), cancel.clone()) {
         Ok(control) => control,
         Err(error) => { dlog(tid, &format!("launch intent could not be persisted; no writer launched: {error}")); return; },
@@ -4494,40 +4068,6 @@ mod tests {
         wait_for_dispatch_wake(Duration::from_secs(5), || completed.load(Ordering::SeqCst));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(worker.join().is_err());
-    }
-
-    fn retained_sweep_candidates(n: usize) -> Vec<WorktreeCandidate> {
-        (0..n).map(|i| WorktreeCandidate {
-            slug: format!("BR-{i}"), path: PathBuf::from(format!("/fixture/BR-{i}")),
-            mtime: std::time::SystemTime::now(),
-        }).collect()
-    }
-
-    #[test]
-    fn retained_sweep_backlog_is_bounded_and_fair_across_restarts() {
-        let mut cursor = WorktreeSweepCursor::default();
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(11), &mut cursor,
-                Duration::from_secs(1), |candidate, _| { seen.push(candidate.slug.clone()); Some("in_progress".into()) },
-                |_, _, _| panic!("retained work must not be removed"));
-            assert!(inspected <= WORKTREE_SWEEP_CAP);
-            assert_eq!(swept, 0);
-            cursor = serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
-        }
-        assert_eq!(seen.len(), 11);
-        seen.sort(); seen.dedup();
-        assert_eq!(seen.len(), 11, "restarts must not keep probing just the oldest retained trees");
-    }
-
-    #[test]
-    fn slow_sweep_reads_exhaust_the_probe_budget_without_losing_the_cursor() {
-        let mut cursor = WorktreeSweepCursor::default();
-        let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(20), &mut cursor,
-            Duration::from_millis(20), |_, limit| { std::thread::sleep(limit); None },
-            |_, _, _| panic!("a failed status probe cannot delete fresh work"));
-        assert_eq!((inspected, swept), (1, 0));
-        assert_eq!(cursor.remaining.len(), 19);
     }
 
     #[test]
@@ -4995,23 +4535,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scratch_dirs_are_per_task_deterministic_paths() {
-        // BR#2460: repo-less dispatches provision <workdir>/sessions/bridge-<slug>.
-        // Creation must be idempotent (resume re-enters the same dir) and
-        // task-scoped (no cross-task bleed).
-        let base = std::env::temp_dir().join(format!("bridge-scratch-test-{}", std::process::id()));
-        let a = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
-        let b = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
-        assert_eq!(a, b);
-        let dir = a.expect("scratch dir created");
-        assert!(dir.is_dir());
-        assert!(dir.to_string_lossy().contains("sessions"));
-        let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
-        assert_ne!(dir, other);
-        let _ = std::fs::remove_dir_all(base);
-    }
-
     // ---- BR#3633: worktree sweep eventual-consistency ----
 
     #[test]
@@ -5024,35 +4547,6 @@ mod tests {
         assert_eq!(reverse_task_slug("hotfix-ext"), "hotfix-ext");
         assert_eq!(reverse_task_slug("br-3620-stale-ledger"), "br-3620-stale-ledger");
         assert_eq!(reverse_task_slug("BR-x"), "BR-x");
-    }
-
-    #[test]
-    fn sweep_disposition_eventual_rules() {
-        // explicit terminal statuses sweep at any age; done/superseded drop
-        // the branch (the WIP preservation branch survives it)
-        assert_eq!(
-            sweep_disposition(0, Some("done")),
-            (true, true, "task is done".to_string())
-        );
-        assert_eq!(
-            sweep_disposition(0, Some("superseded")),
-            (true, true, "task is superseded".to_string())
-        );
-        // todo sweeps but keeps the branch (a re-claim re-attaches to it)
-        let (sweep, drop, _) = sweep_disposition(0, Some("todo"));
-        assert!(sweep && !drop);
-        // fresh non-terminal trees are resume assets — kept whatever the state
-        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
-            let (sweep, _, _) = sweep_disposition(0, s);
-            assert!(!sweep, "fresh tree with status {s:?} must be kept");
-        }
-        // stale trees sweep regardless of status — the eventual guarantee
-        // (hub outage, unresolvable id, parked blocked task all drain)
-        let stale = WORKTREE_STALE_SECS + 1;
-        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
-            let (sweep, drop, _) = sweep_disposition(stale, s);
-            assert!(sweep && !drop, "stale tree with status {s:?} must sweep with branch kept");
-        }
     }
 
     #[test]
@@ -5126,7 +4620,7 @@ mod tests {
         // lives; the dead line is not — and prunes on read
         let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &HashSet::new(), &[]);
         assert!(found.iter().any(|c| c.path == live), "registered live path enumerated");
-        assert_eq!(worktree_registry_load(&home).len(), 1, "dead line pruned on read");
+        assert_eq!(worktree_registry_load(&home).len(), 2, "migration reads must not overwrite concurrent registry appends");
 
         // an in-flight slug is protected even though registered
         let mut active = HashSet::new();
@@ -5136,6 +4630,7 @@ mod tests {
 
         // teardown deregisters: the registry must not outlive the tree
         worktree_registry_remove(Some(&home), &live);
+        worktree_registry_remove(Some(&home), &dead);
         assert!(worktree_registry_load(&home).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }

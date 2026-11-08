@@ -230,6 +230,55 @@ pub fn retire(cfg: &DispatchConfig, record: &Record) -> Result<(), String> {
     Ok(())
 }
 
+/// This is a kernel fact, not a lease or a missing-heartbeat inference. Hold
+/// the original worker lock until the caller durably captures the result. A
+/// stopping hub fence prevents a delayed unit from acquiring a new writer lease.
+pub(super) fn with_stopped_worker<T>(cfg: &DispatchConfig, record: &Record, apply: bool, capture: impl FnOnce(Option<PathBuf>) -> Result<T, String>) -> Result<T, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { libc::getuid() };
+        let groups = PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"));
+        stopped_worker_under(cfg,record,apply,&groups,capture)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (cfg,record,apply,capture); Err("Original Linux systemd/kernel proof is required".into()) }
+}
+
+#[cfg(any(target_os="linux",test))]
+fn stopped_worker_under<T>(cfg:&DispatchConfig,record:&Record,apply:bool,groups:&Path,capture:impl FnOnce(Option<PathBuf>)->Result<T,String>)->Result<T,String> {
+    let root = gateway_pipeline::root(cfg)?.join("workers").join(record.name().trim_end_matches(".json"));
+    let spec: Spec = serde_json::from_slice(&fs::read(root.join("request.json")).map_err(|e| format!("Original worker manifest required: {e}"))?).map_err(|e| e.to_string())?;
+    spec.validate()?;
+    if spec.owner != record.owner || spec.root()? != root || spec.cfg.label != cfg.label || spec.cfg.url.trim_end_matches('/') != cfg.url.trim_end_matches('/') {
+        return Err("Original worker scope changed; preserve ownership".into());
+    }
+    let _lock = if apply { Some(Lock::acquire(&root.join("worker.lock"))?.ok_or("Original independent worker is still running")?) } else { None };
+    unit_kernel_empty(groups, &format!("bridge-worker-{}.service", record.name().trim_end_matches(".json")))?;
+    capture(spec.worktree)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn unit_kernel_empty(root: &Path, unit: &str) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(|e| format!("Kernel unit visibility incomplete: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            if entry.file_name() == unit { if !kernel_group_members(&entry.path())?.is_empty() {return Err("Original unit still contains processes".into());} }
+            else { unit_kernel_empty(&entry.path(), unit)?; }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os="linux",test))]
+pub(super) fn kernel_group_members(path:&Path)->Result<Vec<u32>,String> {
+    let mut members=fs::read_to_string(path.join("cgroup.procs")).map_err(|e|e.to_string())?.split_whitespace().map(|value|value.parse::<u32>().map_err(|e|e.to_string())).collect::<Result<Vec<_>,_>>()?;
+    for entry in fs::read_dir(path).map_err(|e|e.to_string())? {
+        let entry=entry.map_err(|e|e.to_string())?;
+        if entry.file_type().map_err(|e|e.to_string())?.is_dir() {members.extend(kernel_group_members(&entry.path())?);}
+    }
+    members.sort_unstable();members.dedup();Ok(members)
+}
+
 pub fn entry(path: &Path) -> Result<(), String> {
     let mut spec: Spec = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     spec.validate()?;
@@ -276,6 +325,7 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     runtime.control.grant_lease();
     let live = Arc::new(Mutex::new(String::new())); runtime.start_maintenance_every(&spec.cfg, &ticket.task_id, live.clone(), lease_interval);
     let published = live.clone(); let stop = runtime.control.clone(); let owner = spec.owner.clone(); let status_root = root.clone();
+    let output_path = workspace::Owner::open(&spec.cfg)?.output_path(ticket)?.unwrap_or_else(|| root.join("output.jsonl"));
     let mut previous = String::new();
     let status = move || {
         if let Ok(bytes) = fs::read(status_root.join("stop.json")) {
@@ -285,9 +335,12 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
         if !line.is_empty() && line != previous {
             let persisted = (|| -> std::io::Result<()> {
                 use std::io::Write;
-                let mut options = fs::OpenOptions::new(); options.create(true).append(true);
+                // Workspace output is expendable and bounded; exact terminal
+                // results/operation receipts remain in the durable journal.
+                let truncate = fs::metadata(&output_path).map(|m| m.len() >= 4 * 1024 * 1024).unwrap_or(false);
+                let mut options = fs::OpenOptions::new(); options.create(true).write(true).append(!truncate).truncate(truncate);
                 #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-                let mut file = options.open(status_root.join("output.jsonl"))?;
+                let mut file = options.open(&output_path)?;
                 writeln!(file, "{}", json!({"at":now_ms(),"line":line}))?; file.sync_data()
             })();
             if persisted.is_err() { stop.stop.store(true, Ordering::SeqCst); }
@@ -330,6 +383,31 @@ mod tests {
     use super::*;
     use std::process::Stdio;
     use super::super::gateway_pipeline::tests::{Hub, fixture};
+
+    #[test]
+    fn worker_recovery_requires_original_manifest_live_lock_and_complete_kernel_facts() {
+        let hub=Hub::new(|_|None);let (cfg,ready,_)=fixture(&hub);
+        let spec=Spec {protocol:PROTOCOL,owner:Ownership::Attempt {ticket:Ticket {task_id:"kernel-proof".into(),session:"original".into()},host:cfg.label.clone().unwrap(),generation:1,attempt_id:"one".into()},
+            cfg:cfg.clone(),title:"Kernel proof".into(),worktree:Some(PathBuf::from("retained-original-work")),scratch:None,started_at:now_ms(),
+            agent:Agent {workdir:"fixture".into(),bin:"false".into(),backend:"opencode".into(),agent:None,model:"fixture".into(),prompt:"fixture".into(),resume:None,config:None,mode:None}};
+        persist_spec(&spec).unwrap();let record=spec.record();let root=spec.root().unwrap();
+        let groups=root.join("kernel");let unit=groups.join(format!("bridge-worker-{}.service",record.name().trim_end_matches(".json")));
+        journal::write_file(&unit.join("cgroup.procs"),b"").unwrap();
+        assert!(!root.join("worker.lock").exists());
+        assert_eq!(stopped_worker_under(&cfg,&record,false,&groups,Ok).unwrap(),spec.worktree);
+        assert!(!root.join("worker.lock").exists(),"read-only proof cannot create a worker lock");
+        let live=Lock::acquire(&root.join("worker.lock")).unwrap().unwrap();
+        assert!(stopped_worker_under(&cfg,&record,true,&groups,Ok).unwrap_err().contains("still running"));drop(live);
+        journal::write_file(&unit.join("child/cgroup.procs"),b"123\n").unwrap();
+        assert!(stopped_worker_under(&cfg,&record,true,&groups,Ok).is_err());
+        std::fs::remove_file(unit.join("child/cgroup.procs")).unwrap();
+        assert!(stopped_worker_under(&cfg,&record,true,&groups,Ok).is_err(),"a visibility gap cannot prove stopped writers");
+        std::fs::remove_dir(unit.join("child")).unwrap();
+        stopped_worker_under(&cfg,&record,true,&groups,|path| {assert_eq!(path,spec.worktree);assert!(Lock::acquire(&root.join("worker.lock")).unwrap().is_none());Ok(())}).unwrap();
+        let mut foreign=record.clone();foreign.owner=Ownership::Attempt {ticket:record.ticket().clone(),host:record.host.clone(),generation:2,attempt_id:"other".into()};
+        assert!(stopped_worker_under(&cfg,&foreign,true,&groups,Ok).is_err());
+        drop(ready);let _=std::fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
+    }
 
     fn child(which: &str, path: &Path) -> Command {
         let mut cmd = Command::new(std::env::current_exe().unwrap());

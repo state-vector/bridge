@@ -210,7 +210,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
     const mins = Math.max(1, Math.floor((now - f.starved.since) / 60_000));
     const ready = q?.entries?.filter(e => e.cls === "ready").length ?? 0;
-    const reason = `No merge for ${mins} minutes. ${fresh && bs?.verdict === "green" ? "Main's required checks are green. " : ""}`
+    const reason = `Changes have waited ${mins} minutes without a merge. ${fresh && bs?.verdict === "green" ? "Main's required checks are green. " : ""}`
       + (executorLive ? "The gateway is active, but merge execution is not advancing. " : "No live merge executor is confirmed. ")
       + (ready ? `${ready} candidate(s) passed the initial queue gates; Bridge must investigate current-base admission and merge execution, and continue independent candidates.`
         : "Bridge must inspect candidate checks, review and executor failures, then restore delivery.");

@@ -1256,11 +1256,12 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
       { id: "BR#3", pr: 103, state: "waiting" as const },
       { id: "BR#4", pr: 104, state: "ready" as const },
     ];
-    // PR 101 and PR 104 conflict → Batch 1 takes [101, 102, 103], Batch 2 takes [104]
+    // PR 101 and PR 104 conflict. Both ready cars precede unverified cars,
+    // even though they need separate batches.
     const batches = partitionMergeBatches(cars, [[101, 104]], 10);
     expect(batches.map((b) => b.map((c) => c.pr))).toEqual([
-      [101, 102, 103],
-      [104],
+      [101],
+      [104, 102, 103],
     ]);
     // burst_max cap = 2 with no conflicts → ready cars [101, 104] first in Batch 1, then [102, 103] in Batch 2
     const capped = partitionMergeBatches(cars, [], 2);
@@ -2042,6 +2043,19 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
       { pr: 101, state: "verifying" },
       { pr: 102, state: "waiting" },
     ]);
+  });
+
+  it("ready cars in later conflict batches still precede every unverified car", () => {
+    const cars = [
+      { id: "BR#4", pr: 104, state: "waiting" as const },
+      { id: "BR#1", pr: 101, state: "ready" as const },
+      { id: "BR#5", pr: 105, state: "verifying" as const },
+      { id: "BR#2", pr: 102, state: "ready" as const },
+      { id: "BR#3", pr: 103, state: "ready" as const },
+    ];
+    const batches = partitionMergeBatches(cars, [[101, 102], [101, 103], [102, 103]], 2);
+    expect(batches.map(batch => batch.map(car => car.pr))).toEqual([[101], [102], [103, 105], [104]]);
+    expect(batches.flat().map(car => car.state)).toEqual(["ready", "ready", "ready", "verifying", "waiting"]);
   });
 
   it("decideTrainGate self-heals stale main-green gate reds on a green base via rerun_gate", () => {

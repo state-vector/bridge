@@ -47,6 +47,25 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("carries the effective reasoning tier from reservation through begin", async () => {
+    const project = "reservation-model-tier", g = await gateway(project);
+    const large = { ...g.capabilities, tier: "large", model: "test/large" };
+    expect((await g.cmd({ kind: "advertise", capabilities: { ...large, alternatives: [g.capabilities] } })).ok).toBe(true);
+    expect((await post("admin.settings_set", { settings: { model_policy: { impl: { kind: "minimum", tier: "large" } } } })).error).toBeUndefined();
+    const id = await task(project, { execution_requirements: { tier: "small", tools: [], environment: [] } });
+    const claim = await reserve(g, "large-reservation");
+    if (claim.kind !== "reserved") throw new Error("no reservation");
+    expect(claim.task_id).toBe(id);
+    expect(claim.task?.meta).toMatchObject({
+      execution_requirements: { tier: "small" },
+      execution_scheduling_requirements: { tier: "large" },
+    });
+    expect(await reserve(g, "large-reservation")).toEqual(claim);
+    const begun = await g.cmd({ kind: "begin", attempt_id: "large-attempt", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: large.backend, model: large.model, tier: large.tier } }, "large-begin", id, claim.session);
+    expect(begun).toMatchObject({ attempt: { executor: { model: "test/large", tier: "large" } } });
+  });
+
   it("acknowledges capability renewal without reconciling the backlog on the liveness request", async () => {
     const project = "bounded-control-plane", g = await gateway(project);
     const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });

@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 import { parseCardIdRefs } from "../src/kb/core.ts";
 
 /**
@@ -75,6 +76,7 @@ const authAsk = async (subject: string, targets: string[], options: string[]) =>
     reason: "Supersede is human-authority — requesting batch drop authorization.",
     details: `Census of stale parks (receipts on each card): ${targets.join(" / ")} — dead + conflicting parks.`,
     options,
+    decision: decisionFixture(subject, options),
     artefact_id: subject,
     actor: "drill-drain-owner",
   });

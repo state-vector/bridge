@@ -174,17 +174,12 @@ import {
   trainLandedCloseNote,
   trainLandedCloseEdge,
   trainCloseBounceBrief,
-  trainCloseFailAskTitle,
-  trainCloseFailAskDetails,
   TRAIN_LANDED_CLOSE_MAX_RETRIES,
   releaseHold,
   todoDispatchHold,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
   decideProseDisposition,
-  proseClassAskTitle,
-  proseAlarmAskTitle,
-  PROSE_CLASS_AMBIGUOUS,
   PROSE_CLASS_QUIET_MS,
   type ProseLeg,
   type ProseLegVerdict,
@@ -238,7 +233,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -451,6 +446,7 @@ import {
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "./review-query";
+import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
 import type { ExecutorReadiness } from "@bridge/contracts";
@@ -1132,7 +1128,7 @@ export class KnowledgeHub {
       const age = now - (v.age_ts ?? now);
       if (age <= 60 * 60_000) continue;
       const lastNudge = this.one(
-        `SELECT ts FROM events WHERE artefact_id = ? AND op = 'nudge' ORDER BY ts DESC LIMIT 1`, v.verify_task,
+        LAST_NUDGE_SQL, v.verify_task,
       );
       if (lastNudge && now - Number(lastNudge.ts) <= 60 * 60_000) continue;
       const mins = Math.round(age / 60_000);
@@ -2123,48 +2119,16 @@ export class KnowledgeHub {
     prose: { flip: number; restore: number; release: number; escalate: number; prose: number; classCards: { id: string; title: string; fact: string }[] },
     now: number,
   ): Promise<void> {
-    // ---- the ONE class ask (rung 4), deduped by stamp + identical-open guard
+    // A missing resume condition is Bridge repair work, even on a protected
+    // card. A recovery executor may request a real human choice after diagnosis;
+    // the sweep itself has identified no such choice.
     if (prose.classCards.length > 0) {
-      const classKey = `prose_migration_${PROSE_CLASS_AMBIGUOUS}`;
-      const last = Number(this.settingValue(classKey, "0")) || 0;
-      if (now - last >= PROSE_CLASS_QUIET_MS) {
+      for (const c of prose.classCards) {
         try {
-          const ask = await this.askCreate(
-            {
-              to: "ray",
-              question: proseClassAskTitle(prose.classCards.map((c) => c.id)),
-              reason: `these ${prose.classCards.length} blocked card(s) are parked on pure prose with no machine leg anywhere in their state, and they are runner/human-owned — the sweep may not re-scope them; ONE ask covers the class (BR#4416, never one per card)`,
-              details: [
-                ...prose.classCards.map((c) => `- ${c.id} "${c.title}" — ${c.fact}`),
-                ``,
-                `Grammar for a RE-SCOPE (closed set): ${AWAIT_GRAMMAR_DOC}`,
-              ].join("\n"),
-              options: [
-                "RE-SCOPE — I'll rewrite each card's resume condition as a checkable event",
-                "RELEASE — send these cards back to the pool unchanged",
-                "SUPERSEDE — drop the named cards",
-              ],
-              artefact_id: prose.classCards[0].id,
-            },
-            "hub:proxy-watch",
-          );
-          this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('${classKey}', ?)`, String(now));
-          // stamp every class card with the ask as its typed leg — they leave
-          // the prose population the moment the ask exists (the answer owns
-          // the exit, exactly like a bound ask).
-          for (const c of prose.classCards) {
-            try {
-              const row = this.one(`SELECT meta FROM artefacts WHERE id = ?`, c.id) as any;
-              if (!row?.meta) continue;
-              const meta = JSON.parse(row.meta);
-              meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "ask", ask_id: ask.id } };
-              this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), c.id);
-              this.audit("hub:proxy-watch", "prose_class_ask_stamp", c.id, { ask: ask.id });
-            } catch { /* the typed path re-reads meta next pass anyway */ }
-          }
+          const duty = await this.ensureTaskRecovery(c.id, "resume_condition");
+          await this.parkOnRecovery(c.id, duty, "Bridge is repairing the missing resume condition.");
         } catch (e) {
-          // an identical ask is already open for this class — that IS one per class
-          this.audit("hub:proxy-watch", "prose_class_ask_deduped", prose.classCards[0].id, { detail: String((e as Error).message ?? e).slice(0, 200) });
+          this.audit("hub:proxy-watch", "prose_recovery_failed", c.id, { detail: String((e as Error).message ?? e).slice(0, 200) });
         }
       }
     }
@@ -2209,24 +2173,7 @@ export class KnowledgeHub {
     if (now - last < PROSE_CLASS_QUIET_MS) return; // one alarm per episode per day
     const summaries = this.proseAlarmSummaries();
     try {
-      await this.askCreate(
-        {
-          to: "human",
-          question: proseAlarmAskTitle(summaries),
-          reason: `prose_blocked_count=${prose.prose} after the BR#4248 generator-kill deployed — a writer is still minting prose parks (the population canary, BR#4416); this is the ONE class alarm, not per-card asks`,
-          details: summaries.length
-            ? `Cards still parked on unparseable prose with no machine leg, and the writer each card's own state names:\n${summaries.map((s) => `- ${s}`).join("\n")}`
-            : `prose_blocked_count=${prose.prose} this pass; per-card detail rides the prose_check audit lines.`,
-          options: [
-            "Investigating — will find and fix the writer",
-            "Known backlog — draining manually",
-            "False positive — these cards have legs",
-          ],
-          artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-          urgency: "time-sensitive",
-        },
-        "hub:proxy-watch",
-      );
+      this.audit("hub:proxy-watch", "prose_population_alarm", "watchdog", { count: prose.prose, summaries });
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('prose_alarm_ts', ?)`, String(now));
     } catch (e) {
       // an identical alarm is already open for this episode — that IS once
@@ -2410,15 +2357,15 @@ export class KnowledgeHub {
     const id = String(r.id);
     const verdicts: ProseLegVerdict[] = [];
     for (const leg of this.recoverProseLegs(id, meta)) verdicts.push(await this.evalProseLeg(leg));
-    const classKey = `prose_migration_${PROSE_CLASS_AMBIGUOUS}`;
-    const lastRaw = this.settingValue(classKey, "");
     const d = decideProseDisposition({
       cardId: id,
       title: String(r.title ?? id),
       now,
       legs: verdicts,
       releaseRestricted: this.proseReleaseRestricted(meta),
-      lastClassAskTs: lastRaw ? Number(lastRaw) || null : null,
+      // Agent recovery is deduplicated per task, not delayed by the old daily
+      // human-escalation budget (including a stamp from a previous deploy).
+      lastClassAskTs: null,
       classAskQuietMs: PROSE_CLASS_QUIET_MS,
     });
     switch (d.kind) {
@@ -2937,7 +2884,7 @@ export class KnowledgeHub {
     };
     for (const t of tokens) sig(t.label); // agents with no activity still get a row
     for (const p of this.state.storage.sql.exec(
-      `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`,
+      RECENT_PROGRESS_SQL,
       weekTs,
     ).toArray() as any[]) {
       const s = sig(p.actor);
@@ -3483,6 +3430,7 @@ export class KnowledgeHub {
     } catch (e) {
       console.log("ledger migration:", String(e).slice(0, 200));
     }
+    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA);
 
     // sessions.kind backfill: gateway identity via the local token registry
     try {
@@ -4235,6 +4183,8 @@ export class KnowledgeHub {
       if (createMeta.ask.answer || createMeta.ask.resolution) throw new Error("new asks start open; record answers through answer_ask");
       createMeta.ask.route = askRoute(createMeta.ask);
       if (createMeta.ask.route.kind === "independent_review") throw new Error("independent review is work: use ask.create with route independent_review, not a question node");
+      const decision = this.admitHumanAsk(createMeta.ask);
+      if (decision) createMeta.ask = { ...createMeta.ask, decision, artefact_id: decision.task_id, reason: decision.why_human, options: decision.choices.map(c => c.label) };
       const opts = Array.isArray(createMeta.ask.options) ? createMeta.ask.options.filter(Boolean) : [];
       if (opts.length < 2) throw new Error("asks require 2-8 answer options — give the human one-click answers (meta.ask.options)");
       if (!String(body.title ?? "").trimEnd().endsWith("?")) throw new Error("phrase the ask as an answerable question ending in '?' — e.g. 'Do you want to merge PR #84 into main?'");
@@ -4318,26 +4268,11 @@ export class KnowledgeHub {
             };
             const alreadyRight = verdict === "bounce" ? trow.status === "in_progress" : trow.status === "done";
             if (!alreadyRight) {
-              // 3 identical rounds = the loop is stalled; park it for a human.
-              // BR#3578: the human leg is an ACTIVE ask (For Me, one click),
-              // not prose buried on the card.
+              // Repeated review findings require repair, not a generic human
+              // choice between retrying unchanged and dropping the work.
               if (round >= 3) {
-                const stallAsk = await this.askCreate({
-                  to: "ray",
-                  question: `Verify loop stalled on ${trow.id} (${round} identical ${verdict} rounds) — cancel the loop or keep it parked?`,
-                  reason: "the verifier keeps proposing the identical verdict; auto-apply made no progress — the loop needs a human ruling",
-                  options: ["CANCEL — transition the loop to todo for re-scoping", "KEEP PARKED — I'll clear the blocker myself", "SUPERSEDE — drop the stalled round"],
-                  details: `Verify loop stalled: ${round} rounds with identical verdict (${verdict}), each auto-applied with no progress. Read the verify history on ${trow.id} before answering.`,
-                  artefact_id: trow.id,
-                }, "system:verifier").catch(() => null);
-                if (stallAsk?.task_status !== "blocked") {
-                  await this.transition({
-                    id: trow.id, to: "blocked",
-                    note: `verify loop stalled — ${round} rounds with identical verdict (${verdict}); auto-applied each time, no progress. Needs human intervention.`,
-                    unblock_condition: "human: read the verify history on this card; either clear the blocker the verifier keeps naming, or cancel the loop (transition todo and address the task differently)",
-                    ...(stallAsk ? { await_event: { event: "ask", ask_id: stallAsk.id } } : {}),
-                  }, "system:verifier");
-                }
+                const recovery = await this.ensureTaskRecovery(String(trow.id), "queue_binding");
+                await this.parkOnRecovery(String(trow.id), recovery, `Bridge is repairing the repeated review failure (${round} rounds).`);
               } else {
                 await this.transition({
                   id: trow.id, to: verdict === "bounce" ? "in_progress" : "done",
@@ -4777,6 +4712,11 @@ export class KnowledgeHub {
         if (JSON.stringify(body.meta.ask[key]) !== JSON.stringify(JSON.parse(String(row.meta ?? "{}")).ask?.[key])) throw new Error("ask lifecycle fields are owned by answer_ask and machine cancellation, not metadata updates");
       }
       metaObj.ask.route = askRoute(metaObj.ask);
+      if (preMeta.ask?.artefact_id && metaObj.ask.artefact_id !== preMeta.ask.artefact_id) throw new Error("an ask's affected-task binding cannot change through metadata edits");
+    }
+    if (metaObj.ask && (body.meta?.ask || body.title !== undefined || body.body_md !== undefined)) {
+      const decision = this.admitHumanAsk(metaObj.ask);
+      if (decision) metaObj.ask = { ...metaObj.ask, decision, artefact_id: decision.task_id, reason: decision.why_human, options: decision.choices.map(c => c.label) };
     }
     // BR#5807 fail-closed guard: meta_delete is the only remaining way to drop
     // keys, so it carries the authority check the close-protection law uses
@@ -5264,9 +5204,11 @@ export class KnowledgeHub {
           const reservation = this.one(`SELECT expires_at FROM dispatch_reservations WHERE task_id=? AND token_id=? AND session=?`, id, tokenId, session);
           if (!reservation) throw new Error("gate: reservation no longer held after claim");
           const assigned = this.one(`SELECT id,title,body_md,project,meta,roles,tags FROM artefacts WHERE id=?`, id)!;
+          const meta = JSON.parse(String(assigned.meta ?? "{}"));
+          meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
-              meta: JSON.parse(String(assigned.meta ?? "{}")), roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
+              meta, roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
           recoveryCapacity.consume(tokenId, id);
           break;
         } catch (error) {
@@ -6383,7 +6325,7 @@ export class KnowledgeHub {
       // recent version-log rows (newest first) for the server-side silent-churn fold
       recentEvents: () =>
         (this.state.storage.sql.exec(
-          `SELECT ts, actor, action, summary FROM artefact_versions WHERE artefact_id = ? ORDER BY seq DESC LIMIT 50`,
+          RECENT_TASK_MUTATIONS_SQL,
           id,
         ).toArray() as any[]).map((r) => ({ ts: Number(r.ts), actor: String(r.actor), action: String(r.action), summary: String(r.summary ?? "") })),
     };
@@ -7994,8 +7936,7 @@ export class KnowledgeHub {
 
   private async getHistory(artefactId: string, limit = 100) {
     const rows = this.state.storage.sql.exec(
-      `SELECT seq, ts, actor, action, summary, data FROM artefact_versions
-       WHERE artefact_id = ? ORDER BY seq DESC LIMIT ?`,
+      TASK_HISTORY_SQL,
       artefactId, Math.min(limit, 200),
     ).toArray().map((r: any) => ({ ...r, data: JSON.parse(r.data ?? "{}") }));
     return { artefact_id: artefactId, versions: rows };
@@ -8511,7 +8452,7 @@ export class KnowledgeHub {
     let to = String(body.to ?? (body.route?.kind === "human_decision" ? "human" : "any"));
     const route = askRoute({ route: body.route, to });
     const decision = body.decision === undefined ? undefined : HumanDecisionSchema.parse(body.decision);
-    if (body.route?.kind === "human_decision" && !decision) throw new Error("human_decision requires decision: affected task, context, why_human, and explicit choices naming executor, consequence and action; diagnostics belong to agent recovery");
+    if (route.kind === "human_decision") this.admitHumanAsk({ ...body, to, route });
     if (decision && route.kind !== "human_decision") throw new Error("decision is only valid for human_decision requests");
     if (route.kind === "independent_review") {
       return this.ensureIndependentReview(route.task_id, actor);
@@ -8663,6 +8604,12 @@ export class KnowledgeHub {
     }
     this.audit(actor, "ask", artefactId || null, { to, question, options, urgency, ask_id: id });
     return { id, ask: id, question, artefact_id: artefactId || undefined, options, urgency, task_status: taskStatus };
+  }
+
+  private admitHumanAsk(ask: Parameters<typeof requireHumanDecision>[0]) {
+    const decision = requireHumanDecision(ask);
+    if (decision && this.one(`SELECT type FROM artefacts WHERE id = ?`, decision.task_id)?.type !== "task") throw new Error("a human decision must name its existing affected task");
+    return decision;
   }
 
   /** The same review pool used by in_review, never a human staffing question.
@@ -9721,7 +9668,7 @@ export class KnowledgeHub {
       const ownerLabel = t.owner || label;
       const wasDoing = mine && meta.last_progress?.will ? ` Your last will: "${String(meta.last_progress.will).slice(0, 150)}".` : "";
       const lastOwn = this.one(
-        `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`, t.id, ownerLabel,
+        LAST_ACTOR_SIGNAL_SQL, t.id, ownerLabel,
       )?.ts ?? 0;
       const idleFor = now - Math.max(lastOwn, t.updated_ts ?? 0);
       if (mine && idleFor < idleLimit) {
@@ -9738,48 +9685,15 @@ export class KnowledgeHub {
       const attempts = ((meta.attempt?.attempts as number) ?? 0) + 1;
       // REWORK-LOOP ESCALATION: past 5 attempts this is not bad luck — it's a
       // loop (claim → stall → watchdog-bounce → blocked → release → claim…).
-      // Re-releasing just runs the same cycle again. Park it blocked-for-human:
-      // only a human (web/human actor) may release it from here on.
-      if (attempts >= 5) {
-        // BR#3578: the human leg is an ACTIVE ask (For Me, one click), not
-        // prose on a parked card. reapAbandoned stays sync — the ask files as
-        // a promise; askCreate auto-blocks the in_progress subject with the
-        // typed ask event, and the .then leg stamps awaiting_ask + the typed
-        // await onto the card once the ask id exists.
-        void this.askCreate({
-          to: "ray",
-          // Plain-English rewrite (BR#4023): the rework-loop ask states the
-          // fact (stuck, N failed attempts), the consequence (re-release
-          // repeats the cycle), and what each option concretely does.
-          question: `Card ${t.id} is stuck in a rework loop (${attempts} failed attempts) — fix its brief, re-release it, or drop it?`,
-          reason: `${attempts} dispatch attempts ended without completion (last: ${reason.slice(0, 120)}) — each re-release repeats the same claim→stall cycle, so this needs a human decision`,
-          options: [
-            "RE-SCOPE — rewrite the card's brief, then release it normally",
-            "RELEASE — back to the pool as-is",
-            "SUPERSEDE — drop the card",
-          ],
-          details: `"${t.title}" (${t.id}) has failed ${attempts} dispatch attempts. Last release reason: "${reason.slice(0, 200)}".
-
-What this means: agents keep picking the card up and stalling the same way — re-releasing it unchanged just repeats the cycle. Check the attempt history on the card before answering.
-
-- RE-SCOPE: fix the card's brief (title, body, exit condition) so the next attempt can actually succeed, then release it.
-- RELEASE: back to the pool unchanged — reasonable only if the past failures were environmental and are now fixed.
-- SUPERSEDE: drop it — the work is moot, done elsewhere, or not worth the loop.
-
-Or answer in your own words — a typed answer is recorded with the ask exactly like a click.`,
-          artefact_id: t.id,
-        }, "system:reaper")
-          .then((loopAsk) => {
-            const fresh = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id = ?`, t.id)?.meta ?? "{}"));
-            fresh.blocked = { ...(fresh.blocked ?? {}), await_event: { event: "ask", ask_id: loopAsk.id } };
-            fresh.awaiting_ask = { ...(fresh.awaiting_ask ?? {}), ask_id: loopAsk.id, ts: Date.now() };
-            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(fresh), t.id);
-            this.audit("system:reaper", "loop_ask_filed", t.id, { ask_id: loopAsk.id, attempts });
-          })
-          .catch(() => { /* ask filing failed — the escalation record below still parks it for human review */ });
+      // Re-releasing just runs the same cycle again. Bridge must diagnose it
+      // before retrying, while genuine external waits retain their own exits.
+      if (attempts >= 5 && !releaseHold(meta)) {
+        void this.ensureTaskRecovery(String(t.id), "execution_environment")
+          .then(duty => this.parkOnRecovery(String(t.id), duty, "Bridge is investigating repeated failed attempts before retrying."))
+          .catch(error => this.audit("system:reaper", "loop_recovery_failed", t.id, { error: String(error).slice(0, 300) }));
         meta.blocked = {
-          reason: `rework loop detected — ${attempts} dispatch attempts without completion (last release reason: ${reason.slice(0, 160)}). Re-running again would repeat the cycle; escalated to a human.`,
-          unblock_condition: "human: review the attempt history (get_history) — either fix what keeps failing, re-scope the task, or transition it todo yourself to deliberately continue",
+          reason: `Bridge is investigating ${attempts} unsuccessful attempts before retrying. Last result: ${reason.slice(0, 160)}`,
+          unblock_condition: "Bridge's recovery task identifies and repairs the demonstrated execution blocker before the original work resumes.",
           ts: now,
         };
         meta.attempt = { by: ownerLabel, at: now, attempts, last_reason: reason.slice(0, 200) };
@@ -9791,9 +9705,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         // a NOTE, not a transition row — the status does not change here; a
         // transition stamp without from/to is invisible to the replay fold
         // and masquerades as a move that never happened (BR#3322)
-        this.version(t.id, "system:reaper", "note", `rework loop escalated to human — ${attempts} attempts without completion`, { prev_owner: ownerLabel, attempts });
+        this.version(t.id, "system:reaper", "note", `Bridge recovery requested after ${attempts} unsuccessful attempts`, { prev_owner: ownerLabel, attempts });
         out.push(
-          `${t.id} "${t.title}" REWORK LOOP (${attempts} attempts) — escalated to a human instead of re-releasing. Blocked-for-human until reviewed.`,
+          `${t.id} "${t.title}" — Bridge is investigating ${attempts} failed attempts before retrying.`,
         );
         continue;
       }
@@ -11355,13 +11269,17 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   /** train.lease — the CAS op. The DO is single-threaded, so the
    *  read-check-write is atomic by construction; leaseDecide is the check.
-   *  holder defaults to the authenticated actor (the acting gateway). */
+   *  The authenticated actor owns the lease and records train events. */
   private async trainLease(body: any, actor: string): Promise<any> {
     const repo = String(body.repo ?? "").trim();
     const base = String(body.base ?? "main").trim();
     const action: LeaseAction = ["acquire", "renew", "release"].includes(String(body.action)) ? body.action : null;
     if (!action) throw new Error("action must be acquire | renew | release");
-    const holder = String(body.holder ?? actor).trim() || actor;
+    const requestedHolder = String(body.holder ?? "").trim();
+    if (requestedHolder && requestedHolder !== actor) {
+      throw new Error("train lease holder must match the authenticated actor");
+    }
+    const holder = actor;
     const lane = await this.laneEnsure(repo, base, actor);
     const outcome = this.atomicLaneMutation(() => {
     const meta = JSON.parse(lane.meta ?? "{}");
@@ -12383,6 +12301,8 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       // Legacy stops keep the exact legacy shape (no bisect key beyond the
       // culprit_task the BR#4981 vocabulary names).
       const burstStop = meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
+      // culprit_task rides the stop record (BR#4849): the Top view banner
+      // answers "who broke it" from the stop itself, not session memory.
       meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
       // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
@@ -12947,30 +12867,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       );
       this.audit(actor, "train:landed_close_bounced", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) });
       this.version(lane.id, actor, "train:landed", `PR #${p.pr} merged green but the card close failed ${failures}× (${klass}${boundFired ? ", bound fired" : ""}) — card close-bounced with the repair brief; lane idled, queue advances (BR#4753)`, { reason: reason2 });
-      // ONE ask per episode to the alarm sink (BR#3124) — askCreate's
-      // identical-open-ask guard dedupes the rest. NEVER artefact_id = the
-      // culprit card: an open ask child would fence its next landed close —
-      // the exact done-open-children class this fix exists for (BR#4068).
-      const askTitle = trainCloseFailAskTitle({ repo: laneSpec.repo, base: laneSpec.base }, p.mergeSha, p.pr, klass, boundFired);
+      // The failed close is Bridge-owned bookkeeping. The recovery duty is
+      // deduplicated on the actual task; no notification-sink decision is made.
       try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: "the merge train's landed close was gate-rejected repeatedly — previously SILENT per tick, it starved the whole lane past the fail-closed bound (BR#4753); the card is close-bounced, but a session should confirm the named precondition is agent-repairable",
-            details: trainCloseFailAskDetails({ repo: laneSpec.repo, base: laneSpec.base, prNumber: p.pr, mergeSha: p.mergeSha, taskId, error, breachClass: klass, boundFired, failures, gateway: actor }),
-            options: ["Ack — checking the card", "Fix the gate precondition", "Stop the line — human needed"],
-            artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
+        const recovery = await this.ensureTaskRecovery(taskId!, "queue_binding");
+        this.audit(actor, "train:close_recovery_scheduled", taskId!, { recovery, merge_sha: p.mergeSha, breach_class: klass });
       } catch (ae) {
         const am = String((ae as Error)?.message ?? ae);
-        // an identical ask is already open for this episode — that IS one
-        // per episode. Any other failure (missing sink card) is loud in the
-        // audit, never a raw throw (BR#4753: silence is the defect).
-        this.audit(actor, am.startsWith("an identical ask is already open") ? "train:close_ask_deduped" : "train:close_ask_failed", lane.id, { reason: am.slice(0, 160) });
+        this.audit(actor, "train:close_recovery_failed", lane.id, { reason: am.slice(0, 160) });
       }
       return { ok: true, decided: boundFired ? "bounce_bound" : "bounce_gate", pr: p.pr, merge_sha: p.mergeSha, task: taskId, breach_class: klass, bound_fired: boundFired, failures, reason: reason2 };
     }
@@ -13167,23 +13071,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     this.saveLaneState(lane.id, meta, now);
     this.audit(actor, "train:phantom_required_stamped", lane.id, { lane: laneKey(args.repo, args.base), phantom_required: stamped });
     try {
-      await this.askCreate(
-        {
-          to: "human",
-          question: `Lane config defect ${args.repo}@${args.base}: required workflow(s) never run on merge commits — remove ${args.phantoms.join(", ")} from required_workflows?`,
-          reason: "the merge train cannot prove these required workflows on a landed merge commit — merges land judged on the workflows that exist (Ray ruling 2026-10-30), but the lane config should be fixed",
-          details: [
-            `Lane ${laneKey(args.repo, args.base)} requires: ${(meta.lane?.required_workflows ?? []).join(", ")}.`,
-            `On merge commit ${args.mergeSha.slice(0, 9)} (PR #${args.pr}) these required workflows produced NO check run — they look PR-context-only (e.g. a pull_request-triggered gate) and can never appear on a merge commit: ${args.phantoms.join(", ")}.`,
-            `Effect: merges LAND judged on the workflows that exist (the phantom names are stamped out of the settle judge, BR#5829) instead of holding the lane for the fail-closed bound.`,
-            `Fix: remove the PR-context-only names from the lane's required_workflows (admin settings key train_lane, or the lane card's config op) — the admission gate already judges base-main health separately.`,
-          ].join("\n\n"),
-          options: ["Fix the lane config (remove PR-context-only workflows)", "Ack — landing on existing workflows is fine", "Investigate — these should run on merge commits"],
-          artefact_id: this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-          urgency: "time-sensitive",
-        },
-        "system:train",
-      );
+      await this.ensureTaskRecovery(String(lane.id), "execution_environment");
     } catch (e) {
       // an identical ask is already open for this episode — that IS one
       // per episode. Any other failure (missing sink card) is loud in the
@@ -14008,10 +13896,11 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
-      const cm = JSON.parse(cards.find((x) => x.id === c.id)!.meta ?? "{}");
+      const row = cards.find((x) => x.id === c.id)!;
+      const cm = metaById.get(c.id);
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
-      return { ...c, ...(pr ? { pr } : {}) };
+      return { ...c, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
     // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
     // Top-panel budget chip reads this; the executor ignores the extra
@@ -14059,14 +13948,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     const held = entriesArr.length;
     const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
     const fix = this.trainOpenRootFix(repo, entriesArr);
-    const sinkId = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
     const warranted = trainBaseRedAskWarranted(fix);
     const existing = this.one(
-      `SELECT c.id AS id, c.body_md AS body_md, c.meta AS meta FROM relations r
-       JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question' AND c.title = ? LIMIT 1`,
-      sinkId, askTitle,
+      `SELECT id, body_md, meta FROM artefacts WHERE type='question' AND status IN ('todo','in_progress','blocked') AND title=? LIMIT 1`, askTitle,
     ) as any;
     // BR#6390 (Ray 2026-11-05, from the BR#6382→BR#6385 churn): an ANSWERED
     // gate must not be re-minted before the executor acts on it. Two stamps
@@ -14117,32 +14001,31 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
       return;
     }
     const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
+    const affectedTask = fix.card?.id ?? lane.id;
+    const decision = HumanDecisionSchema.parse({
+      kind: fix.curePr ? "authority" : "preference", task_id: affectedTask,
+      context: fix.curePr
+        ? `Changes in ${repo} are waiting because the main branch is failing. Repair PR #${fix.curePr.number} is ready for the remaining administrator-only merge step.`
+        : `Automatic repair of ${repo} has stalled after repeated attempts. The work remains open; choose whether to provide new direction or keep it paused.`,
+      why_human: fix.curePr
+        ? "The remaining merge step requires your repository authority. Bridge will verify the actual merge and deployment afterwards."
+        : "This is a choice about the next repair direction; Bridge cannot invent instructions or treat another unchanged retry as progress.",
+      choices: brief.options.map((label, i) => ({ label, executor: i === 0 ? "human" : "bridge", consequence: fix.curePr
+        ? i === 0 ? "You merge the named repair. Bridge checks the actual GitHub merge and deployment before advancing the queued changes." : "Bridge keeps the changes queued and continues observing the repair; no merge permission or success is inferred."
+        : i === 0 ? "You provide the specific missing information or instructions on the repair task." : i === 1 ? "Bridge re-issues the repair with your new direction; existing execution fences and review requirements remain." : "Bridge keeps the work paused until the existing failure is resolved.", action: "hold" })),
+    });
     if (existing) {
       const em = JSON.parse(existing.meta ?? "{}");
-      const prevOptions = Array.isArray(em?.ask?.options) ? em.ask.options.map(String) : [];
-      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(prevOptions) !== JSON.stringify(brief.options)) {
-        em.ask = { ...(em.ask ?? {}), to: String(em.ask?.to ?? "human"), options: brief.options };
-        this.state.storage.sql.exec(
-          `UPDATE artefacts SET body_md = ?, meta = ?, updated_ts = ? WHERE id = ?`,
-          brief.details, JSON.stringify(em), Date.now(), existing.id,
-        );
-        this.version(existing.id, actor, "update", `base-red ask refreshed — fix ${fix.card ? fix.card.id : "(no card)"}${fix.curePr ? `, cure PR #${fix.curePr.number}` : ", no cure PR yet"} (the ask is a live triage view while the base is red)`, {});
-        this.audit(actor, "train:base_red_ask_refreshed", lane.id, { ask: existing.id, fix_card: fix.card?.id ?? null, cure_pr: fix.curePr?.number ?? null });
+      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(em.ask?.decision) !== JSON.stringify(decision)) {
+        em.ask = { ...em.ask, route: { kind: "human_decision" }, decision, to: "human", artefact_id: affectedTask, reason: decision.why_human, options: brief.options };
+        this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id=? AND relation='child_of'`, existing.id);
+        this.state.storage.sql.exec(`INSERT INTO relations (src_id,relation,dst_id,created_ts) VALUES (?,'child_of',?,?)`, existing.id, affectedTask, Date.now());
+        this.state.storage.sql.exec(`UPDATE artefacts SET body_md=?,meta=?,updated_ts=? WHERE id=?`, brief.details, JSON.stringify(em), Date.now(), existing.id);
+        this.version(existing.id, actor, "update", "Refreshed the actual administrator decision and its affected repair task.", {});
       }
     } else {
       try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: askTitle,
-            reason: `base ${repo}@${base} RED — a human gate is on the table: ${fix.curePr ? `merge cure PR ${fix.curePr.repo}#${fix.curePr.number} yourself, then click DONE (out-of-turn merge is human authority, BR#4122/BR#5450)` : "the fix path is exhausted — manual steps are the only lever left"}`,
-            details: brief.details,
-            options: brief.options,
-            artefact_id: sinkId,
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
+        await this.askCreate({ to: "human", route: { kind: "human_decision" }, question: askTitle, decision, details: brief.details, artefact_id: affectedTask, urgency: "time-sensitive" }, actor);
       } catch (e) {
         this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
       }
@@ -14360,7 +14243,7 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
 
   /** BR#4489 + BR#5674 P4 starvation:
    *  - P4 merge-starvation: when a lane has a non-empty derived queue OR
-   *    non-empty awaiting set AND now - last_merge_ts > 1h AND no stop-the-line
+   *    non-empty awaiting set older than 1h AND no merge in that window AND no stop-the-line
    *    episode is active, fire ONE human ask per episode (carrying full
    *    diagnosis data: base verdict + names + alarm, blocked reason,
    *    queue + awaiting counts, last merge ts) AND auto-spawn ONE
@@ -14380,12 +14263,14 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     tpLastMergeTs?: unknown,
   ): Promise<{ since: number; mins: number; fired_at?: number; ask_id?: string | null; duty_id?: string | null; kind?: string } | null> {
     const awaiting = awaitingArg ?? this.laneAwaitingRows(lane.repo, now0, undefined, lane.base);
-    const hasCars = queue.length > 0 || awaiting.length > 0;
-    const stopActive = !!meta.stop;
     const lastMergeTs = this.laneLastMergeTs(lane.repo, lane.base, meta, tpLastMergeTs);
-    const mergeRefTs = lastMergeTs ?? Math.max(0, Number(l.status_ts ?? l.created_ts ?? 0));
-    const mergeAge = mergeRefTs > 0 ? now0 - mergeRefTs : 0;
-    const mergeStarved = hasCars && !stopActive && mergeRefTs > 0 && mergeAge > TRAIN_MERGE_STARVE_MS;
+    const oldestCarAt = [...queue, ...awaiting].reduce((oldest, car) =>
+      Number.isFinite(car.at) && car.at > 0 ? Math.min(oldest, car.at) : oldest, now0);
+    // An idle lane can go days without a merge. Only time with a car
+    // waiting on this lane counts toward a machinery stall.
+    const mergeRefTs = Math.max(oldestCarAt, lastMergeTs ?? 0);
+    const mergeAge = now0 - mergeRefTs;
+    const mergeStarved = !meta.stop && mergeAge > TRAIN_MERGE_STARVE_MS;
 
     if (mergeStarved) {
       const existingEp = meta.lane?.starvation ?? meta.starvation ?? null;
@@ -14504,9 +14389,9 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
         meta.starvation = existingEp;
         this.saveLaneState(l.id, meta, now0);
       }
-      const curMins = Math.max(60, Math.round((now0 - Number(existingEp.since ?? mergeRefTs)) / 60_000));
+      const curMins = Math.max(60, Math.round(mergeAge / 60_000));
       return {
-        since: Number(existingEp.since ?? mergeRefTs),
+        since: mergeRefTs,
         mins: curMins,
         fired_at: Number(existingEp.fired_at ?? now0),
         ask_id: existingEp.ask_id ?? null,
@@ -14551,7 +14436,6 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
               `Fix: run a merge-capable gateway (gh authed as a worker identity — bridge doctor checks), or merge the head by hand.`,
               `Recovers automatically: the starved state clears on the first capable lease.`,
             ].join("\n\n"),
-            options: ["Ack — restarting a merge-capable gateway", "Merge the head by hand", "Waive — not urgent"],
             artefact_id: String(l.id),
             urgency: "time-sensitive",
           },
@@ -14727,12 +14611,12 @@ Or answer in your own words — a typed answer is recorded with the ask exactly 
     if (active) return String(active.id);
     const parent = this.one(`SELECT title, meta FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
-    const description = reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
-    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
+    const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
+    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
 
-Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Otherwise inspect the actual PR on GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
 
 Keep changes and disposition receipts on the affected task. Finish this recovery task with execution_result {outcome:"<actual result>",receipts:["<per-action evidence>"]}. If no repair is needed, cite the current executor or delivered outcome as the receipt. Escalate only a concrete missing human authority, information or product choice, with its affected task and explicit consequences.` }, "system:recovery");
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, duty.id, taskId, Date.now());
@@ -14743,6 +14627,25 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     this.version(taskId, "system:recovery", "recovery_scheduled", `${description}. Bridge scheduled ${duty.id}; no human action is needed.`, { duty: duty.id, reason });
     this.audit("system:recovery", "recovery_scheduled", taskId, { duty: duty.id, reason });
     return duty.id;
+  }
+
+  /** Repair an invalid wait without taking over its executor or dropping the
+   * product outcome. Completion of the repair only resumes the parent's work. */
+  private async parkOnRecovery(taskId: string, dutyId: string, reason: string): Promise<void> {
+    const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, taskId);
+    if (!row || row.status === "done" || row.status === "superseded") return;
+    const event = { event: "br_done", id: dutyId };
+    if (row.status === "blocked") {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      // A real external wait retains ownership; only missing/unreadable waits
+      // are repaired in place. Never replace an open ask or execution fence.
+      if (validateAwaitEvent(meta.blocked?.await_event)) return;
+      meta.blocked = { ...(meta.blocked ?? {}), reason, unblock_condition: `Bridge recovery ${dutyId} completes; then resume the original outcome work.`, await_event: event };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), taskId);
+      this.version(taskId, "system:recovery", "update", reason, { duty: dutyId, await_event: event });
+    } else {
+      await this.transition({ id: taskId, to: "blocked", session: "", note: reason, await_event: event }, "system:recovery");
+    }
   }
 
   /** Liveness for a stranded card's owner — the same two real signals the
@@ -15758,7 +15661,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // - "waiting"   → orange solid (.tb-wait): waiting to be verified
       const { prStats, batches } = (() => {
         const facts = meta.lane?.queue_facts?.entries ?? [];
-        const factFor = (id: string) => String(facts.find((e: any) => e.id === id)?.cls ?? "");
+        const factFor = (id: string, pr?: number) => String((
+          facts.find((e: any) => e.id === id && e.pr === pr) ??
+          facts.find((e: any) => e.id === id && e.pr == null)
+        )?.cls ?? "");
         const mergedPrs = new Set<number>(
           (this.state.storage.sql.exec(`SELECT pr FROM provenance WHERE repo = ?`, lane.repo).toArray() as any[])
             .map((r) => Number(r.pr ?? 0))
@@ -15773,7 +15679,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         );
         const seenCards = new Set<string>();
         const seenPrs = new Set<number>();
-        let inProgress = 0, verifying = 0, ready = 0;
+        let inProgress = 0;
         const batchCandidates: TrainBatchCar[] = [];
 
         const cardLegsForLane = (cm: any, title: string, bodyMd: string, extraText: string = ""): { pr?: number }[] => {
@@ -15803,7 +15709,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // already queued BEFORE the walk (`status_ts <= qfAt`) and has NO entry in
         // `facts` was skipped by the walk because its PR is CLOSED on GitHub.
         const qfAt = Number(meta.lane?.queue_facts?.at ?? 0);
-        const baseGreenInWalk = String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green";
         const walkCompletedWithoutBounce =
           facts.length > 0 &&
           facts.every((e: any) => e.cls === "ready" || e.cls === "waiting");
@@ -15824,12 +15729,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           ) {
             continue;
           }
-          const cls = factFor(q.id);
+          const cls = factFor(q.id, q.pr);
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
           if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
           } else if (cls === "needs-review") {
-            verifying++;
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
@@ -15838,30 +15742,17 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               state: "waiting",
               detail: "waiting to be verified — needs a fresh review",
             });
-          } else if (cls === "waiting" && baseGreenInWalk) {
-            // Base was green in the walk, so this car was skipped because its
-            // own head checks / mergeability / gate-rerun are still running
-            verifying++;
-            batchCandidates.push({
-              id: q.id,
-              ...(q.pr ? { pr: q.pr } : {}),
-              ...(q.bounces != null ? { bounces: q.bounces } : {}),
-              ...(q.over_budget ? { over_budget: true } : {}),
-              state: "verifying",
-              detail: "being verified — checks/mergeability running",
-            });
           } else {
-            // cls === "ready", or cls === "waiting" while base is settling, or
-            // newly verify-accepted after the last walk → verified & ready (green)
-            ready++;
+            // Accepted and no base conflict/repair or invalidated review:
+            // ready is a PR property. Lane stops, main CI/deploy and executor
+            // waits do not undo verification or change this car's colour.
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
               ...(q.bounces != null ? { bounces: q.bounces } : {}),
               ...(q.over_budget ? { over_budget: true } : {}),
-              state: cls === "ready" && baseGreenInWalk && !meta.stop ? "ready" : "waiting",
-              detail: cls === "ready" && baseGreenInWalk && !meta.stop ? "passed queue gates — current-base admission is checked before merging"
-                : "verified — waiting for current executor and main checks",
+              state: "ready",
+              detail: "ready to merge — verified, no conflicts with base",
             });
           }
         }
@@ -15897,7 +15788,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           for (const leg of legs) {
             if (leg.pr && seenPrs.has(leg.pr)) continue;
             if (leg.pr) seenPrs.add(leg.pr);
-            verifying++;
             const state = activeVerify ? "verifying" : "waiting";
             const detail = activeVerify
               ? `being verified (${activeVerify.id} in progress)`
@@ -15911,7 +15801,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           if (seenCards.has(a.task) || (a.pr && seenPrs.has(a.pr))) continue;
           seenCards.add(a.task);
           if (a.pr) seenPrs.add(a.pr);
-          verifying++;
           const state = a.in_flight ? "verifying" : "waiting";
           const detail = a.in_flight
             ? "being verified — review in progress"
@@ -15937,7 +15826,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             if (leg.pr && seenPrs.has(leg.pr)) continue;
             if (leg.pr) seenPrs.add(leg.pr);
             if (mtState === "awaiting") {
-              verifying++;
               const lastSig = Math.max(Number(rm.session_alive_ts ?? 0), Number(rm.last_progress?.ts ?? 0));
               const live = lastSig > 0 && now0 - lastSig < 10 * 60_000;
               batchCandidates.push({
@@ -15980,7 +15868,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               : null;
             const activeDuty = vDuty ?? childVerify;
             if (activeDuty) {
-              verifying++;
               const dm = JSON.parse(activeDuty.meta ?? "{}");
               const sig = Math.max(Number(dm.session_alive_ts ?? 0), Number(dm.last_progress?.ts ?? 0), Number(activeDuty.updated_ts ?? 0));
               const live = String(activeDuty.status) === "in_progress" && now0 - sig < 10 * 60_000;
@@ -16000,8 +15887,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const conflictPairs: [number, number][] = Array.isArray(meta.lane?.queue_facts?.conflict_pairs)
           ? meta.lane.queue_facts.conflict_pairs
           : [];
+        // Count the same car states that drive colour and ready-first order.
+        // A separate queued-card tally can disagree with the visible blocks.
+        const ready = batchCandidates.filter(car => car.state === "ready").length;
         return {
-          prStats: { in_progress: inProgress, verifying, ready },
+          prStats: { in_progress: inProgress, verifying: batchCandidates.length - ready, ready },
           batches: partitionMergeBatches(batchCandidates, conflictPairs, lane.burst_max),
         };
       })();
@@ -16288,6 +16178,35 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       latestMeta.lane = { ...latestMeta.lane, line };
       this.saveLaneState(l.id, latestMeta, now0);
       lane_state = this.laneStore().operational(String(l.id)) ?? lane_state;
+      // BR#4849: the red-main episode, hub-derived. The hub holds no VCS
+      // credentials (BR#3516) — it cannot see GitHub red itself — but every
+      // episode leaves a board record: the open root-blocker/main-red task.
+      // Derive the newest open one in the lane's project so the Top view
+      // banner answers "who is fixing it" — including the loudest possible
+      // answer: UNOWNED. last_merge (the lane's newest landed event) anchors
+      // "who broke it" when no machine culprit was stamped on the stop.
+      const project = lane.repo.split("/").pop() ?? "";
+      const redTask = this.state.storage.sql.exec(
+        `SELECT id, title, status, owner, meta, created_ts FROM artefacts
+         WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+           AND project = ? AND (tags LIKE '%"main-red"%' OR tags LIKE '%"root-blocker%"')
+         ORDER BY created_ts DESC LIMIT 1`,
+        project,
+      ).toArray()[0] ?? null;
+      let executorSession = "";
+      if (redTask) {
+        // the executor lease is meta.session, surfaced as executor_session for
+        // in_progress/in_review only (mirrors the orient serving, BR#3361 d)
+        try {
+          const rm = JSON.parse(String(redTask.meta ?? "{}"));
+          if (["in_progress", "in_review"].includes(String(redTask.status ?? ""))) executorSession = String(rm.session ?? "");
+        } catch { executorSession = ""; }
+      }
+      const lastMerge = this.state.storage.sql.exec(
+        `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
+         WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+        lane.repo, lane.base,
+      ).toArray()[0] ?? null;
       // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued
       // PRs riding out their owner clock. `expired` + close_reason feed the
       // executor's gh close leg (the hub holds no VCS credentials — the
@@ -16379,6 +16298,25 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         awaiting: awaitingRows,
         pr_stats: prStats,
         batches,
+        red_main: redTask
+          ? {
+              task_id: String(redTask.id),
+              title: String(redTask.title ?? ""),
+              status: String(redTask.status ?? ""),
+              owner: String(redTask.owner ?? ""),
+              executor_session: executorSession,
+              created_ts: Number(redTask.created_ts ?? 0),
+            }
+          : null,
+        last_merge: lastMerge
+          ? {
+              ts: Number(lastMerge.ts ?? 0),
+              pr: lastMerge.pr == null ? undefined : Number(lastMerge.pr),
+              task_id: lastMerge.task_id == null ? undefined : String(lastMerge.task_id),
+              gateway: lastMerge.gateway == null ? undefined : String(lastMerge.gateway),
+              merge_sha: lastMerge.merge_sha == null ? undefined : String(lastMerge.merge_sha),
+            }
+          : null,
         escalations,
         activity: {
           merged_1h: Number(tp.h1 ?? 0),
@@ -16900,30 +16838,19 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       now, actor, repo, JSON.stringify(accounting), line, accounting.ok ? 1 : 0,
     );
 
-    // ---- alarm when the invariant failed: ONE ask per class (the PR-set
-    // title makes identical re-reports dedupe; a changed set re-alarms) ----
+    // Accounting is agent work. Dispatch a durable, deduplicated repair rather
+    // than asking the human to bind internal records or revive dead duties.
     const unaccounted = (judgements as ReconcileJudgement[]).filter((j) => j.decision.action === "alarm_unaccounted");
     if (!accounting.ok && unaccounted.length) {
       try {
-        await this.askCreate(
-          {
-            to: "human",
-            question: `reconcile ALARM ${repo}: ${unaccounted.map((j) => `#${j.pr}`).join(", ")} unaccounted — bind, ignore-with-reason, or revive?`,
-            reason: "every open reviewed PR must be bound / ignored / in-flight within one cycle (BR#4170) — these are none of the three past the actionable age",
-            details: [
-              `Accounting: ${line}`,
-              ...unaccounted.map((j) => {
-                const d = j.decision as { action: "alarm_unaccounted"; why: string };
-                return `PR #${j.pr}: ${d.why} — ${j.reason}`;
-              }),
-              `Fix: bind each PR to its card (or ignore it with reconcile.ignore), or revive the dead duty — then the next report goes green.`,
-            ].join("\n\n"),
-            options: ["On it — binding now", "Ignore these PRs (with reasons)", "Investigate the dead duties"],
-            artefact_id: this.settingValue("reconcile_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-            urgency: "time-sensitive",
-          },
-          actor,
-        );
+        const existing = this.one(`SELECT id FROM artefacts WHERE type='task' AND status NOT IN ('done','superseded') AND json_extract(meta,'$.machine_duty.kind')='reconcile-accounting' AND json_extract(meta,'$.machine_duty.subject')=? LIMIT 1`, repo);
+        if (!existing) {
+          const duty = await this.create({ type: "task", title: `Restore change tracking for ${repo}`, qualified: true, session: "", roles: ["impl"], meta: {
+            completion: { kind: "execution", outcome: "Each observed change has a verified delivery owner or an evidence-backed disposition." },
+            machine_duty: { kind: "reconcile-accounting", subject: repo },
+          }, body_md: `Bridge observed changes without valid delivery tracking in ${repo}.\n\n${line}\n\n${unaccounted.map(j => `- https://github.com/${repo}/pull/${j.pr}: ${j.reason}`).join("\n")}\n\nInspect current GitHub and linked tasks, preserve active ownership and all delivery obligations, and repair missing tracking. Do not ignore or retire real work without recorded authority. Record per-action execution_result receipts and submit for independent outcome review. Only ask the human if investigation identifies a concrete missing permission, information or product choice.` }, "system:recovery");
+          spawned.push({ pr: unaccounted[0].pr, action: "recovery", card: duty.id });
+        }
       } catch (e) {
         // an identical ask is already open for this episode — that IS one per class
         this.audit(actor, "reconcile:alarm_deduped", null, { repo, error: String((e as Error).message ?? e).slice(0, 160) });

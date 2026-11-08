@@ -1213,13 +1213,28 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // destroyed, verdicts stay fenced to the exact reviewed submission, and the
   // refusal's own instruction names the cure (re-verify changed work in a
   // fresh review round — lifecycle auto-spawns that round with the correct
-  // binding). The specimen complied: 3 fence events on BR#7509 (2026-11-07
+  // binding). The specimens complied: 3 fence events on BR#7509 (2026-11-07
   // 08:35–08:49Z, a duty captured at the attempt-1 'legacy' sentinel while
   // the parent re-submitted attempt-2) folded "unclassified" and raised
   // BR#7684; the round closed in the auto-spawned successor duty and the
-  // parent landed done. Named so the Log says WHAT fenced; priced
-  // never-a-breach.
+  // parent landed done — and 3 further events on BR#7761 (2026-11-07
+  // 16:44–17:09Z, a verify duty holding a stale review_subject capture while
+  // BR#5989's fresh round spun up; breach card BR#8034, which reconciled to
+  // this fix) coalesced the same way while this class awaited its merge.
+  // Named so the Log says WHAT fenced; priced never-a-breach.
   review_fence: Number.POSITIVE_INFINITY,
+  // BR#6740 — the doTransition exit gate for typed execution waits (do.ts,
+  // isExecutionWait / local handoff preparing|waiting): ANY ordinary
+  // transition/ask/timeout on a card whose exit a durable execution wait owns
+  // is refused with "gate: typed local/capability wait owns this exit;
+  // ordinary transitions/asks/timeout cannot release it" — a bare throw, no
+  // [rule:] tag. The gate refusing IS the wait owning the exit (the BR#4067
+  // law: zero state destroyed, the sweep/writer just doesn't get to move the
+  // card), so it joins the BR#4562/BR#6654/BR#7008 never-a-breach pricing
+  // family. Specimen: 3 watchdog release attempts on BR#6642, 2026-11-05
+  // 23:30:41–58Z, folded "unclassified" (default threshold 3) and raised
+  // breach card BR#6740. The class is named so the Log says WHAT held.
+  "release:held-execution-wait": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1365,11 +1380,23 @@ export function breachClass(reason: string): string {
   // guard, do.ts:6647). Match the structural fragment "stale or missing
   // review subject_revision", not the whole sentence (BR#3611/BR#3612
   // wording-drift lesson); it sits ~7 chars in, far inside the 300-char
-  // audit slice, so the classification survives any tail. Specimen: 3
+  // audit slice, so the classification survives any tail. Specimens: 3
   // compliant fence events on BR#7509 (2026-11-07, captured 'legacy'
   // sentinel vs re-submitted parent) folded "unclassified" and raised
-  // BR#7684; priced never-a-breach above.
+  // BR#7684; second specimen BR#7761 (3 events 2026-11-07 16:44–17:09Z,
+  // breach card BR#8034) coalesced identically; priced never-a-breach above.
   if (r.includes("stale or missing review subject_revision")) return "review_fence";
+  // BR#6740: the doTransition exit gate for typed execution waits — an
+  // ordinary transition/ask/timeout on a card whose exit a durable execution
+  // wait owns (meta.blocked.await_event local_handoff/executor_capability, or
+  // a local handoff preparing/waiting). The refusal IS the wait owning the
+  // exit — the BR#4562 pricing law again: the gate succeeding is the system
+  // working. Match the structural fragment "typed local/capability wait owns
+  // this exit", not the whole sentence (BR#3611/BR#3612 wording-drift
+  // lesson); the throw carries no [rule:] tag and runs ~104 chars, well
+  // inside the 300-char audit slice, so the classification survives any tail.
+  // Specimen: BR#6642, 3 events 2026-11-05 23:30:41–58Z (breach card BR#6740).
+  if (r.includes("typed local/capability wait owns this exit")) return "release:held-execution-wait";
   return "unclassified";
 }
 

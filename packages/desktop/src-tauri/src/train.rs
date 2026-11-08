@@ -39,7 +39,7 @@
 
 use crate::train_gate::{
     carry_chain_tip, classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
-    is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    is_root_fix_card, latest_red_deploy_health_runs, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
     reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
     verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision,
@@ -3365,7 +3365,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     ].join("\n\n");
                     ctx.mcp("ask_agent", json!({
                         "to": "human",
+                        "route": { "kind": "human_decision" },
                         "question": root_fix_fast_lane_title(repo, pr),
+                        "decision": {
+                            "kind": "authority", "task_id": head_id,
+                            "context": format!("Changes in {repo} are waiting because the main branch is failing. PR #{pr} contains the proposed repair, but GitHub has refused the automatic merge."),
+                            "why_human": "Only a repository administrator can resolve the remaining GitHub permission or protection requirement.",
+                            "choices": [
+                                { "label": format!("DONE — PR #{pr} merged"), "executor": "human", "consequence": "You merge the repair using your repository access. Bridge then checks the actual merge and deployment before continuing.", "action": "hold" },
+                                { "label": "DECLINE — hold the line", "executor": "bridge", "consequence": "Bridge keeps changes queued and continues the repair investigation without treating this answer as a successful deployment.", "action": "hold" }
+                            ]
+                        },
                         "reason": reason,
                         "details": fast_details,
                         "options": [format!("DONE — PR #{pr} merged"), "DECLINE — hold the line"],
@@ -3375,17 +3385,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
                     return Ok(());
                 }
-                // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
+                // Signing/merge defects are repair work. The executor must
+                // identify a concrete missing permission before asking a human.
                 renew_lease(ctx, repo, base);
                 ctx.mcp("ask_agent", json!({
-                    "to": "human",
-                    "question": merge_sweep_human_leg_title(repo, &[reason.clone()]),
+                    "route": { "kind": "executor_coordination", "task_id": head_id },
+                    "question": format!("Can the repair executor resolve the signing or merge prerequisite for PR #{pr} in {repo}?"),
                     "reason": reason,
-                    "options": ["Will re-sign and re-push", "Needs a decision"],
-                    "artefact_id": head_id,
+                    "options": ["Bridge executor repairs the demonstrated prerequisite", "Bridge executor identifies a concrete missing permission and requests it explicitly"],
                 }))?;
-                ctx.note(&format!("filed human-leg ask for {head_id}"));
-                log(Some(key), &format!("human leg filed: {reason}"));
+                ctx.note(&format!("requested prerequisite repair for {head_id}"));
+                log(Some(key), &format!("executor coordination filed: {reason}"));
                 return Ok(());
             }
             MergeAction::CloseSuperseded { reason } => {

@@ -2052,6 +2052,43 @@ describe("breachClass: review_fence (BR#7684)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#6740 — the doTransition exit gate for typed execution waits (do.ts
+// ~6549: isExecutionWait / local handoff preparing|waiting): ANY ordinary
+// transition/ask/timeout on a card whose exit a durable execution wait owns
+// refuses with "gate: typed local/capability wait owns this exit; ordinary
+// transitions/asks/timeout cannot release it" — a bare throw, no [rule:] tag.
+// The gate refusing IS the wait owning the exit (the BR#4067 law; the
+// BR#4562/BR#6654 pricing family): zero state destroyed, the sweep/writer
+// just doesn't get to move the card. Specimen: 3 watchdog release attempts
+// on BR#6642, 2026-11-05 23:30:41–58Z, folded "unclassified" (default
+// threshold 3) and raised breach card BR#6740. The class is named so the Log
+// says WHAT held, and priced never-a-breach so a refusal storm can never arm
+// a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: release:held-execution-wait (BR#6740)", () => {
+  // the exact audited reason shape (do.ts:6550, thrown message, no [rule:] tag)
+  const HELD = "gate: typed local/capability wait owns this exit; ordinary transitions/asks/timeout cannot release it";
+
+  it("the execution-wait exit refusal classifies release:held-execution-wait from its message stem", () => {
+    expect(breachClass(HELD)).toBe("release:held-execution-wait");
+    // ~104 chars — far inside the audit trail's 300-char reason slice; the
+    // stem sits ~7 chars in, so classification survives any tail cut
+    expect(breachClass(HELD.slice(0, 300))).toBe("release:held-execution-wait");
+  });
+
+  it("an execution-wait refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#6642", ts: 1000 + i * 60_000, reason: HELD,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["release:held-execution-wait"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
