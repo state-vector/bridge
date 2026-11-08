@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { WorkerOccupancy } from "./worker-status.ts";
-import { capabilityBlockers, ExecutionBlockerSchema, ExecutionRequirementsSchema, LocalHandoffSchema, type ExecutionBlocker, type ExecutionRequirements, type ExecutorCapabilities, type LocalHandoff } from "./execution.ts";
+import { capabilityBlockers, ExecutionBlockerSchema, ExecutionRequirementsSchema, LocalHandoffSchema, providerIncidentRouteKey, type ExecutionBlocker, type ExecutionRequirements, type ExecutorCapabilities, type LocalHandoff, type ProviderCause } from "./execution.ts";
 import type { ExecutorReadiness } from "./executor-readiness.ts";
 export type { ExecutorReadiness } from "./executor-readiness.ts";
 
@@ -49,13 +49,22 @@ export function projectExecutionBlockers(input: {
       text: [...new Set(causes.map(c => `${c.host}: ${c.readiness.reason}`))].join(" "), causes,
       evidence: [...new Set(live.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}`))] });
     const reason = !configured.length ? "not_configured" : !live.length ? "offline" : "unavailable";
-    const modelCauses = [...new Set(live.filter(h => !h.readiness || h.readiness.kind === "ready").flatMap(h => h.capabilities.availability.kind === "unavailable" ? [h.capabilities.availability.reason] : []))];
+    const unavailableLive = live.filter(h => !h.readiness || h.readiness.kind === "ready").filter(h => h.capabilities.availability.kind === "unavailable");
+    const modelCauses = [...new Set(unavailableLive.map(h => h.capabilities.availability.kind === "unavailable" ? h.capabilities.availability.reason : null).filter((r): r is string => r !== null))];
+    // Typed provider incidents behind the unavailable models, deduped by their
+    // route scope; the UI renders these as account-action items, not generic
+    // "unavailable" text (BR#8821).
+    const incidentCauses = unavailableLive
+      .map(h => { const a = h.capabilities.availability; return a.kind === "unavailable" ? a.cause : undefined; })
+      .filter((c): c is ProviderCause => !!c)
+      .filter((c, i, all) => all.findIndex(x => providerIncidentRouteKey(x, "") === providerIncidentRouteKey(c, "")) === i);
     if (!causes.length || modelCauses.length) {
     blockers.push({ kind: "capability_unavailable", episode_id: key, reason,
       text: reason === "not_configured" ? `No gateway configured for ${requirements.tier} reasoning and the required scope.`
         : reason === "offline" ? `The last supporting gateway for ${requirements.tier} reasoning is offline.`
         : modelCauses.length ? modelCauses.join(" ") : `Supporting gateways report the required model/capability unavailable.`,
-      evidence: configured.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}; model ${h.capabilities.model ?? "unreported"}${h.capabilities.availability.kind === "unavailable" ? `; ${h.capabilities.availability.reason}` : ""}`) });
+      evidence: configured.map(h => `${h.host}: last seen ${h.observed_at}; config ${h.capabilities.config_revision}; model ${h.capabilities.model ?? "unreported"}${h.capabilities.availability.kind === "unavailable" ? `; ${h.capabilities.availability.reason}` : ""}`),
+      causes: incidentCauses });
     }
   } else if (!localReady && usable.every(h => h.active >= h.capabilities.capacity)) {
     blockers.push({ kind: "capacity_wait", episode_id: `capacity:${id}`, text: usable.some(h => (h.occupancy?.unconfirmed ?? 0) > 0)

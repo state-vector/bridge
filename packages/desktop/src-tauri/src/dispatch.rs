@@ -585,8 +585,16 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
             !matches!(clean, Ok(o) if o.status.success() && o.stdout.is_empty())
                 || !matches!(published, Ok(o) if o.status.success() && !o.stdout.is_empty())
         }).unwrap_or(false);
-        let failure_class = if reason.contains("gate:") { "prerequisite" } else { "transport" };
-        execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
+        // BR#8821: a launch whose working directory is MISSING is a
+        // prerequisite failure, not a transport fault (the four
+        // ResultUnavailable/Capture journals were missing-cwd, not
+        // missing-git). Transport cooldown would hot-retry a gone directory
+        // forever; prerequisite demands re-provisioning before any retry, and
+        // no checkpoint/ACK may be fabricated for a launch that never wrote.
+        let missing_cwd = path.map(|p| !p.exists()).unwrap_or(false);
+        let failure_class = if reason.contains("gate:") || missing_cwd { "prerequisite" } else { "transport" };
+        let reason = if missing_cwd { format!("{reason} [launch working directory missing — prerequisite, not transport; never hot-retry a gone directory]") } else { reason.to_string() };
+        execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(&reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
     })();
     // Progress after release would re-claim todo through the legacy API.
     match result {

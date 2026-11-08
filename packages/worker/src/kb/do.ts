@@ -235,7 +235,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, isAccountActionCause, providerIncidentRouteKey, providerIncidentText, type ExecutionState, type ExecutorCapabilities, type ProviderCause } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -3270,6 +3270,29 @@ export class KnowledgeHub {
         review_id TEXT PRIMARY KEY,
         record TEXT NOT NULL
       );
+      -- One canonical route-scoped provider incident (BR#8821): an account /
+      -- provider failure observed on a failed execution. Open incidents gate
+      -- scheduler admission for their route; ONLY a successful exact-model
+      -- probe NEWER than the last observed failure clears one — a human
+      -- answer or a bare usable advertisement is not health proof.
+      CREATE TABLE IF NOT EXISTS route_incidents (
+        route_key TEXT PRIMARY KEY, -- class|backend|model|config_revision
+        task_id TEXT NOT NULL,
+        class TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        model TEXT,
+        config_revision TEXT NOT NULL,
+        code INTEGER,
+        error_name TEXT,
+        message TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        cleared_at INTEGER,
+        cleared_by TEXT,
+        ask_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_route_incidents_route ON route_incidents (backend, model, status);
       CREATE TABLE IF NOT EXISTS delivery_review_backfill (
         review_id TEXT PRIMARY KEY, status_ts INTEGER NOT NULL
       );
@@ -5065,6 +5088,12 @@ export class KnowledgeHub {
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
       else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";
+      // BR#8821: an open route-scoped provider incident gates admission for
+      // the task's last executed provider route. The incident clears ONLY on
+      // a successful exact-model probe newer than the last observed failure —
+      // a human answer to the account ask is not health proof, and neither is
+      // a generic no-deployments observation.
+      else if (meta.execution_last_model && this.openRouteIncident(meta.execution_last_model.backend, meta.execution_last_model.model)) reason = "route_incident";
       else {
         const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
@@ -5326,6 +5355,11 @@ export class KnowledgeHub {
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
           if (this.startupRejected(String(body.id), String(token.label), readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before retrying this task");
+          // BR#8821: an open provider incident on the task's route blocks the
+          // claim — admission gating is not bypassed by a direct claim.
+          const claimMeta = JSON.parse(String(this.one(`SELECT meta FROM artefacts WHERE id=?`, String(body.id))?.meta ?? "{}"));
+          if (claimMeta.execution_last_model && this.openRouteIncident(claimMeta.execution_last_model.backend, claimMeta.execution_last_model.model))
+            throw new Error(`gate: an open provider incident gates route ${claimMeta.execution_last_model.backend}/${claimMeta.execution_last_model.model ?? ""}; only a successful exact-model probe clears it`);
           const scheduling = this.executionSchedulingRequirements(String(body.id), requirements);
           const blockers = capabilityBlockers(scheduling, capabilities, token.label);
           if (blockers.length && !capabilities.alternatives.some(c => capabilityBlockers(scheduling, c, token.label).length === 0)) throw new Error(`gate: claim capability blockers: ${blockers.join(", ")}`);
@@ -5343,6 +5377,100 @@ export class KnowledgeHub {
   /** No awaits between read/decide/write. State and replay receipt share one
    * SQLite transaction; replay after a lost response never authorises a second
    * Git/AWS effect. Those effects still require inspect-and-reconcile. */
+  /** BR#8821: persist ONE canonical route-scoped incident for a typed provider
+   * cause observed on a terminal outcome. Called inside the finalize/stopped
+   * SQLite transaction so the incident, the execution state and the command
+   * receipt commit atomically — never a split-brain charge without evidence. */
+  private recordRouteIncident(taskId: string, cause: ProviderCause, configRevision: string, evidenceLine: string, now: number): void {
+    const routeKey = providerIncidentRouteKey(cause, configRevision);
+    this.state.storage.sql.exec(
+      `INSERT INTO route_incidents (route_key, task_id, class, backend, model, config_revision, code, error_name, message, evidence, observed_at, status, cleared_at, cleared_by, ask_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL)
+       ON CONFLICT(route_key) DO UPDATE SET task_id=excluded.task_id, code=excluded.code, error_name=excluded.error_name,
+         message=excluded.message, evidence=excluded.evidence, observed_at=excluded.observed_at, status='open', cleared_at=NULL, cleared_by=NULL`,
+      routeKey, taskId, cause.class, cause.backend, cause.model ?? null, configRevision,
+      cause.code ?? null, cause.error_name ?? null, cause.message.slice(0, 500), evidenceLine.slice(0, 4000), now,
+    );
+    // The deduplicated owner ask is NOT minted here: ask creation is an async
+    // artefact lifecycle and must not run inside the storage transaction.
+    this.audit("system:executor", "route_incident", taskId, { route_key: routeKey, class: cause.class, backend: cause.backend, model: cause.model, code: cause.code ?? null, error_name: cause.error_name ?? null });
+  }
+
+  /** An open incident on this provider route gates admission. Route scope:
+   * backend + exact model; the config generation rides the incident's own
+   * route_key so an old success receipt can never clear a new configuration. */
+  private openRouteIncident(backend: string, model: string | null): { route_key: string; class: string } | null {
+    return this.one(`SELECT route_key, class FROM route_incidents WHERE status='open' AND backend=? AND model IS ? ORDER BY observed_at DESC LIMIT 1`, backend, model) ?? null;
+  }
+
+  /** A successful exact-model probe NEWER than the incident's last observed
+   * failure is the ONLY clear. The probe must match the route's exact model
+   * and config generation, run with the configured request allowance, and be
+   * tool-less — a CLI --version check or an unrelated model's success never
+   * clears another route's incident (BR#8821). */
+  private clearRouteIncidentsByProbe(backend: string, model: string | null, configRevision: string, probe: { model: string; at: number; ok: boolean; output_head: string }, now: number): void {
+    // only the route's OWN exact-model probe clears; a null-model route is
+    // backend-wide and never cleared by another model's success
+    if (!probe.ok || model === null || probe.model !== model) return;
+    this.state.storage.sql.exec(
+      `UPDATE route_incidents SET status='cleared', cleared_at=?, cleared_by=? WHERE status='open' AND backend=? AND model IS ? AND config_revision=? AND observed_at < ?`,
+      now, JSON.stringify({ probe }), backend, model, configRevision, probe.at,
+    );
+  }
+
+  /** BR#8821: automatic account-action escalation — ONE deduplicated human
+   * ask per incident route. Reuses any open account ask already covering the
+   * provider (e.g. the bound ops account ask on the provider-capacity task);
+   * never mints a second one. The human answer reports the account action
+   * done — it does NOT clear the incident; only an exact-model probe does. */
+  private async escalateRouteIncidentAsk(taskId: string, cause: ProviderCause, configRevision: string, actor: string): Promise<void> {
+    const routeKey = providerIncidentRouteKey(cause, configRevision);
+    const route = `${cause.backend}${cause.model ? `/${cause.model}` : ""}`;
+    // dedupe 1: our own canonical marker on a still-open ask
+    const own = this.one(`SELECT id FROM artefacts WHERE type='question' AND status IN ('todo','in_progress','blocked') AND json_extract(meta,'$.ask.account_route_key')=?`, routeKey);
+    if (own) { this.state.storage.sql.exec(`UPDATE route_incidents SET ask_id=? WHERE route_key=?`, own.id, routeKey); return; }
+    // dedupe 2: a live human ask already covering this provider's account
+    // action (account/quota/credit/billing) — reuse it, never a second ask.
+    const routeWords = [route, cause.model, cause.backend].filter((x): x is string => !!x);
+    const covering = this.state.storage.sql.exec(
+      `SELECT id FROM artefacts WHERE type='question' AND status IN ('todo','in_progress','blocked')
+        AND json_extract(meta,'$.ask.to') IN ('human','ray','rayh')
+        AND (${routeWords.map(() => `body_md LIKE '%' || ? || '%' OR title LIKE '%' || ? || '%'`).join(" OR ")})
+        AND (body_md LIKE '%account%' OR body_md LIKE '%quota%' OR body_md LIKE '%credit%' OR body_md LIKE '%billing%' OR title LIKE '%account%' OR title LIKE '%quota%')
+        LIMIT 1`,
+      ...routeWords.flatMap(w => [w, w]),
+    ).toArray()[0];
+    if (covering) {
+      this.state.storage.sql.exec(`UPDATE route_incidents SET ask_id=? WHERE route_key=?`, String(covering.id), routeKey);
+      this.audit("system:executor", "route_incident_ask_reused", taskId, { route_key: routeKey, ask_id: String(covering.id) });
+      return;
+    }
+    const created = await this.askCreate({
+      to: "human",
+      route: { kind: "human_decision", task_id: taskId },
+      artefact_id: taskId,
+      question: `Will you restore the ${route} provider account (top up quota/credits or fix its credential) so queued work can run again?`,
+      details: `A gateway execution failed with the provider's own typed account error on route ${route} (class ${cause.class}${cause.error_name ? `, adapter error ${cause.error_name}` : ""}${cause.code !== null ? `, code ${cause.code}` : ""}).\n\nEvidence (sanitized): ${cause.message}\n\nYou must act on the provider account yourself: open the provider console for ${cause.backend}${cause.model ? ` (model ${cause.model})` : ""}, top up the exhausted quota/credits or replace the invalid credential, then mark this ask done. Approval here does not grant Bridge any billing credential and Bridge will not top anything up.\n\nAfter your answer, Bridge verifies recovery with a tool-less exact-model probe on this route — only a successful probe clears the incident and reopens admission. Until then tasks routed to this provider stay parked with their evidence preserved.`,
+      decision: {
+        kind: "authority",
+        task_id: taskId,
+        context: `The ${route} route failed with a typed account-action provider error (${cause.error_name ?? cause.class}, code ${cause.code ?? "n/a"}); sanitized evidence is on the incident record. Admission for this route is gated until an exact-model probe succeeds.`,
+        why_human: `Only the provider account owner can top up quota/credits or renew the credential for ${route}; Bridge holds no billing authority for that account.`,
+        choices: [
+          { label: "Account action done", executor: "bridge", consequence: "Bridge runs a tool-less exact-model probe on this route and clears the incident only if the probe succeeds", action: "resume" },
+          { label: "Keep the incident open", executor: "bridge", consequence: "The route stays excluded from admission; evidence stays on the board", action: "hold" },
+        ],
+      },
+    }, actor);
+    // canonical marker for future dedupe + incident binding
+    const askRow = this.one(`SELECT meta FROM artefacts WHERE id=?`, created.id);
+    const askMeta = askRow ? JSON.parse(askRow.meta ?? "{}") : {};
+    askMeta.ask = { ...(askMeta.ask ?? {}), account_route_key: routeKey };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(askMeta), created.id);
+    this.state.storage.sql.exec(`UPDATE route_incidents SET ask_id=? WHERE route_key=?`, created.id, routeKey);
+    this.audit("system:executor", "route_incident_ask_created", taskId, { route_key: routeKey, ask_id: created.id });
+  }
+
   private async executionCommand(raw: unknown, actor: string, trace?: RequestTrace) {
     const req = ExecutionRequestSchema.parse(raw);
     const body = raw as Record<string, unknown>;
@@ -5427,6 +5555,11 @@ export class KnowledgeHub {
       const observedCapabilities = body.runner_protocol === EXECUTOR_READINESS_PROTOCOL ? command.capabilities : { ...command.capabilities, worker: { kind: "unprovisioned" } };
       trace?.stage("inventory");
       if (!keepReady) this.state.storage.sql.exec(`INSERT INTO execution_hosts (token_id, capabilities, observed_ts) VALUES (?, ?, ?) ON CONFLICT(token_id) DO UPDATE SET capabilities=excluded.capabilities, observed_ts=excluded.observed_ts`, tokenId, JSON.stringify(observedCapabilities), now);
+      // BR#8821: a successful exact-model probe newer than the incident's
+      // last observed failure is the ONLY incident clear carried by an
+      // advertisement. The probe is scoped to this gateway's exact
+      // backend/model/config identity — health never copies between routes.
+      if (command.capabilities.probe) this.clearRouteIncidentsByProbe(command.capabilities.backend, command.capabilities.model, command.capabilities.config_revision, command.capabilities.probe, now);
       // Renewal is the control-plane liveness path. Backlog reconciliation and
       // board construction must not delay its acknowledgement. The scheduler
       // and alarm own bounded reconciliation and always recheck claim safety.
@@ -5439,7 +5572,16 @@ export class KnowledgeHub {
     current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
     if (command.kind === "inspect") {
       const handoff = this.recoveryCapacity().forVictim(req.id);
-      return handoff ? { ...current, capacity_handoff: handoff } : current;
+      // BR#8821: open route-scoped provider incidents for this task's last
+      // executed route ride on the inspect response — the canonical incident
+      // is the single source of truth for admission, UI and ask dedupe.
+      const lastModel = (meta.execution_last_model ?? null) as { backend?: string; model?: string | null } | null;
+      const route_incidents = lastModel?.backend ? this.state.storage.sql.exec(
+        `SELECT route_key, task_id, class, backend, model, config_revision, code, error_name, message, evidence, observed_at, status, cleared_at, cleared_by, ask_id
+         FROM route_incidents WHERE task_id=? OR (status='open' AND backend=? AND model IS ?) ORDER BY observed_at DESC`,
+        req.id, lastModel.backend, lastModel.model ?? null,
+      ).toArray().map(row => ({ ...row, code: row.code === null ? null : Number(row.code), observed_at: Number(row.observed_at) })) : [];
+      return handoff ? { ...current, capacity_handoff: handoff, route_incidents } : { ...current, route_incidents };
     }
     if (command.kind === "availability") return this.executionWork().availability(req.id);
     if (command.kind === "writer_receipt") {
@@ -5626,8 +5768,17 @@ export class KnowledgeHub {
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     const response = command.kind === "finalize" ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
+    // BR#8821: typed provider cause on the terminal outcome persists ONE
+    // canonical route-scoped incident in the SAME transaction as the
+    // execution state and command receipt — authenticated failure provenance
+    // and raw sanitized evidence ride on the outcome, never a blank guess.
+    const terminalOutcome = (command.kind === "finalize" || command.kind === "stopped") ? command.outcome : null;
+    const terminalCause = terminalOutcome?.cause ?? null;
+    const terminalEvidence = terminalOutcome ? (terminalOutcome.stderr_tail || terminalOutcome.stdout_tail) : "";
+    const terminalConfigRevision = next.attempt?.executor?.config_revision ?? "legacy";
     this.state.storage.transactionSync(() => {
       if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+      if (terminalCause) this.recordRouteIncident(req.id, terminalCause, terminalConfigRevision, terminalEvidence, now);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
       // Control polls do not authorise external effects. Keep a bounded replay
@@ -5661,6 +5812,18 @@ export class KnowledgeHub {
     });
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
     else this.publishWorkerStatus(next.attempt?.host ?? actor, now);
+    // BR#8821: automatic account-action escalation — after the committed
+    // transaction, ONE deduplicated human ask per incident route. An ask
+    // ANSWER never clears the incident; only an exact-model probe does.
+    if (terminalCause && isAccountActionCause(terminalCause)) {
+      try {
+        await this.escalateRouteIncidentAsk(req.id, terminalCause, terminalConfigRevision, actor);
+      } catch (error) {
+        // the incident is already durably persisted; a failed ask lifecycle
+        // must never fail the finalize receipt itself
+        this.audit(actor, "route_incident_escalation_failed", req.id, { route_key: providerIncidentRouteKey(terminalCause, terminalConfigRevision), error: String((error as Error)?.message ?? error).slice(0, 300) });
+      }
+    }
     if (command.kind === "yield") this.executionWork().sweep();
     if (command.kind === "finalize" || command.kind === "stopped") this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     return response;

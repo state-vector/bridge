@@ -180,7 +180,6 @@ impl ProviderCause {
 /// not a side effect of truncation). Marker-based scanner: `key=value`
 /// pairs, `Bearer <token>` runs, `sk-…` keys and long opaque opaque runs.
 pub fn redact_secrets(input: &str) -> String {
-    const KEY_WORDS: &[&str] = &["authorization", "authorization:", "bearer", "bearer:", "token", "token:", "password", "password:", "secret", "secret:", "key", "key:", "api_key", "api_key:", "apikey", "apikey:", "access_token", "access_token:", "x-api-key", "x-api-key:"];
     let is_keyish = |w: &str| KEY_WORDS.contains(&w.to_ascii_lowercase().as_str());
     let token_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=');
     // Lengths of the leading/trailing NON-token punctuation runs (quotes,
@@ -237,11 +236,24 @@ pub fn redact_secrets(input: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Credential-shaped key names: a value stored under one of these keys is a
+/// secret regardless of its shape — `redact_secrets` only sees value strings,
+/// so the KEY must drive the redaction (BR#8821 review P1).
+const KEY_WORDS: &[&str] = &["authorization", "authorization:", "bearer", "bearer:", "token", "token:", "password", "password:", "secret", "secret:", "key", "key:", "api_key", "api_key:", "apikey", "apikey:", "access_token", "access_token:", "x-api-key", "x-api-key:"];
+
 fn redact_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    const MAX_DEPTH: usize = 6;
     match value {
         serde_json::Value::String(s) => serde_json::Value::String(redact_secrets(s)),
-        serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().take(24).map(|v| redact_value(v, depth + 1)).collect()),
-        serde_json::Value::Object(map) if depth < 6 => serde_json::Value::Object(map.iter().take(24).map(|(k, v)| (k.clone(), redact_value(v, depth + 1))).collect()),
+        serde_json::Value::Array(items) if depth < MAX_DEPTH => serde_json::Value::Array(items.iter().take(24).map(|v| redact_value(v, depth + 1)).collect()),
+        serde_json::Value::Object(map) if depth < MAX_DEPTH => serde_json::Value::Object(map.iter().take(24).map(|(k, v)| {
+            // Key-aware redaction: `redact_secrets` never sees object keys, so
+            // a credential-named key redacts its value wholesale.
+            if KEY_WORDS.contains(&k.to_ascii_lowercase().as_str()) { (k.clone(), serde_json::Value::String("[redacted]")) } else { (k.clone(), redact_value(v, depth + 1)) }
+        }).collect()),
+        // Past the depth budget the subtree is REPLACED, never cloned: cloning
+        // preserves raw nested secrets the scanner never inspected (P1).
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::Value::String("[redacted:depth]"),
         other => other.clone(),
     }
 }
@@ -275,7 +287,17 @@ pub fn classify_provider_error(backend: &str, model: Option<&str>, code: Option<
         (Some(-32000), _, _) => (Some(ProviderCauseClass::AccountAction), Some("provider.auth")), // AuthRequiredError wire shape
         (Some(-32603), Some("session"), Some(name)) => ACP_SESSION_ERROR_NAMES.iter().find(|(n, _)| *n == name)
             .map(|(n, c)| (Some(*c), Some(*n)))
-            .unwrap_or((Some(ProviderCauseClass::Diagnostic), Some(name))), // unlisted session failure: contained, evidence kept
+            // Unlisted provider-prefixed names stay contained as diagnostic
+            // evidence. Session-local failures (permission.rejected,
+            // tool.execution, unknown…) are NOT provider outages — they stay
+            // task evidence in the stderr tail, never a route incident (P2).
+            .unwrap_or_else(|| if name.starts_with("provider.") {
+                (Some(ProviderCauseClass::Diagnostic), Some(name))
+            } else {
+                // Unrecognized session errorName: not a typed provider
+                // discriminator — no route incident.
+                (None, None)
+            }),
         (Some(-32603), Some("session"), None) => (Some(ProviderCauseClass::Diagnostic), None),
         _ => (None, None),
     };
@@ -1387,5 +1409,47 @@ mod provider_cause_tests {
             code: Some(-32000), error_name: Some("provider.auth".into()), message: "x".into(), data: None, evidence_line: None, at_ms: 1 };
         assert_ne!(cause.route_key("rev-1"), cause.route_key("rev-2"));
         assert_eq!(cause.route_key("rev-1"), "account_action|opencode|m|rev-1");
+    }
+
+    /// Unlisted NON-provider session failures (permission.rejected,
+    /// tool.execution, unknown…) are task-local evidence — no route
+    /// containment, no provider incident (BR#8821 review P2).
+    #[test]
+    fn session_local_errors_do_not_become_route_incidents() {
+        for name in ["permission.rejected", "tool.execution", "unknown", ""] {
+            assert!(classify_provider_error("opencode", Some("m"), Some(-32603), "task-level failure",
+                &json!({"service":"session","errorName":name}), 1000).is_none(), "{name}");
+        }
+        // Unlisted provider-prefixed names stay contained as diagnostic.
+        let contained = classify_provider_error("opencode", Some("m"), Some(-32603), "upstream",
+            &json!({"service":"session","errorName":"provider.mystery"}), 1000).expect("provider-prefixed stays contained");
+        assert_eq!(contained.class, ProviderCauseClass::Diagnostic);
+    }
+
+    /// Key-aware redaction (P1): a credential-named object key redacts its
+    /// value wholesale — the value string is short enough that the
+    /// token-length scanner would keep it raw.
+    #[test]
+    fn credential_named_object_keys_redact_values() {
+        let redacted = redact_value(&json!({"api_key":"short-secret","password":"pw","ok":"visible"}), 0);
+        assert_eq!(redacted.get("api_key").and_then(|v| v.as_str()), Some("[redacted]"));
+        assert_eq!(redacted.get("password").and_then(|v| v.as_str()), Some("[redacted]"));
+        assert_eq!(redacted.get("ok").and_then(|v| v.as_str()), Some("visible"));
+        // Authorization headers split across words redact the bearer token.
+        let header = redact_secrets("Authorization: Bearer abc123");
+        assert!(!header.contains("abc123"), "{header}");
+        assert!(header.contains("Bearer") || header.contains("[redacted]"), "{header}");
+    }
+
+    /// Depth-limited subtrees are REPLACED, never cloned: cloning past the
+    /// budget preserves raw nested secrets the scanner never saw (P1).
+    #[test]
+    fn deep_subtrees_are_replaced_not_cloned() {
+        let mut deep = json!({"note":"visible"});
+        for _ in 0..8 { deep = json!({"nest": deep, "leak": "sk-abcdef1234567890"}); }
+        let redacted = redact_value(&deep, 0);
+        assert!(!serde_json::to_string(&redacted).unwrap().contains("sk-abcdef1234567890"));
+        let replaced = serde_json::to_string(&redacted).unwrap();
+        assert!(replaced.contains("[redacted:depth]"), "{replaced}");
     }
 }

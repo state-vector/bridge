@@ -21,4 +21,27 @@ describe("actual execution attention markup", () => {
     expect(html).not.toContain(">Claim locally<");
     expect(html).not.toContain(">Accept handoff<");
   });
+
+  it("renders typed provider causes as account-action incidents with the exact-model probe bar (BR#8821)", () => {
+    const data = ExecutionAttentionSchema.parse({ items: [{ id: "BR#9", title: "Provider-blocked repair", project: "bridge", status: "blocked", url: "https://hub.fleetbridge.run/card/BR-9",
+      handoff: { phase: "none" },
+      requirements: { tier: "large" }, continuation_prompt: null, can_accept: false, prerequisites: [], accept_operation: "handoff_accept",
+      blockers: [{ kind: "capability_unavailable", episode_id: "cap:9", reason: "unavailable", text: "Supporting gateways report the required model/capability unavailable.", evidence: ["gw last seen"],
+        causes: [
+          { class: "account_action", backend: "opencode", model: "llmgw/glm-5.3", code: -32603, error_name: "provider.quota", message: "provider quota exceeded", data: { service: "session", errorName: "provider.quota" }, evidence_line: null, at_ms: 1000 },
+          { class: "route_unavailable", backend: "opencode", model: "llmgw/glm-5.3", code: -32603, error_name: "provider.no-route", message: "no route", data: null, evidence_line: null, at_ms: 1001 },
+        ] }] }], next_cursor: null, interactive_agents: [] });
+    const html = renderToStaticMarkup(<ExecutionAttentionCards data={data} changed={() => {}} />);
+    // the account-action incident names who acts and the exact-model probe bar
+    expect(html).toContain("Provider account incident — you must act:");
+    expect(html).toContain("top up the account quota/credits");
+    expect(html).toContain("only a successful probe reopens admission");
+    // sanitized provider evidence renders (the message), and the contained
+    // non-account incident renders without demanding any account action
+    expect(html).toContain("provider quota exceeded");
+    expect(html).toContain("Provider incident:");
+    expect(html).toContain("no account action needed");
+    // no fabricated billing URL or credentials are implied anywhere
+    expect(html).not.toMatch(/https?:\/\/[^"]*(billing|topup|top-up)/i);
+  });
 });

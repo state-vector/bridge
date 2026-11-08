@@ -18,6 +18,17 @@ pub struct Checkpoint {
 }
 
 fn git(path: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
+    // BR#8821: a missing cwd is a gate-class prerequisite failure, not a git
+    // error: the workspace was moved/removed, so nothing git-flavoured can be
+    // true here. The "gate:" prefix routes this to the prerequisite class —
+    // never a transport retry against a gone directory, and no checkpoint is
+    // fabricated for a workspace that cannot be inspected.
+    if !path.is_dir() {
+        return Err(format!(
+            "gate: checkpoint prerequisite failed: worktree cwd missing: {} — the workspace directory was moved or removed; restore it (or start a fresh workspace) before this task can checkpoint again",
+            path.display()
+        ));
+    }
     let mut cmd = Command::new("git");
     cmd.current_dir(path).args(args).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(index) = index { cmd.env("GIT_INDEX_FILE", index); }

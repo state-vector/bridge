@@ -5,6 +5,7 @@ export const DISPATCH_RESERVATION_MS = 300_000;
 export const SchedulingReasonSchema = z.enum([
   "qualification", "operator_gate", "question", "independent_wait", "writer_not_quiescent",
   "unknown_operations", "retry_budget", "host_affinity", "capability", "startup_prerequisite", "lifecycle_gate",
+  "route_incident",
 ]);
 export type SchedulingReason = z.infer<typeof SchedulingReasonSchema>;
 export const RecoveryPreemptionSchema = z.object({

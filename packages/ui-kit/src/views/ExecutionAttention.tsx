@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExecutionAttentionSchema, ReasoningTierSchema, type ExecutionAttention, type ExecutionAttentionItem } from "@bridge/contracts";
+import { ExecutionAttentionSchema, ReasoningTierSchema, isAccountActionCause, providerIncidentText, type ExecutionAttention, type ExecutionAttentionItem } from "@bridge/contracts";
 import { kbApi } from "../server/kb";
 import { useKb } from "../server/kbStore";
 import { getKbHubConfig } from "../server/config";
@@ -108,6 +108,14 @@ export function ExecutionAttentionCards({ data, changed, openTask }: { data: Exe
       <ul>{item.blockers.map(blocker => <li key={blocker.episode_id}>
         <strong>{blocker.kind === "local_pickup_required" ? "Blocked — pick up locally: " : blocker.kind === "human_answer_required" ? "Blocked — needs your decision: " : blocker.kind === "capacity_wait" ? "Waiting — capacity: " : "Blocked — "}</strong>
         {blocker.text}{blocker.kind === "human_answer_required" && <a href={`https://hub.fleetbridge.run/card/${blocker.ask_id.replace("#", "-")}`}> Open decision</a>}
+        {blocker.kind === "capability_unavailable" && blocker.causes.length > 0 && <ul className="route-incidents">
+          {blocker.causes.map(cause => <li key={`${cause.class}|${cause.backend}|${cause.model ?? ""}`} className={isAccountActionCause(cause) ? "route-incident account-action" : "route-incident"}>
+            {isAccountActionCause(cause)
+              ? <><strong>Provider account incident — you must act:</strong> {providerIncidentText(cause)} Open the provider console, top up the account quota/credits or renew its credential. Your answer reports the action done; Bridge then verifies with a tool-less exact-model probe on this exact route — only a successful probe reopens admission.</>
+              : <><strong>Provider incident:</strong> {providerIncidentText(cause)} — contained on this route; no account action needed.</>}
+            {cause.message && <details><summary>Sanitized provider evidence</summary><pre>{cause.message}</pre></details>}
+          </li>)}
+        </ul>}
         {(blocker.kind === "capability_unavailable" || blocker.kind === "executor_not_ready") && blocker.evidence.length > 0 && <details><summary>Gateway/config evidence</summary><ul>{blocker.evidence.map(e => <li key={e}>{e}</li>)}</ul></details>}
       </li>)}</ul>
       {item.handoff.phase === "accepted" && <p>Local execution accepted by session <strong>{item.handoff.session}</strong>. Automation remains fenced.</p>}

@@ -47,6 +47,53 @@ export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, 
     ? { kind: "repair_required", fingerprint, failures, reason }
     : { kind: "cooldown", fingerprint, failures, until_ts: now + 60_000 * failures, reason });
 }
+/** Typed provider-cause wire shape — mirrors the Rust transport classifier
+ * (opencode v2.2.5 ACP adapter: `provider.auth` serializes as ACP -32000
+ * AuthRequiredError; other session failures as -32603 with OBJECT data
+ * `{service:"session", errorName:"provider.*"}`). The class comes only from
+ * the adapter's typed discriminators — prose never classifies (BR#8821:
+ * a generic failure string is not a quota proof). */
+export const ProviderCauseClassSchema = z.enum(["account_action", "rate_limit", "route_unavailable", "provider_internal", "diagnostic"]);
+export type ProviderCauseClass = z.infer<typeof ProviderCauseClassSchema>;
+export const ProviderCauseSchema = z.object({
+  class: ProviderCauseClassSchema,
+  backend: z.string().default("opencode"),
+  model: z.string().nullable().default(null),
+  /** ACP JSON-RPC error code (-32000/-32603), never a guessed HTTP status. */
+  code: z.number().int().nullable().default(null),
+  /** Exact allowlisted adapter errorName (provider.quota, provider.auth, …). */
+  error_name: z.string().nullable().default(null),
+  /** Redacted provider message. */
+  message: text,
+  /** Redacted structured provider error data, object-valued where the
+   * adapter provides it — never flattened into a lossy string. */
+  data: z.unknown().optional(),
+  evidence_line: text.nullable().default(null),
+  at_ms: z.number().int().nonnegative(),
+});
+export type ProviderCause = z.infer<typeof ProviderCauseSchema>;
+/** Only `account_action` (quota/auth) demands a human account action; the
+ * other classes are contained on the route without an owner ask (BR#8822:
+ * reuse/dedupe the account action, never widen it). */
+export function isAccountActionCause(cause: ProviderCause | null | undefined): boolean {
+  return cause?.class === "account_action";
+}
+/** Dedupe scope of one incident: class + provider route + config/credential
+ * generation. Old success receipts cannot clear a new configuration's
+ * incident; two classes on one route are two incidents. */
+export function providerIncidentRouteKey(cause: Pick<ProviderCause, "class" | "backend" | "model">, configRevision: string): string {
+  return `${cause.class}|${cause.backend}|${cause.model ?? ""}|${configRevision}`;
+}
+export function providerIncidentText(cause: Pick<ProviderCause, "class" | "backend" | "model">): string {
+  const route = `${cause.backend}${cause.model ? `/${cause.model}` : ""}`;
+  switch (cause.class) {
+    case "account_action": return `${route}: provider account action required (quota or authentication)`;
+    case "rate_limit": return `${route}: provider rate limit reached`;
+    case "route_unavailable": return `${route}: provider route unavailable`;
+    case "provider_internal": return `${route}: provider internal error`;
+    case "diagnostic": return `${route}: unclassified provider error — evidence preserved`;
+  }
+}
 export const ModelCapabilitySchema = z.object({
   tier: ReasoningTierSchema,
   tools: z.array(text),
@@ -58,9 +105,16 @@ export const ModelCapabilitySchema = z.object({
   projects: z.array(text).default(["*"]),
   availability: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("usable") }),
-    z.object({ kind: z.literal("unavailable"), reason: text }),
+    z.object({ kind: z.literal("unavailable"), reason: text, cause: ProviderCauseSchema.optional() }),
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
+  /** The last bounded exact-model probe the runner ran for THIS model. A
+   * usable advertisement carrying a probe receipt NEWER than an incident's
+   * last observed failure is the ONLY thing that clears that incident — an
+   * answered ask is not health proof, and neither is a bare usable flag
+   * (BR#8821). The probe must match the route's exact model/config identity
+   * and the configured runtime request allowance, with no tools/side effects. */
+  probe: z.object({ model: text, at: z.number().int(), ok: z.boolean(), output_head: z.string().max(400) }).optional(),
 });
 export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional(),
   admission_hold: z.object({ kind: z.literal("update_handoff"), reason: text }).optional() });
@@ -118,7 +172,11 @@ export const InteractiveClaimSchema = z.object({
 export type InteractiveClaim = z.infer<typeof InteractiveClaimSchema>;
 export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("startup_wait"), episode_id: text, text, wait: StartupWaitSchema }),
-  z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),
+  z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text),
+    /** Typed provider causes behind the unavailable models, deduped by
+     * route scope — the UI renders these as account-action incidents, not
+     * generic "unavailable" text (BR#8821). */
+    causes: z.array(ProviderCauseSchema).max(20).default([]) }),
   z.object({ kind: z.literal("executor_not_ready"), episode_id: text, text, evidence: z.array(text), causes: z.array(z.object({ host: text, readiness: ExecutorNotReadySchema })).min(1) }),
   z.object({ kind: z.literal("capacity_wait"), episode_id: text, text }),
   z.object({ kind: z.literal("human_answer_required"), episode_id: text, ask_id: text, text }),
@@ -178,6 +236,11 @@ export const TerminalOutcomeSchema = z.object({
   exit_code: z.number().int().nullable(),
   stdout_tail: z.string().max(16_000),
   stderr_tail: z.string().max(8_000),
+  /** Typed provider/account cause when the transport captured a structured
+   * provider error. Absent on every older journal (mixed-version safe):
+   * `default` keeps old records parseable, and the authenticated failure
+   * provenance + raw sanitized evidence ride ONLY on this field (BR#8821). */
+  cause: ProviderCauseSchema.optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 export const ExecutionStateSchema = z.object({
