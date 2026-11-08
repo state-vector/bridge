@@ -1502,14 +1502,21 @@ solid if waiting to be"):
    only by the lane's current canonical GREEN deploy coverage (folded from the
    stored base state and the durable deploy observations, so a caller's bare
    green stamp can never override a newer durable failure) and only for the
-   task's exact current PR head; the budget is scoped to the successful
-   coverage receipt the hub derives (covered tip + decisive run id — never a
+   task's exact current PR head (fail-closed: an unobserved head never
+   licenses a dispatch, and legs in other repos are never compared); the
+   budget is scoped to the successful
+   coverage receipt the hub derives (covered tip + decisive run id + its
+   attempt — never a
    timestamp), so exactly one retry is granted per head/obligation/CHANGED
-   successful coverage, while an ordinary head check keeps its permanent
+   successful coverage (a same-run rerun — a new attempt of the same run id,
+   which GitHub reruns create — is a changed receipt that can recover the
+   gate), while an ordinary head check keeps its permanent
    one-dispatch budget (old ledger rows and receipts are preserved, never
    reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
-   fenced until its receipts reconcile — a fresh green stamp never licenses
-   repeating an unknown effect.
+   fenced until its receipts reconcile — the fence is scope-wide and evaluated
+   before any purpose branch, so NO purpose (stale or ordinary) re-dispatches
+   past an unreconciled external effect, and a fresh green stamp never licenses
+   repeating one.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings

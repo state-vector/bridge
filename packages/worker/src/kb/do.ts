@@ -13257,12 +13257,20 @@ export class KnowledgeHub {
           if (effective?.verdict !== "green" || !coverage.success || coverage.data.phase !== "covered") {
             throw new Error(`gate: stale-destination retry requires current canonical GREEN deploy coverage on the lane (verdict=${String(effective?.verdict ?? "none")}, coverage=${coverage.success ? coverage.data.phase : "absent"}) — re-dispatch denied`);
           }
-          // Exact current-head binding: the reserve must name the head the
-          // hub last observed for the task's PR; a moved head never re-opens
-          // a stale-destination budget.
-          for (const t of prTargetsOf({ meta: targetMeta })) {
+          // Exact current-head binding — fail-closed (independent review
+          // P1): the reserve must name the head the hub last observed for
+          // the task's PR legs ON THIS LANE'S REPO (legs in other repos are
+          // unrelated legs — never compared against this repo's rows), and a
+          // leg with no hub-observed current head DENIES: a missing
+          // observation never licenses a stale-destination dispatch, and a
+          // moved head never re-opens a stale-destination budget.
+          const legs = prTargetsOf({ meta: targetMeta }).filter((p) => p.repo === repo);
+          for (const t of legs) {
             const known = this.one(`SELECT head FROM delivery_pr_outcomes WHERE repo=? AND pr=?`, repo, t.number);
-            if (known?.head && String(known.head) !== command.head_sha) {
+            if (!known?.head) {
+              throw new Error(`gate: stale-destination retry requires the hub-observed current head of ${repo}#${t.number} — none recorded, re-dispatch denied`);
+            }
+            if (String(known.head) !== command.head_sha) {
               throw new Error(`gate: stale-destination retry head ${command.head_sha.slice(0, 8)} is not the current head of PR #${t.number} (${String(known.head).slice(0, 8)}) — re-dispatch denied`);
             }
           }

@@ -16,12 +16,19 @@ describe("BR#8824 check retry purpose/evidence contracts", () => {
   });
 
   it("derives the coverage receipt from canonical identity only — never a timestamp", () => {
-    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500 })).toBe(JSON.stringify(["b".repeat(40), 500]));
+    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500 })).toBe(JSON.stringify(["b".repeat(40), 500, null]));
     // a missing decisive run id is its own receipt, not a guess
-    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: null })).toBe(JSON.stringify(["b".repeat(40), null]));
+    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: null })).toBe(JSON.stringify(["b".repeat(40), null, null]));
     // a NEW successful run on the SAME sha is a CHANGED receipt
     expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 501 }))
       .not.toBe(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500 }));
+    // a SAME-run rerun (a new attempt of the same run id — GitHub reruns
+    // create one) is a CHANGED receipt too: it can recover the gate, so it
+    // never silently reuses the consumed budget of the earlier attempt.
+    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500, covered_by_run_attempt: 2 }))
+      .not.toBe(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500, covered_by_run_attempt: 1 }));
+    expect(deployCoverageReceipt({ tip_sha: "b".repeat(40), covered_by_run_id: 500, covered_by_run_attempt: 1 }))
+      .toBe(JSON.stringify(["b".repeat(40), 500, 1]));
   });
 
   it("scopes the ledger keys to the obligation and the validated coverage receipt", () => {

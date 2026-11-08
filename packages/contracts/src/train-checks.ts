@@ -38,12 +38,15 @@ export const CheckRetryCommandSchema = z.discriminatedUnion("kind", [
 ]);
 
 /** BR#8824: the canonical identity of a successful deploy coverage — the
- *  covered base tip plus the decisive covering run. NEVER a timestamp
- *  (observed_at moves every read) and NEVER caller-asserted green (the hub
- *  derives the coverage from its own folded lane state; the caller only names
- *  the purpose). A new decisive run on the SAME sha is a changed receipt. */
-export function deployCoverageReceipt(coverage: { tip_sha: string; covered_by_run_id?: number | null }): string {
-  return JSON.stringify([coverage.tip_sha, coverage.covered_by_run_id ?? null]);
+ *  covered base tip plus the decisive covering run AND its attempt. NEVER a
+ *  timestamp (observed_at moves every read) and NEVER caller-asserted green
+ *  (the hub derives the coverage from its own folded lane state; the caller
+ *  only names the purpose). A new decisive run on the SAME sha is a changed
+ *  receipt, and so is a same-run rerun (a new attempt of the same run id —
+ *  GitHub reruns create one; it can recover the gate) — the attempt keeps
+ *  same-run reruns from silently reusing a consumed budget. */
+export function deployCoverageReceipt(coverage: { tip_sha: string; covered_by_run_id?: number | null; covered_by_run_attempt?: number | null }): string {
+  return JSON.stringify([coverage.tip_sha, coverage.covered_by_run_id ?? null, coverage.covered_by_run_attempt ?? null]);
 }
 
 /** BR#8824: the ledger keys for one (task, head, obligation) pair.

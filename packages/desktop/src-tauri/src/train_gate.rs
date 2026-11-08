@@ -1456,6 +1456,12 @@ pub enum DeployCoverageState {
         covered_by_sha: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_run_id: Option<i64>,
+        /// BR#8824: canonical same-run rerun identity — a new attempt of the
+        /// same run id on the same tip is a CHANGED coverage receipt (it can
+        /// recover the gate), so the executor stamps the attempt alongside the
+        /// run id. Mirrored in `DeployCoverageStateSchema` + `deployCoverageReceipt`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered_by_run_attempt: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_url: Option<String>,
     },
@@ -1802,6 +1808,7 @@ pub fn reconcile_deploy_coverage(
                 tip_age_secs,
                 covered_by_sha: tip_sha.clone(),
                 covered_by_run_id: tip_green.map(|r| r.id),
+                covered_by_run_attempt: tip_green.and_then(|r| r.run_attempt),
                 covered_by_url: tip_green.and_then(|r| r.html_url.clone()),
             },
             dispatch_workflow: None,

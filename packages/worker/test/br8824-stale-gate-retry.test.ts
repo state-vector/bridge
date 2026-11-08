@@ -85,6 +85,10 @@ describe("BR#8824 scoped stale deployment-gate retries", () => {
     const tip = "b".repeat(40);  // the destination (main) tip
     const task = await queueViaAccept({ repo, pr: 1, head });
     expect((await acquire(repo, actor, { required_workflows: ["Deploy Dev"] })).status).toBe(200);
+    // The reconcile daemon's open-PR observation — the hub-observed current
+    // head the stale-destination binding requires (fail-closed without one).
+    const report = await kbJson("/reconcile.report", { repo, prs: [{ number: 1, state: "OPEN", headRefOid: head, updatedAt: new Date().toISOString() }], actor: "system:reconcile" });
+    expect(report.status, JSON.stringify(report.body)).toBe(200);
     return { repo, actor, head, tip, task };
   };
   /** Stamp the lane's base state (the executor's per-tick observation). */
@@ -144,10 +148,37 @@ describe("BR#8824 scoped stale deployment-gate retries", () => {
     const second = `gw-8824-two-holders-b`;
     expect((await acquire(r.repo, second)).status).toBe(200);
     expect((await reserve(r, "stale_destination_gate", second)).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
-    // the ordinary budget of the same scope is untouched by the scoped row.
-    expect((await reserve(r, undefined, second)).body).toMatchObject({ kind: "reserved" });
-    expect((await reserve(r, "ordinary_head_check", second)).body).toMatchObject({ kind: "held", state: "prepared" });
+    // BR#8824 (independent review P1): the unknown-effect fence is
+    // SCOPE-WIDE — the scoped outcome_unknown fences the ORDINARY purpose too
+    // (legacy scope-less and explicit alike): no purpose re-dispatches past
+    // an unreconciled external effect of the same [task, head, obligation].
+    expect((await reserve(r, undefined, second)).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    expect((await reserve(r, "ordinary_head_check", second)).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
     await kbJson("/train.lease", { repo: r.repo, actor: second, action: "release" });
+  });
+
+  it("fences BOTH purpose directions behind an unreconciled unknown dispatch of the same scope", async () => {
+    // direction 1: a SCOPED unknown fences the ORDINARY branch (the P1 —
+    // the pre-fix ordinary branch read the bare key only and let a scoped
+    // unknown effect through).
+    const a = await rig("fence-dir1-scoped-unknown");
+    await stampBase(a, greenCoverage(a.tip, 500));
+    const scoped = await reserve(a, "stale_destination_gate");
+    expect(scoped.body.kind).toBe("reserved");
+    expect((await result(a, scoped.body.key, "outcome_unknown", "Response lost after POST")).body.kind).toBe("recorded");
+    expect((await reserve(a)).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    expect((await reserve(a, "ordinary_head_check")).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    await kbJson("/train.lease", { repo: a.repo, actor: a.actor, action: "release" });
+    // direction 2: an ORDINARY unknown fences the STALE branch — even under
+    // fresh green coverage (the changed receipt grants nothing past it).
+    const b = await rig("fence-dir2-ordinary-unknown");
+    await stampBase(b, greenCoverage(b.tip, 500));
+    const ord = await reserve(b); // legacy scope-less ordinary dispatch
+    expect(ord.body.kind).toBe("reserved");
+    expect((await result(b, ord.body.key, "outcome_unknown", "Response lost after POST")).body.kind).toBe("recorded");
+    await stampBase(b, greenCoverage(b.tip, 900));
+    expect((await reserve(b, "stale_destination_gate")).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+    await kbJson("/train.lease", { repo: b.repo, actor: b.actor, action: "release" });
   });
 
   it("counts a new successful run on the same base SHA as a changed coverage — a new budget", async () => {
@@ -159,6 +190,28 @@ describe("BR#8824 scoped stale deployment-gate retries", () => {
     // a NEW decisive successful run on the SAME tip sha is a changed receipt.
     await stampBase(r, greenCoverage(r.tip, 501));
     const second = await reserve(r, "stale_destination_gate");
+    expect(second.body.kind).toBe("reserved");
+    expect(second.body.key).not.toBe(first.body.key);
+    expect((await reserve(r, "stale_destination_gate")).body).toMatchObject({ kind: "held", state: "prepared" });
+    await kbJson("/train.lease", { repo: r.repo, actor: r.actor, action: "release" });
+  });
+
+  it("counts a same-run rerun (new attempt of the same run id and SHA) as a changed coverage — a new budget", async () => {
+    // (independent review P1) the receipt must carry the canonical
+    // run_attempt: a GitHub rerun of run 500 on the same tip creates attempt
+    // 2 — a CHANGED receipt that can recover the gate. The pre-fix receipt
+    // [tip, run_id] would hold it as the same budget and lose the recovery.
+    const r = await rig("same-run-new-attempt");
+    const attempt = (n: number) => ({ ...greenCoverage(r.tip, 500), deploy_coverage: { ...greenCoverage(r.tip, 500).deploy_coverage, covered_by_run_attempt: n } });
+    await stampBase(r, attempt(1));
+    const first = await reserve(r, "stale_destination_gate");
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.kind).toBe("reserved");
+    expect((await result(r, first.body.key, "dispatched", "run/500/rerun")).body.kind).toBe("recorded");
+    // the SAME run id on the SAME tip sha, rerun to attempt 2 — changed receipt.
+    await stampBase(r, attempt(2));
+    const second = await reserve(r, "stale_destination_gate");
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
     expect(second.body.kind).toBe("reserved");
     expect(second.body.key).not.toBe(first.body.key);
     expect((await reserve(r, "stale_destination_gate")).body).toMatchObject({ kind: "held", state: "prepared" });
@@ -248,5 +301,50 @@ describe("BR#8824 scoped stale deployment-gate retries", () => {
     const current = { ...r, head: moved };
     expect((await reserve(current, "stale_destination_gate")).body.kind).toBe("reserved");
     await kbJson("/train.lease", { repo: r.repo, actor: r.actor, action: "release" });
+  });
+
+  it("fails closed with no observed current head, and never compares an unrelated repo's leg", async () => {
+    // (independent review P1) the pre-fix binding skipped the check when the
+    // hub had NO delivery_pr_outcomes row (fail-open), and compared every
+    // leg's PR number against the LANE repo's rows (unrelated legs).
+    const repo = `state-vector/stale-gate-8824-failclosed`;
+    const actor = "gw-8824-failclosed";
+    const head = "a".repeat(40);
+    const tip = "b".repeat(40);
+    const impl = await kbJson("/create", { type: "task", title: "IMPL: fail-closed drill", session: "" });
+    expect(impl.status).toBe(200);
+    const implId = String(impl.body.id);
+    const verify = await kbJson("/create", { type: "task", title: `VERIFY: fail-closed drill ${implId}`, roles: ["review"], session: "br8824-verify" });
+    const verifyId = String(verify.body.id);
+    await kbJson("/link", { src: verifyId, relation: "child_of", dst: implId });
+    await kbJson("/transition", { id: verifyId, to: "in_progress", actor: "drill-verifier", note: "drill: verifying" });
+    // a TWO-leg accepted verdict: one leg on the lane repo, one on ANOTHER
+    // repo (PR #99) — the unrelated leg must never be compared here.
+    const closed = await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier",
+      note: `verified head ${head} (drill)`,
+      review_result: await reviewOutcome(kbJson, verifyId, { kind: "accepted_pr", task_id: implId, legs: [
+        { repo, number: 1, head_sha_at_acceptance: head },
+        { repo: "state-vector/unrelated-8824", number: 99, head_sha_at_acceptance: "d".repeat(40) },
+      ] }) });
+    expect(closed.status, `verify close failed: ${JSON.stringify(closed.body)}`).toBeLessThan(400);
+    expect((await acquire(repo, actor, { required_workflows: ["Deploy Dev"] })).status).toBe(200);
+    const reserveOn = (h: string) => kbJson("/train.queue_facts", { repo, actor, check_retry: {
+      kind: "reserve", task_id: implId, head_sha: h, name: "Deploy health (merge gate)",
+      source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 }, target: { kind: "workflow_run", id: 41734497120 },
+      purpose: "stale_destination_gate" } });
+    await kbJson("/train.queue_facts", { repo, actor, entries: [], base_state: greenCoverage(tip, 500) });
+    // NO reconcile observation for repo#1 — the hub has no observed current
+    // head, so the stale-destination reserve DENIES (fail-closed).
+    const denied = await reserveOn(head);
+    expect(denied.status, JSON.stringify(denied.body)).toBe(400);
+    expect(denied.body.error).toMatch(/requires the hub-observed current head of .*#1 — none recorded, re-dispatch denied/);
+    // observe only the LANE repo's leg: the unrelated repo's leg (#99) is
+    // never compared against this repo's rows — the current head reserves.
+    const report = await kbJson("/reconcile.report", { repo, prs: [{ number: 1, state: "OPEN", headRefOid: head, updatedAt: new Date().toISOString() }], actor: "system:reconcile" });
+    expect(report.status, JSON.stringify(report.body)).toBe(200);
+    const ok = await reserveOn(head);
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    expect(ok.body.kind).toBe("reserved");
+    await kbJson("/train.lease", { repo, actor, action: "release" });
   });
 });

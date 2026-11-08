@@ -30,14 +30,21 @@ export class TrainCheckRecovery {
       if (command.kind === "reserve") {
         if (command.source.kind === "unknown") throw new Error("gate: check retry requires a typed GitHub source");
         const scopeKey = checkRetryScopeKey(command.task_id, command.head_sha, checkObligationKey(command));
+        // Unknown prior effect fence — SCOPE-WIDE and BEFORE both purpose
+        // branches (independent review P1): any prepared/outcome_unknown
+        // dispatch of this [task, head, obligation] scope — bare-key or
+        // coverage-scoped, whatever purpose issued it — stays fenced until
+        // its receipts reconcile. NO purpose (stale_destination_gate,
+        // ordinary_head_check, or a legacy scope-less caller) may grant a
+        // retry past an unreconciled external effect; repeating one is the
+        // one unrecoverable move, and a new successful coverage never
+        // licenses it.
+        const rows = this.scopeRows(lane, scopeKey);
+        const fenced = rows.find((r) => r.state === "prepared" || r.state === "outcome_unknown");
+        if (fenced) return { kind: "held" as const, key: fenced.retry_key, state: fenced.state, receipt: fenced.receipt };
         if (scope?.purpose === "stale_destination_gate") {
-          // Unknown prior effect fence: any prepared/outcome_unknown dispatch
-          // of this scope stays fenced until its receipts reconcile — a new
-          // successful coverage never licenses repeating an unknown effect.
-          const fenced = this.scopeRows(lane, scopeKey).find((r) => r.state === "prepared" || r.state === "outcome_unknown");
-          if (fenced) return { kind: "held" as const, key: fenced.retry_key, state: fenced.state, receipt: fenced.receipt };
           const scopedKey = checkRetryScopedKey(scopeKey, scope.purpose, scope.coverageReceipt);
-          const old = this.scopeRows(lane, scopeKey).find((r) => r.retry_key === scopedKey);
+          const old = rows.find((r) => r.retry_key === scopedKey);
           if (old) return { kind: "held" as const, key: scopedKey, state: old.state, receipt: old.receipt };
           this.storage.sql.exec(
             `INSERT INTO train_check_retries(lane_id,retry_key,state,receipt,updated_ts,scope_key) VALUES(?,?,'prepared',?,?,?)`,
@@ -45,10 +52,11 @@ export class TrainCheckRecovery {
           return { kind: "reserved" as const, key: scopedKey };
         }
         // ordinary_head_check (and legacy callers): the bare scope key is the
-        // permanent budget — any prior row of it holds, unchanged.
-        const old = this.storage.sql.exec(
-          `SELECT state,receipt FROM train_check_retries WHERE lane_id=? AND retry_key=?`, lane, scopeKey).toArray()[0];
-        if (old) return { kind: "held" as const, key: scopeKey, state: String(old.state), receipt: String(old.receipt) };
+        // permanent budget — any prior row of it holds, unchanged. Only a
+        // terminal row can reach here (the fence above holds every
+        // prepared/outcome_unknown row of the scope).
+        const old = rows.find((r) => r.retry_key === scopeKey);
+        if (old) return { kind: "held" as const, key: scopeKey, state: old.state, receipt: old.receipt };
         this.storage.sql.exec(
           `INSERT INTO train_check_retries(lane_id,retry_key,state,receipt,updated_ts,scope_key) VALUES(?,?,'prepared',?,?,?)`,
           lane, scopeKey, JSON.stringify(command.target), now, scopeKey);

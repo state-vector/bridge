@@ -4011,6 +4011,10 @@ export const DEPLOY_RECONCILE_GRACE_SECS = 300;
 
 export type DeployWorkflowRun = {
   id: number;
+  /** BR#8824: canonical same-run rerun identity (a GitHub rerun is a new
+   *  attempt of the same run id) — rides the observation into the covered
+   *  state's `covered_by_run_attempt`. */
+  run_attempt?: number | null;
   name: string;
   path?: string | null;
   head_sha: string;
@@ -4217,6 +4221,7 @@ export function reconcileDeployCoverage(input: {
         tip_age_secs: tipAgeSecs,
         covered_by_sha: tipSha,
         covered_by_run_id: tipGreen?.id ?? null,
+        covered_by_run_attempt: tipGreen?.run_attempt ?? null,
         covered_by_url: tipGreen?.html_url ?? null,
       },
       dispatch_workflow: null,
