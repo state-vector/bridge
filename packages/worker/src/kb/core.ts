@@ -2912,6 +2912,7 @@ export type CandidateGatePhase =
   | { phase: "head_uncovered"; legNumber: number; stamped: string }
   | { phase: "mergeability_computing"; reason: string }
   | { phase: "conflicting" }
+  | { phase: "commit_evidence_missing" }
   | { phase: "unverified_commits"; count: number }
   | { phase: "unhandled_merge_state"; state: string }
   | {
@@ -2958,6 +2959,7 @@ export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhas
   if (rawState !== "clean" && rawState !== "unstable" && rawState !== "behind" && rawState !== "blocked") {
     return { phase: "unhandled_merge_state", state: rawState };
   }
+  if (!i.commits.some((c) => c.sha === i.headSha)) return { phase: "commit_evidence_missing" };
   const unverified = i.commits.filter((c) => !c.verified).length;
   if (unverified > 0) {
     return { phase: "unverified_commits", count: unverified };
@@ -2973,7 +2975,9 @@ export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhas
     const allBaseHealth = names.length > 0 && names.every((n) => isBaseHealthGateName(n));
     const allMainGreen = names.length > 0 && names.every((n) => n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
     const noneMainGreen = names.every((n) => !n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
-    if (allBaseHealth && noneMainGreen) {
+    if (allBaseHealth && head.unsettled.length) {
+      headState = { kind: "pending", unsettled: head.unsettled };
+    } else if (allBaseHealth && noneMainGreen) {
       headState = { kind: "red_circular_deploy_gate", names };
     } else if (allMainGreen) {
       headState = { kind: "red_circular_main_green_gate", names };
@@ -3046,6 +3050,8 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
         defect: `PR #${i.prNumber} mergeStateStatus=${phase.state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg`,
         bounceKind: "gate",
       };
+    case "commit_evidence_missing":
+      return { kind: "skip", reason: "Commit signature evidence does not cover the live head; wait for a complete GitHub read" };
     case "unverified_commits":
       return {
         kind: "human_leg",

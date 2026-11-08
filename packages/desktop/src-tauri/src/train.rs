@@ -805,19 +805,19 @@ impl Ctx {
     }
 
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
-        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {sha: .sha, verified: .commit.verification.verified}]"]);
-        match out {
-            Ok(Value::Array(a)) => a
-                .iter()
-                .map(|c| {
-                    (
-                        c.get("sha").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        c.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
-                    )
-                })
-                .collect(),
-            _ => vec![],
+        // Slurp all REST pages atomically. Any failed or malformed page leaves
+        // no proof, so a partial response cannot certify a long PR.
+        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--paginate", "--slurp"]);
+        let Ok(Value::Array(pages)) = out else { return vec![]; };
+        let mut commits = Vec::new();
+        for page in pages {
+            let Value::Array(rows) = page else { return vec![]; };
+            for row in rows {
+                let Some(sha) = row.get("sha").and_then(Value::as_str).filter(|sha| !sha.is_empty()) else { return vec![]; };
+                commits.push((sha.to_string(), row.pointer("/commit/verification/verified").and_then(Value::as_bool).unwrap_or(false)));
+            }
         }
+        commits
     }
 
     /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
@@ -6266,6 +6266,15 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    fn signature_fixture(args: &[&str], rows: Value) -> String {
+        if args.contains(&"--slurp") {
+            let page: Vec<Value> = rows.as_array().unwrap().iter().map(|row| json!({
+                "sha": row["sha"], "commit": { "verification": { "verified": row["verified"] } }
+            })).collect();
+            json!([page]).to_string()
+        } else { rows.to_string() }
+    }
+
     fn test_ctx(hub: &str) -> Ctx {
         Ctx {
             operation_deadline: None,
@@ -6895,7 +6904,7 @@ mod tests {
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(signature_fixture(args, json!([{"sha":head,"verified":true}])))); }
                 panic!("unexpected gh command {args:?}");
             }));
             let mut queue = vec![json!({"id":"BR#3"}), json!({"id":"BR#2"})];
@@ -6993,7 +7002,7 @@ mod tests {
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                if endpoint.ends_with("/commits") { return Some(Ok(signature_fixture(args, json!([{"sha": if endpoint.contains("/pulls/1/") { &heads[0] } else { &heads[1] }, "verified":true}])))); }
                 panic!("unexpected gh command {args:?}");
             }));
             drive_lane_inner(&mut ctx, &json!({"queue":[{"id":"BR#1"},{"id":"BR#2"}],"required_workflows":["Test"]}),
@@ -7063,7 +7072,7 @@ mod tests {
             if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
             if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
             if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-            if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{ "verified": true }]).to_string())); }
+            if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(signature_fixture(args, json!([{ "sha": current, "verified": true }])))); }
             panic!("unexpected gh command {args:?}");
         }));
         let result = drive_lane_inner(&mut ctx,
@@ -7141,7 +7150,7 @@ mod tests {
                     return Some(Ok("{}".into()));
                 }
                 if endpoint.contains("/pulls/") && endpoint.ends_with("/commits") {
-                    return Some(Ok(json!([{ "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]).to_string()));
+                    return Some(Ok(signature_fixture(args, json!([{ "sha": if endpoint.contains("/pulls/2/") { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale }, "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]))));
                 }
                 panic!("unexpected gh command {args:?}");
             }));
@@ -7153,6 +7162,26 @@ mod tests {
             assert_eq!(held.pointer("/entries/0/cls"), Some(&json!(if worker_owned { "waiting" } else { "blocked" })));
             assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 2));
             assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 1));
+        }
+    }
+
+    #[test]
+    fn signature_read_includes_later_pages_and_discards_incomplete_results() {
+        let row = |n: u32, verified: bool| json!({ "sha": format!("{n:040x}"), "commit": { "verification": { "verified": verified } } });
+        let page: Vec<Value> = (1..=30).map(|n| row(n, true)).collect();
+        for (response, expected) in [
+            (Ok(json!([page, [row(31, false), row(32, true)]]).to_string()), 32),
+            (Ok(json!([[row(1, true)], {"error":"incomplete page"}]).to_string()), 0),
+            (Err("GitHub page 2 failed".into()), 0),
+        ] {
+            let mut ctx = test_ctx("http://unused.invalid");
+            ctx.sh_mock = Some(std::sync::Arc::new(move |_, args| {
+                assert!(args.contains(&"--paginate") && args.contains(&"--slurp"));
+                Some(response.clone())
+            }));
+            let commits = ctx.pr_commits("o/r", 1);
+            assert_eq!(commits.len(), expected);
+            if expected > 0 { assert!(!commits[30].1); assert_eq!(commits[31].0, format!("{:040x}",32)); }
         }
     }
 
@@ -8161,7 +8190,7 @@ mod tests {
                         }));
                     }
                     if endpoint.contains("/pulls/2880/commits") {
-                        return Some(Ok(json!([{ "sha": pr_head, "verified": true }]).to_string()));
+                        return Some(Ok(signature_fixture(args, json!([{ "sha": pr_head, "verified": true }]))));
                     }
                 }
             }

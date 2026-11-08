@@ -934,6 +934,7 @@ pub enum CandidateGatePhase {
     HeadUncovered { leg_number: usize, stamped: String },
     MergeabilityComputing { reason: String },
     Conflicting,
+    CommitEvidenceMissing,
     UnverifiedCommits { count: usize },
     UnhandledMergeState { state: String },
     MechanicallySound {
@@ -1000,6 +1001,7 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
         "blocked" => CandidateMergeState::Blocked,
         _ => return CandidateGatePhase::UnhandledMergeState { state },
     };
+    if !i.commits.iter().any(|(sha, _)| sha == i.head_sha) { return CandidateGatePhase::CommitEvidenceMissing; }
     let unverified = i.commits.iter().filter(|(_, v)| !v).count();
     if unverified > 0 {
         return CandidateGatePhase::UnverifiedCommits { count: unverified };
@@ -1111,6 +1113,9 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                 n = i.pr_number
             ),
             bounce_kind: BounceKind::Gate,
+        },
+        CandidateGatePhase::CommitEvidenceMissing => MergeAction::Skip {
+            reason: "Commit signature evidence does not cover the live head; wait for a complete GitHub read".into(),
         },
         CandidateGatePhase::UnverifiedCommits { count } => MergeAction::HumanLeg {
             reason: format!(
@@ -2390,7 +2395,7 @@ mod tests {
         // conviction must re-run — never bounce, never a human leg.
         let head = [run(1, "Test", Some("success")), run(2, "main-green gate", Some("failure"))];
         let g = MainVerdict::Green;
-        let commits = [(format!("{:040x}", 1), true)];
+        let commits = [(format!("{:040x}", 2), true)];
         let action = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: 377,
             head_sha: &format!("{:040x}", 2),
@@ -3421,19 +3426,29 @@ mod tests {
     fn bypass_requires_settled_verified_covered_head() {
         let head = "cccccccccccccccccccccccccccccccccccccccc";
         let meta = root_fix_meta(head);
-        for (verified, live_head, pending) in [(true, head, true), (false, head, false),
-            (true, "dddddddddddddddddddddddddddddddddddddddd", false)] {
+        for (verified, live_head, pending, missing) in [(true, head, true, false), (false, head, false, false),
+            (true, "dddddddddddddddddddddddddddddddddddddddd", false, false), (true, head, false, true)] {
             let mut checks = vec![run(1, "Deploy health (merge gate)", Some("failure"))];
             if pending { checks.push(run(2, "Rust Tests", None)); }
+            let commits = if missing { vec![] } else { vec![(live_head.into(), verified)] };
             let gate = decide_train_gate(TrainGateInput {
                 pr_number: 339, head_sha: live_head, card_meta: &meta, card_status: Some("blocked"),
                 base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
-                commits: &[(live_head.into(), verified)], head_checks: &checks, leg_number: Some(1),
+                commits: &commits, head_checks: &checks, leg_number: Some(1),
                 mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
                 base_gate_green: false, train_owned_branch: false,
             });
             assert!(!matches!(gate, MergeAction::RootFixBypass { .. } | MergeAction::Merge { .. }), "{gate:?}");
         }
+        let truncated = vec![("9".repeat(40), true)];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339, head_sha: head, card_meta: &meta, card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
+            commits: &truncated, head_checks: &[run(1, "Deploy health (merge gate)", Some("failure"))], leg_number: Some(1),
+            mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
+            base_gate_green: false, train_owned_branch: false,
+        });
+        assert!(matches!(gate, MergeAction::Skip { .. }), "{gate:?}");
     }
 
     #[test]

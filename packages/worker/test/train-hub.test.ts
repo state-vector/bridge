@@ -1016,7 +1016,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     // the verifier closes done citing the PR + head receipts — the pre-3659
     // hub re-queued the bounced parent on exactly this close (defect 2)
     const closed = await kbJson("/transition", { id: verifyId, to: "done", actor: "drill-verifier", review_result: { kind: "findings", summary: "Parent PR conflicts with base." }, note: `bounced PR https://github.com/${repo}/pull/2801 head ${"e".repeat(40)} — findings filed on the parent` });
-    expect(closed.status).toBeLessThan(400);
+    expect(closed.status, JSON.stringify(closed.body)).toBeLessThan(400);
     const c = (await kbJson("/get", { id: implId })).body;
     // the bounce SURVIVED: no hijack to blocked merge-train: queued
     expect(c.status).toBe("in_progress");
@@ -2560,9 +2560,10 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     // (here via the legitimate retirement path — web/human, on the parked
     // card's one drop edge blocked→superseded; close-protection pins the
     // agent path separately below)
-    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rv" });
+    const release = await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rv" });
+    expect(release.status, JSON.stringify(release.body)).toBe(200);
     const closed = await kbJson("/transition", { id: deadCard, to: "superseded", actor: "web:drill", note: "drill: erroneous close of a live lane (the BR#5061 incident shape)" });
-    expect(closed.status).toBeLessThan(400);
+    expect(closed.status, JSON.stringify(closed.body)).toBeLessThan(400);
 
     // the reseed: a live card carrying the same lane key, supersedes-linked
     const reseed = await kbJson("/create", {
@@ -2605,7 +2606,7 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-fr" });
     await kbJson("/transition", { id: old.card, to: "in_progress", actor: "gw-fr", note: "drill: claiming to retire" });
     const closed = await kbJson("/transition", { id: old.card, to: "done", actor: "web:drill", note: "drill: deliberate retirement via web — no reseed registered (BR#5151: owner identity no longer closes standing cards)" });
-    expect(closed.status).toBeLessThan(400);
+    expect(closed.status, JSON.stringify(closed.body)).toBeLessThan(400);
 
     // every lane op refuses — the lane is deliberately retired, no
     // auto-resurrection, and the terminal card's meta never moves
@@ -4705,7 +4706,7 @@ describe("BR#5186: all-terminal reseed (real bundled worker)", () => {
     // close-protection exempts web/human on purpose: it is the recovery lever)
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rl" });
     const closed = await kbJson("/transition", { id: deadCard, to: "superseded", actor: "web:drill", note: "drill: erroneous close of a live lane (the BR#5050 shape)" });
-    expect(closed.status).toBeLessThan(400);
+    expect(closed.status, JSON.stringify(closed.body)).toBeLessThan(400);
 
     // the executor reseeds (base live) — no manual reseed card this time
     const reseed = await kbJson("/train.lane", { repo, base: "main", base_live: true, actor: "gw-rl2" });
