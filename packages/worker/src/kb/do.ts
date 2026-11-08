@@ -233,7 +233,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -11462,12 +11462,20 @@ export class KnowledgeHub {
       };
       return m;
     };
+    const scope = this.trainRepairScope(a.repo, a.base, a.sha);
+    if (scope.kind === "current") for (const id of scope.task_ids) {
+      const repair = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, id);
+      if (!repair || ["done", "superseded"].includes(repair.status)) continue;
+      const rm = JSON.parse(repair.meta ?? "{}");
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(bind(rm)), id);
+      return id;
+    }
     // (1) culprit-qualified-in-place
     if (a.culpritId) {
       const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
       if (c && c.status !== "done" && c.status !== "superseded") {
         const cm = JSON.parse(c.meta ?? "{}");
-        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm })) {
+        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && mainRedBinding(cm)?.head_sha === a.sha) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
           this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
           return c.id;
@@ -11493,7 +11501,7 @@ export class KnowledgeHub {
       const binding = mainRedBinding(om);
       if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
       const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
-      if (o.status === "blocked" && !sameSha) continue;
+      if (!sameSha && (o.status === "blocked" || trainLegs(om).length > 0 || om.review_pr || om.recovery_links?.length)) continue;
       if (!sameSha && this.rootFixExhausted(om, String(o.status ?? ""))) continue;
       const nextFailing = a.failing.map((f) => f.name);
       const prevFailing = Array.isArray(om.root_fix?.failing) ? om.root_fix.failing.map(String) : [];
@@ -13262,6 +13270,9 @@ export class KnowledgeHub {
     // BR#5633: the entries THIS stamp persists — provided, else the stored
     // ones (the absent-entries preservation above).
     const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
+    for (const entry of entriesArr) {
+      if (entry.bypass !== undefined) entry.bypass = RecoveryMergeGateSchema.parse(entry.bypass);
+    }
     const scan = TrainQueueScanSchema.parse(body.scan ?? meta.lane?.queue_facts?.scan ?? { phase: "complete" });
     // BR#5265 Fix A: the executor stamps the walk's base verdict
     // (scoped to the lane's required workflows, Fix B) alongside the
@@ -13877,6 +13888,7 @@ export class KnowledgeHub {
    *  one of them. root_fix sorts to rank 0 unconditionally; the stopped
    *  lane's fast lane (BR#5190) is enforced walk-side at the merge gate. */
   private laneQueue(repo: string, base: string) {
+    const scope = this.trainRepairScope(repo, base);
     const cards = this.state.storage.sql.exec(
       `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
@@ -13900,8 +13912,11 @@ export class KnowledgeHub {
       const cm = metaById.get(c.id);
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
-      return { ...c, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
+      const root_fix = c.root_fix && scope.kind === "current" &&
+        (scope.task_ids.length ? scope.task_ids.includes(c.id) : mainRedBinding(cm)?.head_sha === scope.head_sha);
+      return { ...c, priority: root_fix ? "root_fix" : c.priority === "root_fix" ? "normal" : c.priority, root_fix, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
+    entries.sort((a, b) => Number(b.root_fix) - Number(a.root_fix));
     // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
     // Top-panel budget chip reads this; the executor ignores the extra
     // fields. Historical totals span different heads/kinds and are NOT the
@@ -13947,7 +13962,7 @@ export class KnowledgeHub {
   ): Promise<void> {
     const held = entriesArr.length;
     const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
-    const fix = this.trainOpenRootFix(repo, entriesArr);
+    const fix = this.trainOpenRootFix(repo, entriesArr, reds.map(r => r.name), base);
     const warranted = trainBaseRedAskWarranted(fix);
     const existing = this.one(
       `SELECT id, body_md, meta FROM artefacts WHERE type='question' AND status IN ('todo','in_progress','blocked') AND title=? LIMIT 1`, askTitle,
@@ -13966,12 +13981,14 @@ export class KnowledgeHub {
     const laneMetaRow = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id) as any;
     const lm = laneMetaRow ? JSON.parse(laneMetaRow.meta ?? "{}") : {};
     const pendingBypass = lm.lane?.bypass_merge ?? null;
+    const requestScope = this.trainRepairScope(repo, base);
     const declinedStamp = lm.lane?.base_red_ask_declined ?? null;
     if (
       warranted &&
       fix.curePr &&
       pendingBypass &&
-      Number(pendingBypass.pr) === Number(fix.curePr.number)
+      Number(pendingBypass.pr) === Number(fix.curePr.number) &&
+      requestScope.kind === "current" && pendingBypass.base_sha === requestScope.head_sha && pendingBypass.head_sha === fix.curePr.head_sha
     ) {
       this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "bypass authorization pending (DONE answered, executor tick outstanding)", pr: pendingBypass.pr, ask: existing?.id ?? null });
       return;
@@ -13982,6 +13999,7 @@ export class KnowledgeHub {
       declinedStamp &&
       String(declinedStamp.ask_title ?? "") === askTitle &&
       Number(declinedStamp.pr ?? -1) === Number(fix.curePr.number) &&
+      requestScope.kind === "current" && declinedStamp.base_sha === requestScope.head_sha && declinedStamp.head_sha === fix.curePr.head_sha &&
       Date.now() - Number(declinedStamp.at ?? 0) < 24 * 3_600_000
     ) {
       this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "declined (hold the line) — same episode + cure PR within 24h", pr: declinedStamp.pr, ask: existing?.id ?? null });
@@ -14014,9 +14032,14 @@ export class KnowledgeHub {
         ? i === 0 ? "You merge the named repair. Bridge checks the actual GitHub merge and deployment before advancing the queued changes." : "Bridge keeps the changes queued and continues observing the repair; no merge permission or success is inferred."
         : i === 0 ? "You provide the specific missing information or instructions on the repair task." : i === 1 ? "Bridge re-issues the repair with your new direction; existing execution fences and review requirements remain." : "Bridge keeps the work paused until the existing failure is resolved.", action: "hold" })),
     });
+    const scope = this.trainRepairScope(repo, base);
+    const ownerMerge = fix.curePr && fix.card && scope.kind === "current"
+      ? RecoveryOwnerMergeSchema.parse({ kind: "owner_merge", repo, base, task_id: fix.card.id,
+          pr: fix.curePr.number, base_sha: scope.head_sha, head_sha: fix.curePr.head_sha }) : undefined;
     if (existing) {
       const em = JSON.parse(existing.meta ?? "{}");
-      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(em.ask?.decision) !== JSON.stringify(decision)) {
+      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(em.ask?.decision) !== JSON.stringify(decision) || JSON.stringify(em.recovery_owner_merge) !== JSON.stringify(ownerMerge)) {
+        em.recovery_owner_merge = ownerMerge;
         em.ask = { ...em.ask, route: { kind: "human_decision" }, decision, to: "human", artefact_id: affectedTask, reason: decision.why_human, options: brief.options };
         this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id=? AND relation='child_of'`, existing.id);
         this.state.storage.sql.exec(`INSERT INTO relations (src_id,relation,dst_id,created_ts) VALUES (?,'child_of',?,?)`, existing.id, affectedTask, Date.now());
@@ -14025,7 +14048,13 @@ export class KnowledgeHub {
       }
     } else {
       try {
-        await this.askCreate({ to: "human", route: { kind: "human_decision" }, question: askTitle, decision, details: brief.details, artefact_id: affectedTask, urgency: "time-sensitive" }, actor);
+        const created = await this.askCreate({ to: "human", route: { kind: "human_decision" }, question: askTitle, decision, details: brief.details, artefact_id: affectedTask, urgency: "time-sensitive" }, actor);
+        if (ownerMerge) {
+          const request = this.one(`SELECT meta FROM artefacts WHERE id=?`, created.id);
+          const requestMeta = JSON.parse(request?.meta ?? "{}");
+          requestMeta.recovery_owner_merge = ownerMerge;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(requestMeta), created.id);
+        }
       } catch (e) {
         this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
       }
@@ -15179,14 +15208,30 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return false;
   }
 
-  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[], redNames?: string[]): {
+  private trainRepairScope(repo: string, base: string, head?: string): RecoveryRepairScope {
+    const row = this.laneRow(laneKey(repo, base));
+    const meta = JSON.parse(row?.meta ?? "{}");
+    const current = head ?? meta.stop?.sha ?? meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.lane?.deploy_observation?.tip_sha ?? "";
+    return recoveryRepairScope(String(current), RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {}));
+  }
+
+  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string; bypass?: unknown }[], redNames?: string[], base = "main"): {
     card: { id: string; title: string; status: string; exhausted?: boolean; blocked_reason?: string } | null;
-    curePr: { repo: string; number: number } | null;
+    curePr: { repo: string; number: number; head_sha?: string } | null;
     conflictPr?: { repo: string; number: number } | null;
     mergedPr?: { repo: string; number: number; merge_sha: string } | null;
     culpritPr: number | null;
     state: BaseRedEpisodeState;
   } {
+    const scope = this.trainRepairScope(repo, base);
+    const inScope = (id: string, meta: unknown): boolean => scope.kind === "unobserved" ||
+      (scope.task_ids.length ? scope.task_ids.includes(id) : mainRedBinding(meta)?.head_sha === scope.head_sha);
+    const bypassHead = (id: string, meta: unknown, pr: number): string | null => {
+      const evidence = RecoveryMergeGateSchema.safeParse(entries?.find(e => e.id === id && e.pr === pr)?.bypass);
+      if (!evidence.success || evidence.data.kind !== "bypass_required" || scope.kind !== "current" || evidence.data.base_sha !== scope.head_sha) return null;
+      const leg = trainLegs(meta).find(l => l.repo === repo && l.number === pr);
+      return leg && trainCarryChainEnd(leg) === evidence.data.head_sha ? evidence.data.head_sha : null;
+    };
     const matchesRedNames = (title: string, failing?: unknown): boolean => {
       if (!redNames || redNames.length === 0) return true;
       const hay = `${title} ${Array.isArray(failing) ? failing.join(" ") : ""}`.toLowerCase();
@@ -15219,7 +15264,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     };
     let root: {
       card: { id: string; title: string; status: string; exhausted?: boolean } | null;
-      curePr: { repo: string; number: number } | null;
+      curePr: { repo: string; number: number; head_sha?: string } | null;
       conflictPr?: { repo: string; number: number } | null;
       mergedPr?: { repo: string; number: number; merge_sha: string } | null;
       culpritPr: number | null;
@@ -15240,7 +15285,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
         // (agent-filed stop-the-line shape — BR#6378) heads the episode.
         if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
-        if (binding?.repo !== repo) continue;
+        if (binding?.repo !== repo || !inScope(String(r.id), m)) continue;
         const unlandedLegs = trainLegs(m)
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
@@ -15251,7 +15296,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           .filter((l): l is { repo: string; number: number; merge_sha: string } => !!l.merge_sha);
         const rawPr = openLegs.length ? openLegs[openLegs.length - 1] : null;
         const conflicting = rawPr ? isCardPrConflicting(m, rawPr.number) : false;
-        const curePr = rawPr && !conflicting ? rawPr : null;
+        const head = rawPr ? bypassHead(String(r.id), m, rawPr.number) : null;
+        const curePr = rawPr && !conflicting && head ? { ...rawPr, head_sha: head } : null;
         const conflictPr = rawPr && conflicting ? rawPr : null;
         const mergedPr = !curePr && !conflictPr && awaitingCiLegs.length ? awaitingCiLegs[awaitingCiLegs.length - 1] : null;
         // If this card's PR already merged for an OLD check (e.g. deploy/sccache)
@@ -15303,6 +15349,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ) as any;
         if (!row) continue;
         const m = JSON.parse(row.meta ?? "{}");
+        if (!inScope(id, m)) continue;
         if (isCardPrConflicting(m, pr)) continue;
         const unlanded = trainLegs(m).filter((l) => !trainLegLanded(m, l));
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);
@@ -15339,6 +15386,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
         const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
         if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
+        const head = bypassHead(id, m, pr);
+        if (!head) continue;
         const resolved = {
           card: {
             id: String(row.id),
@@ -15349,7 +15398,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               ? { blocked_reason: m.blocked.reason.trim() }
               : {}),
           },
-          curePr: { repo: legRepo, number: pr },
+          curePr: { repo: legRepo, number: pr, head_sha: head },
           conflictPr: null,
           mergedPr: null,
           culpritPr: root.culpritPr,
@@ -15374,6 +15423,27 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  through the per-tick queue_facts stamp. Failures are audited, never
    *  thrown — the answer itself is already safely recorded above. */
   private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, answer: string, actor: string): Promise<void> {
+    const ownerMerge = RecoveryOwnerMergeSchema.safeParse(askMeta?.recovery_owner_merge);
+    if (ownerMerge.success) {
+      const request = ownerMerge.data;
+      const row = this.laneRow(laneKey(request.repo, request.base));
+      if (!row) return;
+      const meta = JSON.parse(row.meta ?? "{}");
+      const scope = this.trainRepairScope(request.repo, request.base);
+      const current = this.trainOpenRootFix(request.repo, meta.lane?.queue_facts?.entries, undefined, request.base);
+      if (scope.kind !== "current" || scope.head_sha !== request.base_sha ||
+          current.card?.id !== request.task_id || current.curePr?.number !== request.pr || current.curePr?.head_sha !== request.head_sha) {
+        this.audit(actor, "train:stale_owner_merge_answer", askId, request);
+        return;
+      }
+      if (/\bdone\b/i.test(answer)) {
+        meta.lane = { ...meta.lane, bypass_merge: { ...request, ask_id: askId, at: Date.now() } };
+      } else {
+        meta.lane = { ...meta.lane, base_red_ask_declined: { ...request, ask_title: title, ask_id: askId, at: Date.now() } };
+      }
+      this.saveLaneState(row.id, meta, Date.now());
+      return;
+    }
     const t = String(title ?? askMeta?.ask?.question ?? "");
     const ans = answer.trim();
     // BR#6390: the number the FILED ASK named — its options carry the cure PR
@@ -15995,11 +16065,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const mergedQueue = [
           ...queue.map((q: any) => {
             const qfe = qfEntries.find((e: any) => String(e?.id ?? "") === String(q.id) || (Number(e?.pr) > 0 && Number(e?.pr) === Number(q.pr)));
-            return qfe?.cls ? { ...q, cls: String(qfe.cls) } : q;
+            return qfe?.cls ? { ...q, cls: String(qfe.cls), bypass: qfe.bypass } : q;
           }),
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
-        const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
+        const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name), lane.base);
         if (!rf.state.warrantAsk && !darkTipWarrantAsk && !gateBlockedWarrantAsk && askRow) {
           this.state.storage.sql.exec(
             `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,

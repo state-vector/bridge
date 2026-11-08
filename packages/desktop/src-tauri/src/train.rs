@@ -41,7 +41,7 @@ use crate::train_gate::{
     carry_chain_tip, classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
     is_root_fix_card, latest_red_deploy_health_runs, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
-    reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
+    reconcile_deploy_coverage, train_leg_landed, train_leg_state, train_legs,
     verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision,
     MainCheckRun, MainVerdict, MechanicalMove, MergeAction, TrainLeg, DEPLOY_RECONCILE_GRACE_SECS,
     TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
@@ -1902,7 +1902,7 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         base_verdict, mergeable: facts.get("mergeable").and_then(Value::as_bool),
         merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
         commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
-        mechanical_move: None, root_fix: is_root_fix_card(&card), base_red_names,
+        mechanical_move: None, root_fix: cand.root_fix && is_root_fix_card(&card), base_red_names,
         train_owned_branch: false,
     }), MergeAction::Merge { .. }))
 }
@@ -2363,6 +2363,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             )
             .map(|_| ())
         };
+        // New owner requests only observe the exact reviewed head. They never
+        // turn a DONE acknowledgement into delayed merge permission.
+        let owner_request = lane.pointer("/bypass_merge/kind").and_then(Value::as_str) == Some("owner_merge");
+        if owner_request && facts.as_ref().ok().is_some_and(|f|
+            vstr(f, "headRefOid") != lane.pointer("/bypass_merge/head_sha").and_then(Value::as_str)) {
+            ack(ctx, "stale owner request: PR head changed; fresh review and request required")?;
+            return Ok(());
+        }
         match facts.as_ref().map(|f| {
             (
                 vstr(f, "state").unwrap_or("").to_string(),
@@ -2394,6 +2402,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             Ok((state, _, _)) if state == "CLOSED" => {
                 ack(ctx, "closed")?;
                 log(Some(key), &format!("bypass: PR #{bpr} is CLOSED — authorization consumed (nothing to merge)"));
+            }
+            Ok((_, _, _)) if owner_request => {
+                let (live_base, _) = ctx.base_tip_facts(repo, base)?;
+                let requested_base = lane.pointer("/bypass_merge/base_sha").and_then(Value::as_str);
+                if requested_base != Some(live_base.as_str()) ||
+                    classify_base_check_runs(&ctx.check_runs(repo, &live_base), &required).verdict == MainVerdict::Green {
+                    ack(ctx, "owner request superseded: base changed or recovered; resume normal lane reconciliation")?;
+                    return Ok(());
+                }
+                ctx.note(&format!("PR #{bpr}: waiting to observe the owner's exact-head merge; DONE grants no automatic bypass"));
+                return Ok(());
             }
             Ok((_, _, head_sha)) => {
                 // BR#6390 DONE grace: the human clicked DONE ("I merged it") —
@@ -3092,7 +3111,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // bound root-fix card (tags + meta.root_fix binding) — the executor
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
         // on the card row, the binding under meta.root_fix).
-        let root_fix = is_root_fix_card(&card);
+        let root_fix = head.get("root_fix").and_then(Value::as_bool) == Some(true)
+            && is_root_fix_card(&card)
+            && card_meta.pointer("/root_fix/head_sha").and_then(Value::as_str) == Some(tip_sha.as_str());
         // BR#5880 (live incident, tick 2026-11-03T21:23:47Z): every gate
         // DECISION reads the LIVE check-runs for THIS head sha — the
         // paginated ctx.check_runs() fetch above, this tick — never a
@@ -3185,6 +3206,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::RootFixBypass { reason } => ("root_fix_bypass", format!(" — {reason}")),
             MergeAction::Carry { from_head, to_head, .. } => (
                 "carry",
                 format!(" — mechanical head move {}→{} (same patch-ids): verdict carries", &from_head[..from_head.len().min(9)], &to_head[..to_head.len().min(9)]),
@@ -3336,55 +3358,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // the queue is not held by a stale red
                 return Ok(());
             }
+            MergeAction::RootFixBypass { reason } => {
+                // Persist exact reviewed-head evidence before the shared hub
+                // resolver files the one durable owner request and UI action.
+                qfacts.last_mut().unwrap()["bypass"] = json!({ "kind": "bypass_required",
+                    "base_sha": tip_sha, "head_sha": head_sha });
+                renew_lease(ctx, repo, base);
+                ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base,
+                    "entries": qfacts, "base_state": base_state }))?;
+                ctx.note(&format!("root-fix bypass evidence saved for PR #{pr}: {reason}"));
+                return Ok(());
+            }
             MergeAction::HumanLeg { reason } => {
-                // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
-                // deploy-health class — the deterministic one-click merge ask
-                // (title byte-identical to the hub's, ask-dedupe keys on exact
-                // wording). First option IS the recommendation: one click
-                // merges the cure onto the red base.
-                if root_fix {
-                    renew_lease(ctx, repo, base);
-                    // BR#6390 human-gate contract: the ask says DO THIS, then
-                    // CLICK DONE — the copyable --admin merge command + PR and
-                    // card links inline, and the options are the accept/decline
-                    // pair the ask planes render as inline buttons. DONE is
-                    // dispatched hub-side (trainAlarmAnswerDispatch stamps
-                    // lane.bypass_merge; the executor's stamp consumer lands or
-                    // acks the merge). DECLINE holds the line, stamps nothing.
-                    let fast_details = [
-                        format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
-                        "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
-                        "HUMAN GATE — do this and click DONE when done to unblock:".to_string(),
-                        "1. Merge the cure out of turn (the gate fails every PR — including this fix PR itself — until the fix lands on the base). Copy-paste:".to_string(),
-                        "   ```".to_string(),
-                        format!("   gh pr merge {pr} --repo {repo} --admin --squash"),
-                        "   ```".to_string(),
-                        format!("2. Click DONE — PR #{pr} merged below. The queue unblocks itself: main's checks re-run on the new merge commit and the train drains once they settle green."),
-                        format!("Links: fix PR {repo}#{pr} — https://github.com/{repo}/pull/{pr} · fix card {head_id}."),
-                        "DECLINE — hold the line keeps the queue parked until main greens some other way; the fix work keeps digging.".to_string(),
-                    ].join("\n\n");
-                    ctx.mcp("ask_agent", json!({
-                        "to": "human",
-                        "route": { "kind": "human_decision" },
-                        "question": root_fix_fast_lane_title(repo, pr),
-                        "decision": {
-                            "kind": "authority", "task_id": head_id,
-                            "context": format!("Changes in {repo} are waiting because the main branch is failing. PR #{pr} contains the proposed repair, but GitHub has refused the automatic merge."),
-                            "why_human": "Only a repository administrator can resolve the remaining GitHub permission or protection requirement.",
-                            "choices": [
-                                { "label": format!("DONE — PR #{pr} merged"), "executor": "human", "consequence": "You merge the repair using your repository access. Bridge then checks the actual merge and deployment before continuing.", "action": "hold" },
-                                { "label": "DECLINE — hold the line", "executor": "bridge", "consequence": "Bridge keeps changes queued and continues the repair investigation without treating this answer as a successful deployment.", "action": "hold" }
-                            ]
-                        },
-                        "reason": reason,
-                        "details": fast_details,
-                        "options": [format!("DONE — PR #{pr} merged"), "DECLINE — hold the line"],
-                        "artefact_id": head_id,
-                    }))?;
-                    ctx.note(&format!("root-fix fast lane: filed the human-gate merge ask for PR #{pr} (circular deploy-health class)"));
-                    log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
-                    return Ok(());
-                }
                 // Signing/merge defects are repair work. The executor must
                 // identify a concrete missing permission before asking a human.
                 renew_lease(ctx, repo, base);
@@ -7168,6 +7153,36 @@ mod tests {
             assert_eq!(held.pointer("/entries/0/cls"), Some(&json!(if worker_owned { "waiting" } else { "blocked" })));
             assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 2));
             assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 1));
+        }
+    }
+
+    #[test]
+    fn owner_done_never_merges_and_changed_evidence_spends_old_request() {
+        for scenario in 0..4 {
+            let (hub, calls) = mock_hub_with(|_| Ok(json!({})));
+            let mut ctx = test_ctx(&hub);
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                assert_eq!(cmd, "gh");
+                assert!(!args.contains(&"merge"), "owner DONE must never issue merge or admin commands");
+                if args.first() == Some(&"pr") {
+                    assert_eq!(args[1], "view");
+                    return Some(Ok(json!({ "state": "OPEN", "headRefOid": if scenario == 1 { "d".repeat(40) } else { "c".repeat(40) } }).to_string()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint.ends_with("/commits/main") {
+                    return Some(Ok(json!({ "sha": if scenario == 2 { "e".repeat(40) } else { "b".repeat(40) }, "committed_at": crate::logging::iso(now_ms()) }).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.contains("/check-runs?") {
+                    return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": if scenario == 3 { "success" } else { "failure" } }]).to_string()));
+                }
+                panic!("unexpected gh command {args:?}");
+            }));
+            drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "bypass_merge": { "kind": "owner_merge", "pr": 1,
+                "head_sha": "c".repeat(40), "base_sha": "b".repeat(40), "at": 1 } }), "o/r@main", "o/r", "main", 60_000, 10).unwrap();
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.iter().any(|c| call_name(c) == "train_queue_facts" && call_args(c).get("bypass_consumed").is_some()), scenario != 0);
+            assert!(!calls.iter().any(|c| call_name(c) == "train_event"));
         }
     }
 

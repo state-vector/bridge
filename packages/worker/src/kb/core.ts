@@ -3518,7 +3518,7 @@ export function trainBaseRedAskBrief(
   held: number,
   fix: {
     card: { id: string; title?: string; status?: string; exhausted?: boolean; blocked_reason?: string } | null;
-    curePr: { repo: string; number: number } | null;
+    curePr: { repo: string; number: number; head_sha?: string } | null;
     culpritPr: number | null;
   },
 ): { details: string; options: string[] } {
@@ -3570,7 +3570,7 @@ export function trainBaseRedAskBrief(
           `1. Open the PR: https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`,
           `2. Merge it (Squash and merge — you hold the bypass) or run:`,
           `   \`\`\``,
-          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash${fix.curePr.head_sha ? ` --match-head-commit ${fix.curePr.head_sha}` : ""}`,
           `   \`\`\``,
           `3. Come back here and click **DONE — PR #${fix.curePr.number} merged**.`,
           ``,
@@ -3677,7 +3677,7 @@ export type BaseRedEpisodeState =
       phase: "cure_pr_awaiting_force_merge";
       warrantAsk: true;
       card: { id: string; title: string; status: string; exhausted?: boolean };
-      curePr: { repo: string; number: number };
+      curePr: { repo: string; number: number; head_sha?: string };
       conflictPr: null;
       mergedPr: null;
       culpritPr: number | null;
@@ -3695,7 +3695,7 @@ export type BaseRedEpisodeState =
 
 export function classifyBaseRedEpisodeState(fix: {
   card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
-  curePr?: { repo: string; number: number } | null;
+  curePr?: { repo: string; number: number; head_sha?: string } | null;
   conflictPr?: { repo: string; number: number } | null;
   mergedPr?: { repo: string; number: number; merge_sha: string } | null;
   culpritPr?: number | null;
@@ -3720,11 +3720,11 @@ export function classifyBaseRedEpisodeState(fix: {
       phase: "cure_pr_awaiting_force_merge",
       warrantAsk: true,
       card,
-      curePr: { repo: fix.curePr.repo, number: fix.curePr.number },
+      curePr: { ...fix.curePr },
       conflictPr: null,
       mergedPr: null,
       culpritPr,
-      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash${fix.curePr.head_sha ? ` --match-head-commit ${fix.curePr.head_sha}` : ""}`,
     };
   }
   if (fix?.mergedPr && Number.isInteger(fix.mergedPr.number) && fix.mergedPr.number > 0) {
