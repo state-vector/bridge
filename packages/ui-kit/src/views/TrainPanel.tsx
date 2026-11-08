@@ -129,13 +129,14 @@ const REFRESH_MS = 30_000;
  *    lane's last landed merge before the red (labeled unconfirmed);
  *  - fixing it: a pending action from the current line, or the root repair
  *    with its owner/executor. Keep unclaimed repair work visible. */
-function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: string) => void }) {
+function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const repo = l.lane.split("@")[0];
-  const red = l.red_main ?? null;
+  const line = l.line ?? unavailable;
+  const remediation = line.remediation;
+  const red = remediation && (remediation.kind === "agent" || remediation.kind === "queued" || remediation.kind === "blocked") ? remediation.task : null;
   const culprit = l.stop?.culprit_task ?? null;
   const lastMerge = l.last_merge ?? null;
   const fixer = red ? red.owner || red.executor_session : "";
-  const remediation = l.line?.remediation;
   const pendingAsk = remediation?.kind === "blocked"
     ? remediation.task.execution_blockers?.find((blocker) => blocker.kind === "human_answer_required")
     : undefined;
@@ -147,9 +148,9 @@ function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: strin
       </div>
       <div
         className="train-stopline-why"
-        title={[l.stop?.reason ?? red?.title ?? "", ...(l.stop?.failing ?? []).map((f) => `${f.name}: ${f.conclusion ?? "failed"}`)].filter(Boolean).join(" · ")}
+        title={[line.reason, ...line.evidence.map((f) => f.name)].join(" · ")}
       >
-        {l.stop?.reason ?? red?.title ?? "required checks red on main"}
+        {line.reason}
         {l.stop?.sha ? <span className="top-num"> @ {l.stop.sha.slice(0, 9)}</span> : null}
       </div>
       <div className="train-stopline-who">
@@ -183,17 +184,17 @@ function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: strin
               title={pendingAsk.text}>Awaiting action · {pendingAsk.ask_id}</a>
           ) : red ? (
             <>
-              <a className="train-stopline-who-link" onClick={() => openTask?.(red.task_id)}>{red.task_id}</a>
+              <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
               {fixer ? (
                 <span> · {red.owner || red.executor_session}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
               ) : (
-                <Chip tone="urgent" className="train-stopline-unowned" title={`${red.task_id} is open and unclaimed — claim it before anything else merges`}>
+                <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
                   ⚠ UNOWNED — nobody is fixing it
                 </Chip>
               )}
             </>
           ) : (
-            <span className="muted-note">no open root-blocker task on the board</span>
+            remediation ? <Recovery action={remediation} now={now} openTask={openTask} /> : <span className="muted-note">Recovery status unavailable</span>
           )}
         </span>
       </div>
@@ -255,8 +256,8 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
       <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
-    {!error && (activeLanes ?? []).filter((l) => l.stop || l.red_main).map((l) => (
-      <StopLineBanner key={`stopline-${l.lane}`} l={l} openTask={openTask} />
+    {!error && (activeLanes ?? []).filter((l) => l.line?.phase === "stopped" && l.line.blocker === "main_failed").map((l) => (
+      <StopLineBanner key={`stopline-${l.lane}`} l={l} now={now} openTask={openTask} />
     ))}
     {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
     {!!activeLanes?.length && <div className="ktable-head train-head-cols">
@@ -277,7 +278,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
         <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
-        <span className="trainc-status"><Chip pill tone={l.red_main ? "err" : tones[line.phase]} title={l.red_main ? `open root-blocker/main-red episode task ${l.red_main.task_id} (${l.red_main.status}) — main is red on this lane; merges gated until it lands green` : line.reason}>{l.red_main ? "main RED" : line.label}</Chip>
+        <span className="trainc-status"><Chip pill tone={tones[line.phase]} title={line.reason}>{line.label}</Chip>
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>

@@ -974,3 +974,5 @@ Human requests show the action owner (You or Bridge), the complete instructions,
 Train activity messages use fresh executor facts for the current candidate. Historical bounce metadata cannot override a later ready result or turn a failed hub request into a claim that a new review is needed. Expired or missing observations return to checking; this presentation never grants merge authority.
 
 The train reads canonical task state using `get_artefact` with `view: "execution"`, including at the final merge check. Optional related-work and semantic search are excluded from this control path. Ordinary agent reads retain full discovery; both views share the same task, admission, and carry records.
+
+The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
