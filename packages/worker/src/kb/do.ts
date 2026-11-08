@@ -10640,7 +10640,7 @@ export class KnowledgeHub {
     if (facts?.base_state?.verdict === "red" && observed.success) {
       const failed = [...observed.data.runs].filter((r) => r.head_sha === observed.data.tip_sha && r.status === "completed" && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
       if (failed && failed.conclusion !== "success") for (const episode of Object.values(ledger)) {
-        if (!recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
+        if (episode.head_sha !== failed.head_sha || !recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
         const newer = episode.verified_receipts.every((r) => failed.id > r.run_id || (failed.id === r.run_id && (failed.run_attempt ?? 1) > r.run_attempt));
         if (!newer) continue;
         episode.verified_receipts = [];
@@ -16244,7 +16244,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       let line = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
-      line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })));
+      line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), this.trainRepairScope(lane.repo, lane.base));
       latestMeta.lane = { ...latestMeta.lane, line };
       this.saveLaneState(l.id, latestMeta, now0);
       lane_state = this.laneStore().operational(String(l.id)) ?? lane_state;

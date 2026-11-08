@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { BaseRedResolutionSchema, DeployCoverageStateSchema, TrainFixCardSchema } from "./train.ts";
 import type { TrainFixCard } from "./train.ts";
-import { RecoveryEpisodeSchema, recoveryIsOpen } from "./train-recovery.ts";
+import { RecoveryEpisodeSchema, recoveryIsOpen, type RecoveryRepairScope } from "./train-recovery.ts";
 
 /** Runner stream messages prove liveness, not a structured progress report.
  * Keep their raw output available in details, without advertising fragments
@@ -63,8 +63,12 @@ export const TrainLineProjectionSchema = z.discriminatedUnion("phase", [
 ]);
 export type TrainLineProjection = z.infer<typeof TrainLineProjectionSchema>;
 
-export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonNullable<TrainLineProjection["recoveries"]>): TrainLineProjection {
-  const open = recoveries.filter((r) => recoveryIsOpen(r.episode));
+export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonNullable<TrainLineProjection["recoveries"]>, scope: RecoveryRepairScope): TrainLineProjection {
+  // History remains visible, but only the canonical current head can own the
+  // action or block readiness. Activity and timestamps never confer authority.
+  const open = recoveries.filter((r) => scope.kind === "current"
+    && r.episode.head_sha === scope.head_sha && scope.task_ids.includes(r.episode.stage.task_id)
+    && recoveryIsOpen(r.episode));
   // The cause-bound repair is authoritative over historical starvation or
   // generic diagnostic duties. Keep actual human requirements intact.
   if (line.phase === "stopped" && line.blocker === "main_failed" && line.remediation.kind !== "human" && line.remediation.kind !== "merge") {

@@ -361,6 +361,41 @@ describe("merge train DO drill (real bundled worker)", () => {
     expect((await prove(baseline, 101)).verified_receipts).toHaveLength(0);
     expect((await prove("8".repeat(40), 102)).stage.phase).toBe("recovered");
   });
+  it("BR#8775: current failure cannot replace its repair with history or erase older verification receipts", async () => {
+    const repo = "state-vector/recovery-projection-8775", actor = "merger-8775";
+    const oldHead = "7".repeat(40), head = "8".repeat(40);
+    const oldTask = String((await kbJson("/create", { type: "task", title: "Historical cause repair", qualified: true })).body.id);
+    const task = String((await kbJson("/create", { type: "task", title: "Current cause repair", qualified: true })).body.id);
+    await acquire(repo, actor, { required_workflows: ["Deploy Dev"] });
+    const facts = (tip: string, verdict: string, run?: number) => kbJson("/train.queue_facts", {
+      repo, actor, entries: [], base_state: { verdict, tip_sha: tip, red: verdict === "red" ? [{ name: "Deploy Dev" }] : [], unsettled: [],
+        ...(run ? { deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 60, covered_by_sha: tip, covered_by_run_id: run } } : {}),
+      },
+    });
+    const observe = async (tip: string, id: number, conclusion: string, repair: string) => {
+      const result = await kbJson("/train.observe_deploy", { repo, observation: {
+        tip_sha: tip, observed_at: Date.now(), runs: [{ id, name: "Deploy Dev", head_sha: tip, status: "completed", conclusion,
+          html_url: `https://github.com/${repo}/actions/runs/${id}` }],
+        failures: conclusion === "failure" ? [{ run_id: id, name: "Deploy Dev", url: `https://github.com/${repo}/actions/runs/${id}/job/1`,
+          cause: { kind: "test_failure", check: "Deploy Dev", suite: "smoke", test: repair }, repair_task_id: repair }] : [],
+      } });
+      expect(result.status, JSON.stringify(result.body)).toBe(200);
+    };
+    await facts(oldHead, "green");
+    await observe(oldHead, 87750, "failure", oldTask);
+    await observe(oldHead, 87751, "success", oldTask);
+    await facts(oldHead, "green", 87751);
+    const previous = (await laneSnap(repo)).line.recoveries.find((r: any) => r.episode.head_sha === oldHead).episode;
+    expect(previous.verified_receipts).toHaveLength(1);
+    expect(previous.stage.phase).toBe("verifying");
+    await facts(head, "red");
+    await observe(head, 87752, "failure", task);
+    const current = await laneSnap(repo);
+    expect(current.line.remediation.task.id).toBe(task);
+    expect(current.line.recoveries.find((r: any) => r.episode.head_sha === oldHead).episode).toEqual(previous);
+    // Repeated reads persist the same exact current repair and preserve history.
+    expect((await laneSnap(repo)).line.remediation.task.id).toBe(task);
+  });
   it("observations carrying an IN-FLIGHT deploy run (conclusion key absent) are accepted, not rejected wholesale (2026-11-05 incident)", async () => {
     const repo = "state-vector/observe-inflight-run", tip = "7".repeat(40);
     await acquire(repo, "observe-merger", { required_workflows: ["deploy / Deploy to dev"] });
