@@ -3797,7 +3797,15 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       },
     })).body.error ?? "").toBe("");
 
-    // First read after >1h without a merge: fires starvation!
+    // A newly admitted car must not inherit the lane's idle time.
+    expect((await laneSnap(repo)).starved).toBeNull();
+    const queued = (await kbJson("/get", { id: qCard })).body;
+    const queuedAt = twoHoursAgo + 15 * 60_000;
+    expect((await kbJson("/update", { id: qCard, meta: {
+      ...queued.meta, merge_train: { ...queued.meta.merge_train, at: queuedAt },
+    } })).body.error ?? "").toBe("");
+
+    // Once the car has actually waited over an hour, fire starvation.
     const snap1 = await laneSnap(repo);
     expect(snap1.starved).toBeTruthy();
     expect(snap1.starved.mins).toBeGreaterThanOrEqual(60);
@@ -3807,7 +3815,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     const laneCardObj = (await kbJson("/get", { id: snap1.card })).body;
     const starv = laneCardObj.meta?.lane?.starvation ?? laneCardObj.meta?.starvation;
     expect(starv).toBeTruthy();
-    expect(starv.since).toBe(twoHoursAgo);
+    expect(starv.since).toBe(queuedAt);
     expect(starv.fired_at).toBeGreaterThan(0);
     expect(starv.ask_id).toBe(snap1.starved.ask_id);
     expect(starv.duty_id).toBe(snap1.starved.duty_id);
@@ -3876,6 +3884,13 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       repo, base: "main", kind: "bounced", actor: "gw-p4a", pr: 56746, task_id: awOnly,
       head_sha: "a".repeat(40), bounce_kind: "coverage", conflict_files: ["src/a.ts"],
     });
+
+    expect((await laneSnap(repo)).starved).toBeNull();
+    const parked = (await kbJson("/get", { id: awOnly })).body;
+    const mt = parked.meta.merge_train;
+    expect((await kbJson("/update", { id: awOnly, meta: {
+      ...parked.meta, merge_train: { ...mt, awaiting: { ...mt.awaiting, at: Date.now() - 90 * 60_000 } },
+    } })).body.error ?? "").toBe("");
 
     // While a stop-the-line episode is active, P4 starvation does NOT fire
     await kbJson("/train.event", {

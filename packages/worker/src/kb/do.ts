@@ -13896,10 +13896,11 @@ export class KnowledgeHub {
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
-      const cm = JSON.parse(cards.find((x) => x.id === c.id)!.meta ?? "{}");
+      const row = cards.find((x) => x.id === c.id)!;
+      const cm = metaById.get(c.id);
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
-      return { ...c, ...(pr ? { pr } : {}) };
+      return { ...c, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
     // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
     // Top-panel budget chip reads this; the executor ignores the extra
@@ -14242,7 +14243,7 @@ export class KnowledgeHub {
 
   /** BR#4489 + BR#5674 P4 starvation:
    *  - P4 merge-starvation: when a lane has a non-empty derived queue OR
-   *    non-empty awaiting set AND now - last_merge_ts > 1h AND no stop-the-line
+   *    non-empty awaiting set older than 1h AND no merge in that window AND no stop-the-line
    *    episode is active, fire ONE human ask per episode (carrying full
    *    diagnosis data: base verdict + names + alarm, blocked reason,
    *    queue + awaiting counts, last merge ts) AND auto-spawn ONE
@@ -14262,12 +14263,14 @@ export class KnowledgeHub {
     tpLastMergeTs?: unknown,
   ): Promise<{ since: number; mins: number; fired_at?: number; ask_id?: string | null; duty_id?: string | null; kind?: string } | null> {
     const awaiting = awaitingArg ?? this.laneAwaitingRows(lane.repo, now0, undefined, lane.base);
-    const hasCars = queue.length > 0 || awaiting.length > 0;
-    const stopActive = !!meta.stop;
     const lastMergeTs = this.laneLastMergeTs(lane.repo, lane.base, meta, tpLastMergeTs);
-    const mergeRefTs = lastMergeTs ?? Math.max(0, Number(l.status_ts ?? l.created_ts ?? 0));
-    const mergeAge = mergeRefTs > 0 ? now0 - mergeRefTs : 0;
-    const mergeStarved = hasCars && !stopActive && mergeRefTs > 0 && mergeAge > TRAIN_MERGE_STARVE_MS;
+    const oldestCarAt = [...queue, ...awaiting].reduce((oldest, car) =>
+      Number.isFinite(car.at) && car.at > 0 ? Math.min(oldest, car.at) : oldest, now0);
+    // An idle lane can go days without a merge. Only time with a car
+    // waiting on this lane counts toward a machinery stall.
+    const mergeRefTs = Math.max(oldestCarAt, lastMergeTs ?? 0);
+    const mergeAge = now0 - mergeRefTs;
+    const mergeStarved = !meta.stop && mergeAge > TRAIN_MERGE_STARVE_MS;
 
     if (mergeStarved) {
       const existingEp = meta.lane?.starvation ?? meta.starvation ?? null;
@@ -14386,9 +14389,9 @@ export class KnowledgeHub {
         meta.starvation = existingEp;
         this.saveLaneState(l.id, meta, now0);
       }
-      const curMins = Math.max(60, Math.round((now0 - Number(existingEp.since ?? mergeRefTs)) / 60_000));
+      const curMins = Math.max(60, Math.round(mergeAge / 60_000));
       return {
-        since: Number(existingEp.since ?? mergeRefTs),
+        since: mergeRefTs,
         mins: curMins,
         fired_at: Number(existingEp.fired_at ?? now0),
         ask_id: existingEp.ask_id ?? null,
