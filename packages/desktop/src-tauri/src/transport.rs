@@ -98,6 +98,207 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub session_id: Option<String>, // for resume (kiro stream / ACP sessionId)
+    /// Typed provider provenance (BR#8821). `None` means the failure carried
+    /// no adapter-typed provider discriminator (transport/process/timeout);
+    /// `Some` provenance drives the canonical route incident end-to-end.
+    pub cause: Option<ProviderCause>,
+}
+
+fn ms_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Evidence classes for typed provider incidents. Only `account_action` asks
+/// the owner to act; everything else is contained on the route without a
+/// human ask (BR#8822: reuse/dedupe the account action, never widen it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCauseClass { AccountAction, RateLimit, RouteUnavailable, ProviderInternal, Diagnostic }
+
+impl ProviderCauseClass {
+    pub fn as_str(&self) -> &'static str {
+        match self { Self::AccountAction => "account_action", Self::RateLimit => "rate_limit", Self::RouteUnavailable => "route_unavailable", Self::ProviderInternal => "provider_internal", Self::Diagnostic => "diagnostic" }
+    }
+    /// Owner asks are minted only for account-level actions (quota/auth);
+    /// the human answer is never health proof — an exact-model probe clears.
+    pub fn owner_action(&self) -> bool { matches!(self, Self::AccountAction) }
+    pub fn text(&self, backend: &str, model: Option<&str>) -> String {
+        let route = model.map(|m| format!("{backend}/{m}")).unwrap_or_else(|| backend.to_string());
+        match self {
+            Self::AccountAction => format!("{route}: provider account action required (quota or authentication)"),
+            Self::RateLimit => format!("{route}: provider rate limit reached"),
+            Self::RouteUnavailable => format!("{route}: provider route unavailable"),
+            Self::ProviderInternal => format!("{route}: provider internal error"),
+            Self::Diagnostic => format!("{route}: unclassified provider error"),
+        }
+    }
+}
+
+/// Sanitized, adapter-typed provider failure provenance. Everything here has
+/// passed `redact_secrets` before durable journal/UI/owner-ask propagation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCause {
+    pub class: ProviderCauseClass,
+    pub backend: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// ACP JSON-RPC error code (v2.2.5 adapter: -32000 authRequired,
+    /// -32603 service failure). Never a generic HTTP/RPC status guess.
+    pub code: Option<i64>,
+    /// Exact allowlisted adapter errorName (provider.quota, provider.auth, …).
+    #[serde(default)]
+    pub error_name: Option<String>,
+    /// Redacted provider message.
+    pub message: String,
+    /// Redacted structured error data (object-valued where the adapter
+    /// provides it — never flattened into a lossy string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// One-line sanitized evidence for journal/UI surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_line: Option<String>,
+    pub at_ms: u64,
+}
+
+impl ProviderCause {
+    /// `class|backend|model|config` — the route key scoping an incident. The
+    /// config/credential generation is part of the identity so an old success
+    /// receipt can never clear a new configuration-scoped incident.
+    pub fn route_key(&self, config_revision: &str) -> String {
+        format!("{}|{}|{}|{}", self.class.as_str(), self.backend, self.model.as_deref().unwrap_or(""), config_revision)
+    }
+    pub fn evidence_text(&self) -> String {
+        let mut line = self.message.clone();
+        if let Some(name) = &self.error_name { if !line.contains(name) { line = format!("[{name}] {line}"); } }
+        if let Some(code) = self.code { if !line.contains(&code.to_string()) { line = format!("(code {code}) {line}"); } }
+        line
+    }
+}
+
+/// Credential-shaped substrings are redacted before any provider evidence is
+/// journaled or surfaced (BR#8821 review: evidence sanitization is explicit,
+/// not a side effect of truncation). Marker-based scanner: `key=value`
+/// pairs, `Bearer <token>` runs, `sk-…` keys and long opaque opaque runs.
+pub fn redact_secrets(input: &str) -> String {
+    const KEY_WORDS: &[&str] = &["authorization", "authorization:", "bearer", "bearer:", "token", "token:", "password", "password:", "secret", "secret:", "key", "key:", "api_key", "api_key:", "apikey", "apikey:", "access_token", "access_token:", "x-api-key", "x-api-key:"];
+    let is_keyish = |w: &str| KEY_WORDS.contains(&w.to_ascii_lowercase().as_str());
+    let token_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=');
+    // Lengths of the leading/trailing NON-token punctuation runs (quotes,
+    // parens, commas) — the token core between them is what gets redacted.
+    let lead = |w: &str| w.len() - w.trim_start_matches(|c: char| !token_char(c)).len();
+    let trail = |w: &str| w.len() - w.trim_end_matches(|c: char| !token_char(c)).len();
+    let mut out = String::with_capacity(input.len());
+    let mut redact_next = false;
+    for word in input.split(|c: char| c.is_ascii_whitespace()) {
+        if redact_next {
+            redact_next = false;
+            if lead(word) == 0 && word.trim_end_matches(token_char).eq_ignore_ascii_case("bearer") {
+                out.push_str(word);
+                out.push(' ');
+                redact_next = true;
+                continue;
+            }
+            let l = lead(word);
+            let t = trail(word);
+            out.push_str(&word[..l]);
+            out.push_str("[redacted]");
+            out.push_str(&word[word.len() - t..]);
+            out.push(' ');
+            continue;
+        }
+        // key=value / key:value inside one word
+        if let Some(idx) = word.find(['=', ':']) {
+            let (key, rest) = word.split_at(idx);
+            if is_keyish(key) && rest.len() > 1 {
+                out.push_str(key);
+                out.push_str("[redacted] ");
+                continue;
+            }
+        }
+        if is_keyish(word) {
+            out.push_str(word);
+            out.push(' ');
+            redact_next = true;
+            continue;
+        }
+        let core = word.trim_matches(|c: char| !token_char(c));
+        let opaque = core.len() >= 32 && core.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-' | b'.'));
+        if (core.starts_with("sk-") && core.len() >= 10) || opaque {
+            let l = lead(word);
+            let t = trail(word);
+            out.push_str(&word[..l]);
+            out.push_str("[redacted]");
+            out.push_str(&word[word.len() - t..]);
+        } else {
+            out.push_str(word);
+        }
+        out.push(' ');
+    }
+    out.trim_end().to_string()
+}
+
+fn redact_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact_secrets(s)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().take(24).map(|v| redact_value(v, depth + 1)).collect()),
+        serde_json::Value::Object(map) if depth < 6 => serde_json::Value::Object(map.iter().take(24).map(|(k, v)| (k.clone(), redact_value(v, depth + 1))).collect()),
+        other => other.clone(),
+    }
+}
+
+fn truncate_chars(input: &str, max: usize) -> String {
+    if input.chars().count() <= max { input.to_string() } else { input.chars().take(max).collect() }
+}
+
+/// Classify an ACP JSON-RPC error object using ONLY the installed adapter's
+/// typed discriminators (opencode v2.2.5, receipted on the board):
+/// `provider.auth` failures serialize as ACP code -32000 (AuthRequiredError);
+/// every other session failure as -32603 with OBJECT data
+/// `{service:"session", errorName:"provider.*"}`. Prose never classifies:
+/// quota/credit flavor in a message proves nothing on its own. Unrecognized
+/// provider errors keep the full sanitized evidence under `diagnostic` so the
+/// route is still contained without a quota-specific owner ask.
+const ACP_SESSION_ERROR_NAMES: &[(&str, ProviderCauseClass)] = &[
+    ("provider.auth", ProviderCauseClass::AccountAction),
+    ("provider.quota", ProviderCauseClass::AccountAction),
+    ("provider.rate-limit", ProviderCauseClass::RateLimit),
+    ("provider.no-route", ProviderCauseClass::RouteUnavailable),
+    ("provider.transport", ProviderCauseClass::RouteUnavailable),
+    ("provider.internal", ProviderCauseClass::ProviderInternal),
+    ("provider.timeout", ProviderCauseClass::Diagnostic),
+];
+
+pub fn classify_provider_error(backend: &str, model: Option<&str>, code: Option<i64>, message: &str, data: &serde_json::Value, now: u64) -> Option<ProviderCause> {
+    let error_name = data.get("errorName").and_then(|n| n.as_str());
+    let service = data.get("service").and_then(|s| s.as_str());
+    let (class, classified_name) = match (code, service, error_name) {
+        (Some(-32000), _, _) => (Some(ProviderCauseClass::AccountAction), Some("provider.auth")), // AuthRequiredError wire shape
+        (Some(-32603), Some("session"), Some(name)) => ACP_SESSION_ERROR_NAMES.iter().find(|(n, _)| *n == name)
+            .map(|(n, c)| (Some(*c), Some(*n)))
+            .unwrap_or((Some(ProviderCauseClass::Diagnostic), Some(name))), // unlisted session failure: contained, evidence kept
+        (Some(-32603), Some("session"), None) => (Some(ProviderCauseClass::Diagnostic), None),
+        _ => (None, None),
+    };
+    let class = class?;
+    let redacted_data = match data {
+        serde_json::Value::Null => None,
+        value => {
+            let redacted = redact_value(value, 0);
+            (serde_json::to_string(&redacted).unwrap_or_default().chars().count() <= 4000).then_some(redacted)
+        },
+    };
+    let sanitized_message = truncate_chars(&redact_secrets(message), 500);
+    Some(ProviderCause {
+        class,
+        backend: backend.to_string(),
+        model: model.map(String::from),
+        code,
+        error_name: classified_name.map(String::from),
+        message: sanitized_message,
+        data: redacted_data,
+        evidence_line: None,
+        at_ms: now,
+    })
 }
 
 #[derive(Default)]
@@ -357,6 +558,7 @@ impl AgentTransport for OpencodeRun {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
+                    cause: None,
                 };
             }
         };
@@ -432,6 +634,7 @@ impl AgentTransport for OpencodeRun {
             exit_code: status.and_then(|s| s.code()),
             timed_out,
             session_id: None,
+            cause: None,
         }
     }
 }
@@ -477,6 +680,7 @@ impl AgentTransport for OpencodeAcp {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
+                    cause: None,
                 };
             }
         };
@@ -506,7 +710,9 @@ impl AgentTransport for OpencodeAcp {
 
         // Send a request, then read lines until its response arrives.
         // Non-matching lines (session/update notifications) go to `on_line`.
-        // Returns Err on timeout/dead child.
+        // Returns Err on timeout/dead child. A JSON-RPC error object carries
+        // its typed provider cause alongside the sanitized flat text.
+        struct AcpCallError { text: String, cause: Option<ProviderCause> }
         let call = |stdin: &mut BufWriter<std::process::ChildStdin>,
                         id: i64,
                         method: &str,
@@ -514,7 +720,7 @@ impl AgentTransport for OpencodeAcp {
                         rx: &std::sync::mpsc::Receiver<String>,
                         on_line: &mut dyn FnMut(&str),
                         deadline: Instant|
-         -> Result<serde_json::Value, String> {
+         -> Result<serde_json::Value, AcpCallError> {
             let frame = serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params
             });
@@ -522,11 +728,11 @@ impl AgentTransport for OpencodeAcp {
                 .write_all(serde_json::to_string(&frame).unwrap_or_default().as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
                 .and_then(|_| stdin.flush())
-                .map_err(|e| format!("acp stdin write failed: {e}"))?;
+                .map_err(|e| AcpCallError { text: format!("acp stdin write failed: {e}"), cause: None })?;
             let mut last_line = Instant::now();
             loop {
                 if req.control.map(|c| c.should_stop()).unwrap_or(false) {
-                    return Err("acp interrupted — checkpoint and resume".into());
+                    return Err(AcpCallError { text: "acp interrupted — checkpoint and resume".into(), cause: None });
                 }
                 // wait until whichever comes first: the stall window closing
                 // (no output for 5m — hung) or the hard ceiling (budget +
@@ -540,12 +746,13 @@ impl AgentTransport for OpencodeAcp {
                     .min(stall_end.checked_duration_since(now).unwrap_or(Duration::ZERO));
                 let line = match rx.recv_timeout(left.min(Duration::from_millis(500))) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) if left > Duration::from_millis(500) => continue,
-                    result => result.map_err(|_| {
-                    if now >= stall_end {
+                    result => result.map_err(|_| AcpCallError {
+                    text: if now >= stall_end {
                         "acp timed out — stalled: no output for 5m".to_string()
                     } else {
                         "acp timed out (budget + grace exhausted)".to_string()
-                    }
+                    },
+                    cause: None,
                     })?,
                 };
                 last_line = Instant::now();
@@ -556,9 +763,18 @@ impl AgentTransport for OpencodeAcp {
                 };
                 if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
                     if let Some(err) = v.get("error") {
+                        let code = err.get("code").and_then(|c| c.as_i64());
                         let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-                        let data = err.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                        return Err(format!("acp {method} failed: {msg} {data}"));
+                        let data = err.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                        // Keep the flattened stderr text (string data renders as
+                        // itself; object data renders compactly) but redact it,
+                        // and attach the typed provenance for the incident route.
+                        let data_text = match data.as_str() { Some(s) => s.to_string(), None => data.to_string() };
+                        let cause = classify_provider_error("opencode", req.model, code, msg, &data, ms_now());
+                        return Err(AcpCallError {
+                            text: redact_secrets(&format!("acp {method} failed: {msg} {data_text}")),
+                            cause,
+                        });
                     }
                     return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
                 }
@@ -595,7 +811,7 @@ impl AgentTransport for OpencodeAcp {
             deadline,
         ) {
             Ok(v) => v,
-            Err(e) => return acp_fail(child, format!("{ACP_UNAVAILABLE} {e}")),
+            Err(e) => return acp_fail(child, format!("{ACP_UNAVAILABLE} {}", e.text), e.cause),
         };
         let _ = init;
         next_id += 1;
@@ -611,7 +827,7 @@ impl AgentTransport for OpencodeAcp {
             deadline,
         ) {
             Ok(v) => v,
-            Err(e) => return acp_fail(child, format!("{ACP_UNAVAILABLE} {e}")),
+            Err(e) => return acp_fail(child, format!("{ACP_UNAVAILABLE} {}", e.text), e.cause),
         };
         next_id += 1;
         let session_id = session
@@ -684,29 +900,32 @@ impl AgentTransport for OpencodeAcp {
                     exit_code: status.and_then(|s| s.code()).or(Some(0)),
                     timed_out,
                     session_id,
+                    cause: None,
                 }
             }
-            Err(e) if e.contains("timed out") => RunOutcome {
+            Err(e) if e.text.contains("timed out") => RunOutcome {
                 ok: false,
                 stdout_tail: tail(accumulated, 4000),
-                stderr_tail: e,
+                stderr_tail: e.text,
                 exit_code: None,
                 timed_out: true,
                 session_id,
+                cause: e.cause,
             },
             Err(e) => RunOutcome {
                 ok: false,
                 stdout_tail: tail(accumulated, 4000),
-                stderr_tail: e,
+                stderr_tail: e.text,
                 exit_code: status.and_then(|s| s.code()),
                 timed_out,
                 session_id,
+                cause: e.cause,
             },
         }
     }
 }
 
-fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
+fn acp_fail(mut child: Child, msg: String, cause: Option<ProviderCause>) -> RunOutcome {
     kill_group(&mut child, None);
     RunOutcome {
         ok: false,
@@ -717,6 +936,7 @@ fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
         exit_code: None,
         timed_out: false,
         session_id: None,
+        cause,
     }
 }
 
@@ -846,6 +1066,7 @@ impl AgentTransport for KiroChat {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
+                    cause: None,
                 };
             }
         };
@@ -873,6 +1094,7 @@ impl AgentTransport for KiroChat {
             exit_code: status.and_then(|s| s.code()),
             timed_out,
             session_id,
+            cause: None,
         }
     }
 }
@@ -1064,5 +1286,106 @@ mod spec_shape_tests {
                         "content": { "type": "text", "text": "flat" } }
         });
         assert_eq!(extract_update_text(&v).as_deref(), Some("flat"));
+    }
+}
+
+#[cfg(test)]
+mod provider_cause_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Official v2.2.5 wire fixture (cli/test/acp/prompt.test.ts): provider.auth
+    /// serializes as ACP -32000. Classification must yield the account-action
+    /// class WITHOUT prose matching.
+    #[test]
+    fn auth_required_error_classifies_account_action_from_wire_code() {
+        let cause = classify_provider_error("opencode", Some("llmgw/glm-5.3-flash"), Some(-32000),
+            "Authentication required. Visit https://example.tld/auth to authenticate", &json!({}), 1000)
+            .expect("typed adapter shape must classify");
+        assert_eq!(cause.class, ProviderCauseClass::AccountAction);
+        assert_eq!(cause.error_name.as_deref(), Some("provider.auth"));
+        assert_eq!(cause.code, Some(-32000));
+        assert_eq!(cause.backend, "opencode");
+        assert_eq!(cause.model.as_deref(), Some("llmgw/glm-5.3-flash"));
+        assert!(cause.class.owner_action());
+    }
+
+    /// provider.quota rides -32603 with OBJECT data {service, errorName}.
+    #[test]
+    fn quota_error_name_classifies_account_action_without_prose() {
+        let cause = classify_provider_error("opencode", Some("llmgw/glm-5.3"), Some(-32603),
+            "provider quota exceeded", &json!({"service":"session","errorName":"provider.quota"}), 1000)
+            .expect("provider.quota is an allowlisted adapter errorName");
+        assert_eq!(cause.class, ProviderCauseClass::AccountAction);
+        assert_eq!(cause.error_name.as_deref(), Some("provider.quota"));
+        assert_eq!(cause.data.as_ref().and_then(|d| d.get("service")).and_then(|s| s.as_str()), Some("session"));
+    }
+
+    /// provider.rate-limit / no-route / transport / internal map to their own
+    /// classes and NEVER mint an owner ask.
+    #[test]
+    fn allowlisted_session_error_names_map_to_their_classes() {
+        for (name, expected) in [
+            ("provider.rate-limit", ProviderCauseClass::RateLimit),
+            ("provider.no-route", ProviderCauseClass::RouteUnavailable),
+            ("provider.transport", ProviderCauseClass::RouteUnavailable),
+            ("provider.internal", ProviderCauseClass::ProviderInternal),
+            ("provider.timeout", ProviderCauseClass::Diagnostic),
+        ] {
+            let cause = classify_provider_error("opencode", Some("m"), Some(-32603), "failed",
+                &json!({"service":"session","errorName":name}), 1000).expect("allowlisted");
+            assert_eq!(cause.class, expected, "{name}");
+            assert!(!cause.class.owner_action());
+        }
+    }
+
+    /// Object-valued provider data survives classification (no string
+    /// flattening); unclassified -32603 session failures stay diagnostic and
+    /// preserve sanitized evidence — containment without an owner ask.
+    #[test]
+    fn unclassified_session_failures_keep_diagnostic_with_structured_evidence() {
+        let cause = classify_provider_error("opencode", Some("m"), Some(-32603), "upstream exploded",
+            &json!({"service":"session","errorName":"provider.something-new","detail":{"status":502,"body":"bad gateway"}}), 1000)
+            .expect("session-scoped -32603 always carries evidence");
+        assert_eq!(cause.class, ProviderCauseClass::Diagnostic);
+        assert_eq!(cause.error_name.as_deref(), Some("provider.something-new"));
+        assert!(cause.data.is_some());
+        assert!(!cause.class.owner_action());
+    }
+
+    /// Non-provider JSON-RPC codes (no session scope, no auth code) do NOT
+    /// classify — generic RPC codes are not HTTP statuses and never invent
+    /// quota/credit subtypes.
+    #[test]
+    fn generic_rpc_errors_do_not_classify() {
+        assert!(classify_provider_error("opencode", Some("m"), Some(-32603), "not a provider error",
+            &json!({"detail":"workspace rejected"}), 1000).is_none());
+        assert!(classify_provider_error("opencode", Some("m"), Some(-32700), "parse error", &json!({}), 1000).is_none());
+        assert!(classify_provider_error("opencode", Some("m"), Some(-2), "ZAI 1310 quota exhausted", &json!({}), 1000).is_none());
+    }
+
+    /// Credentials in provider messages/data are redacted before evidence
+    /// leaves the transport.
+    #[test]
+    fn provider_evidence_is_sanitized_of_secrets() {
+        let cause = classify_provider_error("opencode", Some("m"), Some(-32000),
+            "Authorization Bearer sk-abcdef1234567890abcdef rejected",
+            &json!({"api_key":"sk-zzzzzz1234567890","service":"session"}), 1000).unwrap();
+        assert!(!cause.message.contains("sk-abcdef"));
+        assert!(!serde_json::to_string(cause.data.as_ref().unwrap()).unwrap().contains("sk-zzzzzz"));
+        let redacted = redact_secrets("token=supersecret123 and Bearer supersecret456 keep-this");
+        assert!(!redacted.contains("supersecret"));
+        assert!(redacted.contains("keep-this"));
+    }
+
+    /// Route identity scopes config/credential generation: same model under a
+    /// new config revision is a DIFFERENT route, so stale success receipts can
+    /// never clear a new configuration incident.
+    #[test]
+    fn route_key_scopes_config_revision() {
+        let cause = ProviderCause { class: ProviderCauseClass::AccountAction, backend: "opencode".into(), model: Some("m".into()),
+            code: Some(-32000), error_name: Some("provider.auth".into()), message: "x".into(), data: None, evidence_line: None, at_ms: 1 };
+        assert_ne!(cause.route_key("rev-1"), cause.route_key("rev-2"));
+        assert_eq!(cause.route_key("rev-1"), "account_action|opencode|m|rev-1");
     }
 }
