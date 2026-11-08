@@ -207,15 +207,14 @@ fn a_legacy_standalone_build_cache_is_adopted_from_its_standard_disposal_marker(
     let cache=PathBuf::from(&owner.cfg.workdir).join("old-standalone-target");fs::create_dir_all(&cache).unwrap();
     fs::write(cache.join("CACHEDIR.TAG"),"Signature: 8a477f597d28d172789f06886806bc55\n# Cargo cache\n").unwrap();
     fs::write(cache.join("compiled-object"),vec![5u8;512*1024]).unwrap();
-    let visibility=legacy::no_readers(&cache,legacy::ReaderAuthority::UnattributedLegacy);
     let status=owner.reconcile(&[]).unwrap();
-    match visibility {
-        Ok(())=>{assert!(!cache.exists());assert!(status.reclaimed_bytes>=512*1024);},
-        Err(error)=>{
-            assert!(error.contains("incomplete"),"unexpected reader outside the capability case: {error}");
-            assert!(cache.exists(),"an unattributed legacy cache needs complete host visibility");assert_eq!(status.reclaimed_bytes,0);
-            assert!(owner.records().unwrap().iter().any(|r|r.error.as_ref().is_some_and(|error|error.contains("incomplete"))));
-        },
+    if cache.exists() {
+        // Observe the decision made by this exact pass. A separate pre-probe
+        // races short-lived non-dumpable test processes and is not authority.
+        assert_eq!(status.reclaimed_bytes,0);
+        assert!(owner.records().unwrap().iter().any(|r|r.error.as_ref().is_some_and(|error|error.contains("incomplete"))));
+    } else {
+        assert!(status.reclaimed_bytes>=512*1024);
     }
 }
 
