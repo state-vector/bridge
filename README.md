@@ -1494,6 +1494,22 @@ solid if waiting to be"):
    or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
    the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
    (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
+   The self-heal's retry budget is a closed purpose/evidence pair (BR#8824): the
+   executor names WHY it re-requests a check — `stale_destination_gate` (the red
+   was stamped against a destination that has since recovered) or
+   `ordinary_head_check` (the re-run judges this head, e.g. a bisect probe) — and
+   the hub alone validates the evidence. A stale-destination retry is licensed
+   only by the lane's current canonical GREEN deploy coverage (folded from the
+   stored base state and the durable deploy observations, so a caller's bare
+   green stamp can never override a newer durable failure) and only for the
+   task's exact current PR head; the budget is scoped to the successful
+   coverage receipt the hub derives (covered tip + decisive run id — never a
+   timestamp), so exactly one retry is granted per head/obligation/CHANGED
+   successful coverage, while an ordinary head check keeps its permanent
+   one-dispatch budget (old ledger rows and receipts are preserved, never
+   reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
+   fenced until its receipts reconcile — a fresh green stamp never licenses
+   repeating an unknown effect.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings

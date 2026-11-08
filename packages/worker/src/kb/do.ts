@@ -233,7 +233,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -3383,6 +3383,7 @@ export class KnowledgeHub {
       `ALTER TABLE lane_state ADD COLUMN lane_id TEXT`,
       `ALTER TABLE lane_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
+      `ALTER TABLE train_check_retries ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -13238,12 +13239,37 @@ export class KnowledgeHub {
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
     if (body.check_retry) {
       const command = CheckRetryCommandSchema.parse(body.check_retry);
+      let scope: { purpose: "stale_destination_gate"; coverageReceipt: string } | undefined;
       if (command.kind === "reserve") {
         const subject = this.one(`SELECT meta FROM artefacts WHERE id=? AND type='task'`, command.task_id);
         const targetMeta = JSON.parse(String(subject?.meta ?? "{}"));
         if (!prTargetsOf({ meta: targetMeta }).some(p => p.repo === repo)) throw new Error("gate: check retry subject is not bound to this lane repository");
+        if (command.purpose === "stale_destination_gate") {
+          // BR#8824: a stale-destination retry is licensed ONLY by the lane's
+          // current canonical green deploy coverage — folded from the stored
+          // base state and the durable deploy observations, so a caller's
+          // bare green stamp can never override a newer durable failure
+          // (applyDeployObservation's fold), and the receipt is derived by
+          // the hub (base tip + decisive covering run), never asserted.
+          const required = laneOfMeta(meta)?.required_workflows ?? [];
+          const effective = applyDeployObservation(meta.lane?.queue_facts?.base_state, meta.lane?.deploy_observation, required, Date.now());
+          const coverage = DeployCoverageStateSchema.safeParse(effective?.deploy_coverage);
+          if (effective?.verdict !== "green" || !coverage.success || coverage.data.phase !== "covered") {
+            throw new Error(`gate: stale-destination retry requires current canonical GREEN deploy coverage on the lane (verdict=${String(effective?.verdict ?? "none")}, coverage=${coverage.success ? coverage.data.phase : "absent"}) — re-dispatch denied`);
+          }
+          // Exact current-head binding: the reserve must name the head the
+          // hub last observed for the task's PR; a moved head never re-opens
+          // a stale-destination budget.
+          for (const t of prTargetsOf({ meta: targetMeta })) {
+            const known = this.one(`SELECT head FROM delivery_pr_outcomes WHERE repo=? AND pr=?`, repo, t.number);
+            if (known?.head && String(known.head) !== command.head_sha) {
+              throw new Error(`gate: stale-destination retry head ${command.head_sha.slice(0, 8)} is not the current head of PR #${t.number} (${String(known.head).slice(0, 8)}) — re-dispatch denied`);
+            }
+          }
+          scope = { purpose: command.purpose, coverageReceipt: deployCoverageReceipt(coverage.data) };
+        }
       }
-      return new TrainCheckRecovery(this.state.storage).command(String(lane.id), command, Date.now());
+      return new TrainCheckRecovery(this.state.storage).command(String(lane.id), command, Date.now(), scope);
     }
     // BR#5633: the entries THIS stamp persists — provided, else the stored
     // ones (the absent-entries preservation above).

@@ -1166,10 +1166,32 @@ fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget
     }
 }
 
-fn dispatch_check_retry(ctx: &mut Ctx, repo: &str, base: &str, task: &str, head: &str, run: &MainCheckRun) -> Result<(), String> {
+/// BR#8824 closed retry purpose — why this dispatch re-requests a check. The
+/// hub validates the purpose against its own lane evidence: a
+/// `stale_destination_gate` retry is licensed only by the lane's current
+/// canonical green deploy coverage (scoped to the receipt the hub derives);
+/// an `ordinary_head_check` keeps the permanent [task, head, obligation]
+/// budget. The caller never asserts green itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckRetryPurpose {
+    OrdinaryHeadCheck,
+    StaleDestinationGate,
+}
+
+impl CheckRetryPurpose {
+    fn wire(&self) -> &'static str {
+        match self {
+            Self::OrdinaryHeadCheck => "ordinary_head_check",
+            Self::StaleDestinationGate => "stale_destination_gate",
+        }
+    }
+}
+
+fn dispatch_check_retry(ctx: &mut Ctx, repo: &str, base: &str, task: &str, head: &str, run: &MainCheckRun, purpose: CheckRetryPurpose) -> Result<(), String> {
     let target = check_retry_target(repo, run)?;
     let reservation = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "check_retry": {
         "kind": "reserve", "task_id": task, "head_sha": head, "name": run.name, "source": run.source, "target": target,
+        "purpose": purpose.wire(),
     } }))?;
     if reservation.get("kind").and_then(Value::as_str) != Some("reserved") {
         return Err(format!("Retry budget consumed for this head/obligation: {}", reservation));
@@ -3322,7 +3344,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         // dispatched, escalated: error-level log + a
                         // self_heal_stalled stamp on this entry's queue_facts
                         // (the hub panel and the starvation duty read it).
-                        let attempt = dispatch_check_retry(ctx, repo, base, &head_id, &head_sha, r);
+                        // BR#8824: the stale deploy-health self-heal is a
+                        // STALE DESTINATION retry — the red was stamped
+                        // against a destination that has since recovered.
+                        // The hub validates the current canonical green
+                        // coverage and scopes the budget to the coverage
+                        // receipt; the ordinary [task, head, obligation]
+                        // hold is never weakened by this purpose.
+                        let attempt = dispatch_check_retry(ctx, repo, base, &head_id, &head_sha, r, CheckRetryPurpose::StaleDestinationGate);
                         match attempt {
                             Ok(_) => dispatched += 1,
                             Err(e) => last_err = Some(trunc(&e, 240)),
@@ -4232,7 +4261,10 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, r
                         if !seen.insert(r.name.clone()) {
                             continue; // newest run per name only
                         }
-                        let ok = dispatch_check_retry(ctx, repo, base, &task, &sha, r).is_ok();
+                        // BR#8824: a bisect probe re-runs to judge THIS merge
+                        // sha — an ordinary head check; its budget stays
+                        // permanent regardless of destination recovery.
+                        let ok = dispatch_check_retry(ctx, repo, base, &task, &sha, r, CheckRetryPurpose::OrdinaryHeadCheck).is_ok();
                         if ok {
                             dispatched += 1;
                         }
