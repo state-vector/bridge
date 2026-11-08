@@ -127,15 +127,18 @@ const REFRESH_MS = 30_000;
  *  who broke it and b) who is fixing it"). Two accountability lines:
  *  - broke it: the machine-recorded culprit card stamped on the stop, else the
  *    lane's last landed merge before the red (labeled unconfirmed);
- *  - fixing it: the open root-blocker/main-red episode task (hub-derived
- *    `red_main`) with its owner/executor — or a loud UNOWNED chip, because
- *    "nobody is fixing it" is exactly what a reader must not miss. */
+ *  - fixing it: a pending action from the current line, or the root repair
+ *    with its owner/executor. Keep unclaimed repair work visible. */
 function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: string) => void }) {
   const repo = l.lane.split("@")[0];
   const red = l.red_main ?? null;
   const culprit = l.stop?.culprit_task ?? null;
   const lastMerge = l.last_merge ?? null;
   const fixer = red ? red.owner || red.executor_session : "";
+  const remediation = l.line?.remediation;
+  const pendingAsk = remediation?.kind === "blocked"
+    ? remediation.task.execution_blockers?.find((blocker) => blocker.kind === "human_answer_required")
+    : undefined;
   return (
     <div className="train-stopline" role="alert">
       <div className="train-stopline-head">
@@ -170,7 +173,15 @@ function StopLineBanner({ l, openTask }: { l: KbTrainLane; openTask?: (id: strin
         </span>
         <span className="train-stopline-cell" title="who is fixing it — the open root-blocker/main-red episode task and its owner/executor session">
           fixing it:{" "}
-          {red ? (
+          {remediation?.kind === "merge" ? (
+            <a className="train-stopline-who-link" href={remediation.request?.url ?? remediation.url}
+              target="_blank" rel="noreferrer" title={remediation.text}>Awaiting merge action for PR #{remediation.pr}</a>
+          ) : remediation?.kind === "human" ? (
+            <TaskLink id={remediation.action.id} url={remediation.action.url} openTask={openTask}>Awaiting action · {remediation.action.id}</TaskLink>
+          ) : pendingAsk ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(pendingAsk.ask_id)}
+              title={pendingAsk.text}>Awaiting action · {pendingAsk.ask_id}</a>
+          ) : red ? (
             <>
               <a className="train-stopline-who-link" onClick={() => openTask?.(red.task_id)}>{red.task_id}</a>
               {fixer ? (
