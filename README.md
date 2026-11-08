@@ -2195,12 +2195,14 @@ an uncertain effect is not repeated. Exhausted retries and substantive candidate
 failures produce a concrete, deduplicated repair duty instead of assuming that
 an ownerless queued card has an active executor.
 
-Every merge candidate must include the current base in its tested head. A clean
-worker-authored branch is updated mechanically; its substance verdict carries,
-but CI does not. The train waits for fresh integrated-head checks. Conflicting
-or non-worker-authored branches receive an agent-owned repair. This check runs
-again between batch members: disjoint files alone do not prove semantic
-compatibility. This replaces the older conflict-only proactive-update policy.
+Each batch starts with candidates tested against its starting base. Mutually
+non-conflicting members can land back-to-back using that evidence while the
+live tip is still the batch's own landed prefix. The train rechecks review,
+signatures and required checks on each exact head and stops on a red base
+check. If an unrelated merge advances main, candidates need CI against the
+new base. A clean worker-authored update carries the review verdict and runs
+fresh CI. Conflicting or non-worker-authored branches receive an agent-owned
+repair.
 
 A scheduler reservation authorizes initial `begin` through its exact gateway
 token and session, without requiring a caller-supplied agent label. Existing

@@ -1905,13 +1905,21 @@ enum IntegrationAdmission {
     RepairDispatched,
 }
 
-fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate) -> Result<IntegrationAdmission, String> {
+fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
+    batch_base: Option<(&str, &str)>) -> Result<IntegrationAdmission, String> {
     let pr = cand.pr;
     let head = cand.head_sha.as_str();
     ctx.fetch_pr_head(pr)?;
     ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
     let base_sha = ctx.sh("git", &["rev-parse", &format!("origin/{base}")])?.trim().to_string();
-    if ctx.is_ancestor(&base_sha, head)? { return Ok(IntegrationAdmission::Current); }
+    // A selected member may have been tested against this batch's starting
+    // base. Only use that base if the live tip is still our own landed prefix.
+    let tested_base = match batch_base {
+        Some((start, expected_tip)) if base_sha == expected_tip => start,
+        Some(_) => return Err("Main changed outside the current batch; rescan against the new tip".into()),
+        None => &base_sha,
+    };
+    if ctx.is_ancestor(tested_base, head)? { return Ok(IntegrationAdmission::Current); }
     renew_lease(ctx, repo, base);
     let owned = branch_is_worker_authored(&ctx.pr_commit_logins(repo, pr), &ctx.worker_identities);
     let (clean, files) = ctx.trial_merge(base, head)?;
@@ -3769,13 +3777,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
         }
-        // Current-base admission (BR#6776): file-clean is not compile-clean.
-        // A stale car integrated against newer contracts caused the E0063
-        // main-red. Carry the substance verdict across a clean base update,
-        // but never carry CI: the integrated head must run its actual checks.
-        // Re-evaluate for EACH member, including after this pass advanced base.
+        // Require current-base CI before entering a batch. Once it lands a
+        // prefix, independent members can still use the batch's starting base.
+        // An unrelated main advance restores the live-base requirement.
         if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to prepare this PR; no further writes".into()); }
-        let admission = match admit_current_base(ctx, repo, base, cand) {
+        let expected_tip = if pass_merged > initial_pass_merged { &tip_sha } else { &probed_base_sha };
+        let batch_base = (!probed_base_sha.is_empty())
+            .then_some((probed_base_sha.as_str(), expected_tip.as_str()));
+        let admission = match admit_current_base(ctx, repo, base, cand, batch_base) {
             Ok(admission) => admission,
             Err(error) => {
                 log(Some(key), &format!("PR #{pr}: could not finish its current-main check ({}); checking the other changes", trunc(&error, 240)));
@@ -7037,16 +7046,17 @@ mod tests {
             let base = repo.git(&["rev-parse", "main"]);
             let first = repo.side_commit("first", "first reviewed change");
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
-            repo.git(&["checkout", "-q", "main"]);
-            repo.git(&["merge", "--no-ff", "-qm", "tested first merge", "first"]);
-            let first_merge = repo.git(&["rev-parse", "HEAD"]);
-            repo.git(&["checkout", "-qb", "second"]);
+            repo.git(&["checkout", "-qb", "second", &base]);
             std::fs::write(repo.dir.join("second.txt"), "second reviewed change\n").unwrap();
             repo.git(&["add", "second.txt"]);
-            repo.git(&["commit", "-qm", "second tested change includes the first merge"]);
+            repo.git(&["commit", "-qm", "independent second change tested on the same base"]);
             let second = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
             repo.git(&["checkout", "-q", "main"]);
+            repo.git(&["merge", "--no-ff", "-qm", "first merge", "first"]);
+            let first_merge = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["merge", "--no-ff", "-qm", "second merge", "second"]);
+            let second_merge = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["reset", "--hard", &base]);
             let heads = [first, second];
             let cards = heads.iter().enumerate().map(|(i, head)| json!({"id":format!("BR#{}",i+1),"status":"blocked","meta":{
@@ -7070,7 +7080,7 @@ mod tests {
                 if cmd != "gh" { return None; }
                 if args.first() == Some(&"pr") {
                     let i = args[2].parse::<usize>().unwrap()-1;
-                    let merge_sha = if i == 0 { &first_merge } else { &heads[1] };
+                    let merge_sha = if i == 0 { &first_merge } else { &second_merge };
                     if args[1] == "merge" {
                         assert!(Command::new("git").args(["push","-q","origin",&format!("{merge_sha}:main")]).current_dir(&dir).status().unwrap().success());
                         landed_c.lock().unwrap().push(i+1);
@@ -7340,7 +7350,10 @@ mod tests {
             panic!("unexpected command {args:?}");
         }));
         let candidate = BatchCandidate { qi: 0, head_id: "BR#7".into(), pr: 7, head_sha: old.clone(), root_fix: false };
-        assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate).unwrap(),
+        assert!(admit_current_base(&mut ctx, "o/r", "main", &candidate, Some((&old, &old)))
+            .unwrap_err().contains("Main changed outside the current batch"));
+        assert!(calls.lock().unwrap().is_empty(), "unexpected base must not mutate a candidate");
+        assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate, None).unwrap(),
             IntegrationAdmission::AwaitingCi { base_sha: base, head_sha: integrated });
         let events = calls.lock().unwrap();
         assert!(events.iter().any(|c| call_name(c) == "train_carry"));
@@ -8191,7 +8204,11 @@ mod tests {
             sh_log_c.lock().unwrap().push(line.clone());
             let phase = *tick_phase_c.lock().unwrap();
             if cmd == "git" {
-                return Some(Ok(String::new()));
+                return Some(Ok(if args == ["rev-parse", "origin/main"] {
+                    dark_tip.to_string()
+                } else {
+                    String::new()
+                }));
             }
             if cmd == "gh" {
                 if args == ["api", "repos/state-vector/superpositional"] {
