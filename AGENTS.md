@@ -73,7 +73,9 @@ Rules, in force:
     main — no PR round-trip, no merge-train wait (Ray directive
     2026-11-02: "EVERYTHING DIRECT TO MAIN"). The PR/verify ceremony is
     gone for this repo's day-to-day changes; main's mechanical gates still
-    apply (signed commits, CI on the push). If main is red, land the fix
+    apply. Sign the commit and run `scripts/push-main.sh` from the registered
+    worktree. It runs required Linux checks on the exact commit before
+    advancing main and rejects concurrent changes to the base. If main is red, land the fix
     first or hold — never stack work on a red main silently. Bigger or
     riskier changes still get a second pair of eyes — ask, don't assume.
  8. **Closed state machines, single source of truth, and end-to-end tracing
