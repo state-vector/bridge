@@ -115,11 +115,14 @@ impl Owner {
         Ok(Self { cfg, ledger, allocations })
     }
     fn file(&self, id: &str) -> PathBuf { self.ledger.join(format!("{id}.json")) }
+    fn archive_file(&self,id:&str)->PathBuf {self.ledger.join("archive").join(format!("{id}.json"))}
+    fn contains(&self,id:&str)->bool {self.file(id).exists()||self.archive_file(id).exists()}
     fn lock(&self, id: &str) -> Result<Option<worker_session::Lock>, String> {
         worker_session::Lock::acquire(&self.ledger.join(format!("{id}.lock")))
     }
     fn read(&self, id: &str) -> Result<Resource, String> {
-        let record: Resource = serde_json::from_slice(&fs::read(self.file(id)).map_err(|e| e.to_string())?).map_err(|e| format!("workspace journal corrupt: {e}"))?;
+        let bytes=match fs::read(self.file(id)) {Ok(bytes)=>bytes,Err(error) if error.kind()==io::ErrorKind::NotFound=>fs::read(self.archive_file(id)).map_err(|e|e.to_string())?,Err(error)=>return Err(error.to_string())};
+        let record: Resource = serde_json::from_slice(&bytes).map_err(|e| format!("workspace journal corrupt: {e}"))?;
         if record.version != 1 || record.id != id { return Err("workspace journal identity/version mismatch".into()); }
         if let Location::Managed { root } = &record.location {
             if *root != self.allocations.join(id) { return Err("workspace path escaped its allocation".into()); }
@@ -127,7 +130,12 @@ impl Owner {
         Ok(record)
     }
     fn save(&self, record: &Resource) -> Result<(), String> {
-        journal::write_file(&self.file(&record.id), &serde_json::to_vec(record).map_err(|e| e.to_string())?)
+        if matches!(record.phase,Phase::Removed { .. }) {
+            journal::write_file(&self.archive_file(&record.id),&serde_json::to_vec(record).map_err(|e|e.to_string())?)?;
+            match fs::remove_file(self.file(&record.id)) {Ok(())=>{},Err(e) if e.kind()==io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string())}
+            #[cfg(unix)] fs::File::open(&self.ledger).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+            Ok(())
+        } else {journal::write_file(&self.file(&record.id), &serde_json::to_vec(record).map_err(|e| e.to_string())?)}
     }
     fn records(&self) -> Result<Vec<Resource>, String> {
         let mut result = Vec::new();
@@ -149,7 +157,7 @@ impl Owner {
     }
     pub fn environment_for(&self, ticket: &Ticket) -> Result<Vec<(String, String)>, String> {
         let id = journal::stable_key(&[&ticket.task_id, &ticket.session]);
-        if !self.file(&id).exists() { return Ok(vec![]); }
+        if !self.contains(&id) { return Ok(vec![]); }
         let record = self.read(&id)?;
         match record.phase {
             Phase::InUse { owner } if owner.ticket() == ticket => Ok(environment(record.location.root())),
@@ -160,7 +168,7 @@ impl Owner {
         if let Admission::Held { reason } = self.admission() { return Err(reason); }
         let id = journal::stable_key(&[&ticket.task_id, &ticket.session]);
         let lock = self.lock(&id)?.ok_or("workspace is being reconciled; retry preparation")?;
-        if self.file(&id).exists() { return Err("workspace allocation already exists; reconcile its original execution instead of reusing it".into()); }
+        if self.contains(&id) { return Err("workspace allocation already exists; reconcile its original execution instead of reusing it".into()); }
         let root = self.allocations.join(&id);
         let record = Resource { version: 1, id: id.clone(), location: Location::Managed { root: root.clone() },
             phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None };
@@ -172,7 +180,7 @@ impl Owner {
             let cache_path = repo_cache_path(&self.cfg.workdir, repo);
             let cache_id = format!("cache-{}", journal::stable_key(&[&cache_path.to_string_lossy()]));
             let _cache_lock = self.lock(&cache_id)?.ok_or("repository cache is being reclaimed; retry preparation")?;
-            let authority=if self.file(&cache_id).exists() {
+            let authority=if self.contains(&cache_id) {
                 let previous=self.read(&cache_id)?;
                 match (previous.phase,previous.location) {
                     (Phase::Cached { .. },Location::RepositoryCache {authority,..})=>authority,
@@ -185,7 +193,7 @@ impl Owner {
                 phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
-            if self.file(&cache_record.id).exists() && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
+            if self.contains(&cache_record.id) && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
                 return Err("repository cache retirement is still pending".into());
             }
             self.save(&cache_record)?;
@@ -214,7 +222,7 @@ impl Owner {
     }
     pub fn output_path(&self, ticket: &Ticket) -> Result<Option<PathBuf>, String> {
         let id = journal::stable_key(&[&ticket.task_id, &ticket.session]);
-        if !self.file(&id).exists() { return Ok(None); }
+        if !self.contains(&id) { return Ok(None); }
         let record = self.read(&id)?;
         if !matches!(&record.phase, Phase::InUse { owner } if owner.ticket() == ticket) { return Err("workspace no longer owns worker output".into()); }
         Ok(Some(record.location.root().join("logs/output.jsonl")))
@@ -249,7 +257,7 @@ impl Owner {
     pub fn reconcile(&self, protected: &[Ticket]) -> Result<Status, String> {
         legacy::adopt(self)?;
         let mut records = self.records()?;
-        records.sort_by_key(|r| (r.checked_at, r.id.clone()));
+        records.sort_by_key(|r| (r.checked_at, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
         let mut visited = 0;
         for old in &records {
             if matches!(old.phase, Phase::Removed { .. }) || old.retry_at > now_ms() { continue; }

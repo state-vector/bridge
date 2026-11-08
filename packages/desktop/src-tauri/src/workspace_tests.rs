@@ -256,6 +256,23 @@ fn ignored_evidence_arriving_after_checkpoint_publication_is_rechecked_before_re
     assert!(owner.read(&id).unwrap().error.unwrap().contains("ignored input"));
 }
 
+#[test]
+fn completed_resource_history_is_cold_and_cannot_resurrect_a_claim() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let t=ticket("completed");let a=owner.allocate(&t,None).unwrap();let id=a.id.clone();let root=a.root.clone();drop(a);
+    owner.release(&released(&Ownership::Reservation {ticket:t.clone()})).unwrap();owner.reconcile(&[]).unwrap();
+    assert!(!root.exists());assert!(!owner.file(&id).exists());assert!(owner.archive_file(&id).exists());
+    let before=fs::read(owner.archive_file(&id)).unwrap();
+    for n in 0..256 {
+        let name=format!("historical-{n}");
+        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None}).unwrap();
+    }
+    assert!(owner.records().unwrap().is_empty(),"completed history must not be scanned/rewritten as active work");
+    owner.reconcile(&[]).unwrap();assert_eq!(fs::read(owner.archive_file(&id)).unwrap(),before);
+    assert!(owner.allocate(&t,None).is_err(),"archival cannot grant a second use of an old claim");
+    assert!(matches!(owner.read(&id).unwrap().phase,Phase::Removed { .. }));
+}
+
 #[cfg(target_os="linux")]
 #[test]
 fn an_unrelated_real_non_dumpable_daemon_does_not_own_a_released_execution_workspace() {
