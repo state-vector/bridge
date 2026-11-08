@@ -154,7 +154,7 @@ fn attach_with_stop(spec: Spec, cancelled: Option<Arc<AtomicBool>>) -> Result<In
                 let launch = gateway_pipeline::launch_record(&request.cfg, &request.record());
                 let mut record = request.record();
                 record.process = launch.and_then(|r| r.process);
-                if record.process.is_some() { record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into() }, worktree: request.worktree.clone() }; }
+                if record.process.is_some() { record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into(), cause: None }, worktree: request.worktree.clone() }; }
                 if let Ok(root) = gateway_pipeline::terminal_root(&request.cfg) { let _ = journal::insert(&root, record.clone()); }
                 let _ = tx.send(record); finished.store(true, Ordering::SeqCst); return;
             }
@@ -372,7 +372,7 @@ fn unlaunched(spec: &Spec, reason: String) -> Result<(), String> {
     // This branch is reached only before the transport is called while holding
     // the never-before-executed worker lock. It is actual no-child proof.
     let mut record = spec.record();
-    record.work = Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone() },
+    record.work = Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone(), cause: None },
         writers: WriterProof::ProcessGroupEmpty, worktree: spec.worktree.clone(), step: Step::Stop };
     journal::insert(&gateway_pipeline::terminal_root(&spec.cfg)?, record)?;
     Err(reason)

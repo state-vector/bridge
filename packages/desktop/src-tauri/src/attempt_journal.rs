@@ -28,7 +28,11 @@ impl WriterProof {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Outcome { pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdout_tail: String, pub stderr_tail: String }
+pub struct Outcome { pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdout_tail: String, pub stderr_tail: String,
+    /// Typed provider provenance (BR#8821). Serialized only when present so
+    /// older hubs/recovery paths parse unchanged records identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::transport::ProviderCause> }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TerminalReceipt { pub generation: u64, pub attempt_id: String, pub outcome: Outcome }
 
