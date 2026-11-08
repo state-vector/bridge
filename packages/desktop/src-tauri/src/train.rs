@@ -441,6 +441,9 @@ impl Ctx {
         let mut arguments = args_body;
         if let Value::Object(map) = &mut arguments {
             map.insert("session".into(), json!(self.session));
+            // Candidate reads (including the final write-boundary check) need
+            // canonical state, never optional related-work/embedding discovery.
+            if name == "get_artefact" { map.insert("view".into(), json!("execution")); }
         }
         let resp = self
             .http
@@ -6334,6 +6337,18 @@ mod tests {
 
     fn call_args<'a>(params: &'a Value) -> &'a Value {
         params.get("arguments").unwrap_or(&Value::Null)
+    }
+
+    #[test]
+    fn mechanical_card_read_requests_canonical_execution_view() {
+        let card = card_without_lane_legs();
+        let (hub, calls) = mock_hub(vec![ok(card.clone()), ok(json!({ "lanes": [] }))]);
+        let mut ctx = test_ctx(&hub);
+        assert_eq!(ctx.mcp("get_artefact", json!({ "id": "BR#1" })).unwrap(), card);
+        ctx.mcp("train_status", json!({})).unwrap();
+        let recorded = calls.lock().unwrap();
+        assert_eq!(call_args(&recorded[0])["view"], "execution");
+        assert!(call_args(&recorded[1]).get("view").is_none());
     }
 
     #[test]

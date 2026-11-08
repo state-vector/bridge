@@ -91,7 +91,7 @@ export const TOOL_ARG_SCHEMAS = {
     type: z.string().optional(),
     limit: z.number().int().max(100).optional(),
   }),
-  get_artefact: z.looseObject({ id: z.string() }),
+  get_artefact: z.looseObject({ id: z.string(), view: z.enum(["full", "execution"]).optional().describe("Execution returns canonical task state without related-work discovery; full is the default agent view.") }),
   claim_takeover: z.looseObject({
     id: z.string(),
     note: z.string().optional(),
