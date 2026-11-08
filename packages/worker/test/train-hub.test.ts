@@ -3232,7 +3232,8 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(String(ask2.body_md)).toContain("https://github.com/" + repo + "/pull/53499");
     const askMetaM = typeof ask2.meta === "string" ? JSON.parse(ask2.meta) : ask2.meta ?? {};
     expect(askMetaM.ask.options[0]).toContain("DONE — PR #53499 merged");
-    expect(String(askMetaM.ask.reason ?? "")).toContain("your repository authority");
+    expect(String(askMetaM.ask.reason ?? "")).toContain("You must merge the repair using your repository-owner account");
+    expect(String(askMetaM.ask.reason ?? "")).toContain("does not grant it your permissions");
     expect(askMetaM.ask.decision.task_id).toBe(fix.body.id);
 
     // fix_card prefers the root-fix card and carries the cure PR link

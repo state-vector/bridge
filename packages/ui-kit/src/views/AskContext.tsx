@@ -9,7 +9,7 @@ export function AskContext({ body, ask }: { body?: string; ask: { reason?: strin
     return <>
       <p className="ask-reason">{decision.context}</p>
       <p className="ask-reason"><b>Why your decision is needed:</b> {decision.why_human}</p>
-      {body?.trim() && body.trim() !== decision.context.trim() && <details><summary>Evidence and technical details</summary><div className="md-body" dangerouslySetInnerHTML={{ __html: md(body) }} /></details>}
+      {body?.trim() && body.trim() !== decision.context.trim() && <div className="ask-instructions md-body" dangerouslySetInnerHTML={{ __html: md(body) }} />}
     </>;
   }
   // Legacy requests keep their full essential brief until their producer is

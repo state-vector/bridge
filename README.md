@@ -1666,7 +1666,7 @@ The same rule applies to direct question creation and metadata edits. Name the
 affected task, explain the situation and why your decision is needed, and give
 each choice an executor, a concrete consequence and a typed effect. The visible
 options must match those choices; blank context and misplaced recommendations
-are rejected. Supporting logs and event grammar belong in expandable evidence.
+are rejected. The complete request instructions and target links remain visible before the answer buttons; they are not hidden as optional evidence.
 Older stored questions remain readable and answerable.
 
 Missing resume conditions, repeated failed attempts, missing completion reviews
@@ -3694,3 +3694,5 @@ Review clients with a cached connector schema may send the explicit captured `su
 Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.
 
 Recovery banners and readiness use only the current stopped or observed main revision. Historical recovery episodes remain visible as evidence, but their activity cannot replace the current repair, and a later revision’s failed deployment does not erase their verification receipts.
+
+Human requests show the action owner (You or Bridge), the complete instructions, and target links before the answer buttons. A human-owned action must be performed using the human's own account; sending an answer neither performs it nor grants Bridge that account's permissions. Owner-only recovery merges include the PR link and an exact-head GitHub CLI command. Bridge observes the merge and deployment automatically; DONE reports an already completed merge.

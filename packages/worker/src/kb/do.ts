@@ -14026,7 +14026,7 @@ export class KnowledgeHub {
         ? `Changes in ${repo} are waiting because the main branch is failing. Repair PR #${fix.curePr.number} is ready for the remaining administrator-only merge step.`
         : `Automatic repair of ${repo} has stalled after repeated attempts. The work remains open; choose whether to provide new direction or keep it paused.`,
       why_human: fix.curePr
-        ? "The remaining merge step requires your repository authority. Bridge will verify the actual merge and deployment afterwards."
+        ? "You must merge the repair using your repository-owner account. Bridge cannot bypass this gate; answering this request does not grant it your permissions. Bridge observes the merge and deployment automatically."
         : "This is a choice about the next repair direction; Bridge cannot invent instructions or treat another unchanged retry as progress.",
       choices: brief.options.map((label, i) => ({ label, executor: i === 0 ? "human" : "bridge", consequence: fix.curePr
         ? i === 0 ? "You merge the named repair. Bridge checks the actual GitHub merge and deployment before advancing the queued changes." : "Bridge keeps the changes queued and continues observing the repair; no merge permission or success is inferred."
