@@ -3688,3 +3688,5 @@ old result is finalizing. A successful process exit never closes a task or
 fabricates review acceptance. Unfinished claims return through the same scheduler
 with their prior result attached; independent waits, local handoffs, unknown
 operations, host affinity and the persistent retry budget remain enforced.
+
+Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
