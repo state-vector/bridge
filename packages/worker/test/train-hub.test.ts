@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { reviewOutcome } from "./completion-fixture";
 
 /**
@@ -21,9 +21,11 @@ import { reviewOutcome } from "./completion-fixture";
 
 let mf: Miniflare;
 let kbNs: any;
+let scenario = 0;
+let hubName = "bootstrap";
 
 const kbJson = async (path: string, body?: unknown): Promise<{ status: number; body: any }> => {
-  const stub: any = await kbNs.get(kbNs.idFromName("global"));
+  const stub: any = await kbNs.get(kbNs.idFromName(hubName));
   const res = await stub.fetch(`https://kb${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
@@ -58,6 +60,13 @@ beforeAll(async () => {
     }],
   });
   kbNs = await mf.getDurableObjectNamespace("KB");
+});
+
+// Every scenario owns its SQLite hub. Earlier tests deliberately leave old
+// queues, held tasks and expired clocks; their alarms must not mutate a later
+// scenario or fill its scheduler page depending on CI execution speed.
+beforeEach(async () => {
+  hubName = `train-scenario-${++scenario}`;
   await kbJson("/orient", {});
 });
 
@@ -2167,6 +2176,9 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
   });
 
   it("BR#4806 — /sse streams the same kb.event frames the WS channel carries (the gateway wake channel)", { timeout: 40_000 }, async () => {
+    // The production HTTP router targets the global hub; reserve it for this scenario.
+    hubName = "global";
+    await kbJson("/orient", {});
     // The miniflare DO stub bridge cannot carry an open streaming Response
     // (its value-stream closes immediately) — drive the REAL path instead:
     // this rig's OWN HTTP server → /api/kb/sse → authKb(?token=) → DO /sse,
@@ -3806,7 +3818,14 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     })).body.error ?? "").toBe("");
 
     // A newly admitted car must not inherit the lane's idle time.
-    expect((await laneSnap(repo)).starved).toBeNull();
+    const beforeStarvation = await laneSnap(repo);
+    expect(beforeStarvation.starved).toBeNull();
+    const recoveryCards = (await kbJson("/search", { q: "Restore", type: "task", limit: 100 })).body.artefacts;
+    const existingRecovery = (await Promise.all(recoveryCards.map(async (task: any) =>
+      (await kbJson("/get", { id: task.id })).body)))
+      .find((task: any) => task.meta?.machine_duty?.subject === beforeStarvation.card
+        && task.meta?.machine_duty?.kind === "line_recovery");
+    expect(existingRecovery, JSON.stringify({ beforeStarvation, recoveryCards })).toBeTruthy();
     const queued = (await kbJson("/get", { id: qCard })).body;
     const queuedAt = twoHoursAgo + 15 * 60_000;
     expect((await kbJson("/update", { id: qCard, meta: {
@@ -3827,25 +3846,25 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(starv.fired_at).toBeGreaterThan(0);
     expect(starv.ask_id).toBe(snap1.starved.ask_id);
     expect(starv.duty_id).toBe(snap1.starved.duty_id);
+    expect(starv.duty_id).toBe(existingRecovery.id);
 
-    // Check the diagnostic duty card (tags merge-train + diagnostic, checklist items)
+    // The lane may already own a diagnostic for its missing deployment.
+    // Starvation must reuse that recovery owner rather than create a competitor.
     const dutyArt = (await kbJson("/get", { id: starv.duty_id })).body;
     expect(dutyArt.type).toBe("task");
     expect(dutyArt.status).toBe("todo");
     expect(dutyArt.tags).toEqual(expect.arrayContaining(["merge-train", "diagnostic"]));
-    expect(String(dutyArt.body_md)).toContain("per_page");
-    expect(String(dutyArt.body_md)).toContain("required_workflows");
-    expect(String(dutyArt.body_md)).toContain("Verify pool depth");
-    expect(String(dutyArt.body_md)).toContain("Park exits");
+    expect(dutyArt.meta.machine_duty).toMatchObject({
+      by: "system:train", kind: "line_recovery", subject: snap1.card,
+    });
+    expect(String(dutyArt.body_md)).toContain("Read live GitHub runs and gateway status");
 
     // Train-health priority: the diagnostic duty ranks at the top of orient's unclaimed_work
     const oriented = (await kbJson("/orient", { session: "p4-diag-probe" })).body;
-    // The pool is limited to ten rows; automatic recovery of other blocked
-    // lines may fill that page. Every returned task must still be train-health
-    // priority rather than unrelated feature work.
+    // Recovery must rank first; unrelated work may follow on the same page.
     const top = oriented.unclaimed_work ?? [];
     expect(top.length).toBeGreaterThan(0);
-    expect(top.every((w: any) => (w.tags ?? []).includes("diagnostic") || (w.tags ?? []).includes("root_blocker"))).toBe(true);
+    expect(top[0]?.id, JSON.stringify(top)).toBe(starv.duty_id);
 
     // Second read + merge_capable lease renewal: does NOT duplicate the ask or duty, and does NOT clear starvation before a merge
     await kbJson("/train.lease", { repo, base: "main", action: "renew", actor: "gw-p4", merge_capable: true });
