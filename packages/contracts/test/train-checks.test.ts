@@ -9,10 +9,10 @@ describe("BR#8824 check retry purpose/evidence contracts", () => {
   it("keeps the purpose optional for legacy callers and closed for everyone else", () => {
     const base = { kind: "reserve", task_id: "BR#1", head_sha: "a".repeat(40), name: "Deploy health (merge gate)",
       source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 }, target: { kind: "workflow_run", id: 41734497120 } };
-    expect(CheckRetryCommandSchema.parse(base).purpose).toBeUndefined();
-    expect(CheckRetryCommandSchema.parse({ ...base, purpose: "stale_destination_gate", pr: 1 }).purpose).toBe("stale_destination_gate");
+    expect(CheckRetryCommandSchema.parse(base)).not.toHaveProperty("purpose");
+    expect(CheckRetryCommandSchema.parse({ ...base, purpose: "stale_destination_gate", pr: 1 })).toMatchObject({purpose:"stale_destination_gate"});
     expect(CheckRetryCommandSchema.safeParse({ ...base, purpose: "stale_destination_gate" }).success).toBe(false);
-    expect(CheckRetryCommandSchema.parse({ ...base, purpose: "ordinary_head_check" }).purpose).toBe("ordinary_head_check");
+    expect(CheckRetryCommandSchema.parse({ ...base, purpose: "ordinary_head_check" })).toMatchObject({purpose:"ordinary_head_check"});
     expect(CheckRetryCommandSchema.safeParse({ ...base, purpose: "caller_asserted_green" }).success).toBe(false);
   });
 

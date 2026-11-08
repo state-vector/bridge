@@ -978,3 +978,21 @@ The train reads canonical task state using `get_artefact` with `view: "execution
 The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
 
 Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).
+
+
+### Provider failure evidence and bounded historical recovery
+
+Gateway terminal receipts retain structured, sanitized ACP provider causes separately
+from task output. Unknown provider messages remain diagnostic evidence; empty output
+or “no deployments” alone does not establish exhausted credits. Missing checkpoint
+working directories hold the exact delivery stage and original outcome rather than
+repeatedly launching a failing Git process or inventing a successful checkpoint.
+
+For historical provider failures stranded by the retry counter, an authenticated
+full agent can attest a fresh request against the configured model and token allowance.
+The one-use recovery permit binds that proof to the exact task revision, stopped
+attempt, terminal evidence, checkpoint and selected route. Original counters and
+receipts remain intact. The next worker receives the authorized continuation;
+unknown external operations and independent human or lifecycle holds still prevent
+admission. This reconciliation mechanism does not yet implement automatic provider
+circuit recovery or task replanning, and billing confirmation alone is not health proof.

@@ -235,7 +235,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -5054,6 +5054,7 @@ export class KnowledgeHub {
    * window: incompatible tasks cannot hide compatible work further down. */
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
+    const held: Partial<Record<SchedulingReason, string[]>> = {};
     const rows = this.state.storage.sql.exec(`SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''`).toArray();
     const eligible = rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
@@ -5065,7 +5066,9 @@ export class KnowledgeHub {
       else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
-      else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";
+      else if (state && state.budget_exhaustions >= 3 && ![capabilities, ...capabilities.alternatives].some(c =>
+        usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
+        && recoveryPermitMatches(state, c, host, String(meta.work_revision ?? "legacy"), Date.now()))) reason = "retry_budget";
       else {
         const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
@@ -5075,14 +5078,14 @@ export class KnowledgeHub {
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
-      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; return false; }
+      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
     });
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
       || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
-    return { eligible, reasons };
+    return { eligible, reasons, held };
   }
 
   private reconcileDispatchReservations(now = Date.now()) {
@@ -5121,7 +5124,7 @@ export class KnowledgeHub {
           : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
         const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
         return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), eligible: selection.eligible.length,
-          reasons: selection.reasons, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
+          reasons: selection.reasons, held: selection.held, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
   }
@@ -5165,7 +5168,7 @@ export class KnowledgeHub {
     const observation = this.one(`SELECT capabilities,observed_ts FROM execution_hosts WHERE token_id=?`, tokenId);
     const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
     const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
-    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} };
+    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
     const recoveryCapacity = this.recoveryCapacity();
     const pending = recoveryCapacity.prepare(tokenId, selection.eligible.map(priorityTask), mode !== "inspect");
     if (pending?.phase === "slot_available") {
@@ -5207,6 +5210,13 @@ export class KnowledgeHub {
           const assigned = this.one(`SELECT id,title,body_md,project,meta,roles,tags FROM artefacts WHERE id=?`, id)!;
           const meta = JSON.parse(String(assigned.meta ?? "{}"));
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
+          const execution = this.executionState(id);
+          if (execution?.recovery_permit?.phase === "available") {
+            const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
+              && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
+            if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
+            meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
+          }
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
               meta, roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
@@ -5438,6 +5448,45 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
+    if (command.kind === "recover_provider_failure") {
+      // This is an audited human/full-agent diagnosis, never a worker's own
+      // retry request. It preserves the failed attempt and grants one begin.
+      if (!this.executionWork().isInteractive(tokenId) || !req.session) throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
+      if (!validRecoveryRequestProof(command.proof)) throw new Error("gate: recovery proof must bind the actual model and observed allowance to the witnessed configured request");
+      const encoded = JSON.stringify({ command, session:req.session, actor });
+      const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
+      if (replay) { if (replay.request !== encoded) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+      const a = current.attempt, terminal = current.terminal;
+      if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || todoDispatchHold(meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
+      if (!a || a.phase !== "quiesced" || !terminal || terminal.generation !== a.generation || terminal.attempt_id !== a.attempt_id) throw new Error("gate: provider recovery requires the exact quiesced terminal attempt");
+      if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: unresolved external effects prohibit provider recovery");
+      if (JSON.stringify(command.terminal) !== JSON.stringify(terminal)) throw new Error("gate: provider recovery terminal evidence changed");
+      if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
+      if (current.budget_exhaustions < 3) throw new Error("gate: task does not require an exhausted-budget recovery permit");
+      if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
+      if (current.recovery_permit?.phase === "available" && current.recovery_permit.proof.id === command.proof.id) throw new Error("gate: recovery proof already granted; use the original command receipt");
+      const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
+        .find(r => Number(JSON.parse(String(r.data)).generation) === a.generation);
+      if (!ended || command.proof.observed_at <= Number(ended.ts) || command.proof.observed_at > now || now-command.proof.observed_at > 300_000) throw new Error("gate: recovery needs a fresh configured-model request after this terminal failure");
+      const host = this.one(`SELECT h.capabilities,h.observed_ts,t.label FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=? AND t.revoked_ts IS NULL`,command.proof.host);
+      if (!host || now-Number(host.observed_ts)>120_000) throw new Error("gate: recovery gateway inventory is missing or stale");
+      const inventory = ExecutorCapabilitiesSchema.parse(JSON.parse(String(host.capabilities)));
+      const selected = [inventory,...inventory.alternatives].find(c => c.backend===command.proof.backend && c.model===command.proof.model && c.config_revision===command.proof.config_revision
+        && usableFor(current.requirements,c,command.proof.host,String(this.one(`SELECT project FROM artefacts WHERE id=?`,req.id)?.project??"")));
+      if (!selected) throw new Error("gate: recovery proof does not match a usable selected configured capability");
+      if (a.host !== command.proof.host && !a.checkpoint) throw new Error("gate: unpublished work retains original host affinity");
+      current.recovery_permit = { phase:"available",id:`${req.id}:${a.generation}:${a.attempt_id}`,generation:a.generation,attempt_id:a.attempt_id,
+        task_revision:String(meta.work_revision??"legacy"),checkpoint_commit:a.checkpoint?.commit??null,terminal,
+        proof:command.proof,diagnosis:command.diagnosis,continuation:command.continuation,evidence:command.evidence,authorized_by:actor };
+      current.revision += 1;
+      const result = {kind:"provider_recovery_granted",task_id:req.id,permit:current.recovery_permit,budget_exhaustions:current.budget_exhaustions};
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`,JSON.stringify(current),req.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,req.id,req.command_id,encoded,JSON.stringify(result));
+        this.version(req.id,actor,"provider_recovery_granted","One witnessed continuation permitted; original retry count and failure evidence retained",{generation:a.generation,proof:command.proof.id,diagnosis:command.diagnosis,continuation:command.continuation});
+      });
+      return result;
+    }
     if (command.kind === "inspect") {
       const handoff = this.recoveryCapacity().forVictim(req.id);
       return handoff ? { ...current, capacity_handoff: handoff } : current;
@@ -5593,6 +5642,7 @@ export class KnowledgeHub {
       const selection = command.selection;
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
+      if (current.budget_exhaustions >= 3 && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: exhausted budget requires a current one-use recovery permit for the exact selected route");
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");

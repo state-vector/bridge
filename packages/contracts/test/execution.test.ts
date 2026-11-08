@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { providerRecoveryDiagnosis, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -125,5 +125,47 @@ describe("durable execution failure boundaries", () => {
     expect(s.budget_exhaustions).toBe(1);
     s = step(s, { kind: "poll", ...fence }, 60_102);
     expect(s.budget_exhaustions).toBe(1);
+  });
+});
+
+describe("witnessed legacy recovery fences", () => {
+  function held() {
+    let s = step(started(), {kind:"quiesce",...fence,writers:"process_group_empty"});
+    s.budget_exhaustions = 3;
+    const terminal = {...fence,writers:"process_group_empty" as const,outcome:{kind:"failed" as const,exit_code:1,stdout_tail:"",stderr_tail:"acp session/prompt failed: Authentication required: provider authentication required "}};
+    s.terminal = terminal;
+    s.recovery_permit = {phase:"available",id:"permit",...fence,task_revision:"revision",checkpoint_commit:null,terminal:structuredClone(terminal),
+      proof:{id:"probe",host:"mac",backend:"opencode",model:"route",config_revision:"config",result:{kind:"succeeded",response_receipt:"request-read"},observed_at:150,
+        request:{kind:"configured_model_request",max_output_tokens:32000,tools:"none"},actual_model:"actual",configuration_receipt:"config-read",receipts:["request-read"],
+        witness:{kind:"configured_route_observed",configured_model:"route",allowed_actual_models:["actual"],configured_max_output_tokens:32000,observed_max_output_tokens:32000,configuration_receipt:"config-read"}},
+      diagnosis:"provider_authentication",continuation:"Reconcile existing output",evidence:["request-read"],authorized_by:"reviewer"};
+    return s;
+  }
+  const capability = {backend:"opencode",model:"route",config_revision:"config"} as const;
+  it("invalidates proof for changed evidence, routing, work and age while preserving the record", () => {
+    const s=held();
+    expect(recoveryPermitMatches(s,capability,"mac","revision",200)).toBe(true);
+    for (const c of [{...capability,model:"other"},{...capability,config_revision:"new"}]) expect(recoveryPermitMatches(s,c,"mac","revision",200)).toBe(false);
+    expect(recoveryPermitMatches(s,capability,"other","revision",200)).toBe(false);
+    expect(recoveryPermitMatches(s,capability,"mac","new",200)).toBe(false);
+    for (const time of [149,300151]) expect(recoveryPermitMatches(s,capability,"mac","revision",time)).toBe(false);
+    const changed=structuredClone(s); changed.terminal!.outcome.stderr_tail="different";
+    expect(recoveryPermitMatches(changed,capability,"mac","revision",200)).toBe(false);
+    const changedCheckpoint=structuredClone(s); changedCheckpoint.attempt!.checkpoint=cp;
+    expect(recoveryPermitMatches(changedCheckpoint,capability,"mac","revision",200)).toBe(false);
+    for (const state of ["prepared","outcome_unknown"] as const) {
+      const unknown=structuredClone(s); unknown.operations=[{id:"write",action:"publish",input_revision:"old",deadline:1100,state,receipts:[]}];
+      expect(recoveryPermitMatches(unknown,capability,"mac","revision",200)).toBe(false);
+    }
+    const next=step(s,{...begin,attempt_id:"recovered"},200);
+    expect(next.budget_exhaustions).toBe(3);
+    expect(next.recovery_permit?.phase).toBe("consumed");
+    expect(next.terminal).toEqual(s.terminal);
+  });
+  it("does not turn missing output or generic errors into provider diagnoses", () => {
+    for (const stderr_tail of ["No deployments available", "provider quota maybe", "test failed", ""]) {
+      expect(providerRecoveryDiagnosis({kind:"failed",exit_code:1,stdout_tail:"",stderr_tail})).toBeNull();
+    }
+    expect(providerRecoveryDiagnosis(held().terminal!.outcome)).toBe("provider_authentication");
   });
 });

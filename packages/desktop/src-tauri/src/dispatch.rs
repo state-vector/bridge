@@ -305,6 +305,12 @@ fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde
     let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
     let bc = cfg.backends.get(name)?;
     if !bc.enabled || !bc.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str()) { return None; }
+    if let Some(recovery) = meta.get("execution_recovery_selection") {
+        if recovery["backend"].as_str() != Some(name) { return None; }
+        return configured_models(cfg, bc).into_iter().find(|(tier, model)| *tier >= required
+            && recovery["tier"] == serde_json::to_value(tier).unwrap_or_default()
+            && recovery["model"].as_str() == Some(model.as_str()));
+    }
     let initial_selection = meta.get("execution_scheduling_requirements").is_some() && meta.get("execution_last_model").is_none();
     configured_models(cfg, bc).into_iter().filter(|(tier, _)| if initial_selection { *tier == required } else { *tier >= required }).min_by_key(|(tier, _)| *tier)
 }
@@ -3178,6 +3184,14 @@ fn result_lost_receipts(worktree: Option<&str>, pr: Option<&str>) -> String {
     }
 }
 
+/// Only the permit consumed by this exact begin may direct this worker.
+fn append_recovery_continuation(prompt: &mut String, state: &serde_json::Value, generation: u64, attempt_id: &str) {
+    let permit = &state["recovery_permit"];
+    if permit["phase"] != "consumed" || permit["consumed_generation"].as_u64() != Some(generation)
+        || permit["consumed_attempt_id"].as_str() != Some(attempt_id) { return; }
+    prompt.push_str(&format!("\n# Authorized recovery continuation\n{}\nContinue from the preserved checkpoint and exact prior terminal evidence above. Follow the continuation instructions; reconcile receipts before any external effect. This permission is for this attempt only.\n", permit));
+}
+
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
 /// delivery contract (commit, push branch, open PR). Uses an isolated worktree
 /// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
@@ -3604,6 +3618,7 @@ fn spawn_opencode(
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
+    append_recovery_continuation(&mut prompt, &state, generation, &attempt_id);
     if let Err(error) = allocation.bind(&lifecycle::Ownership::Attempt { ticket, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: attempt_id.clone() }) {
         dlog(tid, &format!("workspace exact ownership could not be persisted; no writer launched: {error}")); return;
     }
@@ -3972,6 +3987,21 @@ pub fn logout(state: &DispatchState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_continuation_reaches_only_the_exact_consuming_worker() {
+        let permit = serde_json::json!({"phase":"consumed","consumed_generation":4,"consumed_attempt_id":"next",
+            "continuation":"Inspect PR first; do not repeat the push", "checkpoint_commit":"preserved-sha",
+            "terminal":{"generation":3,"attempt_id":"old","outcome":{"kind":"failed"}},"diagnosis":"provider_authentication"});
+        let state = serde_json::json!({"recovery_permit":permit});
+        let mut prompt = String::new();
+        super::append_recovery_continuation(&mut prompt, &state, 4, "next");
+        for expected in ["Inspect PR first", "preserved-sha", "provider_authentication", "old"] { assert!(prompt.contains(expected)); }
+        for (generation, attempt) in [(3,"next"),(4,"other")] {
+            let mut stale = String::new();
+            super::append_recovery_continuation(&mut stale, &state, generation, attempt);
+            assert!(stale.is_empty());
+        }
+    }
     #[test]
     fn failed_launch_refill_requires_conclusive_no_writer_not_expiry_or_transport_failure() {
         assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":null})));
@@ -4376,6 +4406,11 @@ mod tests {
         } } })).unwrap();
         let task = json!({ "execution_project": "bridge", "execution_scheduling_requirements": { "tier": "medium" } });
         assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &task), Some((ReasoningTier::Medium, "glm-5.3".into())));
+        let mut recovered = task.clone();
+        recovered["execution_recovery_selection"] = json!({"backend":"opencode","model":"provider/sol","tier":"large","config_revision":"one"});
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &recovered), Some((ReasoningTier::Large,"provider/sol".into())));
+        recovered["execution_recovery_selection"]["model"] = json!("not-configured");
+        assert!(selected_model(&cfg,opencode::Backend::OpenCode,&recovered).is_none());
         let mut large = task.clone(); large["execution_scheduling_requirements"]["tier"] = json!("large");
         assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &large), Some((ReasoningTier::Large, "provider/sol".into())));
         large["execution_project"] = json!("other");

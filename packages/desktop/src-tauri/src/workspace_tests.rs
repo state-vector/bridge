@@ -150,7 +150,7 @@ fn controller_reconciles_unrelated_disk_with_a_held_execution_during_update_drai
         _=>Some(json!({"kind":"no_eligible_work"})),
     });
     let (cfg,ready,snap)=fixture(&hub);let owner=Owner::open(&cfg).unwrap();owner.measure().unwrap();
-    let held=super::super::attempt_journal::Record {owner:Ownership::Attempt {ticket:ticket("unknown-writer"),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"unknown-attempt".into()},host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:now_ms(),process:None,disposition:super::super::attempt_journal::Disposition::Pending,work:super::super::attempt_journal::Work::Unproven {outcome:super::super::attempt_journal::Outcome {kind:super::super::attempt_journal::OutcomeKind::Completed,exit_code:None,stdout_tail:"captured result retained without writer proof".into(),stderr_tail:String::new()},worktree:None}};
+    let held=super::super::attempt_journal::Record {owner:Ownership::Attempt {ticket:ticket("unknown-writer"),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"unknown-attempt".into()},host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:now_ms(),process:None,disposition:super::super::attempt_journal::Disposition::Pending,work:super::super::attempt_journal::Work::Unproven {outcome:super::super::attempt_journal::Outcome {kind:super::super::attempt_journal::OutcomeKind::Completed,exit_code:None,stdout_tail:"captured result retained without writer proof".into(),stderr_tail:String::new(),cause:None},worktree:None}};
     journal::insert(&gateway_pipeline::terminal_root(&cfg).unwrap(),held).unwrap();
     let mut controller=super::super::gateway_pipeline::Controller::new(&cfg,&ready,&snap);
     let deadline=Instant::now()+Duration::from_secs(60);

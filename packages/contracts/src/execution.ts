@@ -47,6 +47,53 @@ export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, 
     ? { kind: "repair_required", fingerprint, failures, reason }
     : { kind: "cooldown", fingerprint, failures, until_ts: now + 60_000 * failures, reason });
 }
+/** Typed provider-cause wire shape — mirrors the Rust transport classifier
+ * (opencode v2.2.5 ACP adapter: `provider.auth` serializes as ACP -32000
+ * AuthRequiredError; other session failures as -32603 with OBJECT data
+ * `{service:"session", errorName:"provider.*"}`). The class comes only from
+ * the adapter's typed discriminators — prose never classifies (BR#8821:
+ * a generic failure string is not a quota proof). */
+export const ProviderCauseClassSchema = z.enum(["account_action", "rate_limit", "route_unavailable", "provider_internal", "diagnostic"]);
+export type ProviderCauseClass = z.infer<typeof ProviderCauseClassSchema>;
+export const ProviderCauseSchema = z.object({
+  class: ProviderCauseClassSchema,
+  backend: z.string().default("opencode"),
+  model: z.string().nullable().default(null),
+  /** ACP JSON-RPC error code (-32000/-32603), never a guessed HTTP status. */
+  code: z.number().int().nullable().default(null),
+  /** Exact allowlisted adapter errorName (provider.quota, provider.auth, …). */
+  error_name: z.string().nullable().default(null),
+  /** Redacted provider message. */
+  message: text,
+  /** Redacted structured provider error data, object-valued where the
+   * adapter provides it — never flattened into a lossy string. */
+  data: z.unknown().optional(),
+  evidence_line: text.nullable().default(null),
+  at_ms: z.number().int().nonnegative(),
+});
+export type ProviderCause = z.infer<typeof ProviderCauseSchema>;
+/** Only `account_action` (quota/auth) demands a human account action; the
+ * other classes are contained on the route without an owner ask (BR#8822:
+ * reuse/dedupe the account action, never widen it). */
+export function isAccountActionCause(cause: ProviderCause | null | undefined): boolean {
+  return cause?.class === "account_action";
+}
+/** Dedupe scope of one incident: class + provider route + config/credential
+ * generation. Old success receipts cannot clear a new configuration's
+ * incident; two classes on one route are two incidents. */
+export function providerIncidentRouteKey(cause: Pick<ProviderCause, "class" | "backend" | "model">, configRevision: string): string {
+  return `${cause.class}|${cause.backend}|${cause.model ?? ""}|${configRevision}`;
+}
+export function providerIncidentText(cause: Pick<ProviderCause, "class" | "backend" | "model">): string {
+  const route = `${cause.backend}${cause.model ? `/${cause.model}` : ""}`;
+  switch (cause.class) {
+    case "account_action": return `${route}: provider account action required (quota or authentication)`;
+    case "rate_limit": return `${route}: provider rate limit reached`;
+    case "route_unavailable": return `${route}: provider route unavailable`;
+    case "provider_internal": return `${route}: provider internal error`;
+    case "diagnostic": return `${route}: unclassified provider error — evidence preserved`;
+  }
+}
 export const ModelCapabilitySchema = z.object({
   tier: ReasoningTierSchema,
   tools: z.array(text),
@@ -61,6 +108,7 @@ export const ModelCapabilitySchema = z.object({
     z.object({ kind: z.literal("unavailable"), reason: text }),
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
+
 });
 export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional(),
   admission_hold: z.object({ kind: z.literal("update_handoff"), reason: text }).optional() });
@@ -178,8 +226,45 @@ export const TerminalOutcomeSchema = z.object({
   exit_code: z.number().int().nullable(),
   stdout_tail: z.string().max(16_000),
   stderr_tail: z.string().max(8_000),
+  /** Typed provider/account cause when the transport captured a structured
+   * provider error. Absent on every older journal (mixed-version safe):
+   * `default` keeps old records parseable, and the authenticated failure
+   * provenance + raw sanitized evidence ride ONLY on this field (BR#8821). */
+  cause: ProviderCauseSchema.optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
+/** A bounded, witnessed request on the configured route. A model catalog,
+ * CLI version, answered billing question or timestamp alone is not evidence. */
+export const ProviderRecoveryProofSchema = z.object({
+  id: text, host: text, backend: text, model: text, config_revision: text,
+  result: z.object({ kind: z.literal("succeeded"), response_receipt: text }),
+  observed_at: z.number().int().positive(),
+  request: z.object({ kind: z.literal("configured_model_request"), max_output_tokens: z.number().int().positive(), tools: z.literal("none") }),
+  actual_model: text, configuration_receipt: text, receipts: z.array(text).min(1),
+  witness: z.object({ kind: z.literal("configured_route_observed"), configured_model: text,
+    allowed_actual_models: z.array(text).min(1), configured_max_output_tokens: z.number().int().positive(),
+    observed_max_output_tokens: z.number().int().positive(), configuration_receipt: text }),
+});
+export function validRecoveryRequestProof(proof: z.infer<typeof ProviderRecoveryProofSchema>): boolean {
+  return proof.witness.configured_model === proof.model
+    && proof.witness.allowed_actual_models.includes(proof.actual_model)
+    && proof.witness.configuration_receipt === proof.configuration_receipt
+    && proof.witness.configured_max_output_tokens === proof.request.max_output_tokens
+    && proof.witness.observed_max_output_tokens === proof.request.max_output_tokens;
+}
+const recoveryPermitFields = {
+  id: text, generation: z.number().int().nonnegative(), attempt_id: text,
+  task_revision: text, checkpoint_commit: sha.nullable(),
+  terminal: TerminalReceiptSchema, proof: ProviderRecoveryProofSchema,
+  diagnosis: z.enum(["provider_authentication", "provider_quota", "provider_route_unavailable"]),
+  continuation: text, evidence: z.array(text).min(1), authorized_by: text,
+};
+export const ExecutionRecoveryPermitSchema = z.discriminatedUnion("phase", [
+  z.object({ ...recoveryPermitFields, phase: z.literal("available") }),
+  z.object({ ...recoveryPermitFields, phase: z.literal("consumed"), consumed_generation: z.number().int().positive(), consumed_attempt_id: text }),
+]);
+export type ExecutionRecoveryPermit = z.infer<typeof ExecutionRecoveryPermitSchema>;
+
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -189,18 +274,22 @@ export const ExecutionStateSchema = z.object({
   messages: z.array(MessageSchema),
   operations: z.array(OperationSchema),
   budget_exhaustions: z.number().int().nonnegative().default(0),
+  recovery_permit: ExecutionRecoveryPermitSchema.nullable().default(null),
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
   terminal: TerminalReceiptSchema.nullable().default(null),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, delivery: null, handoff: { phase: "none" }, terminal: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), mode: z.enum(["inspect", "reserve", "request_capacity"]) }),
   z.object({ kind: z.literal("schedule_status"), host: text.optional() }),
+  z.object({ kind: z.literal("recover_provider_failure"), terminal: TerminalReceiptSchema,
+    proof: ProviderRecoveryProofSchema, diagnosis: recoveryPermitFields.diagnosis,
+    continuation: text, evidence: z.array(text).min(1) }),
   z.object({ kind: z.literal("gateway_control"), host: text, mode: z.enum(["enabled", "draining"]), reason: text }),
   z.object({ kind: z.literal("gateway_failure"), reason: text, cooldown_ms: z.number().int().min(10_000).max(300_000) }),
   z.object({ kind: z.literal("pause_claims"), reason: text, budget_ms: z.number().int().min(10_000).max(300_000) }),
@@ -252,7 +341,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     return a;
   };
   switch (command.kind) {
-    case "schedule": case "schedule_status": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "schedule": case "schedule_status": case "recover_provider_failure": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
     case "start_failed": {
       if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
       return s; // the authenticated coordinator owns the atomic task release
@@ -267,11 +356,12 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     }
     case "begin": {
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
-      if (s.budget_exhaustions >= 3) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
+      if (s.budget_exhaustions >= 3 && !recoveryPermitCoversAttempt(s, now)) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
       if (a && a.host !== host && !a.checkpoint) throw new Error("gate: cross-host transfer requires a published checkpoint");
       s.generation += 1;
+      if (s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {
         generation: s.generation, attempt_id: command.attempt_id, host, session,
         lease_until: now + EXECUTION_LEASE_MS,
@@ -400,4 +490,44 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
   }
   s.revision += 1;
   return ExecutionStateSchema.parse(s);
+}
+
+/** Only adapter-typed infrastructure failures are exempt from NEW job-failure
+ * charges. Original counters/receipts are never rewritten retrospectively. */
+export function typedProviderFailure(outcome: z.infer<typeof TerminalOutcomeSchema>): boolean {
+  const c = outcome.cause;
+  if (outcome.kind !== "failed" || !c) return false;
+  if (c.code === -32000 && c.error_name === "provider.auth" && c.class === "account_action") return true;
+  const data = c.data as { service?: unknown; errorName?: unknown } | undefined;
+  return c.code === -32603 && data?.service === "session" && data.errorName === c.error_name
+    && ["provider.quota", "provider.rate-limit", "provider.no-route", "provider.transport", "provider.internal"].includes(c.error_name ?? "")
+    && c.class !== "diagnostic";
+}
+
+/** Recognize the exact archived ACP auth envelope, not empty stdout or prose
+ * anywhere in a task result. Ambiguous legacy failures remain held for diagnosis. */
+export function providerRecoveryDiagnosis(outcome: z.infer<typeof TerminalOutcomeSchema>): z.infer<typeof recoveryPermitFields.diagnosis> | null {
+  if (typedProviderFailure(outcome)) {
+    const name = outcome.cause?.error_name;
+    return name === "provider.auth" ? "provider_authentication" : name === "provider.quota" ? "provider_quota" : "provider_route_unavailable";
+  }
+  if (outcome.kind === "failed" && /^acp session\/(?:prompt|new|set_model) failed: Authentication required[:.] provider authentication required\s*$/i.test(outcome.stderr_tail.trim())) return "provider_authentication";
+  return null;
+}
+
+export function recoveryPermitCoversAttempt(state: ExecutionState, now: number): boolean {
+  const p = state.recovery_permit, a = state.attempt;
+  return !!p && validRecoveryRequestProof(p.proof) && p.phase === "available" && !!a && a.phase === "quiesced"
+    && p.generation === a.generation && p.attempt_id === a.attempt_id
+    && p.checkpoint_commit === (a.checkpoint?.commit ?? null)
+    && JSON.stringify(p.terminal) === JSON.stringify(state.terminal)
+    && p.proof.observed_at <= now && now - p.proof.observed_at <= 300_000
+    && !state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
+}
+
+export function recoveryPermitMatches(state: ExecutionState, capability: Pick<ExecutorCapabilities,"backend"|"model"|"config_revision">, host: string, revision: string, now: number): boolean {
+  const p = state.recovery_permit;
+  return recoveryPermitCoversAttempt(state, now) && !!p && p.task_revision === revision
+    && p.proof.host === host && p.proof.backend === capability.backend
+    && p.proof.model === capability.model && p.proof.config_revision === capability.config_revision;
 }
