@@ -426,6 +426,11 @@ impl Owner {
         }
         for path in paths {
             if !path.exists() || fs::symlink_metadata(&path).map_err(|e|e.to_string())?.file_type().is_symlink() {continue;}
+            // Allocation scaffolding (cache/tmp/logs) holds no content until a
+            // build runs. A file-less tree has nothing to preserve and no
+            // bytes worth a receipt; recording it would count empty
+            // directories as reclaimed disk on every released workspace.
+            if !tree_has_files(&path) {continue;}
             let path=path.canonicalize().map_err(|e|e.to_string())?;
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
@@ -537,6 +542,20 @@ fn uncovered_inputs(path: &Path, repositories: &[PathBuf]) -> Result<bool, Strin
         } else { return Ok(true); }
     }
     Ok(false)
+}
+/// Any read failure counts as content: a child is only skipped when its
+/// emptiness is proven, never assumed.
+fn tree_has_files(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else { return true };
+    for entry in entries {
+        let Ok(entry) = entry else { return true };
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => if tree_has_files(&entry.path()) { return true; },
+            Ok(_) => return true,
+            Err(_) => return true,
+        }
+    }
+    false
 }
 fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
     let ignored=git(path,&["ls-files","--others","--ignored","--exclude-standard","--directory","-z"])?;
