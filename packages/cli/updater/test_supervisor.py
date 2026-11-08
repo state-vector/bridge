@@ -81,7 +81,8 @@ class Harness(m.Supervisor):
         data = Path(binary).read_bytes()
         return {"commit": self.machine.target if data == self.machine.binary else OLD,
                 "update_protocol": 1, "worker_protocol": 1,
-                "recovery_protocol": 1 if self.machine.export_source or not self.machine.ack else 0}
+                "recovery_protocol": 1 if self.machine.export_source or not self.machine.ack else 0,
+                "coordinator_revision":m.COORDINATOR_REVISION if self.machine.export_source else 0}
 
     def idle(self, op, process):
         if self.machine.ack and process:
@@ -90,7 +91,7 @@ class Harness(m.Supervisor):
 
     def health(self, op, commit, since):
         self.assert_hold(op)
-        return self.machine.current is not None and self.machine.current.commit == commit and self.idle(op, self.machine.current) and self.machine.healthy[commit]
+        return self.machine.current is not None and self.machine.current.commit == commit and self.machine.healthy[commit]
 
     def assert_hold(self, op):
         if m.read(self.request, {}).get("nonce") != op.nonce:
@@ -396,6 +397,22 @@ class RecoveryTests(unittest.TestCase):
         self.u=Harness(self.machine);self.u.reconcile()
         self.assertEqual(self.machine.actions,["stop","start","notify"])
 
+    def test_old_false_health_wait_reverifies_same_candidate_without_rollback(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        self.u.binary.write_bytes(self.machine.binary);self.machine.current=m.Process(123,"boot","100",NEW);self.machine.ack=False
+        state=m.encode(m.Waiting(m.Reason.TRANSPORT,"candidate has not acknowledged its exact rollback hold",10000001,m.Restoring(op,m.InstallStep.STOP)))
+        state.pop("coordinator_revision")
+        m.atomic(self.u.state_path,state);m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle);self.assertEqual(self.machine.actions,["notify"])
+        self.assertFalse(self.u.request.exists())
+
+    def test_confirmed_older_native_cannot_downgrade_the_bootstrapped_coordinator(self):
+        self.machine.export_source="# obsolete coordinator\n"
+        original=self.u.info
+        with patch.object(self.u,"info",side_effect=lambda path:{**original(path),"coordinator_revision":0}):self.drive()
+        self.assertFalse((self.u.root/"supervisor.py").exists(),"older embedded source is not a coordinator upgrade")
+
     def test_old_recovery_ladders_and_separate_native_cleanup_commands_are_removed(self):
         source=Path(m.__file__).read_text()
         for symbol in ("def rollback(","def recover(","def accept_running_candidate("):
@@ -426,12 +443,14 @@ else:
   request=root/"request.json"
   if request.exists():
    value=json.loads(request.read_text())
-   for name,data in [("idle.json",{"nonce":value["nonce"],"pid":os.getpid(),"phase":"controller_ready","worker_protocol":1}),("health.json",{"pid":os.getpid(),"commit":COMMIT,"observed_at":int(time.time()*1000)})]:
+   for name,data in [("idle.json",{"nonce":value["nonce"],"pid":os.getpid(),"phase":"controller_ready","worker_protocol":1}),("health.json",{"phase":"ready","pid":os.getpid(),"commit":COMMIT,"observed_at":int(time.time()*1000)})]:
+    if name=="idle.json" and COMMIT!="OLD_COMMIT_VALUE":continue
     tmp=root/(name+".child");tmp.write_text(json.dumps(data));os.replace(tmp,root/name)
   time.sleep(.005)
 '''
         with tempfile.TemporaryDirectory() as directory:
             home=Path(directory);binary=home/"bridge"
+            program=program.replace("OLD_COMMIT_VALUE",OLD)
             binary.write_text(program.replace("COMMIT_VALUE",OLD));binary.chmod(0o755)
             candidate=program.replace("COMMIT_VALUE",NEW).encode();data=archive(candidate)
             m.atomic(home/".bridge/config.json",{"url":"https://fixture","auto_update":{"enabled":True,"channel":"main"}})

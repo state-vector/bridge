@@ -34,6 +34,10 @@ same saved operation; a planned controller reconnect does not add another hour.
 After a verified native update, the supervisor updates its own shipped source
 and continues from the same journal, avoiding a permanently older recovery script.
 Existing useful-work windows and failed-build rejection remain enforced.
+Health readiness and controller quiescence are separate facts: a busy healthy
+controller can pass startup verification while job-specific waits stay protected.
+Stopping it for rollback still requires its real handoff acknowledgement. A newer
+supervisor bootstrap cannot be downgraded by an older native build's embedded code.
 Pending worker-stop requests block controller-ready acknowledgment until they
 are delivered, and candidate health cannot clear a changed update-request nonce.
 Only published worker manifests are adopted. An interrupted manifest write stays

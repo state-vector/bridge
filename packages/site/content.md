@@ -34,6 +34,9 @@ worktrees. Busy controller boundaries are thawed, independent workers continue,
 and uncertain writers or outside actions remain protected. An unproved record
 creates one explicit wait instead of another restart loop. The separate old cleanup
 commands and independent recovery ladders have been removed.
+Ready health is distinct from an idle/handoff acknowledgement, so healthy busy
+controllers do not fail startup verification merely because jobs are still active.
+Newer supervisor bootstraps also reject older embedded coordinator revisions.
 
 ### Operational diagnostics
 

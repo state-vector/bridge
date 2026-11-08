@@ -24,6 +24,7 @@ import urllib.error
 import uuid
 
 MAX_ARCHIVE = 64 * 1024 * 1024
+COORDINATOR_REVISION = 2
 USEFUL_WORK_SECONDS = 3600
 DRAIN_SECONDS = 900
 HEALTH_SECONDS = 180
@@ -237,7 +238,7 @@ def encode(state):
     data = asdict(state)
     if isinstance(state, Waiting):
         data["resume"] = encode(state.resume)
-    return {"schema_version": 2, "phase": type(state).__name__.lower(), **data}
+    return {"schema_version": 2, "coordinator_revision": COORDINATOR_REVISION, "phase": type(state).__name__.lower(), **data}
 
 
 def decode(data):
@@ -250,7 +251,9 @@ def decode(data):
     if data["schema_version"] != 2 or data.get("phase") not in KINDS:
         raise ValueError("unknown recovery state; original journal and hold retained")
     cls = KINDS[data["phase"]]
-    fields = {k: v for k, v in data.items() if k not in ("schema_version", "phase")}
+    if data.get("coordinator_revision",0)>COORDINATOR_REVISION:
+        raise ValueError("newer recovery coordinator owns this journal")
+    fields = {k: v for k, v in data.items() if k not in ("schema_version", "coordinator_revision", "phase")}
     if "operation" in fields:
         op = fields["operation"]
         if not re.fullmatch("[0-9a-f]{32}", op["nonce"]) or any(not re.fullmatch("[0-9a-f]{40}", op[key]) for key in ("source", "target")):
@@ -263,6 +266,12 @@ def decode(data):
         fields["resume"] = decode(fields["resume"])
         if not isinstance(fields["resume"], (Preparing, Handoff, Reconciling, Installing, Verifying, Restoring, VerifyingRestored)):
             raise ValueError("invalid recovery continuation")
+        if data.get("coordinator_revision",0)<COORDINATOR_REVISION and fields["reason"] is Reason.TRANSPORT and isinstance(fields["resume"],Restoring) and fields["resume"].step is InstallStep.STOP:
+            # Early v2 incorrectly used job-idle acknowledgement as health.
+            # Re-observe the same known candidate before any rollback effect;
+            # real process/nonce/health/doctor checks still decide the outcome.
+            saved=fields["resume"]
+            return Verifying(saved.operation,saved.operation.started_at)
         if fields["reason"] is Reason.RECONCILIATION and isinstance(fields["resume"],Handoff):
             saved=fields["resume"]
             return Reconciling(saved.operation,saved.candidate_digest,ReconcileStep.LEGACY_START)
@@ -384,7 +393,7 @@ class Supervisor:
             if current != stable:
                 stable, stable_since = current, time.monotonic()
             receipt = read(self.root / "health.json", {})
-            if current and current.commit == commit and self.idle(op, current) and receipt.get("pid") == current.pid and receipt.get("commit") == commit and receipt.get("observed_at", 0) >= since:
+            if current and current.commit == commit and receipt.get("phase")=="ready" and receipt.get("pid") == current.pid and receipt.get("commit") == commit and receipt.get("observed_at", 0) >= since:
                 try:
                     self.run([str(self.binary), "doctor"], timeout=90)
                 except subprocess.CalledProcessError:
@@ -677,7 +686,8 @@ class Supervisor:
                 self.wait(Reason.RESTORED_HEALTH, "Restored runner needs verified health; no repeated restart", state, 60)
         elif isinstance(state, Finished):
             self.release_request(state.operation)
-            if self.info(self.binary).get("recovery_protocol") == 1:
+            info=self.info(self.binary)
+            if info.get("recovery_protocol") == 1 and info.get("coordinator_revision",0)>=COORDINATOR_REVISION:
                 source = self.run([str(self.binary), "recovery", "source"]).rstrip().encode() + b"\n"
                 compile(source.decode(), "confirmed supervisor", "exec")
                 path = self.root / "supervisor.py"
