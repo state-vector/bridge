@@ -191,6 +191,20 @@ describe("one line status and recovery contract", () => {
     expect(applyDeployObservation(state, observation, required, now)?.verdict).toBe("unsettled");
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_id: 123 } }, observation, required, now)?.verdict).toBe("green");
   });
+  it.each(["failure", null] as const)("older same-run success cannot override a newer rerun (%s)", conclusion => {
+    const tip = "7".repeat(40);
+    const observation = { tip_sha: tip, observed_at: 200, runs: [{ id: 500, run_attempt: 2,
+      name: "Deploy Dev", head_sha: tip, status: conclusion ? "completed" as const : "in_progress" as const,
+      conclusion, html_url: "https://github.com/o/r/actions/runs/500" }] };
+    const state = { verdict: "green", tip_sha: tip, red: [], unsettled: [], check_observed_at: 100,
+      deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 50, covered_by_sha: tip,
+        covered_by_run_id: 500, covered_by_run_attempt: 1 } };
+    const expected = conclusion ? "red" : "unsettled";
+    expect(applyDeployObservation(state, observation, required)?.verdict).toBe(expected);
+    expect(applyDeployObservation(state, observation, required, 300)?.verdict).toBe(expected);
+    expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: undefined } }, observation, required, 300)?.verdict).toBe(expected);
+    expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: 3 } }, observation, required, 300)?.verdict).toBe("green");
+  });
   it("the original empty-checks plus active Spot build is waiting, never deployment-missing", () => {
     const base_state = { verdict: "empty", red: [], unsettled: [], deploy_coverage: {
       phase: "settling", tip_sha: "20b508b3", tip_age_secs: 147, active_run_id: 41911085476, active_run_url: "https://github.com/run/41911085476",

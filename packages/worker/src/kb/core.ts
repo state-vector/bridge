@@ -4011,6 +4011,10 @@ export const DEPLOY_RECONCILE_GRACE_SECS = 300;
 
 export type DeployWorkflowRun = {
   id: number;
+  /** BR#8824: canonical same-run rerun identity (a GitHub rerun is a new
+   *  attempt of the same run id) — rides the observation into the covered
+   *  state's `covered_by_run_attempt`. */
+  run_attempt?: number | null;
   name: string;
   path?: string | null;
   head_sha: string;
@@ -4217,6 +4221,7 @@ export function reconcileDeployCoverage(input: {
         tip_age_secs: tipAgeSecs,
         covered_by_sha: tipSha,
         covered_by_run_id: tipGreen?.id ?? null,
+        covered_by_run_attempt: tipGreen?.run_attempt ?? null,
         covered_by_url: tipGreen?.html_url ?? null,
       },
       dispatch_workflow: null,
@@ -4458,7 +4463,9 @@ export function applyDeployObservation(
   if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
   const raw: Record<string, unknown> & { check_observed_at: number } = { ...(baseState ?? { verdict: "empty", red: [], unsettled: [] }),
     check_observed_at: checksObservedAt ?? Number(baseState?.check_observed_at ?? 0) };
-  const knownRun = Math.max(...observation.runs.filter((r) => r.head_sha === observation.tip_sha).map((r) => r.id));
+  const matchingRuns = observation.runs.filter(r => r.head_sha === observation.tip_sha);
+  const knownRun = Math.max(...matchingRuns.map(r => r.id));
+  const knownAttempt = Math.max(1, ...matchingRuns.filter(r => r.id === knownRun).map(r => r.run_attempt ?? 1));
   const newerCoverage = DeployCoverageStateSchema.safeParse(raw.deploy_coverage);
   if (raw.check_observed_at > observation.observed_at && newerCoverage.success && newerCoverage.data.tip_sha === observation.tip_sha) {
     const cov = newerCoverage.data;
@@ -4466,7 +4473,10 @@ export function applyDeployObservation(
     // A newer, matching terminal receipt supersedes an older observation.
     // This lets an ordinary gateway publish recovery after a watched rerun;
     // a borrowed older green run cannot clear the failure or pending state.
-    if (receipt != null && receipt >= knownRun) return normalizeBaseStateWithCoverage(raw);
+    const receiptAttempt = cov.phase === "covered" ? cov.covered_by_run_attempt ?? 1 : 1;
+    if (receipt != null && (receipt > knownRun || (receipt === knownRun && receiptAttempt >= knownAttempt))) {
+      return normalizeBaseStateWithCoverage(raw);
+    }
   }
   const verdict: MainCheckVerdict = {
     verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",

@@ -77,6 +77,7 @@ export const DeployCoverageStateSchema = z.discriminatedUnion("phase", [
     tip_age_secs: z.number().int().nonnegative(),
     covered_by_sha: z.string(),
     covered_by_run_id: z.number().int().positive().nullable().optional(),
+    covered_by_run_attempt: z.number().int().positive().nullable().optional(),
     covered_by_url: z.string().nullable().optional(),
   }),
   z.object({

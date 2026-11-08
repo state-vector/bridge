@@ -1494,6 +1494,29 @@ solid if waiting to be"):
    or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
    the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
    (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
+   The self-heal's retry budget is a closed purpose/evidence pair (BR#8824): the
+   executor names WHY it re-requests a check — `stale_destination_gate` (the red
+   was stamped against a destination that has since recovered) or
+   `ordinary_head_check` (the re-run judges this head, e.g. a bisect probe) — and
+   the hub alone validates the evidence. A stale-destination retry is licensed
+   only by the lane's current canonical GREEN deploy coverage (folded from the
+   stored base state and the durable deploy observations, so a caller's bare
+   green stamp can never override a newer durable failure) and only for the
+   task's exact current PR head (fail-closed: an unobserved head never
+   licenses a dispatch, and legs in other repos are never compared); the
+   budget is scoped to the successful
+   coverage receipt the hub derives (covered tip + decisive run id + its
+   attempt — never a
+   timestamp), so exactly one retry is granted per head/obligation/CHANGED
+   successful coverage (a same-run rerun — a new attempt of the same run id,
+   which GitHub reruns create — is a changed receipt that can recover the
+   gate), while an ordinary head check keeps its permanent
+   one-dispatch budget (old ledger rows and receipts are preserved, never
+   reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
+   fenced until its receipts reconcile — the fence is scope-wide and evaluated
+   before any purpose branch, so NO purpose (stale or ordinary) re-dispatches
+   past an unreconciled external effect, and a fresh green stamp never licenses
+   repeating one.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings
@@ -3702,3 +3725,5 @@ Train activity messages use fresh executor facts for the current candidate. Hist
 The train reads canonical task state using `get_artefact` with `view: "execution"`, including at the final merge check. Optional related-work and semantic search are excluded from this control path. Ordinary agent reads retain full discovery; both views share the same task, admission, and carry records.
 
 The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
+
+Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).

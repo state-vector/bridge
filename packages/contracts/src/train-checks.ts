@@ -14,11 +14,54 @@ export const CheckRetryTargetSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("actions_job"), id: z.number().int().positive() }),
   z.object({ kind: z.literal("workflow_run"), id: z.number().int().positive() }),
 ]);
-export const CheckRetryCommandSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("reserve"), task_id: z.string(), head_sha: z.string().regex(/^[0-9a-f]{40}$/),
-    name: z.string().min(1), source: CheckSourceSchema, target: CheckRetryTargetSchema }),
+/** BR#8824 closed retry purpose — WHY a dispatch re-requests a check. Never a
+ *  free string: the two legal reasons have different evidence and different
+ *  hold laws.
+ *  - `ordinary_head_check`: the re-run judges THIS head (a bisect probe, a
+ *    settle re-verification). The [task, head, obligation] budget is
+ *    permanent — one dispatch ever, no recovery can re-open it.
+ *  - `stale_destination_gate`: the re-run clears a deployment-gate verdict
+ *    stamped against a destination (main) that was red at verdict time. The
+ *    hub validates CURRENT canonical green deploy coverage and scopes the
+ *    budget to the successful coverage receipt — one retry per exact
+ *    head/obligation/changed successful coverage, never per tick.
+ *  Omitted (legacy callers) reads as `ordinary_head_check`: the old rows and
+ *  their receipts keep their permanent-hold meaning. */
+export const CheckRetryPurposeSchema = z.enum(["ordinary_head_check", "stale_destination_gate"]);
+export type CheckRetryPurpose = z.infer<typeof CheckRetryPurposeSchema>;
+
+const retryReservation = {
+  kind: z.literal("reserve"), task_id: z.string(), head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  name: z.string().min(1), source: CheckSourceSchema, target: CheckRetryTargetSchema,
+};
+export const CheckRetryCommandSchema = z.union([
+  z.object({ ...retryReservation, purpose: z.literal("ordinary_head_check").optional() }),
+  z.object({ ...retryReservation, purpose: z.literal("stale_destination_gate"), pr: z.number().int().positive() }),
   z.object({ kind: z.literal("result"), key: z.string().min(1), outcome: z.enum(["dispatched", "failed", "outcome_unknown"]), receipt: z.string() }),
 ]);
+
+/** BR#8824: the canonical identity of a successful deploy coverage — the
+ *  covered base tip plus the decisive covering run AND its attempt. NEVER a
+ *  timestamp (observed_at moves every read) and NEVER caller-asserted green
+ *  (the hub derives the coverage from its own folded lane state; the caller
+ *  only names the purpose). A new decisive run on the SAME sha is a changed
+ *  receipt, and so is a same-run rerun (a new attempt of the same run id —
+ *  GitHub reruns create one; it can recover the gate) — the attempt keeps
+ *  same-run reruns from silently reusing a consumed budget. */
+export function deployCoverageReceipt(coverage: { tip_sha: string; covered_by_run_id?: number | null; covered_by_run_attempt?: number | null }): string {
+  return JSON.stringify([coverage.tip_sha, coverage.covered_by_run_id ?? null, coverage.covered_by_run_attempt ?? null]);
+}
+
+/** BR#8824: the ledger keys for one (task, head, obligation) pair.
+ *  `scopeKey` is shared by the ordinary row and every scoped row (the fence
+ *  surface); `scopedKey` additionally pins the purpose and the successful
+ *  coverage receipt the hub validated for THIS attempt. */
+export function checkRetryScopeKey(taskId: string, headSha: string, obligation: string): string {
+  return JSON.stringify([taskId, headSha, obligation]);
+}
+export function checkRetryScopedKey(scopeKey: string, purpose: CheckRetryPurpose, coverageReceipt: string): string {
+  return JSON.stringify([...JSON.parse(scopeKey) as unknown[], purpose, coverageReceipt]);
+}
 export const CandidateRepairSchema = z.object({ kind: z.literal("head_checks"), head_sha: z.string().regex(/^[0-9a-f]{40}$/),
   checks: z.array(z.object({ name: z.string().min(1), url: z.string() })).min(1) });
 
