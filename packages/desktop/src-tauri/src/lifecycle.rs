@@ -184,6 +184,7 @@ impl Ownership {
 /// subprocess exit, local stop request or successful checkpoint does not.
 pub struct Released(Ownership);
 impl Released {
+    pub fn owner(&self) -> &Ownership { &self.0 }
     pub fn from_writer_receipt(owner: &Ownership, receipt: &WriterReceipt) -> Result<Self, String> {
         if let (Ownership::Attempt { ticket, host, generation, attempt_id },
             WriterReceipt::WriterReceiptFound { task_id, command_id, proof, .. }) = (owner, receipt) {

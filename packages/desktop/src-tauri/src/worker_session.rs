@@ -325,6 +325,7 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     runtime.control.grant_lease();
     let live = Arc::new(Mutex::new(String::new())); runtime.start_maintenance_every(&spec.cfg, &ticket.task_id, live.clone(), lease_interval);
     let published = live.clone(); let stop = runtime.control.clone(); let owner = spec.owner.clone(); let status_root = root.clone();
+    let output_path = workspace::Owner::open(&spec.cfg)?.output_path(ticket)?.unwrap_or_else(|| root.join("output.jsonl"));
     let mut previous = String::new();
     let status = move || {
         if let Ok(bytes) = fs::read(status_root.join("stop.json")) {
@@ -334,9 +335,12 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
         if !line.is_empty() && line != previous {
             let persisted = (|| -> std::io::Result<()> {
                 use std::io::Write;
-                let mut options = fs::OpenOptions::new(); options.create(true).append(true);
+                // Workspace output is expendable and bounded; exact terminal
+                // results/operation receipts remain in the durable journal.
+                let truncate = fs::metadata(&output_path).map(|m| m.len() >= 4 * 1024 * 1024).unwrap_or(false);
+                let mut options = fs::OpenOptions::new(); options.create(true).write(true).append(!truncate).truncate(truncate);
                 #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-                let mut file = options.open(status_root.join("output.jsonl"))?;
+                let mut file = options.open(&output_path)?;
                 writeln!(file, "{}", json!({"at":now_ms(),"line":line}))?; file.sync_data()
             })();
             if persisted.is_err() { stop.stop.store(true, Ordering::SeqCst); }

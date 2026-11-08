@@ -63,11 +63,12 @@ Rules, in force:
     (BR#3204/BR#3633 law — never another session's discard), restore main,
     work in your tree. Abandoned trees are the #1 disk leak on this repo
     (185 strays / 471 GB observed on 2026-11-02; three stray trees plus a
-    stale merged branch found the same day). The gateway's hygiene sweep
-    is the backstop, not the owner — it enumerates the registry plus the
-    runner's own clones (preserving uncommitted WIP onto
-    `wip/<task>-<date>` branches first, BR#3204/BR#3633 law), so a
-    registered tree is swept by status/age rules even if its session died.
+    stale merged branch found the same day). The native gateway's workspace
+    owner adopts registered interactive trees and owns dispatched allocations
+    from creation through reclamation. It requires stopped-writer authority,
+    verified source checkpoints and current-input/reader checks before removal;
+    review status and age alone are never deletion authority. Retained work has
+    an explicit reason and retry in `bridge workspaces status`.
  7. **Land direct to main.** Commit in your worktree, push straight to
     main — no PR round-trip, no merge-train wait (Ray directive
     2026-11-02: "EVERYTHING DIRECT TO MAIN"). The PR/verify ceremony is

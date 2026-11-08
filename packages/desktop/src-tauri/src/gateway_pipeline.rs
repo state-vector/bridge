@@ -61,13 +61,33 @@ pub(super) fn arm_launch(cfg: &DispatchConfig, task: &str, generation: u64, atte
     // returns. The writer/result record replaces this only after physical proof.
     let intent = Launch { record, worktree };
     journal::write_file(&launch_root.join(intent.record.name()), &serde_json::to_vec(&intent).map_err(|e| e.to_string())?)?;
-    Ok(crate::transport::RunControl::with_cancel(cancel).observe_launch(move |process| {
+    let environment = workspace::Owner::open(cfg)?.environment_for(&intent.record.owner.ticket())?;
+    Ok(crate::transport::RunControl::with_cancel(cancel).with_environment(environment).observe_launch(move |process| {
         let mut launched = intent.clone(); launched.record.process = Some(process);
         journal::write_file(&launch_root.join(launched.record.name()), &serde_json::to_vec(&launched).map_err(|e| e.to_string())?)
     }))
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Launch { record: Record, worktree: Option<PathBuf> }
+pub(super) fn workspace_launch_exists(cfg: &DispatchConfig, ticket: &Ticket) -> Result<bool, String> {
+    let root = root(cfg)?.join("launches");
+    let entries = match std::fs::read_dir(root) { Ok(entries) => entries, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false), Err(e) => return Err(e.to_string()) };
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        let launch: Launch = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        if launch.record.ticket() == ticket { return Ok(true); }
+    }
+    Ok(false)
+}
+pub(super) fn workspace_release_receipt(cfg: &DispatchConfig, owner: &Ownership) -> Result<Option<Released>, String> {
+    let record = Record { owner: owner.clone(), host: cfg.label.clone().ok_or("gateway host missing")?, url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(),
+        disposition: Disposition::Pending, process: None, work: Work::UnknownWriter { reason: "Read-only original workspace-finalization receipt lookup".into() } };
+    record.validate()?;
+    let ticket = owner.ticket();
+    let reply = execution_request(cfg, &ticket.task_id, &ticket.session, &record.command_id("workspace-lookup"), json!({"kind":"receipt","target_command_id":record.command_id("finalize")}))?;
+    if reply["kind"] == "receipt_found" { Ok(Some(Released::from_hub(owner, &reply["result"])?)) } else { Ok(None) }
+}
 pub(super) fn launch_record(cfg: &DispatchConfig, owner: &Record) -> Option<Record> {
     std::fs::read(root(cfg).ok()?.join("launches").join(owner.name())).ok().and_then(|b| serde_json::from_slice::<Launch>(&b).ok()).map(|l| l.record)
 }
@@ -217,6 +237,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                             Released::from_hub(&record.owner, &reply)?
                         },
                     };
+                    workspace::Owner::open(&cfg)?.release(&released)?;
                     report.released(released);
                     remove_reservation(&cfg, record.ticket())?;
                     journal::remove(&root, &record)?;
@@ -251,11 +272,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                         },
                         Step::Acknowledged { reply } => {
                             report.released(Released::from_hub(&record.owner, &reply)?);
-                            if matches!(reply["task_status"].as_str(), Some("done" | "superseded")) {
-                                if let Some(path) = worktree.as_ref() {
-                                    if let Some(retained) = cleanup_worktree_at(path, &ticket.task_id, true) { dlog(&ticket.task_id, &retained); }
-                                }
-                            }
+                            workspace::Owner::open(&cfg)?.release(&Released::from_hub(&record.owner, &reply)?)?;
                             remove_reservation(&cfg, record.ticket())?;
                             remove_launch(&cfg, &record)?;
                             worker_session::retire(&cfg, &record)?;
@@ -595,9 +612,14 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
 
 pub(super) struct Controller { registry: Registry, admission: Admission, shared: Config, recovery: Recovery, last_snapshot: Instant,
     capacity_probe: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_capacity_probe: Instant,
-    hygiene: Option<lifecycle::Job<()>>, next_hygiene: Instant,
+    workspace_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_workspace: Instant,
+    disk_admission: workspace::Admission, disk_observed: Instant,
     reported_attention:std::collections::HashSet<(String,String)> }
 impl Controller {
+    #[cfg(test)]
+    pub(crate) fn force_workspace_pass(&mut self) { self.next_workspace = Instant::now(); }
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> usize { self.registry.counts().held }
     pub fn new(cfg: &DispatchConfig, readiness: &GatewayReadiness, snap: &SharedSnapshot) -> Self {
         let shared = readiness.data.clone(); let preparing = shared.clone(); let finalizing = shared.clone(); let snap = snap.clone();
         let registry = Pipeline::new(cfg.max_sessions.max(1), cfg.max_sessions.clamp(1, 4), cfg.max_sessions.clamp(1, 4),
@@ -611,13 +633,13 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), hygiene: None, next_hygiene: Instant::now() + Duration::from_secs(300), reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), reported_attention:Default::default() }
     }
-    pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
+    pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
     pub fn controller_ready(&self) -> bool {
         let cfg=config(&self.shared);
-        self.capacity_probe.is_none() && self.hygiene.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
+        self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
             && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| !worker.stop.load(Ordering::SeqCst) && worker.reattachable.load(Ordering::SeqCst)),
                 |owner,value,stop| durable_handoff(&cfg,owner,value,stop))
     }
@@ -648,7 +670,7 @@ impl Controller {
         self.recovery = match recovery {
             Recovery::Initial => { let shared = self.shared.clone(); let skip = self.registry.tickets();
                 Recovery::Loading { job: lifecycle::Job::start(move || recover(&shared, skip)), initial: true } },
-            Recovery::Ready { next } if next <= Instant::now() && self.hygiene.is_none() => { let shared = self.shared.clone(); let skip = self.registry.tickets();
+            Recovery::Ready { next } if next <= Instant::now() => { let shared = self.shared.clone(); let skip = self.registry.tickets();
                 Recovery::Loading { job: lifecycle::Job::start(move || recover(&shared, skip)), initial: false } },
             Recovery::Retry { next, initial } if next <= Instant::now() => { let shared = self.shared.clone(); let skip = self.registry.tickets();
                 Recovery::Loading { job: lifecycle::Job::start(move || recover(&shared, skip)), initial } },
@@ -673,15 +695,31 @@ impl Controller {
         };
         let recovered = matches!(self.recovery, Recovery::Ready { .. } | Recovery::Loading { initial: false, .. } | Recovery::Retry { initial: false, .. });
         let locally_ready = self.shared.lock().map(|d| matches!(&d.state, GatewayReadinessState::Ready(p) if p.observed.elapsed() < Duration::from_secs(60))).unwrap_or(false);
-        if let Some(job) = &mut self.hygiene {
-            if job.poll().is_some() { self.hygiene = None; self.next_hygiene = Instant::now() + Duration::from_secs(300); }
+        if let Some(job) = &mut self.workspace_job {
+            if let Some(result) = job.poll() {
+                match result {
+                    Ok(Ok(status)) => {
+                        self.disk_admission = status.admission.clone();
+                        self.disk_observed = Instant::now();
+                        dlog("workspace", &serde_json::to_string(&status).unwrap_or_default());
+                        if let Ok(mut snapshot) = snap.lock() { snapshot.workspaces = Some(status); }
+                    },
+                    Ok(Err(error)) | Err(error) => {
+                        self.disk_admission = workspace::Admission::Held { reason: error.clone() };
+                        dlog("workspace", &format!("reconciliation incomplete; retained for retry: {error}"));
+                    },
+                }
+                self.workspace_job = None; self.next_workspace = Instant::now() + workspace::INTERVAL;
+            }
         }
-        // Hygiene owns an idle local workspace barrier. Never sweep a tree
-        // concurrently with preparation, capture, running or delivery.
-        if !stop && !update && self.next_hygiene <= Instant::now() && self.idle() {
+        // Disk ownership is per workspace, not a global idle barrier. Held
+        // jobs/update drain cannot starve reclamation of unrelated allocations.
+        if self.next_workspace <= Instant::now() && self.workspace_job.is_none() {
             let cfg = cfg.clone();
-            self.hygiene = Some(lifecycle::Job::start(move || { let mut messages = Vec::new(); sweep_stale_worktrees(&cfg, &mut 0, &[], &mut messages); for message in messages { dlog("hygiene", &message); } }));
+            let protected = self.registry.tickets();
+            self.workspace_job = Some(lifecycle::Job::start(move || workspace::Owner::open(&cfg)?.reconcile(&protected)));
         }
+        let disk_ready = matches!(self.disk_admission, workspace::Admission::Ready) && self.disk_observed.elapsed()<Duration::from_secs(120);
         if let Some(job) = &mut self.capacity_probe {
             if let Some(result) = job.poll() {
                 if let Err(error) | Ok(Err(error)) = result { dlog("gateway", &format!("priority-capacity request deferred: {error}")); }
@@ -696,7 +734,7 @@ impl Controller {
         }
         let admission = std::mem::replace(&mut self.admission, Admission::Held { reason: "admission transition".into() });
         self.admission = match admission {
-            Admission::Idle { until } if recovered && locally_ready && self.hygiene.is_none() && !stop && !update && self.registry.can_admit() && until <= Instant::now() => {
+            Admission::Idle { until } if recovered && locally_ready && disk_ready && !stop && !update && self.registry.can_admit() && until <= Instant::now() => {
                 let id = format!("pipeline-reserve-{}-{}", std::process::id(), now_ms());
                 Admission::Request { id }
             },
@@ -902,7 +940,8 @@ pub(crate) mod tests {
     }
     impl Drop for Hub { fn drop(&mut self) { self.stop.store(true, Ordering::SeqCst); let _ = TcpStream::connect(self.url.trim_start_matches("http://")); if let Some(t) = self.thread.take() { let result = t.join(); if !std::thread::panicking() { result.unwrap(); } } } }
     pub(crate) fn fixture(hub: &Hub) -> (DispatchConfig, GatewayReadiness, SharedSnapshot) {
-        let cfg: DispatchConfig = serde_json::from_value(json!({"url":hub.url,"token":"fixture-only","label":format!("pipeline-fixture-{}-{}",std::process::id(),hub.url.rsplit(':').next().unwrap()),"max_sessions":20})).unwrap();
+        let mut cfg: DispatchConfig = serde_json::from_value(json!({"url":hub.url,"token":"fixture-only","label":format!("pipeline-fixture-{}-{}",std::process::id(),hub.url.rsplit(':').next().unwrap()),"max_sessions":20})).unwrap();
+        cfg.workdir = root(&cfg).unwrap().join("disk").to_string_lossy().into_owned();
         let label = format!("{}/worker", cfg.label.as_ref().unwrap());
         let ready = GatewayReadiness::with_probe(&cfg, Duration::from_secs(3600), move |_| Ok(WorkerCredential { label: label.clone(), secret: "fixture-only".into() }));
         (cfg, ready, Arc::new(Mutex::new(DispatchSnapshot::default())))
