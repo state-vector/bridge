@@ -26,6 +26,15 @@ fn released(owner: &Ownership) -> lifecycle::Released {
     lifecycle::Released::from_hub(owner,&reply).unwrap()
 }
 fn ready(owner: &Owner) { owner.measure().unwrap(); }
+fn assert_source_not_removed(owner:&Owner,id:&str,root:&Path) {
+    assert!(root.exists());assert!(!matches!(owner.read(id).unwrap().phase,Phase::Removed { .. }));
+    if let Ok(entries)=fs::read_dir(owner.ledger.join("removals")) {
+        for entry in entries {
+            let receipt:Removal=serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            assert_ne!(receipt.resource_id,id,"retained source was counted as reclaimed");
+        }
+    }
+}
 fn configure(path: &Path, root: &Path) {
     for (key,value) in [("user.name","Workspace test".into()),("user.email","workspace@example.test".into()),("gpg.format","ssh".into()),("user.signingkey",root.join("signing").to_string_lossy().into_owned()),("gpg.ssh.program","/usr/bin/ssh-keygen".into())] {
         git(path,&["config","--local",key,&value]).unwrap();
@@ -90,7 +99,7 @@ fn publication_failure_and_newer_inputs_never_count_as_reclaimed() {
     let t=ticket("publish-failure");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
     a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
     git(&work,&["remote","set-url","origin",sandbox.0.join("unavailable.git").to_str().unwrap()]).unwrap();
-    let status=owner.reconcile(&[]).unwrap();assert_eq!(status.reclaimed_bytes,0);assert!(root.exists());
+    let status=owner.reconcile(&[]).unwrap();assert_source_not_removed(&owner,&id,&root);
     let mut record=owner.read(&id).unwrap();assert!(record.error.is_some());
     git(&work,&["remote","set-url","origin",source.to_str().unwrap()]).unwrap();
     // The immutable failed publication's repository remains unavailable. A
@@ -99,7 +108,7 @@ fn publication_failure_and_newer_inputs_never_count_as_reclaimed() {
     let checkpoint=crate::checkpoint::publish(&work,"newer",1,"test",vec![]).unwrap();
     fs::write(work.join("tracked"),"newer than checkpoint").unwrap();
     record.phase=Phase::Reclaimable {snapshots:vec![Snapshot {path:work.clone(),checkpoint}]};record.retry_at=0;owner.save(&record).unwrap();
-    assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("newer"));
+    assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,status.reclaimed_bytes);assert_source_not_removed(&owner,&id,&root);assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("newer"));
 }
 
 #[test]
@@ -119,7 +128,7 @@ fn scratch_inputs_outside_nested_repositories_are_retained_and_budget_blocks_gro
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let t=ticket("scratch");let a=owner.allocate(&t,None).unwrap();fs::write(a.work.join("unpublished-plan"),"keep").unwrap();
     let id=a.id.clone();let root=a.root.clone();drop(a);owner.release(&released(&Ownership::Reservation {ticket:t})).unwrap();
-    let status=owner.reconcile(&[]).unwrap();assert_eq!(status.reclaimed_bytes,0);assert!(root.exists());assert!(owner.read(&id).unwrap().error.unwrap().contains("non-Git"));
+    owner.reconcile(&[]).unwrap();assert_source_not_removed(&owner,&id,&root);assert_eq!(fs::read_to_string(root.join("work/unpublished-plan")).unwrap(),"keep");assert!(owner.read(&id).unwrap().error.unwrap().contains("non-Git"));
     let held=owner.measure_with_limits(1,0).unwrap();assert!(matches!(held.admission,Admission::Held {..}));
     assert!(owner.allocate(&ticket("new-allocation"),None).is_err());
 }
