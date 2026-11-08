@@ -5204,9 +5204,11 @@ export class KnowledgeHub {
           const reservation = this.one(`SELECT expires_at FROM dispatch_reservations WHERE task_id=? AND token_id=? AND session=?`, id, tokenId, session);
           if (!reservation) throw new Error("gate: reservation no longer held after claim");
           const assigned = this.one(`SELECT id,title,body_md,project,meta,roles,tags FROM artefacts WHERE id=?`, id)!;
+          const meta = JSON.parse(String(assigned.meta ?? "{}"));
+          meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
-              meta: JSON.parse(String(assigned.meta ?? "{}")), roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
+              meta, roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
           recoveryCapacity.consume(tokenId, id);
           break;
         } catch (error) {
