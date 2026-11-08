@@ -59,6 +59,8 @@ use crate::logging::{emit, iso, now_ms, prefer_stdout};
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const SCAN_BUDGET: Duration = Duration::from_secs(30);
+const CARD_READ_BUDGET: Duration = Duration::from_secs(10);
+const CARD_FIRST_ATTEMPT: Duration = Duration::from_secs(4);
 const SCAN_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -445,16 +447,36 @@ impl Ctx {
             // canonical state, never optional related-work/embedding discovery.
             if name == "get_artefact" { map.insert("view".into(), json!("execution")); }
         }
-        let resp = self
-            .http
+        let card_read = name == "get_artefact";
+        let timeout = self.operation_budget(if card_read { CARD_READ_BUDGET } else { RPC_TIMEOUT })?;
+        let deadline = Instant::now() + timeout;
+        let request = self.http
             .post(format!("{}/mcp", self.hub))
-            .timeout(self.operation_budget(if name == "get_artefact" { Duration::from_secs(10) } else { RPC_TIMEOUT })?)
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token))
-            .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
-            .send()
-            .map_err(|e| format!("hub unreachable ({name}): {e}"))?;
-        let out: Value = resp.json().map_err(|e| format!("hub rpc non-JSON ({name}): {e}"))?;
+            .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }));
+        let result = if card_read && timeout > CARD_FIRST_ATTEMPT {
+            // The canonical card read has no effects. Retry one transport
+            // failure within the original deadline, using the same request.
+            let first = request.try_clone().expect("JSON request body is replayable")
+                .timeout(CARD_FIRST_ATTEMPT).send().and_then(|response| response.json());
+            match first {
+                Err(error) if error.is_timeout() || error.is_connect() => {
+                    match deadline.checked_duration_since(Instant::now()).filter(|time| !time.is_zero()) {
+                        Some(remaining) => request.timeout(remaining).send().and_then(|response| response.json()),
+                        None => Err(error),
+                    }
+                }
+                result => result,
+            }
+        } else {
+            request.timeout(timeout).send().and_then(|response| response.json())
+        };
+        let out: Value = result.map_err(|error| {
+            if error.is_timeout() { format!("hub request timed out ({name}): {error}") }
+            else if error.is_decode() { format!("hub rpc non-JSON ({name}): {error}") }
+            else { format!("hub unreachable ({name}): {error}") }
+        })?;
         if let Some(err) = out.get("error") {
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or(&err.to_string()).to_string();
             return Err(format!("hub rpc error ({name}): {msg}"));
@@ -2907,7 +2929,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
     for &qi in &scan_order {
         if visited.len() >= SCAN_MAX_ENTRIES || candidates.len() >= ready_limit
-            || ctx.operation_budget(SCAN_BUDGET).is_err() { break; }
+            || !ctx.operation_budget(SCAN_BUDGET).is_ok_and(|remaining| remaining >= CARD_FIRST_ATTEMPT) {
+            break;
+        }
         let head = &queue[qi];
         visited.push(qi);
         // BR#4934 cap: at burst_max merges per pass the drain settles even
@@ -6349,6 +6373,22 @@ mod tests {
         let recorded = calls.lock().unwrap();
         assert_eq!(call_args(&recorded[0])["view"], "execution");
         assert!(call_args(&recorded[1]).get("view").is_none());
+    }
+
+    #[test]
+    fn canonical_card_read_retries_one_transport_timeout() {
+        let card = card_without_lane_legs();
+        let expected = card.clone();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (hub, calls) = mock_hub_with(move |_| {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                std::thread::sleep(CARD_FIRST_ATTEMPT + Duration::from_millis(100));
+            }
+            ok(card.clone())
+        });
+        let mut ctx = test_ctx(&hub);
+        assert_eq!(ctx.mcp("get_artefact", json!({ "id": "BR#1" })).unwrap(), expected);
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]
