@@ -3696,3 +3696,5 @@ Bypass requests are bound to the current failing revision and its cause-specific
 Recovery banners and readiness use only the current stopped or observed main revision. Historical recovery episodes remain visible as evidence, but their activity cannot replace the current repair, and a later revision’s failed deployment does not erase their verification receipts.
 
 Human requests show the action owner (You or Bridge), the complete instructions, and target links before the answer buttons. A human-owned action must be performed using the human's own account; sending an answer neither performs it nor grants Bridge that account's permissions. Owner-only recovery merges include the PR link and an exact-head GitHub CLI command. Bridge observes the merge and deployment automatically; DONE reports an already completed merge.
+
+Train activity messages use fresh executor facts for the current candidate. Historical bounce metadata cannot override a later ready result or turn a failed hub request into a claim that a new review is needed. Expired or missing observations return to checking; this presentation never grants merge authority.

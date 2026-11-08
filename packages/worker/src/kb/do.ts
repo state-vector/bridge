@@ -9,7 +9,7 @@
  * Transport: the worker forwards JSON op requests via fetch("https://kb/<op>").
  * Ops: create | get | list | search | update | transition | link | stats
  */
-import { WorkerStatusSchema } from "@bridge/contracts";
+import { WorkerStatusSchema, trainCandidateActivity } from "@bridge/contracts";
 import { SchemaInitialization } from "./schema-init.ts";
 import type { DeliveryAdmission, DeliveryDisposition, AcceptedPrLeg } from "@bridge/contracts";
 import {
@@ -11065,29 +11065,7 @@ export class KnowledgeHub {
     const stalledBlock: any = bsQf?.stalled && now - Number(bsQf.at ?? 0) < 15 * 60_000
       ? bsQf.stalled
       : null;
-    // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
-    // the lane's activity line speaks human. The hub knows the head card's
-    // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
-    // PR branch changed after the last review, so that review no longer
-    // covers it); anything else is the pre-merge check running. No "gate",
-    // no "verdict", no "attempting" — plain sentences.
-    const headHold = head
-      ? (() => {
-          const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
-          const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-          const cls = qfCls(head);
-          if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
-            return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
-          }
-          if (cls === "blocked" || cls === "conflict") {
-            return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
-          }
-          if (cls === "waiting" && String(bsQf?.base_state?.verdict ?? "") === "green") {
-            return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
-          }
-          return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
-        })()
-      : null;
+    const headHold = trainCandidateActivity(head, meta.lane?.queue_facts, now);
     let reason: string;
     if (retired) reason = `merge-train: retired — the lane card is done/superseded (BR#4977); the train no longer ticks it`;
     else if (stop) {
@@ -15673,23 +15651,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const activeQueue = queue.filter((q) => !meta.currently?.task_id || q.id !== String(meta.currently.task_id));
       const readyQueueItem = activeQueue.find((q) => qfCls(q.id) === "ready");
       const head = String((readyQueueItem ?? activeQueue[0] ?? queue[0])?.id ?? "") || null;
-      const headHold = head
-        ? (() => {
-            const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
-            const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-            const cls = qfCls(head);
-            if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
-              return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
-            }
-            if (cls === "blocked" || cls === "conflict") {
-              return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
-            }
-            if (cls === "waiting" && String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green") {
-              return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
-            }
-            return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
-          })()
-        : null;
+      const headHold = trainCandidateActivity(head, meta.lane?.queue_facts, now0);
       // cards bounced off this lane and not yet re-accepted — gate/conflict
       // bounces (`bounced`) and BR#4962 coverage parks (`awaiting`) alike —
       // they sit OUTSIDE the derived queue (in_progress/blocked, awaiting a

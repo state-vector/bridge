@@ -278,3 +278,30 @@ export function isAwaitingMerge(meta: unknown): boolean {
   const p = mergePhaseOf(meta);
   return p === AWAITING_MERGE_PHASES[0] || p === AWAITING_MERGE_PHASES[1];
 }
+
+/** Current executor evidence owns the activity message. Historical card bounce
+ * metadata cannot diagnose the current PR head or override a later ready scan. */
+export type TrainCandidateActivity =
+  | { class: "awaiting-review"; note: string }
+  | { class: "held-checks"; note: string }
+  | { class: "waiting-checks"; note: string }
+  | { class: "merge-checks"; note: string };
+
+const ActivityFactsSchema = z.object({
+  at: z.number(),
+  entries: z.array(z.object({ id: z.string(), cls: TrainEntryClassSchema, error: z.string().optional() })),
+});
+
+export function trainCandidateActivity(head: string | null, facts: unknown, now: number): TrainCandidateActivity | null {
+  if (!head) return null;
+  const parsed = ActivityFactsSchema.safeParse(facts);
+  const current = parsed.success && now >= parsed.data.at && now - parsed.data.at < 15 * 60_000
+    ? parsed.data.entries.find(entry => entry.id === head) : undefined;
+  if (current?.error) return { class: "waiting-checks", note: `could not check ${head} — ${current.error}. Bridge will retry the check` };
+  switch (current?.cls) {
+    case "needs-review": return { class: "awaiting-review", note: `waiting on ${head} — the current PR head needs a fresh review before it can merge` };
+    case "blocked": case "conflict": return { class: "held-checks", note: `held on ${head} — PR has failing head checks or conflicts` };
+    case "waiting": return { class: "waiting-checks", note: `waiting on ${head} — PR checks or mergeability still running` };
+    case "ready": case undefined: return { class: "merge-checks", note: `working on ${head} — checking review, signatures and CI before merging` };
+  }
+}

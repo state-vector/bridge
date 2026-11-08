@@ -2906,6 +2906,32 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-now" });
   });
 
+  it("BR#8817: fresh ready/error observations override historical bounce metadata in stored and served activity", async () => {
+    const repo = "state-vector/current-candidate-activity", actor = "gw-activity";
+    await acquire(repo, actor, { merge_capable: true, required_workflows: ["Test"] });
+    const card = await queueViaAccept({ repo, pr: 88170, head: "a".repeat(40), title: "IMPL: activity projection" });
+    const before = (await kbJson("/get", { id: card })).body;
+    await kbJson("/update", { id: card, meta: { ...before.meta, merge_train: { ...before.meta.merge_train, state: "bounced", defect: "historical uncovered head" } } });
+    for (const [entry, expected, text] of [
+      [{ id: card, cls: "ready" }, "merge-checks", "checking review, signatures and CI"],
+      [{ id: card, cls: "waiting", error: "hub request timed out" }, "waiting-checks", "could not check"],
+      [{ id: card, cls: "needs-review" }, "awaiting-review", "current PR head needs a fresh review"],
+    ] as const) {
+      const update = await kbJson("/train.queue_facts", { repo, actor, entries: [entry], base_state: { verdict: "green", red: [], unsettled: [] } });
+      expect(update.status).toBe(200);
+      const lane = (await kbJson("/train.status", { repo })).body.lanes[0];
+      expect(lane.attempt).toMatchObject({ card, hold: expected });
+      expect(lane.attempt.note).toContain(text);
+      expect(lane.reason).toContain(text);
+      const stored = (await kbJson("/get", { id: lane.card })).body;
+      expect(stored.meta.blocked.reason).toContain(text);
+    }
+    const after = (await kbJson("/get", { id: card })).body;
+    expect(after.meta.prs).toEqual(before.meta.prs);
+    expect(after.meta.merge_train.state).toBe("bounced"); // projection never rewrites authority/history
+    await kbJson("/train.lease", { repo, action: "release", actor });
+  });
+
   it("a bounced head reads as awaiting-review in plain words, and the queue counts how many wait on reviews (the 0/h story)", async () => {
     const repo = "state-vector/lane-plain";
     await acquire(repo, "gw-plain", { merge_capable: true, required_workflows: ["Test"] });
