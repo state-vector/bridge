@@ -15,7 +15,9 @@
 #     in-flight check-run: BR#5487).
 #   - List the check runs on that commit
 #     (`gh api repos/<repo>/commits/<sha>/check-runs` — the reference
-#     implementation named in BR#3009).
+#     implementation named in BR#3009). The destination gate's own check runs
+#     and skipped workflow alias are excluded. GitHub attaches preflight checks
+#     to the commit SHA even when main shares that SHA with a temporary ref.
 #   - Per check NAME, the newest non-cancelled run is the judge (a cancelled
 #     run says nothing — the same rule the deploy-health gate uses, PR #2275):
 #       conclusion null                -> UNSETTLED (checks still running)
@@ -23,7 +25,7 @@
 #       success/skipped/neutral        -> green
 #   - Any UNSETTLED name fails the gate: an in-flight main does not vouch for
 #     main. Green is a claim you can only make once the checks are settled.
-#   - Zero check runs on main's HEAD also fails (the vacuity guard — a gate
+#   - Zero substantive check runs on main's HEAD also fails (the vacuity guard — a gate
 #     that cannot see main's checks must not report main healthy).
 #
 # Remediation carve-out (BR#3009's remediation-merge path): if EVERY red
@@ -62,18 +64,13 @@ runs_json="$(gh api "repos/${REPO}/commits/${sha}/check-runs?per_page=100")" || 
 # judge-run-url, one line per name. An empty judge column with a `pending`
 # marker means the newest non-cancelled run has not finished (unsettled).
 classifications="$(printf '%s' "${runs_json}" | jq -r '
-  [.check_runs[]]
-  | if length == 0 then empty
-    else
-      group_by(.name)[]
-      | map(select(.conclusion != "cancelled"))
-      | sort_by(-.id)
-      | .[0]
-      | [.name, (.conclusion // "pending"), (.html_url // "")]
-      | @tsv
-    end')"
+  [.check_runs[] | select(.name != "main-green gate" and .name != "Preflight destination check" and .conclusion != "cancelled")]
+  | group_by(.name)[]
+  | max_by(.id)
+  | [.name, (.conclusion // "pending"), (.html_url // "")]
+  | @tsv')"
 if [ -z "${classifications}" ]; then
-  echo "FAIL: no check runs at all on ${REPO}@${sha} — a gate that cannot see"
+  echo "FAIL: no substantive check runs on ${REPO}@${sha} — a gate that cannot see"
   echo "      main's checks must not report main healthy (BR#3009 vacuity guard)."
   exit 1
 fi
@@ -111,7 +108,7 @@ echo "main-green gate: destination main @ ${sha:0:9} on ${REPO}"
 echo "  settled-green checks: ${green_count}"
 
 if [ "${#red_names[@]}" -eq 0 ] && [ "${#unsettled[@]}" -eq 0 ]; then
-  echo "GREEN — every check on main's HEAD is settled green; the destination is mergeable (BR#3009)."
+  echo "GREEN — every substantive check on main's HEAD is settled green; the destination is mergeable (BR#3009)."
   exit 0
 fi
 

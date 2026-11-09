@@ -1,8 +1,8 @@
 import { Miniflare } from "miniflare";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { reviewOutcome } from "./completion-fixture";
-import type { ReviewResult } from "@bridge/contracts";
+import { initialExecution, type ReviewResult } from "@bridge/contracts";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
@@ -24,9 +24,21 @@ const receipt = `https://github.com/${repo}/commit/${commit}`;
 const outcome = { outcome: "Diagnostic identified the cause; runtime recovery remains unproven.", receipts: [receipt] };
 beforeAll(async () => {
   const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
-  mf = new Miniflare({ workers: [{ name: "main", scriptPath: bundle,
-    modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")), modules: true, compatibilityDate: "2025-09-06",
-    durableObjects: { KB: { className: "KnowledgeHub", useSQLite: true } } }] });
+  const root = bundle.slice(0, bundle.lastIndexOf("/"));
+  const rig = `import { KnowledgeHub } from "./index.js";
+    export class CompletionRig extends KnowledgeHub {
+      async fetch(request) {
+        if (new URL(request.url).pathname !== "/fixture/execution") return super.fetch(request);
+        const {id, execution} = await request.json();
+        this.state.storage.sql.exec("INSERT INTO execution_state(task_id,state,worker_token_id) VALUES(?,?,'')", id, JSON.stringify(execution));
+        return Response.json({ok:true});
+      }
+    }
+    export default {fetch(){return new Response("fixture");}};`;
+  mf = new Miniflare({ modulesRoot: root, modules: [
+    { type: "ESModule", path: root + "/completion-rig.js", contents: rig },
+    { type: "ESModule", path: bundle, contents: readFileSync(bundle, "utf8") },
+  ], compatibilityDate: "2025-09-06", durableObjects: { KB: { className: "CompletionRig", useSQLite: true } } });
 });
 beforeEach(async () => {
   const ns = await mf.getDurableObjectNamespace("KB");
@@ -183,6 +195,38 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect((await get(review)).status).toBe("in_progress");
   });
 
+  it("accepts an explicitly echoed revision through a cached connector's top-level field", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const revision = (await get(review)).meta.review_subject!.revision;
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: revision, review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await get(review)).meta.review_result).toMatchObject({ subject_revision: revision });
+    expect((await get(id)).status).toBe("done");
+  });
+
+  it("rejects conflicting transport revisions without recording acceptance", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: "different-submission", review_result: result });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("conflicting review subject_revision");
+    expect((await get(review)).status).toBe("in_progress");
+    expect((await get(id)).status).toBe("in_review");
+  });
+
+  it("fences a top-level revision against a changed submission", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const revision = (await get(review)).meta.review_subject!.revision;
+    expect((await call("update", { id, body_md: "Changed outcome definition" })).status).toBe(200);
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: revision, review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("subject_revision");
+    expect((await get(id)).status).toBe("in_review");
+  });
+
   it.each(["definition edit", "repository input edit", "repository input deletion", "identical resubmission"])("fences late acceptance after %s", async change => {
     const { id, review } = await submission(["analysis"], { repo: "https://github.com/state-vector/original-input" });
     const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });
@@ -307,6 +351,29 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect((await call("transition", { id: fresh, to: "done", actor: "fresh-reviewer", session: "new-submission-review",
       review_result: await resultFor(fresh, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(200);
     expect((await get(id)).status).toBe("done");
+  });
+
+  it.each(["unowned", "claimed", "unknown operation"])("handles an older review that has state %s", async (oldReviewState) => {
+    const { id, review } = await submission(["analysis"]);
+    expect((await call("transition", { id, to: "in_progress", actor: "impl", session: "impl-session", note: "Repair after changed evidence" })).status).toBe(200);
+    const fresh = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", execution_result: outcome });
+    expect(fresh.status).toBe(200);
+    if (oldReviewState !== "claimed") {
+      const released = await call("transition", { id: review, to: "todo", actor: "reviewer", session: "fresh-review", note: "Preserve old review evidence and release the claim" });
+      expect(released.status, JSON.stringify(released.body)).toBe(200);
+    }
+    if (oldReviewState === "unknown operation") {
+      const execution = initialExecution();
+      execution.operations.push({ id: "receipt-check", action: "Check remote receipt", input_revision: "old",
+        deadline: 100, state: "outcome_unknown", receipts: [] });
+      expect((await call("fixture/execution", { id: review, execution })).status).toBe(200);
+    }
+    const current = fresh.body.verify_task;
+    expect((await call("transition", { id: current, to: "in_progress", actor: "new-reviewer", session: "new-review" })).status).toBe(200);
+    expect((await call("transition", { id: current, to: "done", actor: "new-reviewer", session: "new-review",
+      review_result: await resultFor(current, { kind: "accepted_execution", task_id: id, receipts: [receipt] }) })).status).toBe(200);
+    expect((await get(id)).status).toBe(oldReviewState === "unowned" ? "done" : "in_review");
+    if (oldReviewState === "unknown operation") expect((await get(review)).status).toBe("todo");
   });
 
   it("can reuse an unclaimed review because no prior subject has been captured", async () => {

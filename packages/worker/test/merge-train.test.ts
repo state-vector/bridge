@@ -595,6 +595,12 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     ...over,
   });
 
+  it("requires signature evidence covering the live head and waits for pending substantive checks beside a circular failure", () => {
+    expect(decideTrainGate(clean({ commits: [] })).kind).toBe("skip");
+    expect(decideTrainGate(clean({ commits: [{ sha: "9".repeat(40), verified: true }] })).kind).toBe("skip");
+    expect(classifyCandidateGatePhase(clean({ headChecks: [{ ...green(1, "Deploy health (merge gate)"), conclusion: "failure" }, { ...green(2, "Test"), status: "in_progress", conclusion: null }] }))).toMatchObject({ phase: "mechanically_sound", headState: { kind: "pending" } });
+  });
+
   it("a superseded card closes its PR without review (the work is gone)", () => {
     const d = decideTrainGate(clean({ cardStatus: "superseded" }));
     expect(d.kind).toBe("close_superseded");

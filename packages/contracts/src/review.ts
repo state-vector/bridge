@@ -20,6 +20,22 @@ export const ReviewResultSchema = z.discriminatedUnion("kind", [
     task_id: z.string().regex(/^BR#\d+$/) }),
 ]);
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
+/** Cached connectors may carry the explicit revision at the top level.
+ * Normalize transport only; the hub still fences this against the captured
+ * review subject and the current submission. Never infer a revision. */
+export function parseReviewResult(value: unknown, subjectRevision?: unknown): ReviewResult {
+  const result = ReviewResultSchema.parse(value);
+  if (subjectRevision === undefined) return result;
+  const revision = z.string().min(1).parse(subjectRevision);
+  if (result.kind === "findings" || result.kind === "stronger_implementation_required") {
+    throw new Error("subject_revision requires an acceptance result");
+  }
+  if (result.subject_revision !== undefined && result.subject_revision !== revision) {
+    throw new Error("conflicting review subject_revision values");
+  }
+  return { ...result, subject_revision: revision };
+}
+
 export type ReviewAcceptance = Extract<ReviewResult, { kind: "accepted_pr" | "accepted_execution" | "accepted_direct_main" }>;
 
 export type IndependentReviewReceipt =

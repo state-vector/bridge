@@ -233,3 +233,28 @@ export function verifyRecoveryEpisode(episode: RecoveryEpisode, receipt: Recover
     history: [...episode.history, { event_id: `${verified ? "verified" : "deployment"}:${receipt.run_id}:${receipt.run_attempt}`, at: now, actor: "system:deployment", kind: verified ? "verified" : "verification_passed", summary: `Successful deployment evidence: ${verified_receipts.length}/${episode.successful_deployments_required} required${repairAccepted ? "" : "; repair acceptance pending"}` }],
   });
 }
+
+/** Only a mechanically sound, independently covered head whose remaining
+ * failure is the circular base gate can request administrator action. */
+export const RecoveryMergeGateSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("pending") }),
+  z.object({ kind: z.literal("bypass_required"),
+    base_sha: z.string().regex(/^[0-9a-f]{40}$/),
+    head_sha: z.string().regex(/^[0-9a-f]{40}$/) }),
+]);
+export type RecoveryMergeGate = z.infer<typeof RecoveryMergeGateSchema>;
+export type RecoveryRepairScope =
+  | { kind: "unobserved" }
+  | { kind: "current"; head_sha: string; task_ids: string[] };
+export function recoveryRepairScope(head: string, ledger: Record<string, RecoveryEpisode>): RecoveryRepairScope {
+  if (!head) return { kind: "unobserved" };
+  return { kind: "current", head_sha: head,
+    task_ids: [...new Set(Object.values(ledger).filter(e => e.head_sha === head && recoveryIsOpen(e)).map(e => e.stage.task_id))] };
+}
+
+/** The owner performs this merge; DONE is an observation request, never delegated authority. */
+export const RecoveryOwnerMergeSchema = z.object({
+  kind: z.literal("owner_merge"), repo: z.string().min(1), base: z.string().min(1),
+  task_id: TaskId, pr: z.number().int().positive(),
+  base_sha: z.string().regex(/^[0-9a-f]{40}$/), head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+});

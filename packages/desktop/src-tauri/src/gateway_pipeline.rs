@@ -102,7 +102,7 @@ fn record(cfg: &DispatchConfig, task: &str, runtime: &ExecutionRuntime, result: 
     let owner = Ownership::Attempt { ticket: Ticket { task_id: task.into(), session: claim_session(cfg, task) },
         host: cfg.label.clone().ok_or("gateway host missing")?, generation: runtime.generation, attempt_id: runtime.attempt_id.clone() };
     let outcome = Outcome { kind: if runtime.control.stop.load(Ordering::SeqCst) { OutcomeKind::Interrupted } else if result.timed_out { OutcomeKind::TimedOut } else if result.ok && !void_run(&result.stdout_tail, &result.stderr_tail) { OutcomeKind::Completed } else { OutcomeKind::Failed },
-        exit_code: result.exit_code, stdout_tail: result.stdout_tail.clone(), stderr_tail: result.stderr_tail.clone() };
+        exit_code: result.exit_code, stdout_tail: result.stdout_tail.clone(), stderr_tail: result.stderr_tail.clone(), cause: result.cause.clone() };
     let work = if let Some(writers) = runtime.control.writer_state().and_then(WriterProof::observed) {
         Work::Stopped { outcome, writers, worktree, step: Step::Stop }
     } else { Work::Unproven { outcome, worktree } };
@@ -152,7 +152,7 @@ fn prepare(shared: &Config, snap: &SharedSnapshot, input: Input, cancel: Arc<Ato
                     if let (Some(generation), Some(attempt_id)) = (a["generation"].as_u64(), a["attempt_id"].as_str()) {
                         let owner = Ownership::Attempt { ticket: ticket.clone(), host: cfg.label.clone().unwrap(), generation, attempt_id: attempt_id.into() };
                         let record = Record { owner: owner.clone(), host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
-                            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+                            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
                         return Prepared::Finalize { owner, value: FinalWork::Fresh(record) };
                     }
                 }
@@ -289,7 +289,9 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
     result.map_err(|error| (record, error))
 }
 fn bounded_outcome(outcome: &Outcome) -> Outcome {
-    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000) }
+    // The typed cause survives bounding: its sanitized fields are already
+    // bounded at classification time, so provenance reaches the hub intact.
+    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000), cause: outcome.cause.clone() }
 }
 fn tail_bytes(text: &str, max: usize) -> String {
     let mut start = text.len().saturating_sub(max);
@@ -441,7 +443,7 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
             if !archive.exists() { journal::write_file(&archive, &original)?; }
             let outcome = match &saved.work {
                 Work::Unproven { outcome, .. } => outcome.clone(),
-                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into() },
+                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into(), cause: None },
             };
             let worktree = match &saved.work { Work::Unproven { worktree: Some(path), .. } => Some(path.clone()), _ => worktree };
             journal::save(&terminal, &Record { work: Work::Stopped { outcome, writers: WriterProof::NoLiveGroupMembers, worktree, step: Step::Stop }, disposition: Disposition::Pending, ..saved })?;
@@ -569,7 +571,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
                 Work::Stopped { outcome: serde_json::from_value(state["terminal"]["outcome"].clone()).map_err(|e| format!("gate: recovered terminal outcome drift: {e}"))?,
                     writers: serde_json::from_value(state["terminal"]["writers"].clone()).map_err(|e| format!("gate: recovered writer proof drift: {e}"))?, worktree: launch.worktree, step: Step::Stop }
             } else {
-                Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into() }, worktree: launch.worktree }
+                Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into(), cause: None }, worktree: launch.worktree }
             };
             let record = journal::insert(&root.join("terminal"), record)?;
             recovered.push(Recovered::Final(record.owner.clone(), FinalWork::Journal(record)));
@@ -660,7 +662,7 @@ impl Controller {
                 }
             },
             Err(TryRecvError::Disconnected) => {
-                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None };
+                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, cause: None };
                 record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()).ok().map(|r| FinalWork::Active(r, running.execution.clone()))
             },
             Err(TryRecvError::Empty) => None,
@@ -967,7 +969,7 @@ pub(crate) mod tests {
         let ticket = Ticket {task_id:"old-task".into(),session:"old-session".into()};
         let record = Record {owner:Ownership::Attempt {ticket:ticket.clone(),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"old-attempt".into()},
             host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,disposition:Disposition::Rejected {reason:"old missing proof".into()},
-            work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into()},worktree:Some(wip.clone())}};
+            work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into(),cause:None},worktree:Some(wip.clone())}};
         journal::insert(&terminal,record.clone()).unwrap();
         let launch_path=root(&cfg).unwrap().join("launches").join(record.name());
         let launch=serde_json::to_vec(&Launch {record:record.clone(),worktree:Some(wip.clone())}).unwrap();
@@ -1012,7 +1014,7 @@ pub(crate) mod tests {
             host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:generation,process:None,disposition:Disposition::Rejected {reason:"retained".into()},work:Work::UnknownWriter {reason:"old uncertain writer".into()}};
         let old=record(1);*owner.lock().unwrap()=Some(old.owner.clone());
         let newer=record(2);let uncertain=record(3);
-        let captured=Record {work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::Completed,exit_code:Some(0),stdout_tail:"real result still needs delivery".into(),stderr_tail:String::new()},worktree:Some(root(&cfg).unwrap().join("captured-work"))},..record(4)};
+        let captured=Record {work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::Completed,exit_code:Some(0),stdout_tail:"real result still needs delivery".into(),stderr_tail:String::new(),cause:None},worktree:Some(root(&cfg).unwrap().join("captured-work"))},..record(4)};
         for r in [&old,&newer,&uncertain,&captured] {journal::insert(&terminal,r.clone()).unwrap();}
         let bytes=|r:&Record|std::fs::read(terminal.join(r.name())).unwrap();
         let old_bytes=bytes(&old);let newer_bytes=bytes(&newer);let uncertain_bytes=bytes(&uncertain);let captured_bytes=bytes(&captured);
@@ -1235,6 +1237,46 @@ pub(crate) mod tests {
         assert!(readiness.proof(&cfg).is_err(), "a train connection cannot authorize an agent launch");
     }
     #[test]
+    fn missing_capture_directory_holds_exact_journal_without_publication_or_retry() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let host = Arc::new(Mutex::new(String::new())); let bound_host = host.clone();
+        let hub = Hub::new(move |request| {
+            let args = &request["params"]["arguments"];
+            if args["command"]["kind"] == "receipt" { return Some(json!({"kind":"receipt_missing"})); }
+            assert_eq!(args["command"]["kind"], "stopped", "missing work cannot publish/register/finalize");
+            observed.fetch_add(1, Ordering::SeqCst);
+            Some(json!({"attempt":{"phase":"finalizing","writers":"process_group_empty",
+                "host":*bound_host.lock().unwrap(),"session":args["session"],"generation":1,"attempt_id":"missing-capture"}}))
+        });
+        let (cfg, ready, snap) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
+        let missing = root(&cfg).unwrap().join("never-created-worktree");
+        let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id:"missing-capture".into(),session:"original-session".into() },
+            host:cfg.label.clone().unwrap(),generation:1,attempt_id:"missing-capture".into() }, host:cfg.label.clone().unwrap(),
+            url:cfg.url.clone(),observed_at:123,process:None,disposition:Disposition::Pending,
+            work:Work::Stopped {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,
+                stdout_tail:"original evidence".into(),stderr_tail:"original failure".into(),cause:None},
+                writers:WriterProof::ProcessGroupEmpty,worktree:Some(missing.clone()),step:Step::Capture} };
+        let original = serde_json::to_value(&record).unwrap();
+        let terminal = terminal_root(&cfg).unwrap(); journal::insert(&terminal, record.clone()).unwrap();
+        let mut controller = Controller::new(&cfg, &ready, &snap);
+        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while controller.registry.counts().held == 0 {
+            controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 { controller.registry.poll(|_|None); }
+        let saved:serde_json::Value=serde_json::from_slice(&std::fs::read(terminal.join(record.name())).unwrap()).unwrap();
+        assert_eq!(saved["owner"],original["owner"]);
+        assert_eq!(saved["work"],original["work"]);
+        assert_eq!(saved["observed_at"],original["observed_at"]);
+        assert!(saved["disposition"].to_string().contains("worktree unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst),1);
+        assert!(!missing.exists());
+        drop(controller);drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
     fn actual_finalizer_recovers_captured_result_after_lost_ack_and_daemon_restart() {
         let ids = Arc::new(Mutex::new(Vec::<String>::new()));
         let host = Arc::new(Mutex::new(String::new())); let bound_host = host.clone(); let observed = ids.clone();
@@ -1257,7 +1299,7 @@ pub(crate) mod tests {
         let (cfg, ready, snap) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
         let owner = Ownership::Attempt { ticket: Ticket { task_id: "terminal-fixture".into(), session: "captured-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "captured-one".into() };
         let record = Record { owner: owner.clone(), url: cfg.url.clone(), host: cfg.label.clone().unwrap(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "the exact captured result survives restart".into(), stderr_tail: String::new() }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "the exact captured result survives restart".into(), stderr_tail: String::new(), cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
         journal::insert(&terminal_root(&cfg).unwrap(), record.clone()).unwrap();
         let mut first = Controller::new(&cfg, &ready, &snap);
         first.registry.restore_finalization(owner, FinalWork::Journal(record)).ok().unwrap();
@@ -1291,7 +1333,7 @@ pub(crate) mod tests {
         let work = root(&cfg).unwrap().join("newer-work"); std::fs::create_dir_all(&work).unwrap(); std::fs::write(work.join("keep"), "newer generation's work").unwrap();
         let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id: "old-result".into(), session: "old-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "old-one".into() },
             host: cfg.label.clone().unwrap(), url: cfg.url.clone(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "original result".into(), stderr_tail: String::new() }, writers: WriterProof::ProcessGroupEmpty, worktree: Some(work.clone()), step: Step::Capture } };
+            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "original result".into(), stderr_tail: String::new(), cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: Some(work.clone()), step: Step::Capture } };
         journal::insert(&terminal_root(&cfg).unwrap(), record).unwrap();
         let mut controller = Controller::new(&cfg, &ready, &snap); let deadline = Instant::now() + Duration::from_secs(3);
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
@@ -1323,7 +1365,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id: "slow-publication".into(), session: "slow-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "slow-one".into() },
             host: cfg.label.clone().unwrap(), url: cfg.url.clone(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "Captured result".into(), stderr_tail: String::new() }, writers: WriterProof::NoLiveGroupMembers, worktree: Some(source), step: Step::Publish { checkpoint } } };
+            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "Captured result".into(), stderr_tail: String::new(), cause: None }, writers: WriterProof::NoLiveGroupMembers, worktree: Some(source), step: Step::Publish { checkpoint } } };
         journal::insert(&terminal_root(&cfg).unwrap(), record.clone()).unwrap();
         let mut controller = Controller::new(&cfg, &ready, &snap);
         controller.registry.restore_finalization(record.owner.clone(), FinalWork::Journal(record)).ok().unwrap();

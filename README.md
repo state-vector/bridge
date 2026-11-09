@@ -1494,6 +1494,29 @@ solid if waiting to be"):
    or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
    the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
    (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
+   The self-heal's retry budget is a closed purpose/evidence pair (BR#8824): the
+   executor names WHY it re-requests a check — `stale_destination_gate` (the red
+   was stamped against a destination that has since recovered) or
+   `ordinary_head_check` (the re-run judges this head, e.g. a bisect probe) — and
+   the hub alone validates the evidence. A stale-destination retry is licensed
+   only by the lane's current canonical GREEN deploy coverage (folded from the
+   stored base state and the durable deploy observations, so a caller's bare
+   green stamp can never override a newer durable failure) and only for the
+   task's exact current PR head (fail-closed: an unobserved head never
+   licenses a dispatch, and legs in other repos are never compared); the
+   budget is scoped to the successful
+   coverage receipt the hub derives (covered tip + decisive run id + its
+   attempt — never a
+   timestamp), so exactly one retry is granted per head/obligation/CHANGED
+   successful coverage (a same-run rerun — a new attempt of the same run id,
+   which GitHub reruns create — is a changed receipt that can recover the
+   gate), while an ordinary head check keeps its permanent
+   one-dispatch budget (old ledger rows and receipts are preserved, never
+   reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
+   fenced until its receipts reconcile — the fence is scope-wide and evaluated
+   before any purpose branch, so NO purpose (stale or ordinary) re-dispatches
+   past an unreconciled external effect, and a fresh green stamp never licenses
+   repeating one.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings
@@ -1666,7 +1689,7 @@ The same rule applies to direct question creation and metadata edits. Name the
 affected task, explain the situation and why your decision is needed, and give
 each choice an executor, a concrete consequence and a typed effect. The visible
 options must match those choices; blank context and misplaced recommendations
-are rejected. Supporting logs and event grammar belong in expandable evidence.
+are rejected. The complete request instructions and target links remain visible before the answer buttons; they are not hidden as optional evidence.
 Older stored questions remain readable and answerable.
 
 Missing resume conditions, repeated failed attempts, missing completion reviews
@@ -1808,18 +1831,16 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
 - **The block**: every PR runs the required `main-green gate` check
   (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
   check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
-  (or a check still running, or no check runs at all) fails the gate and GitHub refuses
+  (or a check still running, or no substantive check runs) fails the gate and GitHub refuses
   the merge via the `main: main-green gate + substance checks required` ruleset. The
   newest run per check judges; a cancelled run says nothing. The one exception is written
   into the gate: a PR green on the *exact* checks main fails passes with a printed
   **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
   receipted, not a loophole.
-  Manual gate drills honour the same rule: a `workflow_dispatch` run MUST pass an
-  explicit `main_sha` (BR#5487) — a sha-less dispatch with `--ref main` attaches the
-  drill's own `main-green gate` check-run to main's HEAD, so the script finds itself
-  in flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
-  historic sha instead: the check-run still lands on HEAD, but the judged commit is
-  settled and independent.
+  The destination check excludes its own `main-green gate` and `Preflight destination check`
+  labels. GitHub attaches those results to the commit SHA, which can be shared by main
+  and a preflight ref. A manual `workflow_dispatch` drill still requires an explicit
+  historic `main_sha` (BR#5487).
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The same ruleset
@@ -2172,12 +2193,14 @@ an uncertain effect is not repeated. Exhausted retries and substantive candidate
 failures produce a concrete, deduplicated repair duty instead of assuming that
 an ownerless queued card has an active executor.
 
-Every merge candidate must include the current base in its tested head. A clean
-worker-authored branch is updated mechanically; its substance verdict carries,
-but CI does not. The train waits for fresh integrated-head checks. Conflicting
-or non-worker-authored branches receive an agent-owned repair. This check runs
-again between batch members: disjoint files alone do not prove semantic
-compatibility. This replaces the older conflict-only proactive-update policy.
+Each batch starts with candidates tested against its starting base. Mutually
+non-conflicting members can land back-to-back using that evidence while the
+live tip is still the batch's own landed prefix. The train rechecks review,
+signatures and required checks on each exact head and stops on a red base
+check. If an unrelated merge advances main, candidates need CI against the
+new base. A clean worker-authored update carries the review verdict and runs
+fresh CI. Conflicting or non-worker-authored branches receive an agent-owned
+repair.
 
 A scheduler reservation authorizes initial `begin` through its exact gateway
 token and session, without requiring a caller-supplied agent label. Existing
@@ -2274,6 +2297,15 @@ does a hub that never answers. A failing main-tip lookup never turns a mismatch 
 (fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
 
 ## The merge train: serialized merges, credential-free hub (BR#3516)
+
+The stop-the-line banner follows the latest observed failing main commit. The
+lane retains its repair across refreshes and lease renewals, and a stale
+starvation diagnostic stays in history. If the current failure lacks an active
+repair, Bridge queues recovery for that commit.
+If main advances while a stop is in force, Bridge holds merges while checking
+the new commit. It assigns repair work only when that commit fails.
+Bridge records a late GitHub merge receipt at the actual merge time and keeps
+the lane checking any newer merge already in progress.
 
 Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
 
@@ -3688,3 +3720,59 @@ old result is finalizing. A successful process exit never closes a task or
 fabricates review acceptance. Unfinished claims return through the same scheduler
 with their prior result attached; independent waits, local handoffs, unknown
 operations, host affinity and the persistent retry budget remain enforced.
+
+Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
+
+Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.
+
+Recovery banners and readiness use only the current stopped or observed main revision. Historical recovery episodes remain visible as evidence, but their activity cannot replace the current repair, and a later revision’s failed deployment does not erase their verification receipts.
+
+Human requests show the action owner (You or Bridge), the complete instructions, and target links before the answer buttons. A human-owned action must be performed using the human's own account; sending an answer neither performs it nor grants Bridge that account's permissions. Owner-only recovery merges include the PR link and an exact-head GitHub CLI command. Bridge observes the merge and deployment automatically; DONE reports an already completed merge.
+
+Train activity messages use fresh executor facts for the current candidate. Historical bounce metadata cannot override a later ready result or turn a failed hub request into a claim that a new review is needed. Expired or missing observations return to checking; this presentation never grants merge authority.
+
+The train reads canonical task state using `get_artefact` with `view: "execution"`, including at the final merge check. Optional related-work and semantic search are excluded from this control path. Ordinary agent reads retain full discovery; both views share the same task, admission, and carry records.
+
+The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
+
+Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).
+
+
+### Provider failure evidence and bounded historical recovery
+
+Gateway terminal receipts retain structured, sanitized ACP provider causes separately
+from task output. Unknown provider messages remain diagnostic evidence; empty output
+or “no deployments” alone does not establish exhausted credits. Missing checkpoint
+working directories hold the exact delivery stage and original outcome rather than
+repeatedly launching a failing Git process or inventing a successful checkpoint.
+
+For historical provider failures stranded by the retry counter, an authenticated
+full agent can attest a fresh request against the configured model and token allowance.
+The one-use recovery permit binds that proof to the exact task revision, stopped
+attempt, terminal evidence, checkpoint and selected route. Original counters and
+receipts remain intact. The next worker receives the authorized continuation;
+unknown external operations and independent human or lifecycle holds still prevent
+admission. This reconciliation mechanism does not yet implement automatic provider
+circuit recovery or task replanning, and billing confirmation alone is not health proof.
+
+
+An explicit larger-model escalation now receives its own bounded allowance of
+three failed generations. The lifetime failure counter stays intact; changing a
+session, model alias, timestamp or ordinary task metadata does not renew it.
+Independent review and executor escalation both bind the new strategy to the task
+revision and enforce its minimum model tier through scheduling and launch.
+A deadline poll and finalization charge the same generation only once. Existing
+timeout charges are recognized from exact saved begin/poll receipts, never merely
+from a stopped process. Exhaustion at the largest tier and automatic dependency
+recovery still require the remaining diagnosis and recovery lifecycle work.
+
+
+OpenCode provider retry notifications retain their typed, sanitized failure cause when a prompt loses its response or times out. A cleared retry or an authoritative prompt response takes precedence, so an earlier quota error cannot turn a later tool failure into an account-action request. Session and child-session boundaries prevent unrelated notifications from being attributed to the attempt. This improves failure evidence; it does not itself authorize another attempt or prove provider recovery.
+
+Archived ACP routing failures with the complete LiteLLM unavailable-route error can use the existing one-attempt recovery permit. The error does not identify a billing problem. A fresh configured request and a quiesced attempt with no unresolved external effects are still required.
+
+A successful request through the configured proxy can authorize one trial per task revision for an unavailable route. This receipt verifies the tested request ceiling. Authentication and quota recovery still require the configured output ceiling to be verified. The hub keeps the consumed trial in the original begin receipt even if a later permit replaces it.
+
+An unowned review of an older task revision no longer blocks closure after the current revision is accepted. The hub retains reviews with active claims, unresolved operations, or delivery obligations for reconciliation.
+
+Given a fresh configured proxy receipt, run `python3 scripts/recover-provider-batch.py receipt.json` to preview up to four matching retry holds from the first 32 reported by the gateway. Set `BRIDGE_MCP_URL` and a full-agent `BRIDGE_TOKEN` using your existing connection, then add `--apply` to grant the selected trials. The hub permits at most four grants per proxy receipt. Normal admission and one-use task guards still apply.

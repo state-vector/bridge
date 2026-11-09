@@ -1,5 +1,5 @@
 import { getKbHubConfig } from "./config";
-import type { ExecutionModelView } from "@bridge/contracts";
+import type { ExecutionModelView, LaneOperationalState } from "@bridge/contracts";
 import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
@@ -285,6 +285,7 @@ export interface KbBaseRedResolution {
 }
 
 export interface KbTrainLane {
+  lane_state?: LaneOperationalState;
   line?: import("@bridge/contracts").TrainLineProjection;
   lane: string;
   card: string;
@@ -424,10 +425,7 @@ export interface KbTrainLane {
     ask: { id: string; url: string; question: string; options: string[] } | null;
     unblock: string;
   };
-  /** BR#4849 red-main episode (hub-derived): the newest OPEN root-blocker /
-   *  main-red task in the lane's project — null when main is green (the task
-   *  closes when the line recovers). `owner`/`executor_session` answer "who
-   *  is fixing it"; both empty = UNOWNED, and the banner says so loudly. */
+  /** Compatibility view of the repair recorded on the stopped lane. */
   red_main?: {
     task_id: string;
     title: string;

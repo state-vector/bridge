@@ -1,7 +1,7 @@
 /** Local execution is a human-authorised mode, never an autonomous queue tier.
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema, InteractiveClaimSchema,
-  initialExecution, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
+  initialExecution, openLargerModelStrategy, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
   availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker,
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
@@ -65,6 +65,7 @@ export class ExecutionWork {
       }
     }
     floor = maxTier(floor, state?.attempt?.executor?.tier ?? "small");
+    floor = maxTier(floor, state?.retry_strategy?.minimum_tier ?? "small");
     if (state?.attempt) return { ...required, tier: floor };
     const selection = selectModelTier({ lane, policy: this.modelPolicy(), required: { ...required, tier: floor }, hosts: this.hosts(id), project: row.project, now: Date.now() });
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
@@ -77,11 +78,12 @@ export class ExecutionWork {
     const tier = nextAvailableTier(current, availableModelTiers(this.hosts(id), state.requirements, task.project, Date.now()));
     if (!tier) throw new Error("gate: no larger model tier is available; report findings or an explicit unmet tier requirement instead");
     if (!apply) return tier;
-    state.requirements.tier = tier; state.revision += 1;
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
+    openLargerModelStrategy(state,tier,summary,"independent_review",String(meta.work_revision??"legacy"));
+    state.requirements.tier = tier; state.revision += 1;
     meta.execution_requirements = state.requirements;
     meta.execution_escalation = { kind: "review", tier, reason: summary, by: actor, at: Date.now() };
-    delete meta.session; delete meta.blocked;
+    delete meta.session; delete meta.blocked; delete meta.interactive_execution;
     // Called inside the review completion transaction: verdict + requeue commit together.
     this.sql.exec(`INSERT INTO execution_state(task_id,state,worker_token_id) VALUES (?,?,'') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state`, id, JSON.stringify(state));
     this.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,updated_ts=?,status_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), Date.now(), id);

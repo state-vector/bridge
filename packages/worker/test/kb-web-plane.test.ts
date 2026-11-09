@@ -503,19 +503,19 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
   // must be impossible to miss.
   const trainPanelSrc = readFileSync(new URL("../../ui-kit/src/views/TrainPanel.tsx", import.meta.url).pathname, "utf8");
 
-  it("renders the banner for any lane with a fed stop OR a derived red_main episode, above the lane table", () => {
-    expect(trainPanelSrc).toMatch(/l\.stop \|\| l\.red_main/);
+  it("renders the banner only for a current typed main-failed stop, above the lane table", () => {
+    expect(trainPanelSrc).toContain('l.line?.phase === "stopped" && l.line.blocker === "main_failed"');
     expect(trainPanelSrc).toContain("STOP-THE-LINE");
     // banner markup sits before the column head in source order — it is read first
     expect(trainPanelSrc.indexOf("train-stopline")).toBeGreaterThan(-1);
     expect(trainPanelSrc.indexOf("train-stopline")).toBeLessThan(trainPanelSrc.indexOf("train-head-cols"));
   });
 
-  it("answers WHO BROKE IT: the stop's machine-recorded culprit card, else the last landed merge labeled unconfirmed", () => {
-    expect(trainPanelSrc).toMatch(/l\.stop\?\.culprit_task/);
+  it("shows the recorded culprit or an unconfirmed landing for the failing commit", () => {
+    expect(trainPanelSrc).toMatch(/stopped\s*\?\s*stopped\.culprit_task/);
     expect(trainPanelSrc).toContain("broke it:");
-    expect(trainPanelSrc).toMatch(/l\.last_merge/);
-    expect(trainPanelSrc).toContain("last landed before red");
+    expect(trainPanelSrc).toMatch(/failingSha\s*&&\s*l\.last_merge\?\.merge_sha\s*===\s*failingSha/);
+    expect(trainPanelSrc).toContain("landing at the failing commit, unconfirmed");
   });
 
   it("answers WHO IS FIXING IT: the episode task with owner/executor — or a loud UNOWNED chip", () => {
@@ -523,10 +523,10 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
     expect(trainPanelSrc).toMatch(/red\.owner \|\| red\.executor_session/);
     expect(trainPanelSrc).toContain("UNOWNED — nobody is fixing it");
     // the fixer line click-opens the episode task
-    expect(trainPanelSrc).toMatch(/openTask\?\.\(red\.task_id\)/);
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(red\.id\)/);
   });
 
-  it("the lane status pill itself reads red on an unfed red-main episode (stop null, red_main present)", () => {
-    expect(trainPanelSrc).toContain('"main RED"');
+  it("the lane status pill consumes only the typed line projection", () => {
+    expect(trainPanelSrc).toContain('tone={tones[line.phase]} title={line.reason}>{line.label}');
   });
 });

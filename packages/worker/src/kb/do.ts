@@ -9,7 +9,7 @@
  * Transport: the worker forwards JSON op requests via fetch("https://kb/<op>").
  * Ops: create | get | list | search | update | transition | link | stats
  */
-import { WorkerStatusSchema } from "@bridge/contracts";
+import { WorkerStatusSchema, trainCandidateActivity } from "@bridge/contracts";
 import { SchemaInitialization } from "./schema-init.ts";
 import type { DeliveryAdmission, DeliveryDisposition, AcceptedPrLeg } from "@bridge/contracts";
 import {
@@ -233,9 +233,9 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, ReviewResultSchema, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionAttemptBudgetExhausted, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -3112,6 +3112,9 @@ export class KnowledgeHub {
         request TEXT NOT NULL, result TEXT NOT NULL,
         PRIMARY KEY (task_id, command_id)
       );
+      CREATE INDEX IF NOT EXISTS execution_proxy_grant_receipts ON execution_commands(json_extract(result,'$.permit.proof.id'))
+        WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+          AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request';
       CREATE INDEX IF NOT EXISTS execution_writer_receipts ON execution_commands(
         task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
         json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
@@ -3383,6 +3386,7 @@ export class KnowledgeHub {
       `ALTER TABLE lane_state ADD COLUMN lane_id TEXT`,
       `ALTER TABLE lane_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
+      `ALTER TABLE train_check_retries ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -5053,6 +5057,7 @@ export class KnowledgeHub {
    * window: incompatible tasks cannot hide compatible work further down. */
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
+    const held: Partial<Record<SchedulingReason, string[]>> = {};
     const rows = this.state.storage.sql.exec(`SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''`).toArray();
     const eligible = rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
@@ -5064,7 +5069,9 @@ export class KnowledgeHub {
       else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
-      else if ((state?.budget_exhaustions ?? 0) >= 3) reason = "retry_budget";
+      else if (state && executionAttemptBudgetExhausted(state,String(meta.work_revision??"legacy")) && ![capabilities, ...capabilities.alternatives].some(c =>
+        usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
+        && recoveryPermitMatches(state, c, host, String(meta.work_revision ?? "legacy"), Date.now()))) reason = "retry_budget";
       else {
         const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
@@ -5074,14 +5081,14 @@ export class KnowledgeHub {
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
-      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; return false; }
+      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
     });
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
       || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
-    return { eligible, reasons };
+    return { eligible, reasons, held };
   }
 
   private reconcileDispatchReservations(now = Date.now()) {
@@ -5120,7 +5127,7 @@ export class KnowledgeHub {
           : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
         const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
         return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), eligible: selection.eligible.length,
-          reasons: selection.reasons, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
+          reasons: selection.reasons, held: selection.held, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
   }
@@ -5164,7 +5171,7 @@ export class KnowledgeHub {
     const observation = this.one(`SELECT capabilities,observed_ts FROM execution_hosts WHERE token_id=?`, tokenId);
     const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
     const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
-    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} };
+    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
     const recoveryCapacity = this.recoveryCapacity();
     const pending = recoveryCapacity.prepare(tokenId, selection.eligible.map(priorityTask), mode !== "inspect");
     if (pending?.phase === "slot_available") {
@@ -5206,6 +5213,13 @@ export class KnowledgeHub {
           const assigned = this.one(`SELECT id,title,body_md,project,meta,roles,tags FROM artefacts WHERE id=?`, id)!;
           const meta = JSON.parse(String(assigned.meta ?? "{}"));
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
+          const execution = this.executionState(id);
+          if (execution?.recovery_permit?.phase === "available") {
+            const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
+              && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
+            if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
+            meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
+          }
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
               meta, roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
@@ -5437,6 +5451,59 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
+    if (command.kind === "recover_provider_failure") {
+      // This is an audited human/full-agent diagnosis, never a worker's own
+      // retry request. It preserves the failed attempt and grants one begin.
+      if (!this.executionWork().isInteractive(tokenId) || !req.session) throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
+      if (!validRecoveryRequestProof(command.proof, command.diagnosis)) throw new Error("gate: recovery proof must bind the actual model and observed request ceiling to the configured route and failure diagnosis");
+      const encoded = JSON.stringify({ command, session:req.session, actor });
+      const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
+      if (replay) { if (replay.request !== encoded) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+      if (command.proof.witness.kind === "configured_proxy_request") {
+        const granted = this.one(`SELECT count(*) AS n FROM execution_commands
+          WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+            AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request'
+            AND json_extract(result,'$.permit.proof.id')=?`, command.proof.id);
+        if (Number(granted?.n ?? 0) >= 4) throw new Error("gate: this proxy receipt has already granted four recovery trials");
+      }
+      const a = current.attempt, terminal = current.terminal;
+      if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || todoDispatchHold(meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
+      if (!a || a.phase !== "quiesced" || !terminal || terminal.generation !== a.generation || terminal.attempt_id !== a.attempt_id) throw new Error("gate: provider recovery requires the exact quiesced terminal attempt");
+      if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: unresolved external effects prohibit provider recovery");
+      if (JSON.stringify(command.terminal) !== JSON.stringify(terminal)) throw new Error("gate: provider recovery terminal evidence changed");
+      if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
+      if (current.budget_exhaustions < 3) throw new Error("gate: task does not require an exhausted-budget recovery permit");
+      if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
+      if (command.proof.witness.kind === "configured_proxy_request" && this.one(
+        `SELECT 1 FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
+           AND json_extract(result,'$.recovery_permit.phase')='consumed'
+           AND json_extract(result,'$.recovery_permit.task_revision')=?
+           AND json_extract(result,'$.recovery_permit.proof.witness.kind')='configured_proxy_request' LIMIT 1`,
+        req.id, String(meta.work_revision ?? "legacy"),
+      )) throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
+      if (current.recovery_permit?.phase === "available" && current.recovery_permit.proof.id === command.proof.id) throw new Error("gate: recovery proof already granted; use the original command receipt");
+      const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
+        .find(r => Number(JSON.parse(String(r.data)).generation) === a.generation);
+      if (!ended || command.proof.observed_at <= Number(ended.ts) || command.proof.observed_at > now || now-command.proof.observed_at > 300_000) throw new Error("gate: recovery needs a fresh configured-model request after this terminal failure");
+      const host = this.one(`SELECT h.capabilities,h.observed_ts,t.label FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=? AND t.revoked_ts IS NULL`,command.proof.host);
+      if (!host || now-Number(host.observed_ts)>120_000) throw new Error("gate: recovery gateway inventory is missing or stale");
+      const inventory = ExecutorCapabilitiesSchema.parse(JSON.parse(String(host.capabilities)));
+      const selected = [inventory,...inventory.alternatives].find(c => c.backend===command.proof.backend && c.model===command.proof.model && c.config_revision===command.proof.config_revision
+        && usableFor(current.requirements,c,command.proof.host,String(this.one(`SELECT project FROM artefacts WHERE id=?`,req.id)?.project??"")));
+      if (!selected) throw new Error("gate: recovery proof does not match a usable selected configured capability");
+      if (a.host !== command.proof.host && !a.checkpoint) throw new Error("gate: unpublished work retains original host affinity");
+      current.recovery_permit = { phase:"available",id:`${req.id}:${a.generation}:${a.attempt_id}`,generation:a.generation,attempt_id:a.attempt_id,
+        task_revision:String(meta.work_revision??"legacy"),checkpoint_commit:a.checkpoint?.commit??null,terminal,
+        proof:command.proof,diagnosis:command.diagnosis,continuation:command.continuation,evidence:command.evidence,authorized_by:actor };
+      current.revision += 1;
+      const result = {kind:"provider_recovery_granted",task_id:req.id,permit:current.recovery_permit,budget_exhaustions:current.budget_exhaustions};
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`,JSON.stringify(current),req.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,req.id,req.command_id,encoded,JSON.stringify(result));
+        this.version(req.id,actor,"provider_recovery_granted","One witnessed continuation permitted; original retry count and failure evidence retained",{generation:a.generation,proof:command.proof.id,diagnosis:command.diagnosis,continuation:command.continuation});
+      });
+      return result;
+    }
     if (command.kind === "inspect") {
       const handoff = this.recoveryCapacity().forVictim(req.id);
       return handoff ? { ...current, capacity_handoff: handoff } : current;
@@ -5592,6 +5659,7 @@ export class KnowledgeHub {
       const selection = command.selection;
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
+      if (executionAttemptBudgetExhausted(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: exhausted budget requires a current one-use recovery permit for the exact selected route");
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
@@ -5610,14 +5678,26 @@ export class KnowledgeHub {
     } else if (["poll", "restore", "checkpoint", "quiesce", "stopped", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
-    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
+    if (current.failure_charged_generation === null && current.attempt) {
+      const generation=current.attempt.generation;
+      const parseResult=(row: {result:unknown}|null): ExecutionState|null => {
+        if(!row) return null;
+        const parsed=ExecutionStateSchema.safeParse(JSON.parse(String(row.result)));
+        return parsed.success ? parsed.data : null;
+      };
+      const begun=parseResult(this.one(`SELECT result FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin' AND json_extract(result,'$.attempt.generation')=? LIMIT 1`,req.id,generation));
+      const polls=this.state.storage.sql.exec(`SELECT result FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='poll' AND json_extract(result,'$.attempt.generation')=? LIMIT 32`,req.id,generation).toArray()
+        .map(row=>parseResult({result:row.result})).filter((value):value is ExecutionState=>value!==null);
+      current.failure_charged_generation=legacyTimeoutChargeGeneration(current,begun,polls);
+    }
+    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
     const finalizeCurrentClaim = command.kind === "finalize" && row.status === "in_progress" && meta.session === session;
     const finalizedLocalHandoff = command.kind === "finalize" && ["in_progress", "blocked"].includes(row.status) && meta.session === session && next.handoff.phase === "waiting";
     const canRescheduleFinalized = finalizeCurrentClaim && !this.protectedExecution(req.id, meta, true)
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
-    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") next.budget_exhaustions += 1;
+    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") chargeExecutionFailure(next,command.generation);
     if (canRescheduleFinalized && !next.attempt?.checkpoint) next.requirements = { ...next.requirements, host: actor };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;
@@ -6191,12 +6271,34 @@ export class KnowledgeHub {
     return { phase: "accepted", ...base, subject: subject.data, result };
   }
 
+  private staleReviewHasExecutionHold(id: string, meta: Record<string, unknown>): boolean {
+    const execution = this.executionState(id);
+    return !!((execution?.attempt && execution.attempt.phase !== "quiesced")
+      || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      || this.protectedExecution(id, meta) || meta.operator_gated || this.startupHasAsk(id)
+      || this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=?`, id));
+  }
+
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
   private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
-    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.meta FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
+    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.owner, c.roles, c.meta, c.title, c.body_md FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
       const meta = JSON.parse(String(child.meta ?? "{}"));
       if (meta.machine_duty || meta.ask?.review_leg) return false;
+      if (body.to === "done" && child.type === "task" && child.status === "todo" && !child.owner
+        && parseTags(String(child.roles ?? "")).includes("review")) {
+        const subject = ReviewSubjectSchema.safeParse(meta.review_subject);
+        const revision = JSON.parse(String(row.meta ?? "{}")).work_revision ?? "legacy";
+        if (subject.success && subject.data.task_id === id && subject.data.revision !== revision) {
+          const current = this.currentTaskReview(id);
+          if (current.phase === "accepted" && current.subject.task_id === id && current.subject.revision === revision) {
+            if (this.staleReviewHasExecutionHold(String(child.id), meta)) return true;
+            // The old round no longer covers this submission. Retain any
+            // separately bound delivery obligation for its own reconciliation.
+            try { this.conserveDelivery(child, "", false); return false; } catch { return true; }
+          }
+        }
+      }
       // Peer coordination is retired on terminal work; it is not unfinished
       // implementation and must not deadlock completion behind itself.
       return !(child.type === "question" && meta.ask && !isHumanDecisionAsk(meta.ask));
@@ -6553,7 +6655,7 @@ export class KnowledgeHub {
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = ts0;
     const meta = JSON.parse(row.meta ?? "{}");
-    const reviewResult = body.review_result === undefined ? undefined : ReviewResultSchema.parse(body.review_result);
+    const reviewResult = body.review_result === undefined ? undefined : parseReviewResult(body.review_result, body.subject_revision);
     if (body.execution_result !== undefined) meta.execution_result = ExecutionResultSchema.parse(body.execution_result);
     // Machine bounce briefs annotate existing work; they do not change its
     // business definition. Origin is selected by the server call path, never
@@ -7304,7 +7406,7 @@ export class KnowledgeHub {
           const parentRow = fx.keep_newest ? this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id) : null;
           const parentTargets = fx.keep_newest ? prTargetsOf(parentRow) : [];
           const kids = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+            `SELECT c.id AS id, c.status AS status, c.owner AS owner, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
             id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
@@ -7321,6 +7423,9 @@ export class KnowledgeHub {
               if (!keptNewestRound) { keptNewestRound = true; return; } // newest round survives for re-entry
             }
             const vm = JSON.parse(v.meta ?? "{}");
+            const subject = ReviewSubjectSchema.safeParse(vm.review_subject);
+            if (subject.success && subject.data.task_id === id && subject.data.revision !== (meta.work_revision ?? "legacy")
+              && (v.status !== "todo" || v.owner || this.staleReviewHasExecutionHold(String(v.id), vm))) return;
             vm.superseded_reason = fx.cause;
             this.state.storage.sql.exec(
               `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -10640,7 +10745,7 @@ export class KnowledgeHub {
     if (facts?.base_state?.verdict === "red" && observed.success) {
       const failed = [...observed.data.runs].filter((r) => r.head_sha === observed.data.tip_sha && r.status === "completed" && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
       if (failed && failed.conclusion !== "success") for (const episode of Object.values(ledger)) {
-        if (!recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
+        if (episode.head_sha !== failed.head_sha || !recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
         const newer = episode.verified_receipts.every((r) => failed.id > r.run_id || (failed.id === r.run_id && (failed.run_attempt ?? 1) > r.run_attempt));
         if (!newer) continue;
         episode.verified_receipts = [];
@@ -11065,29 +11170,7 @@ export class KnowledgeHub {
     const stalledBlock: any = bsQf?.stalled && now - Number(bsQf.at ?? 0) < 15 * 60_000
       ? bsQf.stalled
       : null;
-    // BR#5114 round 2 (Ray 2026-10-30: "remove jargon — make it clear"):
-    // the lane's activity line speaks human. The hub knows the head card's
-    // own train state — a 'bounced' head is waiting on a FRESH REVIEW (its
-    // PR branch changed after the last review, so that review no longer
-    // covers it); anything else is the pre-merge check running. No "gate",
-    // no "verdict", no "attempting" — plain sentences.
-    const headHold = head
-      ? (() => {
-          const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
-          const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-          const cls = qfCls(head);
-          if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
-            return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
-          }
-          if (cls === "blocked" || cls === "conflict") {
-            return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
-          }
-          if (cls === "waiting" && String(bsQf?.base_state?.verdict ?? "") === "green") {
-            return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
-          }
-          return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
-        })()
-      : null;
+    const headHold = trainCandidateActivity(head, meta.lane?.queue_facts, now);
     let reason: string;
     if (retired) reason = `merge-train: retired — the lane card is done/superseded (BR#4977); the train no longer ticks it`;
     else if (stop) {
@@ -11216,15 +11299,29 @@ export class KnowledgeHub {
 
   /** Versioned lane_state is authoritative; the card is an atomic rolling-
    * compatibility projection. A stale snapshot cannot overwrite a newer one. */
-  private saveLaneState(laneId: string, meta: any, now: number): LaneOperationalState | null {
+  private saveLaneState(
+    laneId: string, meta: any, now: number,
+    repair?: Pick<Extract<LaneOperationalState, { phase: "stopped_red" }>, "failing_sha" | "episode_phase" | "fix_card">,
+  ): LaneOperationalState | null {
     const lane = laneOfMeta(meta);
     if (!lane) return null;
+    const queueFacts = meta.lane?.queue_facts;
     const opState = resolveLaneOperationalState({
-      baseState: meta.lane?.queue_facts?.base_state ?? null,
+      baseState: queueFacts?.base_state
+        ? applyDeployObservation(queueFacts.base_state, meta.lane?.deploy_observation, lane.required_workflows) : null,
+      baseObservedAt: trainBaseObservedAt(queueFacts),
       stop: meta.stop ?? null,
       currently: meta.currently ?? null,
       now,
     });
+    if (opState.phase === "stopped_red") {
+      const prior = repair?.failing_sha === opState.failing_sha ? repair : this.laneStore().operational(laneId);
+      const recorded = prior && "failing_sha" in prior && prior.failing_sha === opState.failing_sha ? prior : null;
+      if (recorded) {
+        opState.episode_phase = recorded.episode_phase;
+        opState.fix_card = recorded.fix_card;
+      }
+    }
     this.laneStore().save(laneId, laneKey(lane.repo, lane.base), lane.repo, lane.base, meta, opState, now);
     return opState;
   }
@@ -11462,12 +11559,21 @@ export class KnowledgeHub {
       };
       return m;
     };
+    const scope = this.trainRepairScope(a.repo, a.base, a.sha);
+    if (scope.kind === "current") for (const id of scope.task_ids) {
+      const repair = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, id);
+      if (!repair || ["done", "superseded"].includes(repair.status)) continue;
+      const rm = JSON.parse(repair.meta ?? "{}");
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(bind(rm)), id);
+      return id;
+    }
     // (1) culprit-qualified-in-place
     if (a.culpritId) {
       const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
       if (c && c.status !== "done" && c.status !== "superseded") {
         const cm = JSON.parse(c.meta ?? "{}");
-        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm })) {
+        const binding = mainRedBinding(cm, a.base);
+        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && binding?.repo === a.repo && binding.head_sha === a.sha) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
           this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
           return c.id;
@@ -11490,10 +11596,10 @@ export class KnowledgeHub {
     ).toArray() as any[];
     for (const o of open) {
       const om = JSON.parse(o.meta ?? "{}");
-      const binding = mainRedBinding(om);
+      const binding = mainRedBinding(om, a.base);
       if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
       const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
-      if (o.status === "blocked" && !sameSha) continue;
+      if (!sameSha && (o.status === "blocked" || trainLegs(om).length > 0 || om.review_pr || om.recovery_links?.length)) continue;
       if (!sameSha && this.rootFixExhausted(om, String(o.status ?? ""))) continue;
       const nextFailing = a.failing.map((f) => f.name);
       const prevFailing = Array.isArray(om.root_fix?.failing) ? om.root_fix.failing.map(String) : [];
@@ -11658,6 +11764,15 @@ export class KnowledgeHub {
       // the executor may report its own merge wall-clock (BR#4804 settle
       // clock): clamp to now — a future stamp would fake a settled lane
       const mergedAt = Math.min(Number(body.merged_at) || now, now);
+      const latestLaneMergeAt = Math.max(Number(meta.currently?.merged_at) || 0, Number(meta.lane?.last_merge_ts) || 0);
+      const queueFacts = meta.lane?.queue_facts;
+      const baseTip = queueFacts?.base_state;
+      const tipAge = baseTip?.tip_age_secs;
+      // GitHub merge timestamps and the observed tip age have second
+      // resolution. Require a full second of separation for this comparison.
+      const laterObservedTip = /^[0-9a-f]{40}$/.test(String(baseTip?.tip_sha ?? "")) && baseTip.tip_sha !== mergeSha
+        && typeof tipAge === "number" && tipAge >= 0 && trainBaseObservedAt(queueFacts) - tipAge * 1_000 > mergedAt + 1_000;
+      const historical = Number(meta.currently?.pr) !== pr && (mergedAt < latestLaneMergeAt || laterObservedTip);
       // BR#4934 burst payload: the drain pass rides the merged event —
       // burst_merged (merges in this pass, including this one), burst_cap,
       // burst_settling (true = the pass's FINAL merge; the lane settles on
@@ -11670,6 +11785,10 @@ export class KnowledgeHub {
       // order kept); absent → legacy byte-identical rows.
       const batchMembers = sanitizeBatchMembers(body.batch_members);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
+      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      const receipt = { task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")),
+        ...burstFields, burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}),
+        ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) };
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
       // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
@@ -11709,14 +11828,19 @@ export class KnowledgeHub {
           // blocked stays blocked (lifecycle forbids blocked→blocked) — the
           // state rides meta.merge_train; the reason says awaiting-CI.
           if (card.status === "blocked") {
-            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main settling (build/deploy)` };
+            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, ${historical ? "waiting for covering deployment" : "main settling (build/deploy)"}` };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, chain.task_id);
           } else {
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
           }
         }
       }
-      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      // A late GitHub observation accounts for the PR without replacing the
+      // newer merge that the lane is checking or marking its starvation cured.
+      if (historical) {
+        ev({ ...receipt, historical: true }, chain.task_id, mergedAt);
+        return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, historical: true };
+      }
       meta.currently = {
         pr,
         merge_sha: mergeSha,
@@ -11750,7 +11874,7 @@ export class KnowledgeHub {
       }
       const reason = this.laneSyncReason(lane.id, meta, now);
       this.saveLaneState(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}), ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) }, chain.task_id, mergedAt);
+      ev(receipt, chain.task_id, mergedAt);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
         : burstSettling
@@ -13252,16 +13376,46 @@ export class KnowledgeHub {
     if (!lease || lease.holder !== actor) throw new Error(`train.queue_facts requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
     if (body.check_retry) {
       const command = CheckRetryCommandSchema.parse(body.check_retry);
+      let scope: { purpose: "stale_destination_gate"; coverageReceipt: string } | undefined;
       if (command.kind === "reserve") {
         const subject = this.one(`SELECT meta FROM artefacts WHERE id=? AND type='task'`, command.task_id);
         const targetMeta = JSON.parse(String(subject?.meta ?? "{}"));
         if (!prTargetsOf({ meta: targetMeta }).some(p => p.repo === repo)) throw new Error("gate: check retry subject is not bound to this lane repository");
+        if (command.purpose === "stale_destination_gate") {
+          // BR#8824: a stale-destination retry is licensed ONLY by the lane's
+          // current canonical green deploy coverage — folded from the stored
+          // base state and the durable deploy observations, so a caller's
+          // bare green stamp can never override a newer durable failure
+          // (applyDeployObservation's fold), and the receipt is derived by
+          // the hub (base tip + decisive covering run), never asserted.
+          const required = laneOfMeta(meta)?.required_workflows ?? [];
+          const effective = applyDeployObservation(meta.lane?.queue_facts?.base_state, meta.lane?.deploy_observation, required);
+          const coverage = DeployCoverageStateSchema.safeParse(effective?.deploy_coverage);
+          if (effective?.verdict !== "green" || !coverage.success || coverage.data.phase !== "covered") {
+            throw new Error(`gate: stale-destination retry requires current canonical GREEN deploy coverage on the lane (verdict=${String(effective?.verdict ?? "none")}, coverage=${coverage.success ? coverage.data.phase : "absent"}) — re-dispatch denied`);
+          }
+          // Bind exactly the requested PR; other legs can legitimately have
+          // different heads, including replacement PRs in this repository.
+          const leg = prTargetsOf({ meta: targetMeta }).find(p => p.repo === repo && p.number === command.pr);
+          if (!leg) throw new Error("gate: stale-destination retry PR is not bound to this task and lane repository");
+          const known = this.one(`SELECT head FROM delivery_pr_outcomes WHERE repo=? AND pr=?`, repo, leg.number);
+          if (!known?.head) {
+            throw new Error(`gate: stale-destination retry requires the hub-observed current head of ${repo}#${leg.number} — none recorded, re-dispatch denied`);
+          }
+          if (String(known.head) !== command.head_sha) {
+            throw new Error(`gate: stale-destination retry head ${command.head_sha.slice(0, 8)} is not the current head of PR #${leg.number} (${String(known.head).slice(0, 8)}) — re-dispatch denied`);
+          }
+          scope = { purpose: command.purpose, coverageReceipt: deployCoverageReceipt(coverage.data) };
+        }
       }
-      return new TrainCheckRecovery(this.state.storage).command(String(lane.id), command, Date.now());
+      return new TrainCheckRecovery(this.state.storage).command(String(lane.id), command, Date.now(), scope);
     }
     // BR#5633: the entries THIS stamp persists — provided, else the stored
     // ones (the absent-entries preservation above).
     const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
+    for (const entry of entriesArr) {
+      if (entry.bypass !== undefined) entry.bypass = RecoveryMergeGateSchema.parse(entry.bypass);
+    }
     const scan = TrainQueueScanSchema.parse(body.scan ?? meta.lane?.queue_facts?.scan ?? { phase: "complete" });
     // BR#5265 Fix A: the executor stamps the walk's base verdict
     // (scoped to the lane's required workflows, Fix B) alongside the
@@ -13877,6 +14031,7 @@ export class KnowledgeHub {
    *  one of them. root_fix sorts to rank 0 unconditionally; the stopped
    *  lane's fast lane (BR#5190) is enforced walk-side at the merge gate. */
   private laneQueue(repo: string, base: string) {
+    const scope = this.trainRepairScope(repo, base);
     const cards = this.state.storage.sql.exec(
       `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
@@ -13900,8 +14055,11 @@ export class KnowledgeHub {
       const cm = metaById.get(c.id);
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
-      return { ...c, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
+      const root_fix = c.root_fix && scope.kind === "current" &&
+        (scope.task_ids.length ? scope.task_ids.includes(c.id) : mainRedBinding(cm, base)?.head_sha === scope.head_sha);
+      return { ...c, priority: root_fix ? "root_fix" : c.priority === "root_fix" ? "normal" : c.priority, root_fix, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
+    entries.sort((a, b) => Number(b.root_fix) - Number(a.root_fix));
     // BR#4688: attach each entry's PR leg + its LEDGER bounce count — the
     // Top-panel budget chip reads this; the executor ignores the extra
     // fields. Historical totals span different heads/kinds and are NOT the
@@ -13947,7 +14105,7 @@ export class KnowledgeHub {
   ): Promise<void> {
     const held = entriesArr.length;
     const askTitle = trainBaseRedAskTitle({ repo, base }, reds.map((r: { name: string }) => r.name));
-    const fix = this.trainOpenRootFix(repo, entriesArr);
+    const fix = this.trainOpenRootFix(repo, entriesArr, reds.map(r => r.name), base);
     const warranted = trainBaseRedAskWarranted(fix);
     const existing = this.one(
       `SELECT id, body_md, meta FROM artefacts WHERE type='question' AND status IN ('todo','in_progress','blocked') AND title=? LIMIT 1`, askTitle,
@@ -13966,12 +14124,14 @@ export class KnowledgeHub {
     const laneMetaRow = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, lane.id) as any;
     const lm = laneMetaRow ? JSON.parse(laneMetaRow.meta ?? "{}") : {};
     const pendingBypass = lm.lane?.bypass_merge ?? null;
+    const requestScope = this.trainRepairScope(repo, base);
     const declinedStamp = lm.lane?.base_red_ask_declined ?? null;
     if (
       warranted &&
       fix.curePr &&
       pendingBypass &&
-      Number(pendingBypass.pr) === Number(fix.curePr.number)
+      Number(pendingBypass.pr) === Number(fix.curePr.number) &&
+      requestScope.kind === "current" && pendingBypass.base_sha === requestScope.head_sha && pendingBypass.head_sha === fix.curePr.head_sha
     ) {
       this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "bypass authorization pending (DONE answered, executor tick outstanding)", pr: pendingBypass.pr, ask: existing?.id ?? null });
       return;
@@ -13982,6 +14142,7 @@ export class KnowledgeHub {
       declinedStamp &&
       String(declinedStamp.ask_title ?? "") === askTitle &&
       Number(declinedStamp.pr ?? -1) === Number(fix.curePr.number) &&
+      requestScope.kind === "current" && declinedStamp.base_sha === requestScope.head_sha && declinedStamp.head_sha === fix.curePr.head_sha &&
       Date.now() - Number(declinedStamp.at ?? 0) < 24 * 3_600_000
     ) {
       this.audit(actor, "train:base_red_ask_suppressed", lane.id, { why: "declined (hold the line) — same episode + cure PR within 24h", pr: declinedStamp.pr, ask: existing?.id ?? null });
@@ -14008,15 +14169,20 @@ export class KnowledgeHub {
         ? `Changes in ${repo} are waiting because the main branch is failing. Repair PR #${fix.curePr.number} is ready for the remaining administrator-only merge step.`
         : `Automatic repair of ${repo} has stalled after repeated attempts. The work remains open; choose whether to provide new direction or keep it paused.`,
       why_human: fix.curePr
-        ? "The remaining merge step requires your repository authority. Bridge will verify the actual merge and deployment afterwards."
+        ? "You must merge the repair using your repository-owner account. Bridge cannot bypass this gate; answering this request does not grant it your permissions. Bridge observes the merge and deployment automatically."
         : "This is a choice about the next repair direction; Bridge cannot invent instructions or treat another unchanged retry as progress.",
       choices: brief.options.map((label, i) => ({ label, executor: i === 0 ? "human" : "bridge", consequence: fix.curePr
         ? i === 0 ? "You merge the named repair. Bridge checks the actual GitHub merge and deployment before advancing the queued changes." : "Bridge keeps the changes queued and continues observing the repair; no merge permission or success is inferred."
         : i === 0 ? "You provide the specific missing information or instructions on the repair task." : i === 1 ? "Bridge re-issues the repair with your new direction; existing execution fences and review requirements remain." : "Bridge keeps the work paused until the existing failure is resolved.", action: "hold" })),
     });
+    const scope = this.trainRepairScope(repo, base);
+    const ownerMerge = fix.curePr && fix.card && scope.kind === "current"
+      ? RecoveryOwnerMergeSchema.parse({ kind: "owner_merge", repo, base, task_id: fix.card.id,
+          pr: fix.curePr.number, base_sha: scope.head_sha, head_sha: fix.curePr.head_sha }) : undefined;
     if (existing) {
       const em = JSON.parse(existing.meta ?? "{}");
-      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(em.ask?.decision) !== JSON.stringify(decision)) {
+      if (String(existing.body_md ?? "") !== brief.details || JSON.stringify(em.ask?.decision) !== JSON.stringify(decision) || JSON.stringify(em.recovery_owner_merge) !== JSON.stringify(ownerMerge)) {
+        em.recovery_owner_merge = ownerMerge;
         em.ask = { ...em.ask, route: { kind: "human_decision" }, decision, to: "human", artefact_id: affectedTask, reason: decision.why_human, options: brief.options };
         this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id=? AND relation='child_of'`, existing.id);
         this.state.storage.sql.exec(`INSERT INTO relations (src_id,relation,dst_id,created_ts) VALUES (?,'child_of',?,?)`, existing.id, affectedTask, Date.now());
@@ -14025,7 +14191,13 @@ export class KnowledgeHub {
       }
     } else {
       try {
-        await this.askCreate({ to: "human", route: { kind: "human_decision" }, question: askTitle, decision, details: brief.details, artefact_id: affectedTask, urgency: "time-sensitive" }, actor);
+        const created = await this.askCreate({ to: "human", route: { kind: "human_decision" }, question: askTitle, decision, details: brief.details, artefact_id: affectedTask, urgency: "time-sensitive" }, actor);
+        if (ownerMerge) {
+          const request = this.one(`SELECT meta FROM artefacts WHERE id=?`, created.id);
+          const requestMeta = JSON.parse(request?.meta ?? "{}");
+          requestMeta.recovery_owner_merge = ownerMerge;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(requestMeta), created.id);
+        }
       } catch (e) {
         this.audit(actor, "train:base_red_ask_deduped", lane.id, { detail: String((e as Error).message ?? e).slice(0, 160) });
       }
@@ -14969,7 +15141,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
       return line;
     }
-    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working" || line.remediation?.kind !== "attention") return line;
+    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
+    const inactiveRepair = line.blocker === "main_failed" && line.remediation?.kind === "queued"
+      && line.remediation.task.status === "in_progress" && !line.remediation.task.active_agent;
+    if (line.remediation?.kind !== "attention" && !inactiveRepair) return line;
     const lane = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, laneId);
     const meta = JSON.parse(lane?.meta ?? "{}");
     const cfg = laneOfMeta(meta);
@@ -14990,10 +15165,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         return { ...line, remediation: taskRemediation(candidateRepair) };
       }
     }
-    const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo).card;
+    const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo, undefined, undefined, cfg.base).card;
+    const scope = this.trainRepairScope(cfg.repo, cfg.base);
     const episode = `${line.blocker}:${line.blocker === "merge_failed"
       ? meta.lane?.queue_facts?.stalled?.since ?? "current"
-      : meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`;
+      : scope.kind === "current" ? scope.head_sha : "current"}`;
     const bound = current ? this.enrichFixCardRow(current.id, now) : null;
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
       ...line, remediation: taskRemediation(bound),
@@ -15002,10 +15178,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
        AND json_extract(meta, '$.machine_duty.subject') = ?
        AND json_extract(meta, '$.machine_duty.kind') IN ('line_recovery','task-recovery','diagnostic')
-       AND ((? != 'merge_failed' AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
-         OR (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
+       AND ((? NOT IN ('merge_failed','main_failed') AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
+         OR (? != 'main_failed' AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
          OR json_extract(meta, '$.machine_duty.episode') = ?) ORDER BY created_ts DESC`, laneId,
-      line.blocker, episode,
+      line.blocker, line.blocker, episode,
     ).toArray();
     const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
     const task = open ? this.enrichFixCardRow(open.id, now) : null;
@@ -15107,7 +15283,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  hotfix+main-red in the LANE CARD's project (the lane card's project
    *  column is the repo→project join; BR#5346 is the live superpositional
    *  example). Newest-touched first. */
-  private trainFixCard(project: string, repo?: string, redNames?: string[], now: number = Date.now()): TrainFixCard | null {
+  private trainFixCard(
+    project: string, repo?: string, redNames?: string[], now: number = Date.now(),
+    exact?: { base: string; head: string },
+  ): TrainFixCard | null {
     if (!project) return null;
     const rows = this.state.storage.sql.exec(
       `SELECT id, title, status, owner, updated_ts, tags, meta FROM artefacts
@@ -15119,6 +15298,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const candidates = rows.filter((r) => {
       const m = JSON.parse(r.meta ?? "{}");
       if (repo && m?.root_fix?.repo && String(m.root_fix.repo) !== repo) return false;
+      if (exact) {
+        const binding = mainRedBinding(m, exact.base);
+        if (binding?.repo !== repo || binding?.head_sha !== exact.head) return false;
+      }
       const t = parseTags(r.tags).map((x) => x.toLowerCase());
       return t.includes("hotfix") || t.includes("blocker") || t.includes("root_blocker") || t.includes("root-blocker");
     });
@@ -15179,14 +15362,39 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return false;
   }
 
-  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string }[], redNames?: string[]): {
+  private trainRepairScope(repo: string, base: string, head?: string): RecoveryRepairScope {
+    const row = this.laneRow(laneKey(repo, base));
+    const meta = JSON.parse(row?.meta ?? "{}");
+    const queueFacts = meta.lane?.queue_facts;
+    const stopped = resolveLaneOperationalState({
+      baseState: queueFacts?.base_state
+        ? applyDeployObservation(queueFacts.base_state, meta.lane?.deploy_observation, laneOfMeta(meta)?.required_workflows ?? []) : null,
+      baseObservedAt: trainBaseObservedAt(queueFacts),
+      stop: meta.stop,
+      now: Date.now(),
+    });
+    const current = head ?? (stopped.phase === "stopped_red" ? stopped.failing_sha
+      : queueFacts?.base_state?.tip_sha ?? meta.lane?.deploy_observation?.tip_sha ?? "");
+    return recoveryRepairScope(String(current), RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {}));
+  }
+
+  private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string; bypass?: unknown }[], redNames?: string[], base = "main"): {
     card: { id: string; title: string; status: string; exhausted?: boolean; blocked_reason?: string } | null;
-    curePr: { repo: string; number: number } | null;
+    curePr: { repo: string; number: number; head_sha?: string } | null;
     conflictPr?: { repo: string; number: number } | null;
     mergedPr?: { repo: string; number: number; merge_sha: string } | null;
     culpritPr: number | null;
     state: BaseRedEpisodeState;
   } {
+    const scope = this.trainRepairScope(repo, base);
+    const inScope = (id: string, meta: unknown): boolean => scope.kind === "unobserved" ||
+      (scope.task_ids.length ? scope.task_ids.includes(id) : mainRedBinding(meta, base)?.head_sha === scope.head_sha);
+    const bypassHead = (id: string, meta: unknown, pr: number): string | null => {
+      const evidence = RecoveryMergeGateSchema.safeParse(entries?.find(e => e.id === id && e.pr === pr)?.bypass);
+      if (!evidence.success || evidence.data.kind !== "bypass_required" || scope.kind !== "current" || evidence.data.base_sha !== scope.head_sha) return null;
+      const leg = trainLegs(meta).find(l => l.repo === repo && l.number === pr);
+      return leg && trainCarryChainEnd(leg) === evidence.data.head_sha ? evidence.data.head_sha : null;
+    };
     const matchesRedNames = (title: string, failing?: unknown): boolean => {
       if (!redNames || redNames.length === 0) return true;
       const hay = `${title} ${Array.isArray(failing) ? failing.join(" ") : ""}`.toLowerCase();
@@ -15219,7 +15427,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     };
     let root: {
       card: { id: string; title: string; status: string; exhausted?: boolean } | null;
-      curePr: { repo: string; number: number } | null;
+      curePr: { repo: string; number: number; head_sha?: string } | null;
       conflictPr?: { repo: string; number: number } | null;
       mergedPr?: { repo: string; number: number; merge_sha: string } | null;
       culpritPr: number | null;
@@ -15236,11 +15444,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ).toArray() as any[];
       for (const r of rows) {
         const m = JSON.parse(r.meta ?? "{}");
-        const binding = mainRedBinding(m);
+        const binding = mainRedBinding(m, base);
         // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
         // (agent-filed stop-the-line shape — BR#6378) heads the episode.
         if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
-        if (binding?.repo !== repo) continue;
+        if (binding?.repo !== repo || !inScope(String(r.id), m)) continue;
         const unlandedLegs = trainLegs(m)
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
@@ -15251,7 +15459,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           .filter((l): l is { repo: string; number: number; merge_sha: string } => !!l.merge_sha);
         const rawPr = openLegs.length ? openLegs[openLegs.length - 1] : null;
         const conflicting = rawPr ? isCardPrConflicting(m, rawPr.number) : false;
-        const curePr = rawPr && !conflicting ? rawPr : null;
+        const head = rawPr ? bypassHead(String(r.id), m, rawPr.number) : null;
+        const curePr = rawPr && !conflicting && head ? { ...rawPr, head_sha: head } : null;
         const conflictPr = rawPr && conflicting ? rawPr : null;
         const mergedPr = !curePr && !conflictPr && awaitingCiLegs.length ? awaitingCiLegs[awaitingCiLegs.length - 1] : null;
         // If this card's PR already merged for an OLD check (e.g. deploy/sccache)
@@ -15303,6 +15512,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ) as any;
         if (!row) continue;
         const m = JSON.parse(row.meta ?? "{}");
+        if (!inScope(id, m)) continue;
         if (isCardPrConflicting(m, pr)) continue;
         const unlanded = trainLegs(m).filter((l) => !trainLegLanded(m, l));
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);
@@ -15339,6 +15549,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
         const rowIsRootFix = isRootFixCard({ tags: parseTags(row.tags), meta: m });
         if (!rowIsRootFix && (root.card !== null || !isBaseCureCardTitle(String(row.title ?? "")))) continue;
+        const head = bypassHead(id, m, pr);
+        if (!head) continue;
         const resolved = {
           card: {
             id: String(row.id),
@@ -15349,7 +15561,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               ? { blocked_reason: m.blocked.reason.trim() }
               : {}),
           },
-          curePr: { repo: legRepo, number: pr },
+          curePr: { repo: legRepo, number: pr, head_sha: head },
           conflictPr: null,
           mergedPr: null,
           culpritPr: root.culpritPr,
@@ -15374,6 +15586,27 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  through the per-tick queue_facts stamp. Failures are audited, never
    *  thrown — the answer itself is already safely recorded above. */
   private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, answer: string, actor: string): Promise<void> {
+    const ownerMerge = RecoveryOwnerMergeSchema.safeParse(askMeta?.recovery_owner_merge);
+    if (ownerMerge.success) {
+      const request = ownerMerge.data;
+      const row = this.laneRow(laneKey(request.repo, request.base));
+      if (!row) return;
+      const meta = JSON.parse(row.meta ?? "{}");
+      const scope = this.trainRepairScope(request.repo, request.base);
+      const current = this.trainOpenRootFix(request.repo, meta.lane?.queue_facts?.entries, undefined, request.base);
+      if (scope.kind !== "current" || scope.head_sha !== request.base_sha ||
+          current.card?.id !== request.task_id || current.curePr?.number !== request.pr || current.curePr?.head_sha !== request.head_sha) {
+        this.audit(actor, "train:stale_owner_merge_answer", askId, request);
+        return;
+      }
+      if (/\bdone\b/i.test(answer)) {
+        meta.lane = { ...meta.lane, bypass_merge: { ...request, ask_id: askId, at: Date.now() } };
+      } else {
+        meta.lane = { ...meta.lane, base_red_ask_declined: { ...request, ask_title: title, ask_id: askId, at: Date.now() } };
+      }
+      this.saveLaneState(row.id, meta, Date.now());
+      return;
+    }
     const t = String(title ?? askMeta?.ask?.question ?? "");
     const ans = answer.trim();
     // BR#6390: the number the FILED ASK named — its options carry the cure PR
@@ -15603,23 +15836,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const activeQueue = queue.filter((q) => !meta.currently?.task_id || q.id !== String(meta.currently.task_id));
       const readyQueueItem = activeQueue.find((q) => qfCls(q.id) === "ready");
       const head = String((readyQueueItem ?? activeQueue[0] ?? queue[0])?.id ?? "") || null;
-      const headHold = head
-        ? (() => {
-            const hm = this.one(`SELECT meta FROM artefacts WHERE id = ?`, head) as any;
-            const st = hm ? String(JSON.parse(hm.meta ?? "{}")?.merge_train?.state ?? "") : "";
-            const cls = qfCls(head);
-            if (st === "bounced" || st === "awaiting" || cls === "needs-review") {
-              return { class: "awaiting-review" as const, note: `waiting on ${head} — its PR branch changed after the last review, so a fresh review is needed before it can merge` };
-            }
-            if (cls === "blocked" || cls === "conflict") {
-              return { class: "held-checks" as const, note: `held on ${head} — PR has failing head checks or conflicts` };
-            }
-            if (cls === "waiting" && String(meta.lane?.queue_facts?.base_state?.verdict ?? "") === "green") {
-              return { class: "waiting-checks" as const, note: `waiting on ${head} — PR checks or mergeability still running` };
-            }
-            return { class: "merge-checks" as const, note: `working on ${head} — checking review, signatures and CI before merging` };
-          })()
-        : null;
+      const headHold = trainCandidateActivity(head, meta.lane?.queue_facts, now0);
       // cards bounced off this lane and not yet re-accepted — gate/conflict
       // bounces (`bounced`) and BR#4962 coverage parks (`awaiting`) alike —
       // they sit OUTSIDE the derived queue (in_progress/blocked, awaiting a
@@ -15921,8 +16138,17 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         && queue.length > 0
         ? brQf.base_state : null;
       const stopActive: any = meta.stop ?? null;
+      let lane_state = resolveLaneOperationalState({
+        baseState: brQf?.base_state ?? null,
+        baseObservedAt: trainBaseObservedAt(brQf),
+        stop: stopActive,
+        currently: meta.currently ?? null,
+        now: now0,
+      });
+      const verifyingBase = lane_state.phase === "verifying_base" ? lane_state : null;
+      const repairScope = this.trainRepairScope(lane.repo, lane.base);
       let base_red_resolution: any = null;
-      if (brBase || stopActive || brGateBlocked) {
+      if (!verifyingBase && (brBase || stopActive || brGateBlocked)) {
         const nowActionObj: any = meta.lane?.now_action ?? null;
         const nowActionFresh = nowActionObj && now0 - Number(nowActionObj.at ?? 0) < 15 * 60_000;
         const mNowRed = nowActionFresh ? /^main still red \(red: ([^)]+)\)/.exec(String(nowActionObj.note ?? "")) : null;
@@ -15995,11 +16221,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const mergedQueue = [
           ...queue.map((q: any) => {
             const qfe = qfEntries.find((e: any) => String(e?.id ?? "") === String(q.id) || (Number(e?.pr) > 0 && Number(e?.pr) === Number(q.pr)));
-            return qfe?.cls ? { ...q, cls: String(qfe.cls) } : q;
+            return qfe?.cls ? { ...q, cls: String(qfe.cls), bypass: qfe.bypass } : q;
           }),
           ...qfEntries.filter((e: any) => !seenIds.has(String(e?.id ?? ""))),
         ];
-        const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name));
+        const rf = this.trainOpenRootFix(lane.repo, mergedQueue, reds.map((r: any) => r.name), lane.base);
         if (!rf.state.warrantAsk && !darkTipWarrantAsk && !gateBlockedWarrantAsk && askRow) {
           this.state.storage.sql.exec(
             `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -16059,43 +16285,39 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          // 2026-11-02 + BR#5679 + BR#6012 + BR#6389: the fix card prefers the
-          // episode's ROOT-FIX card (matching the live failing check names when
-          // multiple root-fix cards exist), then the gate-blocked diagnostic duty
-          // (when gate_blocked), then the project's open blocker/hotfix+main-red
-          // task, and falls back to stop.culprit_task ONLY when no fix card exists.
-          // Every returned card is enriched with live agent telemetry (owner,
-          // executor_session, active_agent, blocked_reason, last_progress).
+          // A culprit or an unrelated diagnostic cannot own the current red.
+          // Prefer the episode's repair, with a same-head active task as a
+          // display fallback while a journal repair is awaiting execution.
           fix_card: (() => {
+            const projectFix = () => repairScope.kind === "current"
+              ? this.trainFixCard(String(l.project ?? ""), lane.repo, reds.map((r: { name: string }) => r.name), now0,
+                { base: lane.base, head: repairScope.head_sha })
+              : null;
             if (rf.card) {
               const shownPr = rf.curePr ?? rf.conflictPr ?? rf.mergedPr ?? null;
-              return (
-                this.enrichFixCardRow(rf.card.id, now0, {
-                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
-                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
-                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
-                }) ?? {
-                  id: rf.card.id,
-                  url: this.cardUrl(rf.card.id),
-                  title: rf.card.title,
-                  status: rf.card.status,
-                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
-                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
-                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
-                }
-              );
+              const prFacts = {
+                ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
+                ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
+                ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
+              };
+              const root = this.enrichFixCardRow(rf.card.id, now0, prFacts);
+              if (!shownPr && !root?.active_agent) {
+                const bound = projectFix();
+                if (bound?.active_agent) return bound;
+              }
+              return root ?? {
+                id: rf.card.id,
+                url: this.cardUrl(rf.card.id),
+                title: rf.card.title,
+                status: rf.card.status,
+                ...prFacts,
+              };
             }
             if (brGateBlocked && meta.lane?.gate_blocked?.duty_id) {
               const gbDuty = this.enrichFixCardRow(String(meta.lane.gate_blocked.duty_id), now0);
               if (gbDuty && gbDuty.status !== "done" && gbDuty.status !== "superseded") return gbDuty;
             }
-            const projFix = this.trainFixCard(String((l as any).project ?? ""), lane.repo, reds.map((r: any) => r.name), now0);
-            if (projFix) return projFix;
-            const culpritId = String(stopActive?.culprit_task ?? "").trim();
-            if (culpritId) {
-              return this.enrichFixCardRow(culpritId, now0);
-            }
-            return null;
+            return projectFix();
           })(),
         };
       }
@@ -16135,15 +16357,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           unblock: "restart the merge-train gateway/executor onto the current build",
         };
       }
-      let lane_state = this.laneStore().operational(String(l.id)) ?? resolveLaneOperationalState({
-        baseState: brQf?.base_state ?? null,
-        stop: meta.stop ?? null,
-        currently: meta.currently ?? null,
-        fixCard: base_red_resolution?.fix_card ?? null,
-        now: now0,
-      });
       const diagnosticId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.duty_id
-        : starved ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
+        : starved && !isBaseRedNow && !stopActive ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
       const diagnostic = diagnosticId ? this.enrichFixCardRow(String(diagnosticId), now0) : null;
       const diagnosticAskId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.ask_id
         : starved ? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id : null;
@@ -16159,7 +16374,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const mergeResponse = mergeProbe ? { phase: "observed_merged", pr: responsePr, at: Number(mergeProbe.updated_ts), receipt: String(mergeProbe.receipt) }
         : pendingMerge && responsePr > 0 ? { phase: "recorded", pr: responsePr, at: Number(pendingMerge.at) } : null;
       const lineFacts = TrainLineFactsSchema.safeParse({
-        queue, currently: meta.currently ?? null, stop: meta.stop ?? null,
+        queue, currently: meta.currently ?? null, stop: meta.stop ?? null, verifying_base: verifyingBase,
         lease: meta.lease ?? null, capable, queue_facts: brQf,
         base_red_resolution, diagnostic, merge_response: mergeResponse,
         diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,
@@ -16171,40 +16386,38 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         blocker: "stale_observation", evidence: [], held: queue.length, observed_at: trainBaseObservedAt(brQf),
         remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
       };
-      let line = await this.ensureLineRecovery(l.id, projectedLine, now0);
+      const assignedLine = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
-      line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })));
-      latestMeta.lane = { ...latestMeta.lane, line };
-      this.saveLaneState(l.id, latestMeta, now0);
-      lane_state = this.laneStore().operational(String(l.id)) ?? lane_state;
-      // BR#4849: the red-main episode, hub-derived. The hub holds no VCS
-      // credentials (BR#3516) — it cannot see GitHub red itself — but every
-      // episode leaves a board record: the open root-blocker/main-red task.
-      // Derive the newest open one in the lane's project so the Top view
-      // banner answers "who is fixing it" — including the loudest possible
-      // answer: UNOWNED. last_merge (the lane's newest landed event) anchors
-      // "who broke it" when no machine culprit was stamped on the stop.
-      const project = lane.repo.split("/").pop() ?? "";
-      const redTask = this.state.storage.sql.exec(
-        `SELECT id, title, status, owner, meta, created_ts FROM artefacts
-         WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-           AND project = ? AND (tags LIKE '%"main-red"%' OR tags LIKE '%"root-blocker%"')
-         ORDER BY created_ts DESC LIMIT 1`,
-        project,
-      ).toArray()[0] ?? null;
-      let executorSession = "";
-      if (redTask) {
-        // the executor lease is meta.session, surfaced as executor_session for
-        // in_progress/in_review only (mirrors the orient serving, BR#3361 d)
-        try {
-          const rm = JSON.parse(String(redTask.meta ?? "{}"));
-          if (["in_progress", "in_review"].includes(String(redTask.status ?? ""))) executorSession = String(rm.session ?? "");
-        } catch { executorSession = ""; }
+      let line = withRecoveryEpisodes(assignedLine, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), repairScope);
+      if (repairScope.kind === "current" && line.phase === "stopped" && line.blocker === "main_failed"
+        && assignedLine.phase === "stopped" && assignedLine.blocker === "main_failed") {
+        const assigned = assignedLine.remediation;
+        // Journal history cannot replace a current active repair or an
+        // executable duty with a task whose heartbeat expired.
+        if ((assigned.kind === "agent" && line.remediation.kind !== "agent")
+          || (assigned.kind === "queued" && assigned.task.status === "todo"
+            && line.remediation.kind === "queued" && line.remediation.task.status === "in_progress")) {
+          line = { ...line, remediation: assigned };
+        }
       }
+      const baseRed = lineFacts.success ? lineFacts.data.base_red_resolution : null;
+      const stoppedMain = line.phase === "stopped" && line.blocker === "main_failed";
+      const redTask = stoppedMain && "task" in line.remediation
+        ? line.remediation.task : baseRed?.fix_card ?? null;
+      const ownership = stoppedMain && repairScope.kind === "current" ? {
+        failing_sha: repairScope.head_sha,
+        episode_phase: baseRed?.phase ?? "diagnosing" as const,
+        fix_card: redTask,
+      } : undefined;
+      latestMeta.lane = { ...latestMeta.lane, line };
+      lane_state = this.saveLaneState(l.id, latestMeta, now0, ownership) ?? lane_state;
+      const recordedRepair = lane_state.phase === "stopped_red" ? lane_state.fix_card : null;
+      const repairCreated = recordedRepair ? this.one(`SELECT created_ts FROM artefacts WHERE id = ?`, recordedRepair.id) : null;
       const lastMerge = this.state.storage.sql.exec(
         `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
-         WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+         WHERE kind = 'merged' AND repo = ? AND base = ? AND json_extract(detail, '$.historical') IS NOT 1
+         ORDER BY seq DESC LIMIT 1`,
         lane.repo, lane.base,
       ).toArray()[0] ?? null;
       // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued
@@ -16298,14 +16511,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         awaiting: awaitingRows,
         pr_stats: prStats,
         batches,
-        red_main: redTask
+        red_main: recordedRepair
           ? {
-              task_id: String(redTask.id),
-              title: String(redTask.title ?? ""),
-              status: String(redTask.status ?? ""),
-              owner: String(redTask.owner ?? ""),
-              executor_session: executorSession,
-              created_ts: Number(redTask.created_ts ?? 0),
+              task_id: recordedRepair.id,
+              title: recordedRepair.title,
+              status: recordedRepair.status,
+              owner: recordedRepair.owner ?? "",
+              executor_session: recordedRepair.executor_session ?? "",
+              created_ts: Number(repairCreated?.created_ts ?? 0),
             }
           : null,
         last_merge: lastMerge

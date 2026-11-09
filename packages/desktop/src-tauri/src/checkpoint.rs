@@ -3,6 +3,7 @@
 //! Remote publication/readback is mandatory. Failure preserves the local tree.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::fs;
 use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +19,14 @@ pub struct Checkpoint {
 }
 
 fn git(path: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
+    // A filesystem prerequisite cannot be repaired by replaying git every
+    // five seconds. Preserve the journal stage and report the actual cause;
+    // permission errors and symlinks are not proof that a workspace vanished.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {},
+        Ok(_) => return Err(format!("gate: checkpoint worktree is not a directory: {}", path.display())),
+        Err(error) => return Err(format!("gate: checkpoint worktree unavailable at {}: {error}; retained journal requires workspace reconciliation", path.display())),
+    }
     let mut cmd = Command::new("git");
     cmd.current_dir(path).args(args).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(index) = index { cmd.env("GIT_INDEX_FILE", index); }

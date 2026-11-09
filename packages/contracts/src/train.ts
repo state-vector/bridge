@@ -77,6 +77,7 @@ export const DeployCoverageStateSchema = z.discriminatedUnion("phase", [
     tip_age_secs: z.number().int().nonnegative(),
     covered_by_sha: z.string(),
     covered_by_run_id: z.number().int().positive().nullable().optional(),
+    covered_by_run_attempt: z.number().int().positive().nullable().optional(),
     covered_by_url: z.string().nullable().optional(),
   }),
   z.object({
@@ -170,7 +171,7 @@ export const BaseRedResolutionSchema = z.object({
 });
 export type BaseRedResolution = z.infer<typeof BaseRedResolutionSchema>;
 
-/** Canonical 4-state operational state machine for a merge lane (BR#6012):
+/** Canonical operational state machine for a merge lane (BR#6012):
  *  stored atomically in the `lane_state` SQLite table so the hub and UI never
  *  reconstruct lane state from contradictory fragments. */
 export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
@@ -193,6 +194,12 @@ export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
     merge_sha: z.string(),
     task_id: z.string().nullable(),
     merged_at: z.number(),
+    updated_ts: z.number(),
+  }),
+  z.object({
+    phase: z.literal("verifying_base"),
+    tip_sha: z.string().min(1),
+    verdict: z.enum(["unsettled", "green"]),
     updated_ts: z.number(),
   }),
   z.object({
@@ -277,4 +284,31 @@ export function mergePhaseOf(meta: unknown): MergeTrainPhase | null {
 export function isAwaitingMerge(meta: unknown): boolean {
   const p = mergePhaseOf(meta);
   return p === AWAITING_MERGE_PHASES[0] || p === AWAITING_MERGE_PHASES[1];
+}
+
+/** Current executor evidence owns the activity message. Historical card bounce
+ * metadata cannot diagnose the current PR head or override a later ready scan. */
+export type TrainCandidateActivity =
+  | { class: "awaiting-review"; note: string }
+  | { class: "held-checks"; note: string }
+  | { class: "waiting-checks"; note: string }
+  | { class: "merge-checks"; note: string };
+
+const ActivityFactsSchema = z.object({
+  at: z.number(),
+  entries: z.array(z.object({ id: z.string(), cls: TrainEntryClassSchema, error: z.string().optional() })),
+});
+
+export function trainCandidateActivity(head: string | null, facts: unknown, now: number): TrainCandidateActivity | null {
+  if (!head) return null;
+  const parsed = ActivityFactsSchema.safeParse(facts);
+  const current = parsed.success && now >= parsed.data.at && now - parsed.data.at < 15 * 60_000
+    ? parsed.data.entries.find(entry => entry.id === head) : undefined;
+  if (current?.error) return { class: "waiting-checks", note: `could not check ${head} — ${current.error}. Bridge will retry the check` };
+  switch (current?.cls) {
+    case "needs-review": return { class: "awaiting-review", note: `waiting on ${head} — the current PR head needs a fresh review before it can merge` };
+    case "blocked": case "conflict": return { class: "held-checks", note: `held on ${head} — PR has failing head checks or conflicts` };
+    case "waiting": return { class: "waiting-checks", note: `waiting on ${head} — PR checks or mergeability still running` };
+    case "ready": case undefined: return { class: "merge-checks", note: `working on ${head} — checking review, signatures and CI before merging` };
+  }
 }

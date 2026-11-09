@@ -137,6 +137,9 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.get_artefact,
     handler: async (args, ctx) => {
       const a = await ctx.call("get", { id: args.id });
+      // Mechanical execution must not wait on optional semantic discovery.
+      // This is the same canonical record, including admission and carry data.
+      if (args.view === "execution") return text(JSON.stringify(a));
       const rel = await ctx.call("relations", { id: args.id });
       // proactive surfacing: related work + docs, so agents discover overlap
       // and existing knowledge before they build. see seeAlso() above.

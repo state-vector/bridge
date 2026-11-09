@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -125,5 +125,108 @@ describe("durable execution failure boundaries", () => {
     expect(s.budget_exhaustions).toBe(1);
     s = step(s, { kind: "poll", ...fence }, 60_102);
     expect(s.budget_exhaustions).toBe(1);
+  });
+});
+
+describe("witnessed legacy recovery fences", () => {
+  function held() {
+    let s = step(started(), {kind:"quiesce",...fence,writers:"process_group_empty"});
+    s.budget_exhaustions = 3;
+    const terminal = {...fence,writers:"process_group_empty" as const,outcome:{kind:"failed" as const,exit_code:1,stdout_tail:"",stderr_tail:"acp session/prompt failed: Authentication required: provider authentication required "}};
+    s.terminal = terminal;
+    s.recovery_permit = {phase:"available",id:"permit",...fence,task_revision:"revision",checkpoint_commit:null,terminal:structuredClone(terminal),
+      proof:{id:"probe",host:"mac",backend:"opencode",model:"route",config_revision:"config",result:{kind:"succeeded",response_receipt:"request-read"},observed_at:150,
+        request:{kind:"configured_model_request",max_output_tokens:32000,tools:"none"},actual_model:"actual",configuration_receipt:"config-read",receipts:["request-read"],
+        witness:{kind:"configured_route_observed",configured_model:"route",allowed_actual_models:["actual"],configured_max_output_tokens:32000,observed_max_output_tokens:32000,configuration_receipt:"config-read"}},
+      diagnosis:"provider_authentication",continuation:"Reconcile existing output",evidence:["request-read"],authorized_by:"reviewer"};
+    return s;
+  }
+  const capability = {backend:"opencode",model:"route",config_revision:"config"} as const;
+  it("accepts a configured proxy receipt only for route recovery, with the observed request ceiling", () => {
+    const proof = held().recovery_permit!.proof;
+    const witness = { ...proof.witness, kind: "configured_proxy_request" as const };
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_route_unavailable")).toBe(true);
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_quota")).toBe(false);
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_authentication")).toBe(false);
+    expect(validRecoveryRequestProof({ ...proof, witness: { ...witness, observed_max_output_tokens: 1 } }, "provider_route_unavailable")).toBe(false);
+  });
+  it("invalidates proof for changed evidence, routing, work and age while preserving the record", () => {
+    const s=held();
+    expect(recoveryPermitMatches(s,capability,"mac","revision",200)).toBe(true);
+    for (const c of [{...capability,model:"other"},{...capability,config_revision:"new"}]) expect(recoveryPermitMatches(s,c,"mac","revision",200)).toBe(false);
+    expect(recoveryPermitMatches(s,capability,"other","revision",200)).toBe(false);
+    expect(recoveryPermitMatches(s,capability,"mac","new",200)).toBe(false);
+    for (const time of [149,300151]) expect(recoveryPermitMatches(s,capability,"mac","revision",time)).toBe(false);
+    const changed=structuredClone(s); changed.terminal!.outcome.stderr_tail="different";
+    expect(recoveryPermitMatches(changed,capability,"mac","revision",200)).toBe(false);
+    const changedCheckpoint=structuredClone(s); changedCheckpoint.attempt!.checkpoint=cp;
+    expect(recoveryPermitMatches(changedCheckpoint,capability,"mac","revision",200)).toBe(false);
+    for (const state of ["prepared","outcome_unknown"] as const) {
+      const unknown=structuredClone(s); unknown.operations=[{id:"write",action:"publish",input_revision:"old",deadline:1100,state,receipts:[]}];
+      expect(recoveryPermitMatches(unknown,capability,"mac","revision",200)).toBe(false);
+    }
+    const next=step(s,{...begin,attempt_id:"recovered"},200);
+    expect(next.budget_exhaustions).toBe(3);
+    expect(next.recovery_permit?.phase).toBe("consumed");
+    expect(next.terminal).toEqual(s.terminal);
+  });
+  it("recognizes the archived ACP routing failure without inferring exhausted credit", () => {
+    const stderr_tail = `acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=glm-5.3-flash. pre-call-checks=False, cooldown_list=['${"a".repeat(64)}'] `;
+    expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail})).toBe("provider_route_unavailable");
+    expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail:`tool output: ${stderr_tail}`})).toBeNull();
+  });
+  it("does not turn missing output or generic errors into provider diagnoses", () => {
+    for (const stderr_tail of ["No deployments available", "provider quota maybe", "test failed", ""]) {
+      expect(providerRecoveryDiagnosis({kind:"failed",exit_code:1,stdout_tail:"",stderr_tail})).toBeNull();
+    }
+    expect(providerRecoveryDiagnosis(held().terminal!.outcome)).toBe("provider_authentication");
+  });
+});
+
+describe("cause-preserving strategy attempts", () => {
+  it("counts a timeout generation once across poll and terminal accounting", () => {
+    let s=started(); s=step(s,{kind:"poll",...fence},60_101);
+    expect(s.budget_exhaustions).toBe(1);
+    chargeExecutionFailure(s,1); chargeExecutionFailure(s,1);
+    expect(s.budget_exhaustions).toBe(1);
+    chargeExecutionFailure(s,2); expect(s.budget_exhaustions).toBe(2);
+  });
+  it("admits a genuinely larger strategy with preserved history and bounded new failures", () => {
+    const s=started(); s.budget_exhaustions=3;
+    openLargerModelStrategy(s,"medium","The current model cannot resolve the cross-system invariant","independent_review","revision");
+    s.requirements.tier="medium";
+    expect(s.budget_exhaustions).toBe(3);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(false);
+    expect(executionAttemptBudgetExhausted(s,"changed")).toBe(true);
+    chargeExecutionFailure(s,1); // late old-strategy result must not spend new-strategy attempts
+    expect(s.retry_strategy?.failures).toBe(0);
+    for (const generation of [2,3,4]) chargeExecutionFailure(s,generation);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(true);
+    expect(s.budget_exhaustions).toBe(7);
+    expect(()=>openLargerModelStrategy(s,"medium","same strategy","independent_review","revision")).toThrow(/strictly increase/);
+    openLargerModelStrategy(s,"large","Need deeper reasoning","independent_review","revision");
+    expect(s.retry_strategy?.epoch).toBe(2);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(false);
+  });
+});
+
+describe("legacy timeout accounting migration", () => {
+  it("recognizes only an exact recorded timeout charge and never subtracts history", () => {
+    const begun=started(); begun.budget_exhaustions=2;
+    const polled=step(begun,{kind:"poll",...fence},60_101);
+    const legacy=structuredClone(polled); legacy.failure_charged_generation=null;
+    expect(legacyTimeoutChargeGeneration(legacy,begun,[polled])).toBe(1);
+    for(const wrong of [
+      {...polled,budget_exhaustions:2},
+      {...polled,attempt:{...polled.attempt!,attempt_id:"other"}},
+      {...polled,attempt:{...polled.attempt!,generation:2}},
+    ]) expect(legacyTimeoutChargeGeneration(legacy,begun,[wrong])).toBeNull();
+    expect(legacyTimeoutChargeGeneration(legacy,null,[polled])).toBeNull();
+    expect(legacyTimeoutChargeGeneration(legacy,begun,[])).toBeNull();
+    const interrupted=step(begun,{kind:"message",message_id:"stop",text:"Pause",priority:"interrupt"});
+    expect(legacyTimeoutChargeGeneration({...interrupted,failure_charged_generation:null},begun,[interrupted])).toBeNull();
+    legacy.failure_charged_generation=legacyTimeoutChargeGeneration(legacy,begun,[polled]);
+    chargeExecutionFailure(legacy,1);
+    expect(legacy.budget_exhaustions).toBe(3);
   });
 });
