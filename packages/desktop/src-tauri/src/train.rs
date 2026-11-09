@@ -1984,10 +1984,39 @@ enum BatchCandidateReadiness {
     Deferred(String),
 }
 
+const RETIRED_SP_DEPLOY_GATE: &str = "Deploy health (merge gate)";
+
+fn sp_deploy_gate_retired(ctx: &Ctx, repo: &str, base: &str, base_sha: &str) -> bool {
+    // Superpositional #3099 retired this exact candidate check and moved
+    // deployment health to the train's independent destination check.
+    const RETIREMENT: &str = "223e4e27f51b59876c45dcfd2ff33a9fded47a48";
+    if repo != "state-vector/superpositional" || base != "main" || base_sha.is_empty() {
+        return false;
+    }
+    let Ok(rules) = ctx.gh_json(&["api", &format!("repos/{repo}/rules/branches/main")]) else { return false; };
+    let Some(rules) = rules.as_array() else { return false; };
+    let mut checked = false;
+    for rule in rules.iter().filter(|rule| vstr(rule, "type") == Some("required_status_checks")) {
+        let Some(checks) = rule.pointer("/parameters/required_status_checks").and_then(Value::as_array) else { return false; };
+        if checks.iter().any(|check| vstr(check, "context").is_none_or(|name| name.eq_ignore_ascii_case(RETIRED_SP_DEPLOY_GATE))) {
+            return false;
+        }
+        checked |= !checks.is_empty();
+    }
+    checked && ctx.gh_json(&["api", &format!("repos/{repo}/compare/{RETIREMENT}...{base_sha}")])
+        .is_ok_and(|comparison| matches!(vstr(&comparison, "status"), Some("ahead" | "identical")))
+}
+
+fn omit_retired_deploy_gate(checks: &mut Vec<MainCheckRun>, retired: bool) {
+    if retired {
+        checks.retain(|check| !check.name.eq_ignore_ascii_case(RETIRED_SP_DEPLOY_GATE));
+    }
+}
+
 /// Recheck acceptance, exact head, signatures and CI at the write boundary.
 /// A scan position or an earlier ready result is never permission to merge.
 fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
-    base_verdict: MainVerdict, base_red_names: &[String]) -> Result<BatchCandidateReadiness, String> {
+    base_verdict: MainVerdict, base_red_names: &[String], base_sha: &str) -> Result<BatchCandidateReadiness, String> {
     use crate::train_gate::{classify_candidate_gate_phase, classify_head_checks, CandidateGatePhase};
     use BatchCandidateReadiness::{Deferred, Ready, Recomputing};
 
@@ -2008,9 +2037,12 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
     if vstr(&facts, "baseRefName").is_some_and(|current| current != base) {
         return Ok(Deferred("the PR now targets a different base branch".into()));
     }
-    let CheckRunRead::Complete(checks) = ctx.read_check_runs(repo, &cand.head_sha) else {
+    let CheckRunRead::Complete(mut checks) = ctx.read_check_runs(repo, &cand.head_sha) else {
         return Err("GitHub did not return complete candidate check and workflow evidence".into());
     };
+    if base_verdict == MainVerdict::Green && checks.iter().any(|check| check.name.eq_ignore_ascii_case(RETIRED_SP_DEPLOY_GATE)) {
+        omit_retired_deploy_gate(&mut checks, sp_deploy_gate_retired(ctx, repo, base, base_sha));
+    }
     let commits = ctx.pr_commits(repo, cand.pr);
     let input = crate::train_gate::TrainGateInput {
         pr_number: cand.pr, head_sha: &cand.head_sha, card_meta: &meta,
@@ -3042,6 +3074,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         .and_then(|value| serde_json::from_value::<QueueScan>(value).ok()).unwrap_or(QueueScan::Complete);
     let scan_order = queue_scan_order(&queue, &previous_scan);
     let mut visited = Vec::new();
+    let mut retired_deploy_gate = None;
     let ready_limit = if burst_cap == 0 { 10 } else { (burst_cap as usize).min(10) };
     ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
     for &qi in &scan_order {
@@ -3266,7 +3299,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // rule make the cited-verdict-must-be-the-live-verdict invariant:
         // a cache may speed renders, it must never feed a merge or
         // self-heal decision.
-        let head_checks = ctx.check_runs(repo, &head_sha);
+        let mut head_checks = ctx.check_runs(repo, &head_sha);
+        if gate_base == MainVerdict::Green && head_checks.iter().any(|check| check.name.eq_ignore_ascii_case(RETIRED_SP_DEPLOY_GATE)) {
+            let retired = *retired_deploy_gate.get_or_insert_with(|| sp_deploy_gate_retired(ctx, repo, base, &probed_base_sha));
+            omit_retired_deploy_gate(&mut head_checks, retired);
+        }
         let commits = ctx.pr_commits(repo, pr);
         // BR#4689 L1.4: an uncovered head earns ONE mechanical-carry probe —
         // a content-preserving rebase (same patch-ids) carries the verdict
@@ -3896,7 +3933,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 landing_red = live.red.iter().map(|r| r.name.clone()).collect();
                 landing_base = if own_batch_still_running { MainVerdict::Green } else { live.verdict };
             }
-            let ready = candidate_ready_to_land(ctx, repo, base, cand, landing_base, &landing_red);
+            let ready = candidate_ready_to_land(ctx, repo, base, cand, landing_base, &landing_red, expected_tip);
             let Ok(BatchCandidateReadiness::Recomputing(reason)) = &ready else { break ready; };
             if !exact_own_prefix { break ready; }
             let Some(delay) = recheck_delays.next() else { break ready; };
@@ -6596,6 +6633,32 @@ mod tests {
             sh_mock: None,
             last_lane_card: None,
         }
+    }
+
+    #[test]
+    fn retired_superpositional_gate_requires_live_rules_and_retirement_ancestry() {
+        let mut ctx = test_ctx("http://fixture.invalid");
+        let repo = "state-vector/superpositional";
+        let tip = "4447e53d822aada1f4e73a8fe76a1cec9bd9ebb4";
+        let required = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let required_at_read = required.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |_, args| {
+            let endpoint = args.get(1).copied().unwrap_or_default();
+            if endpoint.ends_with("/rules/branches/main") {
+                let context = if required_at_read.load(std::sync::atomic::Ordering::SeqCst) { RETIRED_SP_DEPLOY_GATE } else { "ci / Rust Tests" };
+                return Some(Ok(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":context}]}}]).to_string()));
+            }
+            if endpoint.contains("/compare/") {
+                let status = if endpoint.ends_with(tip) { "ahead" } else { "diverged" };
+                return Some(Ok(json!({"status": status}).to_string()));
+            }
+            None
+        }));
+        assert!(sp_deploy_gate_retired(&ctx, repo, "main", tip));
+        assert!(!sp_deploy_gate_retired(&ctx, repo, "main", "other-head"));
+        assert!(!sp_deploy_gate_retired(&ctx, "org/other", "main", tip));
+        required.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!sp_deploy_gate_retired(&ctx, repo, "main", tip));
     }
 
     fn lane() -> Value {
