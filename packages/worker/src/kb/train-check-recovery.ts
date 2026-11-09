@@ -13,10 +13,12 @@ import { CheckRetryCommandSchema, checkObligationKey, checkRetryScopeKey, checkR
  *    repeated on the strength of a new green stamp alone.
  *  BR#9268: the obligation identity now carries the check-run producer class
  *  (native Actions job vs published report) when the observation carries it.
- *  The migration is fenced BOTH ways: a producer-typed reservation sees the
- *  pre-split collapsed scope's rows too, so an unreconciled dispatch of the
- *  legacy identity stays fenced (an unknown effect is never re-armed by an
- *  identity split), while a TERMINAL collapsed row does not consume the
+ *  The migration is fenced BOTH ways — the fence is SYMMETRIC across the
+ *  split: a producer-typed reservation sees the pre-split collapsed scope's
+ *  rows, AND a legacy-shape reservation sees producer-typed rows of the same
+ *  name/app/suite scope, so an unreconciled dispatch of either identity
+ *  stays fenced (an unknown effect is never re-armed by an identity
+ *  migration), while a TERMINAL collapsed row does not consume the
  *  freshly-identified native job's own one-dispatch-ever budget (its target
  *  was some other check of the collapsed obligation — rerequesting the
  *  published report shell is exactly what it must not be counted against). */
@@ -24,14 +26,20 @@ export class TrainCheckRecovery {
   constructor(private storage: DurableObjectStorage) {}
 
   /** Rows for one (task, head, obligation) scope across BOTH identities of
-   *  BR#9268's producer split: the producer-typed key plus the pre-split
-   *  collapsed key (scope_key '' predates the column; legacy rows are keyed
-   *  by their bare retry key). For a legacy caller the two keys coincide, so
-   *  the query is behaviour-identical to the pre-split one-identity shape. */
-  private scopeRows(lane: string, scopeKey: string, legacyKey: string): Array<{ retry_key: string; state: string; receipt: string }> {
+   *  BR#9268's producer split: the caller's exact identity (producer-typed
+   *  when the observation carries a producer) plus the pre-split collapsed
+   *  identity. Every row is WRITTEN with scope_key = the collapsed key (see
+   *  the inserts below), so scope_key indexes the whole name/app/suite
+   *  scope for both directions of the split; rows that predate the column
+   *  (scope_key '' — every production BR#8824 row) are still found by their
+   *  bare retry_key, which was always the collapsed key. For a legacy
+   *  caller the two keys coincide, so the query is behaviour-identical to
+   *  the pre-split one-identity shape over legacy rows — but it now ALSO
+   *  sees producer-typed rows of the same scope: the fence is symmetric. */
+  private scopeRows(lane: string, exactKey: string, collapsedKey: string): Array<{ retry_key: string; state: string; receipt: string }> {
     return this.storage.sql.exec(
       `SELECT retry_key,state,receipt FROM train_check_retries WHERE lane_id=? AND (retry_key=? OR scope_key=? OR retry_key=? OR scope_key=?)`,
-      lane, scopeKey, scopeKey, legacyKey, legacyKey,
+      lane, exactKey, exactKey, collapsedKey, collapsedKey,
     ).toArray().map((r: any) => ({ retry_key: String(r.retry_key), state: String(r.state), receipt: String(r.receipt) }));
   }
 
@@ -66,7 +74,7 @@ export class TrainCheckRecovery {
           if (old) return { kind: "held" as const, key: scopedKey, state: old.state, receipt: old.receipt };
           this.storage.sql.exec(
             `INSERT INTO train_check_retries(lane_id,retry_key,state,receipt,updated_ts,scope_key) VALUES(?,?,'prepared',?,?,?)`,
-            lane, scopedKey, JSON.stringify(command.target), now, scopeKey);
+            lane, scopedKey, JSON.stringify(command.target), now, legacyKey);
           return { kind: "reserved" as const, key: scopedKey };
         }
         // ordinary_head_check (and legacy callers): the bare scope key is the
@@ -82,7 +90,7 @@ export class TrainCheckRecovery {
         if (old) return { kind: "held" as const, key: scopeKey, state: old.state, receipt: old.receipt };
         this.storage.sql.exec(
           `INSERT INTO train_check_retries(lane_id,retry_key,state,receipt,updated_ts,scope_key) VALUES(?,?,'prepared',?,?,?)`,
-          lane, scopeKey, JSON.stringify(command.target), now, scopeKey);
+          lane, scopeKey, JSON.stringify(command.target), now, legacyKey);
         return { kind: "reserved" as const, key: scopeKey };
       }
       const row = this.storage.sql.exec(`SELECT state,receipt FROM train_check_retries WHERE lane_id=? AND retry_key=?`, lane, command.key).toArray()[0];

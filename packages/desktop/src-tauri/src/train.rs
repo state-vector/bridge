@@ -1225,7 +1225,7 @@ fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget
         // GITHUB_TOKEN): `check-runs/{id}/rerequest` re-executes nothing —
         // the BR#9081 no-op burn. Dispatch the producing workflow or the
         // native gate job instead; never rerequest the shell.
-        CheckSource::CheckRun { producer: CheckRunProducer::Published, .. } if *app_id == GITHUB_ACTIONS_APP_ID => {
+        CheckSource::CheckRun { app_id, producer: CheckRunProducer::Published, .. } if *app_id == GITHUB_ACTIONS_APP_ID => {
             Err("A GitHub Actions app published check run is a report, not a job — rerequest re-executes nothing (BR#9268); dispatch the native gate job or the producing workflow".into())
         }
         // A third-party app's published check run honors
@@ -5983,7 +5983,7 @@ mod tests {
         assert!(matches!(runs[1].source, crate::train_gate::CheckSource::CheckRun { producer: crate::train_gate::CheckRunProducer::Published, .. }));
         // The reader's classification keeps the two obligations distinct:
         // each red judges its own class (both red here — the live sweep shape).
-        let verdict = classify_head_checks(&runs);
+        let verdict = crate::train_gate::classify_head_checks(&runs);
         assert_eq!(verdict.verdict, MainVerdict::Red);
         assert_eq!(verdict.red.len(), 2, "native and published reds are independent obligations");
     }
