@@ -3666,7 +3666,7 @@ fn spawn_opencode(
     if let Err(error) = allocation.bind(&lifecycle::Ownership::Attempt { ticket, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: attempt_id.clone() }) {
         dlog(tid, &format!("workspace exact ownership could not be persisted; no writer launched: {error}")); return;
     }
-    let control = match gateway_pipeline::arm_launch(cfg, tid, generation, &attempt_id, worktree.clone(), cancel.clone()) {
+    let control = match gateway_pipeline::arm_launch(cfg, tid, generation, &attempt_id, worktree.clone(), cancel.clone(), gateway_pipeline::LaunchStage::Preparing) {
         Ok(control) => control,
         Err(error) => { dlog(tid, &format!("launch intent could not be persisted; no writer launched: {error}")); return; },
     };
@@ -3713,6 +3713,11 @@ fn spawn_opencode(
             .to_string(),
         )
     };
+    if let Err(error) = gateway_pipeline::cross_launch_boundary(cfg, tid, generation, &execution.attempt_id) {
+        execution.stop_maintenance();
+        dlog(tid, &format!("launch boundary could not be persisted; no writer launched: {error}"));
+        return;
+    }
     let completed = Arc::new(AtomicBool::new(false));
     if worker_session::supported() {
         execution.stop_maintenance();

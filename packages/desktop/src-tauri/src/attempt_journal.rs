@@ -85,14 +85,19 @@ impl Record {
         Ok(())
     }
     pub fn name(&self) -> String {
-        let (kind, generation, attempt) = match &self.owner {
-            Ownership::Reservation { .. } => ("reservation", "0".into(), ""),
-            Ownership::Attempt { generation, attempt_id, .. } => ("attempt", generation.to_string(), attempt_id.as_str()),
-        };
-        format!("{}.json", stable_key(&[&self.url, &self.host, kind, &self.ticket().task_id, &self.ticket().session, &generation, attempt]))
+        record_name(&self.url, &self.host, &self.owner)
     }
     pub fn command_id(&self, stage: &str) -> String { format!("attempt-journal-v1-{}-{stage}", self.name()) }
     pub fn ticket(&self) -> &Ticket { self.owner.ticket() }
+}
+
+pub fn record_name(url: &str, host: &str, owner: &Ownership) -> String {
+        let (kind, generation, attempt) = match owner {
+            Ownership::Reservation { .. } => ("reservation", "0".into(), ""),
+            Ownership::Attempt { generation, attempt_id, .. } => ("attempt", generation.to_string(), attempt_id.as_str()),
+        };
+        let ticket = owner.ticket();
+        format!("{}.json", stable_key(&[url, host, kind, &ticket.task_id, &ticket.session, &generation, attempt]))
 }
 
 pub fn save(root: &Path, record: &Record) -> Result<(), String> {

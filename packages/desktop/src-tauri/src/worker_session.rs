@@ -374,7 +374,7 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     if a["generation"] != *generation || a["attempt_id"] != *attempt_id || a["host"] != *host || a["session"] != ticket.session || a["phase"] != "running" || a["lease_until"].as_u64().unwrap_or(0) < now_ms().saturating_add(90_000) { return unlaunched(&spec, "gate: worker no longer owns its live exact execution fence".into()); }
     journal::write_file(&root.join("started.json"), &serde_json::to_vec(&spec.owner).unwrap())?;
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(ticket.task_id.clone(), (*generation, attempt_id.clone()));
-    let control = match gateway_pipeline::arm_launch(&spec.cfg, &ticket.task_id, *generation, attempt_id, spec.worktree.clone(), None) { Ok(control) => control, Err(error) => return unlaunched(&spec, error) };
+    let control = match gateway_pipeline::arm_launch(&spec.cfg, &ticket.task_id, *generation, attempt_id, spec.worktree.clone(), None, gateway_pipeline::LaunchStage::MayHaveLaunched) { Ok(control) => control, Err(error) => return unlaunched(&spec, error) };
     let mut runtime = ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(control), maintenance: None };
     runtime.control.grant_lease();
     let live = Arc::new(Mutex::new(String::new())); runtime.start_maintenance_every(&spec.cfg, &ticket.task_id, live.clone(), lease_interval);

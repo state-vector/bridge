@@ -51,34 +51,96 @@ fn remove_reservation(cfg: &DispatchConfig, ticket: &Ticket) -> Result<(), Strin
 }
 
 /// Persist the exact owner/worktree BEFORE the transport may create a process.
-/// An intent without a launch identity is uncertainty, never not-launched proof.
-pub(super) fn arm_launch(cfg: &DispatchConfig, task: &str, generation: u64, attempt_id: &str, worktree: Option<PathBuf>, cancel: Option<Arc<AtomicBool>>) -> Result<crate::transport::RunControl, String> {
+/// Recovery may prove no launch only while the journal is still preparing.
+pub(super) fn arm_launch(cfg: &DispatchConfig, task: &str, generation: u64, attempt_id: &str, worktree: Option<PathBuf>, cancel: Option<Arc<AtomicBool>>, stage: LaunchStage) -> Result<crate::transport::RunControl, String> {
     let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id: task.into(), session: claim_session(cfg, task) }, host: cfg.label.clone().ok_or("gateway host missing")?, generation, attempt_id: attempt_id.into() },
         host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending,
         process: None, work: Work::UnknownWriter { reason: "Launch intent persisted; process/result proof must be reconciled".into() } };
     let launch_root = root(cfg)?.join("launches");
     // Worktree location is retained alongside intent even if transport never
     // returns. The writer/result record replaces this only after physical proof.
-    let intent = Launch { record, worktree };
-    journal::write_file(&launch_root.join(intent.record.name()), &serde_json::to_vec(&intent).map_err(|e| e.to_string())?)?;
+    let path = launch_root.join(record.name());
+    let intent = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let existing: Launch = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if existing.record.owner != record.owner || !matches!(existing.stage, LaunchStage::MayHaveLaunched) {
+                return Err("gate: existing launch journal is outside the worker fence".into());
+            }
+            existing
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let intent = Launch { record, worktree, stage };
+            journal::write_file(&path, &serde_json::to_vec(&intent).map_err(|e| e.to_string())?)?;
+            intent
+        },
+        Err(error) => return Err(error.to_string()),
+    };
     let environment = workspace::Owner::open(cfg)?.environment_for(&intent.record.owner.ticket())?;
     Ok(crate::transport::RunControl::with_cancel(cancel).with_environment(environment).observe_launch(move |process| {
-        let mut launched = intent.clone(); launched.record.process = Some(process);
+        let mut launched = intent.clone(); launched.stage = LaunchStage::MayHaveLaunched; launched.record.process = Some(process);
         journal::write_file(&launch_root.join(launched.record.name()), &serde_json::to_vec(&launched).map_err(|e| e.to_string())?)
     }))
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Launch { record: Record, worktree: Option<PathBuf> }
-pub(super) fn workspace_launch_exists(cfg: &DispatchConfig, ticket: &Ticket) -> Result<bool, String> {
+struct Launch {
+    record: Record,
+    worktree: Option<PathBuf>,
+    #[serde(default)]
+    stage: LaunchStage,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LaunchStage {
+    Preparing,
+    #[default]
+    MayHaveLaunched,
+}
+
+impl Launch {
+    fn unstarted_work(&self, reason: String) -> Option<Work> {
+        if !matches!(self.stage, LaunchStage::Preparing) || self.record.process.is_some() { return None; }
+        Some(Work::Stopped {
+            outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None },
+            writers: WriterProof::ProcessGroupEmpty,
+            worktree: self.worktree.clone(),
+            step: Step::Stop,
+        })
+    }
+}
+
+pub(super) fn cross_launch_boundary(cfg: &DispatchConfig, task: &str, generation: u64, attempt_id: &str) -> Result<(), String> {
+    let ticket = Ticket { task_id: task.into(), session: claim_session(cfg, task) };
+    let host = cfg.label.clone().ok_or("gateway host missing")?;
+    let owner = Ownership::Attempt { ticket, host: host.clone(), generation, attempt_id: attempt_id.into() };
     let root = root(cfg)?.join("launches");
-    let entries = match std::fs::read_dir(root) { Ok(entries) => entries, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false), Err(e) => return Err(e.to_string()) };
+    let mut launch: Launch = serde_json::from_slice(&std::fs::read(root.join(journal::record_name(cfg.url.trim_end_matches('/'), &host, &owner))).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if launch.record.owner != owner || !matches!(launch.stage, LaunchStage::Preparing) {
+        return Err("gate: launch journal is outside the original preparation fence".into());
+    }
+    launch.stage = LaunchStage::MayHaveLaunched;
+    journal::write_file(&root.join(launch.record.name()), &serde_json::to_vec(&launch).map_err(|e| e.to_string())?)
+}
+fn launches_for(cfg: &DispatchConfig, ticket: &Ticket) -> Result<Vec<Launch>, String> {
+    let root = root(cfg)?.join("launches");
+    let entries = match std::fs::read_dir(root) { Ok(entries) => entries, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()), Err(e) => return Err(e.to_string()) };
+    let mut launches = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
         let launch: Launch = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        if launch.record.ticket() == ticket { return Ok(true); }
+        if launch.record.ticket() == ticket {
+            launch.record.validate()?;
+            if launch.record.host != cfg.label.as_deref().unwrap_or_default() || launch.record.url != cfg.url.trim_end_matches('/') {
+                return Err("gate: launch journal belongs to another originating host/hub".into());
+            }
+            launches.push(launch);
+        }
     }
-    Ok(false)
+    Ok(launches)
+}
+pub(super) fn workspace_launch_exists(cfg: &DispatchConfig, ticket: &Ticket) -> Result<bool, String> {
+    Ok(!launches_for(cfg, ticket)?.is_empty())
 }
 pub(super) fn workspace_release_receipt(cfg: &DispatchConfig, owner: &Ownership) -> Result<Option<Released>, String> {
     let record = Record { owner: owner.clone(), host: cfg.label.clone().ok_or("gateway host missing")?, url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(),
@@ -145,15 +207,35 @@ fn prepare(shared: &Config, snap: &SharedSnapshot, input: Input, cancel: Arc<Ato
             generation: running.execution.generation, attempt_id: running.execution.attempt_id.clone() }, value: running },
         result => {
             let reason = result.err().unwrap_or_else(|| "Preparation returned before an agent writer launched".into());
-            // A begun-but-unlaunched attempt uses the very same terminal path.
-            if let Ok(state) = execution_request(&cfg, &ticket.task_id, &ticket.session, &format!("prepare-inspect-{}", now_ms()), json!({"kind":"inspect"})) {
-                let a = &state["attempt"];
-                if a["session"] == ticket.session && a["host"].as_str() == cfg.label.as_deref() {
-                    if let (Some(generation), Some(attempt_id)) = (a["generation"].as_u64(), a["attempt_id"].as_str()) {
-                        let owner = Ownership::Attempt { ticket: ticket.clone(), host: cfg.label.clone().unwrap(), generation, attempt_id: attempt_id.into() };
-                        let record = Record { owner: owner.clone(), host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
-                            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+            // The preparation journal owns the exact fence even if the hub
+            // is unreachable. Crossing the launch boundary requires proof
+            // from the worker, including when launch itself returns an error.
+            if let Ok(launches) = launches_for(&cfg, &ticket) {
+                if let [launch] = launches.as_slice() {
+                    let work = launch.unstarted_work("Gateway stopped during preparation before a writer could launch".into());
+                    let mut record = launch.record.clone();
+                    let owner = record.owner.clone();
+                    if let Some(work) = work {
+                        record.work = work;
                         return Prepared::Finalize { owner, value: FinalWork::Fresh(record) };
+                    }
+                    // The independent writer still owns publication of its
+                    // terminal WAL. An observer must not occupy that path.
+                    return Prepared::Finalize { owner, value: FinalWork::Observe(record) };
+                }
+                // A live preparation that never wrote a launch intent has
+                // not invoked either transport. This also covers a lost begin ACK.
+                if launches.is_empty() {
+                    if let Ok(state) = execution_request(&cfg, &ticket.task_id, &ticket.session, &format!("prepare-inspect-{}", now_ms()), json!({"kind":"inspect"})) {
+                        let a = &state["attempt"];
+                        if a["session"] == ticket.session && a["host"].as_str() == cfg.label.as_deref() {
+                            if let (Some(generation), Some(attempt_id)) = (a["generation"].as_u64(), a["attempt_id"].as_str()) {
+                                let owner = Ownership::Attempt { ticket: ticket.clone(), host: cfg.label.clone().unwrap(), generation, attempt_id: attempt_id.into() };
+                                let record = Record { owner: owner.clone(), host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
+                                    work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone(), cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+                                return Prepared::Finalize { owner, value: FinalWork::Fresh(record) };
+                            }
+                        }
                     }
                 }
             }
@@ -434,11 +516,17 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
     worker_session::with_stopped_worker(cfg, record, apply, |worktree| {
         if apply {
             let terminal = terminal_root(cfg)?;
-            let original = std::fs::read(terminal.join(record.name())).map_err(|e| e.to_string())?;
-            let saved: Record = serde_json::from_slice(&original).map_err(|e| e.to_string())?;
-            if !writer_observable(&saved) || saved.owner != record.owner { return Err("A real result arrived; preserve normal delivery".into()); }
-            let archive = root(cfg)?.join("reconciled-writer-proofs").join(record.name());
-            if !archive.exists() { journal::write_file(&archive, &original)?; }
+            let saved = match std::fs::read(terminal.join(record.name())) {
+                Ok(original) => {
+                    let saved: Record = serde_json::from_slice(&original).map_err(|e| e.to_string())?;
+                    if !writer_observable(&saved) || saved.owner != record.owner { return Err("A real result arrived; preserve normal delivery".into()); }
+                    let archive = root(cfg)?.join("reconciled-writer-proofs").join(record.name());
+                    if !archive.exists() { journal::write_file(&archive, &original)?; }
+                    saved
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => record.clone(),
+                Err(error) => return Err(error.to_string()),
+            };
             let outcome = match &saved.work {
                 Work::Unproven { outcome, .. } => outcome.clone(),
                 _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into(), cause: None },
@@ -559,6 +647,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
             let path = entry.map_err(|e| e.to_string())?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
             let launch: Launch = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| format!("gate: launch journal unreadable: {e}"))?;
+            let unstarted = launch.unstarted_work("Gateway stopped during preparation before a writer could launch".into());
             let mut record = launch.record; record.validate()?;
             if record.host != host || record.url != cfg.url { return Err("gate: launch journal belongs to another originating host/hub".into()); }
             if !known.insert(record.ticket().clone()) { continue; }
@@ -568,6 +657,8 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
             record.work = if state["terminal"]["generation"] == *generation && state["terminal"]["attempt_id"] == *attempt_id {
                 Work::Stopped { outcome: serde_json::from_value(state["terminal"]["outcome"].clone()).map_err(|e| format!("gate: recovered terminal outcome drift: {e}"))?,
                     writers: serde_json::from_value(state["terminal"]["writers"].clone()).map_err(|e| format!("gate: recovered writer proof drift: {e}"))?, worktree: launch.worktree, step: Step::Stop }
+            } else if let Some(work) = unstarted {
+                work
             } else {
                 Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into(), cause: None }, worktree: launch.worktree }
             };
@@ -991,7 +1082,7 @@ pub(crate) mod tests {
             work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into(),cause:None},worktree:Some(wip.clone())}};
         journal::insert(&terminal,record.clone()).unwrap();
         let launch_path=root(&cfg).unwrap().join("launches").join(record.name());
-        let launch=serde_json::to_vec(&Launch {record:record.clone(),worktree:Some(wip.clone())}).unwrap();
+        let launch=serde_json::to_vec(&Launch {record:record.clone(),worktree:Some(wip.clone()),stage:LaunchStage::MayHaveLaunched}).unwrap();
         journal::write_file(&launch_path,&launch).unwrap();
         let original = std::fs::read(terminal.join(record.name())).unwrap();
         let reservation = reservation_path(&cfg,&ticket).unwrap(); journal::write_file(&reservation,b"newer attempt with the SAME session").unwrap();
@@ -1088,6 +1179,41 @@ pub(crate) mod tests {
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
         drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
+    #[test]
+    fn recovery_finalizes_only_launches_that_never_crossed_the_boundary() {
+        let hub = Hub::new(|request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "schedule" => Some(json!({"kind":"no_eligible_work"})),
+                "inspect" => Some(json!({})),
+                other => panic!("recovery should only inspect the hub, got {other}"),
+            }
+        });
+        let (cfg, ready, _) = fixture(&hub);
+        let task = "preparation-fixture";
+        let session = claim_session(&cfg, task);
+        arm_launch(&cfg, task, 1, "before-boundary", None, None, LaunchStage::Preparing).unwrap();
+        let recovered = recover(&ready.data, Vec::new()).unwrap();
+        assert!(matches!(recovered.as_slice(), [Recovered::Final(_, FinalWork::Journal(record))]
+            if matches!(record.work, Work::Stopped { writers: WriterProof::ProcessGroupEmpty, .. })));
+        let terminal = terminal_root(&cfg).unwrap();
+        std::fs::remove_dir_all(terminal).unwrap();
+        assert_eq!(claim_session(&cfg, task), session);
+        cross_launch_boundary(&cfg, task, 1, "before-boundary").unwrap();
+        // The independent worker arms its transport again after the parent
+        // starts the unit. This must never rewind the launch boundary.
+        arm_launch(&cfg, task, 1, "before-boundary", None, None, LaunchStage::MayHaveLaunched).unwrap();
+        let recovered = recover(&ready.data, Vec::new()).unwrap();
+        assert!(matches!(recovered.as_slice(), [Recovered::Final(_, FinalWork::Journal(record))]
+            if matches!(record.work, Work::Unproven { .. })));
+        let launch = launches_for(&cfg, &Ticket { task_id: task.into(), session }).unwrap().pop().unwrap();
+        let mut legacy = serde_json::to_value(launch).unwrap();
+        legacy.as_object_mut().unwrap().remove("stage");
+        assert!(serde_json::from_value::<Launch>(legacy).unwrap().unstarted_work(String::new()).is_none());
+        drop(ready);
+        let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
     #[test]
     fn offline_reservation_recovery_is_controller_fenced_read_only_by_default_and_exact() {
         let hub=Hub::new(|request| {
