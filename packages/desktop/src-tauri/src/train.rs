@@ -3687,10 +3687,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         return Ok(());
     }
 
-    // ---- PHASE C (BR#4996): land the batch back-to-back — no settle
-    // between members. The per-member merge leg law is the standing law
-    // (BR#4934): machine-clean update first (the verdict carries), then
-    // merge. Before EACH member: the burst cap (drain_burst_decision) and
+    // ---- PHASE C (BR#4996): land exact reviewed heads back-to-back, with
+    // no settle between members. A native up-to-date refusal may trigger
+    // strict branch repair. Before EACH member: the burst cap (drain_burst_decision) and
     // the mid-drain tip RED classify (GH#2261). A refused merge
     // soft-breaks: pass_merged > 0 settles the landed prefix and ends the
     // tick; pass_merged == 0 keeps the loud tick error. Every merged event
@@ -4044,13 +4043,8 @@ fn settle_ancestors(ctx: &mut Ctx, repo: &str, base: &str, tip_sha: &str) -> Res
     Ok(out)
 }
 
-/// BR#4934 §6: the settle wait is the rebase window. ONE machine-clean leg
-/// per tick: the first queued head that is BEHIND base and verdict-covered
-/// at its CURRENT head gets `gh pr update-branch` (trial-merge first — a
-/// conflict bounces with the file list, human-resolved), then the hub
-/// appends the carry record (train.carry) so the verdict covers the moved
-/// head (BR#3516 §5). Parked awaiting-ci legs are skipped — the settle owns
-/// them; the identity gate withholds the write from a non-worker credential.
+/// Probe queued heads during the settle wait so confirmed conflicts can go
+/// to repair while deployment runs. Clean heads stay ready for direct merge.
 fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) -> Result<(), String> {
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
     for (qi, head) in queue.iter().enumerate() {
