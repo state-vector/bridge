@@ -47,6 +47,17 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("never reserves or claims the configured standing alarm sink", async () => {
+    const project = "anchor", g = await gateway(project);
+    const sink = await task(project);
+    expect((await post("admin.settings_set", { settings: { train_alarm_sink_id: sink } })).error).toBeUndefined();
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", eligible: 0 });
+    expect((await post("transition", { id: sink, to: "in_progress", actor: "operator", session: "anchor-test" })).error)
+      .toMatch(/standing infrastructure/);
+    const board = await (await stub.fetch("https://kb/board", { method: "GET" })).json() as { tasks: { id: string; meta: unknown }[] };
+    expect(board.tasks.find(task => task.id === sink)).toMatchObject({ meta: { infra_anchor: true } });
+  });
+
   it.each(["configured_route_observed", "configured_proxy_request", "verified_route_event"])("admits one %s recovery through scheduler and begin without erasing failures", async (witnessKind) => {
     const event = witnessKind === "verified_route_event";
     const proxy = witnessKind !== "configured_route_observed";

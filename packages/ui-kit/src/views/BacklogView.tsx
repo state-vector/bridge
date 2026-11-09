@@ -89,7 +89,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
   const tagTheme = useTagTheme(tasks.filter((t) => !["done", "superseded"].includes((t as any).status)));
 
   const groups = useMemo<BlGroup[]>(() => {
-    const ts = tasks as any[];
+    const ts = (tasks as any[]).filter(t => !t.meta?.infra_anchor);
     const parentOf = new Map<string, string>();
     for (const t of ts) if (t.part_of) parentOf.set(t.id, t.part_of);
     const inReviewIds = new Set(ts.filter((t) => t.status === "in_review").map((t) => t.id));

@@ -2208,15 +2208,15 @@ export class KnowledgeHub {
    *  unblock duty can ever clear it and a capped spawner leaves an expired
    *  atom in place forever (the BR#3124 zombie park). Such anchors must rest
    *  parked on a typed wait the machine itself re-arms. */
-  private isUnclaimableAnchor(r: any, meta: any): boolean {
-    if (meta?.infra_anchor === true) return true;
-    const sinks = new Set(
-      [
-        this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-        this.settingValue("reconcile_alarm_sink_id", TRAIN_ALARM_SINK_ID),
-      ].filter(Boolean).map(String),
-    );
-    return sinks.has(String(r?.id ?? ""));
+  private alarmSinkIds(): Set<string> {
+    return new Set([
+      this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+      this.settingValue("reconcile_alarm_sink_id", TRAIN_ALARM_SINK_ID),
+    ].filter(Boolean).map(String));
+  }
+
+  private isUnclaimableAnchor(r: { id?: unknown }, meta: { infra_anchor?: unknown }, sinks?: Set<string>): boolean {
+    return meta?.infra_anchor === true || (sinks ?? this.alarmSinkIds()).has(String(r?.id ?? ""));
   }
 
   /** BR#3578 typed ask/time legs, evaluated first-class: an answered ask or
@@ -2641,7 +2641,9 @@ export class KnowledgeHub {
     const executionNow = Date.now();
     for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
-    const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo").map(t => String(t.id)), executionNow);
+    const sinks = this.alarmSinkIds();
+    for (const task of tasks) if (this.isUnclaimableAnchor(task, task.meta, sinks)) task.meta.infra_anchor = true;
+    const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo" && !t.meta.infra_anchor).map(t => String(t.id)), executionNow);
     for (const task of tasks) {
       const view = dispatch.get(String(task.id));
       const state = executionByTask.get(String(task.id));
@@ -5082,8 +5084,10 @@ export class KnowledgeHub {
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
     const taskHolds = new Map<string, SchedulingReason>();
+    const sinks = this.alarmSinkIds();
     const eligible = rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
+      if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
       const state = this.executionState(id);
       let reason: SchedulingReason | null = null;
       if (meta.operator_gated) reason = "operator_gate";
@@ -6773,6 +6777,8 @@ export class KnowledgeHub {
     const sentiment = isSentiment(body.sentiment) ? body.sentiment : undefined;
     const ts = ts0;
     const meta = JSON.parse(row.meta ?? "{}");
+    if (body.to === "in_progress" && row.type === "task" && this.isUnclaimableAnchor({ id }, meta))
+      throw new Error("gate: standing infrastructure is not runnable work");
     const reviewResult = body.review_result === undefined ? undefined : parseReviewResult(body.review_result, body.subject_revision);
     if (body.execution_result !== undefined) meta.execution_result = ExecutionResultSchema.parse(body.execution_result);
     // Machine bounce briefs annotate existing work; they do not change its
