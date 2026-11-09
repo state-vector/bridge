@@ -4,6 +4,11 @@ on:
     workflows: [CI, dev-build, release]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact main source commit to reconcile
+        type: string
+        required: false
 permissions:
   actions: read
   contents: read
@@ -19,5 +24,5 @@ jobs:
       - name: Reconcile green source builds into update channels and wake subscribers
         env:
           GH_TOKEN: ${{ github.token }}
-          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha || github.sha }}
         run: python3 scripts/promote-runner.py

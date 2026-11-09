@@ -3,11 +3,15 @@ main SHA. Either workflow completion can reconcile the pair; no busy polling.
 """
 import json
 import os
+import re
 import subprocess
 import urllib.request
 import time
 
 sha = os.environ["TRIGGER_SHA"]
+if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    raise SystemExit("expected an exact runner source commit SHA")
+job_token = os.environ["GH_TOKEN"]
 query = f"repos/state-vector/bridge/actions/runs?head_sha={sha}&per_page=100"
 runs = json.loads(subprocess.check_output(["gh", "api", query]))["workflow_runs"]
 
@@ -20,6 +24,14 @@ if not ci or not build:
     print("source build/CI pair not green yet; its completion event will reconcile")
     raise SystemExit(0)
 
+def log_publication(status, body):
+    detail = body.decode(errors="replace").strip()
+    if job_token:
+        detail = detail.replace(job_token, "[redacted]")
+    # The legacy Actions command parser looks for ##[ anywhere.
+    diagnostic = json.dumps({"publication_http": status, "detail": detail})
+    print(diagnostic.replace("#", r"\u0023"), flush=True)
+
 channels = [("main", None)]
 release = successful("release.yml")
 if release:
@@ -30,19 +42,17 @@ for channel, release_run in channels:
         payload["release_run"] = release_run
     request = urllib.request.Request("https://hub.fleetbridge.run/api/runner-updates/publish",
                                      data=json.dumps(payload).encode(), headers={"content-type": "application/json", "user-agent": "bridge-runner-updater/1",
-                                     "authorization": "Bearer " + os.environ["GH_TOKEN"]})
+                                     "authorization": "Bearer " + job_token})
     # Only deployment/transport recovery is retried. A semantic rejection is a
     # broken publication and fails the job instead of looping until it passes.
     for attempt in range(12):
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
-                print(response.read().decode())
+                log_publication(response.status, response.read(2048))
             break
         except urllib.error.HTTPError as error:
-            if error.code not in (404, 429, 500, 502, 503, 504):
-                print(error.read().decode()[:2000])
-                raise
-            if attempt == 11:
+            if attempt == 11 or error.code not in (404, 429, 500, 502, 503, 504):
+                log_publication(error.code, error.read(2048))
                 raise
         except (OSError, TimeoutError):
             if attempt == 11:
