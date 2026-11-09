@@ -471,7 +471,17 @@ fn observe_record(shared: &Config, record: Record, report: Reporter) -> Finished
     match reconcile_record(&cfg, &record, true) {
         Ok(Some(released)) => { report.released(released); Finished::Complete },
         Ok(None) => Finished::Retry { value: FinalWork::Journal(record), after: Duration::ZERO },
-        Err(_) => Finished::Retry { value: FinalWork::Observe(record), after: RESERVATION_OBSERVATION_INTERVAL },
+        Err(_) => {
+            // Give a recent writer time to publish its result promptly. Old
+            // evidence gaps still recheck automatically, at a cadence that
+            // leaves room for live worker polls and final result delivery.
+            let after = if writer_observable(&record) && now_ms().saturating_sub(record.observed_at) >= 60_000 {
+                Duration::from_secs(30)
+            } else {
+                RESERVATION_OBSERVATION_INTERVAL
+            };
+            Finished::Retry { value: FinalWork::Observe(record), after }
+        },
     }
 }
 
@@ -1082,7 +1092,7 @@ pub(crate) mod tests {
         let wip = root(&cfg).unwrap().join("retained-work"); journal::write_file(&wip,b"unpublished work").unwrap();
         let ticket = Ticket {task_id:"old-task".into(),session:"old-session".into()};
         let record = Record {owner:Ownership::Attempt {ticket:ticket.clone(),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"old-attempt".into()},
-            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,disposition:Disposition::Rejected {reason:"old missing proof".into()},
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:now_ms(),process:None,disposition:Disposition::Rejected {reason:"old missing proof".into()},
             work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into(),cause:None},worktree:Some(wip.clone())}};
         journal::insert(&terminal,record.clone()).unwrap();
         let launch_path=root(&cfg).unwrap().join("launches").join(record.name());
@@ -1361,7 +1371,7 @@ pub(crate) mod tests {
         });
         let (cfg,ready,snap)=fixture(&hub);
         let record=Record { owner:Ownership::Attempt { ticket:Ticket { task_id:"unknown".into(),session:"session".into() },host:cfg.label.clone().unwrap(),generation:1,attempt_id:"unknown-one".into() },
-            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:1,process:None,
+            host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:now_ms(),process:None,
             disposition:Disposition::Rejected { reason:"gate: unknown external effect".into() },work:Work::UnknownWriter { reason:"physical proof missing".into() } };
         journal::insert(&terminal_root(&cfg).unwrap(),record.clone()).unwrap();
         let before=std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap();
