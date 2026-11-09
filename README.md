@@ -2370,10 +2370,11 @@ records remaining lifecycle, completion, priority and recovery gaps at commit
 `4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
 
 **A stalled merge pipeline is a machinery fault (BR#7500).** After an hour with
-queued work and no merge, the line says **STOP THE LINE — merge machinery stalled**,
+queued work and no merge, the line says **Merge machinery stalled**,
 with elapsed time, main-check health, live executor presence and the number of
 candidates that passed initial queue gates. Bridge owns priority diagnosis and
-repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
+repair. **STOP THE LINE** is reserved for a red base. A heartbeat is not
+throughput, and a completed diagnostic is not recovery.
 A single candidate's failed check must not be presented as the reason independent
 candidates cannot merge. A candidate waiting for fresh CI after a strict
 branch update or waiting for conflict repair stays queued while the executor

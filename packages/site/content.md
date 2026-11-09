@@ -721,10 +721,11 @@ so a priority repair is not misleadingly described as merely queued.
 The [delivery architecture review and structural repair plan](https://github.com/state-vector/bridge/blob/main/docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 documents remaining mechanism gaps and proposed acceptance tests; it is a plan,
 not a declaration that the gateway refactor is complete.
-**STOP THE LINE — merge machinery stalled** means queued work has gone an hour
+**Merge machinery stalled** means queued work has gone an hour
 without a merge. The error names elapsed time, main's check health, executor
-presence and candidates passing initial gates. Bridge owns priority recovery;
-an active gateway alone does not prove progress. Independent batch members can
+presence and candidates passing initial gates. **STOP THE LINE** is reserved
+for a red base. Bridge owns priority recovery. An active gateway alone does
+not prove progress. Independent batch members can
 land while a candidate waits for strict-branch CI or conflict repair. Each
 separate lane-level merge fault gets its own diagnosis. Diagnostics
 that report missing Bridge MCP tools fail as execution-configuration errors;

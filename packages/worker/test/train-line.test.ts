@@ -31,7 +31,7 @@ describe("one line status and recovery contract", () => {
     expect(pending.reason).not.toContain("PR #2965 is merged");
     f.merge_response = { phase: "observed_merged", pr: 2965, at: now, receipt: fix.pr_url };
     const merged = projectTrainLine(f, now);
-    expect(merged).toMatchObject({ phase: "stopped", blocker: "main_failed", label: "Fix merged — verifying deployment", remediation: { kind: "machine" } });
+    expect(merged).toMatchObject({ phase: "base_red", blocker: "main_failed", label: "Fix merged — verifying deployment", remediation: { kind: "machine" } });
     expect(merged.reason).toContain("PR #2965 is merged");
     expect(merged.reason).toContain("not a green deployment");
   });
@@ -41,7 +41,9 @@ describe("one line status and recovery contract", () => {
         entries: [{ id: "BR#1", cls: "blocked" }, { id: "BR#2", cls: "ready" }] },
       diagnostic: { ...task, active_agent: false, status: "done" },
     }), now);
-    expect(line).toMatchObject({ phase: "stopped", blocker: "no_progress", label: "STOP THE LINE — merge machinery stalled" });
+    expect(line).toMatchObject({ phase: "error", blocker: "no_progress", label: "Merge machinery stalled" });
+    expect(TrainLineProjectionSchema.safeParse({ ...line, phase: "base_red" }).success).toBe(false);
+    expect(TrainLineProjectionSchema.safeParse({ ...line, label: "STOP THE LINE — main is failing" }).success).toBe(false);
     expect(line.reason).toContain("87 minutes");
     expect(line.reason).toContain("required checks are green");
     expect(line.reason).toContain("gateway is active");
@@ -98,8 +100,8 @@ describe("one line status and recovery contract", () => {
     const q = { at: now, base_state: { verdict: "green", red: [], unsettled: [], gate_blocked: true, gate_red: [], gate_unsettled: ["Deploy drift alarm"] } };
     expect(projectTrainLine(facts({ queue_facts: q }), now)).toMatchObject({ phase: "waiting", blocker: "checks_running", label: "Waiting for required checks", remediation: { kind: "machine" } });
     expect(projectTrainLine(facts({ queue_facts: q }), now + 16 * 60_000).phase).toBe("unknown");
-    expect(projectTrainLine(facts({ queue_facts: { ...q, base_state: { ...q.base_state, gate_red: [{ name: "Deploy drift alarm" }] } } }), now).phase).toBe("stopped");
-    expect(projectTrainLine(facts({ queue_facts: q, stop: { reason: "Actual stop", failing: [{ name: "Test" }] } }), now).phase).toBe("stopped");
+    expect(projectTrainLine(facts({ queue_facts: { ...q, base_state: { ...q.base_state, gate_red: [{ name: "Deploy drift alarm" }] } } }), now).phase).toBe("base_red");
+    expect(projectTrainLine(facts({ queue_facts: q, stop: { reason: "Actual stop", failing: [{ name: "Test" }] } }), now).phase).toBe("base_red");
   });
   it("cause-bound repairs replace stale diagnostic selection without concealing a concrete human requirement", () => {
     const line = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [], unsettled: [] } },
@@ -111,7 +113,7 @@ describe("one line status and recovery contract", () => {
     const scope = { kind: "current" as const, head_sha: episode.head_sha, task_ids: ["BR#6494"] };
     expect(withRecoveryEpisodes(line, recoveries, scope)).toMatchObject({ remediation: { kind: "agent", task: { id: "BR#6494" } } });
     expect(withRecoveryEpisodes(line, [{ episode, task: { ...task, id: "BR#6494", active_agent: false } }], scope)).toMatchObject({ remediation: { kind: "queued", task: { id: "BR#6494" } } });
-    if (line.phase !== "stopped") throw new Error("expected stopped fixture");
+    if (line.phase !== "base_red") throw new Error("expected stopped fixture");
     const human = { ...line, remediation: { kind: "human" as const, text: "Missing credential", action: { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Grant access?", options: ["Grant"] } } };
     expect(withRecoveryEpisodes(human, recoveries, scope).remediation).toEqual(human.remediation);
   });
@@ -134,7 +136,7 @@ describe("one line status and recovery contract", () => {
     });
     expect(withRecoveryEpisodes(line, [historical], scope).remediation).toEqual(line.remediation);
     expect(withRecoveryEpisodes(line, recoveries, { kind: "unobserved" }).remediation).toEqual(line.remediation);
-    const ready = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "green" } } }), now);
+    const ready = projectTrainLine(facts({ queue: [{ id: "BR#1" }], lease: { holder: "gw", heartbeat_ts: now }, queue_facts: { at: now, base_state: { verdict: "green" } } }), now);
     expect(ready.phase).toBe("ready");
     expect(withRecoveryEpisodes(ready, [historical], scope)).toMatchObject({ phase: "ready", recoveries: [historical] });
     expect(withRecoveryEpisodes(ready, recoveries, scope).phase).toBe("waiting");
@@ -166,7 +168,7 @@ describe("one line status and recovery contract", () => {
       queue_facts: { at: now, base_state }, diagnostic_ask: { id: "BR#6443", url: "https://hub.test/card/BR-6443", question: "Diagnose or bypass?", options: ["Bypass"] },
       base_red_resolution: { verdict: "red", phase: "fix_in_progress", held: 1, whats_broken: [], ask: null, fix_card: task },
     }), now);
-    expect(line).toMatchObject({ phase: "stopped", blocker: "main_failed", remediation: { kind: "agent", task } });
+    expect(line).toMatchObject({ phase: "base_red", blocker: "main_failed", remediation: { kind: "agent", task } });
     expect(line.evidence.some((e) => e.url?.endsWith("41926939169"))).toBe(true);
   });
   it("a previous success on the same SHA cannot conceal a newer failed deployment", () => {
@@ -250,7 +252,7 @@ describe("one line status and recovery contract", () => {
   it("failed main remains loud with ZERO queued changes and carries actual agent progress", () => {
     const line = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [{ name: "Storage Health", url: "https://github.com/run/fail" }] } },
       base_red_resolution: { verdict: "red", phase: "fix_in_progress", held: 0, whats_broken: [], ask: null, fix_card: task } }), now);
-    expect(line).toMatchObject({ phase: "stopped", blocker: "main_failed", held: 0, remediation: { kind: "agent", task } });
+    expect(line).toMatchObject({ phase: "base_red", blocker: "main_failed", held: 0, remediation: { kind: "agent", task } });
     expect(line.evidence[0].url).toBe("https://github.com/run/fail");
     expect(TrainLineProjectionSchema.safeParse(line).success).toBe(true);
   });
@@ -266,7 +268,7 @@ describe("one line status and recovery contract", () => {
 
   it("stale observations do not turn green, and green recovery clears the interruption", () => {
     expect(projectTrainLine(facts({ queue: [{ id: "BR#1" }], queue_facts: { at: 1, base_state: { verdict: "green" } } }), now).phase).toBe("unknown");
-    const recovered = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "green" } }, capable: { ready: true, at: now, holder: "gateway" } }), now);
+    const recovered = projectTrainLine(facts({ queue: [{ id: "BR#1" }], queue_facts: { at: now, base_state: { verdict: "green" } }, capable: { ready: true, at: now, holder: "gateway" } }), now);
     expect(recovered).toMatchObject({ phase: "ready", blocker: null, remediation: null });
   });
 
@@ -282,9 +284,17 @@ describe("one line status and recovery contract", () => {
     // Legacy green snapshots expire while idle too; empty queue is not health proof.
     expect(projectTrainLine(facts({ queue_facts: { at: 1, base_state: { verdict: "green" } } }), now).phase).toBe("unknown");
     expect(projectTrainLine(facts({ queue_facts: { at: now, base_observed_at: now, base_state: { verdict: "green" } } }), now))
-      .toMatchObject({ phase: "ready", observed_at: now, blocker: null, remediation: null });
+      .toMatchObject({ phase: "idle", observed_at: now, blocker: null, remediation: null });
   });
 
+  it("holds for an unconfirmed CI timeout without declaring the base red", () => {
+    const stop = { kind: "checks_unconfirmed" };
+    const queue_facts = { at: now, base_state: { verdict: "unsettled" } };
+    expect(projectTrainLine(facts({ stop, queue_facts }), now)).toMatchObject({
+      phase: "unknown", blocker: "stale_observation", label: "Required checks overdue",
+    });
+    expect(projectTrainLine(facts({ stop, queue_facts: { at: now, base_state: { verdict: "red" } } }), now).phase).toBe("base_red");
+  });
   it("all interruption causes have an explicit recovery disposition", () => {
     for (const extra of [
       { queue_facts: { at: now, base_state: { verdict: "empty" } } },

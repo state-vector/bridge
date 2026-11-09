@@ -37,16 +37,17 @@ it("uses the current typed line despite historical red-main records", () => {
   expect(render()).toContain("Checking queued changes");
   expect(render()).not.toContain("main RED");
   expect(render()).not.toContain("STOP-THE-LINE");
-  lane.line = { phase: "stopped", label: "Repairing main", reason: "Current required check failed", blocker: "main_failed",
+  lane.line = { phase: "base_red", label: "STOP THE LINE — main is failing", reason: "Current required check failed", blocker: "main_failed",
     remediation: { kind: "attention", text: "Repair required" }, held: 1, observed_at: now, evidence: [] };
   expect(render()).toContain("STOP-THE-LINE");
-  expect(render()).toContain("Repairing main");
+  expect(render()).toContain("STOP THE LINE — main is failing");
   expect(render()).toContain("Current required check failed");
   expect(render()).not.toContain("Old main repair");
   expect(render()).not.toContain("nobody is fixing it");
-  lane.line = { ...lane.line, blocker: "no_progress", label: "Merge stalled" };
+  lane.line = { ...lane.line, phase: "error", blocker: "no_progress", label: "Merge machinery stalled" };
   expect(render()).not.toContain("main RED");
-  expect(render()).toContain("Merge stalled");
+  expect(render()).toContain("Merge machinery stalled");
+  expect(render()).not.toContain("STOP-THE-LINE");
   lane.line = undefined;
   expect(render()).toContain("Status unavailable");
   expect(render()).not.toContain("main RED");

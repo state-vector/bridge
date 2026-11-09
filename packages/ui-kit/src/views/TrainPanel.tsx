@@ -12,8 +12,9 @@ function age(ts: number | undefined, now: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
 }
 
-const tones: Record<TrainLineProjection["phase"], ChipTone> = {
-  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "warn", retired: "muted",
+export const trainLineTones: Record<TrainLineProjection["phase"], ChipTone> = {
+  idle: "muted", ready: "ok", working: "live", waiting: "warn", base_red: "err",
+  error: "err", unknown: "warn", action_required: "warn", retired: "muted",
 };
 const unavailable: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
@@ -80,7 +81,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
  * come from the hub's typed `line` projection, shared with its row and message. */
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
-  return <div className={`train-blocked-banner${line.phase === "waiting" || line.phase === "unknown" ? " train-blocked-banner-amber" : ""}`} role="alert">
+  return <div className={`train-blocked-banner${trainLineTones[line.phase] === "warn" ? " train-blocked-banner-amber" : ""}`} role="alert">
     <div className="train-banner-cause">
     <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
     <span className="train-banner-line">{line.reason}</span>
@@ -260,7 +261,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
       <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
-    {!error && (activeLanes ?? []).filter((l) => l.line?.phase === "stopped" && l.line.blocker === "main_failed").map((l) => (
+    {!error && (activeLanes ?? []).filter((l) => l.line?.phase === "base_red").map((l) => (
       <StopLineBanner key={`stopline-${l.lane}`} l={l} now={now} openTask={openTask} />
     ))}
     {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
@@ -269,7 +270,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     </div>}
     {(activeLanes ?? []).map((l) => {
       const line = l.line ?? unavailable;
-      const needsAttention = line.phase === "stopped" || line.phase === "unknown";
+      const needsAttention = line.phase === "base_red" || line.phase === "error" || line.phase === "unknown" || line.phase === "action_required";
       const live = !!l.lease && now - l.lease.heartbeat_ts < 300_000;
       const machine = l.lease?.holder ?? l.capable?.holder;
       const repo = l.lane.split("@")[0];
@@ -285,7 +286,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
         <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
-        <span className="trainc-status"><Chip pill tone={tones[line.phase]} title={line.reason}>{line.label}</Chip>
+        <span className="trainc-status"><Chip pill tone={trainLineTones[line.phase]} title={line.reason}>{line.label}</Chip>
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>

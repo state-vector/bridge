@@ -504,7 +504,7 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
   const trainPanelSrc = readFileSync(new URL("../../ui-kit/src/views/TrainPanel.tsx", import.meta.url).pathname, "utf8");
 
   it("renders the banner only for a current typed main-failed stop, above the lane table", () => {
-    expect(trainPanelSrc).toContain('l.line?.phase === "stopped" && l.line.blocker === "main_failed"');
+    expect(trainPanelSrc).toContain('l.line?.phase === "base_red"');
     expect(trainPanelSrc).toContain("STOP-THE-LINE");
     // banner markup sits before the column head in source order — it is read first
     expect(trainPanelSrc.indexOf("train-stopline")).toBeGreaterThan(-1);

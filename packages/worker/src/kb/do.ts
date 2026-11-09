@@ -12727,6 +12727,7 @@ export class KnowledgeHub {
       const sha = mergeSha ?? headSha!;
       const failing: { name: string; conclusion?: string | null; url?: string | null }[] = Array.isArray(body.failing) ? body.failing : [];
       const culprit = String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null;
+      const stopKind = body.stop_kind === "checks_unconfirmed" ? "checks_unconfirmed" : "base_red";
       const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
       // BR#5061 storm dedupe: the SAME stop re-reported by an executor tick
       // loop (the stop arm clears on green main, the awaiting-ci arm re-fires
@@ -12748,7 +12749,7 @@ export class KnowledgeHub {
       const burstStop = meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
       // culprit_task rides the stop record (BR#4849): the Top view banner
       // answers "who broke it" from the stop itself, not session memory.
-      meta.stop = { sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
+      meta.stop = { kind: stopKind, sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
       // red AFTER merge ⇒ the culprit (just-merged) card bounces with the
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
       if (culprit && meta.currently) {
@@ -13485,7 +13486,7 @@ export class KnowledgeHub {
           via: "bound",
         });
       }
-      const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)` }, actor);
+      const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, stop_kind: "checks_unconfirmed", reason: `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)` }, actor);
       return { ...out, decided: "stopped_bound" };
     }
     const reason = this.laneSyncReason(lane.id, { ...meta, currently: { ...meta.currently } }, now);
@@ -15606,7 +15607,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
       return line;
     }
-    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
+    if (line.phase === "idle" || line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
     const inactiveRepair = line.blocker === "main_failed" && line.remediation?.kind === "queued"
       && line.remediation.task.status === "in_progress" && !line.remediation.task.active_agent;
     if (line.remediation?.kind !== "attention" && !inactiveRepair) return line;
@@ -16857,7 +16858,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const mergeResponse = mergeProbe ? { phase: "observed_merged", pr: responsePr, at: Number(mergeProbe.updated_ts), receipt: String(mergeProbe.receipt) }
         : pendingMerge && responsePr > 0 ? { phase: "recorded", pr: responsePr, at: Number(pendingMerge.at) } : null;
       const lineFacts = TrainLineFactsSchema.safeParse({
-        queue, currently: meta.currently ?? null, stop: meta.stop ?? null, verifying_base: verifyingBase,
+        queue, currently: meta.currently ?? null, verifying_base: verifyingBase,
+        stop: meta.stop?.kind === undefined && meta.stop?.reason === `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)`
+          ? { ...meta.stop, kind: "checks_unconfirmed" } : meta.stop ?? null,
         lease: meta.lease ?? null, capable, queue_facts: brQf,
         base_red_resolution, diagnostic, merge_response: mergeResponse,
         diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,
@@ -16873,8 +16876,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
       let line = withRecoveryEpisodes(assignedLine, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), repairScope);
-      if (repairScope.kind === "current" && line.phase === "stopped" && line.blocker === "main_failed"
-        && assignedLine.phase === "stopped" && assignedLine.blocker === "main_failed") {
+      if (repairScope.kind === "current" && line.phase === "base_red"
+        && assignedLine.phase === "base_red") {
         const assigned = assignedLine.remediation;
         // Journal history cannot replace a current active repair or an
         // executable duty with a task whose heartbeat expired.
@@ -16885,7 +16888,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
       }
       const baseRed = lineFacts.success ? lineFacts.data.base_red_resolution : null;
-      const stoppedMain = line.phase === "stopped" && line.blocker === "main_failed";
+      const stoppedMain = line.phase === "base_red";
       const redTask = stoppedMain && "task" in line.remediation
         ? line.remediation.task : baseRed?.fix_card ?? null;
       const ownership = stoppedMain && repairScope.kind === "current" ? {

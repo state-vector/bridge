@@ -224,11 +224,11 @@ describe("BR#6901 idle main-health observation", () => {
       expect(acked.line.observed_at).toBe(observedAt);
     }
     await stamp({ verdict: "red", tip_sha: "a".repeat(40), red: [{ name: "Test" }], unsettled: [] });
-    expect((await laneSnap(repo)).line).toMatchObject({ phase: "stopped", blocker: "main_failed", held: 0 });
+    expect((await laneSnap(repo)).line).toMatchObject({ phase: "base_red", blocker: "main_failed", held: 0 });
     await stamp({ verdict: "green", tip_sha: "a".repeat(40), red: [], unsettled: [] });
     const recovered = await laneSnap(repo);
     expect(recovered.queue).toEqual([]);
-    expect(recovered.line).toMatchObject({ phase: "ready", blocker: null, remediation: null, held: 0 });
+    expect(recovered.line).toMatchObject({ phase: "idle", blocker: null, remediation: null, held: 0 });
     expect(recovered.queue_facts.base_observed_at).toBeGreaterThanOrEqual(observedAt);
     await kbJson("/train.lease", { repo, actor, action: "release" });
   });
@@ -336,7 +336,7 @@ describe("BR#6776 durable check recovery", () => {
     const snap = await laneSnap(repo);
     expect(snap.stop.sha).toBe(oldHead);
     expect(snap.line).toMatchObject({
-      phase: "stopped", blocker: "main_failed", remediation: { kind: "agent", task: { id: repair, active_agent: true } },
+      phase: "base_red", blocker: "main_failed", remediation: { kind: "agent", task: { id: repair, active_agent: true } },
     });
     expect(snap.lane_state).toMatchObject({
       phase: "stopped_red", failing_sha: head, fix_card: { id: repair, active_agent: true },
@@ -375,7 +375,7 @@ describe("BR#6776 durable check recovery", () => {
     expect((await kbJson("/train.lease", { repo, actor, action: "release", line_green: true })).status).toBe(200);
     const green = await laneSnap(repo);
     expect(green.stop).toBeNull();
-    expect(green.line).toMatchObject({ phase: "ready", remediation: null });
+    expect(green.line).toMatchObject({ phase: "idle", remediation: null });
     expect(green.lane_state.phase).toBe("idle");
     expect(green.red_main).toBeNull();
   });
@@ -658,7 +658,7 @@ describe("merge train DO drill (real bundled worker)", () => {
     const result = await observe([active, failed], [{ run_id: runId, name: required, url: `${runUrl}/job/128986714580` }]);
     expect(result.status, JSON.stringify(result.body)).toBe(200);
     const stopped = await laneSnap(repo);
-    expect(stopped.line).toMatchObject({ phase: "stopped", blocker: "main_failed" });
+    expect(stopped.line).toMatchObject({ phase: "base_red", blocker: "main_failed" });
     expect(stopped.base_red_resolution.fix_card.id).toMatch(/^BR#/);
     expect(stopped.line.recoveries).toEqual(expect.arrayContaining([expect.objectContaining({
       episode: expect.objectContaining({ sources: [expect.objectContaining({ run_id: runId, run_attempt: 3 })] }),
@@ -675,7 +675,7 @@ describe("merge train DO drill (real bundled worker)", () => {
       failures: [{ run_id: 123, name: "Cortex Quality Smoke", url: `https://github.com/${repo}/actions/runs/123/job/456` }] };
     const result = await kbJson("/train.observe_deploy", { repo, actor: "independent-observer", observation });
     expect(result.status, JSON.stringify(result.body)).toBe(200);
-    expect(result.body.lanes[0].line).toMatchObject({ phase: "stopped", blocker: "main_failed" });
+    expect(result.body.lanes[0].line).toMatchObject({ phase: "base_red", blocker: "main_failed" });
     expect(result.body.lanes[0].line.evidence.some((e: { name: string }) => e.name === "Cortex Quality Smoke")).toBe(true);
     await kbJson("/train.queue_facts", { repo, actor: "merger", entries: [], base_state: green });
     const after = await laneSnap(repo);
@@ -4708,7 +4708,7 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     });
     expect((await stamp()).body.error ?? "").toBe("");
     const first = await laneSnap(repo);
-    expect(first.line).toMatchObject({ phase: "stopped", held: 0, remediation: { kind: "queued" } });
+    expect(first.line).toMatchObject({ phase: "base_red", held: 0, remediation: { kind: "queued" } });
     const repair = first.base_red_resolution.fix_card.id;
     await stamp();
     expect((await laneSnap(repo)).base_red_resolution.fix_card.id).toBe(repair);
