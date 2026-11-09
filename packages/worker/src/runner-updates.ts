@@ -2,7 +2,49 @@ import { RunnerManifestSchema as ManifestSchema, RunnerPublishSchema as PublishS
 import { boundedWakeStream } from "./kb/sse.ts";
 export { ManifestSchema };
 const repo = "state-vector/bridge";
-class PublicationUnavailable extends Error {}
+type PublicationStage = "verify_ci" | "verify_build" | "verify_release" | "fetch_manifest" | "publication_rate" | "publish";
+
+function integerHeader(value: string | null | undefined): number | undefined {
+  return value && /^[0-9]{1,12}$/.test(value) ? Number(value) : undefined;
+}
+
+function retryAfterSeconds(value: string | null | undefined): number {
+  const seconds = integerHeader(value);
+  if (seconds !== undefined) return seconds;
+  if (!value || !/^[A-Za-z]{3}, /.test(value)) return 0;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, Math.ceil((date - Date.now()) / 1000)) : 0;
+}
+
+class PublicationUnavailable extends Error {
+  constructor(readonly stage: PublicationStage, readonly upstream?: Response) {
+    super("publication temporarily unavailable");
+  }
+
+  reply(status = 503, localDelay = 0): Response {
+    const headers = this.upstream?.headers;
+    const rateResetAt = headers?.get("x-ratelimit-remaining") === "0"
+      ? integerHeader(headers.get("x-ratelimit-reset")) : undefined;
+    const delay = Math.max(localDelay, retryAfterSeconds(headers?.get("retry-after")),
+      rateResetAt ? Math.ceil(rateResetAt - Date.now() / 1000) : 0);
+    return Response.json({
+      error: this.message, stage: this.stage, upstream_status: this.upstream?.status, rate_reset_at: rateResetAt,
+    }, { status, headers: delay > 0 ? { "retry-after": String(delay) } : undefined });
+  }
+}
+
+function transportUnavailable(error: unknown): boolean {
+  return error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError");
+}
+
+async function publicationFetch(stage: PublicationStage, url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (error) {
+    if (transportUnavailable(error)) throw new PublicationUnavailable(stage);
+    throw error;
+  }
+}
 
 /** Public build metadata only. Publication accepts hints, never caller-supplied
  * manifests or URLs. GitHub independently proves every gate and source SHA. */
@@ -12,18 +54,20 @@ export class RunnerUpdates {
   private lastProbe = 0;
   constructor(private state: DurableObjectState, private env: { GITHUB_TOKEN?: string }) {}
 
-  private async github(path: string, jobToken?: string): Promise<RunnerGithubRun> {
+  private async github(stage: PublicationStage, path: string, jobToken?: string): Promise<RunnerGithubRun> {
     // The publisher's job-scoped read-only token raises API quota without a
     // long-lived hub secret. Never persist, log, or forward it anywhere except
     // this fixed GitHub repository API. The supplied facts still prove nothing:
     // every run/commit/workflow is independently checked below.
     const token = jobToken || this.env.GITHUB_TOKEN;
-    const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, { headers: {
+    const response = await publicationFetch(stage, `https://api.github.com/repos/${repo}/${path}`, { headers: {
       "user-agent": "bridge-runner-updates", accept: "application/vnd.github+json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
     }, signal: AbortSignal.timeout(15000) });
     if (!response.ok) {
-      if (response.status >= 500 || response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) throw new PublicationUnavailable(`GitHub verification temporarily unavailable (${response.status})`);
+      const quotaLimited = response.status === 403
+        && (response.headers.get("x-ratelimit-remaining") === "0" || retryAfterSeconds(response.headers.get("retry-after")) > 0);
+      if (response.status >= 500 || response.status === 429 || quotaLimited) throw new PublicationUnavailable(stage, response);
       throw new Error(`GitHub verification ${response.status}`);
     }
     return GithubRunSchema.parse(await response.json());
@@ -67,20 +111,22 @@ export class RunnerUpdates {
       const jobToken = request.headers.get("authorization")?.replace(/^Bearer /, "");
       const current = await this.state.storage.get<{ ci_run: number; release_run?: number }>(`channel:${input.channel}`);
       if (current && (input.channel === "main" ? current.ci_run >= input.ci_run : (current.release_run ?? 0) >= (input.release_run ?? 0))) return Response.json({ unchanged: true });
-      if (Date.now() - this.lastProbe < 10000) return new Response("publication validation rate limited", { status: 429 });
-      this.lastProbe = Date.now();
-      for (const [id, path] of [[input.ci_run, "ci.yml"], [input.build_run, "dev-build.yml"]] as const) {
-        const run = await this.github(`actions/runs/${id}`, jobToken);
+      const now = Date.now();
+      const validationDelay = 10000 - (now - this.lastProbe);
+      if (validationDelay > 0) return new PublicationUnavailable("publication_rate").reply(429, Math.ceil(validationDelay / 1000));
+      this.lastProbe = now;
+      for (const [id, path, stage] of [[input.ci_run, "ci.yml", "verify_ci"], [input.build_run, "dev-build.yml", "verify_build"]] as const) {
+        const run = await this.github(stage, `actions/runs/${id}`, jobToken);
         if (!eligibleRun(run, input.commit, path)) throw new Error(`unverified ${path} build`);
       }
       if (input.channel === "stable") {
         if (!input.release_run) throw new Error("stable requires a successful versioned release run");
-        const release = await this.github(`actions/runs/${input.release_run}`, jobToken);
+        const release = await this.github("verify_release", `actions/runs/${input.release_run}`, jobToken);
         if (!eligibleRun(release, input.commit, "release.yml", true)) throw new Error("unverified stable release");
       }
       const download = `https://github.com/${repo}/releases/download/runner-${input.commit}/manifest.json`;
-      const response = await fetch(download, { headers: { "user-agent": "bridge-runner-updates" }, signal: AbortSignal.timeout(15000) });
-      if (!response.ok) throw new PublicationUnavailable(`verified build manifest not available (${response.status})`);
+      const response = await publicationFetch("fetch_manifest", download, { headers: { "user-agent": "bridge-runner-updates" }, signal: AbortSignal.timeout(15000) });
+      if (!response.ok) throw new PublicationUnavailable("fetch_manifest", response);
       const manifest = ManifestSchema.parse(await response.json());
       if (manifest.commit !== input.commit) throw new Error("manifest commit mismatch");
       for (const [target, artifact] of Object.entries(manifest.artifacts)) {
@@ -94,7 +140,11 @@ export class RunnerUpdates {
       });
       this.send(`data: ${JSON.stringify({ type: "runner.update.available", channel: input.channel, commit: input.commit })}\n\n`);
       return Response.json({ published: input.channel, commit: input.commit });
-    } catch (error) { return Response.json({ error: String(error) }, { status: error instanceof PublicationUnavailable || error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError") ? 503 : 400 }); }
+    } catch (error) {
+      if (error instanceof PublicationUnavailable) return error.reply();
+      if (transportUnavailable(error)) return new PublicationUnavailable("publish").reply();
+      return Response.json({ error: String(error) }, { status: 400 });
+    }
   }
 }
 
