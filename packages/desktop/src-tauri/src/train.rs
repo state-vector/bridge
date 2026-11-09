@@ -2884,9 +2884,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // the pass's parked cards on a green verdict (BR#3516: no hub
         // GitHub calls; BR#3935: unreadable shas are excluded, never faked).
         let mut ci_body = json!({ "repo": repo, "base": base, "sha": merge_sha, "checks": runs });
-        let ancestors = settle_ancestors(ctx, repo, base, &merge_sha)?;
-        if !ancestors.is_empty() {
-            ci_body.as_object_mut().unwrap().insert("ancestors_of_settled".into(), json!(ancestors));
+        // The hub keeps these immutable ancestry proofs on this exact merge
+        // SHA until it settles. A repeat poll must not depend on train_history
+        // or another fetch when the previous feed already succeeded.
+        if !cur.get("burst_ancestors").is_some_and(Value::is_array) {
+            let ancestors = settle_ancestors(ctx, repo, base, &merge_sha)?;
+            if !ancestors.is_empty() {
+                ci_body.as_object_mut().unwrap().insert("ancestors_of_settled".into(), json!(ancestors));
+            }
         }
         let ci = ctx.mcp("train_ci", ci_body)?;
         ctx.note(&format!("CI poll on {}: {}", &merge_sha[..merge_sha.len().min(9)], vstr(&ci, "decided").unwrap_or("?")));
