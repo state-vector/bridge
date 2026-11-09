@@ -91,8 +91,10 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
     Ok(())
 }
 
-fn cache_tag(path: &Path) -> bool {
-    fs::read(path.join("CACHEDIR.TAG")).is_ok_and(|bytes| bytes.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
+pub(super) fn cache_tag(path: &Path) -> bool {
+    let tag = path.join("CACHEDIR.TAG");
+    fs::symlink_metadata(&tag).is_ok_and(|metadata| metadata.is_file())
+        && fs::read(tag).is_ok_and(|bytes| bytes.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
 }
 
 pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String> {

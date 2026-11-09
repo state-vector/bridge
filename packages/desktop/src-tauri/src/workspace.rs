@@ -408,6 +408,14 @@ impl Owner {
                 let path=repository.join(name);
                 if path.is_dir() && git(repository,&["check-ignore","--",name]).is_ok() {paths.push(path);}
             }
+            let bundle = repository.join(".kb-bundle");
+            if is_bridge_worker_bundle(repository, &bundle)? {
+                paths.push(bundle);
+            }
+            let cli_target = repository.join("packages/cli/target");
+            if is_bridge_cli_target(repository, &cli_target)? {
+                paths.push(cli_target);
+            }
         }
         for path in paths {
             if !path.exists() || fs::symlink_metadata(&path).map_err(|e|e.to_string())?.file_type().is_symlink() {continue;}
@@ -523,6 +531,52 @@ fn uncovered_inputs(path: &Path, repositories: &[PathBuf]) -> Result<bool, Strin
     }
     Ok(false)
 }
+// The Bridge worker test command emits this ignored Wrangler dry-run output.
+// Check the committed build declaration and the generated directory shape so
+// arbitrary ignored inputs in the same workspace retain their existing fence.
+fn is_bridge_worker_bundle(repository: &Path, bundle: &Path) -> Result<bool, String> {
+    if !is_ignored_output(repository, bundle, ".kb-bundle")? {
+        return Ok(false);
+    }
+    let Some(manifest) = git(repository, &["show", "HEAD:packages/worker/package.json"]).ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()) else { return Ok(false); };
+    if manifest["name"] != "bridge-worker"
+        || !manifest["scripts"]["test"].as_str().is_some_and(|script| script.contains("wrangler deploy --dry-run --outdir ../../.kb-bundle")) {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(bundle).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_file()
+            || !matches!(entry.file_name().to_str(), Some("README.md" | "index.js" | "index.js.map")) {
+            return Ok(false);
+        }
+    }
+    Ok(bundle.join("index.js").is_file()
+        && fs::read_to_string(bundle.join("README.md")).is_ok_and(|readme| {
+            readme.starts_with("This folder contains the built output assets for the worker \"bridge\" generated at ")
+        }))
+}
+
+fn is_ignored_output(repository: &Path, path: &Path, relative: &str) -> Result<bool, String> {
+    if !path.is_dir() || path.canonicalize().map_err(|e| e.to_string())? != path
+        || git(repository, &["check-ignore", "--", relative]).is_err() {
+        return Ok(false);
+    }
+    Ok(git(repository, &["ls-files", "--", relative])?.is_empty())
+}
+
+// Cargo explicitly marks target directories as reproducible caches. Scope
+// the nested allowance to the Bridge CLI's declared package path.
+fn is_bridge_cli_target(repository: &Path, target: &Path) -> Result<bool, String> {
+    if !is_ignored_output(repository, target, "packages/cli/target")?
+        || !git(repository, &["show", "HEAD:packages/cli/Cargo.toml"]).is_ok_and(|manifest| {
+            manifest.lines().any(|line| line.trim() == "name = \"bridge-cli\"")
+        }) {
+        return Ok(false);
+    }
+    Ok(legacy::cache_tag(target))
+}
+
 fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
     let ignored=git(path,&["ls-files","--others","--ignored","--exclude-standard","--directory","-z"])?;
     if let Some(input)=ignored.split('\0').find(|input| !input.is_empty()) {
@@ -564,7 +618,18 @@ fn verify_published_source(path: &Path) -> Result<(), String> {
     Err("workspace HEAD is not reachable from a published branch; source retained".into())
 }
 fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
-    if matches!(record.location,Location::GeneratedCache { .. } | Location::OwnedDisposable { .. }) {return Ok(());}
+    if let Location::OwnedDisposable { root, .. } = &record.location {
+        if root.file_name().and_then(|name| name.to_str()) == Some(".kb-bundle")
+            && !is_bridge_worker_bundle(root.parent().ok_or("worker bundle repository missing")?, root)? {
+            return Err("worker bundle no longer matches the declared build output; retained".into());
+        }
+        if root.ends_with("packages/cli/target")
+            && !is_bridge_cli_target(root.ancestors().nth(3).ok_or("CLI target repository missing")?, root)? {
+            return Err("CLI target no longer matches the declared Cargo cache; retained".into());
+        }
+        return Ok(());
+    }
+    if matches!(record.location,Location::GeneratedCache { .. }) {return Ok(());}
     verify_layout(record)?;
     let paths:Vec<_>=snapshots.iter().map(|s|s.path.clone()).collect();
     if uncovered_inputs(&record.location.work(),&paths)? {return Err("new unpublished scratch inputs arrived before retirement; retained".into());}

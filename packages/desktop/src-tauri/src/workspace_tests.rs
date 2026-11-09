@@ -231,6 +231,60 @@ fn unique_ignored_evidence_survives_while_its_disposable_build_cache_is_reclaime
 }
 
 #[test]
+fn bridge_build_output_reclamation_preserves_drafts_and_unknown_inputs() {
+    let sandbox = Sandbox::new();
+    let owner = sandbox.owner();
+    ready(&owner);
+    let source = crate::checkpoint::tests::init(&sandbox.0);
+    fs::create_dir_all(source.join("packages/worker")).unwrap();
+    fs::create_dir_all(source.join("packages/cli")).unwrap();
+    fs::write(source.join("packages/cli/Cargo.toml"), "[package]\nname = \"bridge-cli\"\n").unwrap();
+    fs::write(source.join(".gitignore"), ".kb-bundle/\n.quality/\npackages/cli/target/\n").unwrap();
+    fs::write(source.join("packages/worker/package.json"), r#"{"name":"bridge-worker","scripts":{"test":"wrangler deploy --dry-run --outdir ../../.kb-bundle"}}"#).unwrap();
+    git(&source, &["add", ".gitignore", "packages/worker/package.json", "packages/cli/Cargo.toml"]).unwrap();
+    git(&source, &["commit", "-m", "Declare the reproducible worker output"]).unwrap();
+
+    for case in ["generated", "extra-input", "staged-input"] {
+        let t = ticket(&format!("worker-bundle-{case}"));
+        let a = owner.allocate(&t, Some(source.to_str().unwrap())).unwrap();
+        let work = a.work.clone();
+        let bundle = work.join(".kb-bundle");
+        let target = work.join("packages/cli/target");
+        fs::create_dir_all(&target).unwrap();
+        if case != "extra-input" {
+            fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+        }
+        fs::write(target.join("build-output"), "reproducible only if the cache is marked").unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("README.md"), r#"This folder contains the built output assets for the worker "bridge" generated at 2026-11-09T09:00:00Z."#).unwrap();
+        fs::write(bundle.join("index.js"), vec![b'x'; 128 * 1024]).unwrap();
+        if case == "extra-input" {
+            fs::write(bundle.join("handwritten-note"), "unique input").unwrap();
+        }
+        if case == "staged-input" {
+            git(&work, &["add", "--force", ".kb-bundle/index.js", "packages/cli/target/build-output"]).unwrap();
+            fs::write(bundle.join("index.js"), "unpublished edits to a staged input").unwrap();
+        }
+        fs::create_dir_all(work.join(".quality")).unwrap();
+        fs::write(work.join(".quality/results"), "unique evidence").unwrap();
+        let owner_attempt = attempt(&t);
+        a.bind(&owner_attempt).unwrap();
+        drop(a);
+        owner.release(&released(&owner_attempt)).unwrap();
+        owner.reconcile(&[]).unwrap();
+        assert_eq!(bundle.exists(), case != "generated");
+        assert_eq!(target.exists(), case != "generated");
+        assert_eq!(fs::read_to_string(work.join(".quality/results")).unwrap(), "unique evidence");
+        if case == "extra-input" {
+            assert_eq!(fs::read_to_string(bundle.join("handwritten-note")).unwrap(), "unique input");
+        }
+        if case == "staged-input" {
+            assert_eq!(fs::read_to_string(bundle.join("index.js")).unwrap(), "unpublished edits to a staged input");
+        }
+    }
+}
+
+#[test]
 fn ignored_evidence_arriving_before_removal_is_rechecked() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);let t=ticket("late-ignored");
