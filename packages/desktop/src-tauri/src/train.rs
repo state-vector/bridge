@@ -1901,7 +1901,6 @@ fn reconcile_merge_command(ctx: &Ctx, repo: &str, pr: i64, head: &str,
 #[derive(Debug, PartialEq, Eq)]
 enum IntegrationAdmission {
     Current,
-    AwaitingCi { base_sha: String, head_sha: String },
     RepairDispatched,
 }
 
@@ -1920,23 +1919,33 @@ fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandida
         None => &base_sha,
     };
     if ctx.is_ancestor(tested_base, head)? { return Ok(IntegrationAdmission::Current); }
+    // BR#9032: a head BEHIND the tested base is never rewritten here. The
+    // ordinary batch lands it at its EXACT reviewed head — the same trial
+    // merge the write boundary uses proves the integration is clean, the
+    // merge rides --match-head-commit, and a strict-protection refusal is
+    // owned by the merge arm's machine update-branch (verdict carries,
+    // BR#3516 §5): the only lawful update-branch, taken AFTER GitHub
+    // refuses, never proactively. A semantic break the file-level merge
+    // cannot see lands with the batch: the pass's single settle on the
+    // final merge commit runs it, a red stops the line and the bisect
+    // names the culprit (GH#2261) — the same net every landing already has.
     renew_lease(ctx, repo, base);
-    let owned = branch_is_worker_authored(&ctx.pr_commit_logins(repo, pr), &ctx.worker_identities);
     let (clean, files) = ctx.trial_merge(base, head)?;
-    if !clean || !owned {
+    if !clean {
+        if files.is_empty() {
+            // BR#5252: a file-less not-clean read is structurally impossible
+            // for a real text conflict — stale/infra garbage: NO bounce, the
+            // member stays queued and the next tick re-reads fresh.
+            return Err("trial merge read not-clean with NO conflict files (BR#5252 stale/infra read) — retrying next tick".into());
+        }
         ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr,
-            "task_id": cand.head_id, "head_sha": head, "bounce_kind": if clean { "gate" } else { "conflict" },
-            "conflict_files": files, "reason": if clean {
-                "Candidate has not been tested against current base; branch is not worker-authored. Repair executor must integrate current base and re-run CI."
-            } else { "Current-base integration conflicts; resolve the named files and run fresh CI." } }))?;
+            "task_id": cand.head_id, "head_sha": head,
+            "bounce_kind": crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, false, files.len()),
+            "conflict_files": files,
+            "reason": "Current-base integration conflicts; resolve the named files and run fresh CI." }))?;
         return Ok(IntegrationAdmission::RepairDispatched);
     }
-    ctx.sh("gh", &["api", &format!("repos/{repo}/pulls/{pr}/update-branch"), "-X", "PUT", "-f", &format!("expected_head_sha={head}")])?;
-    let updated = ctx.pr_facts(repo, pr)?;
-    let to_head = vstr(&updated, "headRefOid").ok_or("Updated branch has no readable head")?;
-    if to_head == head { return Err("Branch update accepted but new head not yet observable; hold for fresh CI".into()); }
-    ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head, "to_head": to_head }))?;
-    Ok(IntegrationAdmission::AwaitingCi { base_sha, head_sha: to_head.into() })
+    Ok(IntegrationAdmission::Current)
 }
 
 /// Recheck acceptance, exact head, signatures and CI at the write boundary.
@@ -1950,6 +1959,18 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         && leg.number == cand.pr && leg.base.as_deref().unwrap_or("main") == base) else { return Ok(false); };
     let facts = ctx.pr_facts(repo, cand.pr)?;
     if vstr(&facts, "state") != Some("OPEN") || vstr(&facts, "headRefOid") != Some(&cand.head_sha) { return Ok(false); }
+    // BR#9032: the write boundary re-applies the SAME provenance-gated behind
+    // pre-clear the classification used (BR#3727/BR#4687) — once an earlier
+    // batch member moves the base, the next member reads `behind` here and
+    // still lands at its exact reviewed head on a worker-authored branch.
+    // The merge arm's strict-refusal update-branch remains the only branch
+    // rewrite; a protected human branch still defers (never rewritten).
+    let merge_state = vstr(&facts, "mergeStateStatus").unwrap_or("").to_lowercase();
+    let train_owned_branch = if merge_state == "behind" {
+        branch_is_worker_authored(&ctx.pr_commit_logins(repo, cand.pr), &ctx.worker_identities)
+    } else {
+        false
+    };
     let checks = ctx.check_runs(repo, &cand.head_sha);
     let commits = ctx.pr_commits(repo, cand.pr);
     Ok(matches!(decide_train_gate(crate::train_gate::TrainGateInput {
@@ -1959,7 +1980,7 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
         commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
         mechanical_move: None, root_fix: cand.root_fix && is_root_fix_card(&card), base_red_names,
-        train_owned_branch: false,
+        train_owned_branch,
     }), MergeAction::Merge { .. }))
 }
 
@@ -2815,9 +2836,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
         } else {
-            // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
-            // update-branch per tick on the first behind+covered queued head, so
-            // conflicts surface during the wait, not at the drain.
+            // BR#4934 §6, as amended by BR#9032: the settle wait is the
+            // conflict-surfacing window — one trial merge per tick on the
+            // first behind+covered queued head, so conflicts surface during
+            // the wait; a clean read is logged and the drain merges the head
+            // directly — no proactive update-branch.
             settle_window_rebase(ctx, key, repo, base, lane)?;
             return Ok(());
         }
@@ -3701,13 +3724,15 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
 
     // ---- PHASE C (BR#4996): land the batch back-to-back — no settle
     // between members. The per-member merge leg law is the standing law
-    // (BR#4934): machine-clean update first (the verdict carries), then
-    // merge. Before EACH member: the burst cap (drain_burst_decision) and
-    // the mid-drain tip RED classify (GH#2261). A refused merge
-    // soft-breaks: pass_merged > 0 settles the landed prefix and ends the
-    // tick; pass_merged == 0 keeps the loud tick error. Every merged event
-    // carries batch_members — the batch composition in landing order (the
-    // hub sanitizes it; do.ts).
+    // (BR#4934/BR#4996, Ray 2026-10-30): merge directly at the exact
+    // reviewed head; a strict-protection refusal takes the merge arm's
+    // machine update-branch (verdict carries, BR#3516 §5) and the member
+    // merges next tick. Before EACH member: the burst cap
+    // (drain_burst_decision) and the mid-drain tip RED classify (GH#2261).
+    // A refused merge soft-breaks: pass_merged > 0 settles the landed
+    // prefix and ends the tick; pass_merged == 0 keeps the loud tick error.
+    // Every merged event carries batch_members — the batch composition in
+    // landing order (the hub sanitizes it; do.ts).
     let batch_prs: Vec<i64> = batch.iter().map(|&i| candidates[i].pr).collect();
     ctx.tick_batch = batch_prs.clone();
     if !batch.is_empty() {
@@ -3780,9 +3805,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
         }
-        // Require current-base CI before entering a batch. Once it lands a
-        // prefix, independent members can still use the batch's starting base.
-        // An unrelated main advance restores the live-base requirement.
+        // BR#9032: a candidate enters the batch at its EXACT reviewed head —
+        // the admission only proves clean integration (trial merge) against
+        // the batch's tested base and fences unrelated main advances; it
+        // NEVER rewrites the branch. Once the pass lands a prefix, members
+        // tested against the starting base keep landing; an unrelated main
+        // advance restores the live-base requirement.
         if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to prepare this PR; no further writes".into()); }
         let expected_tip = if pass_merged > initial_pass_merged { &tip_sha } else { &probed_base_sha };
         let batch_base = (!probed_base_sha.is_empty())
@@ -3804,17 +3832,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 }
                 ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }))?;
                 log(Some(key), &format!("PR #{pr}: integration repair dispatched; continuing independent batch members"));
-                continue;
-            }
-            IntegrationAdmission::AwaitingCi { base_sha, head_sha: integrated_head } => {
-                for entry in &mut qfacts {
-                    if entry.get("id").and_then(Value::as_str) == Some(cand.head_id.as_str()) {
-                        entry["cls"] = json!("waiting");
-                        entry["integration"] = json!({ "phase": "awaiting_ci", "base_sha": base_sha, "head_sha": integrated_head });
-                    }
-                }
-                ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "entries": qfacts, "base_state": base_state }))?;
-                log(Some(key), &format!("PR #{pr}: current base integrated; substance verdict carried, fresh integrated-head CI required; continuing independent batch members"));
                 continue;
             }
         }
@@ -4077,13 +4094,15 @@ fn settle_ancestors(ctx: &mut Ctx, repo: &str, base: &str, tip_sha: &str) -> Res
     Ok(out)
 }
 
-/// BR#4934 §6: the settle wait is the rebase window. ONE machine-clean leg
-/// per tick: the first queued head that is BEHIND base and verdict-covered
-/// at its CURRENT head gets `gh pr update-branch` (trial-merge first — a
-/// conflict bounces with the file list, human-resolved), then the hub
-/// appends the carry record (train.carry) so the verdict covers the moved
-/// head (BR#3516 §5). Parked awaiting-ci legs are skipped — the settle owns
-/// them; the identity gate withholds the write from a non-worker credential.
+/// BR#4934 §6, as amended by Ray's 2026-10-30 law: the settle wait is the
+/// CONFLICT-SURFACING window — ONE probe per tick, the first queued head
+/// that is BEHIND base and verdict-covered at its CURRENT head gets a trial
+/// merge: a conflict bounces with the file list (human-resolved), a clean
+/// read is logged and the drain merges the head directly — NO proactive
+/// update-branch (no machine push, no PR-branch CI churn, BR#9032; the
+/// strict-refusal merge arm owns the only update-branch). Parked awaiting-ci
+/// legs are skipped — the settle owns them; the identity gate withholds the
+/// write from a non-worker credential.
 fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) -> Result<(), String> {
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
     for (qi, head) in queue.iter().enumerate() {
@@ -7196,6 +7215,12 @@ mod tests {
 
     #[test]
     fn deferred_integration_never_blocks_an_independent_current_candidate_br7500() {
+        // BR#7500 + BR#9032: a candidate that cannot land this tick never
+        // starves an independent current candidate. A worker-authored behind
+        // head is no longer deferred at all (BR#9032: it lands at its exact
+        // head with the batch); a PROTECTED human behind head still bounces
+        // at the gate (BR#3727 — the train does not move human branches),
+        // and the independent candidate lands on the next tick.
         for worker_owned in [true, false] {
             let repo = Repo::new(if worker_owned { "batch-ci" } else { "batch-repair" });
             let stale = repo.side_commit("feature-one", "feature one");
@@ -7206,7 +7231,7 @@ mod tests {
             repo.git(&["commit", "-qm", "base advances independently"]);
             repo.git(&["push", "-q", "origin", "main"]);
             let base = repo.git(&["rev-parse", "HEAD"]);
-            repo.git(&["checkout", "-qb", "feature-two"]);
+            repo.git(&["checkout", "-q", "-b", "feature-two"]);
             std::fs::write(repo.dir.join("second.txt"), "independent feature\n").unwrap();
             repo.git(&["add", "second.txt"]);
             repo.git(&["commit", "-qm", "current candidate"]);
@@ -7214,11 +7239,13 @@ mod tests {
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
             repo.git(&["checkout", "-q", "feature-one"]);
             repo.git(&["merge", "-q", "--no-edit", "main"]);
-            let integrated = repo.git(&["rev-parse", "HEAD"]);
-            let card = |pr: i64, head: &str| json!({ "id": format!("BR#{pr}"), "status": "blocked", "meta": {
+            let merge1 = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["checkout", "-q", "main"]);
+            repo.git(&["reset", "--hard", &base]);
+            let card = |pr: i64, head: String| json!({ "id": format!("BR#{pr}"), "status": "blocked", "meta": {
                 "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": head }], "merge_train": { "state": "queued", "pr": pr }
             } });
-            let cards = [card(1, &stale), card(2, &current)];
+            let cards = [card(1, stale.clone()), card(2, current.clone())];
             let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
                 "get_artefact" => Ok(cards[if call_args(params)["id"] == "BR#1" {0} else {1}].clone()),
                 "train_history" => Ok(json!({"events":[]})),
@@ -7229,49 +7256,197 @@ mod tests {
             let mut ctx = test_ctx(&hub);
             ctx.workdir = repo.dir.to_string_lossy().to_string();
             ctx.base_probe = true;
-            let merged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let merged_c = merged.clone();
-            let updated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let updated_c = updated.clone();
+            let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+            let landed_c = landed.clone();
+            let current_base = std::sync::Mutex::new(base.clone());
+            let dir = repo.dir.clone();
+            let stale_c = stale.clone();
+            let current_c = current.clone();
+            let merge1_c = merge1.clone();
             ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
                 if cmd != "gh" { return None; }
                 if args.first() == Some(&"pr") {
-                    let pr = args[2];
+                    let pr: i64 = args[2].parse().unwrap();
                     if args[1] == "merge" {
-                        assert_eq!(pr, "2", "the stale head must never merge before fresh CI");
-                        merged_c.store(true, Ordering::SeqCst);
+                        let expected = if pr == 1 { &stale_c } else { &current_c };
+                        assert_eq!(args.last().copied().unwrap(), expected.as_str(), "merge must pin the exact reviewed head");
+                        let sha = if pr == 1 { &merge1_c } else { &current_c };
+                        assert!(Command::new("git").args(["push", "-q", "origin", &format!("{sha}:main")]).current_dir(&dir).status().unwrap().success());
+                        landed_c.lock().unwrap().push(pr);
+                        *current_base.lock().unwrap() = sha.clone();
                         return Some(Ok(String::new()));
                     }
-                    let head = if pr == "2" { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale };
-                    let done = pr == "2" && merged_c.load(Ordering::SeqCst);
+                    let done = landed_c.lock().unwrap().contains(&pr);
+                    let pr1_done = landed_c.lock().unwrap().contains(&1);
+                    let head = if pr == 1 { &stale_c } else { &current_c };
+                    // PR #1 is honestly `behind` (base advanced past it). PR #2
+                    // reads CLEAN in phase A, but once PR #1 lands the recompute
+                    // reads `behind` too — the write boundary must still land it
+                    // (the BR#9032 provenance recheck at the phase C boundary).
+                    let state = if pr == 1 || done || pr1_done { "behind" } else { "CLEAN" };
+                    let merge_sha = if pr == 1 { &merge1_c } else { &current_c };
                     return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
-                        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "mergeCommit": if done { json!({ "oid": current }) } else { Value::Null }
+                        "mergeable": "MERGEABLE", "mergeStateStatus": state,
+                        "mergeCommit": if done { json!({ "oid": merge_sha }) } else { Value::Null }
                     }).to_string()));
                 }
                 let endpoint = args.get(1).copied().unwrap_or("");
                 if endpoint == "repos/o/r" { return Some(Ok(json!({ "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true }).to_string())); }
                 if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
+                if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": current_base.lock().unwrap().clone(), "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
                 if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/pulls/1/update-branch") {
-                    updated_c.store(true, Ordering::SeqCst);
-                    return Some(Ok("{}".into()));
+                if endpoint.ends_with("/update-branch") {
+                    panic!("BR#9032: ordinary batches never rewrite a candidate branch: {args:?}");
                 }
                 if endpoint.contains("/pulls/") && endpoint.ends_with("/commits") {
-                    return Some(Ok(signature_fixture(args, json!([{ "sha": if endpoint.contains("/pulls/2/") { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale }, "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]))));
+                    let head = if endpoint.contains("/pulls/2/") { &current_c } else { &stale_c };
+                    return Some(Ok(signature_fixture(args, json!([{ "sha": head, "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]))));
                 }
                 panic!("unexpected gh command {args:?}");
             }));
             drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#1" }, { "id": "BR#2" }] }),
                 "o/r@main", "o/r", "main", 60_000, 10).unwrap_or_else(|e| panic!("{e}; calls: {:?}", calls.lock().unwrap().iter().map(call_name).collect::<Vec<_>>()));
-            assert!(merged.load(Ordering::SeqCst), "one candidate's CI/repair hold starved the independent current candidate");
-            let calls = calls.lock().unwrap();
-            let held = calls.iter().filter(|c| call_name(c) == "train_queue_facts").last().map(call_args).unwrap();
-            assert_eq!(held.pointer("/entries/0/cls"), Some(&json!(if worker_owned { "waiting" } else { "blocked" })));
-            assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 2));
-            assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 1));
+            let merged_events = |calls: &Vec<Value>| calls.iter().filter(|c| call_name(c) == "train_event"
+                && call_args(c)["kind"] == "merged").map(|c| call_args(c)["pr"].as_i64().unwrap()).collect::<Vec<i64>>();
+            if worker_owned {
+                // BR#9032: the behind head lands WITH the batch — no update,
+                // no carry, no deferral.
+                assert_eq!(*landed.lock().unwrap(), vec![1, 2], "worker-authored behind head must land with the batch");
+                let calls = calls.lock().unwrap();
+                assert_eq!(merged_events(&calls), vec![1, 2]);
+                assert!(!calls.iter().any(|c| call_name(c) == "train_carry"), "no branch rewrite, no carry");
+                assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "bounced"));
+                assert_eq!(calls.iter().filter(|c| call_name(c) == "train_ci").count(), 1, "one final settle for the batch");
+            } else {
+                // BR#3727 stands: a protected human behind head bounces at the
+                // gate (the walk ends on the bounce), and the independent
+                // current candidate lands next tick — never starved.
+                assert_eq!(*landed.lock().unwrap(), Vec::<i64>::new(), "the gate bounce ends the tick before any merge");
+                let bounced = calls.lock().unwrap().iter().find(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "bounced").cloned().unwrap();
+                assert_eq!(call_args(&bounced)["pr"], json!(1));
+                assert_eq!(call_args(&bounced)["bounce_kind"], json!("gate"));
+                drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#2" }] }),
+                    "o/r@main", "o/r", "main", 60_000, 10).unwrap();
+                assert_eq!(*landed.lock().unwrap(), vec![2], "the independent current candidate lands on the next tick");
+                assert_eq!(merged_events(&calls.lock().unwrap()), vec![2]);
+            }
         }
+    }
+
+    #[test]
+    fn behind_and_current_reviewed_heads_land_together_without_update_branch_br9032() {
+        // THE BR#9032 regression: two non-conflicting reviewed heads — one
+        // BEHIND the green batch starting tip (tested against an older base,
+        // the SP #2457 shape), one current — land together in ONE pass, at
+        // their exact reviewed heads, with NO update-branch anywhere. The
+        // stale admission used to rewrite the behind head to current main
+        // (a forced full PR CI round) before letting it into the batch.
+        let repo = Repo::new("br9032-batch");
+        let older = repo.advance_main("older base commit");
+        let start = repo.advance_main("batch starting tip");
+        // PR #1: reviewed head BEHIND the batch starting tip (child of the
+        // older base), disjoint file change.
+        repo.git(&["checkout", "-q", "-b", "behind-one", &older]);
+        std::fs::write(repo.dir.join("g.txt"), "behind reviewed change\n").unwrap();
+        repo.git(&["add", "g.txt"]);
+        repo.git(&["commit", "-qm", "behind reviewed change"]);
+        let behind = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
+        // PR #2: reviewed head CURRENT (child of the starting tip), disjoint file.
+        repo.git(&["checkout", "-q", "-b", "current-two", &start]);
+        std::fs::write(repo.dir.join("h.txt"), "current reviewed change\n").unwrap();
+        repo.git(&["add", "h.txt"]);
+        repo.git(&["commit", "-qm", "current reviewed change"]);
+        let current = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+        // the real merges (disjoint → clean), for landing receipts only
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "--no-ff", "-qm", "merge behind head", "behind-one"]);
+        let merge1 = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["merge", "--no-ff", "-qm", "merge current head", "current-two"]);
+        let merge2 = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["reset", "--hard", &start]);
+        assert!(repo.ctx().is_ancestor(&older, &behind).unwrap(), "fixture: behind head descends from the older base");
+        assert!(!repo.ctx().is_ancestor(&start, &behind).unwrap(), "fixture: behind head is behind the batch starting tip");
+        assert!(repo.ctx().is_ancestor(&start, &current).unwrap(), "fixture: current head descends from the starting tip");
+        let card = |pr: i64, head: String| json!({ "id": format!("BR#{pr}"), "status": "blocked", "meta": {
+            "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": head }], "merge_train": { "state": "queued", "pr": pr }
+        } });
+        let cards = [card(1, behind.clone()), card(2, current.clone())];
+        let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+            "get_artefact" => Ok(cards[if call_args(params)["id"] == "BR#1" {0} else {1}].clone()),
+            "train_history" => Ok(json!({"events":[]})),
+            "train_ci" => Ok(json!({"decided":"pending"})),
+            "train_lease" | "train_queue_facts" | "train_event" | "train_carry" => Ok(json!({})),
+            other => panic!("unexpected hub command {other}"),
+        });
+        let mut ctx = test_ctx(&hub);
+        ctx.workdir = repo.dir.to_string_lossy().to_string();
+        ctx.base_probe = true;
+        let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let landed_c = landed.clone();
+        let current_base = std::sync::Mutex::new(start.clone());
+        let dir = repo.dir.clone();
+        let behind_c = behind.clone();
+        let current_c = current.clone();
+        let merge1_c = merge1.clone();
+        let merge2_c = merge2.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            if cmd != "gh" { return None; }
+            if args.first() == Some(&"pr") {
+                let pr: i64 = args[2].parse().unwrap();
+                if args[1] == "merge" {
+                    let expected = if pr == 1 { &behind_c } else { &current_c };
+                    assert_eq!(args.last().copied().unwrap(), expected.as_str(), "merge must pin the exact reviewed head");
+                    assert!(args.contains(&"--match-head-commit"), "the exact-head merge pin is mandatory");
+                    let sha = if pr == 1 { &merge1_c } else { &merge2_c };
+                    assert!(Command::new("git").args(["push", "-q", "origin", &format!("{sha}:main")]).current_dir(&dir).status().unwrap().success());
+                    landed_c.lock().unwrap().push(pr);
+                    *current_base.lock().unwrap() = sha.clone();
+                    return Some(Ok(String::new()));
+                }
+                let done = landed_c.lock().unwrap().contains(&pr);
+                let pr1_done = landed_c.lock().unwrap().contains(&1);
+                let head = if pr == 1 { &behind_c } else { &current_c };
+                // PR #1 is honestly `behind` throughout. PR #2 reads CLEAN in
+                // phase A, then — once PR #1 lands and the base moves — reads
+                // `behind` again: the write-boundary provenance recheck must
+                // still land it at its exact head (BR#9032).
+                let state = if pr == 1 || done || pr1_done { "behind" } else { "CLEAN" };
+                let merge_sha = if pr == 1 { &merge1_c } else { &merge2_c };
+                return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
+                    "mergeable": "MERGEABLE", "mergeStateStatus": state,
+                    "mergeCommit": if done { json!({ "oid": merge_sha }) } else { Value::Null }
+                }).to_string()));
+            }
+            let endpoint = args.get(1).copied().unwrap_or("");
+            if endpoint == "repos/o/r" { return Some(Ok(json!({ "allow_merge_commit": true, "allow_squash_merge": true, "allow_rebase_merge": true }).to_string())); }
+            if endpoint.contains("/rules/branches/") { return Some(Ok("[]".into())); }
+            if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": current_base.lock().unwrap().clone(), "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
+            if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
+            if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+            if endpoint.ends_with("/update-branch") {
+                panic!("BR#9032: a clean behind head must land without update-branch: {args:?}");
+            }
+            if endpoint.contains("/pulls/") && endpoint.ends_with("/commits") {
+                let head = if endpoint.contains("/pulls/2/") { &current_c } else { &behind_c };
+                return Some(Ok(signature_fixture(args, json!([{ "sha": head, "verified": true, "login": "detached-cody" }]))));
+            }
+            panic!("unexpected gh command {args:?}");
+        }));
+        drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#1" }, { "id": "BR#2" }] }),
+            "o/r@main", "o/r", "main", 60_000, 10).unwrap_or_else(|e| panic!("{e}; calls: {:?}", calls.lock().unwrap().iter().map(call_name).collect::<Vec<_>>()));
+        assert_eq!(*landed.lock().unwrap(), vec![1, 2], "both reviewed heads land together, in queue order");
+        let calls = calls.lock().unwrap();
+        for pr in [1, 2] {
+            let ev = calls.iter().find(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged"
+                && call_args(c)["pr"] == json!(pr)).unwrap_or_else(|| panic!("missing merged event for PR #{pr}"));
+            assert_eq!(call_args(ev)["batch_members"], json!([1, 2]), "one batch landed both heads");
+        }
+        assert!(!calls.iter().any(|c| call_name(c) == "train_carry"), "no update-branch — no carry");
+        assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "bounced"));
+        assert_eq!(calls.iter().filter(|c| call_name(c) == "train_ci").count(), 1, "one final settle for the batch");
     }
 
     #[test]
@@ -7325,7 +7500,15 @@ mod tests {
     }
 
     #[test]
-    fn file_clean_but_compile_broken_stale_head_must_integrate_and_wait_for_ci() {
+    fn stale_head_with_clean_file_merge_admits_at_its_exact_head_br9032() {
+        // BR#9032: a stale head that file-merges cleanly is admitted at its
+        // EXACT head — no proactive update-branch, no carry, no deferred
+        // re-integration CI wait. The compile-broken integration this
+        // fixture builds (a clean FILE merge against a changed contract) is
+        // the known residual risk: it lands with the batch and the pass's
+        // single settle runs the final merge commit — a red stops the line
+        // and the bisect names the culprit (GH#2261), the same net every
+        // landing already has. The unrelated-advance fence is unchanged.
         let repo = Repo::new("semantic-integration");
         std::fs::write(repo.dir.join("contracts.rs"), "pub struct Metadata { pub a: u8 }\n").unwrap();
         repo.git(&["add", "contracts.rs"]);
@@ -7340,36 +7523,33 @@ mod tests {
         std::fs::write(repo.dir.join("contracts.rs"), "pub struct Metadata { pub a: u8, pub b: u8 }\n").unwrap();
         repo.git(&["commit", "-qam", "new required field"]);
         repo.git(&["push", "-q", "origin", "main"]);
-        let base = repo.git(&["rev-parse", "HEAD"]);
         assert!(repo.ctx().trial_merge("main", &old).unwrap().0, "file merge is clean");
         repo.git(&["merge", "-q", "--no-edit", "feature"]);
-        let integrated = repo.git(&["rev-parse", "HEAD"]);
         let compile = Command::new("rustc").args(["main.rs", "-o", "probe"]).current_dir(&repo.dir).output().unwrap();
         assert!(!compile.status.success());
         assert!(String::from_utf8_lossy(&compile.stderr).contains("missing field `b`"));
 
-        let (hub, calls) = mock_hub(vec![ok(json!({"ok": true})), ok(json!({"ok": true}))]);
+        let (hub, calls) = mock_hub(vec![ok(json!({"ok": true}))]); // the admission's ONE lease renewal
         let mut ctx = test_ctx(&hub);
         ctx.workdir = repo.dir.to_string_lossy().to_string();
-        ctx.worker_identities = vec!["worker".into()];
-        let new_head = integrated.clone();
-        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
-            if cmd != "gh" { return None; }
-            if args.get(1) == Some(&"repos/o/r/pulls/7/commits") { return Some(Ok(json!([{"login":"worker"}]).to_string())); }
-            if args.get(1) == Some(&"repos/o/r/pulls/7/update-branch") { return Some(Ok("{}".into())); }
-            if args.first() == Some(&"pr") { return Some(Ok(json!({"headRefOid":new_head,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}).to_string())); }
-            panic!("unexpected command {args:?}");
+        // NO gh call is lawful in admission anymore: the branch is never
+        // rewritten, so the authorship read and the update-branch API are
+        // gone with the rewrite.
+        ctx.sh_mock = Some(std::sync::Arc::new(|cmd, args| {
+            if cmd == "gh" { panic!("admission must not write or read GitHub (BR#9032): {args:?}"); }
+            None
         }));
         let candidate = BatchCandidate { qi: 0, head_id: "BR#7".into(), pr: 7, head_sha: old.clone(), root_fix: false };
+        // the unrelated-advance fence is preserved byte-for-byte
         assert!(admit_current_base(&mut ctx, "o/r", "main", &candidate, Some((&old, &old)))
             .unwrap_err().contains("Main changed outside the current batch"));
-        assert!(calls.lock().unwrap().is_empty(), "unexpected base must not mutate a candidate");
+        assert!(calls.lock().unwrap().is_empty(), "the fence fires before any hub write");
+        // a clean file merge against the advanced base admits at the exact head
         assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate, None).unwrap(),
-            IntegrationAdmission::AwaitingCi { base_sha: base, head_sha: integrated });
+            IntegrationAdmission::Current);
         let events = calls.lock().unwrap();
-        assert!(events.iter().any(|c| call_name(c) == "train_carry"));
-        assert!(!events.iter().any(|c| call_name(c) == "train_event"), "integration is not a merge receipt");
-        assert_eq!(crate::train_gate::classify_head_checks(&[]).verdict, MainVerdict::Unsettled, "no fresh CI is never admission");
+        assert!(events.iter().all(|c| call_name(c) != "train_carry"), "no carry without a branch move");
+        assert!(!events.iter().any(|c| call_name(c) == "train_event"), "a clean integration is not a bounce");
     }
 
     const BOGUS_SHA: &str = "0123456789abcdef0123456789abcdef01234567";

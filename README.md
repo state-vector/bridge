@@ -2198,9 +2198,15 @@ non-conflicting members can land back-to-back using that evidence while the
 live tip is still the batch's own landed prefix. The train rechecks review,
 signatures and required checks on each exact head and stops on a red base
 check. If an unrelated merge advances main, candidates need CI against the
-new base. A clean worker-authored update carries the review verdict and runs
-fresh CI. Conflicting or non-worker-authored branches receive an agent-owned
-repair.
+new base. Since BR#9032 a behind head whose file-level integration against
+the new base is clean is admitted AT ITS EXACT reviewed head — the branch is
+never rewritten proactively; the merge arm's strict-refusal `update-branch`
+(verdict carries, BR#3516 §5) is the only branch rewrite. A semantic break
+the file merge cannot see lands with the batch and is caught by the pass's
+single settle — a red stops the line and the bisect names the culprit
+(GH#2261), the same net every landing has. Conflicting members bounce with
+the file list; non-worker-authored branches bounce at the gate (the train
+does not move human branches, BR#3727).
 
 A scheduler reservation authorizes initial `begin` through its exact gateway
 token and session, without requiring a caller-supplied agent label. Existing
@@ -2350,9 +2356,10 @@ with elapsed time, main-check health, live executor presence and the number of
 candidates that passed initial queue gates. Bridge owns priority diagnosis and
 repair. A heartbeat is not throughput, and a completed diagnostic is not recovery.
 A single candidate's failed check must not be presented as the reason independent
-candidates cannot merge. Candidates waiting for current-base CI or integration
-repair are deferred while the executor continues the remaining independent batch;
-their stale heads cannot merge. A worker reporting `MCP UNAVAILABLE: bridge tools
+candidates cannot merge. Candidates in integration repair are deferred while the executor continues the
+remaining independent batch; their stale heads cannot merge. A behind head whose
+integration is CLEAN is not deferred at all (BR#9032): it lands with the batch
+at its exact reviewed head. A worker reporting `MCP UNAVAILABLE: bridge tools
 missing` is a failed execution configuration, never a successful diagnostic or
 review. The runner preserves its work and releases the failed claim for execution
 repair. Repeated missing-tool failures name that exact cause in the gateway's
@@ -2624,11 +2631,14 @@ included) as "unmergeable — CONFLICTING".
   held until main settles`); without burst context the BR#4804 strings
   (BR#4981 vocabulary included) are byte-identical. Red anywhere stops the
   line instantly (GH#2261) — a red fed mid-drain never waits for the settle.
-  While the settle wait runs, the executor uses it as a rebase window: one
-  machine-clean `update-branch` per tick on a behind, verdict-covered queued
-  head (a clean trial merge rides with it; a dirty one conflict-bounces;
-  carries append contiguously via `train.carry` — the minimal primitive,
-  superseded by L1.4's carry law when it lands). On a GREEN settle the pass's
+  While the settle wait runs, the executor uses it as a conflict-surfacing
+  window (BR#9032): one trial merge per tick on a behind, verdict-covered
+  queued head — a conflict bounces with the file list (human-resolved); a
+  clean read is logged and the drain merges the head directly at its exact
+  reviewed head. NO proactive `update-branch`: no machine push, no PR-branch
+  CI churn — the strict-refusal merge arm owns the only branch rewrite, and
+  a carried verdict rides `train.carry` when that refusal fires. On a GREEN
+  settle the pass's
   intermediate parked cards close on executor-fed git ancestry
   (`ancestors_of_settled` via `train.ci` — their runs were
   cancelled-by-next-push, and the hub holds no VCS credentials, so the
@@ -2817,7 +2827,6 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
   gave. Force-review is **web/human-only** (the route refuses gateway bearers with 403); the
   stop-the-line and signing-environment asks remain the only genuine-decision asks on
   a lane.
-- **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727)**: behind is
 - **`mergeStateStatus=behind` pre-clears at the TRAIN gate only (BR#3727,
   provenance-gated BR#4687)**: behind is
   exactly "base advanced, branch still mergeable" — the state the carry law was written
@@ -2827,21 +2836,25 @@ successes gated a 4.4h re-run loop on six queued SP PRs):
   `MERGE_TRAIN_WORKER_IDENTITIES` (fetched once, only when the state reads behind, so
   the common tick's gh budget is unchanged; an empty/unknown authorship list fails
   CLOSED to human-owned — a bounce is the safe direction, a machine rewrite of an
-  unknown branch is not). The train machine-updates branches its own fleet authored
+  unknown branch is not). The train rewrites only branches its own fleet authored
   and never moves a protected human branch: behind on one of those still bounces to
-  its owner. With provenance + a verdict-covered head + a clean trial merge → `gh pr
-  update-branch` lands machine-clean, the executor stamps `train:updated` THAT MOMENT
-  (leg stamp → new head), and the card re-enters the queue SILENTLY — no bounce
-  cascade, no card status change, no re-verify duty, no review ask, no boost: the
-  machine rebase is the train's own plumbing, and humans only ever see TRUE content
-  conflicts. A dirty trial merge still bounces with the file list (the verdict does
-  not carry across hand-resolved code), and an update that reports ok but leaves the
-  head unreadable/unchanged fails the tick closed with the carry withheld. The tick
-  right after an update-branch reads `blocked` while strict branch protection re-runs
-  the required checks on the new head — pending, not a defect: the gate WAITS on it
-  (red head checks note; blocked with green checks — protection wants reviews — still
-  bounces honestly).
-  bounces honestly). A SECOND behind on the same leg (base raced again after a prior carry) machine-updates again — coverage is stamp OR carry, so the chain extends instead of attempting a doomed merge.
+  its owner. Since BR#9032 the pre-cleared head is NOT rewritten proactively: with
+  a clean trial merge it lands WITH the batch at its exact reviewed head — the
+  batch re-applies the same provenance gate at the write boundary (BR#9032), so
+  batch members land together; a conflicting integration bounces with the file
+  list (the verdict does not carry across hand-resolved code). The ONLY branch
+  rewrite is the merge leg's strict-refusal machine `update-branch` (BR#3516 §5):
+  GitHub refuses the exact-head merge → the executor machine-updates, stamps
+  `train:updated` (leg stamp → new head), the hub appends the carry so the verdict
+  covers the moved head, and the member merges next tick — SILENTLY: no bounce
+  cascade, no card status change, no re-verify duty, no review ask, no boost, and
+  an update that reports ok but leaves the head unreadable/unchanged fails the tick
+  closed with the carry withheld — a machine rebase is the train's own plumbing,
+  and humans only ever see TRUE content conflicts. The tick right after a carried
+  update reads `blocked` while strict branch protection re-runs the required checks
+  on the new head — pending, not a defect: the gate WAITS on it (red head checks
+  note; blocked with green checks — protection wants reviews — still bounces
+  honestly). A SECOND behind on the same leg (base raced again after a prior carry) machine-updates again — coverage is stamp OR carry, so the chain extends instead of attempting a doomed merge.
 - **UNKNOWN mergeability polls, never bounces (BR#4685)**: GitHub computes mergeability
   asynchronously — a read right after a base merge yields `mergeStateStatus=null/UNKNOWN`,
   and `mergeable` rides the same recomputation, so an answer is definitive only when the
