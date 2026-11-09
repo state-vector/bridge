@@ -307,6 +307,7 @@ export function initialExecution(requirements: ExecutionRequirements = Execution
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), mode: z.enum(["inspect", "reserve", "request_capacity"]) }),
   z.object({ kind: z.literal("schedule_status"), host: text.optional() }),
+  z.object({ kind: z.literal("provider_route_verified"), proof: ProviderRecoveryProofSchema, limit: z.number().int().min(1).max(4).default(4) }),
   z.object({ kind: z.literal("recover_provider_failure"), terminal: TerminalReceiptSchema,
     proof: ProviderRecoveryProofSchema, diagnosis: recoveryPermitFields.diagnosis,
     continuation: text, evidence: z.array(text).min(1) }),
@@ -361,7 +362,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     return a;
   };
   switch (command.kind) {
-    case "schedule": case "schedule_status": case "recover_provider_failure": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "schedule": case "schedule_status": case "recover_provider_failure": case "provider_route_verified": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
     case "start_failed": {
       if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
       return s; // the authenticated coordinator owns the atomic task release

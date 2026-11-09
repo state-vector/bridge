@@ -5357,7 +5357,7 @@ export class KnowledgeHub {
   /** No awaits between read/decide/write. State and replay receipt share one
    * SQLite transaction; replay after a lost response never authorises a second
    * Git/AWS effect. Those effects still require inspect-and-reconcile. */
-  private async executionCommand(raw: unknown, actor: string, trace?: RequestTrace) {
+  private executionCommand(raw: unknown, actor: string, trace?: RequestTrace, inRecoveryBatch = false): unknown {
     const req = ExecutionRequestSchema.parse(raw);
     const body = raw as Record<string, unknown>;
     const tokenId = String(body.token_id ?? "");
@@ -5371,6 +5371,52 @@ export class KnowledgeHub {
     if (command.kind === "gateway_control" || command.kind === "gateway_failure") {
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, effectKey, req.command_id);
       if (replay) { if (replay.request !== effectRequest) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+    }
+    if (command.kind === "provider_route_verified") {
+      const proof = command.proof;
+      if (!req.session || !this.executionWork().isInteractive(tokenId))
+        throw new Error("gate: verified route recovery requires an authenticated full-agent session");
+      if (proof.witness.kind !== "configured_proxy_request" || !validRecoveryRequestProof(proof, "provider_route_unavailable"))
+        throw new Error("gate: expected a witnessed configured proxy request");
+      const key = "provider-route:" + proof.host;
+      const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, key, proof.id);
+      if (replay) {
+        if (replay.request !== effectRequest) throw new Error("gate: route receipt id reused with different evidence");
+        return JSON.parse(replay.result);
+      }
+      if (proof.observed_at > now || now - proof.observed_at > 300_000) throw new Error("gate: route receipt is stale");
+      const host = this.schedulingStatus(proof.host, now)[0];
+      const limit = host?.live && host.readiness.kind === "ready"
+        ? Math.max(0, Math.min(command.limit, host.capacity - host.active - host.reserved - host.eligible))
+        : 0;
+      return this.state.storage.transactionSync(() => {
+        const granted: string[] = [];
+        if (limit) for (const id of (host.held.retry_budget ?? []).slice(0, 32)) {
+          const execution = this.executionState(id);
+          const attempt = execution?.attempt;
+          if (!execution?.terminal || !attempt?.executor || attempt.host !== proof.host
+            || attempt.executor.backend !== proof.backend || attempt.executor.model !== proof.model
+            || attempt.executor.config_revision !== proof.config_revision
+            || execution.recovery_permit?.phase === "available"
+            || providerRecoveryDiagnosis(execution.terminal.outcome) !== "provider_route_unavailable") continue;
+          try {
+            this.executionCommand({ ...body, id, command_id: "verified-route:" + proof.id, command: {
+              kind: "recover_provider_failure", terminal: execution.terminal, proof,
+              diagnosis: "provider_route_unavailable",
+              continuation: "Check current upstream state, preserve previous work, and record a verified outcome.",
+              evidence: proof.receipts,
+            } }, actor, undefined, true);
+            granted.push(id);
+          } catch (error) {
+            if (!(error instanceof Error) || !error.message.startsWith("gate:")) throw error;
+          }
+          if (granted.length >= limit) break;
+        }
+        const result = { kind: "verified_route_recovery", granted };
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,
+          key, proof.id, effectRequest, JSON.stringify(result));
+        return result;
+      });
     }
     if (command.kind === "schedule_status") return { hosts: this.schedulingStatus(command.host) };
     if (command.kind === "gateway_control") {
@@ -5497,11 +5543,13 @@ export class KnowledgeHub {
         proof:command.proof,diagnosis:command.diagnosis,continuation:command.continuation,evidence:command.evidence,authorized_by:actor };
       current.revision += 1;
       const result = {kind:"provider_recovery_granted",task_id:req.id,permit:current.recovery_permit,budget_exhaustions:current.budget_exhaustions};
-      this.state.storage.transactionSync(() => {
+      const save = () => {
         this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`,JSON.stringify(current),req.id);
         this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,req.id,req.command_id,encoded,JSON.stringify(result));
         this.version(req.id,actor,"provider_recovery_granted","One witnessed continuation permitted; original retry count and failure evidence retained",{generation:a.generation,proof:command.proof.id,diagnosis:command.diagnosis,continuation:command.continuation});
-      });
+      };
+      if (inRecoveryBatch) save();
+      else this.state.storage.transactionSync(save);
       return result;
     }
     if (command.kind === "inspect") {

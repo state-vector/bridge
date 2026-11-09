@@ -83,24 +83,16 @@ def main():
         digest = hashlib.sha256(f"{proof['id']}:{task}:{suffix}".encode()).hexdigest()
         return rpc(url, token, task, f"provider-batch:{digest}", command)
 
+    if args.apply:
+        result = call("gateway", {"kind": "provider_route_verified", "proof": proof, "limit": args.limit}, "route-verified")
+        print(json.dumps(result))
+        return
+
     hosts = call("gateway", {"kind": "schedule_status", "host": proof["host"]}, "status")["hosts"]
     if len(hosts) != 1:
         parser.error("the proof must identify one gateway")
-    candidates = choose(hosts[0], proof, lambda task: call(task, {"kind": "inspect"}, "inspect"), args.limit)
-    for task, terminal in candidates:
-        if not args.apply:
-            print(json.dumps({"task_id": task, "generation": terminal["generation"], "status": "selected"}))
-            continue
-        try:
-            result = call(task, {
-                "kind": "recover_provider_failure", "terminal": terminal, "proof": proof,
-                "diagnosis": "provider_route_unavailable",
-                "continuation": "Check current upstream state, preserve prior work, and record a verified outcome.",
-                "evidence": proof["receipts"],
-            }, "grant")
-            print(json.dumps({"task_id": task, "status": result["kind"]}))
-        except ValueError:
-            print(json.dumps({"task_id": task, "status": "rejected_by_hub"}))
+    for task, terminal in choose(hosts[0], proof, lambda task: call(task, {"kind": "inspect"}, "inspect"), args.limit):
+        print(json.dumps({"task_id": task, "generation": terminal["generation"], "status": "selected"}))
 
 
 if __name__ == "__main__":

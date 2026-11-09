@@ -47,8 +47,9 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
-  it.each(["configured_route_observed", "configured_proxy_request"])("admits one %s recovery through scheduler and begin without erasing failures", async (witnessKind) => {
-    const proxy = witnessKind === "configured_proxy_request";
+  it.each(["configured_route_observed", "configured_proxy_request", "verified_route_event"])("admits one %s recovery through scheduler and begin without erasing failures", async (witnessKind) => {
+    const event = witnessKind === "verified_route_event";
+    const proxy = witnessKind !== "configured_route_observed";
     const project = "provider-recovery", g = await gateway(project);
     const larger = {...g.capabilities,tier:"large"};
     await g.cmd({kind:"advertise",capabilities:{...g.capabilities,alternatives:[larger]}});
@@ -75,7 +76,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const terminal = await exhaust(id);
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
     const additional = [];
-    if (proxy) {
+    if (proxy && !event) {
       for (let i = 0; i < 4; i++) {
         const taskId = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
         additional.push({ taskId, terminal: await exhaust(taskId) });
@@ -86,7 +87,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const auth = { actor: `recovery-reviewer-${serial}`, token_id: identity.token_id, session: "recovery-review" };
     const proof = { id: "request-one", host:g.host, backend:g.capabilities.backend, model:g.capabilities.model, config_revision:"one",
       result:{kind:"succeeded",response_receipt:"ssm:request"},observed_at:Date.now(), request:{kind:"configured_model_request",max_output_tokens:32000,tools:"none"}, actual_model:"provider/small",
-      configuration_receipt:"ssm:config", receipts:["ssm:request"], witness:{kind:witnessKind,configured_model:g.capabilities.model,
+      configuration_receipt:"ssm:config", receipts:["ssm:request"], witness:{kind:event ? "configured_proxy_request" : witnessKind,configured_model:g.capabilities.model,
         allowed_actual_models:["provider/small"],configured_max_output_tokens:32000,observed_max_output_tokens:32000,configuration_receipt:"ssm:config"} };
     const command = {kind:"recover_provider_failure",terminal,proof,diagnosis:proxy ? "provider_route_unavailable" : "provider_authentication",continuation:"Inspect PR before any push",evidence:["ssm:request"]};
     const recover = (command_id: string, c: object = command) => post("execution", {...auth,id,command_id,command:c});
@@ -94,6 +95,22 @@ describe("eligibility-first scheduling on real SQLite", () => {
       expect((await recover(`wrong-${++serial}`,{...command,proof:wrong})).error).toMatch(/proof|request/);
     }
     expect((await post("execution",{...g.worker,id,session:"worker-self-recovery",command_id:"worker-grant",command})).error).toMatch(/full-agent/);
+    if (event) {
+      const verified = { kind: "provider_route_verified", proof };
+      const submit = (command_id: string) => post("execution", { ...auth, id: "gateway", command_id, command: verified });
+      expect((await g.cmd(verified)).error).toMatch(/full-agent/);
+      const receipt = await submit("route-observed");
+      expect(receipt).toEqual({ kind: "verified_route_recovery", granted: [id] });
+      const resumed = await reserve(g);
+      if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+      expect(resumed.task_id).toBe(id);
+      const begun = await g.cmd({ kind: "begin", attempt_id: "event-recovered", worker: g.auth.agent,
+        action_budget_ms: 60_000, selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } },
+        "event-begin", id, resumed.session);
+      expect(begun).toMatchObject({ generation: 4, budget_exhaustions: 3, recovery_permit: { phase: "consumed" } });
+      expect(await submit("different-transport-command")).toEqual(receipt);
+      return;
+    }
     const grant = await recover("grant");
     expect(grant).toMatchObject({kind:"provider_recovery_granted",budget_exhaustions:3});
     expect(await recover("grant")).toEqual(grant);
