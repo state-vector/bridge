@@ -2718,19 +2718,38 @@ fn worktree_owner(path: &Path, fallback: &str) -> String {
 /// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
 /// not stall dispatch). ssh-keygen from file signs instantly; 15s is generous.
 pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
-    cmd.stdin(std::process::Stdio::null());
+    use std::io::{Read, Seek};
+    // A child can fill a pipe before it exits. File-backed capture lets the
+    // timeout poll independently of output volume or inherited descriptors.
+    let capture = || -> std::io::Result<_> {
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = file.reopen()?;
+        Ok((file.into_file(), writer))
+    };
+    let capture = || capture().map_err(|e| format!("open command capture: {e}"));
+    let (mut stdout, stdout_writer) = capture()?;
+    let (mut stderr, stderr_writer) = capture()?;
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| format!("wait failed: {e}"));
+            Ok(Some(status)) => {
+                let read = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+                    // Limit the read to bytes captured at exit even if a
+                    // descendant inherited the output descriptor.
+                    let len = file.metadata()?.len();
+                    file.rewind()?;
+                    let mut bytes = Vec::new();
+                    file.take(len).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                };
+                let read = |file| read(file).map_err(|e| format!("read command capture: {e}"));
+                return Ok(std::process::Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? });
             }
             Ok(None) => {
                 if started.elapsed() >= Duration::from_secs(secs) {
@@ -5233,6 +5252,16 @@ mod tests {
         let out = run_with_timeout(quick, 5).expect("a quick program completes");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bridge");
+    }
+
+    #[test]
+    fn run_with_timeout_captures_output_larger_than_a_pipe() {
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2; exit 7"]);
+        let output = run_with_timeout(noisy, 5).expect("large output must not stall the process");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout.len(), 262144);
+        assert_eq!(output.stderr.len(), 262144);
     }
 
     // ---- BR#3337 drill: claim races are skipped, stale claims released ----
