@@ -217,4 +217,32 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     const continuation = (await call("stats", { park_inventory: true, after_park: id })).body.park_inventory;
     expect(continuation.items.every((entry: { id: string }) => entry.id > id)).toBe(true);
   });
+
+  it("keeps older open human asks on the board when recent work fills the window", async () => {
+    const subject = await task("Pilot archive policy");
+    const human = await call("ask.create", {
+      actor: "author", route: { kind: "human_decision" }, question: "Should the archive be retained after the pilot?",
+      decision: {
+        kind: "preference", task_id: subject, context: "The pilot is complete.",
+        why_human: "The owner sets the archive policy.",
+        choices: [
+          { label: "Keep the archive", executor: "bridge", consequence: "Bridge retains the records.", action: "hold" },
+          { label: "Discard the archive", executor: "bridge", consequence: "Bridge implements the new retention policy.", action: "resume" },
+        ],
+      },
+    });
+    expect(human.status, JSON.stringify(human.body)).toBe(200);
+    const peer = await call("ask.create", {
+      actor: "author", to: "any", route: { kind: "agent_coordination" },
+      question: "Can someone review the pilot logs?",
+      options: ["I can review the logs", "Leave the logs for the next reviewer"],
+    });
+    expect(peer.status).toBe(200);
+    for (let i = 0; i < 260; i++) await task(`Recent work ${i}`);
+
+    const board = await (await stub.fetch("https://kb/board")).json();
+    const ids = board.tasks.map((row: { id: string }) => row.id);
+    expect(ids).toContain(human.body.id);
+    expect(ids).not.toContain(peer.body.id);
+  });
 });

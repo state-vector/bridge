@@ -2707,14 +2707,23 @@ export class KnowledgeHub {
     // burst of closures never pushes active/blocked/queued tasks out of the
     // board payload window.
     const tasks = this.state.storage.sql.exec(
-      `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
+      `WITH recent AS (
+         SELECT id FROM artefacts WHERE type IN ('task','question')
+         ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END, updated_ts DESC
+         LIMIT 250
+       )
+       SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.type IN ('task','question')
-       ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END ASC, a.updated_ts DESC
-       LIMIT 250`,
+       WHERE a.id IN (SELECT id FROM recent)
+          OR (a.type = 'question' AND a.status IN ('todo','in_progress','blocked')
+              AND coalesce(json_extract(a.meta, '$.ask.answer'), '') = ''
+              AND (json_extract(a.meta, '$.ask.route.kind') = 'human_decision'
+                   OR (json_type(a.meta, '$.ask.route') IS NULL
+                       AND json_extract(a.meta, '$.ask.to') IN ('human','ray','rayh'))))
+       ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END, a.updated_ts DESC`,
     ).toArray().map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
-    // One bounded JSON parameter avoids the runtime's SQL variable ceiling on
-    // full (250-card) snapshots without loading every historical execution.
+    // Open human decisions stay visible beyond the recent-work window. Use
+    // one JSON parameter to keep the execution lookup within SQLite limits.
     const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, JSON.stringify(tasks.map(task => String(task.id)))).toArray() : [];
     const executionByTask = new Map(executionRows
       .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
