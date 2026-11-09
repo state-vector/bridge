@@ -314,20 +314,43 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await g.cmd(final, "old-final-not-replay", id, "wrong-session")).error).toMatch(/fenced|session/);
   });
   it("releases physical capacity but preserves unknown operations and independent waits on terminal capture", async () => {
-    const project = "terminal-unknown-effects", g = await gateway(project);
+    const project = "terminal-unknown-effects", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), claim = await reserve(g);
     if (claim.kind !== "reserved") throw new Error("no reservation");
     await g.cmd({ kind: "begin", attempt_id: "unknown-one", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-begin", id, claim.session);
     await g.cmd({ kind: "prepare", generation: 1, attempt_id: "unknown-one", operation_id: "publish", action: "Push exact ref", input_revision: "a", budget_ms: 60_000 }, "unknown-prepare", id, claim.session);
+    await g.cmd({ kind: "prepare", generation: 1, attempt_id: "unknown-one", operation_id: "deploy", action: "Start exact deployment", input_revision: "a", budget_ms: 60_000 }, "unknown-prepare-deploy", id, claim.session);
     const command = { kind: "finalize", generation: 1, attempt_id: "unknown-one", writers: "process_group_empty",
       outcome: { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "network lost; preserve all work" } };
     expect((await g.cmd({ ...command, kind: "stopped" }, "unknown-stopped", id, claim.session)).error).toBeUndefined();
+    expect((await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "unknown-one", checkpoint: publishedCheckpoint },
+      "unknown-checkpoint", id, claim.session)).error).toBeUndefined();
     const final = await g.cmd(command, "unknown-final", id, claim.session);
-    expect(final.operations).toMatchObject([{ id: "publish", state: "prepared" }]);
+    expect(final.operations).toMatchObject([{ id: "publish", state: "prepared" }, { id: "deploy", state: "prepared" }]);
     expect((await post("get", { id })).status).toBe("in_progress");
     const status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].occupancy.held).toBe(0);
     expect((await g.cmd({ kind: "begin", attempt_id: "unsafe-retry", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-retry", id, claim.session)).error).toMatch(/unknown external operations/);
+    const result = { kind: "result", generation: 1, attempt_id: "unknown-one", operation_id: "publish",
+      outcome: "succeeded", receipts: ["GitHub ref readback at exact commit"] };
+    expect((await peer.cmd(result, "foreign-operation", id, claim.session)).error).toMatch(/authority/);
+    expect((await g.cmd({ ...result, receipts: [] }, "empty-operation", id, claim.session)).error).toMatch(/requires receipts/);
+    expect((await g.cmd(result, "wrong-session-operation", id, "different-session")).error).toMatch(/fenced/);
+    expect(await g.cmd(result, "record-push", id, claim.session)).toMatchObject({ task_status: "in_progress" });
+    expect((await post("get", { id })).status).toBe("in_progress");
+    const last = { ...result, operation_id: "deploy", outcome: "failed", receipts: ["Deployment API confirmed no deployment was created"] };
+    const reconciled = await g.cmd(last, "record-deploy", id, claim.session);
+    expect(reconciled).toMatchObject({ task_status: "todo", terminal: final.terminal,
+      operations: [{ id: "publish", state: "succeeded" }, { id: "deploy", state: "failed" }] });
+    const recovered = await reserve(peer);
+    if (recovered.kind !== "reserved") throw new Error(JSON.stringify(recovered));
+    expect(recovered.task_id).toBe(id);
+    const next = await peer.cmd({ kind: "begin", attempt_id: "next-host", worker: peer.auth.agent, action_budget_ms: 60_000 },
+      "other-host-begin", id, recovered.session);
+    expect(next).toMatchObject({ generation: 2, attempt: { host: peer.host, phase: "restoring" } });
+    expect(await g.cmd(last, "record-deploy", id, claim.session)).toEqual(reconciled);
+    expect((await g.cmd(last, "new-old-host-command", id, claim.session)).error).toMatch(/authority/);
+    expect((await g.cmd({ ...last, outcome: "succeeded" }, "record-deploy", id, claim.session)).error).toMatch(/reused/);
   });
   it("never resurrects stopped writers on late poll or interrupt, and bounds unfinished finalization before refilling", async () => {
     const project = "finalization-boundary", g = await gateway(project);

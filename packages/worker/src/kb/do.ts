@@ -5679,9 +5679,9 @@ export class KnowledgeHub {
       if (!gateway || request.actor !== actor || request.session !== req.session) throw new Error("gate: receipt belongs to another originating runner/session");
       return { kind: "receipt_found", result: JSON.parse(String(receipt.result)) };
     }
-    // A released failed-start acknowledgement never authorises a writer or an
-    // external operation. Its exact authenticated replay survives owner clear.
-    if (["start_failed", "recover_unstarted", "cancel_start", "stopped", "finalize"].includes(command.kind) && gateway && req.session) {
+    // Exact originating-gateway acknowledgements survive owner clear and a
+    // subsequent attempt on another host. Replay never authorises an effect.
+    if (["start_failed", "recover_unstarted", "cancel_start", "stopped", "finalize", "result"].includes(command.kind) && gateway && req.session) {
       const replay = this.one(`SELECT request, result FROM execution_commands WHERE task_id = ? AND command_id = ?`, req.id, req.command_id);
       if (replay) {
         if (replay.request !== JSON.stringify({ command, session: req.session, actor })) throw new Error("gate: command_id reused with different input");
@@ -5828,22 +5828,33 @@ export class KnowledgeHub {
       current.failure_charged_generation=legacyTimeoutChargeGeneration(current,begun,polls);
     }
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
-    const finalizeCurrentClaim = command.kind === "finalize" && row.status === "in_progress" && meta.session === session;
+    const currentClaim = row.status === "in_progress" && meta.session === session;
+    const finalizeCurrentClaim = command.kind === "finalize" && currentClaim;
+    // Finalize can leave the claim in place while an external effect is unknown.
+    // A later receipt may release that exact claim, but only after durable
+    // finalization, and only when every effect is resolved.
+    const reconcileFinalizedClaim = command.kind === "result" && command.outcome !== "outcome_unknown"
+      && currentClaim && current.attempt?.phase === "quiesced"
+      && !!this.one(`SELECT 1 FROM execution_commands WHERE task_id=?
+        AND json_extract(request,'$.command.kind')='finalize'
+        AND json_extract(request,'$.command.generation')=?
+        AND json_extract(request,'$.command.attempt_id')=?
+        AND json_extract(request,'$.session')=? LIMIT 1`, req.id, command.generation, command.attempt_id, session);
     const finalizedLocalHandoff = command.kind === "finalize" && ["in_progress", "blocked"].includes(row.status) && meta.session === session && next.handoff.phase === "waiting";
-    const canRescheduleFinalized = finalizeCurrentClaim && !this.protectedExecution(req.id, meta, true)
+    const canRescheduleFinalized = (finalizeCurrentClaim || reconcileFinalizedClaim) && !this.protectedExecution(req.id, meta, true)
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
     if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted"
       && providerRecoveryDiagnosis(command.outcome) !== "provider_route_unavailable") chargeExecutionFailure(next,command.generation);
-    if (canRescheduleFinalized && !next.attempt?.checkpoint) next.requirements = { ...next.requirements, host: actor };
+    if (canRescheduleFinalized && next.attempt && !next.attempt.checkpoint) next.requirements = { ...next.requirements, host: next.attempt.host };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;
       next.requirements.tier = maxTier(next.requirements.tier, begunExecutor.tier);
       meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
-    const response = command.kind === "finalize" ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
+    const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
     this.state.storage.transactionSync(() => {
       if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
@@ -5864,7 +5875,7 @@ export class KnowledgeHub {
         this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',status_ts=?,updated_ts=?,meta=? WHERE id=?`, now, now, JSON.stringify(meta), req.id);
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
         this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
-        this.version(req.id, actor, "execution_terminal", "Writer stopped; captured result awaits reconciliation through the hub scheduler, not inferred completion", { generation: next.generation, outcome: command.kind === "finalize" ? command.outcome.kind : "unknown" });
+        this.version(req.id, actor, "execution_terminal", "Writer stopped; captured result awaits reconciliation through the hub scheduler, not inferred completion", { generation: next.generation, outcome: next.terminal?.outcome.kind ?? "unknown" });
       } else if (command.kind === "yield" || finalizedLocalHandoff) {
         delete meta.session;
         const local = next.handoff.phase === "waiting" ? next.handoff : null;
