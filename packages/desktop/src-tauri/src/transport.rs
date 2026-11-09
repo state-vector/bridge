@@ -335,6 +335,39 @@ pub fn classify_provider_error(backend: &str, model: Option<&str>, code: Option<
     })
 }
 
+/// OpenCode v2 reports pending provider retries as typed session metadata,
+/// before session/prompt returns. Never infer this from progress/stdout text.
+/// https://opencode.ai/docs/cli/acp/#retry-status
+#[derive(Debug, PartialEq)]
+enum ProviderRetryUpdate { Unchanged, Cleared, Failed(ProviderCause) }
+fn provider_retry_update(frame: &serde_json::Value, session: &str, model: Option<&str>, now: u64) -> ProviderRetryUpdate {
+    if frame.get("method").and_then(|v|v.as_str()) != Some("session/update")
+        || frame.pointer("/params/sessionId").or_else(||frame.get("sessionId")).and_then(|v|v.as_str()) != Some(session) {
+        return ProviderRetryUpdate::Unchanged;
+    }
+    let Some(update) = update_payload(frame) else { return ProviderRetryUpdate::Unchanged; };
+    if update.get("sessionUpdate").and_then(|v|v.as_str()) != Some("session_info_update")
+        || update.pointer("/_meta/opencode~1child-session").is_some()
+        || frame.pointer("/params/_meta/opencode~1child-session").is_some() {
+        return ProviderRetryUpdate::Unchanged;
+    }
+    let Some(retry) = update.pointer("/_meta/opencode~1retry") else { return ProviderRetryUpdate::Unchanged; };
+    if retry.is_null() { return ProviderRetryUpdate::Cleared; }
+    let Some(name) = retry.pointer("/error/type").and_then(|v|v.as_str()) else { return ProviderRetryUpdate::Unchanged; };
+    if !name.starts_with("provider.") { return ProviderRetryUpdate::Cleared; }
+    let class = ACP_SESSION_ERROR_NAMES.iter().find(|(n,_)|*n==name).map(|(_,class)|*class).unwrap_or(ProviderCauseClass::Diagnostic);
+    let data = redact_value(retry, 0);
+    let data = (serde_json::to_string(&data).unwrap_or_default().chars().count() <= 4000).then_some(data);
+    ProviderRetryUpdate::Failed(ProviderCause {
+        class, backend:"opencode".into(), model:model.map(String::from),
+        // This is a notification, not an RPC error response. HTTP status stays
+        // in the sanitized original metadata; never invent an RPC code.
+        code:None, error_name:Some(name.into()),
+        message:truncate_chars(&redact_secrets(retry.pointer("/error/message").and_then(|v|v.as_str()).unwrap_or("Provider retry pending")),500),
+        data, evidence_line:Some("ACP opencode/retry was pending when the prompt stopped".into()), at_ms:now,
+    })
+}
+
 #[derive(Default)]
 pub struct RunControl {
     pub stop: AtomicBool,
@@ -746,7 +779,9 @@ impl AgentTransport for OpencodeAcp {
         // Non-matching lines (session/update notifications) go to `on_line`.
         // Returns Err on timeout/dead child. A JSON-RPC error object carries
         // its typed provider cause alongside the sanitized flat text.
-        struct AcpCallError { text: String, cause: Option<ProviderCause> }
+        #[derive(PartialEq)]
+        enum AcpFailureOrigin { Transport, Response }
+        struct AcpCallError { text: String, cause: Option<ProviderCause>, origin: AcpFailureOrigin }
         let call = |stdin: &mut BufWriter<std::process::ChildStdin>,
                         id: i64,
                         method: &str,
@@ -762,11 +797,11 @@ impl AgentTransport for OpencodeAcp {
                 .write_all(serde_json::to_string(&frame).unwrap_or_default().as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
                 .and_then(|_| stdin.flush())
-                .map_err(|e| AcpCallError { text: format!("acp stdin write failed: {e}"), cause: None })?;
+                .map_err(|e| AcpCallError { text: format!("acp stdin write failed: {e}"), cause: None, origin: AcpFailureOrigin::Transport })?;
             let mut last_line = Instant::now();
             loop {
                 if req.control.map(|c| c.should_stop()).unwrap_or(false) {
-                    return Err(AcpCallError { text: "acp interrupted — checkpoint and resume".into(), cause: None });
+                    return Err(AcpCallError { text: "acp interrupted — checkpoint and resume".into(), cause: None, origin: AcpFailureOrigin::Transport });
                 }
                 // wait until whichever comes first: the stall window closing
                 // (no output for 5m — hung) or the hard ceiling (budget +
@@ -787,6 +822,7 @@ impl AgentTransport for OpencodeAcp {
                         "acp timed out (budget + grace exhausted)".to_string()
                     },
                     cause: None,
+                    origin: AcpFailureOrigin::Transport,
                     })?,
                 };
                 last_line = Instant::now();
@@ -808,6 +844,7 @@ impl AgentTransport for OpencodeAcp {
                         return Err(AcpCallError {
                             text: acp_error_text(method, msg, &data),
                             cause,
+                            origin: AcpFailureOrigin::Response,
                         });
                     }
                     return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
@@ -873,8 +910,16 @@ impl AgentTransport for OpencodeAcp {
         // 3. session/prompt — the actual work. Resume = loadSession + prompt
         // (ACP sessions persist server-side; session/new is skipped on resume).
         let mut accumulated = String::new();
+        let mut retry_cause = None;
         let mut on_prompt = |line: &str| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(session) = session_id.as_deref() {
+                    match provider_retry_update(&v, session, req.model, ms_now()) {
+                        ProviderRetryUpdate::Unchanged => {},
+                        ProviderRetryUpdate::Cleared => retry_cause = None,
+                        ProviderRetryUpdate::Failed(cause) => retry_cause = Some(cause),
+                    }
+                }
                 if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
                     frames.set(frames.get() + 1);
                     let shown = extract_update_text(&v);
@@ -944,7 +989,7 @@ impl AgentTransport for OpencodeAcp {
                 exit_code: None,
                 timed_out: true,
                 session_id,
-                cause: e.cause,
+                cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
             },
             Err(e) => RunOutcome {
                 ok: false,
@@ -953,7 +998,7 @@ impl AgentTransport for OpencodeAcp {
                 exit_code: status.and_then(|s| s.code()),
                 timed_out,
                 session_id,
-                cause: e.cause,
+                cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
             },
         }
     }
@@ -1327,6 +1372,69 @@ mod spec_shape_tests {
 mod provider_cause_tests {
     use super::*;
     use serde_json::json;
+
+    fn retry_frame(session: &str, retry: serde_json::Value) -> serde_json::Value {
+        json!({"method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"session_info_update","_meta":{"opencode/retry":retry}}}})
+    }
+    /// Exercise the real subprocess/JSON-RPC path: metadata must survive a
+    /// lost prompt response, but must never override a terminal task error.
+    #[cfg(unix)]
+    #[test]
+    fn acp_prompt_retry_cause_tracks_response_and_clear_boundaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("bridge-acp-retry-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for mode in ["lost", "cleared", "success", "task_error"] {
+            let mut frames = vec![retry_frame("parent", json!({"error":{"type":"provider.quota","message":"Credit exhausted","status":402}}))];
+            match mode {
+                "cleared" => frames.push(retry_frame("parent", serde_json::Value::Null)),
+                "success" => frames.push(json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})),
+                "task_error" => frames.push(json!({"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Tool rejected","data":{"service":"session","errorName":"tool.execution"}}})),
+                _ => {},
+            }
+            let script = dir.join(mode);
+            let mut body = String::from("#!/bin/sh\nread -r line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread -r line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"parent\"}}'\nread -r line\n");
+            for frame in frames { body.push_str(&format!("printf '%s\\n' '{}'\n", frame)); }
+            std::fs::write(&script,body).unwrap();
+            std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out = OpencodeAcp.dispatch(&RunRequest {workdir:dir.to_str().unwrap(),bin:script.to_str().unwrap(),agent:None,model:Some("llmgw/glm-5.3"),prompt:"test",title:None,resume:None,extra_config:None,control:None},Duration::from_secs(5),None);
+            assert_eq!(out.session_id.as_deref(),Some("parent"),"{mode}");
+            assert_eq!(out.ok,mode=="success","{mode}");
+            if mode=="lost" {
+                assert_eq!(out.cause.unwrap().error_name.as_deref(),Some("provider.quota"));
+            } else {assert!(out.cause.is_none(),"{mode}: stale provider cause");}
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_retry_preserves_typed_cause_without_inventing_rpc_code() {
+        let frame=retry_frame("parent",json!({"attempt":2,"nextRetryAt":"2026-11-09T01:00:00Z","error":{"type":"provider.quota","message":"Credit exhausted","status":402,"response":{"headers":{"authorization":"Bearer short-secret"}}}}));
+        let ProviderRetryUpdate::Failed(cause)=provider_retry_update(&frame,"parent",Some("llmgw/glm-5.3"),100) else {panic!("typed retry missing")};
+        assert_eq!(cause.class,ProviderCauseClass::AccountAction);
+        assert_eq!(cause.code,None);
+        assert_eq!(cause.error_name.as_deref(),Some("provider.quota"));
+        assert!(!serde_json::to_string(&cause).unwrap().contains("short-secret"));
+        assert_eq!(cause.data.unwrap()["error"]["status"],402);
+    }
+    #[test]
+    fn retry_clear_and_session_child_fences_prevent_stale_provider_blame() {
+        let mut frame=retry_frame("parent",json!({"error":{"type":"provider.rate-limit","message":"Busy"}}));
+        assert_eq!(provider_retry_update(&frame,"another",None,1),ProviderRetryUpdate::Unchanged);
+        frame["params"]["update"]["_meta"]["opencode/child-session"]=json!({"id":"child"});
+        assert_eq!(provider_retry_update(&frame,"parent",None,1),ProviderRetryUpdate::Unchanged);
+        assert_eq!(provider_retry_update(&retry_frame("parent",serde_json::Value::Null),"parent",None,2),ProviderRetryUpdate::Cleared);
+        assert_eq!(provider_retry_update(&retry_frame("parent",json!({"error":{"type":"tool.execution","message":"Credit exhausted"}})),"parent",None,2),ProviderRetryUpdate::Cleared);
+    }
+    #[test]
+    fn generic_provider_retry_stays_diagnostic_and_progress_text_is_not_evidence() {
+        let frame=retry_frame("parent",json!({"error":{"type":"provider.unknown","message":"NoDeploymentsAvailable"}}));
+        let ProviderRetryUpdate::Failed(cause)=provider_retry_update(&frame,"parent",None,1) else {panic!("diagnostic missing")};
+        assert_eq!(cause.class,ProviderCauseClass::Diagnostic);
+        let prose=json!({"method":"session/update","params":{"sessionId":"parent","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"provider.quota"}}}});
+        assert_eq!(provider_retry_update(&prose,"parent",None,1),ProviderRetryUpdate::Unchanged);
+    }
 
     #[test]
     fn stderr_error_serializes_only_key_redacted_structured_data() {

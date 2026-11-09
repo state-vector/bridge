@@ -1007,3 +1007,6 @@ A deadline poll and finalization charge the same generation only once. Existing
 timeout charges are recognized from exact saved begin/poll receipts, never merely
 from a stopped process. Exhaustion at the largest tier and automatic dependency
 recovery still require the remaining diagnosis and recovery lifecycle work.
+
+
+OpenCode provider retry notifications retain their typed, sanitized failure cause when a prompt loses its response or times out. A cleared retry or an authoritative prompt response takes precedence, so an earlier quota error cannot turn a later tool failure into an account-action request. Session and child-session boundaries prevent unrelated notifications from being attributed to the attempt. This improves failure evidence; it does not itself authorize another attempt or prove provider recovery.
