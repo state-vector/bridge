@@ -13917,7 +13917,10 @@ export class KnowledgeHub {
     // A queued red candidate is not owned merely because it has a train slot.
     // Give its exact head ONE concrete repair duty, preserving any live writer.
     const checkRecovery = new TrainCheckRecovery(this.state.storage);
-    for (const entry of entriesArr) {
+    let enrichedCandidate = false;
+    // A base-only heartbeat preserves the previous queue projection. It
+    // must not replay candidate repair work before admitting a fresh walk.
+    for (const entry of entries ?? []) {
       const evidence = CandidateRepairSchema.safeParse(entry.repair);
       if (!evidence.success) continue;
       const subject = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=? AND type='task'`, String(entry.id));
@@ -13929,10 +13932,11 @@ export class KnowledgeHub {
         ?? await this.ensureTaskRecovery(String(entry.id), "head_checks");
       checkRecovery.bindCandidate(String(entry.id), evidence.data.head_sha, duty);
       entry.repair_task = duty;
+      enrichedCandidate = true;
     }
     // Recovery task creation awaits; re-read before persisting the enriched
     // projection so a concurrent lease/event mutation is never overwritten.
-    if (entriesArr.some(e => e.repair_task)) {
+    if (enrichedCandidate) {
       const freshMeta = JSON.parse(String(this.one(`SELECT id,meta FROM lane_cards WHERE id=?`, lane.id)?.meta ?? "{}"));
       if (freshMeta.lane?.queue_facts?.at === meta.lane.queue_facts.at) {
         freshMeta.lane.queue_facts.entries = entriesArr;
