@@ -21,6 +21,7 @@ jobs:
         run: |
           python3 -m unittest discover -s packages/cli/updater -p 'test_*.py'
           node --test scripts/tests/diagnose-hub.test.mjs
+          npm run test:promote-runner
           npm run test:deploy-drift-alarm
           npm run test:main-green-gate
           npm run test -w packages/contracts

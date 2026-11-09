@@ -18,6 +18,7 @@
     "test": "npm run test --workspaces --if-present",
     "test:main-green-gate": "bash scripts/tests/main-green-gate.test.sh",
     "test:deploy-drift-alarm": "bash scripts/tests/deploy-drift-alarm.test.sh",
+    "test:promote-runner": "python3 scripts/tests/test_promote_runner.py",
     "diagnose:hub": "node scripts/diagnose-hub.mjs",
     "lint": "npm run lint --workspaces --if-present"
   },

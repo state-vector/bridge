@@ -418,6 +418,12 @@ checks. The public publication endpoint accepts **no caller-provided download
 URLs/manifests**: it independently verifies successful GitHub CI/build runs for
 the source commit (and the versioned release gate for stable), fetches that
 commit's release manifest, and advances channel revisions monotonically.
+Transient verification/manifest failures answer `503` with a bounded, fixed
+`stage` (`github_verification` or `manifest_fetch`) and the provider's own retry
+timing (`retry_after_secs` body field and `Retry-After` header, capped at 3600s);
+the publisher echoes that stage/status for every attempt and waits exactly as
+long as the provider asked (capped at 120s) inside its unchanged 12-attempt
+window, so a quota exhaustion is visible instead of masked by blind polling.
 The promotion job supplies its short-lived, read-only GitHub job token so
 verification is not dependent on anonymous API quotas; it is used only for
 fixed-repository API reads and is never stored in channel state or notifications.

@@ -236,7 +236,11 @@ Linux runners can explicitly opt into automatic updates in config:
 `main` follows CI-approved commit-addressed builds; `stable` additionally requires
 a successful versioned release. A separate systemd updater receives build-ready
 push events, reconciles on reconnect, and uses an hourly fallback instead of
-aggressively polling releases. It verifies the download and embedded source SHA,
+aggressively polling releases. Channel publication itself reports a bounded,
+fixed failure stage and the provider's own retry timing, and the promotion job
+honors that timing inside its bounded retry window — so a provider quota
+exhaustion is visible in the promotion log instead of hidden behind blind
+polling. It verifies the download and embedded source SHA,
 waits for a fenced controller handoff and the train thread to join (or full worker
 drain for legacy/incompatible builds), then restarts under
 a no-claims hold. Fresh process/backend/hub health proves adoption; an unhealthy
