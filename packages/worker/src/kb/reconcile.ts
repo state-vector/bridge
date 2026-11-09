@@ -351,10 +351,18 @@ export function reconcileJoin(args: {
       // A verified recovery owes the bound PR a fresh review at its live head.
       // GitHub may have dismissed the old approval when the branch changed.
       if (b.repairAccepted && b.progress === "stranded" && !b.lane && !b.queued && b.open_verify_children === 0
-        && b.status === "todo" && !p.isDraft && !changesRequested && p.headRefOid
-        && p.mergeable === "MERGEABLE" && ["CLEAN", "UNSTABLE"].includes(p.mergeStateStatus ?? "")) {
+        && b.status === "todo" && !changesRequested && !conflicting) {
         acc.accounted++;
-        if (hasDuty(dutiesByPr, p.number, "verify")) {
+        // The bulk GitHub feed can return UNKNOWN indefinitely. An
+        // independent verifier checks the exact head directly before it
+        // can produce an acceptance, so UNKNOWN may request that read.
+        const viable = p.mergeable === "MERGEABLE" && ["CLEAN", "UNSTABLE"].includes(p.mergeStateStatus ?? "");
+        const needsProbe = (p.mergeable == null || p.mergeable === "UNKNOWN") && (p.mergeStateStatus == null || p.mergeStateStatus === "UNKNOWN");
+        const reviewable = !p.isDraft && p.headRefOid && (viable || needsProbe);
+        if (!reviewable) {
+          acc.bound++;
+          judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: "accepted repair is waiting for conclusive GitHub mergeability" });
+        } else if (hasDuty(dutiesByPr, p.number, "verify")) {
           acc.bound++;
           judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: "a review duty already owns this repaired head" });
         } else {

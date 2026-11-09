@@ -144,8 +144,9 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect(outcome.status, JSON.stringify(outcome.body)).toBe(200);
     expect((await kbJson("/get", { id: repair })).body.status).toBe("done");
 
-    const observation = prRow(number, { headRefOid: repairedHead, reviewDecision: null, mergeStateStatus: "UNSTABLE" });
-    const reports = await Promise.all([report(repo, [observation]), report(repo, [observation])]);
+    const observation = prRow(number, { headRefOid: repairedHead, reviewDecision: null, mergeStateStatus: "UNSTABLE", updatedAt: iso(90) });
+    const inconclusive = { ...observation, mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
+    const reports = await Promise.all([report(repo, [inconclusive]), report(repo, [observation])]);
     const reviews = reports.flatMap(r => r.body.spawned.filter((x: { action: string; duty?: string }) => x.action === "verify" && x.duty));
     expect(reviews).toHaveLength(1);
     const review = reviews[0].duty;

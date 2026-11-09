@@ -17458,6 +17458,13 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const a = j.decision;
       switch (a.action) {
         case "repair_binding": {
+          // Another report can reserve verification after this report took
+          // its snapshot. Respect the live reservation as well as its card.
+          const verify = this.one(`SELECT 1 FROM reconcile_duties d LEFT JOIN artefacts a ON a.id=d.duty_id
+            WHERE d.repo=? AND d.pr=? AND d.kind='verify'
+            AND ((d.duty_id='' AND d.created_ts>?) OR a.status IN ('todo','in_progress','in_review','blocked'))`,
+            repo, j.pr, Date.now() - 60_000);
+          if (verify || this.currentTaskReview(a.card).phase === "pending") break;
           const duty = await this.ensureTaskRecovery(a.card, a.reason);
           spawned.push({ pr: j.pr, action: "repair", card: a.card, duty });
           break;
@@ -17498,8 +17505,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           // child of the lane is the foothold for the provenance mis-stamp
           // (the BR#5050 class). The join already lane-exempts; defense in depth.
           const parentRow = parent ? this.one(`SELECT id,status,meta,tags FROM artefacts WHERE id = ?`, parent) : null;
-          if (a.action === "verify_repaired" && (!parentRow || !this.acceptedQueueRepair(parentRow, repo, j.pr)
-            || this.openVerifyChildren(parent) > 0 || this.currentTaskReview(parent).phase === "pending")) break;
+          if (a.action === "verify_repaired" && (!parentRow || this.taskRecoveries.has(parent)
+            || !this.acceptedQueueRepair(parentRow, repo, j.pr) || this.openVerifyChildren(parent) > 0 || this.currentTaskReview(parent).phase === "pending")) break;
           if (parentRow && isStandingCard(JSON.parse(parentRow.meta ?? "{}"), parseTags(parentRow.tags))) {
             this.audit(actor, "reconcile_verify_spawn_skipped_lane", parent, { pr: `${repo}#${j.pr}`, note: "standing lane card — reconcile never parents duties onto it (BR#5151)" });
             break;
