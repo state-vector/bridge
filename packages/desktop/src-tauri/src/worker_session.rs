@@ -42,6 +42,17 @@ enum State {
     Finished { owner: Ownership },
 }
 
+const REATTACH_GRACE_MS: u64 = 45_000;
+
+fn reattach_expired(spec: &Spec, state: Option<&State>, now: u64) -> bool {
+    let last_seen = match state {
+        Some(State::Running { protocol, owner, observed_at, .. })
+            if *protocol == PROTOCOL && owner == &spec.owner => spec.started_at.max(*observed_at),
+        _ => spec.started_at,
+    };
+    now.saturating_sub(last_seen) >= REATTACH_GRACE_MS
+}
+
 pub(super) struct Lock(fs::File);
 impl Lock {
     pub(super) fn acquire(path: &Path) -> Result<Option<Self>, String> {
@@ -132,32 +143,62 @@ fn attach_with_stop(spec: Spec, cancelled: Option<Arc<AtomicBool>>) -> Result<In
     let reattachable = Arc::new(AtomicBool::new(false)); let ready = reattachable.clone();
     let (tx, rx) = mpsc::channel(); let request = spec.clone();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(45);
         while !left.load(Ordering::SeqCst) {
-            let result_path = gateway_pipeline::terminal_root(&request.cfg).map(|r| r.join(request.record().name()));
-            if let Ok(Some(record)) = result_path.and_then(|p| read_record(&p)) {
+            if let Ok(Some(record)) = worker_result(&request) {
                 if record.owner == request.owner { ready.store(false, Ordering::SeqCst); let _ = tx.send(record); finished.store(true, Ordering::SeqCst); return; }
             }
-            if requested.load(Ordering::SeqCst) {
+            if requested.load(Ordering::SeqCst) && root.join("request.json").is_file() {
                 let _ = journal::write_file(&root.join("stop.json"), &serde_json::to_vec(&request.owner).unwrap());
             }
+            let worker_lock = Lock::acquire(&root.join("worker.lock"));
             let state = fs::read(root.join("state.json")).ok().and_then(|b| serde_json::from_slice::<State>(&b).ok());
-            let owns_lock = matches!(Lock::acquire(&root.join("worker.lock")), Ok(None));
-            let alive = match state {
-                Some(State::Running { protocol, owner, pid, observed_at, line }) if protocol == PROTOCOL && owner == request.owner && pid > 1 && owns_lock && now_ms().saturating_sub(observed_at) < 5_000 => {
-                    if let Ok(mut last) = observed.lock() { *last = line; } true
+            let owns_lock = matches!(worker_lock, Ok(None));
+            let alive = match state.as_ref() {
+                Some(State::Running { protocol, owner, pid, observed_at, line }) if *protocol == PROTOCOL && owner == &request.owner && *pid > 1 && owns_lock && now_ms().saturating_sub(*observed_at) < 5_000 => {
+                    if let Ok(mut last) = observed.lock() { *last = line.clone(); } true
                 }, _ => false,
             };
             ready.store(alive, Ordering::SeqCst);
-            if !owns_lock && Instant::now() > deadline {
+            if matches!(worker_lock, Ok(Some(_))) && reattach_expired(&request, state.as_ref(), now_ms()) {
+                let Ok(existing) = worker_result(&request) else {
+                    drop(worker_lock);
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                if let Some(record) = existing {
+                    let _ = tx.send(record);
+                    finished.store(true, Ordering::SeqCst);
+                    return;
+                }
+                let manifest = fs::read(root.join("request.json")).ok()
+                    .and_then(|bytes| serde_json::from_slice::<Spec>(&bytes).ok());
+                if !manifest.is_some_and(|saved| serde_json::to_value(saved).ok().zip(serde_json::to_value(&request).ok())
+                    .is_some_and(|(saved, expected)| saved == expected)) {
+                    drop(worker_lock);
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
                 // A dead worker is not proof that its agent descendants stopped.
                 let launch = gateway_pipeline::launch_record(&request.cfg, &request.record());
                 let mut record = request.record();
                 record.process = launch.and_then(|r| r.process);
-                if record.process.is_some() { record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into(), cause: None }, worktree: request.worktree.clone() }; }
-                if let Ok(root) = gateway_pipeline::terminal_root(&request.cfg) { let _ = journal::insert(&root, record.clone()); }
-                let _ = tx.send(record); finished.store(true, Ordering::SeqCst); return;
+                if record.process.is_some() {
+                    record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into(), cause: None }, worktree: request.worktree.clone() };
+                } else if ["started.json", "state.json"].iter().all(|name| {
+                    matches!(fs::symlink_metadata(root.join(name)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                }) {
+                    // Worker entry takes this same lock, checks for a terminal
+                    // record, and writes started.json before it can spawn.
+                    record.work = unlaunched_work(&request, "Independent worker launch window expired before execution".into());
+                }
+                if let Ok(record) = gateway_pipeline::terminal_root(&request.cfg)
+                    .and_then(|root| journal::insert(&root, record)) {
+                    let _ = tx.send(record);
+                    finished.store(true, Ordering::SeqCst);
+                    return;
+                }
             }
+            drop(worker_lock);
             std::thread::sleep(Duration::from_millis(200));
         }
     });
@@ -174,6 +215,19 @@ fn read_record(path: &Path) -> Result<Option<Record>, String> {
         Ok(bytes) => { let record: Record = serde_json::from_slice(&bytes).map_err(|e| format!("gate: worker result corrupt: {e}"))?; record.validate()?; Ok(Some(record)) },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e.to_string()),
     }
+}
+
+fn worker_result(spec: &Spec) -> Result<Option<Record>, String> {
+    let root = gateway_pipeline::terminal_root(&spec.cfg)?;
+    let name = spec.record().name();
+    let result = match read_record(&root.join(&name))? {
+        Some(record) => Some(record),
+        None => read_record(&root.join("archive").join(&name))?,
+    };
+    if result.as_ref().is_some_and(|record| record.owner != spec.owner) {
+        return Err("gate: worker terminal owner changed".into());
+    }
+    Ok(result)
 }
 
 pub fn discover(cfg: &DispatchConfig, skip: &[Ticket]) -> Result<Vec<InFlight>, String> {
@@ -372,10 +426,14 @@ fn unlaunched(spec: &Spec, reason: String) -> Result<(), String> {
     // This branch is reached only before the transport is called while holding
     // the never-before-executed worker lock. It is actual no-child proof.
     let mut record = spec.record();
-    record.work = Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone(), cause: None },
-        writers: WriterProof::ProcessGroupEmpty, worktree: spec.worktree.clone(), step: Step::Stop };
+    record.work = unlaunched_work(spec, reason.clone());
     journal::insert(&gateway_pipeline::terminal_root(&spec.cfg)?, record)?;
     Err(reason)
+}
+
+fn unlaunched_work(spec: &Spec, reason: String) -> Work {
+    Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None },
+        writers: WriterProof::ProcessGroupEmpty, worktree: spec.worktree.clone(), step: Step::Stop }
 }
 
 #[cfg(test)]
@@ -576,5 +634,44 @@ for line in sys.stdin:
         assert!(gateway_pipeline::root(&cfg).unwrap().join("workers-archive").join(spec.record().name().trim_end_matches(".json")).join("output.jsonl").exists(), "live updates must survive controller loss on disk");
         assert_eq!(calls.lock().unwrap().iter().filter(|k| k.as_str() == "finalize").count(), 1);
         drop(second); let _ = fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
+    }
+    #[test]
+    fn rediscovery_of_expired_worker_preserves_the_start_fence() {
+        let hub = Hub::new(|_| panic!("reattachment must not launch or renew a worker"));
+        let (cfg, _, _) = fixture(&hub);
+        for (started, archived) in [(false, false), (true, false), (true, true)] {
+            let spec = Spec {
+                protocol: PROTOCOL,
+                owner: Ownership::Attempt {
+                    ticket: Ticket { task_id: format!("expired-{started}-{archived}"), session: "old-session".into() },
+                    host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "expired-attempt".into(),
+                },
+                cfg: cfg.clone(), title: "expired worker".into(), worktree: None, scratch: None,
+                started_at: now_ms() - REATTACH_GRACE_MS - 1,
+                agent: Agent { workdir: ".".into(), bin: "must-not-execute".into(), backend: "opencode".into(),
+                    agent: None, model: "fixture".into(), prompt: "fixture".into(), resume: None, config: None, mode: None },
+            };
+            persist_spec(&spec).unwrap();
+            if started {
+                journal::write_file(&spec.root().unwrap().join("started.json"), &serde_json::to_vec(&spec.owner).unwrap()).unwrap();
+            }
+            if archived {
+                let mut original = spec.record();
+                original.work = unlaunched_work(&spec, "archived result".into());
+                let terminal = gateway_pipeline::terminal_root(&cfg).unwrap();
+                journal::insert(&terminal.join("archive"), original).unwrap();
+                retire(&cfg, &spec.record()).unwrap();
+            }
+            let worker = attach_with_stop(spec.clone(), Some(Arc::new(AtomicBool::new(archived)))).unwrap().worker.unwrap();
+            let record = worker.rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            if archived {
+                assert!(matches!(record.work, Work::Stopped { outcome, .. } if outcome.stderr_tail == "archived result"));
+                assert!(!spec.root().unwrap().exists());
+                assert!(!gateway_pipeline::terminal_root(&cfg).unwrap().join(spec.record().name()).exists());
+            } else {
+                assert_eq!(matches!(record.work, Work::Stopped { writers: WriterProof::ProcessGroupEmpty, .. }), !started);
+            }
+        }
+        fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap()).unwrap();
     }
 }
