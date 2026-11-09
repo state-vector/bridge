@@ -63,6 +63,49 @@ function TopBar({ tab, setTab, openCard }: { tab: Tab; setTab: (t: Tab) => void;
   );
 }
 
+function AppUpdateNotice() {
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  useEffect(() => {
+    const current = import.meta.env.VITE_BRIDGE_COMMIT;
+    const commit = /^[0-9a-f]{40}$/;
+    if (typeof current !== "string" || !commit.test(current)) return;
+    const lifetime = new AbortController();
+    let checking = false;
+    const check = async () => {
+      if (checking || document.visibilityState !== "visible") return;
+      checking = true;
+      try {
+        const response = await fetch("/__version", {
+          cache: "no-store",
+          signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(10_000)]),
+        });
+        if (!response.ok) return;
+        const remote: unknown = (await response.json()).commit;
+        if (!lifetime.signal.aborted && typeof remote === "string" && commit.test(remote)) setUpdateAvailable(remote !== current);
+      } catch {
+        // A transient connection failure supplies no version evidence.
+      } finally {
+        checking = false;
+      }
+    };
+    void check();
+    const poll = window.setInterval(check, 60_000);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      lifetime.abort();
+      window.clearInterval(poll);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, []);
+
+  return updateAvailable && (
+    <div className="conn-banner" role="status">
+      Bridge has updated. Reload to see the current backlog and controls.
+      <Btn size="sm" onClick={() => window.location.reload()}>Reload Bridge</Btn>
+    </div>
+  );
+}
+
 function SignIn() {
   const url = useBridge((s) => s.url);
   const signInWithGithub = useBridge((s) => s.signInWithGithub);
@@ -144,6 +187,7 @@ export default function App() {
   return (
     <div className="app">
       <TopBar tab={tab} setTab={setTab} openCard={openCard} />
+      <AppUpdateNotice />
       {conn === "closed" && (
         <div className="conn-banner">
           Hub unreachable — is it deployed / mock hub running (npm run hub)?
