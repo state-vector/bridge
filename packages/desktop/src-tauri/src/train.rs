@@ -699,7 +699,7 @@ impl Ctx {
             "--repo",
             repo,
             "--json",
-            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,baseRefName",
+            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,mergedAt,baseRefName",
         ])?;
         let norm_mergeable = normalize_gh_mergeable(raw.get("mergeable").unwrap_or(&Value::Null));
         let norm_state = normalize_gh_merge_state(raw.get("mergeStateStatus").unwrap_or(&Value::Null));
@@ -2118,6 +2118,10 @@ fn awaiting_sweep(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value
     }
 }
 
+fn github_merge_time(facts: &Value) -> Option<u64> {
+    vstr(facts, "mergedAt").and_then(parse_iso8601_epoch_ms)
+}
+
 fn lane_required_workflows(lane: &Value) -> Vec<String> {
     lane.get("required_workflows")
         .and_then(|v| v.as_array())
@@ -2447,6 +2451,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     json!({
                         "repo": repo, "base": base, "kind": "merged", "pr": bpr,
                         "merge_sha": merge_sha, "head_sha": head_sha,
+                        "merged_at": facts.as_ref().ok().and_then(github_merge_time),
                         "signer": ctx.holder, "bypass": true,
                         "reason": "bypass-merge (merged-elsewhere) — the human landed the cure out of turn via the answered HUMAN GATE ask; stamping the merged event so the lane settles on it",
                     }),
@@ -2735,7 +2740,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
             // merged on GitHub but the event never fired — recover by stamping now
-            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": cur_pr, "merge_sha": facts.as_ref().and_then(|f| f.pointer("/mergeCommit/oid")).and_then(|v| v.as_str()).unwrap_or(&merge_sha), "head_sha": facts.as_ref().and_then(|f| vstr(f, "headRefOid")), "task_id": cur.get("task_id").filter(|v| !v.is_null()), "signer": ctx.holder, "reason": "reconcile: merge happened but the train event was lost — stamped from live GitHub" }))?;
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": cur_pr, "merge_sha": facts.as_ref().and_then(|f| f.pointer("/mergeCommit/oid")).and_then(|v| v.as_str()).unwrap_or(&merge_sha), "head_sha": facts.as_ref().and_then(|f| vstr(f, "headRefOid")), "merged_at": facts.as_ref().and_then(github_merge_time), "task_id": cur.get("task_id").filter(|v| !v.is_null()), "signer": ctx.holder, "reason": "reconcile: merge happened but the train event was lost — stamped from live GitHub" }))?;
             ctx.note(&format!("reconcile: stamped lost merged event for PR #{cur_pr}"));
             log(Some(key), &format!("reconcile: PR #{cur_pr} merged on GitHub, event recovered"));
         }
@@ -3034,6 +3039,8 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     "repo": repo, "base": base, "kind": "merged", "pr": last.number,
                     "merge_sha": card_meta.pointer(&format!("/merge_train/legs/{}/merge_sha", last.number)).and_then(|v| v.as_str())
                         .or_else(|| card_meta.pointer("/merge_train/merge_sha").and_then(|v| v.as_str())),
+                    "merged_at": card_meta.pointer(&format!("/merge_train/legs/{}/merged_at", last.number))
+                        .or_else(|| card_meta.pointer("/merge_train/merged_at")),
                     "task_id": head_id, "signer": ctx.holder,
                     "reason": "reconcile: all legs landed but the card never closed (crash between merge and landed) — re-stamped",
                 }))?;
@@ -3108,9 +3115,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let facts = ctx.pr_facts(repo, pr)?;
         if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
             // reconcile: merged on GitHub, no train event (crash between merge and
-            // event) — stamp it and continue walking the remaining queue entries.
+            // event) — preserve GitHub's actual merge time so an older receipt
+            // cannot replace settlement on a newer merge.
+            let merged_at = github_merge_time(&facts)
+                .ok_or_else(|| format!("PR #{pr} was merged, but GitHub did not return its merge time"))?;
             renew_lease(ctx, repo, base);
-            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
+            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "merged_at": merged_at, "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
             ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
             return Ok(());
@@ -3120,13 +3130,6 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         if vstr(&facts, "state") == Some("OPEN") && !mergeability_definitive(&facts) {
             qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "waiting" }));
             log(Some(key), &format!("PR #{pr}: GitHub is still checking whether it can merge; checking other changes meanwhile"));
-            return Ok(());
-        }
-        if vstr(&facts, "state") == Some("MERGED") && facts.pointer("/mergeCommit/oid").is_some() {
-            renew_lease(ctx, repo, base);
-            ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "merged", "pr": pr, "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"), "task_id": head_id, "signer": ctx.holder, "reason": "reconcile: PR already merged on GitHub — event stamped from live state" }))?;
-            ctx.note(&format!("reconcile: stamped already-merged PR #{pr}"));
-            log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
             return Ok(());
         }
         // BR#5639 ghost car + BR#3935/BR#5897 lineage, fail-closed
@@ -6934,7 +6937,7 @@ mod tests {
 
     #[test]
     fn batch_progress_and_write_guards_survive_failures_br7736() {
-        for scenario in ["lookup", "repair", "revoked", "main-red", "lost-reply", "unknown-reply", "restart"] {
+        for scenario in ["lookup", "repair", "revoked", "main-red", "lost-reply", "unknown-reply", "restart", "historical"] {
             let repo = Repo::new(scenario);
             let head = repo.side_commit("ready", "reviewed change");
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
@@ -6983,9 +6986,13 @@ mod tests {
                         return Some(if matches!(scenario, "lost-reply" | "unknown-reply") { Err("reply was lost".into()) } else { Ok(String::new()) });
                     }
                     if scenario == "unknown-reply" && merged_c.load(Ordering::SeqCst) { return Some(Err("GitHub cannot be reached".into())); }
-                    let done = merged_c.load(Ordering::SeqCst);
+                    let done = merged_c.load(Ordering::SeqCst) || scenario == "historical";
+                    if scenario == "historical" {
+                        assert!(args.iter().any(|arg| arg.split(',').any(|field| field == "mergedAt")));
+                    }
                     return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
                         "mergeable":"MERGEABLE", "mergeStateStatus":"CLEAN",
+                        "mergedAt": if scenario == "historical" { Some("2026-10-23T22:12:57Z") } else { None },
                         "mergeCommit": if done { json!({"oid":head}) } else { Value::Null }
                     }).to_string()));
                 }
@@ -7029,12 +7036,16 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 1, "unknown write must never be repeated");
             } else {
                 assert!(result.is_ok(), "{scenario}: {result:?}");
-                let should_merge = !matches!(scenario, "revoked" | "main-red");
+                let should_merge = !matches!(scenario, "revoked" | "main-red" | "historical");
                 assert_eq!(writes.load(Ordering::SeqCst), usize::from(should_merge), "{scenario}");
                 let calls = calls.lock().unwrap();
                 assert_eq!(calls.iter().any(|p| call_name(p) == "train_ci"), should_merge, "successful work still owes deployment checks");
                 if scenario == "repair" { assert!(calls.iter().any(|p| call_name(p) == "train_event" && call_args(p)["kind"] == "bounced")); }
                 if scenario == "main-red" { assert!(calls.iter().any(|p| call_name(p) == "train_queue_facts" && call_args(p).pointer("/base_state/verdict") == Some(&json!("red")))); }
+                if scenario == "historical" {
+                    let receipt = calls.iter().find(|p| call_name(p) == "train_event" && call_args(p)["kind"] == "merged").unwrap();
+                    assert_eq!(call_args(receipt)["merged_at"], json!(1_792_793_577_000_u64));
+                }
             }
         }
     }

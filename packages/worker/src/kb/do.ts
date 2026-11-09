@@ -3112,6 +3112,9 @@ export class KnowledgeHub {
         request TEXT NOT NULL, result TEXT NOT NULL,
         PRIMARY KEY (task_id, command_id)
       );
+      CREATE INDEX IF NOT EXISTS execution_proxy_grant_receipts ON execution_commands(json_extract(result,'$.permit.proof.id'))
+        WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+          AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request';
       CREATE INDEX IF NOT EXISTS execution_writer_receipts ON execution_commands(
         task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
         json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
@@ -5456,6 +5459,13 @@ export class KnowledgeHub {
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
       if (replay) { if (replay.request !== encoded) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+      if (command.proof.witness.kind === "configured_proxy_request") {
+        const granted = this.one(`SELECT count(*) AS n FROM execution_commands
+          WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+            AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request'
+            AND json_extract(result,'$.permit.proof.id')=?`, command.proof.id);
+        if (Number(granted?.n ?? 0) >= 4) throw new Error("gate: this proxy receipt has already granted four recovery trials");
+      }
       const a = current.attempt, terminal = current.terminal;
       if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || todoDispatchHold(meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
       if (!a || a.phase !== "quiesced" || !terminal || terminal.generation !== a.generation || terminal.attempt_id !== a.attempt_id) throw new Error("gate: provider recovery requires the exact quiesced terminal attempt");
@@ -6261,12 +6271,34 @@ export class KnowledgeHub {
     return { phase: "accepted", ...base, subject: subject.data, result };
   }
 
+  private staleReviewHasExecutionHold(id: string, meta: Record<string, unknown>): boolean {
+    const execution = this.executionState(id);
+    return !!((execution?.attempt && execution.attempt.phase !== "quiesced")
+      || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      || this.protectedExecution(id, meta) || meta.operator_gated || this.startupHasAsk(id)
+      || this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=?`, id));
+  }
+
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
   private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
-    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.meta FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
+    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.owner, c.roles, c.meta, c.title, c.body_md FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
       const meta = JSON.parse(String(child.meta ?? "{}"));
       if (meta.machine_duty || meta.ask?.review_leg) return false;
+      if (body.to === "done" && child.type === "task" && child.status === "todo" && !child.owner
+        && parseTags(String(child.roles ?? "")).includes("review")) {
+        const subject = ReviewSubjectSchema.safeParse(meta.review_subject);
+        const revision = JSON.parse(String(row.meta ?? "{}")).work_revision ?? "legacy";
+        if (subject.success && subject.data.task_id === id && subject.data.revision !== revision) {
+          const current = this.currentTaskReview(id);
+          if (current.phase === "accepted" && current.subject.task_id === id && current.subject.revision === revision) {
+            if (this.staleReviewHasExecutionHold(String(child.id), meta)) return true;
+            // The old round no longer covers this submission. Retain any
+            // separately bound delivery obligation for its own reconciliation.
+            try { this.conserveDelivery(child, "", false); return false; } catch { return true; }
+          }
+        }
+      }
       // Peer coordination is retired on terminal work; it is not unfinished
       // implementation and must not deadlock completion behind itself.
       return !(child.type === "question" && meta.ask && !isHumanDecisionAsk(meta.ask));
@@ -7374,7 +7406,7 @@ export class KnowledgeHub {
           const parentRow = fx.keep_newest ? this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id) : null;
           const parentTargets = fx.keep_newest ? prTargetsOf(parentRow) : [];
           const kids = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+            `SELECT c.id AS id, c.status AS status, c.owner AS owner, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
             id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
@@ -7391,6 +7423,9 @@ export class KnowledgeHub {
               if (!keptNewestRound) { keptNewestRound = true; return; } // newest round survives for re-entry
             }
             const vm = JSON.parse(v.meta ?? "{}");
+            const subject = ReviewSubjectSchema.safeParse(vm.review_subject);
+            if (subject.success && subject.data.task_id === id && subject.data.revision !== (meta.work_revision ?? "legacy")
+              && (v.status !== "todo" || v.owner || this.staleReviewHasExecutionHold(String(v.id), vm))) return;
             vm.superseded_reason = fx.cause;
             this.state.storage.sql.exec(
               `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
@@ -11729,6 +11764,15 @@ export class KnowledgeHub {
       // the executor may report its own merge wall-clock (BR#4804 settle
       // clock): clamp to now — a future stamp would fake a settled lane
       const mergedAt = Math.min(Number(body.merged_at) || now, now);
+      const latestLaneMergeAt = Math.max(Number(meta.currently?.merged_at) || 0, Number(meta.lane?.last_merge_ts) || 0);
+      const queueFacts = meta.lane?.queue_facts;
+      const baseTip = queueFacts?.base_state;
+      const tipAge = baseTip?.tip_age_secs;
+      // GitHub merge timestamps and the observed tip age have second
+      // resolution. Require a full second of separation for this comparison.
+      const laterObservedTip = /^[0-9a-f]{40}$/.test(String(baseTip?.tip_sha ?? "")) && baseTip.tip_sha !== mergeSha
+        && typeof tipAge === "number" && tipAge >= 0 && trainBaseObservedAt(queueFacts) - tipAge * 1_000 > mergedAt + 1_000;
+      const historical = Number(meta.currently?.pr) !== pr && (mergedAt < latestLaneMergeAt || laterObservedTip);
       // BR#4934 burst payload: the drain pass rides the merged event —
       // burst_merged (merges in this pass, including this one), burst_cap,
       // burst_settling (true = the pass's FINAL merge; the lane settles on
@@ -11741,6 +11785,10 @@ export class KnowledgeHub {
       // order kept); absent → legacy byte-identical rows.
       const batchMembers = sanitizeBatchMembers(body.batch_members);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
+      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      const receipt = { task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")),
+        ...burstFields, burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}),
+        ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) };
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
       // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
@@ -11780,14 +11828,19 @@ export class KnowledgeHub {
           // blocked stays blocked (lifecycle forbids blocked→blocked) — the
           // state rides meta.merge_train; the reason says awaiting-CI.
           if (card.status === "blocked") {
-            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main settling (build/deploy)` };
+            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, ${historical ? "waiting for covering deployment" : "main settling (build/deploy)"}` };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, chain.task_id);
           } else {
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
           }
         }
       }
-      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      // A late GitHub observation accounts for the PR without replacing the
+      // newer merge that the lane is checking or marking its starvation cured.
+      if (historical) {
+        ev({ ...receipt, historical: true }, chain.task_id, mergedAt);
+        return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, historical: true };
+      }
       meta.currently = {
         pr,
         merge_sha: mergeSha,
@@ -11821,7 +11874,7 @@ export class KnowledgeHub {
       }
       const reason = this.laneSyncReason(lane.id, meta, now);
       this.saveLaneState(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}), ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) }, chain.task_id, mergedAt);
+      ev(receipt, chain.task_id, mergedAt);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
         : burstSettling
@@ -16363,7 +16416,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const repairCreated = recordedRepair ? this.one(`SELECT created_ts FROM artefacts WHERE id = ?`, recordedRepair.id) : null;
       const lastMerge = this.state.storage.sql.exec(
         `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
-         WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+         WHERE kind = 'merged' AND repo = ? AND base = ? AND json_extract(detail, '$.historical') IS NOT 1
+         ORDER BY seq DESC LIMIT 1`,
         lane.repo, lane.base,
       ).toArray()[0] ?? null;
       // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued

@@ -57,19 +57,30 @@ describe("eligibility-first scheduling on real SQLite", () => {
       stderr_tail: proxy
         ? "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]"
         : "acp session/prompt failed: Authentication required: provider authentication required " };
-    let terminal: Record<string, unknown> = {};
-    for (let generation = 1; generation <= 3; generation++) {
-      const claim = await reserve(g);
-      if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
-      const attempt_id = `failed-${generation}`, fence = { generation, attempt_id };
-      expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,selection:{backend:g.capabilities.backend,model:g.capabilities.model,tier:"large"} }, `begin-${generation}`, id, claim.session)).error).toBeUndefined();
-      const stopped = { ...fence, writers: "process_group_empty", outcome };
-      expect((await g.cmd({ kind: "stopped", ...stopped }, `stop-${generation}`, id, claim.session)).error).toBeUndefined();
-      const final = await g.cmd({ kind: "finalize", ...stopped }, `final-${generation}`, id, claim.session);
-      expect(final.error).toBeUndefined(); terminal = final.terminal;
-      expect(final.budget_exhaustions).toBe(generation);
+    async function exhaust(taskId: string) {
+      let terminal: Record<string, unknown> = {};
+      for (let generation = 1; generation <= 3; generation++) {
+        const claim = await reserve(g);
+        if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+        const attempt_id = `failed-${generation}`, fence = { generation, attempt_id };
+        expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,selection:{backend:g.capabilities.backend,model:g.capabilities.model,tier:"large"} }, `begin-${generation}`, taskId, claim.session)).error).toBeUndefined();
+        const stopped = { ...fence, writers: "process_group_empty", outcome };
+        expect((await g.cmd({ kind: "stopped", ...stopped }, `stop-${generation}`, taskId, claim.session)).error).toBeUndefined();
+        const final = await g.cmd({ kind: "finalize", ...stopped }, `final-${generation}`, taskId, claim.session);
+        expect(final.error).toBeUndefined(); terminal = final.terminal;
+        expect(final.budget_exhaustions).toBe(generation);
+      }
+      return terminal;
     }
+    const terminal = await exhaust(id);
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
+    const additional = [];
+    if (proxy) {
+      for (let i = 0; i < 4; i++) {
+        const taskId = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+        additional.push({ taskId, terminal: await exhaust(taskId) });
+      }
+    }
     const token = await post("admin.mint", { label: `recovery-reviewer-${serial}`, tags: [] });
     const identity = await post("auth.identify", { bearer: token.secret });
     const auth = { actor: `recovery-reviewer-${serial}`, token_id: identity.token_id, session: "recovery-review" };
@@ -95,6 +106,14 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(next).toMatchObject({generation:4,budget_exhaustions:3,recovery_permit:{phase:"consumed",consumed_generation:4,continuation:command.continuation,terminal}});
     expect(await g.cmd(begin,"recovered-begin",id,resumed.session)).toEqual(next);
     expect((await g.cmd({...begin,attempt_id:"duplicate"},"duplicate-begin",id,resumed.session)).error).toMatch(/quiescence|budget/);
+    if (proxy) {
+      for (const [index, entry] of additional.entries()) {
+        const trial = await post("execution", { ...auth, id: entry.taskId, command_id: "same-proxy-receipt",
+          command: { ...command, terminal: entry.terminal } });
+        if (index < 3) expect(trial).toMatchObject({ kind: "provider_recovery_granted" });
+        else expect(trial.error).toMatch(/already granted four/);
+      }
+    }
     if (proxy) {
       const stopped = { generation: 4, attempt_id: begin.attempt_id, writers: "process_group_empty", outcome };
       expect((await g.cmd({ kind: "stopped", ...stopped }, "proxy-stop", id, resumed.session)).error).toBeUndefined();

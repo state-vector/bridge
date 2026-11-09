@@ -2304,6 +2304,8 @@ starvation diagnostic stays in history. If the current failure lacks an active
 repair, Bridge queues recovery for that commit.
 If main advances while a stop is in force, Bridge holds merges while checking
 the new commit. It assigns repair work only when that commit fails.
+Bridge records a late GitHub merge receipt at the actual merge time and keeps
+the lane checking any newer merge already in progress.
 
 Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
 
@@ -3770,3 +3772,7 @@ OpenCode provider retry notifications retain their typed, sanitized failure caus
 Archived ACP routing failures with the complete LiteLLM unavailable-route error can use the existing one-attempt recovery permit. The error does not identify a billing problem. A fresh configured request and a quiesced attempt with no unresolved external effects are still required.
 
 A successful request through the configured proxy can authorize one trial per task revision for an unavailable route. This receipt verifies the tested request ceiling. Authentication and quota recovery still require the configured output ceiling to be verified. The hub keeps the consumed trial in the original begin receipt even if a later permit replaces it.
+
+An unowned review of an older task revision no longer blocks closure after the current revision is accepted. The hub retains reviews with active claims, unresolved operations, or delivery obligations for reconciliation.
+
+Given a fresh configured proxy receipt, run `python3 scripts/recover-provider-batch.py receipt.json` to preview up to four matching retry holds from the first 32 reported by the gateway. Set `BRIDGE_MCP_URL` and a full-agent `BRIDGE_TOKEN` using your existing connection, then add `--apply` to grant the selected trials. The hub permits at most four grants per proxy receipt. Normal admission and one-use task guards still apply.
