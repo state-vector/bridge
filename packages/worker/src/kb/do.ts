@@ -11264,15 +11264,28 @@ export class KnowledgeHub {
 
   /** Versioned lane_state is authoritative; the card is an atomic rolling-
    * compatibility projection. A stale snapshot cannot overwrite a newer one. */
-  private saveLaneState(laneId: string, meta: any, now: number): LaneOperationalState | null {
+  private saveLaneState(
+    laneId: string, meta: any, now: number,
+    repair?: Pick<Extract<LaneOperationalState, { phase: "stopped_red" }>, "failing_sha" | "episode_phase" | "fix_card">,
+  ): LaneOperationalState | null {
     const lane = laneOfMeta(meta);
     if (!lane) return null;
+    const queueFacts = meta.lane?.queue_facts;
     const opState = resolveLaneOperationalState({
-      baseState: meta.lane?.queue_facts?.base_state ?? null,
+      baseState: queueFacts?.base_state ?? null,
+      baseObservedAt: trainBaseObservedAt(queueFacts),
       stop: meta.stop ?? null,
       currently: meta.currently ?? null,
       now,
     });
+    if (opState.phase === "stopped_red") {
+      const prior = repair?.failing_sha === opState.failing_sha ? repair : this.laneStore().operational(laneId);
+      const recorded = prior && "failing_sha" in prior && prior.failing_sha === opState.failing_sha ? prior : null;
+      if (recorded) {
+        opState.episode_phase = recorded.episode_phase;
+        opState.fix_card = recorded.fix_card;
+      }
+    }
     this.laneStore().save(laneId, laneKey(lane.repo, lane.base), lane.repo, lane.base, meta, opState, now);
     return opState;
   }
@@ -11523,7 +11536,8 @@ export class KnowledgeHub {
       const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
       if (c && c.status !== "done" && c.status !== "superseded") {
         const cm = JSON.parse(c.meta ?? "{}");
-        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && mainRedBinding(cm)?.head_sha === a.sha) {
+        const binding = mainRedBinding(cm, a.base);
+        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && binding?.repo === a.repo && binding.head_sha === a.sha) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
           this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
           return c.id;
@@ -11546,7 +11560,7 @@ export class KnowledgeHub {
     ).toArray() as any[];
     for (const o of open) {
       const om = JSON.parse(o.meta ?? "{}");
-      const binding = mainRedBinding(om);
+      const binding = mainRedBinding(om, a.base);
       if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
       const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
       if (!sameSha && (o.status === "blocked" || trainLegs(om).length > 0 || om.review_pr || om.recovery_links?.length)) continue;
@@ -13988,7 +14002,7 @@ export class KnowledgeHub {
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
       const root_fix = c.root_fix && scope.kind === "current" &&
-        (scope.task_ids.length ? scope.task_ids.includes(c.id) : mainRedBinding(cm)?.head_sha === scope.head_sha);
+        (scope.task_ids.length ? scope.task_ids.includes(c.id) : mainRedBinding(cm, base)?.head_sha === scope.head_sha);
       return { ...c, priority: root_fix ? "root_fix" : c.priority === "root_fix" ? "normal" : c.priority, root_fix, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
     entries.sort((a, b) => Number(b.root_fix) - Number(a.root_fix));
@@ -15073,7 +15087,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
       return line;
     }
-    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working" || line.remediation?.kind !== "attention") return line;
+    if (line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
+    const inactiveRepair = line.blocker === "main_failed" && line.remediation?.kind === "queued"
+      && line.remediation.task.status === "in_progress" && !line.remediation.task.active_agent;
+    if (line.remediation?.kind !== "attention" && !inactiveRepair) return line;
     const lane = this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, laneId);
     const meta = JSON.parse(lane?.meta ?? "{}");
     const cfg = laneOfMeta(meta);
@@ -15094,10 +15111,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         return { ...line, remediation: taskRemediation(candidateRepair) };
       }
     }
-    const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo).card;
+    const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo, undefined, undefined, cfg.base).card;
+    const scope = this.trainRepairScope(cfg.repo, cfg.base);
     const episode = `${line.blocker}:${line.blocker === "merge_failed"
       ? meta.lane?.queue_facts?.stalled?.since ?? "current"
-      : meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.stop?.sha ?? "current"}`;
+      : scope.kind === "current" ? scope.head_sha : "current"}`;
     const bound = current ? this.enrichFixCardRow(current.id, now) : null;
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
       ...line, remediation: taskRemediation(bound),
@@ -15106,10 +15124,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
        AND json_extract(meta, '$.machine_duty.subject') = ?
        AND json_extract(meta, '$.machine_duty.kind') IN ('line_recovery','task-recovery','diagnostic')
-       AND ((? != 'merge_failed' AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
-         OR (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
+       AND ((? NOT IN ('merge_failed','main_failed') AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
+         OR (? != 'main_failed' AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
          OR json_extract(meta, '$.machine_duty.episode') = ?) ORDER BY created_ts DESC`, laneId,
-      line.blocker, episode,
+      line.blocker, line.blocker, episode,
     ).toArray();
     const open = duties.find((d) => d.status !== "done" && d.status !== "superseded");
     const task = open ? this.enrichFixCardRow(open.id, now) : null;
@@ -15211,7 +15229,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  hotfix+main-red in the LANE CARD's project (the lane card's project
    *  column is the repo→project join; BR#5346 is the live superpositional
    *  example). Newest-touched first. */
-  private trainFixCard(project: string, repo?: string, redNames?: string[], now: number = Date.now()): TrainFixCard | null {
+  private trainFixCard(
+    project: string, repo?: string, redNames?: string[], now: number = Date.now(),
+    exact?: { base: string; head: string },
+  ): TrainFixCard | null {
     if (!project) return null;
     const rows = this.state.storage.sql.exec(
       `SELECT id, title, status, owner, updated_ts, tags, meta FROM artefacts
@@ -15223,6 +15244,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const candidates = rows.filter((r) => {
       const m = JSON.parse(r.meta ?? "{}");
       if (repo && m?.root_fix?.repo && String(m.root_fix.repo) !== repo) return false;
+      if (exact) {
+        const binding = mainRedBinding(m, exact.base);
+        if (binding?.repo !== repo || binding?.head_sha !== exact.head) return false;
+      }
       const t = parseTags(r.tags).map((x) => x.toLowerCase());
       return t.includes("hotfix") || t.includes("blocker") || t.includes("root_blocker") || t.includes("root-blocker");
     });
@@ -15286,7 +15311,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   private trainRepairScope(repo: string, base: string, head?: string): RecoveryRepairScope {
     const row = this.laneRow(laneKey(repo, base));
     const meta = JSON.parse(row?.meta ?? "{}");
-    const current = head ?? meta.stop?.sha ?? meta.lane?.queue_facts?.base_state?.tip_sha ?? meta.lane?.deploy_observation?.tip_sha ?? "";
+    const queueFacts = meta.lane?.queue_facts;
+    const stopped = resolveLaneOperationalState({
+      baseState: queueFacts?.base_state,
+      baseObservedAt: trainBaseObservedAt(queueFacts),
+      stop: meta.stop,
+      now: Date.now(),
+    });
+    const current = head ?? (stopped.phase === "stopped_red" ? stopped.failing_sha
+      : queueFacts?.base_state?.tip_sha ?? meta.lane?.deploy_observation?.tip_sha ?? "");
     return recoveryRepairScope(String(current), RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {}));
   }
 
@@ -15300,7 +15333,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   } {
     const scope = this.trainRepairScope(repo, base);
     const inScope = (id: string, meta: unknown): boolean => scope.kind === "unobserved" ||
-      (scope.task_ids.length ? scope.task_ids.includes(id) : mainRedBinding(meta)?.head_sha === scope.head_sha);
+      (scope.task_ids.length ? scope.task_ids.includes(id) : mainRedBinding(meta, base)?.head_sha === scope.head_sha);
     const bypassHead = (id: string, meta: unknown, pr: number): string | null => {
       const evidence = RecoveryMergeGateSchema.safeParse(entries?.find(e => e.id === id && e.pr === pr)?.bypass);
       if (!evidence.success || evidence.data.kind !== "bypass_required" || scope.kind !== "current" || evidence.data.base_sha !== scope.head_sha) return null;
@@ -15356,7 +15389,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ).toArray() as any[];
       for (const r of rows) {
         const m = JSON.parse(r.meta ?? "{}");
-        const binding = mainRedBinding(m);
+        const binding = mainRedBinding(m, base);
         // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
         // (agent-filed stop-the-line shape — BR#6378) heads the episode.
         if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
@@ -16050,6 +16083,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         && queue.length > 0
         ? brQf.base_state : null;
       const stopActive: any = meta.stop ?? null;
+      const repairScope = this.trainRepairScope(lane.repo, lane.base);
       let base_red_resolution: any = null;
       if (brBase || stopActive || brGateBlocked) {
         const nowActionObj: any = meta.lane?.now_action ?? null;
@@ -16188,43 +16222,39 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
                 options: Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map(String) : [],
               }
             : null,
-          // 2026-11-02 + BR#5679 + BR#6012 + BR#6389: the fix card prefers the
-          // episode's ROOT-FIX card (matching the live failing check names when
-          // multiple root-fix cards exist), then the gate-blocked diagnostic duty
-          // (when gate_blocked), then the project's open blocker/hotfix+main-red
-          // task, and falls back to stop.culprit_task ONLY when no fix card exists.
-          // Every returned card is enriched with live agent telemetry (owner,
-          // executor_session, active_agent, blocked_reason, last_progress).
+          // A culprit or an unrelated diagnostic cannot own the current red.
+          // Prefer the episode's repair, with a same-head active task as a
+          // display fallback while a journal repair is awaiting execution.
           fix_card: (() => {
+            const projectFix = () => repairScope.kind === "current"
+              ? this.trainFixCard(String(l.project ?? ""), lane.repo, reds.map((r: { name: string }) => r.name), now0,
+                { base: lane.base, head: repairScope.head_sha })
+              : null;
             if (rf.card) {
               const shownPr = rf.curePr ?? rf.conflictPr ?? rf.mergedPr ?? null;
-              return (
-                this.enrichFixCardRow(rf.card.id, now0, {
-                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
-                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
-                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
-                }) ?? {
-                  id: rf.card.id,
-                  url: this.cardUrl(rf.card.id),
-                  title: rf.card.title,
-                  status: rf.card.status,
-                  ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
-                  ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
-                  ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
-                }
-              );
+              const prFacts = {
+                ...(shownPr ? { pr: shownPr.number, pr_url: `https://github.com/${shownPr.repo}/pull/${shownPr.number}` } : {}),
+                ...(rf.conflictPr && !rf.curePr ? { conflict: true } : {}),
+                ...(rf.mergedPr && !rf.curePr ? { merged: true, merge_sha: rf.mergedPr.merge_sha } : {}),
+              };
+              const root = this.enrichFixCardRow(rf.card.id, now0, prFacts);
+              if (!shownPr && !root?.active_agent) {
+                const bound = projectFix();
+                if (bound?.active_agent) return bound;
+              }
+              return root ?? {
+                id: rf.card.id,
+                url: this.cardUrl(rf.card.id),
+                title: rf.card.title,
+                status: rf.card.status,
+                ...prFacts,
+              };
             }
             if (brGateBlocked && meta.lane?.gate_blocked?.duty_id) {
               const gbDuty = this.enrichFixCardRow(String(meta.lane.gate_blocked.duty_id), now0);
               if (gbDuty && gbDuty.status !== "done" && gbDuty.status !== "superseded") return gbDuty;
             }
-            const projFix = this.trainFixCard(String((l as any).project ?? ""), lane.repo, reds.map((r: any) => r.name), now0);
-            if (projFix) return projFix;
-            const culpritId = String(stopActive?.culprit_task ?? "").trim();
-            if (culpritId) {
-              return this.enrichFixCardRow(culpritId, now0);
-            }
-            return null;
+            return projectFix();
           })(),
         };
       }
@@ -16266,13 +16296,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
       let lane_state = this.laneStore().operational(String(l.id)) ?? resolveLaneOperationalState({
         baseState: brQf?.base_state ?? null,
+        baseObservedAt: trainBaseObservedAt(brQf),
         stop: meta.stop ?? null,
         currently: meta.currently ?? null,
         fixCard: base_red_resolution?.fix_card ?? null,
         now: now0,
       });
       const diagnosticId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.duty_id
-        : starved ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
+        : starved && !isBaseRedNow && !stopActive ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
       const diagnostic = diagnosticId ? this.enrichFixCardRow(String(diagnosticId), now0) : null;
       const diagnosticAskId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.ask_id
         : starved ? meta.lane?.starvation?.ask_id ?? meta.starvation?.ask_id : null;
@@ -16300,37 +16331,34 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         blocker: "stale_observation", evidence: [], held: queue.length, observed_at: trainBaseObservedAt(brQf),
         remediation: { kind: "attention", text: "The recovery monitor is assigning investigation of the inconsistent status." },
       };
-      let line = await this.ensureLineRecovery(l.id, projectedLine, now0);
+      const assignedLine = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
-      line = withRecoveryEpisodes(line, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), this.trainRepairScope(lane.repo, lane.base));
-      latestMeta.lane = { ...latestMeta.lane, line };
-      this.saveLaneState(l.id, latestMeta, now0);
-      lane_state = this.laneStore().operational(String(l.id)) ?? lane_state;
-      // BR#4849: the red-main episode, hub-derived. The hub holds no VCS
-      // credentials (BR#3516) — it cannot see GitHub red itself — but every
-      // episode leaves a board record: the open root-blocker/main-red task.
-      // Derive the newest open one in the lane's project so the Top view
-      // banner answers "who is fixing it" — including the loudest possible
-      // answer: UNOWNED. last_merge (the lane's newest landed event) anchors
-      // "who broke it" when no machine culprit was stamped on the stop.
-      const project = lane.repo.split("/").pop() ?? "";
-      const redTask = this.state.storage.sql.exec(
-        `SELECT id, title, status, owner, meta, created_ts FROM artefacts
-         WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
-           AND project = ? AND (tags LIKE '%"main-red"%' OR tags LIKE '%"root-blocker%"')
-         ORDER BY created_ts DESC LIMIT 1`,
-        project,
-      ).toArray()[0] ?? null;
-      let executorSession = "";
-      if (redTask) {
-        // the executor lease is meta.session, surfaced as executor_session for
-        // in_progress/in_review only (mirrors the orient serving, BR#3361 d)
-        try {
-          const rm = JSON.parse(String(redTask.meta ?? "{}"));
-          if (["in_progress", "in_review"].includes(String(redTask.status ?? ""))) executorSession = String(rm.session ?? "");
-        } catch { executorSession = ""; }
+      let line = withRecoveryEpisodes(assignedLine, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), repairScope);
+      if (repairScope.kind === "current" && line.phase === "stopped" && line.blocker === "main_failed"
+        && assignedLine.phase === "stopped" && assignedLine.blocker === "main_failed") {
+        const assigned = assignedLine.remediation;
+        // Journal history cannot replace a current active repair or an
+        // executable duty with a task whose heartbeat expired.
+        if ((assigned.kind === "agent" && line.remediation.kind !== "agent")
+          || (assigned.kind === "queued" && assigned.task.status === "todo"
+            && line.remediation.kind === "queued" && line.remediation.task.status === "in_progress")) {
+          line = { ...line, remediation: assigned };
+        }
       }
+      const baseRed = lineFacts.success ? lineFacts.data.base_red_resolution : null;
+      const stoppedMain = line.phase === "stopped" && line.blocker === "main_failed";
+      const redTask = stoppedMain && "task" in line.remediation
+        ? line.remediation.task : baseRed?.fix_card ?? null;
+      const ownership = stoppedMain && repairScope.kind === "current" ? {
+        failing_sha: repairScope.head_sha,
+        episode_phase: baseRed?.phase ?? "diagnosing" as const,
+        fix_card: redTask,
+      } : undefined;
+      latestMeta.lane = { ...latestMeta.lane, line };
+      lane_state = this.saveLaneState(l.id, latestMeta, now0, ownership) ?? lane_state;
+      const recordedRepair = lane_state.phase === "stopped_red" ? lane_state.fix_card : null;
+      const repairCreated = recordedRepair ? this.one(`SELECT created_ts FROM artefacts WHERE id = ?`, recordedRepair.id) : null;
       const lastMerge = this.state.storage.sql.exec(
         `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
          WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
@@ -16427,14 +16455,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         awaiting: awaitingRows,
         pr_stats: prStats,
         batches,
-        red_main: redTask
+        red_main: recordedRepair
           ? {
-              task_id: String(redTask.id),
-              title: String(redTask.title ?? ""),
-              status: String(redTask.status ?? ""),
-              owner: String(redTask.owner ?? ""),
-              executor_session: executorSession,
-              created_ts: Number(redTask.created_ts ?? 0),
+              task_id: recordedRepair.id,
+              title: recordedRepair.title,
+              status: recordedRepair.status,
+              owner: recordedRepair.owner ?? "",
+              executor_session: recordedRepair.executor_session ?? "",
+              created_ts: Number(repairCreated?.created_ts ?? 0),
             }
           : null,
         last_merge: lastMerge

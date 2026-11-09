@@ -50,6 +50,26 @@ EOF
       echo "red456sha"
     fi
     ;;
+  preflight-mixed|preflight-only|preflight-test-red)
+    if [[ "${url}" == *"/check-runs"* ]]; then
+      real_check=""
+      case "${SCENARIO}" in
+        preflight-mixed)
+          real_check=', {"id":901,"name":"Test","conclusion":"success","html_url":"https://example/main/Test"}' ;;
+        preflight-test-red)
+          real_check=', {"id":901,"name":"Test","conclusion":"failure","html_url":"https://example/main/Test"}' ;;
+      esac
+      cat <<EOF
+{"check_runs":[
+ {"id":902,"name":"main-green gate","conclusion":"failure","html_url":"https://example/preflight/gate"},
+ {"id":903,"name":"Preflight destination check","conclusion":"skipped","html_url":"https://example/main/preflight-alias"}
+ ${real_check}
+]}
+EOF
+    else
+      echo "sharedsha"
+    fi
+    ;;
   cancelled-supersede)
     if [[ "${url}" == *"/check-runs"* ]]; then
       # newest run cancelled, older run failure: the cancelled run says

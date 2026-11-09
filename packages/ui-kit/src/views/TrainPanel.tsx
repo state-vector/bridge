@@ -125,8 +125,8 @@ const REFRESH_MS = 30_000;
 /** BR#4849: the stop-the-line banner — a red main must be the FIRST thing the
  *  Top view says (Ray 2026-10-29: "its critical we reflect this and show a)
  *  who broke it and b) who is fixing it"). Two accountability lines:
- *  - broke it: the machine-recorded culprit card stamped on the stop, else the
- *    lane's last landed merge before the red (labeled unconfirmed);
+ *  - broke it: the recorded culprit, or the landing at the failing commit
+ *    (labeled unconfirmed);
  *  - fixing it: a pending action from the current line, or the root repair
  *    with its owner/executor. Keep unclaimed repair work visible. */
 function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; openTask?: (id: string) => void }) {
@@ -134,9 +134,11 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
   const line = l.line ?? unavailable;
   const remediation = line.remediation;
   const red = remediation && (remediation.kind === "agent" || remediation.kind === "queued" || remediation.kind === "blocked") ? remediation.task : null;
-  const culprit = l.stop?.culprit_task ?? null;
-  const lastMerge = l.last_merge ?? null;
-  const fixer = red ? red.owner || red.executor_session : "";
+  const stopped = l.lane_state?.phase === "stopped_red" ? l.lane_state : null;
+  const failingSha = stopped?.failing_sha ?? l.stop?.sha;
+  const culprit = stopped ? stopped.culprit_task : l.stop?.culprit_task ?? null;
+  const lastMerge = failingSha && l.last_merge?.merge_sha === failingSha ? l.last_merge : null;
+  const fixer = red?.active_agent ? red.owner || red.executor_session : "";
   const pendingAsk = remediation?.kind === "blocked"
     ? remediation.task.execution_blockers?.find((blocker) => blocker.kind === "human_answer_required")
     : undefined;
@@ -151,12 +153,12 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
         title={[line.reason, ...line.evidence.map((f) => f.name)].join(" · ")}
       >
         {line.reason}
-        {l.stop?.sha ? <span className="top-num"> @ {l.stop.sha.slice(0, 9)}</span> : null}
+        {failingSha ? <span className="top-num"> @ {failingSha.slice(0, 9)}</span> : null}
       </div>
       <div className="train-stopline-who">
         <span
           className="train-stopline-cell"
-          title="who broke it — the machine-recorded culprit card on the stop, else the lane's last landed merge before the red (probable, unconfirmed)"
+          title="The recorded culprit or the landing at the failing commit"
         >
           broke it:{" "}
           {culprit ? (
@@ -166,13 +168,13 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
               <a className="train-stopline-who-link" href={`https://github.com/${repo}/pull/${lastMerge.pr}`} target="_blank" rel="noreferrer">#{lastMerge.pr}</a>
               {" "}by {lastMerge.gateway ?? "?"}
               {lastMerge.task_id ? <> — <a className="train-stopline-who-link" onClick={() => openTask?.(lastMerge.task_id!)}>{lastMerge.task_id}</a></> : null}
-              {" "}<span className="muted-note">(last landed before red — unconfirmed)</span>
+              {" "}<span className="muted-note">(landing at the failing commit, unconfirmed)</span>
             </>
           ) : (
-            <span className="muted-note">unconfirmed — no landing recorded</span>
+            <span className="muted-note">unconfirmed for this commit</span>
           )}
         </span>
-        <span className="train-stopline-cell" title="who is fixing it — the open root-blocker/main-red episode task and its owner/executor session">
+        <span className="train-stopline-cell" title="Recovery for the failing commit">
           fixing it:{" "}
           {remediation?.kind === "merge" ? (
             <a className="train-stopline-who-link" href={remediation.request?.url ?? remediation.url}
@@ -186,7 +188,9 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
             <>
               <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
               {fixer ? (
-                <span> · {red.owner || red.executor_session}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
+                <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
+              ) : remediation?.kind === "queued" ? (
+                <Chip tone="warn" title={remediation.text}>Recovery queued</Chip>
               ) : (
                 <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
                   ⚠ UNOWNED — nobody is fixing it

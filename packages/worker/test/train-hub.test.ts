@@ -235,6 +235,84 @@ describe("BR#6901 idle main-health observation", () => {
 });
 
 describe("BR#6776 durable check recovery", () => {
+  it("BR#8945: a fresh failed head keeps its exact recovery instead of an old stop or starvation task", async () => {
+    const repo = "state-vector/recovery-owner-8945", actor = "gw-recovery-owner-8945";
+    const oldHead = "a".repeat(40), head = "b".repeat(40);
+    const oldFailures = [{ name: "Old failed check", url: "https://github.test/old" }];
+    const failures = [{ name: "Cortex Quality Smoke", url: "https://github.test/current" }];
+    await acquire(repo, actor, { merge_capable: true, required_workflows: [failures[0].name] });
+    expect((await kbJson("/train.event", {
+      repo, actor, kind: "stopped", head_sha: oldHead, failing: oldFailures,
+    })).status).toBe(200);
+    const oldLane = await laneSnap(repo);
+    const oldRepair = oldLane.base_red_resolution.fix_card.id;
+    const diagnostic = (await kbJson("/create", {
+      type: "task", title: "Yesterday's starvation diagnostic", qualified: true,
+      meta: { machine_duty: { kind: "diagnostic", subject: oldLane.card } },
+    })).body.id;
+    const repair = (await kbJson("/create", {
+      type: "task", title: "Repair today's Cortex smoke failure", qualified: true, roles: ["impl"],
+      tags: ["root_blocker", "main-red", "p0"],
+      meta: { root_fix: { repo, base: "main", head_sha: head, failing: [failures[0].name] } },
+    })).body.id;
+    expect((await kbJson("/transition", {
+      id: repair, to: "in_progress", actor: "agent-repair-8945", session: "session-repair-8945",
+    })).status).toBe(200);
+    expect((await kbJson("/progress.log", {
+      id: repair, actor: "agent-repair-8945", session: "session-repair-8945",
+      did: "Confirmed the failing main check", will: "Repair the exact failing candidate",
+    })).status).toBe(200);
+
+    expect((await kbJson("/train.queue_facts", {
+      repo, actor, entries: [], base_state: { verdict: "red", tip_sha: head, red: failures, unsettled: [] },
+    })).status).toBe(200);
+    const snap = await laneSnap(repo);
+    expect(snap.stop.sha).toBe(oldHead);
+    expect(snap.line).toMatchObject({
+      phase: "stopped", blocker: "main_failed", remediation: { kind: "agent", task: { id: repair, active_agent: true } },
+    });
+    expect(snap.lane_state).toMatchObject({
+      phase: "stopped_red", failing_sha: head, fix_card: { id: repair, active_agent: true },
+    });
+    expect(snap.red_main.task_id).toBe(repair);
+
+    expect((await kbJson("/train.lease", { repo, actor, action: "renew" })).status).toBe(200);
+    expect((await laneSnap(repo)).lane_state.fix_card.id).toBe(repair);
+
+    const prior = (await kbJson("/get", { id: repair })).body;
+    expect((await kbJson("/update", { id: repair, meta: {
+      ...prior.meta, session_alive_ts: 1, last_progress: { ...prior.meta.last_progress, ts: 1 },
+    } })).status).toBe(200);
+    const fallback = await laneSnap(repo);
+    expect(fallback.line.remediation.kind).toBe("queued");
+    const fallbackId = fallback.line.remediation.task.id;
+    expect(fallbackId).not.toBe(repair);
+    expect(fallbackId).not.toBe(oldRepair);
+    expect(fallbackId).not.toBe(diagnostic);
+    expect((await kbJson("/get", { id: fallbackId })).body.meta.machine_duty).toMatchObject({
+      kind: "line_recovery", subject: snap.card, episode: `main_failed:${head}`,
+    });
+    expect((await laneSnap(repo)).lane_state.fix_card.id).toBe(fallbackId);
+    expect((await kbJson("/get", { id: oldRepair })).body.meta.root_fix.head_sha).toBe(oldHead);
+    expect((await kbJson("/get", { id: diagnostic })).body.status).toBe("todo");
+
+    expect((await kbJson("/transition", {
+      id: fallbackId, to: "in_progress", actor: "fallback-agent-8945", session: "fallback-session-8945",
+    })).status).toBe(200);
+    expect((await kbJson("/admin.stall_sweep", { now: Date.now() + 11 * 60_000 })).status).toBe(200);
+    expect((await kbJson("/get", { id: fallbackId })).body).toMatchObject({ status: "todo", owner: "" });
+
+    expect((await kbJson("/train.queue_facts", {
+      repo, actor, entries: [], base_state: { verdict: "green", tip_sha: head, red: [], unsettled: [] },
+    })).status).toBe(200);
+    expect((await kbJson("/train.lease", { repo, actor, action: "release", line_green: true })).status).toBe(200);
+    const green = await laneSnap(repo);
+    expect(green.stop).toBeNull();
+    expect(green.line).toMatchObject({ phase: "ready", remediation: null });
+    expect(green.lane_state.phase).toBe("idle");
+    expect(green.red_main).toBeNull();
+  });
+
   it("keeps the qualified root fix visible behind newer unrelated repo cards", async () => {
     const repo = "state-vector/root-priority-7564", actor = "gw-root7564", head = "f".repeat(40);
     const root = await kbJson("/create", { type: "task", title: "Repair the actual main failure", qualified: true,
@@ -3150,7 +3228,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-gb" });
   });
 
-  it("BR#5349 (+ BR#5631): a non-green base holding cars serves base_red_resolution on train.status — whats_broken + held + ask:null while agent-workable (no action demanded of the human) + the lane's OPEN hotfix+main-red fix card; green drops the block (the banner's own off-switch)", async () => {
+  it("BR#5349 (+ BR#5631): a non-green base serves checks and held cars, omits unrelated repairs, and clears when green", async () => {
     const repo = "state-vector/lane-brr";
     await acquire(repo, "gw-brr", { merge_capable: true, required_workflows: ["Test"] });
     const c1 = await queueViaAccept({ repo, pr: 53491, head: "c".repeat(40), title: "IMPL: brr drill 1" });
@@ -3184,17 +3262,14 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     // no fix card yet → null, never a lie
     expect(brr.fix_card).toBeNull();
 
-    // an OPEN hotfix+main-red task in the LANE CARD's project becomes the fix card
+    // A project-only hotfix cannot own a red whose commit is still unknown.
     const laneProject = String((await kbJson("/get", { id: lane.card })).body.project ?? "");
     expect(laneProject).not.toBe("");
-    const fix = await kbJson("/create", { type: "task", title: "HOTFIX P0: fix main red (brr drill)", tags: ["hotfix", "main-red", "p0"], project: laneProject, body_md: "drill fix card" });
-    expect(fix.status).toBe(200);
-    const lane2 = (await kbJson("/train.status", { repo })).body.lanes[0];
-    expect(lane2.base_red_resolution.fix_card).toBeTruthy();
-    expect(lane2.base_red_resolution.fix_card.id).toBe(fix.body.id);
-    expect(lane2.base_red_resolution.fix_card.status).toBe("todo");
-    expect(lane2.base_red_resolution.fix_card.url).toBe(`https://hub.fleetbridge.run/card/${String(fix.body.id).replace("#", "-")}`);
-
+    const unrelated = await kbJson("/create", { type: "task", title: "Another repository hotfix",
+      tags: ["hotfix", "main-red", "p0"], project: laneProject, body_md: "different repository",
+      meta: { root_fix: { repo: "state-vector/other-repo", base: "main", head_sha: "c".repeat(40) } } });
+    expect(unrelated.status).toBe(200);
+    expect((await laneSnap(repo)).base_red_resolution.fix_card).toBeNull();
     // GREEN base: the block disappears by itself — the banner never lingers
     await kbJson("/train.queue_facts", {
       repo, base: "main", actor: "gw-brr",

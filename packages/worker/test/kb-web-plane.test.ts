@@ -511,11 +511,11 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
     expect(trainPanelSrc.indexOf("train-stopline")).toBeLessThan(trainPanelSrc.indexOf("train-head-cols"));
   });
 
-  it("answers WHO BROKE IT: the stop's machine-recorded culprit card, else the last landed merge labeled unconfirmed", () => {
-    expect(trainPanelSrc).toMatch(/l\.stop\?\.culprit_task/);
+  it("shows the recorded culprit or an unconfirmed landing for the failing commit", () => {
+    expect(trainPanelSrc).toMatch(/stopped\s*\?\s*stopped\.culprit_task/);
     expect(trainPanelSrc).toContain("broke it:");
-    expect(trainPanelSrc).toMatch(/l\.last_merge/);
-    expect(trainPanelSrc).toContain("last landed before red");
+    expect(trainPanelSrc).toMatch(/failingSha\s*&&\s*l\.last_merge\?\.merge_sha\s*===\s*failingSha/);
+    expect(trainPanelSrc).toContain("landing at the failing commit, unconfirmed");
   });
 
   it("answers WHO IS FIXING IT: the episode task with owner/executor — or a loud UNOWNED chip", () => {

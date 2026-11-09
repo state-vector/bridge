@@ -81,6 +81,19 @@ expect_grep "abc123def" "pass receipt names the judged sha"
 run green
 expect_nogrep "REMEDIATION" "no carve-out on a green main"
 
+run preflight-mixed
+expect_rc 0 "old failed preflight attached to the same SHA cannot override green main Test"
+expect_grep "settled-green checks: 1" "only real destination checks count as evidence"
+
+run preflight-only
+expect_rc 1 "destination metadata checks alone cannot vouch for main"
+expect_grep "no substantive check runs" "preflight-only evidence fails the vacuity guard"
+
+run preflight-test-red
+expect_rc 1 "a real Test failure still stops the line beside preflight checks"
+expect_grep "Test https://example/main/Test" "destination Test failure is named"
+expect_nogrep "https://example/preflight/gate" "the historical preflight is not a failing destination check"
+
 run red
 expect_rc 1 "a failure on main's HEAD fails the gate"
 expect_grep "RED — main's HEAD has failing checks" "red verdict is named"
@@ -100,7 +113,7 @@ expect_rc 1 "all-cancelled main fails (inconclusive is not green)"
 
 run empty
 expect_rc 1 "zero check runs fails (vacuity guard)"
-expect_grep "no check runs at all" "vacuity is explained"
+expect_grep "no substantive check runs" "vacuity is explained"
 
 run api-error
 expect_rc 1 "gh API error fails loudly"

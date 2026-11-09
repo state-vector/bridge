@@ -2104,8 +2104,10 @@ export type RootFixBinding = { repo: string; head_sha: string };
  *  `root_blocker_for_lane` ("<repo>@<base>") by the field — BR#6390, the
  *  2026-11-04 BR#6378 shape, which hub code never mints but must still
  *  recognize). */
-export function mainRedBinding(meta: any): RootFixBinding | null {
+export function mainRedBinding(meta: any, base?: string): RootFixBinding | null {
   const b = meta?.root_fix;
+  const boundBase = b?.base ?? String(meta?.root_blocker_for_lane ?? "").split("@")[1] ?? "main";
+  if (base && boundBase !== base) return null;
   if (b && typeof b === "object") {
     const repo = typeof b.repo === "string" ? b.repo : "";
     const sha = typeof b.head_sha === "string" ? b.head_sha : "";
@@ -3820,8 +3822,10 @@ export function trainBaseRedAskWarranted(fix: {
  *  fragments. */
 export function resolveLaneOperationalState(input: {
   baseState?: { verdict?: string; tip_sha?: string; red?: { name: string; url?: string }[] } | null;
+  baseObservedAt?: number;
   stop?: {
     sha?: string;
+    at?: number;
     reason?: string;
     failing?: { name: string; url?: string }[];
     culprit_task?: string;
@@ -3840,8 +3844,10 @@ export function resolveLaneOperationalState(input: {
   now: number;
 }): LaneOperationalState {
   const { currently, episodeState, fixCard, now } = input;
-  const stop = input.baseState?.verdict === "red" && input.baseState.tip_sha
-    ? { sha: input.baseState.tip_sha, failing: input.baseState.red ?? [], culprit_task: input.stop?.culprit_task }
+  const redTip = input.baseState?.verdict === "red" && input.baseState.tip_sha;
+  const stop = redTip && (input.baseObservedAt ?? now) >= (input.stop?.at ?? 0)
+    ? { sha: redTip, failing: input.baseState?.red ?? [],
+        culprit_task: input.stop?.sha === redTip ? input.stop.culprit_task : null }
     : input.stop;
   if (stop && stop.sha) {
     const failingChecks = Array.isArray(stop.failing)

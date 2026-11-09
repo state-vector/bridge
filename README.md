@@ -1831,18 +1831,16 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
 - **The block**: every PR runs the required `main-green gate` check
   (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
   check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
-  (or a check still running, or no check runs at all) fails the gate and GitHub refuses
+  (or a check still running, or no substantive check runs) fails the gate and GitHub refuses
   the merge via the `main: main-green gate + substance checks required` ruleset. The
   newest run per check judges; a cancelled run says nothing. The one exception is written
   into the gate: a PR green on the *exact* checks main fails passes with a printed
   **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
   receipted, not a loophole.
-  Manual gate drills honour the same rule: a `workflow_dispatch` run MUST pass an
-  explicit `main_sha` (BR#5487) — a sha-less dispatch with `--ref main` attaches the
-  drill's own `main-green gate` check-run to main's HEAD, so the script finds itself
-  in flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
-  historic sha instead: the check-run still lands on HEAD, but the judged commit is
-  settled and independent.
+  The destination check excludes its own `main-green gate` and `Preflight destination check`
+  labels. GitHub attaches those results to the commit SHA, which can be shared by main
+  and a preflight ref. A manual `workflow_dispatch` drill still requires an explicit
+  historic `main_sha` (BR#5487).
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The same ruleset
@@ -2299,6 +2297,11 @@ does a hub that never answers. A failing main-tip lookup never turns a mismatch 
 (fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
 
 ## The merge train: serialized merges, credential-free hub (BR#3516)
+
+The stop-the-line banner follows the latest observed failing main commit. The
+lane retains its repair across refreshes and lease renewals, and a stale
+starvation diagnostic stays in history. If the current failure lacks an active
+repair, Bridge queues recovery for that commit.
 
 Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
 
