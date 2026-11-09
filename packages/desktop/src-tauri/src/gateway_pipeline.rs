@@ -163,6 +163,17 @@ fn prepare(shared: &Config, snap: &SharedSnapshot, input: Input, cancel: Arc<Ato
     }
 }
 
+// The old capture path rejected ENOENT before the hub could finalize.
+// The fresh-attempt policy no longer needs that worktree. Match only that
+// historical rejection and keep its original outcome and writer proof.
+fn legacy_missing_capture(record: &Record, reason: &str) -> bool {
+    let Work::Stopped { outcome, worktree: Some(path), step: Step::Capture, .. } = &record.work else { return false; };
+    if !matches!(outcome.kind, OutcomeKind::ResultUnavailable) { return false; }
+    let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+    reason == format!("gate: checkpoint worktree unavailable at {}: {missing}; retained journal requires workspace reconciliation", path.display())
+        && std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh: bool) -> Result<(), (Record, String)> {
     let result = (|| -> Result<(), String> {
         let cfg = config(shared);
@@ -186,7 +197,6 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                 return Ok(());
             }
         }
-        if let Disposition::Rejected { reason } = &record.disposition { return Err(reason.clone()); }
         if !fresh && !root.join(record.name()).exists() {
             // A recovery scan can race a completed local delivery. Read its
             // immutable ACK; never resurrect an older checkpoint stage or
@@ -205,6 +215,9 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
         // Persisted stage is always the source of recovery, including after a
         // lost response. Every mutating RPC uses its original deterministic ID.
         record = journal::insert(&root, record.clone())?;
+        if let Disposition::Rejected { reason } = &record.disposition {
+            if !legacy_missing_capture(&record, reason) { return Err(reason.clone()); }
+        }
         if let Work::Unproven { outcome, worktree } = record.work.clone() {
             let process = record.process.as_ref().ok_or("gate: launch identity unavailable; retain owner for original-host reconciliation")?;
             let state = crate::transport::stop_recovered(process);
@@ -1223,6 +1236,15 @@ pub(crate) mod tests {
     }
     #[test]
     fn actual_finalizer_recovers_captured_result_after_lost_ack_and_daemon_restart() {
+        finalizer_recovers_after_lost_ack(false);
+    }
+
+    #[test]
+    fn legacy_missing_capture_finalizes_after_lost_ack_without_replaying() {
+        finalizer_recovers_after_lost_ack(true);
+    }
+
+    fn finalizer_recovers_after_lost_ack(legacy_missing: bool) {
         let ids = Arc::new(Mutex::new(Vec::<String>::new()));
         let host = Arc::new(Mutex::new(String::new())); let bound_host = host.clone(); let observed = ids.clone();
         let hub = Hub::new(move |request| {
@@ -1237,6 +1259,10 @@ pub(crate) mod tests {
                 });
             }
             assert_eq!(args["command"]["kind"], "finalize");
+            if legacy_missing {
+                assert_eq!(args["command"]["outcome"]["kind"], "result_unavailable");
+                assert_eq!(args["command"]["outcome"]["stdout_tail"], "the exact captured result survives restart");
+            }
             let mut ids = observed.lock().unwrap(); ids.push(args["command_id"].as_str().unwrap().into());
             if ids.len() == 1 { return None; }
             Some(json!({"attempt":{"phase":"quiesced","host":*bound_host.lock().unwrap(),"session":args["session"],"generation":1,"attempt_id":"captured-one"}}))
@@ -1245,6 +1271,22 @@ pub(crate) mod tests {
         let owner = Ownership::Attempt { ticket: Ticket { task_id: "terminal-fixture".into(), session: "captured-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "captured-one".into() };
         let record = Record { owner: owner.clone(), url: cfg.url.clone(), host: cfg.label.clone().unwrap(), observed_at: 1, disposition: Disposition::Pending, process: None,
             work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "the exact captured result survives restart".into(), stderr_tail: String::new(), cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+        let record = if legacy_missing {
+            let path = root(&cfg).unwrap().join("missing-old-worktree");
+            let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+            let reason = format!("gate: checkpoint worktree unavailable at {}: {missing}; retained journal requires workspace reconciliation", path.display());
+            let mut record = record;
+            record.disposition = Disposition::Rejected { reason: reason.clone() };
+            if let Work::Stopped { outcome, worktree, step, .. } = &mut record.work {
+                outcome.kind = OutcomeKind::ResultUnavailable;
+                outcome.exit_code = None;
+                *worktree = Some(path);
+                *step = Step::Capture;
+            }
+            assert!(legacy_missing_capture(&record, &reason));
+            assert!(!legacy_missing_capture(&record, "gate: unknown external effect"));
+            record
+        } else { record };
         journal::insert(&terminal_root(&cfg).unwrap(), record.clone()).unwrap();
         let mut first = Controller::new(&cfg, &ready, &snap);
         first.registry.restore_finalization(owner, FinalWork::Journal(record)).ok().unwrap();
