@@ -1118,7 +1118,16 @@ fn check_runs_from_pages(pages: &[Option<Vec<Value>>]) -> Vec<MainCheckRun> {
         runs.extend(arr.iter().map(|r| MainCheckRun {
             id: r.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
             source: match r.pointer("/check_suite/id").and_then(Value::as_i64).filter(|id| *id > 0) {
-                Some(suite_id) => crate::train_gate::CheckSource::CheckRun { suite_id, app_id: r.pointer("/app/id").and_then(Value::as_i64).unwrap_or(0) },
+                // BR#9268: the producer class is derived from the provider
+                // payload itself — the check run's GitHub URL shape — at read
+                // time, so every downstream identity (obligation grouping,
+                // dispatch target) separates a native Actions job from an
+                // API-published report sharing name/app/suite.
+                Some(suite_id) => crate::train_gate::CheckSource::CheckRun {
+                    suite_id,
+                    app_id: r.pointer("/app/id").and_then(Value::as_i64).unwrap_or(0),
+                    producer: crate::train_gate::check_run_producer(r.get("html_url").and_then(Value::as_str)),
+                },
                 None => crate::train_gate::CheckSource::Unknown,
             },
             name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1187,14 +1196,15 @@ impl CheckRetryTarget {
 }
 
 fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget, String> {
-    use crate::train_gate::CheckSource;
+    use crate::train_gate::{CheckRunProducer, CheckSource, GITHUB_ACTIONS_APP_ID};
     if run.id <= 0 { return Err("Cannot retry a check without a positive GitHub id".into()); }
     match &run.source {
         CheckSource::Unknown => Err("Cannot retry an untyped observation; refresh GitHub source identity".into()),
         CheckSource::WorkflowRun { .. } => Ok(CheckRetryTarget::WorkflowRun { id: run.id }),
-        CheckSource::CheckRun { .. } => {
-            // The Actions job id is not the Checks API id. Read the job's
-            // explicit GitHub URL, scoped to this repository; never guess.
+        // BR#9268: the dispatch aim is producer-typed. The Actions job id is
+        // not the Checks API id — read the job's explicit GitHub URL, scoped
+        // to this repository; never guess.
+        CheckSource::CheckRun { producer: CheckRunProducer::ActionsJob, .. } => {
             let prefix = format!("https://github.com/{repo}/actions/runs/");
             if let Some(path) = run.html_url.as_deref().and_then(|url| url.strip_prefix(&prefix)) {
                 let parts: Vec<_> = path.split('/').collect();
@@ -1208,7 +1218,23 @@ fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget
             if run.html_url.as_deref().is_some_and(|url| url.contains("/actions/runs/")) {
                 return Err("Actions job URL belongs to a different repository".into());
             }
-            Ok(CheckRetryTarget::CheckRun { id: run.id })
+            Err("A native Actions job observation without its actions/runs URL cannot be dispatched — fail-closed (BR#9268)".into())
+        }
+        // A published check run created by the GitHub Actions app is a
+        // REPORT (deploy-health-record publishes the gate verdict with
+        // GITHUB_TOKEN): `check-runs/{id}/rerequest` re-executes nothing —
+        // the BR#9081 no-op burn. Dispatch the producing workflow or the
+        // native gate job instead; never rerequest the shell.
+        CheckSource::CheckRun { producer: CheckRunProducer::Published, .. } if *app_id == GITHUB_ACTIONS_APP_ID => {
+            Err("A GitHub Actions app published check run is a report, not a job — rerequest re-executes nothing (BR#9268); dispatch the native gate job or the producing workflow".into())
+        }
+        // A third-party app's published check run honors
+        // `check_run.rerequested` — the app re-runs it.
+        CheckSource::CheckRun { producer: CheckRunProducer::Published, .. } => Ok(CheckRetryTarget::CheckRun { id: run.id }),
+        // Unclassified URL: the producer cannot be identified from the
+        // provider payload — fail-closed, never dispatch on a guess.
+        CheckSource::CheckRun { producer: CheckRunProducer::Unclassified, .. } => {
+            Err("Cannot classify this check run's producer from its URL — fail-closed, never dispatch on a guess (BR#9268)".into())
         }
     }
 }
@@ -3382,6 +3408,36 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     // healed check and flip the head back to unsettled next
                     // tick. Never the raw historical list.
                     let stale = latest_red_deploy_health_runs(&head_checks);
+                    // BR#9268: with the producer split the head can read red
+                    // purely on the PUBLISHED gate report (`/runs/{id}`) —
+                    // the native job's judge is green. A published check run
+                    // is a report; re-requesting it re-executes nothing (the
+                    // BR#9081 no-op burn) and there is no red native job to
+                    // re-run. That is NOT a stall: the publisher's next run
+                    // republishes the verdict, and GitHub holds the car
+                    // BLOCKED in the meantime — the arm advances as a waiting
+                    // clock, quietly. An UNCLASSIFIED red judge is payload
+                    // drift — fail-closed and loud (BR#5911 law).
+                    if stale.is_empty() {
+                        let reports = crate::train_gate::red_report_gate_judges(&head_checks);
+                        if reports.iter().any(|(_, _, unclassified)| *unclassified) {
+                            let names = reports.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>().join(", ");
+                            let fact = self_heal_stall_fact(reports.len(), 0, Some("unclassified red gate judge — cannot identify the producer from its URL (fail-closed)"));
+                            if let (Some(fact), Some(entry)) = (fact, qfacts.last_mut()) {
+                                entry.as_object_mut().map(|o| o.insert("self_heal_stalled".into(), fact.clone()));
+                                entry["repair"] = json!({ "kind": "head_checks", "head_sha": head_sha,
+                                    "checks": reports.iter().map(|(n, u, _)| json!({ "name": n, "url": u })).collect::<Vec<_>>() });
+                            }
+                            ctx.note(&format!("SELF-HEAL STALLED on PR #{pr}: unclassified red gate judge(s) {names} — producer not identifiable from the URL (fail-closed)"));
+                            log(Some(key), &format!("ERROR — queue[{qi}] PR #{pr} self-heal STALLED: red gate judge(s) unclassified — payload drift, never dispatched on a guess (BR#9268)"));
+                        } else if !reports.is_empty() {
+                            let names = reports.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>().join(", ");
+                            ctx.note(&format!("PR #{pr}: red is the published gate report ({names}) — the publisher republishes it; no native gate job is red to re-run"));
+                            log(Some(key), &format!("queue[{qi}] PR #{pr} published gate report is the red — waiting on the publisher (no dispatch, BR#9268)"));
+                        }
+                        // the entry is a clock (waiting), never a defect: advance
+                        return Ok(());
+                    }
                     let mut dispatched = 0usize;
                     let mut last_err: Option<String> = None;
                     for r in &stale {
@@ -5868,6 +5924,68 @@ mod tests {
         assert!(check_retry_target("other/repo", &checks[0]).is_err());
         let untyped = check_runs_from_pages(&[Some(vec![json!({ "id": 41734497120i64, "name": "Gate", "conclusion": "failure" })])]);
         assert!(check_retry_target("o/r", &untyped[0]).is_err());
+    }
+
+    /// BR#9268: the dispatch aim is producer-typed. The live SP #3057 head
+    /// shape: a native job and a GITHUB-ACTIONS-app published report share
+    /// name/app/suite; only the URL shape separates them. The published
+    /// shell is never rerequested (it re-executes nothing), an unclassified
+    /// URL is never dispatched on a guess, and a third-party app's report
+    /// still honors `check_run.rerequested`.
+    #[test]
+    fn retry_dispatch_aim_is_producer_typed_br9268() {
+        let checks = check_runs_from_pages(&[Some(vec![
+            json!({ "id": 128984021963i64, "name": "Deploy health (merge gate)", "check_suite": { "id": 115286627637i64 },
+                "app": { "id": 15368 }, "conclusion": "failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/42563228107/job/128984021963" }),
+            json!({ "id": 129034449798i64, "name": "Deploy health (merge gate)", "check_suite": { "id": 115286627637i64 },
+                "app": { "id": 15368 }, "conclusion": "failure",
+                "html_url": "https://github.com/state-vector/superpositional/runs/129034449798" }),
+            json!({ "id": 129050000001i64, "name": "Superpositional", "check_suite": { "id": 115286699999i64 },
+                "app": { "id": 9 }, "conclusion": "failure",
+                "html_url": "https://github.com/state-vector/superpositional/runs/129050000001" }),
+        ])]);
+        assert_eq!(check_retry_target("state-vector/superpositional", &checks[0]).unwrap(),
+            CheckRetryTarget::ActionsJob { id: 128984021963 });
+        // The Actions app's published report: refuse — a report re-executes nothing.
+        let err = check_retry_target("state-vector/superpositional", &checks[1]).unwrap_err();
+        assert!(err.contains("report"), "refusal names the report: {err}");
+        // A third-party app's published check run honors rerequested.
+        assert_eq!(check_retry_target("state-vector/superpositional", &checks[2]).unwrap(),
+            CheckRetryTarget::CheckRun { id: 129050000001 });
+        // Unclassified URL: fail-closed, never dispatch on a guess.
+        let unclass = check_runs_from_pages(&[Some(vec![json!({ "id": 130000000001i64, "name": "Deploy health (merge gate)",
+            "check_suite": { "id": 3 }, "app": { "id": 15368 }, "conclusion": "failure", "html_url": "https://gitlab.com/x/y" })])]);
+        let err = check_retry_target("state-vector/superpositional", &unclass[0]).unwrap_err();
+        assert!(err.contains("fail-closed"), "refusal names fail-closed: {err}");
+        // A native job observation stripped of its URL cannot be aimed — fail-closed.
+        let no_url = check_runs_from_pages(&[Some(vec![json!({ "id": 130000000002i64, "name": "Deploy health (merge gate)",
+            "check_suite": { "id": 3 }, "app": { "id": 15368 }, "conclusion": "failure" })])]);
+        let err = check_retry_target("state-vector/superpositional", &no_url[0]).unwrap_err();
+        assert!(err.contains("fail-closed"), "missing native URL refuses: {err}");
+    }
+
+    /// BR#9268: the reader derives the producer class from the provider URL
+    /// shape at read time, so every downstream identity separates the live
+    /// #3057 collision pair (same name, app 15368, suite).
+    #[test]
+    fn check_runs_reader_derives_producer_br9268() {
+        let runs = check_runs_from_pages(&[Some(vec![
+            json!({ "id": 128984021963i64, "name": "Deploy health (merge gate)", "check_suite": { "id": 115286627637i64 },
+                "app": { "id": 15368 }, "conclusion": "failure",
+                "html_url": "https://github.com/state-vector/superpositional/actions/runs/42563228107/job/128984021963" }),
+            json!({ "id": 129034449798i64, "name": "Deploy health (merge gate)", "check_suite": { "id": 115286627637i64 },
+                "app": { "id": 15368 }, "conclusion": "failure",
+                "html_url": "https://github.com/state-vector/superpositional/runs/129034449798" }),
+        ])]);
+        assert_eq!(runs.len(), 2);
+        assert!(matches!(runs[0].source, crate::train_gate::CheckSource::CheckRun { producer: crate::train_gate::CheckRunProducer::ActionsJob, .. }));
+        assert!(matches!(runs[1].source, crate::train_gate::CheckSource::CheckRun { producer: crate::train_gate::CheckRunProducer::Published, .. }));
+        // The reader's classification keeps the two obligations distinct:
+        // each red judges its own class (both red here — the live sweep shape).
+        let verdict = classify_head_checks(&runs);
+        assert_eq!(verdict.verdict, MainVerdict::Red);
+        assert_eq!(verdict.red.len(), 2, "native and published reds are independent obligations");
     }
 
     #[test]

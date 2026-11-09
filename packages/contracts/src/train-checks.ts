@@ -1,10 +1,41 @@
 import { z } from "zod";
 
+/** BR#9268: GitHub's own Actions app id. Every check run GitHub Actions
+ *  creates — a NATIVE job AND an API-published report created with
+ *  GITHUB_TOKEN — carries this app id, so the app id can never separate a
+ *  real job from a published gate report. */
+export const GITHUB_ACTIONS_APP_ID = 15368;
+
+/** BR#9268: the producer class of a check-run observation — derived from the
+ *  provider payload itself (the check run's GitHub URL shape), never
+ *  caller-asserted. GitHub files an API-created check run into the creating
+ *  app's most recent check suite for the head SHA, so a published report can
+ *  share name + app id + suite id with a native job while enforcing nothing
+ *  on its own. The class is what keeps the two distinct obligations:
+ *  - `actions_job`: a NATIVE Actions job (`…/actions/runs/{run}/job/{job}`) —
+ *    the enforcing execution; a dispatch re-runs THIS.
+ *  - `published`: an API-created check run (`…/runs/{check_run_id}`) — a
+ *    report; a newer one supersedes only other published reports and can
+ *    never mask (or be masked by) the native job's verdict.
+ *  - `unclassified`: URL missing or an unrecognized shape — its own
+ *    obligation (it never merges with a classified one), and never
+ *    dispatchable (fail-closed). */
+export const CheckRunProducerSchema = z.enum(["actions_job", "published", "unclassified"]);
+export type CheckRunProducer = z.infer<typeof CheckRunProducerSchema>;
+
+/** MUST stay behaviour-identical to train_gate.rs `check_run_producer`. */
+export function checkRunProducer(url: string | null | undefined): CheckRunProducer {
+  const u = typeof url === "string" ? url.trim() : "";
+  if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/[1-9][0-9]*\/job\/[1-9][0-9]*$/.test(u)) return "actions_job";
+  if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/runs\/[1-9][0-9]*$/.test(u)) return "published";
+  return "unclassified";
+}
+
 /** GitHub identifiers live in different namespaces. Never infer a dispatch
  * endpoint from an unqualified numeric id or collapse two enforcing suites. */
 export const CheckSourceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("unknown") }),
-  z.object({ kind: z.literal("check_run"), suite_id: z.number().int().positive(), app_id: z.number().int().nonnegative() }),
+  z.object({ kind: z.literal("check_run"), suite_id: z.number().int().positive(), app_id: z.number().int().nonnegative(), producer: CheckRunProducerSchema.optional() }),
   z.object({ kind: z.literal("workflow_run"), workflow_id: z.number().int().positive(), run_attempt: z.number().int().positive() }),
 ]);
 export type CheckSource = z.infer<typeof CheckSourceSchema>;
@@ -70,11 +101,40 @@ export const CandidateIntegrationSchema = z.discriminatedUnion("phase", [
   z.object({ phase: z.literal("current"), base_sha: z.string(), head_sha: z.string() }),
 ]);
 
+/** BR#9268: the enforcing identity of one check obligation. A check run's
+ *  producer class (native Actions job vs API-published report) rides the key
+ *  when the observation carries it, so a newer published green can never
+ *  supersede — mask — an older native red of the same name/app/suite (the
+ *  live SP #3057 shape: GitHub keeps BLOCKED while the collapsed key read
+ *  green). Supersession stays WITHIN one producer class: a newer native
+ *  attempt supersedes an older native attempt, a fresher publication
+ *  supersedes an older report.
+ *  An observation WITHOUT a producer keeps the bare pre-split identity —
+ *  legacy rows, legacy callers and their receipts keep their exact meaning. */
 export function checkObligationKey(run: { name: string; source?: CheckSource }): string {
   const source = run.source;
   switch (source?.kind) {
-    case "check_run": return JSON.stringify([source.kind, source.app_id, source.suite_id, run.name]);
+    case "check_run":
+      return source.producer
+        ? JSON.stringify([source.kind, source.app_id, source.suite_id, run.name, source.producer])
+        : JSON.stringify([source.kind, source.app_id, source.suite_id, run.name]);
     case "workflow_run": return JSON.stringify([source.kind, source.workflow_id, run.name]);
     default: return JSON.stringify(["unknown", run.name]); // legacy observations, never mixed with typed ones
   }
+}
+
+/** BR#9268: the PRE-split obligation identity (no producer class). The retry
+ *  ledger wrote every BR#8824 row under this collapsed key; a producer-typed
+ *  reservation must still see (fence on, and be fenced by) an unreconciled
+ *  dispatch of that scope — the identity migration must never re-arm an
+ *  unknown external effect. A TERMINAL collapsed row does NOT consume a
+ *  producer-typed budget: it dispatched some check of the collapsed
+ *  obligation, provably not the freshly-identified native job's own
+ *  one-dispatch-ever budget. */
+export function legacyCheckObligationKey(run: { name: string; source?: CheckSource }): string {
+  const source = run.source;
+  if (source?.kind === "check_run") {
+    return JSON.stringify([source.kind, source.app_id, source.suite_id, run.name]);
+  }
+  return checkObligationKey(run);
 }
