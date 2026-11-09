@@ -175,6 +175,17 @@ describe("witnessed legacy recovery fences", () => {
     expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail})).toBe("provider_route_unavailable");
     expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail:`tool output: ${stderr_tail}`})).toBeNull();
   });
+  it("diagnoses a lost prompt response only with matching structured pending retry evidence", () => {
+    const cause = { class: "route_unavailable" as const, backend: "opencode", model: "llmgw/glm-5.3-flash",
+      code: null, error_name: "provider.no-route", message: "route unavailable", data: { error: { type: "provider.no-route" } },
+      evidence_line: "ACP opencode/retry was pending when the prompt stopped", at_ms: 100 };
+    const outcome = { kind: "timed_out" as const, exit_code: null, stdout_tail: "", stderr_tail: "", cause };
+    expect(providerRecoveryDiagnosis(outcome)).toBe("provider_route_unavailable");
+    expect(providerRecoveryDiagnosis({ ...outcome, kind: "interrupted" })).toBeNull();
+    expect(providerRecoveryDiagnosis({ ...outcome, cause: { ...cause, data: { error: { type: "tool.execution" } } } })).toBeNull();
+    expect(providerRecoveryDiagnosis({ ...outcome, cause: { ...cause, evidence_line: null } })).toBeNull();
+    expect(providerRecoveryDiagnosis({ ...outcome, cause: { ...cause, class: "diagnostic" } })).toBeNull();
+  });
   it("does not turn missing output or generic errors into provider diagnoses", () => {
     for (const stderr_tail of ["No deployments available", "provider quota maybe", "test failed", ""]) {
       expect(providerRecoveryDiagnosis({kind:"failed",exit_code:1,stdout_tail:"",stderr_tail})).toBeNull();

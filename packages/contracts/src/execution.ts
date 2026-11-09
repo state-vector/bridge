@@ -513,16 +513,29 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
   return ExecutionStateSchema.parse(s);
 }
 
-/** Only adapter-typed infrastructure failures are exempt from NEW job-failure
- * charges. Original counters/receipts are never rewritten retrospectively. */
+/** Accept structured adapter evidence, including an ACP retry notification
+ * still pending when the prompt ended. A notification has no JSON-RPC code. */
 export function typedProviderFailure(outcome: z.infer<typeof TerminalOutcomeSchema>): boolean {
-  const c = outcome.cause;
-  if (outcome.kind !== "failed" || !c) return false;
-  if (c.code === -32000 && c.error_name === "provider.auth" && c.class === "account_action") return true;
-  const data = c.data as { service?: unknown; errorName?: unknown } | undefined;
-  return c.code === -32603 && data?.service === "session" && data.errorName === c.error_name
-    && ["provider.quota", "provider.rate-limit", "provider.no-route", "provider.transport", "provider.internal"].includes(c.error_name ?? "")
-    && c.class !== "diagnostic";
+  const cause = outcome.cause;
+  if (!cause) return false;
+  if ((outcome.kind === "failed" || outcome.kind === "timed_out") && cause.backend === "opencode"
+    && cause.code === null && cause.evidence_line === "ACP opencode/retry was pending when the prompt stopped") {
+    const data = cause.data as { error?: { type?: unknown } } | undefined;
+    if (data?.error?.type !== cause.error_name) return false;
+    switch (cause.error_name) {
+      case "provider.auth": case "provider.quota": return cause.class === "account_action";
+      case "provider.rate-limit": return cause.class === "rate_limit";
+      case "provider.no-route": case "provider.transport": return cause.class === "route_unavailable";
+      case "provider.internal": return cause.class === "provider_internal";
+      default: return false;
+    }
+  }
+  if (outcome.kind !== "failed") return false;
+  if (cause.code === -32000 && cause.error_name === "provider.auth" && cause.class === "account_action") return true;
+  const data = cause.data as { service?: unknown; errorName?: unknown } | undefined;
+  return cause.code === -32603 && data?.service === "session" && data.errorName === cause.error_name
+    && ["provider.quota", "provider.rate-limit", "provider.no-route", "provider.transport", "provider.internal"].includes(cause.error_name ?? "")
+    && cause.class !== "diagnostic";
 }
 
 /** Recognize exact archived ACP failure envelopes, not empty stdout or prose

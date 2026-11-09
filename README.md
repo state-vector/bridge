@@ -3774,3 +3774,5 @@ Gateway admission holds appear in the backlog’s Blocked sections with their ex
 Configured alarm sinks and explicitly marked infrastructure anchors are excluded from gateway scheduling and backlog pickup. Their asks and diagnostic children still follow the normal lifecycle.
 
 Verified route recovery filters retry holds by the exact failed route and current capability requirements. It considers the oldest matching cards first, skipping spent trials and unrelated holds. The cap limits grants, so a fixed prefix of rejected cards cannot hide later eligible work.
+
+Recovery recognizes the structured OpenCode provider retry still pending when a prompt loses its response or times out. The adapter’s error type and class must agree. A manual interruption or a generic timeout alone does not establish a provider failure.
