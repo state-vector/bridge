@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, exitClassOf, blockedSummaryOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, exitClassOf, dispatchExitClass, blockedSummaryOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
@@ -43,6 +43,7 @@ const gatewayHoldLabels: Record<SchedulingReason, string> = {
   unknown_operations: "Previous operation needs reconciliation",
   retry_budget: "Retry budget exhausted; needs recovery evidence or a changed approach",
   host_affinity: "Work is retained on another host",
+  recovery_route: "Verified retry permit is waiting for its selected gateway and model",
   capability: "No ready gateway matches the required model, tools, or environment",
   startup_prerequisite: "Previous startup failed; needs a changed prerequisite",
   lifecycle_gate: "Task ownership or lifecycle prevents dispatch",
@@ -50,9 +51,20 @@ const gatewayHoldLabels: Record<SchedulingReason, string> = {
 
 function gatewayReason(dispatch?: GatewayDispatch): string {
   if (!dispatch) return "Gateway eligibility has not been reported";
-  if (dispatch.kind === "gateway_unavailable") return "No live gateway is ready to take work";
+  if (dispatch.kind === "gateway_unavailable") return dispatch.reasons?.length
+    ? dispatch.reasons.map(reason => gatewayHoldLabels[reason]).join(" · ")
+    : "No live gateway is ready to take work";
   if (dispatch.kind === "eligible") return "";
-  return dispatch.reasons.map(reason => gatewayHoldLabels[reason]).join(" · ");
+  const attempt = dispatch.last_attempt && {
+    provider_route: "Last attempt: provider route unavailable.",
+    provider_auth: "Last attempt: provider authentication failed.",
+    provider_quota: "Last attempt: provider quota error.",
+    completed: "Last process exited; the task still lacks a recorded completion.",
+    interrupted: "Last attempt stopped; earlier failures still count.",
+    timed_out: "Last attempt timed out; cause needs diagnosis.",
+    unclassified: "The recorded attempt does not establish a cause.",
+  }[dispatch.last_attempt];
+  return [...dispatch.reasons.map(reason => gatewayHoldLabels[reason]), ...(attempt ? [attempt] : [])].join(" · ");
 }
 
 interface BlGroup {
@@ -102,18 +114,19 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     // EXIT_CLASS_ORDER; in_review rides the same classifier ("Awaiting PR
     // verification"). The live unblock duty is a chip on the row, not a group.
     const questions = ts.filter((t) => t.status === "todo" && t.type === "question" && !t.meta?.startup_wait).sort(byUpdated);
-    const parked = ts.filter((t) => t.status === "todo" && t.type !== "question" && t.is_claimable === false && !t.meta?.startup_wait && !t.gateway_dispatch).sort(byUpdated);
-    const gatewayHeld = ts.filter((t) => t.status === "todo" && t.type !== "question"
-      && t.gateway_dispatch?.kind !== "eligible" && !t.meta?.startup_wait && (t.gateway_dispatch || t.is_claimable !== false)).sort(byUpdated);
+    const parked = ts.filter((t) => t.status === "todo" && t.type !== "question" && !t.meta?.startup_wait && !t.gateway_dispatch).sort(byUpdated);
     const byExit = new Map<string, any[]>();
     for (const t of ts) {
-      if (t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
+      const dispatch = t.status === "todo" && t.type !== "question" && !t.meta?.startup_wait
+        && t.gateway_dispatch?.kind !== "eligible" ? t.gateway_dispatch as GatewayDispatch | undefined : undefined;
+      if (!dispatch && t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
       // Standing merge-lane cards and infra anchors belong to the Trains panel /
       // infra sinks, not the task backlog (BR#6395).
       if (t.meta?.lane?.key || t.meta?.infra_anchor) continue;
-      const cls = exitClassOf(t);
+      const typedWait = dispatch?.kind === "held" && dispatch.reasons.includes("independent_wait") && t.meta?.blocked?.await_event;
+      const cls = typedWait ? exitClassOf({ ...t, status: "blocked" }) : dispatch ? dispatchExitClass(dispatch) : exitClassOf(t);
       const list = byExit.get(cls.key) ?? [];
-      list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
+      list.push({ t, dispatch, typedWait, duty: !!activeUnblockTwinOf(t, twinIdx) });
       byExit.set(cls.key, list);
     }
     // boost-first WITHIN each exit group (BR#4068 rank seam — the ▲ pins
@@ -140,7 +153,6 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
 
     return [
       { key: "ready", title: "Ready for gateway", note: "Eligible for at least one ready gateway. A free slot is still required.", rows: ready, showRank: true, showBoost: true },
-      { key: "gateway-held", title: "Waiting for gateway eligibility", note: "The reason each task cannot start is shown on its row.", rows: gatewayHeld, showRank: false, showBoost: false },
       { key: "questions", title: "Open questions", note: "Waiting for an answer or contribution.", rows: questions, showRank: false, showBoost: false },
       ...exitGroups,
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
@@ -252,7 +264,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
               const rank = r.rank;
               const boosted = !!r.boosted;
               const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
-              const bs = (t.status === "blocked" || t.status === "in_review" || t.meta?.startup_wait) ? blockedSummaryOf(t) : null;
+              const bs = r.typedWait ? blockedSummaryOf({ ...t, status: "blocked" }) : (t.status === "blocked" || t.status === "in_review" || t.meta?.startup_wait) ? blockedSummaryOf(t) : null;
               return (
                 <div
                   key={t.id}
@@ -267,7 +279,10 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
                     <TagChips tags={t.tags} />
-                    {g.key === "gateway-held" && <span className="backlog-why">{gatewayReason(t.gateway_dispatch)}</span>}
+                    {r.dispatch && !r.typedWait && <span className="backlog-why">
+                      <Chip tone={g.unblockedTone ?? "warn"}>{g.unblockedBy}</Chip>{" "}
+                      {gatewayReason(r.dispatch)}
+                    </span>}
                     {bs && (
                       <span className="backlog-why">
                         <Chip tone={bs.unblockedTone}>{bs.whatUnblocks}</Chip>{" "}

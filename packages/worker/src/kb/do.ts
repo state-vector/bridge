@@ -236,7 +236,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionAttemptBudgetExhausted, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionAttemptBudgetExhausted, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -2642,7 +2642,22 @@ export class KnowledgeHub {
     for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
     const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo").map(t => String(t.id)), executionNow);
-    for (const task of tasks) task.gateway_dispatch = dispatch.get(String(task.id));
+    for (const task of tasks) {
+      const view = dispatch.get(String(task.id));
+      const state = executionByTask.get(String(task.id));
+      if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
+        const terminal = state?.terminal;
+        const outcome = terminal && terminal.generation === state?.attempt?.generation
+          && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
+        const cause = outcome && providerRecoveryDiagnosis(outcome);
+        view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
+          : cause === "provider_authentication" ? "provider_auth"
+          : cause === "provider_quota" ? "provider_quota"
+          : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
+            ? outcome.kind : "unclassified";
+      }
+      task.gateway_dispatch = view;
+    }
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -5058,7 +5073,7 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities, taskIds?: string[]) {
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[]) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
     const filter = taskIds ? " AND id IN (SELECT value FROM json_each(?))" : "";
@@ -5075,12 +5090,17 @@ export class KnowledgeHub {
       else if (isQuestionTask(meta)) reason = "question";
       else if (this.unmetBars(row).length) reason = "qualification";
       else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
-      else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
-      else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
-      else if (state && executionAttemptBudgetExhausted(state,String(meta.work_revision??"legacy")) && ![capabilities, ...capabilities.alternatives].some(c =>
-        usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
-        && recoveryPermitMatches(state, c, host, String(meta.work_revision ?? "legacy"), Date.now()))) reason = "retry_budget";
       else {
+        const revision = String(meta.work_revision ?? "legacy");
+        const hold = executionAdmissionHold(state ?? undefined, revision);
+        const permit = hold === "retry_budget" && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
+          usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
+          && recoveryPermitMatches(state, c, host, revision, Date.now()));
+        const awaitingPermitHost = hold === "retry_budget" && state && recoveryPermitCoversAttempt(state, Date.now())
+          && state.recovery_permit?.task_revision === revision;
+        reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
+      }
+      if (!reason && capabilities) {
         const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
         else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
@@ -5120,10 +5140,23 @@ export class KnowledgeHub {
         holds.set(id, reasons);
       }
     }
+    // A missing gateway must not hide task-level holds. Run the same
+    // checks without a capability to classify the backlog during an outage.
+    if (!ready) {
+      const intrinsic = this.dispatchCandidates("", "", null, ids);
+      const waitingForHost = new Set(intrinsic.eligible.map(task => String(task.id)));
+      for (const id of ids) {
+        const reason = intrinsic.taskHolds.get(id);
+        if (reason || !waitingForHost.has(id)) holds.set(id, new Set([reason ?? "lifecycle_gate"]));
+      }
+    }
     for (const id of ids) {
+      const reasons = [...(holds.get(id) ?? [])];
+      const taskReasons = reasons.filter(reason => reason !== "capability" && reason !== "host_affinity" && reason !== "recovery_route");
       if (eligible.has(id)) result.set(id, { kind: "eligible" });
-      else if (ready) result.set(id, { kind: "held", reasons: [...(holds.get(id) ?? ["lifecycle_gate"])] });
-      else result.set(id, { kind: "gateway_unavailable" });
+      else if (taskReasons.length) result.set(id, { kind: "held", reasons: taskReasons });
+      else if (!ready || reasons.length) result.set(id, { kind: "gateway_unavailable", reasons });
+      else result.set(id, { kind: "held", reasons: ["lifecycle_gate"] });
     }
     return result;
   }

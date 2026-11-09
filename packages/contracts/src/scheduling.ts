@@ -4,13 +4,13 @@ import { z } from "zod";
 export const DISPATCH_RESERVATION_MS = 300_000;
 export const SchedulingReasonSchema = z.enum([
   "qualification", "operator_gate", "question", "independent_wait", "writer_not_quiescent",
-  "unknown_operations", "retry_budget", "host_affinity", "capability", "startup_prerequisite", "lifecycle_gate",
+  "unknown_operations", "retry_budget", "host_affinity", "recovery_route", "capability", "startup_prerequisite", "lifecycle_gate",
 ]);
 export type SchedulingReason = z.infer<typeof SchedulingReasonSchema>;
 export type GatewayDispatch =
   | { kind: "eligible" }
-  | { kind: "held"; reasons: SchedulingReason[] }
-  | { kind: "gateway_unavailable" };
+  | { kind: "held"; reasons: SchedulingReason[]; last_attempt?: "provider_route" | "provider_auth" | "provider_quota" | "completed" | "interrupted" | "timed_out" | "unclassified" }
+  | { kind: "gateway_unavailable"; reasons?: SchedulingReason[] };
 
 export const RecoveryPreemptionSchema = z.object({
   phase: z.enum(["stopping_verification", "slot_available"]), recovery_id: z.string(), victim_id: z.string(),

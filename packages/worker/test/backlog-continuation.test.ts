@@ -86,7 +86,10 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     const answered = await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
     expect(answered.status, JSON.stringify(answered.body)).toBe(200);
-    expect((await get(target)).meta.blocked.await_event.event).toBe("executor_capability");
+    const gated = await get(target);
+    expect(gated.status).toBe("todo");
+    expect(gated.meta.operator_gated).toBe("Ray go before execution");
+    expect(gated.meta.blocked?.await_event).toBeUndefined();
     const applied = await call("transition", { id: target, to: "superseded", batch_auth: { ask: ask.body.id }, actor: "executor", session: "cleanup" });
     expect(applied.status, JSON.stringify(applied.body)).toBe(200);
     const retired = await get(target);

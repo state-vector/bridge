@@ -575,6 +575,17 @@ export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTi
   state.retry_strategy = {kind:"larger_model",epoch:(state.retry_strategy?.epoch ?? 0)+1,task_revision:taskRevision,
     minimum_tier:tier,first_generation:state.generation+1,failures:0,reason,source};
 }
+/** Intrinsic attempt fences precede gateway availability. A compatible
+ * gateway alone cannot clear any of these conditions. */
+export function executionAdmissionHold(state: ExecutionState | undefined, revision: string):
+  "writer_not_quiescent" | "unknown_operations" | "retry_budget" | null {
+  if (!state) return null;
+  if (state.attempt && state.attempt.phase !== "quiesced") return "writer_not_quiescent";
+  if (state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return "unknown_operations";
+  if (executionAttemptBudgetExhausted(state, revision)) return "retry_budget";
+  return null;
+}
+
 export function chargeExecutionFailure(state: ExecutionState, generation: number): void {
   if (state.failure_charged_generation !== null && state.failure_charged_generation >= generation) return;
   state.failure_charged_generation = generation;

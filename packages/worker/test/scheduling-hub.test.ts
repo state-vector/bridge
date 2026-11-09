@@ -75,12 +75,20 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
     const terminal = await exhaust(id);
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
-    const boardTask = async () => {
+    const boardTask = async (taskId = id) => {
       const response = await stub.fetch("https://kb/board", { method: "GET" });
       const board = await response.json() as { tasks: { id: string; gateway_dispatch: unknown }[] };
-      return board.tasks.find(task => task.id === id);
+      return board.tasks.find(task => task.id === taskId);
     };
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } });
+    const needsHost = await task(project, { execution_requirements: { tier: "small", tools: ["fixture-missing-tool"], environment: [] } });
+    expect(await boardTask(needsHost)).toMatchObject({ status: "blocked", meta: {
+      execution_wait: { kind: "capability" }, execution_blockers: [{ kind: "capability_unavailable" }],
+    } });
+    expect((await g.cmd({ kind: "pause_claims", budget_ms: 60_000, reason: "fixture: temporarily unavailable" })).kind).toBe("claims_paused");
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } });
+    expect(await boardTask(needsHost)).toMatchObject({ status: "blocked" });
+    await g.cmd({ kind: "resume_claims" });
 
     const additional = [];
     if (proxy && !event) {
@@ -121,6 +129,10 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const grant = await recover("grant");
     expect(grant).toMatchObject({kind:"provider_recovery_granted",budget_exhaustions:3});
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "eligible" } });
+    await g.cmd({ kind: "pause_claims", budget_ms: 60_000, reason: "fixture: permit route paused" });
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "gateway_unavailable", reasons: ["recovery_route"] } });
+    await g.cmd({ kind: "resume_claims" });
+
     expect(await recover("grant")).toEqual(grant);
     expect((await recover("grant-again")).error).toMatch(/already granted/);
     const resumed = await reserve(g);

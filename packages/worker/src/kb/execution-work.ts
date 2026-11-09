@@ -2,9 +2,10 @@
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema, InteractiveClaimSchema,
   initialExecution, openLargerModelStrategy, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
-  availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker,
+  availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker, executionAdmissionHold,
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
+import { todoDispatchHold } from "./core.ts";
 import { gatewayOccupancy } from "./scheduling.ts";
 import { ExecutionModelIdentitySchema, type ExecutionHistoryEvent } from "@bridge/contracts";
 
@@ -373,13 +374,18 @@ export class ExecutionWork {
       const unavailable = blockers.find(isExecutorAvailabilityBlocker);
       const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
       let status = task.status;
+      const attemptHold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
+      const capabilityWait = status === "blocked" && meta.execution_wait?.kind === "capability"
+        && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability";
+      const independent = blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required");
       if (this.startupWait(task.id)) {
-        // Startup reconciliation owns this episode. Keep composable blockers
-        // visible without replacing its legacy park or manufacturing a new wait.
-      } else if (status === "todo" && unavailable) {
+        // Startup reconciliation owns this episode.
+      } else if (status === "todo" && unavailable && !attemptHold && !independent && !todoDispatchHold(meta) && !meta.operator_gated) {
         status = "blocked"; meta.execution_wait = { kind: "capability" };
         meta.blocked = { reason: unavailable.text, unblock_condition: "A live eligible executor capability becomes usable; all other blockers must also clear", ts: Date.now(), await_event: { event: "executor_capability", id: task.id } };
-      } else if (status === "blocked" && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability" && !unavailable && !blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required" || b.kind === "writer_quiescence_required")) {
+      } else if (capabilityWait && !task.owner && !independent && (attemptHold || !unavailable)) {
+        // Remove only the capability sweep's own marker. The scheduler still
+        // enforces the original attempt fence, even while the host is down.
         status = "todo"; delete meta.blocked; delete meta.execution_wait;
       }
       if (prior === JSON.stringify(blockers) && status === task.status) continue;
