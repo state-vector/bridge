@@ -431,26 +431,36 @@ impl Owner {
     }
     fn measure_with_limits(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
         let records = self.records()?;
-        let mut positions=Vec::new();
+        let mut measured = HashMap::new();
+        let mut positions = Vec::new();
         for record in &records {
-            let path = allocation_path(record);
-            let bytes=if matches!(record.phase,Phase::Removed { .. }) {0} else {disk_bytes(path)?};
-            if !matches!(record.phase,Phase::Removed { .. }) && !matches!(record.location, Location::RepositoryCache { .. }) { positions.push(path.to_path_buf()); }
-            if let Some(_lock)=self.lock(&record.id)? {
-                let mut current=self.read(&record.id)?;
-                current.observed_bytes=bytes;
-                self.save(&current)?;
+            if matches!(record.phase, Phase::Removed { .. }) { continue; }
+            let path = accounting_path(allocation_path(record));
+            let bytes = match measured.entry(path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(disk_bytes(&path)?),
+            };
+            if !matches!(record.location, Location::RepositoryCache { .. }) {
+                positions.push(path);
+            }
+            if record.observed_bytes != bytes {
+                if let Some(_lock) = self.lock(&record.id)? {
+                    let mut current = self.read(&record.id)?;
+                    if !matches!(current.phase, Phase::Removed { .. }) && current.observed_bytes != bytes {
+                        current.observed_bytes = bytes;
+                        self.save(&current)?;
+                    }
+                }
             }
         }
-        let positions=minimal_roots(positions);
-        let mut managed_bytes:u64=0;
-        for path in &positions {managed_bytes=managed_bytes.saturating_add(disk_bytes(path)?);}
+        let positions = minimal_roots(positions);
+        let managed_bytes = positions.iter().map(|path| measured[path]).fold(0u64, u64::saturating_add);
         let repos=PathBuf::from(&self.cfg.workdir).join("repos");
         let repos=repos.canonicalize().unwrap_or(repos);
         let cache_bytes = disk_bytes(&repos)?;
         // Legacy worktrees nested in a cache are already in managed_bytes.
-        let mut nested:u64=0;
-        for path in positions.iter().filter(|path|path.starts_with(&repos)) {nested=nested.saturating_add(disk_bytes(path)?);}
+        let nested = positions.iter().filter(|path| path.starts_with(&repos))
+            .map(|path| measured[path]).fold(0u64, u64::saturating_add);
         let cache_bytes = cache_bytes.saturating_sub(nested);
         let journal=gateway_pipeline::root(&self.cfg)?;
         let evidence_bytes = disk_bytes(&journal)?;
@@ -501,10 +511,14 @@ fn allocation_path(record:&Resource)->&Path {
         _=>record.location.root(),
     }
 }
-fn minimal_roots(paths:Vec<PathBuf>)->Vec<PathBuf> {
-    let mut paths:Vec<_>=paths.into_iter().map(|path| {
-        if fs::symlink_metadata(&path).is_ok_and(|m|m.file_type().is_symlink()) {path} else {path.canonicalize().unwrap_or(path)}
-    }).collect();
+fn accounting_path(path: &Path) -> PathBuf {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        path.to_path_buf()
+    } else {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+fn minimal_roots(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort_by_key(|path|(path.components().count(),path.clone()));
     let mut result:Vec<PathBuf>=Vec::new();
     for path in paths {if !result.iter().any(|root|path.starts_with(root)) {result.push(path);}}

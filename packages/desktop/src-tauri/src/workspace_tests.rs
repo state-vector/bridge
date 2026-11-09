@@ -112,6 +112,38 @@ fn interrupted_deletion_retries_only_the_tombstone_and_preserves_reused_original
     assert!(!trash.exists());assert_eq!(fs::read_to_string(root.join("new-owner")).unwrap(),"never remove me");
 }
 
+#[cfg(unix)]
+#[test]
+fn budget_counts_aliased_nested_allocations_once() {
+    let sandbox = Sandbox::new();
+    let owner = sandbox.owner();
+    let repos = PathBuf::from(&owner.cfg.workdir).join("repos");
+    let cache = repos.join("cached-clone");
+    let allocation = cache.join("legacy-worktree");
+    let nested = allocation.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(cache.join("cache-data"), vec![1u8; 64 * 1024]).unwrap();
+    fs::write(nested.join("managed-data"), vec![2u8; 128 * 1024]).unwrap();
+    let alias = sandbox.0.join("cache-alias");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+
+    for (id, root) in [
+        ("physical", allocation.clone()),
+        ("alias", alias.join("legacy-worktree")),
+        ("nested", nested),
+    ] {
+        owner.save(&Resource {
+            version: 1, id: id.into(), location: Location::Legacy { root, task: None },
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+        }).unwrap();
+    }
+    let allocation_bytes = disk_bytes(&allocation).unwrap();
+    let status = owner.measure().unwrap();
+    assert_eq!(status.managed_bytes, allocation_bytes);
+    assert_eq!(status.cache_bytes, disk_bytes(&repos).unwrap() - allocation_bytes);
+    assert_eq!(owner.read("alias").unwrap().observed_bytes, allocation_bytes);
+}
+
 #[test]
 fn scratch_inputs_outside_nested_repositories_are_retained_and_budget_blocks_growth() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
