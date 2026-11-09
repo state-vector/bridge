@@ -5684,6 +5684,45 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
     current.requirements = this.executionWork().schedulingRequirements(req.id, current.requirements, current);
+    if (command.kind === "reconcile_operation") {
+      const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | undefined;
+      const duty = scope?.id ? this.one(`SELECT e.state, e.worker_token_id, a.meta FROM execution_state e JOIN artefacts a ON a.id=e.task_id
+          WHERE a.id=? AND a.status='in_progress' AND a.created_by='system:recovery'
+            AND EXISTS (SELECT 1 FROM artefact_versions v
+              WHERE v.artefact_id=? AND v.actor='system:recovery' AND v.action='execution_diagnosis_scheduled'
+                AND json_extract(v.data,'$.generation')=? AND json_extract(v.data,'$.attempt_id')=?
+                AND json_extract(v.data,'$.hold')='unknown_operations' AND json_extract(v.data,'$.duty')=a.id)
+            AND EXISTS (SELECT 1 FROM artefact_versions v
+              WHERE v.artefact_id=? AND v.actor='system:recovery' AND v.action='recovery_scheduled'
+                AND json_extract(v.data,'$.reason')='execution_environment' AND json_extract(v.data,'$.duty')=a.id)`,
+        scope.id, req.id, command.generation, command.attempt_id, req.id) : null;
+      const dutyState = duty && ExecutionStateSchema.parse(JSON.parse(duty.state));
+      const dutyAttempt = dutyState?.attempt;
+      const assignedDiagnostic = duty?.worker_token_id === tokenId && dutyAttempt?.phase === "running"
+        && scope?.generation === dutyAttempt.generation && scope?.attempt_id === dutyAttempt.attempt_id
+        && dutyAttempt.lease_until > now && dutyAttempt.action_deadline > now
+        && dutyAttempt.session === req.session && JSON.parse(duty.meta).session === req.session
+        && !dutyState.messages.some(m => m.priority === "interrupt" && m.state !== "acted");
+      if (!req.session || (!assignedDiagnostic && !this.executionWork().isInteractive(tokenId))) {
+        throw new Error("gate: operation reconciliation requires the assigned diagnostic or an authenticated full-agent session");
+      }
+      const encoded = JSON.stringify({ command, session: req.session, actor });
+      const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
+      if (replay) {
+        if (replay.request !== encoded) throw new Error("gate: command_id reused with different input");
+        return JSON.parse(replay.result);
+      }
+      const attempt = current.attempt;
+      if (!attempt || row.status !== "todo" || row.owner) throw new Error("gate: operation reconciliation requires an unassigned task");
+      const next = reduceExecution(current, command, attempt.host, attempt.session, now, String(meta.work_revision ?? "legacy"));
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(next), req.id);
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, req.id, req.command_id, encoded, JSON.stringify(next));
+        this.version(req.id, actor, "operation_reconciled", "Recorded external evidence for a stopped attempt",
+          { generation: command.generation, operation_id: command.operation_id, outcome: command.outcome, receipts: command.receipts });
+      });
+      return next;
+    }
     if (command.kind === "recover_provider_failure") {
       // This is an audited human/full-agent diagnosis, never a worker's own
       // retry request. It preserves the failed attempt and grants one begin.
@@ -15122,7 +15161,9 @@ export class KnowledgeHub {
     const candidates = this.state.storage.sql.exec(`
       SELECT a.id, a.meta, e.state FROM execution_state e JOIN artefacts a ON a.id=e.task_id
       WHERE a.type='task' AND a.status='todo' AND a.owner=''
-        AND coalesce(json_extract(a.meta,'$.machine_duty.kind'), '') != 'task-recovery'
+        -- A repair duty can itself need diagnosis. An execution-environment
+        -- duty is the leaf, so the same fault cannot spawn an unbounded chain.
+        AND coalesce(json_extract(a.meta,'$.machine_duty.reason'), '') != 'execution_environment'
         AND (json_extract(e.state,'$.budget_exhaustions') > 0
           OR json_extract(e.state,'$.retry_strategy') IS NOT NULL
           OR EXISTS (SELECT 1 FROM json_each(e.state,'$.operations') op
@@ -15143,9 +15184,15 @@ export class KnowledgeHub {
           || this.protectedExecution(id, meta) || todoDispatchHold(meta)) continue;
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
         const fresh = this.executionState(id);
-        if (fresh?.generation !== state.generation) continue;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?))
-          WHERE id=? AND status='todo' AND owner=''`, JSON.stringify({ generation: state.generation, hold, duty }), id);
+        if (fresh?.generation !== state.generation || executionAdmissionHold(fresh, String(meta.work_revision ?? "legacy")) !== hold
+          || !this.one(`SELECT 1 FROM artefacts WHERE id=? AND status='todo' AND owner=''`, id)) continue;
+        const diagnosis = { generation: state.generation, hold, duty };
+        this.state.storage.transactionSync(() => {
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?))
+            WHERE id=? AND status='todo' AND owner=''`, JSON.stringify(diagnosis), id);
+          this.version(id, "system:recovery", "execution_diagnosis_scheduled", "Assigned diagnosis of a stopped execution attempt",
+            { ...diagnosis, attempt_id: state.attempt?.attempt_id });
+        });
         scheduled++;
       } catch (e) {
         this.audit("system:recovery", "execution_diagnosis_failed", id, { error: String(e).slice(0, 240) });
@@ -15174,7 +15221,7 @@ export class KnowledgeHub {
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
 
-Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. For an exhausted execution budget, inspect the durable attempt and distinguish provider, environment, and strategy failure. Obtain a valid recovery permit or independently reviewed strategy before resuming; a cleared counter, timer, or completed diagnostic alone cannot authorize retry. For unknown operations, inspect the external system by operation identity and arrange for the original executor to record the verified result against its existing fence. Never repeat the operation to find out whether it succeeded. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. For an exhausted execution budget, inspect the durable attempt and distinguish provider, environment, and strategy failure. Obtain a valid recovery permit or independently reviewed strategy before resuming; a cleared counter, timer, or completed diagnostic alone cannot authorize retry. For unknown operations, inspect the external system by operation identity. Read-only probes do not use the external mutation ledger. Record a conclusive result with execution reconcile_operation on the subject using the stopped attempt generation and attempt_id, the operation_id and input_revision, and first-hand receipts. If the evidence is inconclusive, preserve the hold. Never repeat the operation to find out whether it succeeded. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
 
 When the affected task is waiting on this recovery duty, submit a replacement condition on transition to in_review with unblock_result {kind:"reblocked",parent_id:"${taskId}",reason,next,await_event}. The independent reviewer verifies that the replacement is causal and observable. If no replacement is feasible, obtain a receipt-backed disposition. Completion alone will not release the task.
 

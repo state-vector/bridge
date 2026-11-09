@@ -354,6 +354,8 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("local_handoff"), ...FenceSchema.shape, reason: text, action: text, findings: text, tried: text, next: text,
     evidence: z.array(text), approvals: z.array(text), recipient: text.nullable().default(null) }),
   z.object({ kind: z.literal("prepare"), ...FenceSchema.shape, operation_id: text, action: text, input_revision: text, budget_ms: z.number().int().min(1000).max(3_600_000) }),
+  z.object({ kind: z.literal("reconcile_operation"), ...FenceSchema.shape, operation_id: text, input_revision: text,
+    outcome: z.enum(["succeeded", "failed"]), receipts: z.array(text).min(1) }),
   z.object({ kind: z.literal("result"), ...FenceSchema.shape, operation_id: text, outcome: z.enum(["succeeded", "failed", "outcome_unknown"]), receipts: z.array(text) }),
 ]);
 export type ExecutionCommand = z.infer<typeof ExecutionCommandSchema>;
@@ -512,9 +514,14 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       s.operations.push({ id: command.operation_id, action: command.action, input_revision: command.input_revision, deadline: now + command.budget_ms, state: "prepared", receipts: [] });
       break;
     }
+    case "reconcile_operation":
     case "result": {
-      requireAttempt(true);
+      const current = requireAttempt(true);
       const op = s.operations.find(x => x.id === command.operation_id);
+      if (command.kind === "reconcile_operation") {
+        if (current.phase !== "quiesced") throw new Error("gate: operation reconciliation requires a stopped writer");
+        if (!op || op.input_revision !== command.input_revision) throw new Error("gate: operation evidence is stale");
+      }
       if (!op || (op.state !== "prepared" && op.state !== "outcome_unknown")) throw new Error("gate: operation missing or already resolved");
       if (command.outcome !== "outcome_unknown" && command.receipts.length === 0) throw new Error("gate: reconciled external result requires receipts");
       op.state = command.outcome;

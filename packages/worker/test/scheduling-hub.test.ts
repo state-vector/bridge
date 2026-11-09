@@ -20,10 +20,21 @@ beforeEach(async () => {
   const rig = `import { KnowledgeHub } from "./index.js";
     export class SchedulingRig extends KnowledgeHub {
       async fetch(request) {
-        if (new URL(request.url).pathname !== "/fixture/spent-route") return super.fetch(request);
+        const path = new URL(request.url).pathname;
+        if (path === "/fixture/attempt-diagnosis") {
+          await this.scheduleAttemptDiagnosis();
+          return Response.json({ok:true});
+        }
+        if (path !== "/fixture/spent-route" && path !== "/fixture/watchdog-release") return super.fetch(request);
         const { id } = await request.json();
         const sql = this.state.storage.sql;
         const row = sql.exec("SELECT * FROM artefacts WHERE id=?", id).toArray()[0];
+        if (path === "/fixture/watchdog-release") {
+          const meta = JSON.parse(row.meta);
+          delete meta.session;
+          sql.exec("UPDATE artefacts SET status='todo',owner='',meta=? WHERE id=?", JSON.stringify(meta), id);
+          return Response.json({ok:true});
+        }
         const state = sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0].state;
         const revision = JSON.parse(row.meta).work_revision;
         for (let i=0; i<66; i++) {
@@ -322,6 +333,54 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(card.meta.execution_requirements.host).toBeUndefined();
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
     expect((await g.cmd(final, "old-final-not-replay", id, "wrong-session")).error).toMatch(/fenced|session/);
+  });
+  it("diagnoses a stranded repair and resumes it only after an attempt-bound receipt", async () => {
+    const project = "stranded-repair", g = await gateway(project, 2);
+    const id = await task(project, { machine_duty: { by: "recovery", kind: "task-recovery", subject: "BR#999", reason: "queue_binding" } });
+    const claim = await reserve(g);
+    if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+    const fence = { generation: 1, attempt_id: "stranded" };
+    await g.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-stranded", id, claim.session);
+    const operation_id = "publish";
+    const input_revision = "old-head";
+    await g.cmd({ kind: "prepare", ...fence, operation_id, input_revision, action: "Push exact ref", budget_ms: 60_000 }, "prepare-stranded", id, claim.session);
+    const terminal = { ...fence, writers: "process_group_empty", outcome: { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "runner stopped" } };
+    await g.cmd({ kind: "stopped", ...terminal }, "stopped-stranded", id, claim.session);
+    await g.cmd({ kind: "finalize", ...terminal }, "finalize-stranded", id, claim.session);
+    const fixture = (path: string) => stub.fetch("https://kb/fixture/" + path, { method: "POST", body: JSON.stringify({ id }) });
+    await fixture("watchdog-release");
+    await fixture("attempt-diagnosis");
+    const recovery = (await post("get", { id })).meta.execution_diagnosis;
+    expect(recovery).toMatchObject({ generation: 1, hold: "unknown_operations" });
+    expect((await post("get", { id: recovery.duty })).meta.machine_duty).toMatchObject({ subject: id, reason: "execution_environment" });
+    await fixture("attempt-diagnosis");
+    expect((await post("get", { id })).meta.execution_diagnosis).toEqual(recovery);
+
+    const diagnostic = await reserve(g);
+    if (diagnostic.kind !== "reserved") throw new Error(JSON.stringify(diagnostic));
+    expect(diagnostic.task_id).toBe(recovery.duty);
+    const receipt = { kind: "reconcile_operation", ...fence, operation_id, input_revision,
+      outcome: "succeeded", receipts: ["GitHub ref readback at exact commit"] };
+    const scope = { id: diagnostic.task_id, generation: 1, attempt_id: "diagnostic" };
+    const reconcile = (command_id: string, command: object = receipt, execution_scope = scope) => post("execution", {
+      ...g.worker, id, session: diagnostic.session, command_id, command, execution_scope,
+    });
+    expect((await reconcile("before-begin")).error).toMatch(/assigned diagnostic/);
+    await g.cmd({ kind: "begin", attempt_id: "diagnostic", worker: g.auth.agent, action_budget_ms: 60_000 },
+      "begin-diagnostic", diagnostic.task_id, diagnostic.session);
+    expect((await g.cmd(receipt, "gateway-bypass", id, claim.session)).error).toMatch(/full-agent/);
+    expect((await reconcile("wrong-scope", receipt, { ...scope, attempt_id: "old-diagnostic" })).error).toMatch(/assigned diagnostic/);
+    expect((await reconcile("stale", { ...receipt, input_revision: "other-head" })).error).toMatch(/stale/);
+    const result = await reconcile("confirmed");
+    expect(result.operations).toMatchObject([{ id: operation_id, state: "succeeded" }]);
+    expect(await reconcile("confirmed")).toEqual(result);
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(id);
+    expect(await g.cmd({ kind: "begin", attempt_id: "resumed-repair", worker: g.auth.agent, action_budget_ms: 60_000 },
+      "begin-resumed", id, resumed.session)).toMatchObject({
+      generation: 2, attempt: { phase: "running" }, operations: [{ id: operation_id, state: "succeeded" }],
+    });
   });
   it("releases physical capacity but preserves unknown operations and independent waits on terminal capture", async () => {
     const project = "terminal-unknown-effects", g = await gateway(project), peer = await gateway(project);
