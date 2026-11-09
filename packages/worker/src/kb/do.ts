@@ -3112,6 +3112,9 @@ export class KnowledgeHub {
         request TEXT NOT NULL, result TEXT NOT NULL,
         PRIMARY KEY (task_id, command_id)
       );
+      CREATE INDEX IF NOT EXISTS execution_proxy_grant_receipts ON execution_commands(json_extract(result,'$.permit.proof.id'))
+        WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+          AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request';
       CREATE INDEX IF NOT EXISTS execution_writer_receipts ON execution_commands(
         task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
         json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
@@ -5456,6 +5459,13 @@ export class KnowledgeHub {
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
       if (replay) { if (replay.request !== encoded) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
+      if (command.proof.witness.kind === "configured_proxy_request") {
+        const granted = this.one(`SELECT count(*) AS n FROM execution_commands
+          WHERE json_extract(result,'$.kind')='provider_recovery_granted'
+            AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request'
+            AND json_extract(result,'$.permit.proof.id')=?`, command.proof.id);
+        if (Number(granted?.n ?? 0) >= 4) throw new Error("gate: this proxy receipt has already granted four recovery trials");
+      }
       const a = current.attempt, terminal = current.terminal;
       if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || todoDispatchHold(meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
       if (!a || a.phase !== "quiesced" || !terminal || terminal.generation !== a.generation || terminal.attempt_id !== a.attempt_id) throw new Error("gate: provider recovery requires the exact quiesced terminal attempt");

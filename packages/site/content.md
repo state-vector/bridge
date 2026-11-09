@@ -1016,3 +1016,5 @@ Archived ACP routing failures with the complete LiteLLM unavailable-route error 
 A successful request through the configured proxy can authorize one trial per task revision for an unavailable route. This receipt verifies the tested request ceiling. Authentication and quota recovery still require the configured output ceiling to be verified. The hub keeps the consumed trial in the original begin receipt even if a later permit replaces it.
 
 An unowned review of an older task revision no longer blocks closure after the current revision is accepted. The hub retains reviews with active claims, unresolved operations, or delivery obligations for reconciliation.
+
+Given a fresh configured proxy receipt, run `python3 scripts/recover-provider-batch.py receipt.json` to preview up to four matching retry holds from the first 32 reported by the gateway. Set `BRIDGE_MCP_URL` and a full-agent `BRIDGE_TOKEN` using your existing connection, then add `--apply` to grant the selected trials. The hub permits at most four grants per proxy receipt. Normal admission and one-use task guards still apply.
