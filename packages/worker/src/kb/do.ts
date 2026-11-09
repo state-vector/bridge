@@ -235,7 +235,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionAttemptBudgetExhausted, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -5066,7 +5066,7 @@ export class KnowledgeHub {
       else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else if (state?.attempt && state.attempt.phase !== "quiesced") reason = "writer_not_quiescent";
       else if (state?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) reason = "unknown_operations";
-      else if (state && state.budget_exhaustions >= 3 && ![capabilities, ...capabilities.alternatives].some(c =>
+      else if (state && executionAttemptBudgetExhausted(state,String(meta.work_revision??"legacy")) && ![capabilities, ...capabilities.alternatives].some(c =>
         usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
         && recoveryPermitMatches(state, c, host, String(meta.work_revision ?? "legacy"), Date.now()))) reason = "retry_budget";
       else {
@@ -5642,7 +5642,7 @@ export class KnowledgeHub {
       const selection = command.selection;
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
-      if (current.budget_exhaustions >= 3 && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: exhausted budget requires a current one-use recovery permit for the exact selected route");
+      if (executionAttemptBudgetExhausted(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: exhausted budget requires a current one-use recovery permit for the exact selected route");
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
@@ -5661,14 +5661,26 @@ export class KnowledgeHub {
     } else if (["poll", "restore", "checkpoint", "quiesce", "stopped", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
       throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
     }
-    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now);
+    if (current.failure_charged_generation === null && current.attempt) {
+      const generation=current.attempt.generation;
+      const parseResult=(row: {result:unknown}|null): ExecutionState|null => {
+        if(!row) return null;
+        const parsed=ExecutionStateSchema.safeParse(JSON.parse(String(row.result)));
+        return parsed.success ? parsed.data : null;
+      };
+      const begun=parseResult(this.one(`SELECT result FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin' AND json_extract(result,'$.attempt.generation')=? LIMIT 1`,req.id,generation));
+      const polls=this.state.storage.sql.exec(`SELECT result FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='poll' AND json_extract(result,'$.attempt.generation')=? LIMIT 32`,req.id,generation).toArray()
+        .map(row=>parseResult({result:row.result})).filter((value):value is ExecutionState=>value!==null);
+      current.failure_charged_generation=legacyTimeoutChargeGeneration(current,begun,polls);
+    }
+    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
     const finalizeCurrentClaim = command.kind === "finalize" && row.status === "in_progress" && meta.session === session;
     const finalizedLocalHandoff = command.kind === "finalize" && ["in_progress", "blocked"].includes(row.status) && meta.session === session && next.handoff.phase === "waiting";
     const canRescheduleFinalized = finalizeCurrentClaim && !this.protectedExecution(req.id, meta, true)
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
-    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") next.budget_exhaustions += 1;
+    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") chargeExecutionFailure(next,command.generation);
     if (canRescheduleFinalized && !next.attempt?.checkpoint) next.requirements = { ...next.requirements, host: actor };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;

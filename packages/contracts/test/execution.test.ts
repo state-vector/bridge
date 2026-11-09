@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { providerRecoveryDiagnosis, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, openLargerModelStrategy, providerRecoveryDiagnosis, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -167,5 +167,53 @@ describe("witnessed legacy recovery fences", () => {
       expect(providerRecoveryDiagnosis({kind:"failed",exit_code:1,stdout_tail:"",stderr_tail})).toBeNull();
     }
     expect(providerRecoveryDiagnosis(held().terminal!.outcome)).toBe("provider_authentication");
+  });
+});
+
+describe("cause-preserving strategy attempts", () => {
+  it("counts a timeout generation once across poll and terminal accounting", () => {
+    let s=started(); s=step(s,{kind:"poll",...fence},60_101);
+    expect(s.budget_exhaustions).toBe(1);
+    chargeExecutionFailure(s,1); chargeExecutionFailure(s,1);
+    expect(s.budget_exhaustions).toBe(1);
+    chargeExecutionFailure(s,2); expect(s.budget_exhaustions).toBe(2);
+  });
+  it("admits a genuinely larger strategy with preserved history and bounded new failures", () => {
+    const s=started(); s.budget_exhaustions=3;
+    openLargerModelStrategy(s,"medium","The current model cannot resolve the cross-system invariant","independent_review","revision");
+    s.requirements.tier="medium";
+    expect(s.budget_exhaustions).toBe(3);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(false);
+    expect(executionAttemptBudgetExhausted(s,"changed")).toBe(true);
+    chargeExecutionFailure(s,1); // late old-strategy result must not spend new-strategy attempts
+    expect(s.retry_strategy?.failures).toBe(0);
+    for (const generation of [2,3,4]) chargeExecutionFailure(s,generation);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(true);
+    expect(s.budget_exhaustions).toBe(7);
+    expect(()=>openLargerModelStrategy(s,"medium","same strategy","independent_review","revision")).toThrow(/strictly increase/);
+    openLargerModelStrategy(s,"large","Need deeper reasoning","independent_review","revision");
+    expect(s.retry_strategy?.epoch).toBe(2);
+    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(false);
+  });
+});
+
+describe("legacy timeout accounting migration", () => {
+  it("recognizes only an exact recorded timeout charge and never subtracts history", () => {
+    const begun=started(); begun.budget_exhaustions=2;
+    const polled=step(begun,{kind:"poll",...fence},60_101);
+    const legacy=structuredClone(polled); legacy.failure_charged_generation=null;
+    expect(legacyTimeoutChargeGeneration(legacy,begun,[polled])).toBe(1);
+    for(const wrong of [
+      {...polled,budget_exhaustions:2},
+      {...polled,attempt:{...polled.attempt!,attempt_id:"other"}},
+      {...polled,attempt:{...polled.attempt!,generation:2}},
+    ]) expect(legacyTimeoutChargeGeneration(legacy,begun,[wrong])).toBeNull();
+    expect(legacyTimeoutChargeGeneration(legacy,null,[polled])).toBeNull();
+    expect(legacyTimeoutChargeGeneration(legacy,begun,[])).toBeNull();
+    const interrupted=step(begun,{kind:"message",message_id:"stop",text:"Pause",priority:"interrupt"});
+    expect(legacyTimeoutChargeGeneration({...interrupted,failure_charged_generation:null},begun,[interrupted])).toBeNull();
+    legacy.failure_charged_generation=legacyTimeoutChargeGeneration(legacy,begun,[polled]);
+    chargeExecutionFailure(legacy,1);
+    expect(legacy.budget_exhaustions).toBe(3);
   });
 });

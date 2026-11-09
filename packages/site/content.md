@@ -996,3 +996,14 @@ receipts remain intact. The next worker receives the authorized continuation;
 unknown external operations and independent human or lifecycle holds still prevent
 admission. This reconciliation mechanism does not yet implement automatic provider
 circuit recovery or task replanning, and billing confirmation alone is not health proof.
+
+
+An explicit larger-model escalation now receives its own bounded allowance of
+three failed generations. The lifetime failure counter stays intact; changing a
+session, model alias, timestamp or ordinary task metadata does not renew it.
+Independent review and executor escalation both bind the new strategy to the task
+revision and enforce its minimum model tier through scheduling and launch.
+A deadline poll and finalization charge the same generation only once. Existing
+timeout charges are recognized from exact saved begin/poll receipts, never merely
+from a stopped process. Exhaustion at the largest tier and automatic dependency
+recovery still require the remaining diagnosis and recovery lifecycle work.

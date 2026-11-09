@@ -265,6 +265,13 @@ export const ExecutionRecoveryPermitSchema = z.discriminatedUnion("phase", [
 ]);
 export type ExecutionRecoveryPermit = z.infer<typeof ExecutionRecoveryPermitSchema>;
 
+export const ExecutionRetryStrategySchema = z.object({
+  kind: z.literal("larger_model"), epoch: z.number().int().positive(),
+  task_revision: text, minimum_tier: ReasoningTierSchema,
+  first_generation: z.number().int().positive(), failures: z.number().int().nonnegative(),
+  reason: text, source: z.enum(["executor", "independent_review"]),
+});
+
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -274,6 +281,8 @@ export const ExecutionStateSchema = z.object({
   messages: z.array(MessageSchema),
   operations: z.array(OperationSchema),
   budget_exhaustions: z.number().int().nonnegative().default(0),
+  failure_charged_generation: z.number().int().nonnegative().nullable().default(null),
+  retry_strategy: ExecutionRetryStrategySchema.nullable().default(null),
   recovery_permit: ExecutionRecoveryPermitSchema.nullable().default(null),
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
@@ -281,7 +290,7 @@ export const ExecutionStateSchema = z.object({
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, failure_charged_generation: 0, retry_strategy: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -330,7 +339,7 @@ export const ExecutionRequestSchema = z.looseObject({
 /** Pure reducer: caller authenticates host/session; one SQLite transaction commits
  * this state AND the command receipt. An expired writer is NEVER automatically
  * declared quiescent, even after host death. */
-export function reduceExecution(previous: ExecutionState, command: ExecutionCommand, host: string, session: string, now: number): ExecutionState {
+export function reduceExecution(previous: ExecutionState, command: ExecutionCommand, host: string, session: string, now: number, taskRevision = "legacy"): ExecutionState {
   const s = structuredClone(previous);
   const a = s.attempt;
   const requireAttempt = (allowExpired = false): ExecutionAttempt => {
@@ -356,7 +365,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     }
     case "begin": {
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
-      if (s.budget_exhaustions >= 3 && !recoveryPermitCoversAttempt(s, now)) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
+      if (executionAttemptBudgetExhausted(s, taskRevision) && !recoveryPermitCoversAttempt(s, now)) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
       if (a && a.host !== host && !a.checkpoint) throw new Error("gate: cross-host transfer requires a published checkpoint");
@@ -379,9 +388,8 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       if (current.phase === "finalizing") return s; // stopped writers cannot renew or become running again
       if (current.phase === "quiesced" || current.lease_until <= now) throw new Error("gate: execution lease expired or quiesced");
       if (current.action_deadline <= now && current.phase !== "stopping") {
-        s.budget_exhaustions += 1;
-        // The budget belongs to the task, not a session/host/model. Exhaustion
-        // demands diagnosis; only an explicit escalate command selects a tier.
+        chargeExecutionFailure(s, current.generation);
+        // One generation is charged once, even if finalize arrives later.
       }
       if (current.action_deadline <= now || s.messages.some(x => x.priority === "interrupt" && (x.state === "queued" || x.state === "delivered"))) current.phase = "stopping";
       current.lease_until = now + EXECUTION_LEASE_MS;
@@ -454,6 +462,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const tiers: ReasoningTier[] = ["small", "medium", "large"];
       const actualTier = current.executor?.tier ?? s.requirements.tier;
       if (tiers.indexOf(command.tier) <= Math.max(tiers.indexOf(s.requirements.tier), tiers.indexOf(actualTier))) throw new Error("gate: escalation must increase the persistent minimum reasoning tier and actual execution tier");
+      openLargerModelStrategy(s, command.tier, command.reason, "executor", taskRevision);
       s.requirements.tier = command.tier;
       current.phase = "stopping";
       break;
@@ -530,4 +539,36 @@ export function recoveryPermitMatches(state: ExecutionState, capability: Pick<Ex
   return recoveryPermitCoversAttempt(state, now) && !!p && p.task_revision === revision
     && p.proof.host === host && p.proof.backend === capability.backend
     && p.proof.model === capability.model && p.proof.config_revision === capability.config_revision;
+}
+
+/** Cumulative history is immutable; admission is bounded within an explicit
+ * changed strategy. Time, aliases, sessions and arbitrary edits grant nothing. */
+export function executionAttemptBudgetExhausted(state: ExecutionState, taskRevision = "legacy"): boolean {
+  const strategy = state.retry_strategy;
+  if (!strategy) return state.budget_exhaustions >= 3;
+  return strategy.task_revision !== taskRevision || strategy.failures >= 3;
+}
+export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTier, reason: string,
+  source: "executor" | "independent_review", taskRevision: string): void {
+  const tiers: ReasoningTier[] = ["small","medium","large"];
+  const floor = Math.max(tiers.indexOf(state.delivery?.tier ?? "small"), tiers.indexOf(state.attempt?.executor?.tier ?? "small"),
+    tiers.indexOf(state.retry_strategy?.minimum_tier ?? "small"));
+  if (tiers.indexOf(tier) < tiers.indexOf(state.requirements.tier) || tiers.indexOf(tier) <= floor) throw new Error("gate: new retry strategy must strictly increase the diagnosed reasoning tier");
+  state.retry_strategy = {kind:"larger_model",epoch:(state.retry_strategy?.epoch ?? 0)+1,task_revision:taskRevision,
+    minimum_tier:tier,first_generation:state.generation+1,failures:0,reason,source};
+}
+export function chargeExecutionFailure(state: ExecutionState, generation: number): void {
+  if (state.failure_charged_generation !== null && state.failure_charged_generation >= generation) return;
+  state.failure_charged_generation = generation;
+  state.budget_exhaustions += 1;
+  if (state.retry_strategy && generation >= state.retry_strategy.first_generation) state.retry_strategy.failures += 1;
+}
+
+/** Stored command results prove a prior timeout charge; merely being stopping
+ * never does (it may be an interrupt or an unresolved external operation). */
+export function legacyTimeoutChargeGeneration(state: ExecutionState, begun: ExecutionState | null, polls: ExecutionState[]): number | null {
+  const a=state.attempt;
+  if (state.failure_charged_generation !== null || !a || !begun?.attempt || begun.attempt.generation !== a.generation || begun.attempt.attempt_id !== a.attempt_id) return null;
+  return polls.some(p => p.attempt?.generation === a.generation && p.attempt.attempt_id === a.attempt_id
+    && p.attempt.phase === "stopping" && p.budget_exhaustions > begun.budget_exhaustions) ? a.generation : null;
 }
