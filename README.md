@@ -27,15 +27,17 @@ stopping only `bridge.service` preserves independently supervised workers; use
 the worker stop command when stopping the work itself. Worker units inherit the
 gateway PATH and `~/.bridge/env`, keeping provider configuration with the worker.
 
-The independent updater script must also be refreshed from this build using the
-documented updater installation procedure. Replacing the native binary alone
-does not upgrade an already-installed Python updater. Update availability now
-reports the admission hold for controller handoff/health verification rather
-than implying that zero-slot workers are still draining.
-If recovery observes that its recorded candidate is already the actual managed
-executable, it can finish that existing update after exact PID/nonce, fresh health,
-stable-process and doctor checks. It performs no reinstall/restart and preserves
-the existing next-install deadline.
+The independent supervisor is the single owner of server recovery. It keeps one
+versioned journal through prerequisite checking, handoff, reconciliation,
+installation and health verification. Restarting either participant resumes the
+same saved operation; a planned controller reconnect does not add another hour.
+After a verified native update, the supervisor updates its own shipped source
+and continues from the same journal, avoiding a permanently older recovery script.
+Existing useful-work windows and failed-build rejection remain enforced.
+Health readiness and controller quiescence are separate facts: a busy healthy
+controller can pass startup verification while job-specific waits stay protected.
+Stopping it for rollback still requires its real handoff acknowledgement. A newer
+supervisor bootstrap cannot be downgraded by an older native build's embedded code.
 Pending worker-stop requests block controller-ready acknowledgment until they
 are delivered, and candidate health cannot clear a changed update-request nonce.
 Only published worker manifests are adopted. An interrupted manifest write stays
@@ -49,28 +51,29 @@ This also recovers journals written by older builds. Missing/malformed facts,
 unknown writers/effects and foreign host identities retain their barriers.
 The journal format remains readable by rollback builds.
 
-For an older controller already stuck on these historical reservations, use a
-verified recovery binary's `bridge workers reconcile-reservations [BR#task]`
-while **only the controller service is stopped**. It refuses a live controller's
-exclusive lock and defaults to a read-only drill. `--apply` rechecks current claim
-facts, archives each eligible original record, and retires only its exact ended,
-never-launched reservation. Restart the controller afterward; independently
-supervised workers keep their original processes and sessions. This bootstrap
-does not install a binary, change update deadlines, clear health holds, or resolve
-unknown writers/effects.
+`bridge recovery inspect [BR#task]` observes the shared reconciliation path.
+`bridge recovery reconcile [--apply] [BR#task]` is its guarded execution adapter;
+without `--apply` it is read-only, and execution requires the controller's lock.
+The supervisor calls this same implementation when an older controller cannot
+reconcile its saved records. The old separate reservation/stopped-job commands
+and recovery/rollback ladders have been removed.
 
-Confirmed stopped jobs are also rechecked every five seconds against saved hub
-receipts for their original server, session and attempt. A newer job cannot supply
-that proof. Missing proof or an uncertain outside action keeps the old job protected.
-The runner saves the original result, launch record and worktree location before
-archiving old ownership; it does not mark the task complete or remove the worktree.
-Captured real results continue through their normal checkpoint and delivery steps.
-For an older stuck controller, `bridge workers reconcile-stopped [BR#task]` uses
-the same controller lock and defaults to a read-only check. With `--apply`, it
-rechecks the saved confirmation and original record before archiving. Stop only
-the controller while using this verified recovery binary, then restart it;
-independent workers keep running and a live worker lock prevents cleanup.
-This command does not install an update or change its deadline or health checks.
+When needed, the supervisor freezes only the controller's systemd group and
+requires a complete kernel census proving that no child/effect process is in it
+before a controlled handoff. A busy boundary is thawed without stopping its work.
+Independent worker units keep running. Reconciliation requires exact original
+scope, real stop confirmation or an original worker lock plus kernel proof;
+unknown outside actions remain protected. Original results and worktree locations
+are retained. Unavailable results follow the normal checkpoint/delivery protocol
+and never become fabricated success. An unproved record creates one explicit wait
+instead of repeated controller restarts.
+
+To bootstrap an existing installation, stop **only** `bridge-update`, use a
+verified build's `bridge update install --managed-bin /absolute/path/to/installed/bridge`,
+then reload systemd and start `bridge-update`. The installer uses the supervisor's
+exclusive lock and preserves its existing journal and deadlines. It does not
+replace the running native binary. Subsequent recovery belongs to the supervisor.
+See [the recovery ownership and removal map](docs/recovery.md).
 
 **bridge** is a control plane for coding-agent fleets: a live board with confidence/risk/completion gauges, a gateway that claims tasks and dispatches them to agent CLIs on your machines, and a human inbox for sign-off. The [public site](https://fleetbridge.run/) covers what it does and why; **this README gets the app running in your own Cloudflare account.**
 
@@ -117,6 +120,12 @@ interleaved write cannot resurrect a stale HTTP board cache. Current-review look
 uses indexed declared subjects and incoming child relations instead of scanning
 retained review history per task; pending, findings and detached rounds retain
 their exact submission/revision authority.
+
+The append-only receipt ledger has canonical lookup indexes for card history,
+actor activity, per-card actions and action/time windows. Watchdog and control
+queries use these indexes through the existing event/version views; unrelated
+retained receipts do not require a full scan for each task. History sequence,
+actor attribution, scoring windows and every stored receipt remain unchanged.
 
 Executor availability keeps its cause: an operator pause, update handoff, drain,
 startup cooldown, task-specific prerequisite, and missing worker identity are
@@ -890,7 +899,26 @@ Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
 and independent receipt review; other repositories retain PR/merge-train
 delivery. The generated prompt uses the actual `dispatch-<task>` claim session.
 
-The runner claims eligible `todo` work and dispatches an agent CLI in a registered isolated worktree. Delivery follows the repository's policy (signed direct-main for Bridge; PR/train elsewhere). The hygiene sweep joins the worktree registry, disk and board state; it does not delete dirty or unpublished work on a best-effort preservation promise. Clean remotely reachable trees are swept when released/terminal, or after the stale horizon when no process holds them. `sweep_repos` (`BRIDGE_SWEEP_REPOS`) adds registered roots. Claim races do not count as agent-CLI failures. Expired claims do not override the durable writer-quiescence or checkpoint-restoration barriers above.
+The runner claims eligible `todo` work and dispatches an agent CLI in an isolated, gateway-owned workspace. Delivery follows the repository's policy (signed direct-main for Bridge; PR/train elsewhere). Claim races do not count as agent-CLI failures. Expired claims do not override durable writer-quiescence or checkpoint-restoration barriers.
+
+### One workspace owner
+
+The native gateway owns allocation, preservation, reclamation and disk admission through one durable workspace lifecycle in its existing `~/.bridge/lifecycle/<scope>/workspaces/` journal. Every new claim gets a unique `<workdir>/workspaces/<identity>/` with `work`, `tmp`, `cache` and `logs` directories. Old finalizers cannot reuse or delete a newer claim's path. Workers inherit workspace-local `TMPDIR`/`TMP`/`TEMP`, `CARGO_TARGET_DIR`, npm cache and `XDG_CACHE_HOME`; live output is bounded to 4 MiB in that workspace. Shared repository clones are journalled cache resources, with provisioning and eviction taking the same cache lock. Repository refresh fetches the default branch rather than accumulating every remote checkpoint ref.
+
+After the exact execution's stopped result is acknowledged, its workspace is released independently of whether the task awaits review, is blocked, or is finished. The owner captures dirty/untracked source through a private Git index, persists the exact checkpoint before publication, verifies remote readback and current local content, then atomically renames the allocation to a journalled retirement path and removes it. Nested Git repositories get their own retained checkpoint receipts. Source receipts remain available through `bridge workspaces status` after local deletion. Failed publication, newer inputs, incomplete process visibility, open readers, dependent worktrees and unresolved execution/operation evidence retain only the affected resource, with a durable reason and retry. Non-Git scratch inputs with no publication destination remain retained explicitly; deliver them to the board or preserve them in a repository before retirement.
+
+A bounded, fair reconciliation job runs every 30 seconds under sustained load, held executions and managed-update drain. Restart resumes the recorded preservation/deletion stage. Removed counts and allocation bytes are recorded only after the retirement path is gone; a skipped or retained resource is never reported as removed. `bridge status` includes workspace accounting and disk-admission state. `bridge workspaces status` shows resource states, retention errors and checkpoint receipts. `bridge workspaces reconcile` invokes the same owner for offline recovery and refuses to race a live gateway controller.
+Completed resource records move to cold history, outside the active reconciliation
+and rewrite set; immutable removal receipts preserve cumulative accounting. Fair
+passes prefer larger resources among equally unvisited allocations.
+
+Declared disposable cache/tmp/log allocations retire through the same state machine as soon as their execution is stopped, even when source must remain protected. Git-ignored unique inputs such as `.env` or measurement evidence are not assumed disposable: they retain source with a precise reason while bulky build caches can still be reclaimed. Checkpoint publication never silently discards ignored evidence.
+
+Deletion authority comes from the allocation's exact stopped execution and exclusive ownership, with observable reader checks as an additional guard. An unrelated non-dumpable Linux daemon does not own a fenced workspace and cannot globally suspend its cleanup. Unattributed legacy directories still require complete host visibility; missing visibility retains those specific directories explicitly. Legacy execution directories become fenced only after same-host, exact canonical stopped ownership and clear operation/handoff/claim checks.
+
+The default owned-disk budget is **100 GiB**, including retained lifecycle evidence, with at least **5 GiB free** on the workspace filesystem. `BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` override those limits. Reclamation continues when admission is held; the gateway stops granting new local allocations until measurement is fresh and the budget permits them. Source and unknown effects are never sacrificed to satisfy a quota.
+
+Legacy adoption imports existing registered worktrees, runner-owned trees and session directories, `~/opencode-tmp` children, repository caches, and standalone build caches carrying a standard `CACHEDIR.TAG` into this same journal. `sweep_repos` (`BRIDGE_SWEEP_REPOS`) adds repository roots for registered-tree discovery. Adoption proves ownership/readers and preservation before removing anything; it does not apply an age-only deletion rule. Historical `isolate`/`worktree_exempt_repos` settings are accepted for configuration compatibility; dispatched executions always use owned isolation.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/state-vector/bridge/main/install.sh | bash
@@ -1439,35 +1467,56 @@ solid if waiting to be"):
    back to `in_progress` / conflicted); `verifying` counts all PRs in the
    verification stage across `in_review` (both `Verify:` todo and `Verify:` in
    progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
-   counts verified (`ACCEPT`) PRs ready to merge. BR#5897 correction (Ray colour
-   law, 2026-11-03): a car already sitting in `lane.queue` has **passed
-   verification** — a `cls: "waiting"` car renders `ready` green while the
-   walk's base verdict is still settling (`verified — ready to merge (waiting
-   on lane/CI)`), and once the base is green in the walk the same car renders
-   `verifying` (orange pulsing, `being verified — checks/mergeability running`)
-   while its own head checks / mergeability / gate re-run finish; `verifying`
-   (orange pulsing) is otherwise strictly PRs being verified right now (an
-   active `Verify:` child, an in-flight `awaiting` park, a live reconcile
-   verify duty), `waiting` (orange solid) is strictly PRs waiting to be
-   verified (`Verify:` todo, an idle park, `cls: "needs-review"`, an unclaimed
-   reconcile-seen PR), and `conflict`/`blocked` — like a queued car with no
-   stamp at all after a bounce-free walk — count as in progress.
+   counts **verified (`ACCEPT`), base-conflict-free PRs**. The count is derived
+   from the same car states as the colours: `K ready` means exactly K green
+   blocks. A verified queued PR stays green through a stopped line, red or
+   settling main, a deployment in flight, or an executor wait (`cls: "waiting"`);
+   those are lane holds, not loss of PR readiness. An explicit `needs-review`
+   (invalidated acceptance) is orange solid; `conflict`/`blocked` and a queued
+   car skipped after a bounce-free walk count as in progress. Per-PR facts
+   classify each leg separately when a task carries multiple PRs.
 2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
    orders candidates by readiness state first (`ready` → `verifying` → `waiting` —
    the train is NOT FIFO: ready PRs merge immediately in Batch 1 without waiting on
    verifying PRs) and runs `selectBatch` iteratively over the lane's verifying + ready
    PRs (using the executor's `conflict_pairs` and `lane.burst_max`), separating batches
-   with `.train-block-gap` dividers.
+   with `.train-block-gap` dividers. All ready cars precede unverified cars across
+   the whole strip, including when ready cars conflict with each other and need
+   separate batches. Conflicts between queued PRs affect batching; conflicts with
+   base affect readiness.
 3. **Verification colour law & lane idle/held clarity**: inside each batch, **green solid (`.tb-ready`)** =
-   ready (verified), **orange pulsing (`.tb-verifying`)** = actively being
+   ready (verified, no conflicts with base), **orange pulsing (`.tb-verifying`)** = actively being
    verified right now (`Verify:` child `in_progress` / live heartbeat <10m /
-   walk checks running), **orange solid (`.tb-wait`)** = waiting to be verified
+   active review), **orange solid (`.tb-wait`)** = waiting to be verified
    (`Verify:` child `todo` or idle `awaiting` park; never red on awaiting,
    never diagonal stripes, per BR#5476). When `ready === 0`, the lane status pill
    shows whether the line is idle waiting on verification/PR checks (`idle — 0 ready`)
    or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
    the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
    (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
+   The self-heal's retry budget is a closed purpose/evidence pair (BR#8824): the
+   executor names WHY it re-requests a check — `stale_destination_gate` (the red
+   was stamped against a destination that has since recovered) or
+   `ordinary_head_check` (the re-run judges this head, e.g. a bisect probe) — and
+   the hub alone validates the evidence. A stale-destination retry is licensed
+   only by the lane's current canonical GREEN deploy coverage (folded from the
+   stored base state and the durable deploy observations, so a caller's bare
+   green stamp can never override a newer durable failure) and only for the
+   task's exact current PR head (fail-closed: an unobserved head never
+   licenses a dispatch, and legs in other repos are never compared); the
+   budget is scoped to the successful
+   coverage receipt the hub derives (covered tip + decisive run id + its
+   attempt — never a
+   timestamp), so exactly one retry is granted per head/obligation/CHANGED
+   successful coverage (a same-run rerun — a new attempt of the same run id,
+   which GitHub reruns create — is a changed receipt that can recover the
+   gate), while an ordinary head check keeps its permanent
+   one-dispatch budget (old ledger rows and receipts are preserved, never
+   reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
+   fenced until its receipts reconcile — the fence is scope-wide and evaluated
+   before any purpose branch, so NO purpose (stale or ordinary) re-dispatches
+   past an unreconciled external effect, and a fresh green stamp never licenses
+   repeating one.
 And three structural guards close the loop: `trainParseNoteLegs` validates GitHub
 `owner/name` syntax and rejects `/BR#N` tracker tokens and numeric owners so prose
 never mints ghost lanes (`tb-pulse/BR`, `5563/BR`); direct-to-main landings
@@ -1634,6 +1683,22 @@ For Me has no duplicate blanket GO action detached from the actual question.
 Legacy exact human targets (`human`, `ray`, `rayh`) adapt to human decisions;
 bare agent labels, coordinator tokens and offline stamps never imply human audience.
 
+**Human ask admission (BR#8106).** New requests must include a structured
+`decision` even when the caller omits `route` and uses a legacy human recipient.
+The same rule applies to direct question creation and metadata edits. Name the
+affected task, explain the situation and why your decision is needed, and give
+each choice an executor, a concrete consequence and a typed effect. The visible
+options must match those choices; blank context and misplaced recommendations
+are rejected. The complete request instructions and target links remain visible before the answer buttons; they are not hidden as optional evidence.
+Older stored questions remain readable and answerable.
+
+Missing resume conditions, repeated failed attempts, missing completion reviews
+and change-tracking failures schedule deduplicated agent repair work. They do
+not ask you to “re-scope, release or drop” a task or “fix the gate precondition”.
+A protected task keeps its scope and actual outcome obligation; repairing its
+wait only resumes that work. A real missing permission or product choice may
+still be escalated explicitly after the repair executor has diagnosed it.
+
 `ask_agent` writes no side table — the ask **is** a question task: a BR#-numbered
 `type: "question"` node, `child_of` the subject task when you pass `artefact_id`. The
 subject goes `blocked`, the watchdog pauses for it, and an answer auto-resumes it back to
@@ -1766,18 +1831,16 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
 - **The block**: every PR runs the required `main-green gate` check
   (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
   check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
-  (or a check still running, or no check runs at all) fails the gate and GitHub refuses
+  (or a check still running, or no substantive check runs) fails the gate and GitHub refuses
   the merge via the `main: main-green gate + substance checks required` ruleset. The
   newest run per check judges; a cancelled run says nothing. The one exception is written
   into the gate: a PR green on the *exact* checks main fails passes with a printed
   **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
   receipted, not a loophole.
-  Manual gate drills honour the same rule: a `workflow_dispatch` run MUST pass an
-  explicit `main_sha` (BR#5487) — a sha-less dispatch with `--ref main` attaches the
-  drill's own `main-green gate` check-run to main's HEAD, so the script finds itself
-  in flight on the sha it judges and fails UNSETTLED, reding a green main. Judge a
-  historic sha instead: the check-run still lands on HEAD, but the judged commit is
-  settled and independent.
+  The destination check excludes its own `main-green gate` and `Preflight destination check`
+  labels. GitHub attaches those results to the commit SHA, which can be shared by main
+  and a preflight ref. A manual `workflow_dispatch` drill still requires an explicit
+  historic `main_sha` (BR#5487).
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The same ruleset
@@ -2130,12 +2193,14 @@ an uncertain effect is not repeated. Exhausted retries and substantive candidate
 failures produce a concrete, deduplicated repair duty instead of assuming that
 an ownerless queued card has an active executor.
 
-Every merge candidate must include the current base in its tested head. A clean
-worker-authored branch is updated mechanically; its substance verdict carries,
-but CI does not. The train waits for fresh integrated-head checks. Conflicting
-or non-worker-authored branches receive an agent-owned repair. This check runs
-again between batch members: disjoint files alone do not prove semantic
-compatibility. This replaces the older conflict-only proactive-update policy.
+Each batch starts with candidates tested against its starting base. Mutually
+non-conflicting members can land back-to-back using that evidence while the
+live tip is still the batch's own landed prefix. The train rechecks review,
+signatures and required checks on each exact head and stops on a red base
+check. If an unrelated merge advances main, candidates need CI against the
+new base. A clean worker-authored update carries the review verdict and runs
+fresh CI. Conflicting or non-worker-authored branches receive an agent-owned
+repair.
 
 A scheduler reservation authorizes initial `begin` through its exact gateway
 token and session, without requiring a caller-supplied agent label. Existing
@@ -2203,6 +2268,19 @@ reconcile deploy coverage as a closed 6-state machine (`DeployCoverageState`:
   cancel <id>`, audited as `train:redundant_runs_cancelled`), saving ~15m of
   extra line hold per occurrence.
 
+- **The banner (BR#4849)**: a red main is the loudest thing on the Top view — the merge
+  trains panel opens with a red STOP-THE-LINE banner per red lane answering the two
+  accountability questions: **who broke it** (the machine-recorded `culprit_task` stamped
+  on the stop, else the lane's last landed merge from the train ledger — labeled
+  unconfirmed) and **who is fixing it** (the open root-blocker/main-red episode task in
+  the lane's project, with its owner/executor session — or a loud `⚠ UNOWNED — nobody is
+  fixing it` chip, because an unclaimed blocker must be impossible to miss). The
+  derivation is hub-native (`red_main` in `GET /api/kb/train`: newest OPEN task tagged
+  `main-red`/`root-blocker` in the lane's project): it catches reds the train never saw
+  fed — a post-merge deploy failing on main files no train stop, but the episode task
+  still turns the panel red. The banner clears when the episode task leaves the open set
+  (fixed, done, superseded) — main green again is board fact, not a manual UI toggle.
+
 ### The deploy drift alarm's settle window (BR#3289)
 
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in
@@ -2219,6 +2297,15 @@ does a hub that never answers. A failing main-tip lookup never turns a mismatch 
 (fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
 
 ## The merge train: serialized merges, credential-free hub (BR#3516)
+
+The stop-the-line banner follows the latest observed failing main commit. The
+lane retains its repair across refreshes and lease renewals, and a stale
+starvation diagnostic stays in history. If the current failure lacks an active
+repair, Bridge queues recovery for that commit.
+If main advances while a stop is in force, Bridge holds merges while checking
+the new commit. It assigns repair work only when that commit fails.
+
+Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
 
 Accepted decision BR#3516 re-divisioned the merge machinery: **the hub holds no VCS
 credentials, ever.** Every GitHub fact is fed to it by an executor running on your own
@@ -3486,7 +3573,7 @@ double-binding single spawn) and `test/machine.test.ts` (the refusal names child
 - **Blocked parks get a clock too** (BR#2893): churn-guard parks (retry instructions stamped as blocks) and parks whose unblock condition references only closed asks drain back to the pool automatically; an honest park with no external gate ages out past `blocked_stale_hours` (a setting, default 48). True external gates — dated checkpoints, GitHub issue/PR lanes, red-main — are exempt, and so is any park on a live machine wait (BR#4067): a typed `await_event`, a merge-train queue slot, or a bound ask owns its own exit, and the drain never attempts one (attempting it only re-bred a refused release — and a breach card — every sweep tick). A card whose owner has had no live session for `owner_stale_hours` (default 4) loses the claim regardless of status. And a parent that has burned `UNBLOCK_SPAWN_CAP` (3) unblock rounds stops spawning them and escalates to a human once — do-not-claim anchors excepted: the alarm sink and other `infra_anchor` cards skip the spawner entirely (an audit line only), never burning the shared round budget and never escalating, because their own machine exits re-arm instead (BR#5916). On the board, Top is the actionable fleet only; every parked card files in Backlog under its EXIT CONDITION — one group per typed await class (awaiting you · PR verification · PR merge (train) · CI · deploy · another task · GitHub issue · a date · green main · other), with churn parks under Timeout — each row has a **Release** button and the section head a **Release all** (human early-exit; protected parks — typed awaits, train-queue slots — refuse server-side and are listed, never routed around) — and a live unblock duty shown as a chip on the row.
 - Anything needing a human lands in **For Me** (genuine decisions only — a merge-train coverage bounce parks the card Awaiting only for genuine human legs (BR#5226): a machine-verdict-covered head re-queues itself, a plain lapse re-verifies, BR#4960)
 - **For Me never jumps (BR#3457)**: acting on a proposed decision (accept, or reject — which routes to supersede-with-reason, the decision lifecycle's only exit for a verdict that doesn't hold) pins the card to the bottom of its section with an `actioning…` chip and dead buttons; the card leaves the list only when a refetch confirms the server flipped it, and an error returns it to its slot with the reason inline. Server-side, one actionable verdict per target, ever: a newer verify-verdict for a target supersedes still-proposed older rounds at create, and the acting party's accept/reject (human or the machine apply, BR#5377) sweeps any leftover proposed sibling (legacy stacked rounds included). Machine verdicts rarely sit proposed at all — they accept on filing — so the panel holds only failed-apply stragglers and the deploy-time backlog, which both the create-time sweep and the adoption sweep (below) clean up: a stacked group collapses to one card that can never regrow.
-- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738), and the verdict-done receipts gate classifies as `gate:verdict-receipts` — a rejection carrying the audited ` [rule: <name>]` tag classifies by its rule name FIRST (the gate's own message embeds "PR link", which the older message-stem ladder mis-folded as `gate:review-needs-pr`, leaving the receipts class unreachable for its own gate; specimens BR#3735, BR#4291), with the stems kept as the fallback for suffix-less legacy reasons (BR#4295). The BR#4067 release-hold backstop classifies its refusals too: a machine silence- or owner-death release correctly held by a typed wait or a train queue slot is benign by design — the proxy watch / the answer / the train owns the exit — so its rejections classify as `release:held-typed-await` / `release:held-train-queue` instead of piling into `unclassified` (specimens TASK-016/BR#4563, BR#3727/BR#4573). And the blocked-park drain's ask-ref scan is word-bounded, so an unblock condition naming a task id (`TASK-016`) no longer yields the phantom ref `ASK-016` that made the drain re-attempt a refused release every sweep tick (BR#4563). The receipts gate's rejection and every unblock-duty spawn template now teach the accepted note shape — any URL, or one of the verdict tokens (`PR` / `merged` / `passed` / `unblocked` / `still blocked`) — so a duty holder closing with honest findings prose passes on the first try instead of burning rejections (each rejection is a breach event) reverse-engineering the matcher from source (BR#4295). And the bootstrap teaches every dispatched session the retry law that keeps the loops from forming at all (rule 4c + a mirrored PROTOCOL CARD clause, BR#4474): a 5xx / `infra_storage_fault` is retryable — same transition, backoff, heartbeat — while a SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child", "malformed") is TERMINAL for that attempt — stop, read what it names, resolve the named precondition or take a lifecycle-legal edge; retrying a gate-rejected transition cannot succeed and every retry is an audited breach event (the 2026-10-28/29 storage-fault era uncorked four `gate:open-children` cards in 18 minutes from exactly these loops — BR#4403, BR#4473). And the BR#4067 release-hold backstop classifies as `release_held`, priced as noise like `claim_race`: a machine sweep's release attempt on a card parked on a typed wait or a merge-train queue slot being refused IS the system working (zero state destroyed — the proxy watch / the answer owns the exit), so no pile-up of refusals ever raises a breach card (BR#4562, specimen TASK-001) — and the pricing covers the NAMED held spellings too (`release:held-typed-await` / `release:held-train-queue`, the tagged-refusal classes above): they exist so the Log says WHAT held, not so the same benign refusals can re-arm breach cards under a different name (BR#6654: three tagged refusals on an awaiting-ci car raised exactly such a card, 2026-11-05). The park-drain sweep that kept re-attempting those refusals every tick now checks the same hold its sibling sweeps check before releasing — a held park is waited out, not re-refused — and the owner-death release leg joins that hold-check family (it was the last release path attempting bare, re-manufacturing a refused release once per alarm tick until the owner's next live session), and the full alarm sweep gained an `admin.alarm_sweep` drill, since the drain was previously reachable by no test path at all. The durable-execution mutation fence joins the same never-a-breach family: a write from a bound runner token whose execution attempt is not a live bound running attempt (expired lease, quiesced/stopping attempt, claim or generation mismatch) is refused with "gate: execution mutation fenced — stop and checkpoint; runner must verify restore/quiescence before resuming" — the fence refusing a stale writer IS the system working (zero state destroyed, and the refusal's own instruction is to stop, checkpoint and re-establish), so those refusals classify `execution_fence` and are priced never-a-breach — no pile-up of them ever raises a breach card, and the Log says WHAT fenced (specimens BR#7008/BR#7028: 3 compliant fence events on BR#5971, 2026-11-06, folded `unclassified` and raised a card until BR#7008 named the class).
+- **Breach cards**: when the task machinery loops (rejection storms, double-spawn attempts, invariant violations, version-log replays that disagree with stored state), the server folds the audit stream into one open `breach`-tagged card per (task, class) on the Board — the loop's fingerprint and its sample event, ready to investigate. A closed card never re-arms its key: every card stamps a fold high-water (the newest event its adjudication covered — its raised group plus everything that coalesced while it was open), and a later fold trigger counts only events strictly above that mark, so already-adjudicated events can never resurrect as a duplicate card while they remain in the lookback (BR#3443); genuinely new events raise a fresh card. Not every rejection counts: claim races never do — both a raced double-claim (lifecycle-edge rejections) and a non-owner's attempt to release a claimed card (the ownership gate's `release-needs-ownership` rejections, e.g. a dispatched session's rule-9 release on a runner-claimed task) classify as `claim_race` and are priced as noise, so no pile-up of them ever raises a breach card (BR#3337, BR#3429). The classifier matches the guard's *structural pair* (`claimed by` + `only the owner`), not a sentence literal — a wording edit to the gate message can no longer silently re-classify its rejections (PR #210's proven-unblock rewording did exactly that until BR#3611). Three release-protocol truths ride with it: a **gateway may release its own attributed claim** (claims are attributed — owner = the dispatched agent — so the raw gateway actor never matches the owner; the self-release exemption is token-derived and unforgeable, while a *different* gateway's release stays gated), and the **runner only posts its "stale claim released" note when the release actually happened** — a refused release stays noteless (the board never records a release that didn't happen) — and the **stale-claim flow re-checks the live card before touching it**: a release fires only while the card is still `in_progress` and still attributed to this runner, so a card the watchdog already redirected (blocked) or another dispatcher already re-claimed is skipped outright (no rejection, no note, no re-claim), and the recovery re-claim carries a resolution note re-stamping the card's own blocked reason + unblock condition (BR#3823). The replay fold re-anchors across historical chain gaps (a row that doesn't chain is healed and, when it's the newest row, audited as a `chain_break`) — the breach fires when the fold's end state disagrees with the stored status, not forever after on ancient damage (BR#3322). Known gates get named classes: the BR#3578 fail-closed typed-await park gates classify as `gate:blocked-needs-typed-await` (a park with no grammar-valid await_event) and `gate:malformed-await-event` (an await_event that fails the closed grammar — e.g. a `run_id` sent as a number) instead of folding into the `unclassified` bucket (BR#3738), and the verdict-done receipts gate classifies as `gate:verdict-receipts` — a rejection carrying the audited ` [rule: <name>]` tag classifies by its rule name FIRST (the gate's own message embeds "PR link", which the older message-stem ladder mis-folded as `gate:review-needs-pr`, leaving the receipts class unreachable for its own gate; specimens BR#3735, BR#4291), with the stems kept as the fallback for suffix-less legacy reasons (BR#4295). The BR#4067 release-hold backstop classifies its refusals too: a machine silence- or owner-death release correctly held by a typed wait or a train queue slot is benign by design — the proxy watch / the answer / the train owns the exit — so its rejections classify as `release:held-typed-await` / `release:held-train-queue` instead of piling into `unclassified` (specimens TASK-016/BR#4563, BR#3727/BR#4573). And the blocked-park drain's ask-ref scan is word-bounded, so an unblock condition naming a task id (`TASK-016`) no longer yields the phantom ref `ASK-016` that made the drain re-attempt a refused release every sweep tick (BR#4563). The receipts gate's rejection and every unblock-duty spawn template now teach the accepted note shape — any URL, or one of the verdict tokens (`PR` / `merged` / `passed` / `unblocked` / `still blocked`) — so a duty holder closing with honest findings prose passes on the first try instead of burning rejections (each rejection is a breach event) reverse-engineering the matcher from source (BR#4295). And the bootstrap teaches every dispatched session the retry law that keeps the loops from forming at all (rule 4c + a mirrored PROTOCOL CARD clause, BR#4474): a 5xx / `infra_storage_fault` is retryable — same transition, backoff, heartbeat — while a SEMANTIC gate rejection (the error text names a rule: "gate: …", "requires …", "separation of duties", "open child", "malformed") is TERMINAL for that attempt — stop, read what it names, resolve the named precondition or take a lifecycle-legal edge; retrying a gate-rejected transition cannot succeed and every retry is an audited breach event (the 2026-10-28/29 storage-fault era uncorked four `gate:open-children` cards in 18 minutes from exactly these loops — BR#4403, BR#4473). And the BR#4067 release-hold backstop classifies as `release_held`, priced as noise like `claim_race`: a machine sweep's release attempt on a card parked on a typed wait or a merge-train queue slot being refused IS the system working (zero state destroyed — the proxy watch / the answer owns the exit), so no pile-up of refusals ever raises a breach card (BR#4562, specimen TASK-001) — and the pricing covers the NAMED held spellings too (`release:held-typed-await` / `release:held-train-queue`, the tagged-refusal classes above): they exist so the Log says WHAT held, not so the same benign refusals can re-arm breach cards under a different name (BR#6654: three tagged refusals on an awaiting-ci car raised exactly such a card, 2026-11-05). The park-drain sweep that kept re-attempting those refusals every tick now checks the same hold its sibling sweeps check before releasing — a held park is waited out, not re-refused — and the owner-death release leg joins that hold-check family (it was the last release path attempting bare, re-manufacturing a refused release once per alarm tick until the owner's next live session), and the full alarm sweep gained an `admin.alarm_sweep` drill, since the drain was previously reachable by no test path at all. The durable-execution mutation fence joins the same never-a-breach family: a write from a bound runner token whose execution attempt is not a live bound running attempt (expired lease, quiesced/stopping attempt, claim or generation mismatch) is refused with "gate: execution mutation fenced — stop and checkpoint; runner must verify restore/quiescence before resuming" — the fence refusing a stale writer IS the system working (zero state destroyed, and the refusal's own instruction is to stop, checkpoint and re-establish), so those refusals classify `execution_fence` and are priced never-a-breach — no pile-up of them ever raises a breach card, and the Log says WHAT fenced (specimens BR#7008/BR#7028: 3 compliant fence events on BR#5971, 2026-11-06, folded `unclassified` and raised a card until BR#7008 named the class). And the typed execution-wait exit gate joins the same family: any ordinary transition/ask/timeout on a card whose exit a durable execution wait owns (`local_handoff`/`executor_capability` typed waits, or a local handoff preparing/waiting) is refused with "gate: typed local/capability wait owns this exit; ordinary transitions/asks/timeout cannot release it" — the gate refusing IS the wait owning the exit (zero state destroyed), so those refusals classify `release:held-execution-wait` and are priced never-a-breach: a refusal storm on a held card can never arm a breach card, and the Log says WHAT held (specimen BR#6642: 3 watchdog release attempts, 2026-11-05 23:30:41–58Z, folded `unclassified` and raised BR#6740 until this class named it).
 - **Decisions collect consensus (BR#903)**: proposing a decision auto-spawns a `Feedback:` round (a question node) — agents contribute agree/disagree with reasons via `log_progress`; orient surfaces the open rounds (`decisions_awaiting_consensus`) and For Me shows the tally next to your accept/reject buttons. The round informs you; it never gates you. **Verify-verdicts spawn no round** (BR#5377): a machine verdict is not a consensus-seeking proposal — it applies on filing, so there is nothing to collect; supersede is the one human leg left.
 
 
@@ -3631,3 +3718,55 @@ old result is finalizing. A successful process exit never closes a task or
 fabricates review acceptance. Unfinished claims return through the same scheduler
 with their prior result attached; independent waits, local handoffs, unknown
 operations, host affinity and the persistent retry budget remain enforced.
+
+Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
+
+Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.
+
+Recovery banners and readiness use only the current stopped or observed main revision. Historical recovery episodes remain visible as evidence, but their activity cannot replace the current repair, and a later revision’s failed deployment does not erase their verification receipts.
+
+Human requests show the action owner (You or Bridge), the complete instructions, and target links before the answer buttons. A human-owned action must be performed using the human's own account; sending an answer neither performs it nor grants Bridge that account's permissions. Owner-only recovery merges include the PR link and an exact-head GitHub CLI command. Bridge observes the merge and deployment automatically; DONE reports an already completed merge.
+
+Train activity messages use fresh executor facts for the current candidate. Historical bounce metadata cannot override a later ready result or turn a failed hub request into a claim that a new review is needed. Expired or missing observations return to checking; this presentation never grants merge authority.
+
+The train reads canonical task state using `get_artefact` with `view: "execution"`, including at the final merge check. Optional related-work and semantic search are excluded from this control path. Ordinary agent reads retain full discovery; both views share the same task, admission, and carry records.
+
+The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
+
+Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).
+
+
+### Provider failure evidence and bounded historical recovery
+
+Gateway terminal receipts retain structured, sanitized ACP provider causes separately
+from task output. Unknown provider messages remain diagnostic evidence; empty output
+or “no deployments” alone does not establish exhausted credits. Missing checkpoint
+working directories hold the exact delivery stage and original outcome rather than
+repeatedly launching a failing Git process or inventing a successful checkpoint.
+
+For historical provider failures stranded by the retry counter, an authenticated
+full agent can attest a fresh request against the configured model and token allowance.
+The one-use recovery permit binds that proof to the exact task revision, stopped
+attempt, terminal evidence, checkpoint and selected route. Original counters and
+receipts remain intact. The next worker receives the authorized continuation;
+unknown external operations and independent human or lifecycle holds still prevent
+admission. This reconciliation mechanism does not yet implement automatic provider
+circuit recovery or task replanning, and billing confirmation alone is not health proof.
+
+
+An explicit larger-model escalation now receives its own bounded allowance of
+three failed generations. The lifetime failure counter stays intact; changing a
+session, model alias, timestamp or ordinary task metadata does not renew it.
+Independent review and executor escalation both bind the new strategy to the task
+revision and enforce its minimum model tier through scheduling and launch.
+A deadline poll and finalization charge the same generation only once. Existing
+timeout charges are recognized from exact saved begin/poll receipts, never merely
+from a stopped process. Exhaustion at the largest tier and automatic dependency
+recovery still require the remaining diagnosis and recovery lifecycle work.
+
+
+OpenCode provider retry notifications retain their typed, sanitized failure cause when a prompt loses its response or times out. A cleared retry or an authoritative prompt response takes precedence, so an earlier quota error cannot turn a later tool failure into an account-action request. Session and child-session boundaries prevent unrelated notifications from being attributed to the attempt. This improves failure evidence; it does not itself authorize another attempt or prove provider recovery.
+
+Archived ACP routing failures with the complete LiteLLM unavailable-route error can use the existing one-attempt recovery permit. The error does not identify a billing problem. A fresh configured request and a quiesced attempt with no unresolved external effects are still required.
+
+A successful request through the configured proxy can authorize one trial per task revision for an unavailable route. This receipt verifies the tested request ceiling. Authentication and quota recovery still require the configured output ceiling to be verified. The hub keeps the consumed trial in the original begin receipt even if a later permit replaces it.

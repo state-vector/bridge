@@ -494,3 +494,39 @@ describe("POST /api/kb/force_review — the human force-review plane (BR#4962)",
     expect(viewsSrc).toContain('"ask", "awaiting"');
   });
 });
+
+describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (BR#4849)", () => {
+  // Source assertions on the real component (no UI rig exists — repo
+  // convention, Ray 2026-10-29: "its critical we reflect this and show a) who
+  // broke it and b) who is fixing it"): a red main must be the loudest thing
+  // on the panel, the two accountability answers must render, and UNOWNED
+  // must be impossible to miss.
+  const trainPanelSrc = readFileSync(new URL("../../ui-kit/src/views/TrainPanel.tsx", import.meta.url).pathname, "utf8");
+
+  it("renders the banner only for a current typed main-failed stop, above the lane table", () => {
+    expect(trainPanelSrc).toContain('l.line?.phase === "stopped" && l.line.blocker === "main_failed"');
+    expect(trainPanelSrc).toContain("STOP-THE-LINE");
+    // banner markup sits before the column head in source order — it is read first
+    expect(trainPanelSrc.indexOf("train-stopline")).toBeGreaterThan(-1);
+    expect(trainPanelSrc.indexOf("train-stopline")).toBeLessThan(trainPanelSrc.indexOf("train-head-cols"));
+  });
+
+  it("shows the recorded culprit or an unconfirmed landing for the failing commit", () => {
+    expect(trainPanelSrc).toMatch(/stopped\s*\?\s*stopped\.culprit_task/);
+    expect(trainPanelSrc).toContain("broke it:");
+    expect(trainPanelSrc).toMatch(/failingSha\s*&&\s*l\.last_merge\?\.merge_sha\s*===\s*failingSha/);
+    expect(trainPanelSrc).toContain("landing at the failing commit, unconfirmed");
+  });
+
+  it("answers WHO IS FIXING IT: the episode task with owner/executor — or a loud UNOWNED chip", () => {
+    expect(trainPanelSrc).toContain("fixing it:");
+    expect(trainPanelSrc).toMatch(/red\.owner \|\| red\.executor_session/);
+    expect(trainPanelSrc).toContain("UNOWNED — nobody is fixing it");
+    // the fixer line click-opens the episode task
+    expect(trainPanelSrc).toMatch(/openTask\?\.\(red\.id\)/);
+  });
+
+  it("the lane status pill consumes only the typed line projection", () => {
+    expect(trainPanelSrc).toContain('tone={tones[line.phase]} title={line.reason}>{line.label}');
+  });
+});

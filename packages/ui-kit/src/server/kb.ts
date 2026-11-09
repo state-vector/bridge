@@ -1,5 +1,5 @@
 import { getKbHubConfig } from "./config";
-import type { ExecutionModelView } from "@bridge/contracts";
+import type { ExecutionModelView, LaneOperationalState } from "@bridge/contracts";
 import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
@@ -285,12 +285,21 @@ export interface KbBaseRedResolution {
 }
 
 export interface KbTrainLane {
+  lane_state?: LaneOperationalState;
   line?: import("@bridge/contracts").TrainLineProjection;
   lane: string;
   card: string;
   lease: KbTrainLease | null;
   currently: { phase?: string; merge_sha?: string; pr?: number; head_sha?: string; merged_at?: number; task_id?: string; burst_merged?: number; burst_cap?: number } | null;
-  stop: { sha?: string; reason?: string; at?: number; pr?: number; culprit_task?: string } | null;
+  stop: {
+    sha?: string;
+    reason?: string;
+    at?: number;
+    pr?: number;
+    /** the card whose landing turned the line red (stamped by train.event stopped, BR#4849) */
+    culprit_task?: string | null;
+    failing?: { name: string; conclusion?: string | null; url?: string | null }[];
+  } | null;
   /** BR#4981: a gate-bounced head blocked on branch protection (review /
    *  required checks) — cleared by the typed self-clear when the PR lands. */
   bypass_wait?: { pr: number; task_id?: string; at: number } | null;
@@ -344,7 +353,8 @@ export interface KbTrainLane {
    *  ALL open PRs on the lane:
    *  - in_progress: active implementation or bounced back to in_progress
    *  - verifying: in verification (being verified + waiting to be verified)
-   *  - ready: verified (ACCEPT) and ready to merge */
+   *  - ready: verified (ACCEPT), no conflicts with base; exactly the green
+   *    block count, independent of lane stops or main CI/deploy holds */
   pr_stats?: { in_progress: number; verifying: number; ready: number };
   /** BR#5658 (Ray 2026-11-03, v2): all verifying + ready PRs on the lane
    *  partitioned into sequential merge batches (Batch 1 | Batch 2 | …) via
@@ -415,6 +425,18 @@ export interface KbTrainLane {
     ask: { id: string; url: string; question: string; options: string[] } | null;
     unblock: string;
   };
+  /** Compatibility view of the repair recorded on the stopped lane. */
+  red_main?: {
+    task_id: string;
+    title: string;
+    status: string;
+    owner: string;
+    executor_session: string;
+    created_ts: number;
+  } | null;
+  /** the lane's newest landed merge (train_events ledger) — the probable
+   *  "who broke it" anchor when no machine culprit was recorded on the stop */
+  last_merge?: { ts: number; pr?: number; task_id?: string; gateway?: string; merge_sha?: string } | null;
   /** Active bounce-budget escalations (BR#4688): de-queued PRs riding out
    *  their owner clock; `expired` ones are closed by the executor's gh leg. */
   escalations?: { task_id: string; pr: number; bounce_kind?: string | null; bounce_no: number; at: number; grace_until: number; ask_id?: string | null; expired: boolean; close_reason?: string }[];

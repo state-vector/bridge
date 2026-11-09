@@ -502,7 +502,7 @@ export function composeBootstrap(projectName: string, board: BoardSettings): str
     `5e. INTERACTIVE CLAIM TAKEOVER (BR#6135): the card's owner agent, a human via the web, or an authenticated FULL-AGENT credential (BR#6436: your token's LIVE tags say full agent — gateway and cron credentials are excluded, and the class is never body-declared) may claim_takeover (or transition {to:"in_progress", takeover:true}) an in_progress task whose claim a dispatched runner holds — across owners, no ownership anchor required for a full-agent token: ONE atomic write flips the holder session to the taker, no pool pass, no race window. Authority is server-verified from your token (owner label/principal, the web plane, or full-agent credential tags) — never declared. Refused on verify/unblock duty cards (separation of duties is not transferable) and on cards holding a typed wait (train slot / await_event / bound ask). If your session WAS taken over: your next state change is gate-rejected with a stand-down order — checkpoint last_will via log_progress (still open to you: worktree, branch, done/next), push nothing, end your run; your WIP survives in your registered worktree. INTERACTIVE PAUSE LAW (the BR#6068 lesson): a session about to wait on the human must BIND AN ASK to the task (ask_agent, artefact_id) — an open ask pauses the watchdog; a bare silent pause is fair abandonment and the claim is fairly lost to the pool.`,
     `6. Blocked on a decision → ask_agent immediately, bound to your task (artefact_id). The ask pauses the watchdog; the answer auto-resumes you.`,
     `6b. QUESTIONS are tasks tagged 'question' — answered, not claimed. Contribute via log_progress {id, did, will}; any number of agents, additive input. The author weighs contributions and closes it with an ADR (decision artefact, derived_from the task, contributors + receipts in the body). Answers thin? the author adds steering with specifics and re-issues the task in todo. Humans are the final escalation — consensus among agents escalates to them for the last say.`,
-    `6c. ASK QUALITY BAR — an ask must be answerable on plain reading. (a) If you recommend an option, put it FIRST in options and prefix it "(Recommended)" — the first button IS the recommendation. (b) Human-directed asks REQUIRE details: a self-contained brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected by the hub. (c) Split the fields: question ≤240 chars, details carries the full story, reason is the one-line WHY escalated. Never cram the narrative into reason or reference cards the reader hasn't read.`,
+    `6c. ASK QUALITY BAR — an ask must be answerable on plain reading. (a) If you recommend an option, put it FIRST in options and prefix it "(Recommended)" — the first button IS the recommendation. (b) Human-directed asks REQUIRE details: a self-contained brief (what this is about, current state, why it needs a human) that glosses every BR#/PR# reference in one clause — bare reference soup is rejected by the hub. (c) Split the fields: question ≤240 chars, details carries the full story, reason is the one-line WHY escalated. Never cram the narrative into reason or reference cards the reader hasn't read. (d) Name who acts: for a human-owned action say "You must", include the direct target URL and exact steps in details, and make completion buttons report work already done. Never offer to perform an owner-only action merely on approval when Bridge lacks that credential. For Bridge-owned actions say what Bridge will do after the answer.`,
     `6d. REQUEST ROUTING: use route {kind:"executor_coordination",task_id:"BR#N"} to ask the current executor of work — the recipient follows claim changes. Use route {kind:"independent_review",task_id:"BR#N"} for review: Bridge schedules/reuses a fresh review agent, no human staffing question. Agent delivery failures return to the agent pool, never become human decisions merely because a recipient is offline. Human decisions use route {kind:"human_decision"}, to:"human", only for a specific choice/authority Bridge lacks. Write the complete question in plain English: explain the user-visible issue before task/commit evidence; each option names who acts and what happens. Answer coordination via answer_ask (even "No overlap"), never log_progress: progress is commentary, not an answer.`,
     `6e. EXPLICIT EFFECTS: human_decision requests require decision {kind:authority|information|preference,task_id,context,why_human,choices:[{label,executor:bridge|human,consequence,action:resume|hold|release}]}. Diagnostics are machine recovery work, not a human choice. Operational/post-deploy tasks declare meta.completion {kind:"execution",outcome}; prerequisite delivery only resumes them. Record actual execution_result {outcome,receipts}, submit to independent outcome review, and accept with review_result {kind:"accepted_execution",task_id,receipts}. Never mark prerequisite arrival as completed execution.`,
     `6f. RECOVERY EXECUTION: a task's meta.recovery_links identifies its cause-specific recovery journals. Use train_recovery_event with that repo/base/head_sha/cause, a unique event_id, and event {kind:"diagnosed",task_id,diagnosis,next}, then {kind:"attempt_started",task_id,attempt_id,attempt_kind:"repair"|"retry"|"verification",action,next} before the action and {kind:"attempt_finished",task_id,attempt_id,outcome:"failed"|"delivered"|"inconclusive",summary,receipts,next} after the real result. A denied/replayed retry is not authorization to execute again. Report structured did/next via log_progress; a heartbeat or stdout fragment is not a repair result. Code delivery only starts verification; never claim live recovery without the matched deployment evidence and acceptance bar.`,
@@ -1894,7 +1894,8 @@ export function selectBatch(clean: boolean[], conflictPairs: [number, number][],
 
 /** BR#5658 (Ray 2026-11-03): one verifying or ready PR car in a merge batch.
  *  `state` drives the verification colour law:
- *  - "ready"     → green solid (.tb-ready): verified & ready to merge
+ *  - "ready"     → green solid (.tb-ready): verified, no conflicts with base;
+ *                 independent of lane stops or main CI/deploy holds
  *  - "verifying" → orange pulsing (.tb-verifying): actively being verified now
  *  - "waiting"   → orange solid (.tb-wait): waiting to be verified */
 export interface TrainBatchCar {
@@ -1945,7 +1946,11 @@ export function partitionMergeBatches<T extends { id: string; pr?: number; state
         if (prConflict(remaining[a], remaining[b])) subPairs.push([a, b]);
       }
     }
-    const chosenSub = selectBatch(clean, subPairs, cap);
+    let chosenSub = selectBatch(clean, subPairs, cap);
+    // A conflict between ready PRs can spread them across batches. Do not
+    // let an unverified PR in an earlier batch overtake a deferred ready PR.
+    const hasDeferredReady = remaining.some((idx, si) => ordered[idx].state === "ready" && !chosenSub.includes(si));
+    if (hasDeferredReady) chosenSub = chosenSub.filter(si => ordered[remaining[si]].state === "ready");
     if (!chosenSub.length) {
       // safety fallback (clean is all-true so selectBatch always picks >=1)
       batches.push([ordered[remaining.shift()!]]);
@@ -2099,8 +2104,10 @@ export type RootFixBinding = { repo: string; head_sha: string };
  *  `root_blocker_for_lane` ("<repo>@<base>") by the field — BR#6390, the
  *  2026-11-04 BR#6378 shape, which hub code never mints but must still
  *  recognize). */
-export function mainRedBinding(meta: any): RootFixBinding | null {
+export function mainRedBinding(meta: any, base?: string): RootFixBinding | null {
   const b = meta?.root_fix;
+  const boundBase = b?.base ?? String(meta?.root_blocker_for_lane ?? "").split("@")[1] ?? "main";
+  if (base && boundBase !== base) return null;
   if (b && typeof b === "object") {
     const repo = typeof b.repo === "string" ? b.repo : "";
     const sha = typeof b.head_sha === "string" ? b.head_sha : "";
@@ -2907,6 +2914,7 @@ export type CandidateGatePhase =
   | { phase: "head_uncovered"; legNumber: number; stamped: string }
   | { phase: "mergeability_computing"; reason: string }
   | { phase: "conflicting" }
+  | { phase: "commit_evidence_missing" }
   | { phase: "unverified_commits"; count: number }
   | { phase: "unhandled_merge_state"; state: string }
   | {
@@ -2953,6 +2961,7 @@ export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhas
   if (rawState !== "clean" && rawState !== "unstable" && rawState !== "behind" && rawState !== "blocked") {
     return { phase: "unhandled_merge_state", state: rawState };
   }
+  if (!i.commits.some((c) => c.sha === i.headSha)) return { phase: "commit_evidence_missing" };
   const unverified = i.commits.filter((c) => !c.verified).length;
   if (unverified > 0) {
     return { phase: "unverified_commits", count: unverified };
@@ -2968,7 +2977,9 @@ export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhas
     const allBaseHealth = names.length > 0 && names.every((n) => isBaseHealthGateName(n));
     const allMainGreen = names.length > 0 && names.every((n) => n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
     const noneMainGreen = names.every((n) => !n.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN));
-    if (allBaseHealth && noneMainGreen) {
+    if (allBaseHealth && head.unsettled.length) {
+      headState = { kind: "pending", unsettled: head.unsettled };
+    } else if (allBaseHealth && noneMainGreen) {
       headState = { kind: "red_circular_deploy_gate", names };
     } else if (allMainGreen) {
       headState = { kind: "red_circular_main_green_gate", names };
@@ -3041,6 +3052,8 @@ export function decideTrainGate(i: TrainGateInput): MergeAction {
         defect: `PR #${i.prNumber} mergeStateStatus=${phase.state} — not clean. Fix the named state (rebase/re-sign) and re-enter — the accepted BR verify verdict is the approval of record (BR#4633 L4.2); there is no GitHub re-approve leg`,
         bounceKind: "gate",
       };
+    case "commit_evidence_missing":
+      return { kind: "skip", reason: "Commit signature evidence does not cover the live head; wait for a complete GitHub read" };
     case "unverified_commits":
       return {
         kind: "human_leg",
@@ -3513,7 +3526,7 @@ export function trainBaseRedAskBrief(
   held: number,
   fix: {
     card: { id: string; title?: string; status?: string; exhausted?: boolean; blocked_reason?: string } | null;
-    curePr: { repo: string; number: number } | null;
+    curePr: { repo: string; number: number; head_sha?: string } | null;
     culpritPr: number | null;
   },
 ): { details: string; options: string[] } {
@@ -3560,16 +3573,16 @@ export function trainBaseRedAskBrief(
       ? [
           ``,
           `# HUMAN GATE — your one action`,
-          `Merge fix PR **${fix.curePr.repo}#${fix.curePr.number}** yourself, then click **DONE** below:`,
+          `**You must merge** fix PR **${fix.curePr.repo}#${fix.curePr.number}** using your repository-owner account. Bridge cannot perform this bypass; answering here does not grant it your permissions.`,
           ``,
           `1. Open the PR: https://github.com/${fix.curePr.repo}/pull/${fix.curePr.number}`,
           `2. Merge it (Squash and merge — you hold the bypass) or run:`,
           `   \`\`\``,
-          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+          `   gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash${fix.curePr.head_sha ? ` --match-head-commit ${fix.curePr.head_sha}` : ""}`,
           `   \`\`\``,
-          `3. Come back here and click **DONE — PR #${fix.curePr.number} merged**.`,
+          `3. Bridge detects the merge automatically and watches the deployment. You may also click **DONE — PR #${fix.curePr.number} merged** after merging; that button only reports completion.`,
           ``,
-          `Why you: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`. Bridge's gateway cannot bypass branch protection (no admin). When you click DONE, the train picks up the merge, waits out main's deploy, and the ${held} held PR${held === 1 ? "" : "s"} drain automatically.`,
+          `Why you: main is red on the check(s) above, so the required branch gate fails on every PR — including this fix PR itself — until the fix lands on \`${lane.base}\`. Bridge's gateway cannot bypass branch protection (no admin). After GitHub confirms the merge, Bridge waits for main's deployment to pass before the ${held} held PR${held === 1 ? "" : "s"} drain automatically.`,
           ``,
           `If you **DECLINE**: the line holds — nothing merges until main is green again, and agent sessions keep fixing on ${fix.card ? fix.card.id : "the fix card"}. The queue drains by itself the moment main recovers.`,
         ]
@@ -3672,7 +3685,7 @@ export type BaseRedEpisodeState =
       phase: "cure_pr_awaiting_force_merge";
       warrantAsk: true;
       card: { id: string; title: string; status: string; exhausted?: boolean };
-      curePr: { repo: string; number: number };
+      curePr: { repo: string; number: number; head_sha?: string };
       conflictPr: null;
       mergedPr: null;
       culpritPr: number | null;
@@ -3690,7 +3703,7 @@ export type BaseRedEpisodeState =
 
 export function classifyBaseRedEpisodeState(fix: {
   card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
-  curePr?: { repo: string; number: number } | null;
+  curePr?: { repo: string; number: number; head_sha?: string } | null;
   conflictPr?: { repo: string; number: number } | null;
   mergedPr?: { repo: string; number: number; merge_sha: string } | null;
   culpritPr?: number | null;
@@ -3715,11 +3728,11 @@ export function classifyBaseRedEpisodeState(fix: {
       phase: "cure_pr_awaiting_force_merge",
       warrantAsk: true,
       card,
-      curePr: { repo: fix.curePr.repo, number: fix.curePr.number },
+      curePr: { ...fix.curePr },
       conflictPr: null,
       mergedPr: null,
       culpritPr,
-      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash`,
+      command: `gh pr merge ${fix.curePr.number} --repo ${fix.curePr.repo} --admin --squash${fix.curePr.head_sha ? ` --match-head-commit ${fix.curePr.head_sha}` : ""}`,
     };
   }
   if (fix?.mergedPr && Number.isInteger(fix.mergedPr.number) && fix.mergedPr.number > 0) {
@@ -3801,16 +3814,25 @@ export function trainBaseRedAskWarranted(fix: {
   return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
 }
 
-/** BR#6012 canonical 4-state operational state machine for a merge lane.
+/** BR#6012 canonical operational state machine for a merge lane.
  *  Resolves `stop`, `currently`, and `base_red_resolution` into a single
- *  mutually-exclusive `LaneOperationalState` (`idle` | `draining_batch` |
- *  `settling_ci` | `stopped_red`), persisted atomically in the `lane_state`
+ *  mutually exclusive `LaneOperationalState`, persisted atomically in the `lane_state`
  *  SQLite table so the hub and UI never reconstruct state from contradictory
  *  fragments. */
 export function resolveLaneOperationalState(input: {
-  baseState?: { verdict?: string; tip_sha?: string; red?: { name: string; url?: string }[] } | null;
+  baseState?: {
+    verdict?: string;
+    tip_sha?: string;
+    red?: { name: string; url?: string }[];
+    gate_blocked?: boolean;
+    gate_red?: { name: string }[];
+    gate_unsettled?: string[];
+    deploy_coverage?: { phase: string } | null;
+  } | null;
+  baseObservedAt?: number;
   stop?: {
     sha?: string;
+    at?: number;
     reason?: string;
     failing?: { name: string; url?: string }[];
     culprit_task?: string;
@@ -3828,9 +3850,19 @@ export function resolveLaneOperationalState(input: {
   fixCard?: TrainFixCard | null;
   now: number;
 }): LaneOperationalState {
-  const { currently, episodeState, fixCard, now } = input;
-  const stop = input.baseState?.verdict === "red" && input.baseState.tip_sha
-    ? { sha: input.baseState.tip_sha, failing: input.baseState.red ?? [], culprit_task: input.stop?.culprit_task }
+  const { baseState, currently, episodeState, fixCard, now } = input;
+  const observedAfterStop = (input.baseObservedAt ?? now) >= (input.stop?.at ?? 0);
+  const verdict = baseState?.verdict;
+  const tip = baseState?.tip_sha;
+  const gateFailed = baseState?.gate_blocked && (!!baseState.gate_red?.length || !baseState.gate_unsettled?.length);
+  if (input.stop?.sha && tip && /^[0-9a-f]{40}$/.test(tip) && tip !== input.stop.sha && observedAfterStop && !gateFailed
+    && baseState?.deploy_coverage?.phase !== "failed" && (verdict === "unsettled" || verdict === "green")) {
+    return { phase: "verifying_base", tip_sha: tip, verdict, updated_ts: now };
+  }
+  const redTip = verdict === "red" && tip;
+  const stop = redTip && observedAfterStop
+    ? { sha: redTip, failing: input.baseState?.red ?? [],
+        culprit_task: input.stop?.sha === redTip ? input.stop.culprit_task : null }
     : input.stop;
   if (stop && stop.sha) {
     const failingChecks = Array.isArray(stop.failing)
@@ -4000,6 +4032,10 @@ export const DEPLOY_RECONCILE_GRACE_SECS = 300;
 
 export type DeployWorkflowRun = {
   id: number;
+  /** BR#8824: canonical same-run rerun identity (a GitHub rerun is a new
+   *  attempt of the same run id) — rides the observation into the covered
+   *  state's `covered_by_run_attempt`. */
+  run_attempt?: number | null;
   name: string;
   path?: string | null;
   head_sha: string;
@@ -4206,6 +4242,7 @@ export function reconcileDeployCoverage(input: {
         tip_age_secs: tipAgeSecs,
         covered_by_sha: tipSha,
         covered_by_run_id: tipGreen?.id ?? null,
+        covered_by_run_attempt: tipGreen?.run_attempt ?? null,
         covered_by_url: tipGreen?.html_url ?? null,
       },
       dispatch_workflow: null,
@@ -4447,7 +4484,9 @@ export function applyDeployObservation(
   if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
   const raw: Record<string, unknown> & { check_observed_at: number } = { ...(baseState ?? { verdict: "empty", red: [], unsettled: [] }),
     check_observed_at: checksObservedAt ?? Number(baseState?.check_observed_at ?? 0) };
-  const knownRun = Math.max(...observation.runs.filter((r) => r.head_sha === observation.tip_sha).map((r) => r.id));
+  const matchingRuns = observation.runs.filter(r => r.head_sha === observation.tip_sha);
+  const knownRun = Math.max(...matchingRuns.map(r => r.id));
+  const knownAttempt = Math.max(1, ...matchingRuns.filter(r => r.id === knownRun).map(r => r.run_attempt ?? 1));
   const newerCoverage = DeployCoverageStateSchema.safeParse(raw.deploy_coverage);
   if (raw.check_observed_at > observation.observed_at && newerCoverage.success && newerCoverage.data.tip_sha === observation.tip_sha) {
     const cov = newerCoverage.data;
@@ -4455,7 +4494,10 @@ export function applyDeployObservation(
     // A newer, matching terminal receipt supersedes an older observation.
     // This lets an ordinary gateway publish recovery after a watched rerun;
     // a borrowed older green run cannot clear the failure or pending state.
-    if (receipt != null && receipt >= knownRun) return normalizeBaseStateWithCoverage(raw);
+    const receiptAttempt = cov.phase === "covered" ? cov.covered_by_run_attempt ?? 1 : 1;
+    if (receipt != null && (receipt > knownRun || (receipt === knownRun && receiptAttempt >= knownAttempt))) {
+      return normalizeBaseStateWithCoverage(raw);
+    }
   }
   const verdict: MainCheckVerdict = {
     verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",

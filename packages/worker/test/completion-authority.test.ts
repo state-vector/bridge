@@ -183,6 +183,38 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect((await get(review)).status).toBe("in_progress");
   });
 
+  it("accepts an explicitly echoed revision through a cached connector's top-level field", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const revision = (await get(review)).meta.review_subject!.revision;
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: revision, review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await get(review)).meta.review_result).toMatchObject({ subject_revision: revision });
+    expect((await get(id)).status).toBe("done");
+  });
+
+  it("rejects conflicting transport revisions without recording acceptance", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: "different-submission", review_result: result });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("conflicting review subject_revision");
+    expect((await get(review)).status).toBe("in_progress");
+    expect((await get(id)).status).toBe("in_review");
+  });
+
+  it("fences a top-level revision against a changed submission", async () => {
+    const { id, review } = await submission(["analysis"]);
+    const revision = (await get(review)).meta.review_subject!.revision;
+    expect((await call("update", { id, body_md: "Changed outcome definition" })).status).toBe(200);
+    const refused = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      subject_revision: revision, review_result: { kind: "accepted_execution", task_id: id, receipts: [receipt] } });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toContain("subject_revision");
+    expect((await get(id)).status).toBe("in_review");
+  });
+
   it.each(["definition edit", "repository input edit", "repository input deletion", "identical resubmission"])("fences late acceptance after %s", async change => {
     const { id, review } = await submission(["analysis"], { repo: "https://github.com/state-vector/original-input" });
     const result = await resultFor(review, { kind: "accepted_execution", task_id: id, receipts: [receipt] });

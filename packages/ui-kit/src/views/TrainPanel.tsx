@@ -120,6 +120,92 @@ export function LaneRecoveryHistory({ line, now, openTask }: { line: TrainLinePr
 }
 
 const REFRESH_MS = 30_000;
+
+
+/** BR#4849: the stop-the-line banner — a red main must be the FIRST thing the
+ *  Top view says (Ray 2026-10-29: "its critical we reflect this and show a)
+ *  who broke it and b) who is fixing it"). Two accountability lines:
+ *  - broke it: the recorded culprit, or the landing at the failing commit
+ *    (labeled unconfirmed);
+ *  - fixing it: a pending action from the current line, or the root repair
+ *    with its owner/executor. Keep unclaimed repair work visible. */
+function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; openTask?: (id: string) => void }) {
+  const repo = l.lane.split("@")[0];
+  const line = l.line ?? unavailable;
+  const remediation = line.remediation;
+  const red = remediation && (remediation.kind === "agent" || remediation.kind === "queued" || remediation.kind === "blocked") ? remediation.task : null;
+  const stopped = l.lane_state?.phase === "stopped_red" ? l.lane_state : null;
+  const failingSha = stopped?.failing_sha ?? l.stop?.sha;
+  const culprit = stopped ? stopped.culprit_task : l.stop?.culprit_task ?? null;
+  const lastMerge = failingSha && l.last_merge?.merge_sha === failingSha ? l.last_merge : null;
+  const fixer = red?.active_agent ? red.owner || red.executor_session : "";
+  const pendingAsk = remediation?.kind === "blocked"
+    ? remediation.task.execution_blockers?.find((blocker) => blocker.kind === "human_answer_required")
+    : undefined;
+  return (
+    <div className="train-stopline" role="alert">
+      <div className="train-stopline-head">
+        <span className="train-stopline-flag">⛔ STOP-THE-LINE</span>
+        <span className="train-stopline-line">main RED — {l.lane}</span>
+      </div>
+      <div
+        className="train-stopline-why"
+        title={[line.reason, ...line.evidence.map((f) => f.name)].join(" · ")}
+      >
+        {line.reason}
+        {failingSha ? <span className="top-num"> @ {failingSha.slice(0, 9)}</span> : null}
+      </div>
+      <div className="train-stopline-who">
+        <span
+          className="train-stopline-cell"
+          title="The recorded culprit or the landing at the failing commit"
+        >
+          broke it:{" "}
+          {culprit ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(culprit)}>{culprit}</a>
+          ) : lastMerge?.pr ? (
+            <>
+              <a className="train-stopline-who-link" href={`https://github.com/${repo}/pull/${lastMerge.pr}`} target="_blank" rel="noreferrer">#{lastMerge.pr}</a>
+              {" "}by {lastMerge.gateway ?? "?"}
+              {lastMerge.task_id ? <> — <a className="train-stopline-who-link" onClick={() => openTask?.(lastMerge.task_id!)}>{lastMerge.task_id}</a></> : null}
+              {" "}<span className="muted-note">(landing at the failing commit, unconfirmed)</span>
+            </>
+          ) : (
+            <span className="muted-note">unconfirmed for this commit</span>
+          )}
+        </span>
+        <span className="train-stopline-cell" title="Recovery for the failing commit">
+          fixing it:{" "}
+          {remediation?.kind === "merge" ? (
+            <a className="train-stopline-who-link" href={remediation.request?.url ?? remediation.url}
+              target="_blank" rel="noreferrer" title={remediation.text}>Awaiting merge action for PR #{remediation.pr}</a>
+          ) : remediation?.kind === "human" ? (
+            <TaskLink id={remediation.action.id} url={remediation.action.url} openTask={openTask}>Awaiting action · {remediation.action.id}</TaskLink>
+          ) : pendingAsk ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(pendingAsk.ask_id)}
+              title={pendingAsk.text}>Awaiting action · {pendingAsk.ask_id}</a>
+          ) : red ? (
+            <>
+              <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
+              {fixer ? (
+                <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
+              ) : remediation?.kind === "queued" ? (
+                <Chip tone="warn" title={remediation.text}>Recovery queued</Chip>
+              ) : (
+                <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
+                  ⚠ UNOWNED — nobody is fixing it
+                </Chip>
+              )}
+            </>
+          ) : (
+            remediation ? <Recovery action={remediation} now={now} openTask={openTask} /> : <span className="muted-note">Recovery status unavailable</span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function HubRequestDiagnostics({ now }: { now: number }) {
   const [snapshot, setSnapshot] = useState<HubDiagnostics | null>(null);
   const [loading, setLoading] = useState(false);
@@ -174,6 +260,9 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
       <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
+    {!error && (activeLanes ?? []).filter((l) => l.line?.phase === "stopped" && l.line.blocker === "main_failed").map((l) => (
+      <StopLineBanner key={`stopline-${l.lane}`} l={l} now={now} openTask={openTask} />
+    ))}
     {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
     {!!activeLanes?.length && <div className="ktable-head train-head-cols">
       <span title="Executor heartbeat" aria-label="Executor heartbeat">●</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
@@ -203,7 +292,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog"><span className="train-stats">
-          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready" title="Ready to merge: verified, no conflicts with base">{stats.ready} ready</span>
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}

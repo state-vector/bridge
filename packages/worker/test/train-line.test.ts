@@ -108,11 +108,36 @@ describe("one line status and recovery contract", () => {
       cause: { kind: "capability_unavailable", check: "Smoke", scenario: "php", capability: "callers", scope: "User.php:2416" }, event_id: "cause", actor: "observer", now,
       event: { kind: "observed", task_id: "BR#6494", next: "Publish callers repair", source: { head_sha: "7".repeat(40), run_id: 100, run_attempt: 1, url: "https://github.com/o/r/actions/runs/100" } } });
     const recoveries = [{ episode, task: { ...task, id: "BR#6494" } }];
-    expect(withRecoveryEpisodes(line, recoveries)).toMatchObject({ remediation: { kind: "agent", task: { id: "BR#6494" } } });
-    expect(withRecoveryEpisodes(line, [{ episode, task: { ...task, id: "BR#6494", active_agent: false } }])).toMatchObject({ remediation: { kind: "queued", task: { id: "BR#6494" } } });
+    const scope = { kind: "current" as const, head_sha: episode.head_sha, task_ids: ["BR#6494"] };
+    expect(withRecoveryEpisodes(line, recoveries, scope)).toMatchObject({ remediation: { kind: "agent", task: { id: "BR#6494" } } });
+    expect(withRecoveryEpisodes(line, [{ episode, task: { ...task, id: "BR#6494", active_agent: false } }], scope)).toMatchObject({ remediation: { kind: "queued", task: { id: "BR#6494" } } });
     if (line.phase !== "stopped") throw new Error("expected stopped fixture");
     const human = { ...line, remediation: { kind: "human" as const, text: "Missing credential", action: { id: "BR#2", url: "https://hub.test/card/BR-2", question: "Grant access?", options: ["Grant"] } } };
-    expect(withRecoveryEpisodes(human, recoveries).remediation).toEqual(human.remediation);
+    expect(withRecoveryEpisodes(human, recoveries, scope).remediation).toEqual(human.remediation);
+  });
+  it("historical episodes cannot replace the current repair or hold a healthy current head", () => {
+    const head = "8".repeat(40), oldHead = "7".repeat(40);
+    const make = (sha: string, id: string) => reduceRecoveryEpisode(undefined, {
+      head_sha: sha, cause: { kind: "check_failure", check: "Deploy Dev" },
+      event_id: `observed-${id}`, actor: "observer", now,
+      event: { kind: "observed", task_id: id, next: "Repair", source: {
+        head_sha: sha, run_id: 100, run_attempt: 1, url: "https://github.com/o/r/actions/runs/100",
+      } },
+    });
+    const historical = { episode: make(oldHead, "BR#7123"), task: { ...task, id: "BR#7123", active_agent: true } };
+    const current = { episode: make(head, "BR#7540"), task: { ...task, id: "BR#7540", active_agent: false } };
+    const scope = { kind: "current" as const, head_sha: head, task_ids: ["BR#7540"] };
+    const line = projectTrainLine(facts({ stop: { reason: "Deployment failed" } }), now);
+    const recoveries = [historical, current]; // same timestamp; old task is active and inserted first
+    expect(withRecoveryEpisodes(line, recoveries, scope)).toMatchObject({
+      remediation: { kind: "queued", task: { id: "BR#7540" } }, recoveries,
+    });
+    expect(withRecoveryEpisodes(line, [historical], scope).remediation).toEqual(line.remediation);
+    expect(withRecoveryEpisodes(line, recoveries, { kind: "unobserved" }).remediation).toEqual(line.remediation);
+    const ready = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "green" } } }), now);
+    expect(ready.phase).toBe("ready");
+    expect(withRecoveryEpisodes(ready, [historical], scope)).toMatchObject({ phase: "ready", recoveries: [historical] });
+    expect(withRecoveryEpisodes(ready, recoveries, scope).phase).toBe("waiting");
   });
   it("runner transcripts remain diagnostic output, never an invented next action", () => {
     const runner = { ...task, last_progress: { note: "runner: agent output — timing suggests classifier...", ts: now } };
@@ -165,6 +190,20 @@ describe("one line status and recovery contract", () => {
     } };
     expect(applyDeployObservation(state, observation, required, now)?.verdict).toBe("unsettled");
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_id: 123 } }, observation, required, now)?.verdict).toBe("green");
+  });
+  it.each(["failure", null] as const)("older same-run success cannot override a newer rerun (%s)", conclusion => {
+    const tip = "7".repeat(40);
+    const observation = { tip_sha: tip, observed_at: 200, runs: [{ id: 500, run_attempt: 2,
+      name: "Deploy Dev", head_sha: tip, status: conclusion ? "completed" as const : "in_progress" as const,
+      conclusion, html_url: "https://github.com/o/r/actions/runs/500" }] };
+    const state = { verdict: "green", tip_sha: tip, red: [], unsettled: [], check_observed_at: 100,
+      deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 50, covered_by_sha: tip,
+        covered_by_run_id: 500, covered_by_run_attempt: 1 } };
+    const expected = conclusion ? "red" : "unsettled";
+    expect(applyDeployObservation(state, observation, required)?.verdict).toBe(expected);
+    expect(applyDeployObservation(state, observation, required, 300)?.verdict).toBe(expected);
+    expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: undefined } }, observation, required, 300)?.verdict).toBe(expected);
+    expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: 3 } }, observation, required, 300)?.verdict).toBe("green");
   });
   it("the original empty-checks plus active Spot build is waiting, never deployment-missing", () => {
     const base_state = { verdict: "empty", red: [], unsettled: [], deploy_coverage: {

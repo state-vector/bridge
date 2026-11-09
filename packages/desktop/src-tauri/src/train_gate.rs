@@ -748,6 +748,7 @@ pub enum MergeAction {
     Note { reason: String },
     Skip { reason: String },
     HumanLeg { reason: String },
+    RootFixBypass { reason: String },
     /// BR#4689 L1.4: the head moved MECHANICALLY (same patch-ids) — stamp
     /// the carry leg (hub event `carried`) and let the next tick merge the
     /// covered head. Never a bounce, never a re-verify duty, never a
@@ -933,6 +934,7 @@ pub enum CandidateGatePhase {
     HeadUncovered { leg_number: usize, stamped: String },
     MergeabilityComputing { reason: String },
     Conflicting,
+    CommitEvidenceMissing,
     UnverifiedCommits { count: usize },
     UnhandledMergeState { state: String },
     MechanicallySound {
@@ -999,6 +1001,7 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
         "blocked" => CandidateMergeState::Blocked,
         _ => return CandidateGatePhase::UnhandledMergeState { state },
     };
+    if !i.commits.iter().any(|(sha, _)| sha == i.head_sha) { return CandidateGatePhase::CommitEvidenceMissing; }
     let unverified = i.commits.iter().filter(|(_, v)| !v).count();
     if unverified > 0 {
         return CandidateGatePhase::UnverifiedCommits { count: unverified };
@@ -1012,7 +1015,9 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
             let all_base_health = !names.is_empty() && names.iter().all(|n| is_base_health_gate_name(n));
             let all_main_green = !names.is_empty() && names.iter().all(|n| n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
             let none_main_green = names.iter().all(|n| !n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
-            if all_base_health && none_main_green {
+            if all_base_health && !head.unsettled.is_empty() {
+                CandidateHeadCheckState::Pending { unsettled: head.unsettled }
+            } else if all_base_health && none_main_green {
                 CandidateHeadCheckState::RedCircularDeployGate { names }
             } else if all_main_green {
                 CandidateHeadCheckState::RedCircularMainGreenGate { names }
@@ -1109,6 +1114,9 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             ),
             bounce_kind: BounceKind::Gate,
         },
+        CandidateGatePhase::CommitEvidenceMissing => MergeAction::Skip {
+            reason: "Commit signature evidence does not cover the live head; wait for a complete GitHub read".into(),
+        },
         CandidateGatePhase::UnverifiedCommits { count } => MergeAction::HumanLeg {
             reason: format!(
                 "PR #{n} has {count} commit(s) not GitHub-verified — signing-environment class, never per-PR",
@@ -1168,13 +1176,8 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                         | CandidateHeadCheckState::RedCircularMainGreenGate { .. }
                         | CandidateHeadCheckState::RedCircularMixedGates { .. }
                 );
-                let base_circular = i
-                    .base_red_names
-                    .iter()
-                    .any(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN))
-                    && !matches!(&head_state, CandidateHeadCheckState::RedSubstantive { .. });
-                if head_circular || base_circular {
-                    return MergeAction::HumanLeg {
+                if head_circular {
+                    return MergeAction::RootFixBypass {
                         reason: format!(
                             "PR #{n} is the bound main-breakage fix but the circular deploy-health class stands (BR#5189, SP #2617 precedent): the gate is red because MAIN is red — the head cannot go green while the line it fixes is stopped; the one-click human merge ask is the fast lane",
                             n = i.pr_number
@@ -1453,6 +1456,12 @@ pub enum DeployCoverageState {
         covered_by_sha: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_run_id: Option<i64>,
+        /// BR#8824: canonical same-run rerun identity — a new attempt of the
+        /// same run id on the same tip is a CHANGED coverage receipt (it can
+        /// recover the gate), so the executor stamps the attempt alongside the
+        /// run id. Mirrored in `DeployCoverageStateSchema` + `deployCoverageReceipt`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered_by_run_attempt: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_url: Option<String>,
     },
@@ -1799,6 +1808,7 @@ pub fn reconcile_deploy_coverage(
                 tip_age_secs,
                 covered_by_sha: tip_sha.clone(),
                 covered_by_run_id: tip_green.map(|r| r.id),
+                covered_by_run_attempt: tip_green.and_then(|r| r.run_attempt),
                 covered_by_url: tip_green.and_then(|r| r.html_url.clone()),
             },
             dispatch_workflow: None,
@@ -2392,7 +2402,7 @@ mod tests {
         // conviction must re-run — never bounce, never a human leg.
         let head = [run(1, "Test", Some("success")), run(2, "main-green gate", Some("failure"))];
         let g = MainVerdict::Green;
-        let commits = [(format!("{:040x}", 1), true)];
+        let commits = [(format!("{:040x}", 2), true)];
         let action = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: 377,
             head_sha: &format!("{:040x}", 2),
@@ -3347,7 +3357,7 @@ mod tests {
             train_owned_branch: false,
         });
         match gate {
-            MergeAction::HumanLeg { reason } => {
+            MergeAction::RootFixBypass { reason } => {
                 assert!(reason.contains("circular deploy-health class") && reason.contains("BR#5189"), "{reason}");
             }
             other => panic!("expected human fast lane, got {other:?}"),
@@ -3417,6 +3427,35 @@ mod tests {
             train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::Merge { .. }) && !matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn bypass_requires_settled_verified_covered_head() {
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        for (verified, live_head, pending, missing) in [(true, head, true, false), (false, head, false, false),
+            (true, "dddddddddddddddddddddddddddddddddddddddd", false, false), (true, head, false, true)] {
+            let mut checks = vec![run(1, "Deploy health (merge gate)", Some("failure"))];
+            if pending { checks.push(run(2, "Rust Tests", None)); }
+            let commits = if missing { vec![] } else { vec![(live_head.into(), verified)] };
+            let gate = decide_train_gate(TrainGateInput {
+                pr_number: 339, head_sha: live_head, card_meta: &meta, card_status: Some("blocked"),
+                base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
+                commits: &commits, head_checks: &checks, leg_number: Some(1),
+                mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
+                base_gate_green: false, train_owned_branch: false,
+            });
+            assert!(!matches!(gate, MergeAction::RootFixBypass { .. } | MergeAction::Merge { .. }), "{gate:?}");
+        }
+        let truncated = vec![("9".repeat(40), true)];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339, head_sha: head, card_meta: &meta, card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
+            commits: &truncated, head_checks: &[run(1, "Deploy health (merge gate)", Some("failure"))], leg_number: Some(1),
+            mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
+            base_gate_green: false, train_owned_branch: false,
+        });
+        assert!(matches!(gate, MergeAction::Skip { .. }), "{gate:?}");
     }
 
     #[test]
@@ -3634,7 +3673,7 @@ mod tests {
             train_owned_branch: false,
         });
         assert!(
-            matches!(circular_blocked, MergeAction::HumanLeg { .. }),
+            matches!(circular_blocked, MergeAction::RootFixBypass { .. }),
             "expected HumanLeg on BLOCKED circular root-fix PR, got {circular_blocked:?}"
         );
         // 3. A CONFLICTING PR (`mergeable == Some(false)`) ALWAYS bounces as Conflict,

@@ -1,394 +1,511 @@
+"""Recovery is tested as a restarted production workflow, not isolated ladders."""
 import importlib.util
 import io
+import gzip
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("supervisor", Path(__file__).with_name("supervisor.py"))
 m = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = m
 spec.loader.exec_module(m)
+OLD, NEW, NEXT, NONCE = "a" * 40, "b" * 40, "c" * 40, "d" * 32
 
 
-class UpdateTests(unittest.TestCase):
+class Crash(BaseException):
+    pass
+
+
+def archive(binary):
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode="w") as tar:
+        member = tarfile.TarInfo("bridge")
+        member.size = len(binary)
+        tar.addfile(member, io.BytesIO(binary))
+    return gzip.compress(data.getvalue(),mtime=0)
+
+
+class Machine:
+    def __init__(self, home):
+        self.home = home
+        self.clock = 10000.0
+        self.current = m.Process(123, "boot", "100", OLD)
+        self.actions = []
+        self.target = NEW
+        self.binary = b"new binary"
+        self.fetches = []
+        self.ack = True
+        self.frozen = False
+        self.children = False
+        self.waiting = False
+        self.healthy = {OLD: True, NEW: True, NEXT: True}
+        self.crash_state = None
+        self.crash_effect = None
+        self.did_crash = False
+        self.doctor_ok = True
+        self.export_source = None
+
+    def fetch(self, url, timeout):
+        self.fetches.append(url)
+        if url.endswith("tar.gz"):
+            return io.BytesIO(archive(self.binary))
+        target = "aarch64-unknown-linux-gnu"
+        return io.BytesIO(json.dumps({"schema_version": 1, "channel": "main", "commit": self.target,
+            "artifacts": {target: {"url": f"https://github.com/state-vector/bridge/releases/download/runner-{self.target}/bridge-{target}.tar.gz",
+                                   "sha256": m.hashlib.sha256(archive(self.binary)).hexdigest()}}}).encode())
+
+
+class Harness(m.Supervisor):
+    def __init__(self, machine):
+        self.machine = machine
+        super().__init__(machine.home / "bridge", machine.home)
+
+    def process(self):
+        return self.machine.current
+
+    def pid(self):
+        return self.machine.current.pid if self.machine.current else 0
+
+    def stopped(self):
+        return self.machine.current is None
+
+    def info(self, binary):
+        data = Path(binary).read_bytes()
+        return {"commit": self.machine.target if data == self.machine.binary else OLD,
+                "update_protocol": 1, "worker_protocol": 1,
+                "recovery_protocol": 1 if self.machine.export_source or not self.machine.ack else 0,
+                "coordinator_revision":m.COORDINATOR_REVISION if self.machine.export_source else 0}
+
+    def idle(self, op, process):
+        if self.machine.ack and process:
+            m.atomic(self.root / "idle.json", {"nonce": op.nonce, "pid": process.pid, "phase": "controller_ready" if op.worker_protocol==1 else "idle", "worker_protocol": op.worker_protocol})
+        return super().idle(op, process)
+
+    def health(self, op, commit, since):
+        self.assert_hold(op)
+        return self.machine.current is not None and self.machine.current.commit == commit and self.machine.healthy[commit]
+
+    def assert_hold(self, op):
+        if m.read(self.request, {}).get("nonce") != op.nonce:
+            raise AssertionError("service/health action without the exact admission hold")
+
+    def save(self, state):
+        super().save(state)
+        key = type(state).__name__ + ":" + str(getattr(state, "step", ""))
+        if self.machine.crash_state == key and not self.machine.did_crash:
+            self.machine.did_crash = True
+            raise Crash()
+
+    def service(self, action):
+        op = self.state.operation
+        self.assert_hold(op)
+        self.machine.actions.append(action)
+        if action == "stop":
+            self.machine.current = None
+        elif action == "start":
+            self.machine.current = m.Process(124 + len(self.machine.actions), "boot", str(200 + len(self.machine.actions)), self.build(self.binary))
+            if self.machine.current.commit==self.machine.target:self.machine.ack=True
+        elif action == "freeze":
+            self.machine.frozen = True
+        elif action == "thaw":
+            self.machine.frozen = False
+        if self.machine.crash_effect == action and not self.machine.did_crash:
+            self.machine.did_crash = True
+            raise Crash()
+
+    def run(self, args, timeout=60):
+        if args[1] == "doctor":
+            if not self.machine.doctor_ok:
+                raise subprocess.CalledProcessError(1, "doctor")
+        elif args[1:3] == ["recovery", "boundary"]:
+            return json.dumps({"kind": "controller_only" if self.machine.frozen and not self.machine.children else "busy"})
+        elif args[1] == "recovery" and args[2] in ("inspect", "reconcile"):
+            if args[2] == "reconcile":
+                self.machine.actions.append("reconcile")
+                if not self.machine.waiting:
+                    self.machine.ack = True
+            return json.dumps({"kind":"reconciliation","waiting": ["protected original record"] if self.machine.waiting else []})
+        elif args[1:3] == ["recovery", "source"]:
+            return self.machine.export_source
+        elif args[1] == "alarm":
+            self.machine.actions.append("notify")
+        else:
+            raise AssertionError(args)
+        return ""
+
+
+class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.bin = self.home / "bridge"
-        self.bin.write_text("old binary")
-        self.u = m.Supervisor(self.bin, self.home)
-        self.bin = self.u.binary
+        (self.home / "bridge").write_bytes(b"old binary")
+        self.machine = Machine(self.home)
+        self.u = Harness(self.machine)
+        m.atomic(self.home / ".bridge/config.json", {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}})
+        self.clock = patch.object(m.time, "time", side_effect=lambda: self.machine.clock)
+        self.clock.start();self.addCleanup(self.clock.stop)
+        self.network = patch.object(m, "fetch", side_effect=self.machine.fetch)
+        self.network.start();self.addCleanup(self.network.stop)
+        self.uname = patch.object(m.os, "uname", return_value=type("Uname", (), {"machine":"aarch64", "nodename":"test-host"})())
+        self.uname.start();self.addCleanup(self.uname.stop)
+        self.quiet = patch("builtins.print")
+        self.quiet.start();self.addCleanup(self.quiet.stop)
 
-    def test_opt_in_is_strict_and_pinned_never_updates(self):
-        for value in ({}, {"auto_update": None}, {"auto_update": {"enabled": False, "channel": "main"}},
-                      {"auto_update": {"enabled": "true", "channel": "main"}}, {"auto_update": {"enabled": True, "channel": "pinned"}}):
-            self.assertFalse(m.opted_in(value))
-        self.assertTrue(m.opted_in({"auto_update": {"enabled": True, "channel": "main"}}))
-        with patch.object(m.urllib.request, "urlopen", side_effect=AssertionError("disabled updater contacted network")):
-            self.u.reconcile()
-
-    def test_http_requests_use_the_application_user_agent(self):
-        with patch.object(m.urllib.request, "urlopen") as open_url:
-            m.fetch("https://hub.example/api/runner-updates/events", 90)
-            request = open_url.call_args.args[0]
-            self.assertEqual(request.get_header("User-agent"), "bridge-runner-updater/1")
-
-    def test_digest_origin_channel_and_commit_are_closed(self):
-        sha = "a" * 40
-        manifest = {"schema_version": 1, "channel": "main", "commit": sha, "artifacts": {"aarch64-unknown-linux-gnu": {
-            "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-aarch64-unknown-linux-gnu.tar.gz", "sha256": "b" * 64}}}
-        m.validate_manifest(manifest, "main", "aarch64-unknown-linux-gnu")
-        with self.assertRaises(ValueError):
-            m.validate_manifest(manifest, "stable", "aarch64-unknown-linux-gnu")
-        manifest["artifacts"]["aarch64-unknown-linux-gnu"]["url"] = "https://evil.invalid/bridge"
-        with self.assertRaises(ValueError):
-            m.validate_manifest(manifest, "main", "aarch64-unknown-linux-gnu")
-
-    def test_archive_does_not_extract_traversal_or_links(self):
-        for name, kind in [("../bridge", tarfile.REGTYPE), ("bridge", tarfile.SYMTYPE)]:
-            archive = self.home / "test.tgz"
-            with tarfile.open(archive, "w:gz") as tar:
-                member = tarfile.TarInfo(name)
-                member.type = kind
-                member.size = 1 if kind == tarfile.REGTYPE else 0
-                tar.addfile(member, io.BytesIO(b"x") if member.size else None)
-            with self.assertRaises(ValueError):
-                m.extract_candidate(archive, self.home / "extracted")
-
-    def test_stale_pid_nonce_and_lease_are_not_quiescence(self):
-        m.atomic(self.u.root / "idle.json", {"nonce": "old", "pid": 11, "phase": "idle"})
-        self.assertFalse(self.u.idle("new", 11))
-        self.assertFalse(self.u.idle("old", 12))
-        self.assertFalse(self.u.idle("old", 0))
-        self.assertTrue(self.u.idle("old", 11))
-
-    def test_unacknowledged_candidate_is_never_killed_for_rollback(self):
-        self.u.backup.write_text("old")
-        self.u.state = {"from_commit": "a", "to_commit": "b"}
-        m.atomic(self.u.request, {"nonce": "n"})
-        with patch.object(self.u, "pid", return_value=12), patch.object(self.u, "service") as service:
-            with self.assertRaisesRegex(RuntimeError, "not acknowledged idle"):
-                self.u.rollback()
-            service.assert_not_called()
-        self.assertTrue(self.u.request.exists())
-
-    def test_live_worker_handoff_requires_negotiated_protocol_and_exact_pid_nonce(self):
-        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 123, "phase": "controller_ready", "worker_protocol": 1})
-        self.assertFalse(self.u.idle("n", 123), "legacy updates must not mistake live workers for quiescence")
-        self.u.state["handoff_protocol"] = 1
-        self.assertTrue(self.u.idle("n", 123))
-        self.assertFalse(self.u.idle("wrong", 123))
-        self.assertFalse(self.u.idle("n", 124))
-        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 123, "phase": "controller_ready", "worker_protocol": 2})
-        self.assertFalse(self.u.idle("n", 123), "unknown worker protocols require the safe full-drain path")
-
-    def test_interrupted_install_rolls_back_under_hold_then_resumes_after_health(self):
-        self.bin.write_text("candidate")
-        self.u.backup.write_text("previous")
-        self.u.record(m.Phase.INSTALLING, from_commit="old", to_commit="new")
-        m.atomic(self.u.request, {"nonce": "n"})
-        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 12, "phase": "idle"})
-        actions = []
-        def health(commit):
-            self.assertTrue(self.u.request.exists())
-            self.assertEqual(self.bin.read_text(), "previous")
-            return commit == "old"
-        with patch.object(self.u, "pid", return_value=12), patch.object(self.u, "service", side_effect=actions.append), patch.object(self.u, "health", side_effect=health), patch.object(self.u, "notify") as notify:
-            self.u.recover()
-            self.assertEqual(actions, ["stop", "start"])
-            self.assertEqual(self.u.state["phase"], "rolled_back")
-            self.assertEqual(self.u.state["rejected_commit"], "new")
-            self.assertFalse(self.u.request.exists())
-            notify.assert_called_once()
-
-    def test_confirmed_crash_releases_hold_without_rollback(self):
-        self.u.record(m.Phase.CONFIRMED)
-        m.atomic(self.u.request, {"nonce": "n"})
-        with patch.object(self.u, "rollback", side_effect=AssertionError("rolled back a confirmed writer")):
-            self.u.recover()
-        self.assertFalse(self.u.request.exists())
-
-    def test_already_restored_rollback_checks_health_without_restarting_again(self):
-        self.u.backup.write_text("previous")
-        self.u.record(m.Phase.ROLLING_BACK, from_commit="old", to_commit="failed")
-        m.atomic(self.u.request, {"nonce": "n"})
-        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 12, "phase": "idle"})
-        with patch.object(self.u, "pid", return_value=12), \
-             patch.object(self.u, "running_build", return_value="old", create=True), \
-             patch.object(self.u, "health", return_value=True), \
-             patch.object(self.u, "service") as service, patch.object(self.u, "notify"):
-            self.u.recover()
-        service.assert_not_called()
-        self.assertEqual(self.u.state["phase"], "rolled_back")
-        self.assertFalse(self.u.request.exists())
-
-    def test_failed_rollback_health_persists_recovery_without_restarting_or_releasing_hold(self):
-        self.u.backup.write_text("previous")
-        self.u.record(m.Phase.ROLLING_BACK, from_commit="old", to_commit="failed", attempt_started_at=1000000)
-        m.atomic(self.u.request, {"nonce": "n"})
-        m.atomic(self.u.root / "idle.json", {"nonce": "n", "pid": 12, "phase": "idle"})
-        with patch.object(self.u, "pid", return_value=12), \
-             patch.object(self.u, "running_build", return_value="old", create=True), \
-             patch.object(self.u, "health", return_value=False), \
-             patch.object(self.u, "service") as service, patch.object(self.u, "notify"):
-            self.u.recover()
-            restarted = m.Supervisor(self.bin, self.home)
-            restarted.recover()
-        service.assert_not_called()
-        self.assertEqual(restarted.state["phase"], "recovery_required")
-        self.assertEqual(restarted.state["to_commit"], "failed")
-        self.assertGreaterEqual(restarted.state["next_attempt_at"], 4600000)
-        self.assertTrue(self.u.request.exists())
-
-    def test_recovery_preparation_restart_never_releases_the_existing_hold(self):
-        self.u.record(m.Phase.RECOVERY_PREPARING, from_commit="old", to_commit="new")
-        m.atomic(self.u.request, {"nonce": "n"})
-        with patch.object(self.u, "service") as service, patch.object(self.u, "rollback") as rollback:
-            self.u.recover()
-        self.assertEqual(m.read(self.u.request), {"nonce": "n"})
-        service.assert_not_called()
-        rollback.assert_not_called()
-
-    def test_already_running_candidate_requires_real_gates_without_install_or_budget_reset(self):
-        config = {"auto_update": {"enabled": True, "channel": "main"}}
-        for case in ("valid", "wrong_build", "wrong_nonce", "failed_health", "changed_pid", "changed_nonce"):
-            with self.subTest(case=case):
-                self.u.state = {"phase":"recovery_required", "from_commit":"old", "to_commit":"known-candidate", "next_attempt_at":20000000}
-                m.atomic(self.u.request, {"nonce":"n"})
-                m.atomic(self.u.root / "idle.json", {"nonce":"wrong" if case == "wrong_nonce" else "n", "pid":123, "phase":"idle"})
-                def health(commit):
-                    if case == "changed_nonce": m.atomic(self.u.request, {"nonce":"new-request"})
-                    return case != "failed_health"
-                with patch.object(self.u, "config", return_value=config), patch.object(m.time, "time", return_value=10000), \
-                     patch.object(self.u, "build", return_value="known-candidate"), \
-                     patch.object(self.u, "pid", side_effect=[123,124] if case == "changed_pid" else None, return_value=123), \
-                     patch.object(self.u, "running_build", return_value="other" if case == "wrong_build" else "known-candidate"), \
-                     patch.object(self.u, "health", side_effect=health), \
-                     patch.object(self.u, "service") as service, patch.object(self.u, "notify"), \
-                     patch.object(m, "fetch", side_effect=AssertionError("known running install must not be downloaded/reinstalled")):
-                    self.u.reconcile()
-                service.assert_not_called()
-                self.assertEqual(self.u.state["next_attempt_at"], 20000000)
-                self.assertEqual(self.u.state["phase"], "confirmed" if case == "valid" else "recovery_required")
-                self.assertEqual(self.u.request.exists(), case != "valid")
-
-    def test_recovery_never_retries_failed_candidate_or_uses_wrong_process_or_nonce(self):
-        machine = type("Uname", (), {"machine": "aarch64"})()
-        target = "aarch64-unknown-linux-gnu"
-        sha = "c" * 40
-        manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
-            "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
-            "sha256": "d" * 64}}}
-        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
-        for case in ("same_candidate", "wrong_process", "wrong_nonce", "cooldown"):
-            with self.subTest(case=case):
-                self.u.state = {"phase": "recovery_required", "from_commit": "old", "to_commit": sha if case == "same_candidate" else "b" * 40,
-                                "next_attempt_at": 20000000 if case == "cooldown" else 0}
-                m.atomic(self.u.request, {"nonce": "n"})
-                m.atomic(self.u.root / "idle.json", {"nonce": "wrong" if case == "wrong_nonce" else "n", "pid": 123, "phase": "idle"})
-                fetched = []
-                def fetch(url, timeout):
-                    fetched.append(url)
-                    self.assertFalse(url.endswith("tar.gz"), "unproven recovery downloaded an archive")
-                    return io.BytesIO(json.dumps(manifest).encode())
-                with patch.object(m.time, "time", return_value=10000), patch.object(m.os, "uname", return_value=machine), \
-                     patch.object(self.u, "config", return_value=config), patch.object(self.u, "build", return_value="old"), \
-                     patch.object(self.u, "pid", return_value=123), patch.object(m.Path, "resolve", return_value=self.bin), \
-                     patch.object(self.u, "running_build", return_value=None if case == "wrong_process" else "old"), \
-                     patch.object(self.u, "service") as service, patch.object(m, "fetch", side_effect=fetch):
-                    if case in ("wrong_process", "wrong_nonce"):
-                        with self.assertRaisesRegex(RuntimeError, "exact idle acknowledgement"):
-                            self.u.reconcile()
-                    else:
-                        self.u.reconcile()
-                service.assert_not_called()
-                self.assertEqual(m.read(self.u.request), {"nonce": "n"})
-                if case == "cooldown":
-                    self.assertEqual(fetched, [])
-
-    def test_every_drain_outcome_preserves_work_window_across_restart(self):
-        config = {"auto_update": {"enabled": True, "channel": "main"}}
-        for phase in (m.Phase.CONFIRMED, m.Phase.DEFERRED, m.Phase.ROLLED_BACK):
-            with self.subTest(phase=phase), patch.object(m.time, "time", return_value=10000):
-                self.u.record(phase)
-                restarted = m.Supervisor(self.bin, self.home)
-                restarted.recover()
-                self.assertEqual(restarted.state["next_attempt_at"], 13600000)
-                with patch.object(restarted, "config", return_value=config), \
-                     patch.object(m, "fetch", side_effect=AssertionError("publication bypassed work window")), \
-                     patch.object(restarted, "service") as service:
-                    for _ in range(20):
-                        restarted.reconcile()
-                    service.assert_not_called()
-                self.assertFalse(restarted.request.exists())
-                self.assertEqual(restarted.next_check_delay(), 3600)
-
-    def test_legacy_receipt_and_interrupted_drain_do_not_bypass_cooldown(self):
-        m.atomic(self.u.state_path, {"phase": "confirmed", "at": 10000000})
-        with patch.object(m.time, "time", return_value=10030):
-            restarted = m.Supervisor(self.bin, self.home)
-            # Construction alone must never mutate state outside the lock.
-            self.assertNotIn("next_attempt_at", m.read(restarted.state_path))
-            restarted.recover()
-            self.assertEqual(restarted.next_check_delay(), 3570)
-            self.assertEqual(m.read(restarted.state_path)["next_attempt_at"], 13600000)
-            restarted.record(m.Phase.DRAINING)
-            m.atomic(restarted.request, {"nonce": "old"})
-            restarted.recover()
-            self.assertFalse(restarted.request.exists())
-            self.assertEqual(restarted.state["phase"], "deferred")
-            self.assertEqual(restarted.state["next_attempt_at"], 13630000)
-
-    def test_cooldown_coalesces_publications_and_installs_latest_at_deadline(self):
-        # Real archive/digest/install path: a deferred drain must not immediately
-        # re-drain for a new SHA, but the latest manifest must install when due.
-        machine = type("Uname", (), {"machine": "aarch64", "nodename": "test-host"})()
-        target = "aarch64-unknown-linux-gnu"
-        archive = io.BytesIO()
-        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
-            member = tarfile.TarInfo("bridge")
-            member.size = 3
-            tar.addfile(member, io.BytesIO(b"new"))
-        data = archive.getvalue()
-        latest = ["a" * 40]
-        fetched = []
-        def fetch(url, timeout):
-            fetched.append(url)
-            sha = latest[0]
-            manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
-                "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
-                "sha256": m.hashlib.sha256(data).hexdigest()}}}
-            return io.BytesIO(data if url.endswith("tar.gz") else json.dumps(manifest).encode())
-        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
-        with patch.object(m.time, "time", return_value=10000) as clock, \
-             patch.object(m.os, "uname", return_value=machine), \
-             patch.object(self.u, "config", return_value=config), patch.object(m, "fetch", side_effect=fetch), \
-             patch.object(self.u, "pid", return_value=123), patch.object(m.Path, "resolve", return_value=self.bin), \
-             patch.object(self.u, "build", side_effect=lambda p: "old" if p == self.bin else latest[0]), \
-             patch.object(self.u, "idle", return_value=True), patch.object(self.u, "run", return_value=""), \
-             patch.object(self.u, "health", return_value=True), patch.object(self.u, "notify"), \
-             patch.object(self.u, "service") as service:
-            self.u.record(m.Phase.DEFERRED)
-            for seconds, sha in ((1, "a"), (8, "b"), (3599, "c")):
-                clock.return_value = 10000 + seconds
-                latest[0] = sha * 40
+    def drive(self, limit=100):
+        for _ in range(limit):
+            try:
                 self.u.reconcile()
+            except Crash:
+                self.u = Harness(self.machine)
+            if isinstance(self.u.state, m.Idle) and self.u.binary.read_bytes() == self.machine.binary:
+                return
+            self.machine.clock += 31
+        self.fail(f"workflow did not settle: {self.u.state}")
+
+    def test_closed_opt_in_digest_origin_and_archive(self):
+        for value in ({}, {"auto_update":None}, {"auto_update":{"enabled":"true","channel":"main"}}, {"auto_update":{"enabled":True,"channel":"pinned"}}):
+            self.assertFalse(m.opted_in(value))
+        for name, kind in (("../bridge",tarfile.REGTYPE),("bridge",tarfile.SYMTYPE)):
+            path = self.home / "bad.tar.gz"
+            with tarfile.open(path,"w:gz") as tar:
+                item=tarfile.TarInfo(name);item.type=kind;tar.addfile(item)
+            with self.assertRaises(ValueError):m.extract_candidate(path,self.home/"extracted")
+        manifest=json.load(self.machine.fetch("manifest",30))
+        with self.assertRaises(ValueError):m.validate_manifest(manifest,"stable","aarch64-unknown-linux-gnu")
+        manifest["artifacts"]["aarch64-unknown-linux-gnu"]["url"]="https://evil.invalid/bridge"
+        with self.assertRaises(ValueError):m.validate_manifest(manifest,"main","aarch64-unknown-linux-gnu")
+        m.atomic(self.home/".bridge/config.json",{})
+        self.u.reconcile();self.assertEqual(self.machine.fetches,["manifest"])
+
+    def test_every_saved_phase_resumes_one_operation_without_duplicate_install(self):
+        keys=["Preparing:","Handoff:","Installing:InstallStep.STOP","Installing:InstallStep.SWAP","Installing:InstallStep.START","Verifying:","Finished:"]
+        for key in keys:
+            with self.subTest(key=key):
+                self.setUp()
+                self.machine.crash_state=key
+                self.drive()
+                self.assertTrue(self.machine.did_crash)
+                self.assertEqual(self.machine.actions,["stop","start","notify"])
                 self.assertFalse(self.u.request.exists())
-            self.assertEqual(fetched, [])
-            service.assert_not_called()
-            self.assertEqual(self.u.next_check_delay(), 1)
-            clock.return_value = 13600
-            self.u.reconcile()
-            self.assertEqual(self.u.state["to_commit"], "c" * 40)
-            self.assertEqual(self.u.state["phase"], "confirmed")
-            self.assertEqual(self.u.state["next_attempt_at"], 17200000)
-            self.assertEqual([c.args[0] for c in service.call_args_list], ["stop", "start"])
-            self.assertFalse(self.u.request.exists())
+                self.assertGreaterEqual(self.u.state.next_attempt_at,13600000)
+                self.assertLessEqual(self.u.state.next_attempt_at,13631000)
 
-    def test_pending_candidate_reconciles_at_cooldown_expiry_without_new_event(self):
-        # Exercise serve's timer with only stream heartbeats, no publication.
-        config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
-        class Stream:
-            def __enter__(stream):
-                return stream
-            def __exit__(stream, *args):
-                pass
-            def __iter__(stream):
-                clock.return_value = 13599
-                mono.return_value = 3599
-                yield b": heartbeat\n"
-                clock.return_value = 13600
-                mono.return_value = 3600
-                yield b": heartbeat\n"
-                raise KeyboardInterrupt()
-        with patch.object(m.time, "time", return_value=10000) as clock, \
-             patch.object(m.time, "monotonic", return_value=0) as mono, \
-             patch.object(m.time, "sleep"), patch.object(self.u, "config", return_value=config), \
-             patch.object(m, "fetch", return_value=Stream()), patch.object(self.u, "notify"):
-            self.u.record(m.Phase.DEFERRED)
-            checked = []
-            def reconcile():
-                checked.append(clock.return_value)
-            with patch.object(self.u, "reconcile", side_effect=reconcile):
-                with self.assertRaises(KeyboardInterrupt):
-                    self.u.serve()
-            self.assertEqual(checked, [10000, 13600])
+    def test_stop_and_start_effect_with_lost_response_are_observed_not_repeated(self):
+        for effect in ("stop","start"):
+            with self.subTest(effect=effect):
+                self.setUp();self.machine.crash_effect=effect;self.drive()
+                self.assertEqual(self.machine.actions,["stop","start","notify"])
 
-    def test_full_install_and_failed_candidate_rollback_keep_writers_held(self):
-        for fail_health, recovery, adoption in ((False, None, False), (True, None, False), (False, "recovery_required", False), (False, "recovery_preparing", False),
-                                      (False, "bad_digest", False), (False, "changed_pid", False), (False, "doctor_fault", False), (False, None, True), (True, None, True)):
-            with self.subTest(fail_health=fail_health, recovery=recovery, adoption=adoption):
-                self.bin.write_bytes(b"old binary")
-                self.u.state = {}
-                sha = "c" * 40
-                if recovery:
-                    self.u.state = {"phase": "recovery_preparing" if recovery == "recovery_preparing" else "recovery_required",
-                                    "from_commit": "old", "to_commit": sha if recovery == "recovery_preparing" else "b" * 40}
-                    m.atomic(self.u.request, {"nonce": "existing-recovery-hold"})
-                target = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[m.os.uname().machine] + "-unknown-linux-gnu"
-                archive = io.BytesIO()
-                with tarfile.open(fileobj=archive, mode="w:gz") as tar:
-                    member = tarfile.TarInfo("bridge")
-                    member.size = len(b"new binary")
-                    tar.addfile(member, io.BytesIO(b"new binary"))
-                data = archive.getvalue()
-                manifest = {"schema_version": 1, "commit": sha, "channel": "main", "artifacts": {target: {
-                    "url": f"https://github.com/state-vector/bridge/releases/download/runner-{sha}/bridge-{target}.tar.gz",
-                    "sha256": "0" * 64 if recovery == "bad_digest" else m.hashlib.sha256(data).hexdigest()}}}
-                config = {"url": "https://hub.example", "auto_update": {"enabled": True, "channel": "main"}}
-                actions = []
-                def idle(nonce, pid):
-                    if adoption:
-                        m.atomic(self.u.root / "idle.json", {"nonce": nonce, "pid": pid, "phase": "controller_ready", "worker_protocol": 1})
-                        return m.Supervisor.idle(self.u, nonce, pid)
-                    return True
-                def service(action):
-                    self.assertTrue(self.u.request.exists(), "service mutation outside update hold")
-                    if adoption:
-                        self.assertEqual(m.read(self.u.request)["worker_protocol"], 1, "both update and rollback must preserve live-worker handoff")
-                    actions.append(action)
-                def health(commit):
-                    self.assertTrue(self.u.request.exists(), "writer hold lifted before health")
-                    if commit == sha:
-                        self.assertEqual(self.bin.read_bytes(), b"new binary")
-                        return not fail_health
-                    self.assertEqual(self.bin.read_bytes(), b"old binary")
-                    return True
-                def fetch(url, timeout):
-                    return io.BytesIO(data if url.full_url.endswith("tar.gz") else json.dumps(manifest).encode())
-                machine = type("Uname", (), {"machine": target.split("-unknown")[0], "nodename": "test-host"})()
-                with patch.object(self.u, "config", return_value=config), \
-                     patch.object(self.u, "pid", side_effect=[123, 124] if recovery == "changed_pid" else None, return_value=123), \
-                     patch.object(self.u, "running_build", side_effect=lambda pid: "old" if self.bin.read_bytes() == b"old binary" else sha), \
-                      patch.object(self.u, "build", side_effect=lambda p: sha if Path(p).read_bytes() == b"new binary" else "old"), \
-                      patch.object(self.u, "worker_protocol", return_value=1 if adoption else 0), \
-                     patch.object(self.u, "idle", side_effect=idle), patch.object(self.u, "service", side_effect=service), \
-                     patch.object(self.u, "health", side_effect=health), \
-                     patch.object(self.u, "run", side_effect=m.subprocess.CalledProcessError(1, "doctor") if recovery == "doctor_fault" else None, return_value=""), \
-                     patch.object(self.u, "notify") as notify, patch.object(m.Path, "resolve", return_value=self.bin), \
-                     patch.object(m.urllib.request, "urlopen", side_effect=fetch), patch.object(m.os, "uname", return_value=machine):
-                    if recovery in ("bad_digest", "changed_pid", "doctor_fault"):
-                        with self.assertRaises((ValueError, RuntimeError, m.subprocess.CalledProcessError)):
-                            self.u.reconcile()
-                        self.assertEqual(actions, [])
-                        self.assertEqual(self.bin.read_bytes(), b"old binary")
-                        self.assertTrue(self.u.request.exists())
-                        self.assertEqual(m.read(self.u.request)["nonce"], "existing-recovery-hold")
-                        self.u.recover()
-                        self.assertTrue(self.u.request.exists())
-                        continue
-                    elif fail_health:
-                        with self.assertRaisesRegex(RuntimeError, "candidate did not pass"):
-                            self.u.reconcile()
-                    else:
-                        self.u.reconcile()
-                    self.assertEqual(actions, ["stop", "start"] * (2 if fail_health else 1))
-                    self.assertEqual(self.u.state["phase"], "rolled_back" if fail_health else "confirmed")
-                    self.assertFalse(self.u.request.exists())
-                    notify.assert_called_once()
+    def test_swap_crash_replays_saved_digest_without_needing_moved_staging_file(self):
+        replace=os.replace
+        def after_swap(source,target):
+            replace(source,target)
+            if Path(target)==self.u.binary and not self.machine.did_crash:
+                self.machine.did_crash=True;raise Crash()
+        with patch.object(m.os,"replace",side_effect=after_swap):self.drive()
+        self.assertEqual(self.machine.actions,["stop","start","notify"])
+
+    def test_pid_zero_with_queued_service_start_cannot_authorise_swap(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        candidate=self.u.candidate(op);candidate.parent.mkdir(parents=True);candidate.write_bytes(self.machine.binary)
+        self.machine.current=None
+        self.u.save(m.Installing(op,m.digest(candidate),m.InstallStep.SWAP))
+        with patch.object(self.u,"run",side_effect=["activating","12 /org/freedesktop/systemd1/job/12"]):
+            self.assertFalse(m.Supervisor.stopped(self.u))
+        with patch.object(self.u,"stopped",return_value=False):self.u.reconcile()
+        self.assertEqual(self.u.binary.read_bytes(),b"old binary")
+        self.assertEqual(self.machine.actions,[])
+        self.drive()
+
+    def test_expected_controller_restart_uses_fresh_ack_without_resetting_deadline(self):
+        self.machine.crash_state="Handoff:"
+        with self.assertRaises(Crash):self.u.reconcile()
+        saved=self.u.state.operation
+        self.machine.current=m.Process(900,"boot","new-start",OLD)
+        self.machine.crash_state=None
+        self.u=Harness(self.machine)
+        self.u.step()
+        self.assertIsInstance(self.u.state,m.Installing)
+        self.assertEqual(self.u.state.operation.nonce,saved.nonce)
+        self.assertEqual(self.u.state.operation.deadline,saved.deadline)
+        self.assertEqual(self.u.state.operation.next_attempt_at,saved.next_attempt_at)
+        self.drive()
+
+    def test_all_reconciliation_phases_restart_and_keep_independent_work(self):
+        for step in m.ReconcileStep:
+            if step is m.ReconcileStep.LEGACY_START:continue
+            with self.subTest(step=step):
+                self.setUp();self.machine.ack=False
+                self.machine.crash_state="Reconciling:"+str(step)
+                protected=self.home/"unrelated-work";protected.write_bytes(b"unpublished work and output")
+                self.drive()
+                self.assertEqual(protected.read_bytes(),b"unpublished work and output")
+                self.assertEqual(self.machine.actions.count("reconcile"),1)
+                self.assertEqual(self.machine.actions.count("stop"),1)
+                self.assertEqual(self.machine.actions.count("start"),1)
+
+    def test_unproved_job_records_remain_protected_without_blocking_controller_upgrade(self):
+        self.machine.ack=False;self.machine.waiting=True
+        self.drive()
+        self.assertTrue(self.machine.waiting,"job-specific uncertainty must not be cleared by an update")
+        self.assertEqual(self.machine.actions.count("stop"),1)
+        self.assertEqual(self.machine.actions.count("start"),1)
+
+    def test_early_v2_start_continuation_resumes_without_restarting_old_code(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        path=self.u.candidate(op);path.parent.mkdir(parents=True);path.write_bytes(self.machine.binary)
+        m.atomic(self.u.request,{"nonce":NONCE,"worker_protocol":1})
+        self.machine.current=None
+        self.u.save(m.Reconciling(op,m.digest(path),m.ReconcileStep.LEGACY_START))
+        self.u=Harness(self.machine);self.drive()
+        self.assertEqual(self.machine.actions,["reconcile","start","notify"])
+
+    def test_busy_frozen_boundary_is_thawed_without_stopping_writers(self):
+        self.machine.ack=False;self.machine.children=True
+        self.u.reconcile()
+        self.assertEqual(self.machine.actions,["freeze","thaw"])
+        self.assertTrue(self.u.request.exists())
+        self.assertNotIn("stop",self.machine.actions)
+
+    def test_failed_candidate_restores_once_and_never_retries_that_candidate(self):
+        self.machine.healthy[NEW]=False
+        self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertEqual(self.u.binary.read_bytes(),b"old binary")
+        self.assertEqual(self.u.state.rejected,NEW)
+        self.assertEqual(self.machine.actions,["stop","start","stop","start","notify"])
+        self.machine.clock+=7200;self.u.reconcile()
+        self.assertEqual(self.machine.actions,["stop","start","stop","start","notify"])
+
+    def test_failed_restored_health_never_restarts_it_again(self):
+        self.machine.healthy[NEW]=False;self.machine.healthy[OLD]=False
+        self.u.reconcile()
+        actions=list(self.machine.actions)
+        for _ in range(10):
+            self.machine.clock+=61;self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(actions,["stop","start","stop","start"])
+        self.assertEqual(self.machine.actions,actions)
+        self.assertTrue(self.u.request.exists())
+
+    def test_new_verified_candidate_recovers_failed_rollback_after_original_budget(self):
+        self.machine.healthy[NEW]=False;self.machine.healthy[OLD]=False
+        self.u.reconcile();nonce=m.read(self.u.request)["nonce"]
+        self.machine.target=NEXT;self.machine.binary=b"newer binary";self.machine.clock+=3601
+        self.drive()
+        self.assertEqual(self.machine.current.commit,NEXT)
+        self.assertEqual(self.machine.actions.count("stop"),3)
+        self.assertEqual(self.machine.actions.count("start"),3)
+        self.assertFalse(self.u.request.exists())
+        self.assertTrue(nonce)
+
+    def test_prerequisite_failure_waits_before_any_hold_or_service_change(self):
+        self.machine.doctor_ok=False
+        self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Waiting)
+        self.assertEqual(self.u.state.reason,m.Reason.PREREQUISITE)
+        self.assertFalse(self.u.request.exists())
+        self.assertEqual(self.machine.actions,[])
+        self.machine.doctor_ok=True;self.drive()
+
+    def test_changed_nonce_is_never_released_or_used_as_authority(self):
+        self.machine.crash_state="Installing:InstallStep.STOP"
+        with self.assertRaises(Crash):self.u.reconcile()
+        m.atomic(self.u.request,{"nonce":"someone-else"})
+        self.machine.crash_state=None;self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(m.read(self.u.request),{"nonce":"someone-else"})
+        self.assertEqual(self.machine.actions,[])
+
+    def test_old_pid_start_and_boot_identity_do_not_cover_another_process(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,1,100,0,1)
+        m.atomic(self.u.root/"idle.json",{"nonce":NONCE,"pid":122,"phase":"controller_ready","worker_protocol":1})
+        self.machine.ack=False
+        self.assertFalse(self.u.idle(op,self.machine.current))
+        for identity in (m.Process(123,"other-boot","100",OLD),m.Process(123,"boot","200",OLD)):
+            self.assertNotEqual(identity,op.controller)
+        self.u.save(m.Installing(op,"invalid",m.InstallStep.STOP));self.machine.current=None
+        self.u.step();self.assertEqual(self.u.state.step,m.InstallStep.SWAP)
+
+    def test_cooldown_coalesces_publications_and_survives_restart(self):
+        self.u.save(m.Idle(13600000))
+        for seconds in (1,8,3599):
+            self.machine.clock=10000+seconds;self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(self.machine.fetches,[])
+        self.machine.clock=13600;self.machine.target=NEXT;self.machine.binary=b"newest";self.drive()
+        self.assertEqual(self.machine.current.commit,NEXT)
+
+    def test_legacy_known_running_candidate_requires_health_and_preserves_budget(self):
+        self.u.binary.write_bytes(self.machine.binary);self.machine.current=m.Process(123,"boot","100",NEW)
+        m.atomic(self.u.state_path,{"phase":"recovery_required","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":20000000})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(self.machine.actions,["notify"])
+        self.assertEqual(self.u.state.next_attempt_at,20000000)
+
+    def test_legacy_interrupted_drain_migrates_without_old_job_ack_or_new_hour(self):
+        self.machine.ack=False
+        m.atomic(self.u.state_path,{"phase":"draining","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":13600000})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertEqual(self.u.state.next_attempt_at,13600000)
+        self.assertFalse(self.u.request.exists());self.assertEqual(self.machine.actions,[])
+
+    def test_legacy_recovery_preparation_resumes_pinned_work_under_same_hold(self):
+        self.machine.ack=False
+        m.atomic(self.u.state_path,{"phase":"recovery_preparing","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":0,"at":10000000})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.drive()
+        self.assertEqual(self.machine.current.commit,NEW)
+        self.assertEqual(self.machine.actions.count("stop"),1)
+
+    def test_legacy_install_with_stopped_controller_restores_without_inventing_pid(self):
+        self.u.backup.write_bytes(b"old binary");self.u.binary.write_bytes(self.machine.binary);self.machine.current=None
+        m.atomic(self.u.state_path,{"phase":"installing","from_commit":OLD,"to_commit":NEW,"nonce":NONCE,"next_attempt_at":0})
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(self.u.binary.read_bytes(),b"old binary")
+        self.assertEqual(self.machine.actions,["start","notify"])
+
+    def test_closed_state_rejects_unknown_continuations_and_missing_data(self):
+        for data in ({"schema_version":3,"phase":"idle"},{"schema_version":2,"phase":"invented"},
+                     {"schema_version":2,"phase":"installing"},
+                     {"schema_version":2,"phase":"waiting","reason":"transport","detail":"x","retry_at":1,"resume":m.encode(m.Idle())}):
+            with self.assertRaises((ValueError,TypeError,KeyError)):m.decode(data)
+
+    def test_legacy_migration_cannot_borrow_another_operations_hold(self):
+        m.atomic(self.u.state_path,{"phase":"recovery_required","from_commit":OLD,"to_commit":NEW,"nonce":NONCE})
+        m.atomic(self.u.request,{"nonce":"other"})
+        self.u=Harness(self.machine)
+        with self.assertRaisesRegex(RuntimeError,"identity is unproved"):self.u.reconcile()
+        self.assertEqual(m.read(self.u.request),{"nonce":"other"});self.assertEqual(self.machine.actions,[])
+
+    def test_confirmed_native_updates_the_only_supervisor_and_reexecs_from_saved_finish(self):
+        self.machine.export_source="# upgraded single supervisor\n"
+        with self.assertRaises(m.SupervisorUpgraded):self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Finished)
+        self.assertEqual((self.u.root/"supervisor.py").read_text(),self.machine.export_source)
+        self.assertFalse(self.u.request.exists())
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertEqual(self.machine.actions,["stop","start","notify"])
+
+    def test_old_false_health_wait_reverifies_same_candidate_without_rollback(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",self.machine.current,10000000,10900000,0,1)
+        self.u.binary.write_bytes(self.machine.binary);self.machine.current=m.Process(123,"boot","100",NEW);self.machine.ack=False
+        state=m.encode(m.Waiting(m.Reason.TRANSPORT,"candidate has not acknowledged its exact rollback hold",10000001,m.Restoring(op,m.InstallStep.STOP)))
+        state.pop("coordinator_revision")
+        m.atomic(self.u.state_path,state);m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle);self.assertEqual(self.machine.actions,["notify"])
+        self.assertFalse(self.u.request.exists())
+
+    def test_confirmed_older_native_cannot_downgrade_the_bootstrapped_coordinator(self):
+        self.machine.export_source="# obsolete coordinator\n"
+        original=self.u.info
+        with patch.object(self.u,"info",side_effect=lambda path:{**original(path),"coordinator_revision":0}):self.drive()
+        self.assertFalse((self.u.root/"supervisor.py").exists(),"older embedded source is not a coordinator upgrade")
+
+    def test_old_recovery_ladders_and_separate_native_cleanup_commands_are_removed(self):
+        source=Path(m.__file__).read_text()
+        for symbol in ("def rollback(","def recover(","def accept_running_candidate("):
+            self.assertNotIn(symbol,source)
+        cli=Path(__file__).parents[1]/"src/main.rs"
+        for command in ("reconcile-stopped","reconcile-reservations"):
+            self.assertNotIn(command,cli.read_text())
+
+
+class RealProcessRecoveryTests(unittest.TestCase):
+    def test_real_archive_install_survives_coordinator_crash_and_preserves_live_worker_output(self):
+        # Only the OS service adapter is substituted. The production journal,
+        # archive validation, installation, native subprocess doctor, hold and
+        # health protocol all execute against real files and live processes.
+        program = '''#!/usr/bin/env python3
+import json,os,sys,time
+from pathlib import Path
+COMMIT = "COMMIT_VALUE"
+if sys.argv[1] == "build-info":
+ print(json.dumps({"commit":COMMIT,"update_protocol":1,"worker_protocol":1,"recovery_protocol":0}))
+elif sys.argv[1] == "doctor":
+ sys.exit(0)
+elif sys.argv[1] == "alarm":
+ sys.exit(0)
+else:
+ root=Path(sys.argv[2])/".bridge/update"
+ while True:
+  request=root/"request.json"
+  if request.exists():
+   value=json.loads(request.read_text())
+   for name,data in [("idle.json",{"nonce":value["nonce"],"pid":os.getpid(),"phase":"controller_ready","worker_protocol":1}),("health.json",{"phase":"ready","pid":os.getpid(),"commit":COMMIT,"observed_at":int(time.time()*1000)})]:
+    if name=="idle.json" and COMMIT!="OLD_COMMIT_VALUE":continue
+    tmp=root/(name+".child");tmp.write_text(json.dumps(data));os.replace(tmp,root/name)
+  time.sleep(.005)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);binary=home/"bridge"
+            program=program.replace("OLD_COMMIT_VALUE",OLD)
+            binary.write_text(program.replace("COMMIT_VALUE",OLD));binary.chmod(0o755)
+            candidate=program.replace("COMMIT_VALUE",NEW).encode();data=archive(candidate)
+            m.atomic(home/".bridge/config.json",{"url":"https://fixture","auto_update":{"enabled":True,"channel":"main"}})
+            hardware={"process":None,"commit":OLD,"actions":[],"crashed":False}
+            output=home/"independent-output"
+            worker=subprocess.Popen([sys.executable,"-c","import pathlib,time,sys,os\np=pathlib.Path(sys.argv[1]);tmp=p.with_suffix('.next')\ni=0\nwhile True:\n i+=1;tmp.write_text(str(i));os.replace(tmp,p);time.sleep(.005)",str(output)])
+            class Actual(m.Supervisor):
+                def process(self):
+                    p=hardware["process"]
+                    return m.Process(p.pid,"fixture-boot",str(p.pid),hardware["commit"]) if p and p.poll() is None else None
+                def pid(self):
+                    current=self.process();return current.pid if current else 0
+                def stopped(self):
+                    return self.process() is None
+                def service(self,action):
+                    if action=="stop":
+                        hardware["process"].terminate();hardware["process"].wait(timeout=2)
+                    elif action=="start":
+                        hardware["commit"]=self.build(self.binary)
+                        hardware["process"]=subprocess.Popen([str(self.binary),"fixture-run",str(home)])
+                    else:raise AssertionError(action)
+                    hardware["actions"].append(action)
+                def idle(self,op,process):
+                    deadline=time.monotonic()+.2
+                    while not super().idle(op,process) and time.monotonic()<deadline:time.sleep(.001)
+                    return super().idle(op,process)
+                def save(self,state):
+                    super().save(state)
+                    if isinstance(state,m.Installing) and state.step is m.InstallStep.SWAP and not hardware["crashed"]:
+                        hardware["crashed"]=True;raise Crash()
+            hardware["process"]=subprocess.Popen([str(binary),"fixture-run",str(home)])
+            original_pid=hardware["process"].pid
+            def fetch(url,timeout):
+                manifest={"schema_version":1,"channel":"main","commit":NEW,"artifacts":{"aarch64-unknown-linux-gnu":{
+                    "url":f"https://github.com/state-vector/bridge/releases/download/runner-{NEW}/bridge-aarch64-unknown-linux-gnu.tar.gz",
+                    "sha256":m.hashlib.sha256(data).hexdigest()}}}
+                return io.BytesIO(data if url.endswith("tar.gz") else json.dumps(manifest).encode())
+            try:
+                with patch.object(m,"fetch",side_effect=fetch),patch.object(m,"STABLE_SECONDS",.025),patch.object(m,"OBSERVE_SECONDS",.005),patch.object(m,"HEALTH_SECONDS",3),\
+                     patch.object(m.os,"uname",return_value=type("Uname",(),{"machine":"aarch64","nodename":"real-process-test"})()),patch("builtins.print"):
+                    u=Actual(binary,home);deadline=time.monotonic()+10
+                    while True:
+                        try:u.reconcile()
+                        except Crash:u=Actual(binary,home)
+                        if isinstance(u.state,m.Idle) and hardware["commit"]==NEW:break
+                        self.assertLess(time.monotonic(),deadline);time.sleep(.01)
+                    self.assertEqual(hardware["actions"],["stop","start"])
+                    self.assertTrue(hardware["crashed"])
+                    self.assertNotEqual(hardware["process"].pid,original_pid)
+                    before=int(output.read_text());time.sleep(.03)
+                    self.assertIsNone(worker.poll());self.assertGreater(int(output.read_text()),before)
+                    self.assertFalse(u.request.exists());self.assertEqual(u.build(binary),NEW)
+            finally:
+                for p in [hardware["process"],worker]:
+                    if p and p.poll() is None:p.terminate();p.wait(timeout=2)
 
 
 if __name__ == "__main__":

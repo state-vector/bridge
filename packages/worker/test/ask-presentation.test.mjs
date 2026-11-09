@@ -67,9 +67,10 @@ it("human decisions render essential context, named executors and consequences w
   useKb.setState({ tasks: [{ id: "BR#1", type: "question", status: "todo", title: "Should Bridge keep customer records?", body_md: "Commit details and check URLs are supporting evidence.", created_ts: 1, updated_ts: 1, ask_target: { online: false, source: "unknown", last_seen_ts: null }, meta: { ask: { route: { kind: "human_decision" }, to: "human", decision, options: decision.choices.map((c) => c.label) } } }] });
   const html = renderToStaticMarkup(createElement(ForMeView, {}));
   expect(html).toContain(decision.context);
-  expect(html).toContain("<b>Bridge:</b>");
-  expect(html).toContain("<b>You:</b>");
-  expect(html).toContain("Evidence and technical details</summary>");
+  expect(html).toContain("<b>Action owner: Bridge.</b>");
+  expect(html).toContain("<b>Action owner: You.</b>");
+  expect(html).not.toContain("<details");
+  expect(html).toContain("ask-instructions md-body");
   expect(html).not.toContain("never seen");
   expect(html).not.toContain("Choose how Bridge should proceed");
 });

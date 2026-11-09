@@ -80,7 +80,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
   it("replays a human's exact per-card retirement instead of asking again, including an unclaimed operator gate", async () => {
     const target = await task("Obsolete operator purge", { operator_gated: "Ray go before execution", execution_requirements: { tier: "large", environment: ["retired-host"] } });
     const answer = `Close the overtaken issue — retire ${target}`;
-    const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the obsolete purge whose target no longer exists?",
+    const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Retire the obsolete purge whose target no longer exists?",
       reason: "The operator must choose whether this obsolete operation is retired.", details: `The purge target is gone; retire ${target}.`,
       options: [answer, "KEEP the operation"], actor: "author" });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
@@ -104,7 +104,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     for (const prefix of ["KEEP — do not retire", "NO — retire", "Do not retire"]) {
       const target = await task(`Protected decision ${prefix}`);
       const answer = `${prefix} ${target}`;
-      const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Should this operation remain available?",
+      const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Should this operation remain available?",
         reason: "Only the operator chooses whether to retain this operation.", details: `Current operation ${target} remains valid.`,
         options: [answer, `SUPERSEDE ${target}`], actor: "author" });
       expect(ask.status, JSON.stringify(ask.body)).toBe(200);
@@ -119,7 +119,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     const target = await task("Obsolete duplicate");
     const successor = await task("Real delivery owner");
     const answer = `SUPERSEDE — ${target} superseded by ${successor}`;
-    const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the duplicate in favor of its existing delivery owner?",
+    const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Retire the duplicate in favor of its existing delivery owner?",
       reason: "Only the operator chooses which obligation is retired.", details: `${target} duplicates ${successor}.`, options: [answer, "KEEP both"], actor: "author" });
     await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
     const current = await get(target);

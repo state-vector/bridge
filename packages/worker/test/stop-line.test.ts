@@ -606,4 +606,99 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     expect(snapGreen.base_red_resolution ?? null).toBeNull();
   });
 });
-import { completePrReview } from "./completion-fixture";
+
+describe("train.status red-main episode — who broke it / who is fixing it (BR#4849)", () => {
+  it("shows only the exact main-red recovery, stamps the stop's culprit, and clears both on green", async () => {
+    const repo = "state-vector/red-banner";
+    const head = "c".repeat(40);
+    await acquire(repo, "gw-banner", { required_workflows: ["Deploy Dev"] });
+
+    // a landing first: the ledger's newest merged event anchors "who broke it"
+    const anchorCard = await kbJson("/create", { type: "task", title: "IMPL: banner drill — last landed" });
+    expect(anchorCard.status).toBe(200);
+    const anchor = String(anchorCard.body.id);
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-banner",
+      pr: 2710, merge_sha: "b".repeat(40), head_sha: "a".repeat(40), task_id: anchor,
+    });
+    expect(merged.body.error ?? "", `train:merged failed: ${JSON.stringify(merged.body)}`).toBe("");
+
+    // no episode task yet → red_main null, but the landing anchor is served
+    let snap = await laneSnap(repo);
+    expect(snap.red_main).toBeNull();
+    expect(snap.last_merge?.pr).toBe(2710);
+    expect(snap.last_merge?.gateway).toBe("gw-banner");
+    expect(snap.last_merge?.task_id).toBe(anchor);
+
+    // Project and tags alone cannot associate an open task with the failure.
+    const ep = await kbJson("/create", {
+      type: "task",
+      title: "ROOT BLOCKER (main-red): banner drill — Deploy Dev red on main",
+      tags: ["root-blocker", "main-red"],
+      project: "red-banner",
+      meta: { completion: { kind: "execution", outcome: "The main-red episode is resolved on verified live evidence" } },
+    });
+    expect(ep.status, `create failed: ${JSON.stringify(ep.body)}`).toBeLessThan(400);
+    const epId = String(ep.body.id);
+    expect((await laneSnap(repo)).red_main).toBeNull();
+
+    // a fed stop stamps the machine culprit on the stop record itself — the
+    // banner's "who broke it" then points at the card, not a guess
+    const stopped = await kbJson("/train.event", {
+      repo, base: "main", kind: "stopped", actor: "gw-banner",
+      merge_sha: head, culprit_task: anchor,
+      failing: [{ name: "Deploy Dev", conclusion: "failure", url: "https://example/ci/deploy-red" }],
+    });
+    expect(stopped.body.error ?? "", `train:stopped failed: ${JSON.stringify(stopped.body)}`).toBe("");
+    snap = await laneSnap(repo);
+    expect(snap.stop?.culprit_task).toBe(anchor);
+    expect(snap.red_main?.task_id).not.toBe(epId);
+
+    const otherBase = await kbJson("/update", {
+      id: epId, meta: { root_fix: { repo, base: "release", head_sha: head, failing: ["Deploy Dev"] } },
+    });
+    expect(otherBase.status, `other base binding failed: ${JSON.stringify(otherBase.body)}`).toBeLessThan(400);
+    expect((await laneSnap(repo)).red_main?.task_id).not.toBe(epId);
+
+    const bind = await kbJson("/update", {
+      id: epId, meta: { root_fix: { repo, base: "main", head_sha: head, failing: ["Deploy Dev"] } },
+    });
+    expect(bind.status, `binding failed: ${JSON.stringify(bind.body)}`).toBeLessThan(400);
+    snap = await laneSnap(repo);
+    expect(snap.red_main?.task_id).toBe(epId);
+    expect(snap.red_main?.status).toBe("todo");
+    expect(snap.red_main?.owner).toBe("");
+    expect(snap.red_main?.executor_session).toBe("");
+
+    // "who is fixing it" going from UNOWNED to named is board fact
+    const claim = await kbJson("/transition", {
+      id: epId, to: "in_progress", session: "banner-drill-fixer", note: "diagnosing the query-engine invoke failure",
+    });
+    expect(claim.status, `claim failed: ${JSON.stringify(claim.body)}`).toBeLessThan(400);
+    const heartbeat = await kbJson("/progress.log", {
+      id: epId, session: "banner-drill-fixer", did: "Confirmed the failure", will: "Verify the retry",
+    });
+    expect(heartbeat.status, `heartbeat failed: ${JSON.stringify(heartbeat.body)}`).toBeLessThan(400);
+    snap = await laneSnap(repo);
+    expect(snap.red_main?.task_id).toBe(epId);
+    expect(snap.red_main?.status).toBe("in_progress");
+    expect(snap.red_main?.executor_session).toBe("banner-drill-fixer");
+
+    // A live passing result clears the stop. The owner can then close with
+    // that receipt through the independent execution review gate (BR#7564).
+    const green = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-banner", sha: head,
+      checks: [check(2, "Deploy Dev", "success")],
+    });
+    expect(green.body.decided).toBe("line_green");
+    await completeExecutionReview(kbJson, epId, {
+      outcome: "drill: main settled green — Deploy Dev SUCCESS at tip, merge gate cleared",
+      receipts: ["drill: Deploy Dev SUCCESS at tip, merge gate cleared"],
+    });
+    snap = await laneSnap(repo);
+    expect(snap.stop).toBeNull();
+    expect(snap.red_main).toBeNull();
+    expect(snap.last_merge?.pr).toBe(2710);
+  });
+});
+import { completeExecutionReview, completePrReview } from "./completion-fixture";

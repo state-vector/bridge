@@ -17,5 +17,32 @@ it("renders actual PR blocks without overlapping multiplication labels and expla
   expect(html).not.toContain("×34");
   expect(html).not.toContain("train-bounce-chip");
   expect(html).not.toContain("de-queued");
-  expect(html).toContain("verified");
+  expect(html).toContain("Ready to merge: verified, no conflicts with base");
+  expect(html).toContain(">1 ready</span>");
+});
+
+
+it("uses the current typed line despite historical red-main records", () => {
+  const now = 1_800_000_000_000;
+  const lane: KbTrainLane = { card: "BR#1", lane: "test/repo@main", lease: null, currently: null, stop: null, queue: [],
+    red_main: { task_id: "BR#9", title: "Old main repair", status: "todo", owner: "", executor_session: "", created_ts: now - 100000 },
+    line: { phase: "working", label: "Checking queued changes", reason: "Current main is green", blocker: null, remediation: null, held: 1, observed_at: now, evidence: [] },
+  };
+  const render = () => renderToStaticMarkup(<TrainPanelView lanes={[lane]} error={null} now={now} />);
+  expect(render()).toContain("Checking queued changes");
+  expect(render()).not.toContain("main RED");
+  expect(render()).not.toContain("STOP-THE-LINE");
+  lane.line = { phase: "stopped", label: "Repairing main", reason: "Current required check failed", blocker: "main_failed",
+    remediation: { kind: "attention", text: "Repair required" }, held: 1, observed_at: now, evidence: [] };
+  expect(render()).toContain("STOP-THE-LINE");
+  expect(render()).toContain("Repairing main");
+  expect(render()).toContain("Current required check failed");
+  expect(render()).not.toContain("Old main repair");
+  expect(render()).not.toContain("nobody is fixing it");
+  lane.line = { ...lane.line, blocker: "no_progress", label: "Merge stalled" };
+  expect(render()).not.toContain("main RED");
+  expect(render()).toContain("Merge stalled");
+  lane.line = undefined;
+  expect(render()).toContain("Status unavailable");
+  expect(render()).not.toContain("main RED");
 });

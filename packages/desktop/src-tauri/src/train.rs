@@ -39,9 +39,9 @@
 
 use crate::train_gate::{
     carry_chain_tip, classify_base_check_runs, decide_train_gate, drain_burst_decision, format_deploy_coverage_summary,
-    is_root_fix_card, latest_red_deploy_health_runs, merge_sweep_human_leg_title, normalize_gh_mergeable,
+    is_root_fix_card, latest_red_deploy_health_runs, normalize_gh_mergeable,
     normalize_gh_merge_state, parse_burst_max, parse_iso8601_epoch_ms, reconcile_base_verdict_with_deploy_coverage,
-    reconcile_deploy_coverage, root_fix_fast_lane_title, train_leg_landed, train_leg_state, train_legs,
+    reconcile_deploy_coverage, train_leg_landed, train_leg_state, train_legs,
     verdict_covers_head_leg, CheckVerdict, DeployCoverageState, DeployReconcilePlan, DeployWorkflowRun, DrainDecision,
     MainCheckRun, MainVerdict, MechanicalMove, MergeAction, TrainLeg, DEPLOY_RECONCILE_GRACE_SECS,
     TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
@@ -59,6 +59,8 @@ use crate::logging::{emit, iso, now_ms, prefer_stdout};
 const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const SCAN_BUDGET: Duration = Duration::from_secs(30);
+const CARD_READ_BUDGET: Duration = Duration::from_secs(10);
+const CARD_FIRST_ATTEMPT: Duration = Duration::from_secs(4);
 const SCAN_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -441,17 +443,40 @@ impl Ctx {
         let mut arguments = args_body;
         if let Value::Object(map) = &mut arguments {
             map.insert("session".into(), json!(self.session));
+            // Candidate reads (including the final write-boundary check) need
+            // canonical state, never optional related-work/embedding discovery.
+            if name == "get_artefact" { map.insert("view".into(), json!("execution")); }
         }
-        let resp = self
-            .http
+        let card_read = name == "get_artefact";
+        let timeout = self.operation_budget(if card_read { CARD_READ_BUDGET } else { RPC_TIMEOUT })?;
+        let deadline = Instant::now() + timeout;
+        let request = self.http
             .post(format!("{}/mcp", self.hub))
-            .timeout(self.operation_budget(if name == "get_artefact" { Duration::from_secs(10) } else { RPC_TIMEOUT })?)
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token))
-            .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
-            .send()
-            .map_err(|e| format!("hub unreachable ({name}): {e}"))?;
-        let out: Value = resp.json().map_err(|e| format!("hub rpc non-JSON ({name}): {e}"))?;
+            .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }));
+        let result = if card_read && timeout > CARD_FIRST_ATTEMPT {
+            // The canonical card read has no effects. Retry one transport
+            // failure within the original deadline, using the same request.
+            let first = request.try_clone().expect("JSON request body is replayable")
+                .timeout(CARD_FIRST_ATTEMPT).send().and_then(|response| response.json());
+            match first {
+                Err(error) if error.is_timeout() || error.is_connect() => {
+                    match deadline.checked_duration_since(Instant::now()).filter(|time| !time.is_zero()) {
+                        Some(remaining) => request.timeout(remaining).send().and_then(|response| response.json()),
+                        None => Err(error),
+                    }
+                }
+                result => result,
+            }
+        } else {
+            request.timeout(timeout).send().and_then(|response| response.json())
+        };
+        let out: Value = result.map_err(|error| {
+            if error.is_timeout() { format!("hub request timed out ({name}): {error}") }
+            else if error.is_decode() { format!("hub rpc non-JSON ({name}): {error}") }
+            else { format!("hub unreachable ({name}): {error}") }
+        })?;
         if let Some(err) = out.get("error") {
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or(&err.to_string()).to_string();
             return Err(format!("hub rpc error ({name}): {msg}"));
@@ -805,19 +830,19 @@ impl Ctx {
     }
 
     fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
-        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {sha: .sha, verified: .commit.verification.verified}]"]);
-        match out {
-            Ok(Value::Array(a)) => a
-                .iter()
-                .map(|c| {
-                    (
-                        c.get("sha").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        c.get("verified").and_then(|v| v.as_bool()).unwrap_or(false),
-                    )
-                })
-                .collect(),
-            _ => vec![],
+        // Slurp all REST pages atomically. Any failed or malformed page leaves
+        // no proof, so a partial response cannot certify a long PR.
+        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--paginate", "--slurp"]);
+        let Ok(Value::Array(pages)) = out else { return vec![]; };
+        let mut commits = Vec::new();
+        for page in pages {
+            let Value::Array(rows) = page else { return vec![]; };
+            for row in rows {
+                let Some(sha) = row.get("sha").and_then(Value::as_str).filter(|sha| !sha.is_empty()) else { return vec![]; };
+                commits.push((sha.to_string(), row.pointer("/commit/verification/verified").and_then(Value::as_bool).unwrap_or(false)));
+            }
         }
+        commits
     }
 
     /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
@@ -1163,10 +1188,33 @@ fn check_retry_target(repo: &str, run: &MainCheckRun) -> Result<CheckRetryTarget
     }
 }
 
-fn dispatch_check_retry(ctx: &mut Ctx, repo: &str, base: &str, task: &str, head: &str, run: &MainCheckRun) -> Result<(), String> {
+/// BR#8824 closed retry purpose — why this dispatch re-requests a check. The
+/// hub validates the purpose against its own lane evidence: a
+/// `stale_destination_gate` retry is licensed only by the lane's current
+/// canonical green deploy coverage (scoped to the receipt the hub derives);
+/// an `ordinary_head_check` keeps the permanent [task, head, obligation]
+/// budget. The caller never asserts green itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckRetryPurpose {
+    OrdinaryHeadCheck,
+    StaleDestinationGate { pr: i64 },
+}
+
+impl CheckRetryPurpose {
+    fn wire(&self) -> &'static str {
+        match self {
+            Self::OrdinaryHeadCheck => "ordinary_head_check",
+            Self::StaleDestinationGate { .. } => "stale_destination_gate",
+        }
+    }
+}
+
+fn dispatch_check_retry(ctx: &mut Ctx, repo: &str, base: &str, task: &str, head: &str, run: &MainCheckRun, purpose: CheckRetryPurpose) -> Result<(), String> {
     let target = check_retry_target(repo, run)?;
     let reservation = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "check_retry": {
         "kind": "reserve", "task_id": task, "head_sha": head, "name": run.name, "source": run.source, "target": target,
+        "purpose": purpose.wire(),
+        "pr": match purpose { CheckRetryPurpose::StaleDestinationGate { pr } => Some(pr), _ => None },
     } }))?;
     if reservation.get("kind").and_then(Value::as_str) != Some("reserved") {
         return Err(format!("Retry budget consumed for this head/obligation: {}", reservation));
@@ -1857,13 +1905,21 @@ enum IntegrationAdmission {
     RepairDispatched,
 }
 
-fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate) -> Result<IntegrationAdmission, String> {
+fn admit_current_base(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
+    batch_base: Option<(&str, &str)>) -> Result<IntegrationAdmission, String> {
     let pr = cand.pr;
     let head = cand.head_sha.as_str();
     ctx.fetch_pr_head(pr)?;
     ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
     let base_sha = ctx.sh("git", &["rev-parse", &format!("origin/{base}")])?.trim().to_string();
-    if ctx.is_ancestor(&base_sha, head)? { return Ok(IntegrationAdmission::Current); }
+    // A selected member may have been tested against this batch's starting
+    // base. Only use that base if the live tip is still our own landed prefix.
+    let tested_base = match batch_base {
+        Some((start, expected_tip)) if base_sha == expected_tip => start,
+        Some(_) => return Err("Main changed outside the current batch; rescan against the new tip".into()),
+        None => &base_sha,
+    };
+    if ctx.is_ancestor(tested_base, head)? { return Ok(IntegrationAdmission::Current); }
     renew_lease(ctx, repo, base);
     let owned = branch_is_worker_authored(&ctx.pr_commit_logins(repo, pr), &ctx.worker_identities);
     let (clean, files) = ctx.trial_merge(base, head)?;
@@ -1902,7 +1958,7 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         base_verdict, mergeable: facts.get("mergeable").and_then(Value::as_bool),
         merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
         commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
-        mechanical_move: None, root_fix: is_root_fix_card(&card), base_red_names,
+        mechanical_move: None, root_fix: cand.root_fix && is_root_fix_card(&card), base_red_names,
         train_owned_branch: false,
     }), MergeAction::Merge { .. }))
 }
@@ -2363,6 +2419,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             )
             .map(|_| ())
         };
+        // New owner requests only observe the exact reviewed head. They never
+        // turn a DONE acknowledgement into delayed merge permission.
+        let owner_request = lane.pointer("/bypass_merge/kind").and_then(Value::as_str) == Some("owner_merge");
+        if owner_request && facts.as_ref().ok().is_some_and(|f|
+            vstr(f, "headRefOid") != lane.pointer("/bypass_merge/head_sha").and_then(Value::as_str)) {
+            ack(ctx, "stale owner request: PR head changed; fresh review and request required")?;
+            return Ok(());
+        }
         match facts.as_ref().map(|f| {
             (
                 vstr(f, "state").unwrap_or("").to_string(),
@@ -2394,6 +2458,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             Ok((state, _, _)) if state == "CLOSED" => {
                 ack(ctx, "closed")?;
                 log(Some(key), &format!("bypass: PR #{bpr} is CLOSED — authorization consumed (nothing to merge)"));
+            }
+            Ok((_, _, _)) if owner_request => {
+                let (live_base, _) = ctx.base_tip_facts(repo, base)?;
+                let requested_base = lane.pointer("/bypass_merge/base_sha").and_then(Value::as_str);
+                if requested_base != Some(live_base.as_str()) ||
+                    classify_base_check_runs(&ctx.check_runs(repo, &live_base), &required).verdict == MainVerdict::Green {
+                    ack(ctx, "owner request superseded: base changed or recovered; resume normal lane reconciliation")?;
+                    return Ok(());
+                }
+                ctx.note(&format!("PR #{bpr}: waiting to observe the owner's exact-head merge; DONE grants no automatic bypass"));
+                return Ok(());
             }
             Ok((_, _, head_sha)) => {
                 // BR#6390 DONE grace: the human clicked DONE ("I merged it") —
@@ -2885,7 +2960,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
     for &qi in &scan_order {
         if visited.len() >= SCAN_MAX_ENTRIES || candidates.len() >= ready_limit
-            || ctx.operation_budget(SCAN_BUDGET).is_err() { break; }
+            || !ctx.operation_budget(SCAN_BUDGET).is_ok_and(|remaining| remaining >= CARD_FIRST_ATTEMPT) {
+            break;
+        }
         let head = &queue[qi];
         visited.push(qi);
         // BR#4934 cap: at burst_max merges per pass the drain settles even
@@ -3092,7 +3169,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // bound root-fix card (tags + meta.root_fix binding) — the executor
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
         // on the card row, the binding under meta.root_fix).
-        let root_fix = is_root_fix_card(&card);
+        let root_fix = head.get("root_fix").and_then(Value::as_bool) == Some(true)
+            && is_root_fix_card(&card)
+            && card_meta.pointer("/root_fix/head_sha").and_then(Value::as_str) == Some(tip_sha.as_str());
         // BR#5880 (live incident, tick 2026-11-03T21:23:47Z): every gate
         // DECISION reads the LIVE check-runs for THIS head sha — the
         // paginated ctx.check_runs() fetch above, this tick — never a
@@ -3185,6 +3264,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::Note { reason } => ("note", format!(" — {reason}")),
             MergeAction::Skip { reason } => ("skip", format!(" — {reason}")),
             MergeAction::HumanLeg { reason } => ("human_leg", format!(" — {reason}")),
+            MergeAction::RootFixBypass { reason } => ("root_fix_bypass", format!(" — {reason}")),
             MergeAction::Carry { from_head, to_head, .. } => (
                 "carry",
                 format!(" — mechanical head move {}→{} (same patch-ids): verdict carries", &from_head[..from_head.len().min(9)], &to_head[..to_head.len().min(9)]),
@@ -3297,7 +3377,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         // dispatched, escalated: error-level log + a
                         // self_heal_stalled stamp on this entry's queue_facts
                         // (the hub panel and the starvation duty read it).
-                        let attempt = dispatch_check_retry(ctx, repo, base, &head_id, &head_sha, r);
+                        // BR#8824: the stale deploy-health self-heal is a
+                        // STALE DESTINATION retry — the red was stamped
+                        // against a destination that has since recovered.
+                        // The hub validates the current canonical green
+                        // coverage and scopes the budget to the coverage
+                        // receipt; the ordinary [task, head, obligation]
+                        // hold is never weakened by this purpose.
+                        let attempt = dispatch_check_retry(ctx, repo, base, &head_id, &head_sha, r, CheckRetryPurpose::StaleDestinationGate { pr });
                         match attempt {
                             Ok(_) => dispatched += 1,
                             Err(e) => last_err = Some(trunc(&e, 240)),
@@ -3336,56 +3423,29 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // the queue is not held by a stale red
                 return Ok(());
             }
+            MergeAction::RootFixBypass { reason } => {
+                // Persist exact reviewed-head evidence before the shared hub
+                // resolver files the one durable owner request and UI action.
+                qfacts.last_mut().unwrap()["bypass"] = json!({ "kind": "bypass_required",
+                    "base_sha": tip_sha, "head_sha": head_sha });
+                renew_lease(ctx, repo, base);
+                ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base,
+                    "entries": qfacts, "base_state": base_state }))?;
+                ctx.note(&format!("root-fix bypass evidence saved for PR #{pr}: {reason}"));
+                return Ok(());
+            }
             MergeAction::HumanLeg { reason } => {
-                // BR#5190: the root-fix fast lane's HumanLeg is the CIRCULAR
-                // deploy-health class — the deterministic one-click merge ask
-                // (title byte-identical to the hub's, ask-dedupe keys on exact
-                // wording). First option IS the recommendation: one click
-                // merges the cure onto the red base.
-                if root_fix {
-                    renew_lease(ctx, repo, base);
-                    // BR#6390 human-gate contract: the ask says DO THIS, then
-                    // CLICK DONE — the copyable --admin merge command + PR and
-                    // card links inline, and the options are the accept/decline
-                    // pair the ask planes render as inline buttons. DONE is
-                    // dispatched hub-side (trainAlarmAnswerDispatch stamps
-                    // lane.bypass_merge; the executor's stamp consumer lands or
-                    // acks the merge). DECLINE holds the line, stamps nothing.
-                    let fast_details = [
-                        format!("Main on {repo}@{base} is RED; PR #{pr} ({head_id}) is the bound root-fix card (BR#5189 absolute p0)."),
-                        "The base red is the circular deploy-health class: the gate is red because MAIN is red, so this PR's own deploy-health check can never go green while the line it fixes is stopped — no machine leg can pass (SP #2617 precedent).".to_string(),
-                        "HUMAN GATE — do this and click DONE when done to unblock:".to_string(),
-                        "1. Merge the cure out of turn (the gate fails every PR — including this fix PR itself — until the fix lands on the base). Copy-paste:".to_string(),
-                        "   ```".to_string(),
-                        format!("   gh pr merge {pr} --repo {repo} --admin --squash"),
-                        "   ```".to_string(),
-                        format!("2. Click DONE — PR #{pr} merged below. The queue unblocks itself: main's checks re-run on the new merge commit and the train drains once they settle green."),
-                        format!("Links: fix PR {repo}#{pr} — https://github.com/{repo}/pull/{pr} · fix card {head_id}."),
-                        "DECLINE — hold the line keeps the queue parked until main greens some other way; the fix work keeps digging.".to_string(),
-                    ].join("\n\n");
-                    ctx.mcp("ask_agent", json!({
-                        "to": "human",
-                        "question": root_fix_fast_lane_title(repo, pr),
-                        "reason": reason,
-                        "details": fast_details,
-                        "options": [format!("DONE — PR #{pr} merged"), "DECLINE — hold the line"],
-                        "artefact_id": head_id,
-                    }))?;
-                    ctx.note(&format!("root-fix fast lane: filed the human-gate merge ask for PR #{pr} (circular deploy-health class)"));
-                    log(Some(key), &format!("root-fix fast lane: human gate filed for PR #{pr} — merge with --admin, click DONE; the train cannot merge through the circular gate"));
-                    return Ok(());
-                }
-                // ONE ask per class (5c): identical-open-ask dedupe keeps this single.
+                // Signing/merge defects are repair work. The executor must
+                // identify a concrete missing permission before asking a human.
                 renew_lease(ctx, repo, base);
                 ctx.mcp("ask_agent", json!({
-                    "to": "human",
-                    "question": merge_sweep_human_leg_title(repo, &[reason.clone()]),
+                    "route": { "kind": "executor_coordination", "task_id": head_id },
+                    "question": format!("Can the repair executor resolve the signing or merge prerequisite for PR #{pr} in {repo}?"),
                     "reason": reason,
-                    "options": ["Will re-sign and re-push", "Needs a decision"],
-                    "artefact_id": head_id,
+                    "options": ["Bridge executor repairs the demonstrated prerequisite", "Bridge executor identifies a concrete missing permission and requests it explicitly"],
                 }))?;
-                ctx.note(&format!("filed human-leg ask for {head_id}"));
-                log(Some(key), &format!("human leg filed: {reason}"));
+                ctx.note(&format!("requested prerequisite repair for {head_id}"));
+                log(Some(key), &format!("executor coordination filed: {reason}"));
                 return Ok(());
             }
             MergeAction::CloseSuperseded { reason } => {
@@ -3717,13 +3777,14 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 return Ok(());
             }
         }
-        // Current-base admission (BR#6776): file-clean is not compile-clean.
-        // A stale car integrated against newer contracts caused the E0063
-        // main-red. Carry the substance verdict across a clean base update,
-        // but never carry CI: the integrated head must run its actual checks.
-        // Re-evaluate for EACH member, including after this pass advanced base.
+        // Require current-base CI before entering a batch. Once it lands a
+        // prefix, independent members can still use the batch's starting base.
+        // An unrelated main advance restores the live-base requirement.
         if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to prepare this PR; no further writes".into()); }
-        let admission = match admit_current_base(ctx, repo, base, cand) {
+        let expected_tip = if pass_merged > initial_pass_merged { &tip_sha } else { &probed_base_sha };
+        let batch_base = (!probed_base_sha.is_empty())
+            .then_some((probed_base_sha.as_str(), expected_tip.as_str()));
+        let admission = match admit_current_base(ctx, repo, base, cand, batch_base) {
             Ok(admission) => admission,
             Err(error) => {
                 log(Some(key), &format!("PR #{pr}: could not finish its current-main check ({}); checking the other changes", trunc(&error, 240)));
@@ -4234,7 +4295,10 @@ fn bisect_step(ctx: &mut Ctx, key: &str, repo: &str, base: &str, stop: &Value, r
                         if !seen.insert(r.name.clone()) {
                             continue; // newest run per name only
                         }
-                        let ok = dispatch_check_retry(ctx, repo, base, &task, &sha, r).is_ok();
+                        // BR#8824: a bisect probe re-runs to judge THIS merge
+                        // sha — an ordinary head check; its budget stays
+                        // permanent regardless of destination recovery.
+                        let ok = dispatch_check_retry(ctx, repo, base, &task, &sha, r, CheckRetryPurpose::OrdinaryHeadCheck).is_ok();
                         if ok {
                             dispatched += 1;
                         }
@@ -6271,6 +6335,15 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    fn signature_fixture(args: &[&str], rows: Value) -> String {
+        if args.contains(&"--slurp") {
+            let page: Vec<Value> = rows.as_array().unwrap().iter().map(|row| json!({
+                "sha": row["sha"], "commit": { "verification": { "verified": row["verified"] } }
+            })).collect();
+            json!([page]).to_string()
+        } else { rows.to_string() }
+    }
+
     fn test_ctx(hub: &str) -> Ctx {
         Ctx {
             operation_deadline: None,
@@ -6330,6 +6403,34 @@ mod tests {
 
     fn call_args<'a>(params: &'a Value) -> &'a Value {
         params.get("arguments").unwrap_or(&Value::Null)
+    }
+
+    #[test]
+    fn mechanical_card_read_requests_canonical_execution_view() {
+        let card = card_without_lane_legs();
+        let (hub, calls) = mock_hub(vec![ok(card.clone()), ok(json!({ "lanes": [] }))]);
+        let mut ctx = test_ctx(&hub);
+        assert_eq!(ctx.mcp("get_artefact", json!({ "id": "BR#1" })).unwrap(), card);
+        ctx.mcp("train_status", json!({})).unwrap();
+        let recorded = calls.lock().unwrap();
+        assert_eq!(call_args(&recorded[0])["view"], "execution");
+        assert!(call_args(&recorded[1]).get("view").is_none());
+    }
+
+    #[test]
+    fn canonical_card_read_retries_one_transport_timeout() {
+        let card = card_without_lane_legs();
+        let expected = card.clone();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (hub, calls) = mock_hub_with(move |_| {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                std::thread::sleep(CARD_FIRST_ATTEMPT + Duration::from_millis(100));
+            }
+            ok(card.clone())
+        });
+        let mut ctx = test_ctx(&hub);
+        assert_eq!(ctx.mcp("get_artefact", json!({ "id": "BR#1" })).unwrap(), expected);
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -6900,7 +7001,7 @@ mod tests {
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(signature_fixture(args, json!([{"sha":head,"verified":true}])))); }
                 panic!("unexpected gh command {args:?}");
             }));
             let mut queue = vec![json!({"id":"BR#3"}), json!({"id":"BR#2"})];
@@ -6945,16 +7046,17 @@ mod tests {
             let base = repo.git(&["rev-parse", "main"]);
             let first = repo.side_commit("first", "first reviewed change");
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
-            repo.git(&["checkout", "-q", "main"]);
-            repo.git(&["merge", "--no-ff", "-qm", "tested first merge", "first"]);
-            let first_merge = repo.git(&["rev-parse", "HEAD"]);
-            repo.git(&["checkout", "-qb", "second"]);
+            repo.git(&["checkout", "-qb", "second", &base]);
             std::fs::write(repo.dir.join("second.txt"), "second reviewed change\n").unwrap();
             repo.git(&["add", "second.txt"]);
-            repo.git(&["commit", "-qm", "second tested change includes the first merge"]);
+            repo.git(&["commit", "-qm", "independent second change tested on the same base"]);
             let second = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
             repo.git(&["checkout", "-q", "main"]);
+            repo.git(&["merge", "--no-ff", "-qm", "first merge", "first"]);
+            let first_merge = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["merge", "--no-ff", "-qm", "second merge", "second"]);
+            let second_merge = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["reset", "--hard", &base]);
             let heads = [first, second];
             let cards = heads.iter().enumerate().map(|(i, head)| json!({"id":format!("BR#{}",i+1),"status":"blocked","meta":{
@@ -6978,7 +7080,7 @@ mod tests {
                 if cmd != "gh" { return None; }
                 if args.first() == Some(&"pr") {
                     let i = args[2].parse::<usize>().unwrap()-1;
-                    let merge_sha = if i == 0 { &first_merge } else { &heads[1] };
+                    let merge_sha = if i == 0 { &first_merge } else { &second_merge };
                     if args[1] == "merge" {
                         assert!(Command::new("git").args(["push","-q","origin",&format!("{merge_sha}:main")]).current_dir(&dir).status().unwrap().success());
                         landed_c.lock().unwrap().push(i+1);
@@ -6998,7 +7100,7 @@ mod tests {
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-                if endpoint.ends_with("/commits") { return Some(Ok(json!([{"verified":true}]).to_string())); }
+                if endpoint.ends_with("/commits") { return Some(Ok(signature_fixture(args, json!([{"sha": if endpoint.contains("/pulls/1/") { &heads[0] } else { &heads[1] }, "verified":true}])))); }
                 panic!("unexpected gh command {args:?}");
             }));
             drive_lane_inner(&mut ctx, &json!({"queue":[{"id":"BR#1"},{"id":"BR#2"}],"required_workflows":["Test"]}),
@@ -7068,7 +7170,7 @@ mod tests {
             if endpoint.ends_with("/commits/main") { return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string())); }
             if endpoint.contains("/check-runs?") { return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": "success" }]).to_string())); }
             if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
-            if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(json!([{ "verified": true }]).to_string())); }
+            if endpoint.ends_with("/pulls/2/commits") { return Some(Ok(signature_fixture(args, json!([{ "sha": current, "verified": true }])))); }
             panic!("unexpected gh command {args:?}");
         }));
         let result = drive_lane_inner(&mut ctx,
@@ -7146,7 +7248,7 @@ mod tests {
                     return Some(Ok("{}".into()));
                 }
                 if endpoint.contains("/pulls/") && endpoint.ends_with("/commits") {
-                    return Some(Ok(json!([{ "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]).to_string()));
+                    return Some(Ok(signature_fixture(args, json!([{ "sha": if endpoint.contains("/pulls/2/") { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale }, "verified": true, "login": if worker_owned { "detached-cody" } else { "human" } }]))));
                 }
                 panic!("unexpected gh command {args:?}");
             }));
@@ -7158,6 +7260,56 @@ mod tests {
             assert_eq!(held.pointer("/entries/0/cls"), Some(&json!(if worker_owned { "waiting" } else { "blocked" })));
             assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 2));
             assert!(!calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged" && call_args(c)["pr"] == 1));
+        }
+    }
+
+    #[test]
+    fn signature_read_includes_later_pages_and_discards_incomplete_results() {
+        let row = |n: u32, verified: bool| json!({ "sha": format!("{n:040x}"), "commit": { "verification": { "verified": verified } } });
+        let page: Vec<Value> = (1..=30).map(|n| row(n, true)).collect();
+        for (response, expected) in [
+            (Ok(json!([page, [row(31, false), row(32, true)]]).to_string()), 32),
+            (Ok(json!([[row(1, true)], {"error":"incomplete page"}]).to_string()), 0),
+            (Err("GitHub page 2 failed".into()), 0),
+        ] {
+            let mut ctx = test_ctx("http://unused.invalid");
+            ctx.sh_mock = Some(std::sync::Arc::new(move |_, args| {
+                assert!(args.contains(&"--paginate") && args.contains(&"--slurp"));
+                Some(response.clone())
+            }));
+            let commits = ctx.pr_commits("o/r", 1);
+            assert_eq!(commits.len(), expected);
+            if expected > 0 { assert!(!commits[30].1); assert_eq!(commits[31].0, format!("{:040x}",32)); }
+        }
+    }
+
+    #[test]
+    fn owner_done_never_merges_and_changed_evidence_spends_old_request() {
+        for scenario in 0..4 {
+            let (hub, calls) = mock_hub_with(|_| Ok(json!({})));
+            let mut ctx = test_ctx(&hub);
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                assert_eq!(cmd, "gh");
+                assert!(!args.contains(&"merge"), "owner DONE must never issue merge or admin commands");
+                if args.first() == Some(&"pr") {
+                    assert_eq!(args[1], "view");
+                    return Some(Ok(json!({ "state": "OPEN", "headRefOid": if scenario == 1 { "d".repeat(40) } else { "c".repeat(40) } }).to_string()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint.ends_with("/commits/main") {
+                    return Some(Ok(json!({ "sha": if scenario == 2 { "e".repeat(40) } else { "b".repeat(40) }, "committed_at": crate::logging::iso(now_ms()) }).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.contains("/check-runs?") {
+                    return Some(Ok(json!([{ "id": 1, "name": "Test", "status": "completed", "conclusion": if scenario == 3 { "success" } else { "failure" } }]).to_string()));
+                }
+                panic!("unexpected gh command {args:?}");
+            }));
+            drive_lane_inner(&mut ctx, &json!({ "required_workflows": ["Test"], "bypass_merge": { "kind": "owner_merge", "pr": 1,
+                "head_sha": "c".repeat(40), "base_sha": "b".repeat(40), "at": 1 } }), "o/r@main", "o/r", "main", 60_000, 10).unwrap();
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.iter().any(|c| call_name(c) == "train_queue_facts" && call_args(c).get("bypass_consumed").is_some()), scenario != 0);
+            assert!(!calls.iter().any(|c| call_name(c) == "train_event"));
         }
     }
 
@@ -7198,7 +7350,10 @@ mod tests {
             panic!("unexpected command {args:?}");
         }));
         let candidate = BatchCandidate { qi: 0, head_id: "BR#7".into(), pr: 7, head_sha: old.clone(), root_fix: false };
-        assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate).unwrap(),
+        assert!(admit_current_base(&mut ctx, "o/r", "main", &candidate, Some((&old, &old)))
+            .unwrap_err().contains("Main changed outside the current batch"));
+        assert!(calls.lock().unwrap().is_empty(), "unexpected base must not mutate a candidate");
+        assert_eq!(admit_current_base(&mut ctx, "o/r", "main", &candidate, None).unwrap(),
             IntegrationAdmission::AwaitingCi { base_sha: base, head_sha: integrated });
         let events = calls.lock().unwrap();
         assert!(events.iter().any(|c| call_name(c) == "train_carry"));
@@ -8049,7 +8204,11 @@ mod tests {
             sh_log_c.lock().unwrap().push(line.clone());
             let phase = *tick_phase_c.lock().unwrap();
             if cmd == "git" {
-                return Some(Ok(String::new()));
+                return Some(Ok(if args == ["rev-parse", "origin/main"] {
+                    dark_tip.to_string()
+                } else {
+                    String::new()
+                }));
             }
             if cmd == "gh" {
                 if args == ["api", "repos/state-vector/superpositional"] {
@@ -8136,7 +8295,7 @@ mod tests {
                         }));
                     }
                     if endpoint.contains("/pulls/2880/commits") {
-                        return Some(Ok(json!([{ "sha": pr_head, "verified": true }]).to_string()));
+                        return Some(Ok(signature_fixture(args, json!([{ "sha": pr_head, "verified": true }]))));
                     }
                 }
             }

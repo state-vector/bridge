@@ -121,3 +121,39 @@ function orientPayload() {
     action_required: [],
   };
 }
+
+describe("canonical execution reads", () => {
+  const record = { id: "BR#4063", type: "task", title: "Repair", status: "blocked", tags: [], meta: {
+    prs: [{ repo: "state-vector/superpositional", number: 2476, head_sha_at_acceptance: "a".repeat(40), carry: [{ from_head: "a".repeat(40), to_head: "b".repeat(40) }] }],
+  }, delivery_admissions: [{ review_id: "BR#1", state: { phase: "admitted" } }] };
+  const identity = { token_id: "test", label: "train", tags: [], principal: null };
+
+  it("returns identical task authority without invoking discovery, even when discovery is unavailable", async () => {
+    const calls: string[] = [];
+    const ctx = { identity, sessionName: "train", call: async (op: string) => {
+      calls.push(op);
+      if (op !== "get") throw new Error("optional discovery unavailable");
+      return record;
+    } };
+    const result = await TOOL_TABLE.get_artefact.handler({ id: record.id, view: "execution" }, ctx) as { content: Array<{ text: string }> };
+    expect(JSON.parse(result.content[0].text)).toEqual(record);
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("keeps related-work discovery for the default agent view", async () => {
+    const calls: string[] = [];
+    const ctx = { identity, sessionName: "agent", call: async (op: string) => {
+      calls.push(op);
+      if (op === "get") return record;
+      if (op === "relations") return { relations: [] };
+      if (op === "related" || op === "search") return { artefacts: [] };
+      throw new Error(`unexpected operation ${op}`);
+    } };
+    const result = await TOOL_TABLE.get_artefact.handler({ id: record.id }, ctx) as { content: Array<{ text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.meta).toEqual(record.meta);
+    expect(parsed.delivery_admissions).toEqual(record.delivery_admissions);
+    expect(calls).toEqual(["get", "relations", "related", "search"]);
+    expect(parsed.see_also).toEqual([]);
+  });
+});
