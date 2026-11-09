@@ -58,9 +58,14 @@ export const ModelCapabilitySchema = z.object({
   projects: z.array(text).default(["*"]),
   availability: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("usable") }),
-    z.object({ kind: z.literal("unavailable"), reason: text }),
+    z.object({ kind: z.literal("unavailable"), reason: text, cause: ProviderCauseSchema.optional() }),
     z.object({ kind: z.literal("disabled") }),
   ]).default({ kind: "usable" }),
+  /** The last bounded exact-model probe the runner ran for THIS model. A
+   * usable advertisement carrying a probe receipt NEWER than an incident's
+   * last observed failure is the ONLY thing that clears that incident — an
+   * answered ask is not health proof, and neither is a bare usable flag. */
+  probe: z.object({ model: text, at: z.number().int(), ok: z.boolean(), output_head: z.string().max(400) }).optional(),
 });
 export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional(),
   admission_hold: z.object({ kind: z.literal("update_handoff"), reason: text }).optional() });
@@ -118,7 +123,8 @@ export const InteractiveClaimSchema = z.object({
 export type InteractiveClaim = z.infer<typeof InteractiveClaimSchema>;
 export const ExecutionBlockerSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("startup_wait"), episode_id: text, text, wait: StartupWaitSchema }),
-  z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text) }),
+  z.object({ kind: z.literal("capability_unavailable"), episode_id: text, reason: z.enum(["not_configured", "offline", "unavailable"]), text, evidence: z.array(text),
+    causes: z.array(ProviderCauseSchema).max(20).default([]) }),
   z.object({ kind: z.literal("executor_not_ready"), episode_id: text, text, evidence: z.array(text), causes: z.array(z.object({ host: text, readiness: ExecutorNotReadySchema })).min(1) }),
   z.object({ kind: z.literal("capacity_wait"), episode_id: text, text }),
   z.object({ kind: z.literal("human_answer_required"), episode_id: text, ask_id: text, text }),
@@ -171,13 +177,54 @@ export const AttemptSchema = z.discriminatedUnion("phase", [
   z.object({ ...AttemptFields, phase: z.literal("quiesced"), checkpoint: CheckpointSchema.nullable(), restored_tree: sha.nullable() }),
 ]);
 export type ExecutionAttempt = z.infer<typeof AttemptSchema>;
+/** One canonical provider/account cause per failed attempt. The runner
+ * extracts the provider's own structured JSON-RPC error (code + message +
+ * data) and classifies it ONLY on a trustworthy discriminator; anything else
+ * stays `unknown_provider_error` with the raw sanitized evidence preserved
+ * (BR#8811/BR#8821: evidence over guesses — a generic failure string is never
+ * promoted to a quota proof). */
+export const ProviderCauseSchema = z.object({
+  class: z.enum(["quota_exhausted", "insufficient_credits", "auth_unauthorized", "unknown_provider_error"]),
+  code: z.number().int().nullable().default(null),
+  backend: text,
+  model: z.string().nullable().default(null),
+  phase: text.optional(),
+  evidence: z.array(text).max(20).default([]),
+});
+export type ProviderCause = z.infer<typeof ProviderCauseSchema>;
+/** Account-capacity incident classes: the blocker lives outside the system and
+ * demands a human account action (top-up / credential / plan). Only these are
+ * exempt from the action-retry budget charge — a diagnosed genuine failure
+ * still charges (BR#8821; no blanket reset of existing counters). */
+export const ACCOUNT_INCIDENT_CLASSES = ["quota_exhausted", "insufficient_credits", "auth_unauthorized"] as const;
+export function isAccountIncidentCause(cause: ProviderCause | null | undefined): boolean {
+  return !!cause && (ACCOUNT_INCIDENT_CLASSES as readonly string[]).includes(cause.class);
+}
+/** Dedupe scope of one incident: the provider route (backend + exact model)
+ * and failure class. Two classes on one route are two incidents (different
+ * human actions); the same class on two models of one provider is two routes. */
+export function providerIncidentRouteKey(cause: Pick<ProviderCause, "class" | "backend" | "model">): string {
+  return `${cause.class}|${cause.backend}|${cause.model ?? ""}`;
+}
+export function providerIncidentText(cause: Pick<ProviderCause, "class" | "backend" | "model">): string {
+  const route = `${cause.backend}${cause.model ? `/${cause.model}` : ""}`;
+  switch (cause.class) {
+    case "quota_exhausted": return `Provider account exhausted its quota for ${route}; it needs an account action (plan/limit).`;
+    case "insufficient_credits": return `Provider account has insufficient credits for ${route}; the account needs topping up.`;
+    case "auth_unauthorized": return `Provider rejected authorization for ${route}; the account needs a valid credential.`;
+    default: return `Provider error on ${route}; classified unknown — raw evidence preserved, no automatic recovery.`;
+  }
+}
 /** Process outcome is evidence, never business acceptance. The agent/hub owns
- * task completion; exit 0 cannot manufacture a review or close a diagnostic. */
+ * task completion; exit 0 cannot manufacture a review or close a diagnostic.
+ * `cause` is the typed provider/account cause when the terminal evidence
+ * carries one; absent on every older journal (mixed-version safe). */
 export const TerminalOutcomeSchema = z.object({
   kind: z.enum(["completed", "interrupted", "failed", "timed_out", "result_unavailable"]),
   exit_code: z.number().int().nullable(),
   stdout_tail: z.string().max(16_000),
   stderr_tail: z.string().max(8_000),
+  cause: ProviderCauseSchema.optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 export const ExecutionStateSchema = z.object({

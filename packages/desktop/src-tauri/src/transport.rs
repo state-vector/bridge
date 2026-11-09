@@ -91,6 +91,80 @@ pub fn stop_recovered(identity: &ProcessIdentity) -> GroupState {
     GroupState::Unobservable
 }
 
+/// One canonical provider/account cause per failed attempt, extracted from the
+/// provider's own structured JSON-RPC error object (code + message + data).
+/// Classification happens ONLY on a trustworthy discriminator; everything else
+/// stays `unknown_provider_error` with the raw sanitized evidence preserved
+/// (BR#8811/BR#8821: a generic failure string is never promoted to a quota
+/// proof, and a human answer is never health proof).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCauseClass { QuotaExhausted, InsufficientCredits, AuthUnauthorized, UnknownProviderError }
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCause {
+    pub class: ProviderCauseClass,
+    pub code: Option<i64>,
+    pub backend: String,
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+impl ProviderCauseClass {
+    /// The account-action sentence every surface (admission text, ask, UI)
+    /// renders for this class. Never a bare "no deployments" string.
+    pub fn text(&self, backend: &str, model: Option<&str>) -> String {
+        let route = format!("{backend}{}", model.map(|m| format!("/{m}")).unwrap_or_default());
+        match self {
+            Self::QuotaExhausted => format!("Provider account exhausted its quota for {route}; it needs an account action (plan/limit)."),
+            Self::InsufficientCredits => format!("Provider account has insufficient credits for {route}; the account needs topping up."),
+            Self::AuthUnauthorized => format!("Provider rejected authorization for {route}; the account needs a valid credential."),
+            Self::UnknownProviderError => format!("Provider error on {route}; classified unknown — raw evidence preserved, no automatic recovery."),
+        }
+    }
+}
+
+/// Keep the raw evidence but bounded: full upstream payloads never persist.
+fn evidence_line(text: &str) -> String {
+    let text = text.trim();
+    let mut out: String = text.chars().take(400).collect();
+    if text.chars().count() > 400 { out.push('…'); }
+    out
+}
+
+pub fn classify_provider_cause(
+    code: Option<i64>, message: &str, data: &str, backend: &str, model: Option<&str>, phase: &str,
+) -> ProviderCause {
+    let haystack = format!("{} {message} {data}", code.map(|c| c.to_string()).unwrap_or_default()).to_lowercase();
+    let class = if haystack.contains("insufficient credit") || haystack.contains("insufficient_credits")
+        || haystack.contains("out of credits") || haystack.contains("credit balance")
+        || haystack.contains("payment required") || code == Some(402)
+    {
+        ProviderCauseClass::InsufficientCredits
+    } else if (haystack.contains("quota")
+        && (haystack.contains("exhaust") || haystack.contains("exceed") || haystack.contains("limit") || haystack.contains("used up")))
+        || haystack.contains("usage limit") || haystack.contains("rate_limit_quota") || code == Some(1310)
+    {
+        ProviderCauseClass::QuotaExhausted
+    } else if code == Some(401) || code == Some(403) || haystack.contains("unauthorized")
+        || haystack.contains("invalid api key")
+        || (haystack.contains("api key") && (haystack.contains("invalid") || haystack.contains("missing") || haystack.contains("expired")))
+        || haystack.contains("authentication")
+    {
+        ProviderCauseClass::AuthUnauthorized
+    } else {
+        ProviderCauseClass::UnknownProviderError
+    };
+    let mut evidence = Vec::new();
+    if let Some(code) = code { evidence.push(format!("code={code}")); }
+    evidence.push(format!("message={}", evidence_line(message)));
+    if !data.trim().is_empty() { evidence.push(format!("data={}", evidence_line(data))); }
+    ProviderCause { class, code, backend: backend.to_string(), model: model.map(|m| m.to_string()), phase: Some(phase.to_string()), evidence }
+}
+
 pub struct RunOutcome {
     pub ok: bool,
     pub stdout_tail: String,
@@ -98,6 +172,10 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub session_id: Option<String>, // for resume (kiro stream / ACP sessionId)
+    /// Typed provider/account cause when the transport captured a structured
+    /// provider error. Absent on transport-level failures (spawn/timeout) and
+    /// on every older journal (serde default keeps mixed versions safe).
+    pub cause: Option<ProviderCause>,
 }
 
 #[derive(Default)]
@@ -185,7 +263,7 @@ fn head_line(s: &str, max: usize) -> String {
 /// make child processes resolve against the desktop's state dir (no auth
 /// there) — the "Unauthorized"/"Session not found" failure class. Stripping
 /// them is what makes `opencode acp session/new` work at all.
-fn sanitized(cmd: &mut Command) {
+pub(crate) fn sanitized(cmd: &mut Command) {
     cmd.env_remove("OPENCODE_CLIENT")
         .env_remove("XDG_STATE_HOME")
         .env_remove("OPENCODE_SERVER_USERNAME")
@@ -357,7 +435,8 @@ impl AgentTransport for OpencodeRun {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
-                };
+                    cause: None,
+};
             }
         };
 
@@ -432,7 +511,8 @@ impl AgentTransport for OpencodeRun {
             exit_code: status.and_then(|s| s.code()),
             timed_out,
             session_id: None,
-        }
+            cause: None,
+}
     }
 }
 
@@ -477,7 +557,8 @@ impl AgentTransport for OpencodeAcp {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
-                };
+                    cause: None,
+};
             }
         };
 
@@ -506,7 +587,9 @@ impl AgentTransport for OpencodeAcp {
 
         // Send a request, then read lines until its response arrives.
         // Non-matching lines (session/update notifications) go to `on_line`.
-        // Returns Err on timeout/dead child.
+        // Returns Err on timeout/dead child, or the structured JSON-RPC error
+        // object when the provider reports one (BR#8821: the typed cause is
+        // extracted here, never flattened away).
         let call = |stdin: &mut BufWriter<std::process::ChildStdin>,
                         id: i64,
                         method: &str,
@@ -514,7 +597,7 @@ impl AgentTransport for OpencodeAcp {
                         rx: &std::sync::mpsc::Receiver<String>,
                         on_line: &mut dyn FnMut(&str),
                         deadline: Instant|
-         -> Result<serde_json::Value, String> {
+         -> Result<serde_json::Value, AcpCallError> {
             let frame = serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params
             });
@@ -522,11 +605,11 @@ impl AgentTransport for OpencodeAcp {
                 .write_all(serde_json::to_string(&frame).unwrap_or_default().as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
                 .and_then(|_| stdin.flush())
-                .map_err(|e| format!("acp stdin write failed: {e}"))?;
+                .map_err(|e| AcpCallError::Transport(format!("acp stdin write failed: {e}")))?;
             let mut last_line = Instant::now();
             loop {
                 if req.control.map(|c| c.should_stop()).unwrap_or(false) {
-                    return Err("acp interrupted — checkpoint and resume".into());
+                    return Err(AcpCallError::Transport("acp interrupted — checkpoint and resume".into()));
                 }
                 // wait until whichever comes first: the stall window closing
                 // (no output for 5m — hung) or the hard ceiling (budget +
@@ -540,13 +623,11 @@ impl AgentTransport for OpencodeAcp {
                     .min(stall_end.checked_duration_since(now).unwrap_or(Duration::ZERO));
                 let line = match rx.recv_timeout(left.min(Duration::from_millis(500))) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) if left > Duration::from_millis(500) => continue,
-                    result => result.map_err(|_| {
-                    if now >= stall_end {
+                    result => result.map_err(|_| AcpCallError::Transport(if now >= stall_end {
                         "acp timed out — stalled: no output for 5m".to_string()
                     } else {
                         "acp timed out (budget + grace exhausted)".to_string()
-                    }
-                    })?,
+                    }))?,
                 };
                 last_line = Instant::now();
                 on_line(&line);
@@ -556,9 +637,10 @@ impl AgentTransport for OpencodeAcp {
                 };
                 if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
                     if let Some(err) = v.get("error") {
-                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-                        let data = err.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                        return Err(format!("acp {method} failed: {msg} {data}"));
+                        let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
+                        let data = err.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                        let code = err.get("code").and_then(|c| c.as_i64());
+                        return Err(AcpCallError::Rpc { method: method.to_string(), code, message, data });
                     }
                     return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
                 }
@@ -684,24 +766,56 @@ impl AgentTransport for OpencodeAcp {
                     exit_code: status.and_then(|s| s.code()).or(Some(0)),
                     timed_out,
                     session_id,
+                    cause: None,
                 }
             }
-            Err(e) if e.contains("timed out") => RunOutcome {
+            Err(AcpCallError::Transport(text)) if text.contains("timed out") => RunOutcome {
                 ok: false,
                 stdout_tail: tail(accumulated, 4000),
-                stderr_tail: e,
+                stderr_tail: text,
                 exit_code: None,
                 timed_out: true,
                 session_id,
+                cause: None,
             },
-            Err(e) => RunOutcome {
-                ok: false,
-                stdout_tail: tail(accumulated, 4000),
-                stderr_tail: e,
-                exit_code: status.and_then(|s| s.code()),
-                timed_out,
-                session_id,
-            },
+            Err(e) => {
+                // The provider's own structured error object is the evidence;
+                // the flattened text stays in stderr_tail for compatibility.
+                let cause = match &e {
+                    AcpCallError::Rpc { code, message, data, .. } => {
+                        Some(classify_provider_cause(*code, message, data, "opencode", req.model, "session/prompt"))
+                    }
+                    _ => None,
+                };
+                RunOutcome {
+                    ok: false,
+                    stdout_tail: tail(accumulated, 4000),
+                    stderr_tail: e.to_string(),
+                    exit_code: status.and_then(|s| s.code()),
+                    timed_out,
+                    session_id,
+                    cause,
+                }
+            }
+        }
+    }
+}
+
+/// ACP call failure, two kinds: transport-level (timeout/stall/IO — the
+/// caller may fall back to stdio) and a structured JSON-RPC error object from
+/// the agent/provider (the typed ProviderCause source). `Display` reproduces
+/// the historical flattened text exactly, so ACP_UNAVAILABLE fallback checks
+/// keep matching (BR#8821: keep the string for logs, keep the object for law).
+#[derive(Debug)]
+enum AcpCallError {
+    Transport(String),
+    Rpc { method: String, code: Option<i64>, message: String, data: String },
+}
+impl std::fmt::Display for AcpCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(text) => write!(f, "{text}"),
+            Self::Rpc { method, message, data, .. } => write!(f, "acp {method} failed: {message} {data}"),
         }
     }
 }
@@ -718,6 +832,7 @@ fn acp_fail(mut child: Child, msg: String) -> RunOutcome {
         timed_out: false,
         session_id: None,
     }
+    cause: None,
 }
 
 /// Pull the human-readable text out of a session/update notification.
@@ -846,7 +961,8 @@ impl AgentTransport for KiroChat {
                     exit_code: None,
                     timed_out: false,
                     session_id: None,
-                };
+                    cause: None,
+};
             }
         };
         let stdout = child.stdout.take().map(|mut p| {
@@ -873,7 +989,8 @@ impl AgentTransport for KiroChat {
             exit_code: status.and_then(|s| s.code()),
             timed_out,
             session_id,
-        }
+            cause: None,
+}
     }
 }
 

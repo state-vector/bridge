@@ -28,7 +28,15 @@ impl WriterProof {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Outcome { pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdout_tail: String, pub stderr_tail: String }
+pub struct Outcome {
+    pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdout_tail: String, pub stderr_tail: String,
+    /// Typed provider/account cause when the transport captured a structured
+    /// provider error. `default` keeps every older journal readable (mixed
+    /// versions); `skip_serializing_if` keeps cause-less records byte-stable
+    /// against the hub's captured-evidence immutability comparisons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::transport::ProviderCause>,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TerminalReceipt { pub generation: u64, pub attempt_id: String, pub outcome: Outcome }
 

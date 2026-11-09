@@ -102,7 +102,7 @@ fn record(cfg: &DispatchConfig, task: &str, runtime: &ExecutionRuntime, result: 
     let owner = Ownership::Attempt { ticket: Ticket { task_id: task.into(), session: claim_session(cfg, task) },
         host: cfg.label.clone().ok_or("gateway host missing")?, generation: runtime.generation, attempt_id: runtime.attempt_id.clone() };
     let outcome = Outcome { kind: if runtime.control.stop.load(Ordering::SeqCst) { OutcomeKind::Interrupted } else if result.timed_out { OutcomeKind::TimedOut } else if result.ok && !void_run(&result.stdout_tail, &result.stderr_tail) { OutcomeKind::Completed } else { OutcomeKind::Failed },
-        exit_code: result.exit_code, stdout_tail: result.stdout_tail.clone(), stderr_tail: result.stderr_tail.clone() };
+        exit_code: result.exit_code, stdout_tail: result.stdout_tail.clone(), stderr_tail: result.stderr_tail.clone(), cause: result.cause.clone() };
     let work = if let Some(writers) = runtime.control.writer_state().and_then(WriterProof::observed) {
         Work::Stopped { outcome, writers, worktree, step: Step::Stop }
     } else { Work::Unproven { outcome, worktree } };
@@ -152,7 +152,7 @@ fn prepare(shared: &Config, snap: &SharedSnapshot, input: Input, cancel: Arc<Ato
                     if let (Some(generation), Some(attempt_id)) = (a["generation"].as_u64(), a["attempt_id"].as_str()) {
                         let owner = Ownership::Attempt { ticket: ticket.clone(), host: cfg.label.clone().unwrap(), generation, attempt_id: attempt_id.into() };
                         let record = Record { owner: owner.clone(), host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
-                            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+                            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
                         return Prepared::Finalize { owner, value: FinalWork::Fresh(record) };
                     }
                 }
@@ -289,7 +289,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
     result.map_err(|error| (record, error))
 }
 fn bounded_outcome(outcome: &Outcome) -> Outcome {
-    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000) }
+    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000), cause: outcome.cause.clone() }
 }
 fn tail_bytes(text: &str, max: usize) -> String {
     let mut start = text.len().saturating_sub(max);
@@ -441,7 +441,7 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
             if !archive.exists() { journal::write_file(&archive, &original)?; }
             let outcome = match &saved.work {
                 Work::Unproven { outcome, .. } => outcome.clone(),
-                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into() },
+                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into(), cause: None },
             };
             let worktree = match &saved.work { Work::Unproven { worktree: Some(path), .. } => Some(path.clone()), _ => worktree };
             journal::save(&terminal, &Record { work: Work::Stopped { outcome, writers: WriterProof::NoLiveGroupMembers, worktree, step: Step::Stop }, disposition: Disposition::Pending, ..saved })?;
@@ -660,7 +660,7 @@ impl Controller {
                 }
             },
             Err(TryRecvError::Disconnected) => {
-                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None };
+                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, cause: None };
                 record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()).ok().map(|r| FinalWork::Active(r, running.execution.clone()))
             },
             Err(TryRecvError::Empty) => None,
