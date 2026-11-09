@@ -101,7 +101,7 @@ export class ExecutionWork {
     const task = this.task(id); const state = this.state(task);
     if (state.attempt && state.attempt.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — stop and preserve its work before claiming");
     if (state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before interactive claim");
-    if (state.handoff.phase === "preparing") throw new Error("gate: local handoff preparation/checkpoint must complete before claiming");
+    if (state.handoff.phase === "preparing") throw new Error("gate: local handoff preparation must complete before claiming");
     if (state.handoff.phase === "accepted") throw new Error("gate: local handoff already has an executor; preserve its claim");
     const h = state.handoff; const token = this.credential(tokenId)!;
     if (h.phase === "waiting" && h.recipient && h.recipient !== token.label && h.recipient !== token.principal) throw new Error("gate: local handoff is addressed to another recipient");
@@ -153,7 +153,7 @@ export class ExecutionWork {
     const task = this.task(id); const blockers = this.blockers(task, Date.now());
     const capability = blockers.find(isExecutorAvailabilityBlocker);
     const state = this.state(task);
-    const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
+    const requirements = state.requirements;
     const hosts = this.hosts(id).map(host => {
       const inventory = [host.capabilities, ...host.capabilities.alternatives];
       const compatible = inventory.some(c => capabilityBlockers(requirements, c, host.host).length === 0);
@@ -182,7 +182,7 @@ export class ExecutionWork {
     const state = this.state(task);
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
-    const requirements = state.attempt && !state.attempt.checkpoint ? { ...state.requirements, host: state.attempt.host } : state.requirements;
+    const requirements = state.requirements;
     const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id), asks: this.asks(task.id), now, local });
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
@@ -241,13 +241,13 @@ export class ExecutionWork {
     if (h.phase === "none" || h.id !== cmd.handoff_id || h.version !== cmd.version) return { kind: "stale_episode" as const };
     if (cmd.kind === "confirm_preparation") {
       if (h.phase !== "preparing" || (state.attempt && state.attempt.phase !== "quiesced")) return { kind: "unmet_prerequisites" as const, prerequisites: ["originating_runner_quiescence_required"] };
-      if (cmd.checkpoint.tests.some(t => t.tree !== cmd.checkpoint.tree)) return { kind: "unmet_prerequisites" as const, prerequisites: ["checkpoint_evidence_content_mismatch"] };
-      state.handoff = { ...h, phase: "waiting", checkpoint: cmd.checkpoint, version: h.version + 1, quiescence: { kind: "human_attested", by: actor, evidence: cmd.evidence } };
+      if (cmd.checkpoint?.tests.some(t => t.tree !== cmd.checkpoint?.tree)) return { kind: "unmet_prerequisites" as const, prerequisites: ["checkpoint_evidence_content_mismatch"] };
+      state.handoff = { ...h, phase: "waiting", checkpoint: null, version: h.version + 1, quiescence: { kind: "human_attested", by: actor, evidence: cmd.evidence } };
       const meta: TaskMeta = JSON.parse(task.meta || "{}");
       meta.execution_requirements = state.requirements;
       meta.blocked = { reason: `Pick up locally: ${h.action}`, ts: Date.now(), unblock_condition: "Explicit authorised local acceptance", await_event: { event: "local_handoff", handoff_id: h.id, version: h.version + 1 } };
       this.storage.transactionSync(() => { this.save(task.id, state); this.sql.exec(`UPDATE artefacts SET status='blocked',owner='',meta=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), task.id); });
-      this.audit(actor, "local_preparation_attested", task.id, { handoff: h.id, evidence: cmd.evidence, checkpoint: cmd.checkpoint.commit });
+      this.audit(actor, "local_preparation_attested", task.id, { handoff: h.id, evidence: cmd.evidence, checkpoint: cmd.checkpoint?.commit ?? null });
       return { kind: "preparation_confirmed" as const };
     }
     if (cmd.kind === "authorize") {
@@ -268,16 +268,15 @@ export class ExecutionWork {
     if (state.operations.some(o => o.state === "prepared" || o.state === "outcome_unknown")) return { kind: "unmet_prerequisites" as const, prerequisites: ["unknown_external_operations"] };
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
     state.handoff = { ...h, phase: "returned", returned_at: Date.now(), by: actor, quiescence: { kind: "human_attested", by: actor, evidence: `Explicit stopped-writer return for ${h.id} version ${h.version}` } };
-    if (state.attempt?.phase === "quiesced") state.attempt.checkpoint = h.checkpoint;
     state.revision += 1;
     this.storage.transactionSync(() => {
       this.save(task.id, state); delete meta.session; delete meta.blocked; delete meta.execution_wait; delete meta.local_execution;
       const asks = this.asks(task.id);
       if (asks.length) meta.blocked = { reason: asks[0].question, unblock_condition: `Answer ${asks[0].id}`, ts: Date.now(), await_event: { event: "ask", ask_id: asks[0].id } };
       this.sql.exec(`UPDATE artefacts SET status=?,owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, asks.length ? "blocked" : "todo", JSON.stringify(meta), Date.now(), Date.now(), task.id);
-      this.record(task.id, actor, { kind: "local_handoff_returned", handoff_id: h.id, checkpoint_commit: h.checkpoint.commit });
+      this.record(task.id, actor, { kind: "local_handoff_returned", handoff_id: h.id, checkpoint_commit: h.checkpoint?.commit ?? null });
     });
-    this.audit(actor, "local_execution_returned", task.id, { handoff: h.id, writers: cmd.writers, checkpoint: h.checkpoint.commit });
+    this.audit(actor, "local_execution_returned", task.id, { handoff: h.id, writers: cmd.writers, checkpoint: h.checkpoint?.commit ?? null });
     this.sweep(); // capability/human blockers remain independent of this return
     return { kind: "returned_autonomous" as const };
   }
@@ -323,12 +322,12 @@ export class ExecutionWork {
     const details = { id: `local:decision:${crypto.randomUUID()}`, version: 1, requested_at: Date.now(), reason, action: question,
       findings: "See the task and answered decision for the executor's findings.", tried: "Consult the executor's recorded history; no additional attempts are claimed.", next: "Read the continuation and explicitly accept this handoff after human authorisation.",
       evidence: [`https://hub.fleetbridge.run/card/${id.replace("#", "-")}`], approvals: [`Human selected local handoff (${actor})`], recipient: null, quiescence: { kind: "pending" as const } };
-    state.handoff = state.attempt?.phase === "quiesced" && state.attempt.checkpoint
-      ? { ...details, phase: "waiting", checkpoint: state.attempt.checkpoint, quiescence: { kind: "runner", host: state.attempt.host, generation: state.attempt.generation } } : { ...details, phase: "preparing" };
+    state.handoff = state.attempt?.phase === "quiesced" && !state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      ? { ...details, phase: "waiting", checkpoint: null, quiescence: { kind: "runner", host: state.attempt.host, generation: state.attempt.generation } } : { ...details, phase: "preparing" };
     if (state.attempt && state.attempt.phase !== "quiesced") state.attempt.phase = "stopping";
     const meta: TaskMeta = JSON.parse(task.meta || "{}"); delete meta.awaiting_ask; delete meta.startup_wait;
     meta.execution_requirements = state.requirements;
-    meta.blocked = { reason: `Pick up locally: ${question}`, ts: Date.now(), unblock_condition: "Only explicit authorised local acceptance resolves this handoff; old-writer checkpoint/quiescence must complete first",
+    meta.blocked = { reason: `Pick up locally: ${question}`, ts: Date.now(), unblock_condition: "Only explicit authorised local acceptance resolves this handoff; old-writer quiescence must complete first",
       await_event: { event: "local_handoff", handoff_id: details.id, version: 1 } };
     this.storage.transactionSync(() => {
       // Explicit human conversion transfers the wait, not execution authority.

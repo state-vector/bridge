@@ -729,7 +729,6 @@ struct ExecutionRuntime {
     attempt_id: String,
     control: Arc<crate::transport::RunControl>,
     maintenance: Option<Arc<LeaseMaintenance>>,
-    last_checkpoint: Instant,
 }
 
 /// One clock per attempt: preparing other workers, Git publication and the
@@ -769,7 +768,7 @@ impl Drop for LeaseMaintenance {
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum RemoteAttemptState {
-    Restoring { checkpoint: crate::checkpoint::Checkpoint },
+    Restoring,
     Running,
     Stopping,
     Finalizing,
@@ -805,7 +804,7 @@ struct RemoteExecution {
 enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
 impl RemoteExecution {
     fn permits_renewal(&self, generation: u64, attempt_id: &str) -> bool {
-        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring { .. }))
+        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring))
             && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered) && matches!(m.priority, MessagePriority::Interrupt))
     }
     fn parse(value: serde_json::Value) -> Result<Self, String> {
@@ -862,13 +861,6 @@ impl ExecutionRuntime {
     }
     fn command(&self, kind: &str) -> serde_json::Value {
         json!({ "kind": kind, "generation": self.generation, "attempt_id": self.attempt_id })
-    }
-    fn checkpoint(&self, cfg: &DispatchConfig, tid: &str, path: &Path) -> Result<(), String> {
-        let checkpoint = crate::checkpoint::publish(path, tid, self.generation, "Read task history and checkpoint; continue the remaining action, preserving any newer local WIP.", vec![std::env::consts::OS.into(), std::env::consts::ARCH.into()])?;
-        let mut cmd = self.command("checkpoint");
-        cmd["checkpoint"] = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
-        execution_call(cfg, tid, cmd)?;
-        Ok(())
     }
 }
 
@@ -2088,13 +2080,12 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
 }
 
 #[derive(Clone, Copy)]
-enum DispatchStage { Starting, Readiness, Checkpoint, Finalizing, Admission, Preparing, Hygiene, Waiting }
+enum DispatchStage { Starting, Readiness, Finalizing, Admission, Preparing, Hygiene, Waiting }
 
 fn dispatch_stage(snap: &SharedSnapshot, stage: DispatchStage) {
     let label = match stage {
         DispatchStage::Starting => "starting",
         DispatchStage::Readiness => "checking worker readiness",
-        DispatchStage::Checkpoint => "publishing checkpoint",
         DispatchStage::Finalizing => "draining completed workers",
         DispatchStage::Admission => "reserving eligible work",
         DispatchStage::Preparing => "preparing reserved worker",
@@ -3189,7 +3180,7 @@ fn append_recovery_continuation(prompt: &mut String, state: &serde_json::Value, 
     let permit = &state["recovery_permit"];
     if permit["phase"] != "consumed" || permit["consumed_generation"].as_u64() != Some(generation)
         || permit["consumed_attempt_id"].as_str() != Some(attempt_id) { return; }
-    prompt.push_str(&format!("\n# Authorized recovery continuation\n{}\nContinue from the preserved checkpoint and exact prior terminal evidence above. Follow the continuation instructions; reconcile receipts before any external effect. This permission is for this attempt only.\n", permit));
+    prompt.push_str(&format!("\n# Authorized recovery continuation\n{}\nStart from the current repository and reconcile the prior terminal evidence above. Follow the continuation instructions; reconcile receipts before any external effect. This permission is for this attempt only.\n", permit));
 }
 
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
@@ -3425,16 +3416,12 @@ fn spawn_opencode(
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
     let model = Some(model_id);
     let model_str = model.clone().unwrap_or_default();
-    // A different model gets a fresh session, preserving the checkpoint/WIP.
+    // A different model gets a fresh session.
     let previous = task_meta.get("execution_last_model");
     let model_changed = previous.and_then(|p| p["model"].as_str()) != model.as_deref()
         || previous.and_then(|p| serde_json::from_value::<ReasoningTier>(p["tier"].clone()).ok()) != Some(model_tier)
         || previous.and_then(|p| p["backend"].as_str()) != Some(backend_name);
-    let resume_session = if model_changed { None } else if resume_session.is_none() && backend == opencode::Backend::Kiro {
-        load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
-    } else {
-        resume_session
-    };
+    let resume_session = if model_changed { None } else { resume_session };
     let resume = resume_session.is_some();
     let ticket = lifecycle::Ticket { task_id: tid.into(), session: claim_session(cfg, tid) };
     let allocation = match workspace::Owner::open(cfg).and_then(|owner| owner.allocate(&ticket, repo_url.as_deref())) {
@@ -3444,7 +3431,7 @@ fn spawn_opencode(
     let worktree = allocation.checkout.clone();
     let scratch = worktree.is_none().then(|| allocation.work.clone());
     let run_dir = allocation.work.to_string_lossy().to_string();
-    let branch = "detached checkpoint";
+    let branch = "detached worktree";
     if let Some(wt) = &worktree {
         let profile = cfg.identity_profile();
         if let Err(error) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
@@ -3513,7 +3500,7 @@ fn spawn_opencode(
         }
     } else {
         format!(
-            "- You are working in {run_dir}, a gateway-owned scratch workspace. Clone any required repositories inside this directory. The workspace owner checkpoints source and reclaims local disk after confirmed writer stop; deliver findings and receipts to the board."
+            "- You are working in {run_dir}, a gateway-owned scratch workspace. Clone any required repositories inside this directory. The workspace owner reclaims clean, published source after confirmed writer stop; deliver findings and receipts to the board."
         )
     };
     let bridge_session = claim_session(cfg, tid);
@@ -3626,34 +3613,16 @@ fn spawn_opencode(
         Ok(control) => control,
         Err(error) => { dlog(tid, &format!("launch intent could not be persisted; no writer launched: {error}")); return; },
     };
-    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None, last_checkpoint: Instant::now() };
+    if matches!(remote.state, RemoteAttemptState::Restoring) {
+        dlog(tid, "Hub requested a retired checkpoint restore; no writer launched");
+        return;
+    }
+    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
     execution.control.grant_lease();
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
-    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
+    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
     execution.start_maintenance(cfg, tid, live.clone());
-    if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
-        let restored = (|| -> Result<(), String> {
-            let path = worktree.as_deref().ok_or("portable checkpoint requires an isolated Git worktree")?;
-            crate::checkpoint::restore(path, &cp)?;
-            let mut cmd = execution.command("restore"); cmd["tree"] = json!(cp.tree); cmd["commit"] = json!(cp.commit);
-            execution_call(cfg, tid, cmd)?;
-            Ok(())
-        })();
-        if let Err(e) = restored {
-            execution.stop_maintenance();
-            dlog(tid, &format!("checkpoint restore held: {e}; no agent spawned"));
-            // This attempt has never spawned a child. Preserve checkpoint/WIP;
-            // don't leave an imaginary writer lease blocking reconciliation.
-            return;
-        }
-    }
-    // Give the hub a real preservation point before a routine verifier can
-    // become a recovery-preemption victim. Publication runs in this bounded
-    // preparation job; terminal finalization captures any later WIP again.
-    if let Some(path) = worktree.as_deref() {
-        if let Err(error) = execution.checkpoint(cfg, tid, path) { dlog(tid, &format!("initial preservation unavailable; writer remains non-preemptible without a checkpoint: {error}")); }
-    }
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
         Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }

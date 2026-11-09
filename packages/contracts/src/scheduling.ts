@@ -14,7 +14,7 @@ export type GatewayDispatch =
 
 export const RecoveryPreemptionSchema = z.object({
   phase: z.enum(["stopping_verification", "slot_available"]), recovery_id: z.string(), victim_id: z.string(),
-  generation: z.number().int().positive(), attempt_id: z.string(), session: z.string(), requested_at: z.number(), checkpoint_commit: z.string(),
+  generation: z.number().int().positive(), attempt_id: z.string(), session: z.string(), requested_at: z.number(), checkpoint_commit: z.string().nullable(),
 });
 export type RecoveryPreemption = z.infer<typeof RecoveryPreemptionSchema>;
 const counts = { host: z.string(), active: z.number(), reserved: z.number(), finalizing: z.number().default(0), capacity: z.number(), eligible: z.number(),

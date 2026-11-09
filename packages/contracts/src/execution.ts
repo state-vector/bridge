@@ -147,10 +147,10 @@ const QuiescenceProofSchema = z.discriminatedUnion("kind", [
 export const LocalHandoffSchema = z.discriminatedUnion("phase", [
   z.object({ phase: z.literal("none") }),
   z.object({ phase: z.literal("preparing"), ...HandoffDetails, quiescence: z.object({ kind: z.literal("pending") }) }),
-  z.object({ phase: z.literal("waiting"), ...HandoffDetails, checkpoint: CheckpointSchema, quiescence: QuiescenceProofSchema }),
-  z.object({ phase: z.literal("accepted"), ...HandoffDetails, checkpoint: CheckpointSchema,
+  z.object({ phase: z.literal("waiting"), ...HandoffDetails, checkpoint: CheckpointSchema.nullable(), quiescence: QuiescenceProofSchema }),
+  z.object({ phase: z.literal("accepted"), ...HandoffDetails, checkpoint: CheckpointSchema.nullable(),
     token_id: text, session: text, host: text, accepted_at: z.number(), grant_id: text, capabilities: ExecutorCapabilitiesSchema, quiescence: QuiescenceProofSchema }),
-  z.object({ phase: z.literal("returned"), ...HandoffDetails, checkpoint: CheckpointSchema, returned_at: z.number(), by: text, quiescence: QuiescenceProofSchema }),
+  z.object({ phase: z.literal("returned"), ...HandoffDetails, checkpoint: CheckpointSchema.nullable(), returned_at: z.number(), by: text, quiescence: QuiescenceProofSchema }),
 ]);
 export type LocalHandoff = z.infer<typeof LocalHandoffSchema>;
 export const LocalGrantSchema = z.object({
@@ -178,7 +178,7 @@ export const HandoffReadSchema = z.looseObject({ project: text.optional(), recip
 export const HandoffAcceptSchema = z.looseObject({ id: text, handoff_id: text, version: z.number().int().positive(), session: text });
 export const HandoffControlSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("request_local"), id: text, reason: text, action: text }),
-  z.object({ kind: z.literal("confirm_preparation"), id: text, handoff_id: text, version: z.number().int().positive(), checkpoint: CheckpointSchema, evidence: text, writers: z.literal("human_confirmed_quiescent") }),
+  z.object({ kind: z.literal("confirm_preparation"), id: text, handoff_id: text, version: z.number().int().positive(), checkpoint: CheckpointSchema.optional(), evidence: text, writers: z.literal("human_confirmed_quiescent") }),
   z.object({ kind: z.literal("authorize"), id: text, handoff_id: text, version: z.number().int().positive(), label: text, session: text, host: text, evidence: text, capabilities: ExecutorCapabilitiesSchema, ttl_ms: z.number().int().min(1).max(900_000).optional() }),
   z.object({ kind: z.literal("return_autonomous"), id: text, handoff_id: text, version: z.number().int().positive(), writers: z.literal("human_confirmed_quiescent") }),
 ]);
@@ -381,7 +381,6 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       if (needsRecoveryPermit && !(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now))) throw new Error("gate: retry budget or provider route requires a current recovery permit");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
-      if (a && a.host !== host && !a.checkpoint) throw new Error("gate: cross-host transfer requires a published checkpoint");
       s.generation += 1;
       if (needsRecoveryPermit && s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {
@@ -390,10 +389,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         action_deadline: now + command.action_budget_ms,
         executor: null,
       };
-      const checkpoint = a?.checkpoint ?? (s.handoff.phase === "returned" ? s.handoff.checkpoint : null);
-      s.attempt = checkpoint
-        ? { ...common, phase: "restoring", checkpoint, restored_tree: null }
-        : { ...common, phase: "running", checkpoint: null, restored_tree: null };
+      s.attempt = { ...common, phase: "running", checkpoint: null, restored_tree: null };
       break;
     }
     case "poll": {
@@ -442,16 +438,16 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       // Receipt of stop/interrupt does not mean its requested business action
       // was completed. Keep it acknowledged for the next executor to reconcile.
       for (const message of s.messages) if (message.state === "delivered") message.state = "acknowledged";
-      if (s.handoff.phase === "preparing" && current.checkpoint && !s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
-        s.handoff = { ...s.handoff, phase: "waiting", checkpoint: current.checkpoint, quiescence: { kind: "runner", host, generation: current.generation } };
+      if (s.handoff.phase === "preparing" && !s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
+        s.handoff = { ...s.handoff, phase: "waiting", checkpoint: null, quiescence: { kind: "runner", host, generation: current.generation } };
       }
       break;
     }
     case "yield": {
       const current = requireAttempt(true);
-      if (current.phase !== "quiesced" || !current.checkpoint) throw new Error("gate: yield requires a published checkpoint and quiescent writer");
+      if (current.phase !== "quiesced") throw new Error("gate: yield requires a quiescent writer");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile pending external operations before yielding");
-      if (s.handoff.phase === "preparing") s.handoff = { ...s.handoff, phase: "waiting", checkpoint: current.checkpoint, quiescence: { kind: "runner", host, generation: current.generation } };
+      if (s.handoff.phase === "preparing") s.handoff = { ...s.handoff, phase: "waiting", checkpoint: null, quiescence: { kind: "runner", host, generation: current.generation } };
       break;
     }
     case "message": {

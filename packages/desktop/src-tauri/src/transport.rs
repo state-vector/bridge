@@ -801,7 +801,7 @@ impl AgentTransport for OpencodeAcp {
             let mut last_line = Instant::now();
             loop {
                 if req.control.map(|c| c.should_stop()).unwrap_or(false) {
-                    return Err(AcpCallError { text: "acp interrupted — checkpoint and resume".into(), cause: None, origin: AcpFailureOrigin::Transport });
+                    return Err(AcpCallError { text: "acp interrupted — stop for a fresh attempt".into(), cause: None, origin: AcpFailureOrigin::Transport });
                 }
                 // wait until whichever comes first: the stall window closing
                 // (no output for 5m — hung) or the hard ceiling (budget +

@@ -309,7 +309,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const card = await post("get", { id });
     expect(card.status).toBe("todo");
     expect(card.meta.execution_resume).toMatchObject({ kind: "terminal_result", generation: 1 });
-    expect(card.meta.execution_requirements.host).toBe(g.host);
+    expect(card.meta.execution_requirements.host).toBeUndefined();
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
     expect((await g.cmd(final, "old-final-not-replay", id, "wrong-session")).error).toMatch(/fenced|session/);
   });
@@ -347,7 +347,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(recovered.task_id).toBe(id);
     const next = await peer.cmd({ kind: "begin", attempt_id: "next-host", worker: peer.auth.agent, action_budget_ms: 60_000 },
       "other-host-begin", id, recovered.session);
-    expect(next).toMatchObject({ generation: 2, attempt: { host: peer.host, phase: "restoring" } });
+    expect(next).toMatchObject({ generation: 2, attempt: { host: peer.host, phase: "running", checkpoint: null } });
     expect(await g.cmd(last, "record-deploy", id, claim.session)).toEqual(reconciled);
     expect((await g.cmd(last, "new-old-host-command", id, claim.session)).error).toMatch(/authority/);
     expect((await g.cmd({ ...last, outcome: "succeeded" }, "record-deploy", id, claim.session)).error).toMatch(/reused/);
@@ -607,18 +607,17 @@ describe("priority line recovery capacity", () => {
     expect(await g.cmd({ kind: "schedule", mode: "request_capacity" })).toMatchObject({ kind: "ready", active: 0, reserved: 0 });
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: repair });
   });
-  it("checkpoint-preempts exactly one verifier, retains its slot until quiescence and dispatches recovery before the verifier resumes", async () => {
+  it("preempts exactly one verifier without a checkpoint, retains its slot until quiescence and dispatches recovery before the verifier resumes", async () => {
     const project = "repair-preemption", g = await gateway(project);
     const victim = await task(project); await post("update", { id: victim, roles: ["review"] });
     const r = await reserve(g); if (r.kind !== "reserved") throw new Error("no verification reservation");
     await g.cmd({ kind: "begin", attempt_id: "verification", worker: g.auth.agent, action_budget_ms: 60_000 }, "verify-begin", victim, r.session);
-    await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "verification", checkpoint: publishedCheckpoint }, "verify-checkpoint", victim, r.session);
     const repair = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
     expect((await g.cmd({ kind: "schedule", mode: "inspect" })).preemption).toBeUndefined();
     expect((await g.cmd({ kind: "inspect" }, "before-preempt", victim, r.session)).messages).toHaveLength(0);
     const responses = await Promise.all([g.cmd({ kind: "schedule", mode: "request_capacity" }, "full-runner-capacity"), reserve(g, "preempt-a"), reserve(g, "preempt-b")]);
     for (const result of responses) expect(result).toMatchObject({ kind: "at_capacity", active: 1, reserved: 0,
-      preemption: { phase: "stopping_verification", recovery_id: repair, victim_id: victim, generation: 1, checkpoint_commit: publishedCheckpoint.commit } });
+      preemption: { phase: "stopping_verification", recovery_id: repair, victim_id: victim, generation: 1, checkpoint_commit: null } });
     const stopped = await g.cmd({ kind: "poll", generation: 1, attempt_id: "verification" }, "verify-poll", victim, r.session);
     expect(stopped.attempt.phase).toBe("stopping");
     expect(stopped.messages).toHaveLength(1);
@@ -631,11 +630,11 @@ describe("priority line recovery capacity", () => {
     expect((await g.cmd({ kind: "begin", attempt_id: "cannot-steal-slot", worker: g.auth.agent, action_budget_ms: 60_000 }, "verify-cannot-resume-first", victim, r.session)).error).toMatch(/priority recovery/);
     await g.cmd({ kind: "yield", generation: 1, attempt_id: "verification" }, "verify-yield", victim, r.session);
     expect((await post("get", { id: victim })).status).toBe("todo");
-    expect((await g.cmd({ kind: "inspect" }, "preserved-verifier", victim, r.session)).attempt.checkpoint).toEqual(publishedCheckpoint);
+    expect((await g.cmd({ kind: "inspect" }, "stopped-verifier", victim, r.session)).attempt.checkpoint).toBeNull();
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: repair });
     expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0]).toMatchObject({ active: 0, reserved: 1 });
   });
-  it.each(["uncheckpointed", "recovery-review", "pending-effect"])("does not interrupt protected verification: %s", async protection => {
+  it.each(["recovery-review", "pending-effect"])("does not interrupt protected verification: %s", async protection => {
     const project = `repair-protection-${protection}`, g = await gateway(project);
     let reviewMeta = {};
     if (protection === "recovery-review") {
@@ -647,7 +646,6 @@ describe("priority line recovery capacity", () => {
     const victim = await task(project, reviewMeta); await post("update", { id: victim, roles: ["review"] });
     const r = await reserve(g); if (r.kind !== "reserved") throw new Error("no verification reservation");
     await g.cmd({ kind: "begin", attempt_id: "protected", worker: g.auth.agent, action_budget_ms: 60_000 }, "protected-begin", victim, r.session);
-    if (protection !== "uncheckpointed") await g.cmd({ kind: "checkpoint", generation: 1, attempt_id: "protected", checkpoint: publishedCheckpoint }, "protected-checkpoint", victim, r.session);
     if (protection === "pending-effect") await g.cmd({ kind: "prepare", generation: 1, attempt_id: "protected", operation_id: "external", action: "publish", input_revision: "head", budget_ms: 60_000 }, "protected-effect", victim, r.session);
     await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
     expect((await reserve(g)).preemption).toBeUndefined();

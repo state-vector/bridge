@@ -4936,12 +4936,7 @@ export class KnowledgeHub {
 
   private executionSchedulingRequirements(id: string, fallback: unknown) {
     const state = this.executionState(id);
-    const requirements = this.executionWork().schedulingRequirements(id, state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {}), state ?? undefined);
-    // A quiescent writer can still own unpublished work. Check this before
-    // claiming, using the same durable affinity that begin will enforce.
-    return state?.attempt && !state.attempt.checkpoint
-      ? { ...requirements, host: state.attempt.host }
-      : requirements;
+    return this.executionWork().schedulingRequirements(id, state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {}), state ?? undefined);
   }
 
   private startupWait(id: string): StartupWait | null {
@@ -5414,7 +5409,7 @@ export class KnowledgeHub {
       const claimSession = claim ? JSON.parse(claim.meta ?? "{}").session : null;
       const interrupted = state?.messages.some(m => m.priority === "interrupt" && m.state !== "acted") && op !== "ask.answer";
       if (!a || interrupted || claim?.status !== "in_progress" || claimSession !== a.session || binding?.worker_token_id !== body.token_id || scope?.generation !== a.generation || scope?.attempt_id !== a.attempt_id || a.phase !== "running" || a.lease_until <= Date.now() || a.action_deadline <= Date.now()) {
-        throw new Error("gate: execution mutation fenced — stop and checkpoint; runner must verify restore/quiescence before resuming");
+        throw new Error("gate: execution mutation fenced — stop; runner must confirm writer quiescence before a fresh attempt");
       }
     }
     if (op === "transition" && body.to === "in_progress") {
@@ -5626,7 +5621,6 @@ export class KnowledgeHub {
       const selected = [inventory,...inventory.alternatives].find(c => c.backend===command.proof.backend && c.model===command.proof.model && c.config_revision===command.proof.config_revision
         && usableFor(current.requirements,c,command.proof.host,String(this.one(`SELECT project FROM artefacts WHERE id=?`,req.id)?.project??"")));
       if (!selected) throw new Error("gate: recovery proof does not match a usable selected configured capability");
-      if (a.host !== command.proof.host && !a.checkpoint) throw new Error("gate: unpublished work retains original host affinity");
       current.recovery_permit = { phase:"available",id:`${req.id}:${a.generation}:${a.attempt_id}`,generation:a.generation,attempt_id:a.attempt_id,
         task_revision:String(meta.work_revision??"legacy"),checkpoint_commit:a.checkpoint?.commit??null,terminal,
         proof:command.proof,diagnosis:command.diagnosis,continuation:command.continuation,evidence:command.evidence,authorized_by:actor };
@@ -5733,8 +5727,7 @@ export class KnowledgeHub {
       const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && !isSigningScratchResourceFailure(reason) && readiness.kind === "ready";
       const paused = Number(this.one(`SELECT until_ts FROM executor_claim_pauses WHERE token_id=?`, tokenId)?.until_ts ?? 0) > now;
       const barrier = command.kind === "start_failed" && !taskPrerequisite && !paused ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
-      const affinity = command.retained_work ? actor : current.attempt && !current.attempt.checkpoint ? current.attempt.host : null;
-      const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(affinity ? { host: affinity } : {}) };
+      const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(command.retained_work ? { host: actor } : {}) };
       meta.execution_requirements = requirements;
       const taskFingerprint = taskPrerequisite ? this.taskStartupProof(req.id, fingerprint, meta) : fingerprint;
       const startupWait = command.kind === "start_failed" && !current.attempt && current.generation === 0 && !current.operations.length
@@ -5847,7 +5840,6 @@ export class KnowledgeHub {
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
     if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted"
       && providerRecoveryDiagnosis(command.outcome) !== "provider_route_unavailable") chargeExecutionFailure(next,command.generation);
-    if (canRescheduleFinalized && next.attempt && !next.attempt.checkpoint) next.requirements = { ...next.requirements, host: next.attempt.host };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;
       next.requirements.tier = maxTier(next.requirements.tier, begunExecutor.tier);
@@ -7162,10 +7154,10 @@ export class KnowledgeHub {
         const execution = this.executionState(id);
         if (execution?.attempt && execution.attempt.phase !== "quiesced") {
           // Releasing the card fences its writer, not just its tools. Keep the
-          // slot charged until the host stops/checkpoints and proves quiescence.
+          // slot charged until the host stops and proves quiescence.
           const stopped = reduceExecution(execution, { kind: "message", priority: "interrupt",
             message_id: `claim-ended:${execution.generation}:${execution.attempt.attempt_id}`,
-            text: "Task claim ended. Stop the writer, preserve/checkpoint work and report process-group quiescence; do not continue execution." },
+            text: "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution." },
             execution.attempt.host, execution.attempt.session, ts);
           this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(stopped), id);
         }

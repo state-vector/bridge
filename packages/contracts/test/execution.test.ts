@@ -9,16 +9,15 @@ const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", s
 const started = () => step(initialExecution(), begin);
 
 describe("durable execution failure boundaries", () => {
-  it("finishes an authored local handoff only after stopped proof and checkpoint, never by exit code", () => {
+  it("finishes an authored local handoff only after stopped proof, never by exit code", () => {
     let s = step(started(), { kind: "local_handoff", ...fence, reason: "Local device needed", action: "Run on paired device", findings: "Remote device is unavailable", tried: "Inspected device binding", next: "Verify on local device", evidence: ["device binding"], approvals: [], recipient: null });
     const outcome = { kind: "interrupted", exit_code: null, stdout_tail: "WIP retained", stderr_tail: "" } as const;
     s = step(s, { kind: "stopped", ...fence, writers: "no_live_group_members", outcome });
     expect(s.handoff.phase).toBe("preparing");
     expect(() => step(s, { kind: "prepare", ...fence, operation_id: "new-effect", action: "Must not run", input_revision: cp.commit, budget_ms: 1000 })).toThrow(/stopped/);
-    s = step(s, { kind: "checkpoint", ...fence, checkpoint: cp }, 1_000_000);
     s = step(s, { kind: "finalize", ...fence, writers: "no_live_group_members", outcome }, 1_000_000);
     expect(s.attempt?.phase).toBe("quiesced");
-    expect(s.handoff).toMatchObject({ phase: "waiting", checkpoint: cp, quiescence: { kind: "runner", generation: 1 } });
+    expect(s.handoff).toMatchObject({ phase: "waiting", checkpoint: null, quiescence: { kind: "runner", generation: 1 } });
   });
   it("recovers historical scratch ENOSPC once without sliding backoff or clearing real signing defects", () => {
     const reason = "gate: identity profile failed — refusing to dispatch (sign-check scratch dir: No space left on device (os error 28)). Fix the runner's identity config or provision the signing key.";
@@ -69,19 +68,12 @@ describe("durable execution failure boundaries", () => {
     expect(() => step(s, { kind: "poll", ...fence }, 1_000_000)).toThrow(/expired/);
     expect(() => step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" }, 1_000_000, "linux")).toThrow(/fenced/);
   });
-  it("retains host affinity without a portable checkpoint", () => {
-    const s = step(started(), { kind: "quiesce", ...fence, writers: "process_group_empty" });
-    expect(() => step(s, { ...begin, attempt_id: "two" }, 200, "linux")).toThrow(/published checkpoint/);
-  });
-  it("requires exact restoration before starting a replacement writer and fences the old generation", () => {
-    let s = step(started(), { kind: "checkpoint", ...fence, checkpoint: cp });
+  it.each([null, cp])("starts fresh on another host after quiescence with legacy checkpoint %j", (checkpoint) => {
+    let s = started();
+    if (checkpoint) s = step(s, { kind: "checkpoint", ...fence, checkpoint });
     s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
     s = step(s, { ...begin, attempt_id: "two" }, 200, "linux");
-    expect(s.attempt?.phase).toBe("restoring");
-    expect(() => step(s, { kind: "prepare", generation: 2, attempt_id: "two", operation_id: "push", action: "push", input_revision: cp.commit, budget_ms: 1000 }, 200, "linux")).toThrow(/restoring/);
-    expect(() => step(s, { kind: "restore", generation: 2, attempt_id: "two", tree: "d".repeat(40), commit: cp.commit }, 200, "linux")).toThrow(/exact commit and tree/);
-    s = step(s, { kind: "restore", generation: 2, attempt_id: "two", tree: cp.tree, commit: cp.commit }, 200, "linux");
-    expect(s.attempt?.phase).toBe("running");
+    expect(s.attempt).toMatchObject({ phase: "running", host: "linux", generation: 2, checkpoint: null, restored_tree: null });
     expect(() => step(s, { kind: "checkpoint", ...fence, checkpoint: cp })).toThrow(/fenced/);
   });
   it("rejects content-unbound test evidence", () => {
@@ -107,7 +99,7 @@ describe("durable execution failure boundaries", () => {
     s = step(s, { kind: "result", ...fence, operation_id: "deploy", outcome: "succeeded", receipts: ["https://github.com/state-vector/bridge/actions/runs/1"] }, 1200);
     expect(s.operations[0].state).toBe("succeeded");
   });
-  it("persists a higher reasoning minimum and requires checkpoint/quiescence before yield", () => {
+  it("persists a higher reasoning minimum and requires quiescence before yield", () => {
     let s = step(started(), { kind: "escalate", ...fence, tier: "large", reason: "Two failed proof attempts at medium reasoning" });
     expect(s.requirements.tier).toBe("large");
     expect(() => step(s, { kind: "yield", ...fence })).toThrow(/quiescent/);

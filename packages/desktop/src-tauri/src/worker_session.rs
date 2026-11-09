@@ -165,7 +165,7 @@ fn attach_with_stop(spec: Spec, cancelled: Option<Arc<AtomicBool>>) -> Result<In
     Ok(InFlight { task_id: spec.owner.ticket().task_id.clone(), task_title: spec.title, completed,
         role_work: false, started: Instant::now() - Duration::from_millis(now_ms().saturating_sub(spec.started_at)), last_note: String::new(),
         worktree: spec.worktree, scratch: spec.scratch, pr_url: None, rx: mpsc::channel().1, live,
-        execution: ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(crate::transport::RunControl::default()), maintenance: None, last_checkpoint: Instant::now() },
+        execution: ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(crate::transport::RunControl::default()), maintenance: None },
         worker: Some(Handle { owner: spec.owner.clone(), rx, stop, reattachable, detached }) })
 }
 
@@ -321,7 +321,7 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     journal::write_file(&root.join("started.json"), &serde_json::to_vec(&spec.owner).unwrap())?;
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(ticket.task_id.clone(), (*generation, attempt_id.clone()));
     let control = match gateway_pipeline::arm_launch(&spec.cfg, &ticket.task_id, *generation, attempt_id, spec.worktree.clone(), None) { Ok(control) => control, Err(error) => return unlaunched(&spec, error) };
-    let mut runtime = ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(control), maintenance: None, last_checkpoint: Instant::now() };
+    let mut runtime = ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(control), maintenance: None };
     runtime.control.grant_lease();
     let live = Arc::new(Mutex::new(String::new())); runtime.start_maintenance_every(&spec.cfg, &ticket.task_id, live.clone(), lease_interval);
     let published = live.clone(); let stop = runtime.control.clone(); let owner = spec.owner.clone(); let status_root = root.clone();

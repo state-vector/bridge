@@ -621,22 +621,13 @@ agent. The SQLite state and command replay receipt commit atomically. Worker
 MCP writes carry their generation/attempt scope in runner-injected headers;
 removing or changing the scope does not restore legacy write access.
 
-- **Portable work:** every five minutes and when a process stops, an isolated
-  Git worktree is snapshotted through a private index (tracked and non-ignored
-  untracked files). A signed preservation commit is pushed to a unique
-  `bridge-checkpoints/…` ref and read back. Snapshotting leaves HEAD, the real
-  index and local WIP intact. Checkpoints record base, commit, tree, environment,
-  next action and content-bound test evidence. Ignored inputs/secrets are not
-  uploaded: required external environments must be provisioned separately.
-- **Safe transfer:** lease expiry and missing stdout never prove a writer has
-  stopped. Another attempt waits for the original runner's empty-process-group
-  acknowledgement; cross-host execution additionally requires a published
-  checkpoint and verified commit/tree restoration. Newer local WIP is retained,
-  not reset to an older checkpoint. Dirty or unpublished worktrees are retained
-  by cleanup if the preservation barrier cannot be proved.
+- **Fresh attempts:** after the original runner confirms its writers have stopped,
+  another eligible runner starts from the repository and task history. Execution
+  has no snapshot backend. Workspace cleanup retains dirty or unpublished
+  source locally.
 - **Independent clocks:** a two-minute execution lease is renewed by a dedicated
-  per-attempt control poller every 20 seconds, independently of worker preparation,
-  checkpoint publication and the dispatch tick. The poller is joined before
+  per-attempt control poller every 20 seconds, independently of worker preparation
+  and the dispatch tick. The poller is joined before
   quiescence/transfer; refused polls stop the writer and retain WIP. The configured
   task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
@@ -645,7 +636,7 @@ removing or changing the scope does not restore legacy write access.
   from the runner's process group.
 - **Active coordination:** safe-point polls reconcile task-addressed asks into a
   durable mailbox (`queued → delivered → acknowledged → acted`). For CLIs that
-  cannot accept hot input, the runner stops/checkpoints and resumes with the
+  cannot accept hot input, the runner stops and the next attempt receives the
   message. Interruptions gate conflicting hub writes immediately. Delivery is
   not a claim that the requested repair succeeded.
 - **Bounded external operations:** the `execution` MCP tool supports
@@ -700,7 +691,7 @@ worker credentials cannot impersonate it; classification comes from live token
 tags, never a declared session name or a payload flag.
 
 The claim atomically binds the credential/session, consumes the matching execution
-wait and preserves published checkpoints/continuation evidence. Competing claims
+wait and preserves task continuation evidence. Competing claims
 cannot both win. Original writers must actually be quiescent, unknown external
 effects must be reconciled, local preparation must be complete, and outstanding
 human decisions, qualification and review separation still apply. Owner progress
@@ -713,18 +704,16 @@ remain and are re-evaluated, rather than erased to force a dispatch.
 
 `handoffs` remains side-effect-free discovery. The older episode/version-bound
 **Authorise a local session** → `handoff_accept` flow remains available when an
-explicit capability grant is desired. For that grant-based flow, publish updates
-with `handoff_checkpoint` and use **Return to automation** after stopping local
-writers. Ordinary ask answers, copying, notification dismissal and expiry never
+explicit capability grant is desired. For that grant-based flow, record findings on the task and use
+**Return to automation** after stopping local writers. Ordinary ask answers, copying, notification dismissal and expiry never
 claim work. A full agent's explicit claim is the direct pickup operation.
 
 A human decision can explicitly use choice action `local_handoff` instead of
 `resume`, `hold` or `release`. Native-origin work still needs its originating
 runner's quiescence proof. For manual-origin work without a managed runner,
 **Confirm manual preparation** records a separately labelled human attestation
-of the published checkpoint and stopped writers; it cannot override a native
-writer. Continuation prompts identify what is portable and require a fresh
-registered worktree, not reuse of another executor's working directory.
+that manual writers have stopped. A native writer requires its own proof.
+Continuation prompts direct the next executor to a fresh registered worktree.
 The human may also choose **Request local pickup** for queued/unserved work.
 That prepares the same guarded lifecycle; it does not create an execution claim.
 Notifications are deduplicated by workspace and blocker/handoff episode;
@@ -826,8 +815,7 @@ not another configuration knob.
 **Escalation:** an executor inspects `execution` command `availability`, which
 reports `next_available_tier` (or null). It explicitly calls `escalate` with its
 generation/attempt, concrete limitation, and a stronger tier. It stops working;
-the runner checkpoints, quiesces and yields. The next session is fresh when
-backend/model/tier changes. Explicit unavailable minima block rather than fall
+the runner quiesces and yields. The next attempt starts fresh. Explicit unavailable minima block rather than fall
 back, and capability restoration clears only that blocker.
 
 **Verification:** ordinary `review_result: {kind:"findings",summary:"..."}` does
@@ -887,8 +875,8 @@ bridge execution availability 'BR#123'
 For a managed runtime update, `bridge execution pause` temporarily stops new
 claims for that gateway (five-minute, self-expiring lease) without aborting
 healthy active work. `bridge execution coordinate 'BR#123' '<message>'` requests
-a bounded checkpoint/stop through its durable mailbox. Wait for quiescent
-checkpoints and a writer-free runner before replacing it, then run
+a bounded stop through its durable mailbox. Wait for confirmed quiescence
+and a writer-free runner before replacing it, then run
 `bridge execution resume`. The gateway's own credential is required; a pause
 is not a credential failure or a waiver of task/transfer fences.
 After restart, an unchanged same-host claim with authoritative writer quiescence
@@ -899,13 +887,13 @@ Delivery policy v1 uses signed direct-main commits for `state-vector/bridge`
 and independent receipt review; other repositories retain PR/merge-train
 delivery. The generated prompt uses the actual `dispatch-<task>` claim session.
 
-The runner claims eligible `todo` work and dispatches an agent CLI in an isolated, gateway-owned workspace. Delivery follows the repository's policy (signed direct-main for Bridge; PR/train elsewhere). Claim races do not count as agent-CLI failures. Expired claims do not override durable writer-quiescence or checkpoint-restoration barriers.
+The runner claims eligible `todo` work and dispatches an agent CLI in an isolated, gateway-owned workspace. Delivery follows the repository's policy (signed direct-main for Bridge; PR/train elsewhere). Claim races do not count as agent-CLI failures. Expired claims do not override durable writer-quiescence barriers.
 
 ### One workspace owner
 
 The native gateway owns allocation, preservation, reclamation and disk admission through one durable workspace lifecycle in its existing `~/.bridge/lifecycle/<scope>/workspaces/` journal. Every new claim gets a unique `<workdir>/workspaces/<identity>/` with `work`, `tmp`, `cache` and `logs` directories. Old finalizers cannot reuse or delete a newer claim's path. Workers inherit workspace-local `TMPDIR`/`TMP`/`TEMP`, `CARGO_TARGET_DIR`, npm cache and `XDG_CACHE_HOME`; live output is bounded to 4 MiB in that workspace. Shared repository clones are journalled cache resources, with provisioning and eviction taking the same cache lock. Repository refresh fetches the default branch rather than accumulating every remote checkpoint ref.
 
-After the exact execution's stopped result is acknowledged, its workspace is released independently of whether the task awaits review, is blocked, or is finished. The owner captures dirty/untracked source through a private Git index, persists the exact checkpoint before publication, verifies remote readback and current local content, then atomically renames the allocation to a journalled retirement path and removes it. Nested Git repositories get their own retained checkpoint receipts. Source receipts remain available through `bridge workspaces status` after local deletion. Failed publication, newer inputs, incomplete process visibility, open readers, dependent worktrees and unresolved execution/operation evidence retain only the affected resource, with a durable reason and retry. Non-Git scratch inputs with no publication destination remain retained explicitly; deliver them to the board or preserve them in a repository before retirement.
+After the exact execution's stopped result is acknowledged, its workspace is released independently of whether the task awaits review, is blocked, or is finished. The owner verifies that Git source is clean and reachable from a published branch, then atomically renames the allocation to a journalled retirement path and removes it. Dirty or unpublished Git source, non-Git scratch inputs, open readers and dependent worktrees remain local with a durable retention reason.
 
 A bounded, fair reconciliation job runs every 30 seconds under sustained load, held executions and managed-update drain. Restart resumes the recorded preservation/deletion stage. Removed counts and allocation bytes are recorded only after the retirement path is gone; a skipped or retained resource is never reported as removed. `bridge status` includes workspace accounting and disk-admission state. `bridge workspaces status` shows resource states, retention errors and checkpoint receipts. `bridge workspaces reconcile` invokes the same owner for offline recovery and refuses to race a live gateway controller.
 Completed resource records move to cold history, outside the active reconciliation
@@ -3648,11 +3636,10 @@ stop a writer; an explicit interrupt or expired local lease does.
 
 `~/.bridge/lifecycle/<hub-and-host>/` holds durable admission identities, launch
 intent/process identities and terminal results. The originating runner sends an
-exact fenced `stopped` receipt before checkpoint network publication. The hub
+exact fenced `stopped` receipt before finalization. The hub
 records the result and a truthful `process_group_empty` or Linux
 `no_live_group_members` (zombies-only) proof, freeing execution capacity while
-retaining exclusive `finalizing` task ownership. The runner then publishes the
-captured checkpoint and finalizes delivery. Local and hub backlog bounds prevent
+retaining exclusive `finalizing` task ownership. The runner then finalizes delivery. Local and hub backlog bounds prevent
 unbounded accumulation. Runner snapshots distinguish running, preparing,
 finalizing, delivering and held work; an update waits for every outstanding job.
 

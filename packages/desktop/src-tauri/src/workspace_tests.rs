@@ -60,14 +60,12 @@ fn allocation_is_write_ahead_unique_per_claim_and_cannot_be_rebound_to_another_f
 }
 
 #[test]
-fn actual_dirty_source_and_build_bytes_are_checkpointed_removed_and_restorable_while_twenty_jobs_stay_active() {
+fn clean_published_source_and_build_bytes_are_reclaimed_while_twenty_jobs_stay_active() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);
     let t=ticket("retired");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
-    fs::write(a.work.join("tracked"),"valuable dirty repair\n").unwrap();
-    fs::write(a.work.join("new-source"),"new input\n").unwrap();
     fs::write(a.root.join("cache/cargo/object"),vec![7u8;1024*1024]).unwrap();
-    a.bind(&attempt(&t)).unwrap();let root=a.root.clone();let id=a.id.clone();drop(a);
+    a.bind(&attempt(&t)).unwrap();let root=a.root.clone();drop(a);
     owner.release(&released(&attempt(&t))).unwrap();
     let mut protected=Vec::new();
     for n in 0..21 {
@@ -84,16 +82,11 @@ fn actual_dirty_source_and_build_bytes_are_checkpointed_removed_and_restorable_w
     assert!(status.reclaimed_bytes>=1024*1024);
     assert!(disk_bytes(&owner.allocations).unwrap()<before);
     for t in &protected {assert!(owner.allocations.join(journal::stable_key(&[&t.task_id,&t.session])).join("work/active-input").exists());}
-    let checkpoints:Vec<Snapshot>=serde_json::from_slice(&fs::read(owner.ledger.join("checkpoints").join(format!("{id}.json"))).unwrap()).unwrap();
-    let restored=sandbox.0.join("restored");git(&sandbox.0,&["clone",source.to_str().unwrap(),restored.to_str().unwrap()]).unwrap();
-    crate::checkpoint::restore(&restored,&checkpoints[0].checkpoint).unwrap();
-    assert_eq!(fs::read_to_string(restored.join("tracked")).unwrap(),"valuable dirty repair\n");
-    assert_eq!(fs::read_to_string(restored.join("new-source")).unwrap(),"new input\n");
     let restarted=sandbox.owner();assert_eq!(restarted.reconcile(&protected).unwrap().reclaimed_bytes,status.reclaimed_bytes,"restart double-counted deletion");
 }
 
 #[test]
-fn publication_failure_and_newer_inputs_never_count_as_reclaimed() {
+fn unreachable_origin_and_dirty_source_never_count_as_reclaimed() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);
     let t=ticket("publish-failure");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
@@ -102,12 +95,8 @@ fn publication_failure_and_newer_inputs_never_count_as_reclaimed() {
     let status=owner.reconcile(&[]).unwrap();assert_source_not_removed(&owner,&id,&root);
     let mut record=owner.read(&id).unwrap();assert!(record.error.is_some());
     git(&work,&["remote","set-url","origin",source.to_str().unwrap()]).unwrap();
-    // The immutable failed publication's repository remains unavailable. A
-    // fresh preservation must be an explicit, independently checked operation.
-    assert!(matches!(record.phase,Phase::Preserving {..}));
-    let checkpoint=crate::checkpoint::publish(&work,"newer",1,"test",vec![]).unwrap();
-    fs::write(work.join("tracked"),"newer than checkpoint").unwrap();
-    record.phase=Phase::Reclaimable {snapshots:vec![Snapshot {path:work.clone(),checkpoint}]};record.retry_at=0;owner.save(&record).unwrap();
+    fs::write(work.join("tracked"),"newer unpublished work").unwrap();
+    record.retry_at=0;owner.save(&record).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,status.reclaimed_bytes);assert_source_not_removed(&owner,&id,&root);assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("newer"));
 }
 
@@ -242,15 +231,14 @@ fn unique_ignored_evidence_survives_while_its_disposable_build_cache_is_reclaime
 }
 
 #[test]
-fn ignored_evidence_arriving_after_checkpoint_publication_is_rechecked_before_removal() {
+fn ignored_evidence_arriving_before_removal_is_rechecked() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);let t=ticket("late-ignored");
     let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
     fs::write(a.work.join(".gitignore"),".secret-output\n").unwrap();
-    let checkpoint=crate::checkpoint::publish(&a.work,"late-ignored",1,"Preserve",vec![]).unwrap();
     fs::write(a.work.join(".secret-output"),"new unique evidence").unwrap();
     let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);
-    let mut record=owner.read(&id).unwrap();record.phase=Phase::Reclaimable {snapshots:vec![Snapshot {path:work,checkpoint}]};owner.save(&record).unwrap();
+    let mut record=owner.read(&id).unwrap();record.phase=Phase::Reclaimable {snapshots:vec![Snapshot {path:work}]};owner.save(&record).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);
     assert_eq!(fs::read_to_string(root.join("work/.secret-output")).unwrap(),"new unique evidence");
     assert!(owner.read(&id).unwrap().error.unwrap().contains("ignored input"));

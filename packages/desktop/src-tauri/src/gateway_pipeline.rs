@@ -247,22 +247,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                     let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("gate: stopped journal has no attempt fence".into()); };
                     let ticket = record.ticket().clone();
                     let next = match step {
-                        Step::Stop => if worktree.is_some() { Step::Capture } else { Step::Finalize },
-                        Step::Capture => {
-                            let path = worktree.as_deref().ok_or("gate: checkpoint worktree missing")?;
-                            Step::Publish { checkpoint: crate::checkpoint::capture(path, &ticket.task_id, *generation,
-                                "Reconcile the captured terminal result and remaining task action; do not repeat unknown effects.", vec![std::env::consts::OS.into(), std::env::consts::ARCH.into()])? }
-                        },
-                        Step::Publish { checkpoint } => {
-                            crate::checkpoint::publish_captured(worktree.as_deref().ok_or("gate: checkpoint worktree missing")?, &checkpoint)?;
-                            Step::Register { checkpoint }
-                        },
-                        Step::Register { checkpoint } => {
-                            execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("checkpoint"),
-                                json!({"kind":"checkpoint","generation":generation,"attempt_id":attempt_id,"checkpoint":checkpoint}))?;
-                            Step::Finalize
-                        },
-                        Step::Finalize => {
+                        Step::Stop | Step::Capture | Step::Publish { .. } | Step::Register { .. } | Step::Finalize => {
                             let bounded = bounded_outcome(&outcome);
                             let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("finalize"),
                                 json!({"kind":"finalize","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded}))?;
@@ -317,7 +302,7 @@ fn writer_observable(record: &Record) -> bool {
     matches!(record.owner, Ownership::Attempt { .. }) && match &record.work {
         Work::UnknownWriter { .. } => true,
         Work::Unproven { outcome, .. } => matches!(outcome.kind, OutcomeKind::ResultUnavailable),
-        // A captured real result still owns its checkpoint/delivery work.
+        // A captured real result still owns its result delivery.
         _ => false,
     }
 }
@@ -420,7 +405,7 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
     }
     // A vanished transport result is not success. Capture that exact truth,
     // with kernel proof and the original worktree, into the NORMAL stopped →
-    // checkpoint → finalize path. No synthesized finalize ACK or lease inference.
+    // stopped → finalize path. No synthesized finalize ACK or lease inference.
     let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("Original attempt required".into()); };
     if !root(cfg)?.join("workers").join(record.name().trim_end_matches(".json")).join("request.json").exists() {
         return Err("Original stopped receipt or worker manifest is required".into());
@@ -1237,46 +1222,6 @@ pub(crate) mod tests {
         assert!(readiness.proof(&cfg).is_err(), "a train connection cannot authorize an agent launch");
     }
     #[test]
-    fn missing_capture_directory_holds_exact_journal_without_publication_or_retry() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = calls.clone();
-        let host = Arc::new(Mutex::new(String::new())); let bound_host = host.clone();
-        let hub = Hub::new(move |request| {
-            let args = &request["params"]["arguments"];
-            if args["command"]["kind"] == "receipt" { return Some(json!({"kind":"receipt_missing"})); }
-            assert_eq!(args["command"]["kind"], "stopped", "missing work cannot publish/register/finalize");
-            observed.fetch_add(1, Ordering::SeqCst);
-            Some(json!({"attempt":{"phase":"finalizing","writers":"process_group_empty",
-                "host":*bound_host.lock().unwrap(),"session":args["session"],"generation":1,"attempt_id":"missing-capture"}}))
-        });
-        let (cfg, ready, snap) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
-        let missing = root(&cfg).unwrap().join("never-created-worktree");
-        let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id:"missing-capture".into(),session:"original-session".into() },
-            host:cfg.label.clone().unwrap(),generation:1,attempt_id:"missing-capture".into() }, host:cfg.label.clone().unwrap(),
-            url:cfg.url.clone(),observed_at:123,process:None,disposition:Disposition::Pending,
-            work:Work::Stopped {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,
-                stdout_tail:"original evidence".into(),stderr_tail:"original failure".into(),cause:None},
-                writers:WriterProof::ProcessGroupEmpty,worktree:Some(missing.clone()),step:Step::Capture} };
-        let original = serde_json::to_value(&record).unwrap();
-        let terminal = terminal_root(&cfg).unwrap(); journal::insert(&terminal, record.clone()).unwrap();
-        let mut controller = Controller::new(&cfg, &ready, &snap);
-        controller.registry.restore_finalization(record.owner.clone(),FinalWork::Journal(record.clone())).ok().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while controller.registry.counts().held == 0 {
-            controller.registry.poll(|_|None); assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(1));
-        }
-        for _ in 0..100 { controller.registry.poll(|_|None); }
-        let saved:serde_json::Value=serde_json::from_slice(&std::fs::read(terminal.join(record.name())).unwrap()).unwrap();
-        assert_eq!(saved["owner"],original["owner"]);
-        assert_eq!(saved["work"],original["work"]);
-        assert_eq!(saved["observed_at"],original["observed_at"]);
-        assert!(saved["disposition"].to_string().contains("worktree unavailable"));
-        assert_eq!(calls.load(Ordering::SeqCst),1);
-        assert!(!missing.exists());
-        drop(controller);drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
-    }
-
-    #[test]
     fn actual_finalizer_recovers_captured_result_after_lost_ack_and_daemon_restart() {
         let ids = Arc::new(Mutex::new(Vec::<String>::new()));
         let host = Arc::new(Mutex::new(String::new())); let bound_host = host.clone(); let observed = ids.clone();
@@ -1338,51 +1283,6 @@ pub(crate) mod tests {
         let mut controller = Controller::new(&cfg, &ready, &snap); let deadline = Instant::now() + Duration::from_secs(3);
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
         assert_eq!(std::fs::read_to_string(work.join("keep")).unwrap(), "newer generation's work");
-        drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
-    }
-    #[cfg(unix)]
-    #[test]
-    fn actual_checkpoint_publication_releases_execution_charge_before_slow_git_io() {
-        use std::os::unix::fs::PermissionsExt;
-        let host = Arc::new(Mutex::new(String::new())); let bound = host.clone();
-        let seen = Arc::new(Mutex::new(Vec::new())); let calls = seen.clone();
-        let hub = Hub::new(move |request| {
-            let args = &request["params"]["arguments"]; let kind = args["command"]["kind"].as_str().unwrap();
-            calls.lock().unwrap().push(kind.to_string());
-            if kind == "receipt" { return Some(json!({"kind":"receipt_missing"})); }
-            if kind == "schedule" { return Some(json!({"kind":"no_eligible_work"})); }
-            assert!(matches!(kind, "stopped" | "checkpoint" | "finalize"));
-            if kind == "stopped" || kind == "finalize" { assert_eq!(args["command"]["writers"], "no_live_group_members"); }
-            Some(json!({"attempt":{"phase":if kind == "finalize" { "quiesced" } else { "finalizing" },"writers":"no_live_group_members","host":*bound.lock().unwrap(),"session":"slow-session","generation":1,"attempt_id":"slow-one"}}))
-        });
-        let (cfg, ready, snap) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
-        let sandbox = root(&cfg).unwrap().join("slow-git"); std::fs::create_dir_all(&sandbox).unwrap();
-        let source = crate::checkpoint::tests::init(&sandbox);
-        let checkpoint = crate::checkpoint::capture(&source, "slow-publication", 1, "Preserve actual WIP", vec![]).unwrap();
-        let entered = sandbox.join("entered"); let release = sandbox.join("release");
-        let hook = source.join(".git/hooks/pre-push");
-        std::fs::write(&hook, format!("#!/bin/sh\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n", entered.display(), release.display())).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id: "slow-publication".into(), session: "slow-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "slow-one".into() },
-            host: cfg.label.clone().unwrap(), url: cfg.url.clone(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "Captured result".into(), stderr_tail: String::new(), cause: None }, writers: WriterProof::NoLiveGroupMembers, worktree: Some(source), step: Step::Publish { checkpoint } } };
-        journal::insert(&terminal_root(&cfg).unwrap(), record.clone()).unwrap();
-        let mut controller = Controller::new(&cfg, &ready, &snap);
-        controller.registry.restore_finalization(record.owner.clone(), FinalWork::Journal(record)).ok().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !entered.exists() || controller.registry.counts().charged != 0 {
-            controller.registry.poll(|_| None);
-            if Instant::now() >= deadline { std::fs::write(&release, "release on failure").unwrap(); panic!("checkpoint job never reached blocking push"); }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(controller.registry.counts().delivering, 1);
-        assert!(controller.registry.can_admit(), "physical execution slots must refill before Git publication completes");
-        assert!(!controller.idle(), "managed update must wait for the outstanding publication");
-        for _ in 0..30 { let start = Instant::now(); controller.registry.poll(|_| None); assert!(start.elapsed() < Duration::from_millis(200)); }
-        std::fs::write(release, "release").unwrap();
-        while !controller.registry.is_idle() { controller.registry.poll(|_| None); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
-        let calls = seen.lock().unwrap(); let stopped = calls.iter().position(|s| s == "stopped").unwrap(); let checkpoint = calls.iter().position(|s| s == "checkpoint").unwrap(); let finalized = calls.iter().position(|s| s == "finalize").unwrap();
-        assert!(stopped < checkpoint && checkpoint < finalized);
         drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
 }

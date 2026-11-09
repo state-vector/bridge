@@ -51,10 +51,10 @@ export const ExecutionHistoryEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("model_started"), ...identity, generation: z.number(), host: z.string(), session: z.string() }),
   z.object({ kind: z.literal("model_escalated"), from_tier: ReasoningTierSchema, to_tier: ReasoningTierSchema, reason: z.string(),
     source: z.enum(["agent", "review"]), review_id: z.string().nullable(), generation: z.number() }),
-  z.object({ kind: z.literal("execution_yielded"), generation: z.number(), destination: z.enum(["agent_pool", "local"]), minimum_tier: ReasoningTierSchema, checkpoint_commit: z.string() }),
+  z.object({ kind: z.literal("execution_yielded"), generation: z.number(), destination: z.enum(["agent_pool", "local"]), minimum_tier: ReasoningTierSchema, checkpoint_commit: z.string().nullable() }),
   z.object({ kind: z.literal("local_handoff_requested"), handoff_id: z.string(), reason: z.string(), action: z.string(), next: z.string() }),
   z.object({ kind: z.literal("local_handoff_accepted"), handoff_id: z.string(), ...identity, host: z.string(), session: z.string() }),
-  z.object({ kind: z.literal("local_handoff_returned"), handoff_id: z.string(), checkpoint_commit: z.string() }),
+  z.object({ kind: z.literal("local_handoff_returned"), handoff_id: z.string(), checkpoint_commit: z.string().nullable() }),
 ]);
 export type ExecutionHistoryEvent = z.infer<typeof ExecutionHistoryEventSchema>;
 
@@ -64,7 +64,7 @@ export function executionCommandHistory(before: ExecutionState, after: Execution
     case "begin": return a?.executor ? { kind: "model_started", ...ExecutionModelIdentitySchema.parse(a.executor), generation: a.generation, host: a.host, session: a.session } : null;
     case "escalate": return { kind: "model_escalated", from_tier: before.attempt?.executor?.tier ?? before.requirements.tier,
       to_tier: command.tier, reason: command.reason, source: "agent", review_id: null, generation: before.generation };
-    case "yield": return a?.checkpoint ? { kind: "execution_yielded", generation: a.generation, destination: after.handoff.phase === "waiting" ? "local" : "agent_pool", minimum_tier: after.requirements.tier, checkpoint_commit: a.checkpoint.commit } : null;
+    case "yield": return a ? { kind: "execution_yielded", generation: a.generation, destination: after.handoff.phase === "waiting" ? "local" : "agent_pool", minimum_tier: after.requirements.tier, checkpoint_commit: a.checkpoint?.commit ?? null } : null;
     case "local_handoff": return after.handoff.phase === "preparing" ? { kind: "local_handoff_requested", handoff_id: after.handoff.id,
       reason: command.reason, action: command.action, next: command.next } : null;
     default: return null; // polls/heartbeats/checkpoints are not user-facing history noise
@@ -75,9 +75,9 @@ export function executionHistorySummary(event: ExecutionHistoryEvent): string {
   switch (event.kind) {
     case "model_started": return `Started ${event.tier} model ${event.model ?? "(ID unreported)"} via ${event.backend} on ${event.host} · session ${event.session} · attempt ${event.generation}`;
     case "model_escalated": return `Escalated ${event.from_tier} → ${event.to_tier} (${event.source === "review" ? `review ${event.review_id}` : "agent requested"}): ${event.reason}`;
-    case "execution_yielded": return `Yielded to ${event.destination === "local" ? "local pickup" : "the agent pool"}; requires ${event.minimum_tier}; checkpoint ${event.checkpoint_commit}`;
+    case "execution_yielded": return `Yielded to ${event.destination === "local" ? "local pickup" : "the agent pool"}; requires ${event.minimum_tier}${event.checkpoint_commit ? `; checkpoint ${event.checkpoint_commit}` : ""}`;
     case "local_handoff_requested": return `Local pickup required: ${event.action}. Why: ${event.reason}. Next: ${event.next}`;
     case "local_handoff_accepted": return `Local pickup accepted by ${event.session} on ${event.host}; model configured locally (${event.model ?? "ID unreported"})`;
-    case "local_handoff_returned": return `Returned to autonomous execution; checkpoint ${event.checkpoint_commit}`;
+    case "local_handoff_returned": return `Returned to autonomous execution${event.checkpoint_commit ? `; checkpoint ${event.checkpoint_commit}` : ""}`;
   }
 }

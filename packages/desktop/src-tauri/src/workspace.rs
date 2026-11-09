@@ -33,7 +33,7 @@ impl Location {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Snapshot { path: PathBuf, checkpoint: crate::checkpoint::Checkpoint }
+struct Snapshot { path: PathBuf }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -199,7 +199,7 @@ impl Owner {
             self.save(&cache_record)?;
             let cache = ensure_repo_clone(&self.cfg.workdir, repo).map_err(|e| e.detail().to_string())?;
             // Unique per claim: an old finalizer can never remove a newer run's
-            // directory or branch. Restoration comes from the hub checkpoint.
+            // directory or branch. Each claim starts at the repository default.
             git(&cache, &["worktree", "add", "--detach", work.to_str().ok_or("workspace path is not UTF-8")?, "origin/HEAD"])?;
             Some(work.clone())
         } else { None };
@@ -312,7 +312,7 @@ impl Owner {
             Phase::LegacyUnproved => { legacy::prove(self, record)?; },
             _ => {},
         }
-        if let Phase::Released { owner } = record.phase.clone() {
+        if matches!(record.phase, Phase::Released { .. } | Phase::Preserving { .. }) {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
             verify_layout(record)?;
             let mut paths = Vec::new();
@@ -321,32 +321,16 @@ impl Owner {
             for path in &paths { unpreserved_ignored_inputs(path)?; }
             // Non-Git scratch inputs are never silently thrown away. Empty
             // scratch and explicitly owned cache/tmp are disposable.
-            if uncovered_inputs(&record.location.work(), &paths)? { return Err("scratch contains uncheckpointed non-Git inputs; preserve them before retirement".into()); }
-            let generation = match owner { Ownership::Attempt { generation, .. } => generation, _ => 0 };
-            let mut snapshots = Vec::new();
-            for path in paths {
-                let checkpoint = crate::checkpoint::capture(&path, &owner.ticket().task_id, generation,
-                    "Workspace owner preserved stopped execution; restore this checkpoint to resume.", vec![std::env::consts::OS.into(), std::env::consts::ARCH.into()])?;
-                snapshots.push(Snapshot { path, checkpoint });
-            }
-            record.phase = Phase::Preserving { owner, snapshots }; self.save(record)?;
-        }
-        if let Phase::Preserving { snapshots, .. } = record.phase.clone() {
-            for snapshot in &snapshots { crate::checkpoint::publish_captured(&snapshot.path, &snapshot.checkpoint)?; }
+            if uncovered_inputs(&record.location.work(), &paths)? { return Err("scratch contains unpublished non-Git inputs; preserve them before retirement".into()); }
+            let snapshots = paths.into_iter().map(|path| Snapshot { path }).collect();
             record.phase = Phase::Reclaimable { snapshots }; self.save(record)?;
         }
         if let Phase::Reclaimable { snapshots } = &record.phase {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
             verify_inputs(record,snapshots)?;
             for snapshot in snapshots {
-                if !crate::checkpoint::matches_working_tree(&snapshot.path, &snapshot.checkpoint)? { return Err("newer local inputs differ from the verified checkpoint; retained".into()); }
-                crate::checkpoint::verify_published(&snapshot.path, &snapshot.checkpoint)?;
                 legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
             }
-            // The source receipt outlives the local allocation and its terminal
-            // delivery WAL. Scratch/nested-repo checkpoints remain discoverable.
-            journal::write_file(&self.ledger.join("checkpoints").join(format!("{}.json", record.id)),
-                &serde_json::to_vec(snapshots).map_err(|e| e.to_string())?)?;
             let repositories = snapshots.iter().filter(|s| s.path.join(".git").is_file()).map(|s| PathBuf::from(worktree_owner(&s.path, &s.path.to_string_lossy()))).collect();
             let root = record.location.root();
             let trash = root.parent().ok_or("workspace root parent missing")?.join(format!(".bridge-reclaim-{}", record.id));
@@ -359,7 +343,8 @@ impl Owner {
                 legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
                 verify_inputs(record,&snapshots)?;
                 for snapshot in snapshots {
-                    if !crate::checkpoint::matches_working_tree(&snapshot.path, &snapshot.checkpoint)? { return Err("newer local inputs arrived before retirement rename; retained".into()); }
+                    legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
+                    verify_published_source(&snapshot.path)?;
                 }
                 if record.location.root().exists() {
                     fs::rename(record.location.root(), &trash).map_err(|e| e.to_string())?;
@@ -554,11 +539,35 @@ fn verify_layout(record:&Resource)->Result<(),String> {
     }
     Ok(())
 }
+fn verify_published_source(path: &Path) -> Result<(), String> {
+    if !git(path, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?.is_empty() {
+        return Err("workspace has local changes; source retained".into());
+    }
+    if path.join(".git").is_dir() {
+        // A standalone clone's refs disappear with the directory.
+        for tip in git(path, &["for-each-ref", "--format=%(objectname)", "refs/heads/", "refs/tags/", "refs/stash"])?.lines() {
+            git(path, &["merge-base", "--is-ancestor", tip, "HEAD"])
+                .map_err(|_| "workspace has local refs outside HEAD; source retained".to_string())?;
+        }
+    }
+    let head = git(path, &["rev-parse", "HEAD"])?;
+    let published_candidates = git(path, &["for-each-ref", "--contains", &head, "--format=%(objectname)", "refs/remotes/origin"])?;
+    let candidates: std::collections::HashSet<_> = published_candidates.lines().collect();
+    let remote = git(path, &["ls-remote", "--heads", "origin"])?;
+    for line in remote.lines() {
+        let Some((tip, reference)) = line.split_once('\t') else { continue; };
+        if reference.starts_with("refs/heads/bridge-checkpoints/") { continue; }
+        if tip == head || candidates.contains(tip) {
+            return Ok(());
+        }
+    }
+    Err("workspace HEAD is not reachable from a published branch; source retained".into())
+}
 fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
     if matches!(record.location,Location::GeneratedCache { .. } | Location::OwnedDisposable { .. }) {return Ok(());}
     verify_layout(record)?;
     let paths:Vec<_>=snapshots.iter().map(|s|s.path.clone()).collect();
-    if uncovered_inputs(&record.location.work(),&paths)? {return Err("new uncheckpointed scratch inputs arrived before retirement; retained".into());}
+    if uncovered_inputs(&record.location.work(),&paths)? {return Err("new unpublished scratch inputs arrived before retirement; retained".into());}
     for snapshot in snapshots {unpreserved_ignored_inputs(&snapshot.path)?;}
     Ok(())
 }

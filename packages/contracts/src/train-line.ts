@@ -32,7 +32,7 @@ export function taskRemediation(task: TrainFixCard): LineRemediation {
   const blockers = task.execution_blockers ?? [];
   if (task.status === "todo" && task.preemption && blockers.every(b => b.kind === "capacity_wait")) return {
     kind: "queued", task, text: task.preemption.phase === "stopping_verification"
-      ? `Priority recovery: verification ${task.preemption.victim_id} is checkpointing and yielding its slot.`
+      ? `Priority recovery: verification ${task.preemption.victim_id} is stopping and yielding its slot.`
       : "Priority recovery: its reclaimed slot is available for dispatch.",
   };
   if (blockers.length) return { kind: "blocked", task, text: blockers.map(b => b.text).join(" ") };
