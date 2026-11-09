@@ -5073,17 +5073,25 @@ export class KnowledgeHub {
       || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL`, id);
   }
 
+  private proxyTrialConsumed(id: string, revision: string): boolean {
+    return !!this.one(`SELECT 1 FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
+      AND json_extract(result,'$.recovery_permit.phase')='consumed'
+      AND json_extract(result,'$.recovery_permit.task_revision')=?
+      AND json_extract(result,'$.recovery_permit.proof.witness.kind')='configured_proxy_request' LIMIT 1`, id, revision);
+  }
+
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[]) {
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string }) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
     const filter = taskIds ? " AND id IN (SELECT value FROM json_each(?))" : "";
     const rows = this.state.storage.sql.exec(
-      `SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''` + filter,
+      `SELECT id,title,body_md,project,meta,roles,tags,updated_ts,created_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''` + filter,
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
     const taskHolds = new Map<string, SchedulingReason>();
+    const routeCandidates: { id: string; created: number }[] = [];
     const sinks = this.alarmSinkIds();
     const eligible = rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
@@ -5113,6 +5121,18 @@ export class KnowledgeHub {
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
+      if (retryRoute && reason === "retry_budget" && state?.terminal && state.attempt?.host === host
+        && state.attempt.executor?.backend === retryRoute.backend && state.attempt.executor.model === retryRoute.model
+        && state.attempt.executor.config_revision === retryRoute.config_revision
+        && capabilities && [capabilities, ...capabilities.alternatives].some(candidate =>
+          candidate.backend === retryRoute.backend && candidate.model === retryRoute.model
+          && candidate.config_revision === retryRoute.config_revision
+          && usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), candidate, host, String(row.project ?? "")))
+        && state.terminal.generation === state.attempt.generation && state.terminal.attempt_id === state.attempt.attempt_id
+        && providerRecoveryDiagnosis(state.terminal.outcome) === "provider_route_unavailable"
+        && !this.proxyTrialConsumed(id, String(meta.work_revision ?? "legacy"))) {
+        routeCandidates.push({ id, created: Number(row.created_ts) });
+      }
       if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
     });
@@ -5120,7 +5140,8 @@ export class KnowledgeHub {
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
       || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
-    return { eligible, reasons, held, taskHolds };
+    routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
+    return { eligible, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id) };
   }
 
   private boardDispatch(ids: string[], now: number): Map<string, GatewayDispatch> {
@@ -5190,18 +5211,18 @@ export class KnowledgeHub {
     }
   }
 
-  private schedulingStatus(host?: string, now = Date.now()) {
+  private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     return this.state.storage.sql.exec(`SELECT h.token_id,t.label,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray()
       .filter(row => !host || row.label === host).map(row => {
         const tokenId = String(row.token_id), label = String(row.label), capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
         const readiness = this.executorReadiness(tokenId, label, capabilities, now);
-        const selection = this.dispatchCandidates(tokenId, label, capabilities);
+        const selection = this.dispatchCandidates(tokenId, label, capabilities, undefined, retryRoute);
         const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, tokenId);
         const health: SchedulingHealth = !pending ? { kind: "clear" } : now - Number(pending.since) < 120_000 ? { kind: "waiting", since: Number(pending.since) }
           : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
         const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
         return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), eligible: selection.eligible.length,
-          reasons: selection.reasons, held: selection.held, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
+          reasons: selection.reasons, held: selection.held, routeCandidates: selection.routeCandidates, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
   }
@@ -5459,19 +5480,18 @@ export class KnowledgeHub {
         return JSON.parse(replay.result);
       }
       if (proof.observed_at > now || now - proof.observed_at > 300_000) throw new Error("gate: route receipt is stale");
-      const host = this.schedulingStatus(proof.host, now)[0];
+      const host = this.schedulingStatus(proof.host, now, proof)[0];
       const limit = host?.live && host.readiness.kind === "ready"
         ? Math.max(0, Math.min(command.limit, host.capacity - host.active - host.reserved - host.eligible))
         : 0;
       return this.state.storage.transactionSync(() => {
         const granted: string[] = [];
-        if (limit) for (const id of (host.held.retry_budget ?? []).slice(0, 32)) {
+        if (limit) for (const id of host.routeCandidates) {
           const execution = this.executionState(id);
           const attempt = execution?.attempt;
           if (!execution?.terminal || !attempt?.executor || attempt.host !== proof.host
             || attempt.executor.backend !== proof.backend || attempt.executor.model !== proof.model
             || attempt.executor.config_revision !== proof.config_revision
-            || execution.recovery_permit?.phase === "available"
             || providerRecoveryDiagnosis(execution.terminal.outcome) !== "provider_route_unavailable") continue;
           try {
             this.executionCommand({ ...body, id, command_id: "verified-route:" + proof.id, command: {
@@ -5594,13 +5614,8 @@ export class KnowledgeHub {
       if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
       if (current.budget_exhaustions < 3) throw new Error("gate: task does not require an exhausted-budget recovery permit");
       if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
-      if (command.proof.witness.kind === "configured_proxy_request" && this.one(
-        `SELECT 1 FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
-           AND json_extract(result,'$.recovery_permit.phase')='consumed'
-           AND json_extract(result,'$.recovery_permit.task_revision')=?
-           AND json_extract(result,'$.recovery_permit.proof.witness.kind')='configured_proxy_request' LIMIT 1`,
-        req.id, String(meta.work_revision ?? "legacy"),
-      )) throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
+      if (command.proof.witness.kind === "configured_proxy_request" && this.proxyTrialConsumed(req.id, String(meta.work_revision ?? "legacy")))
+        throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
       if (current.recovery_permit?.phase === "available" && current.recovery_permit.proof.id === command.proof.id) throw new Error("gate: recovery proof already granted; use the original command receipt");
       const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
         .find(r => Number(JSON.parse(String(r.data)).generation) === a.generation);

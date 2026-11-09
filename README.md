@@ -3772,3 +3772,5 @@ The backlog shows **Ready for gateway** only for tasks eligible on a ready gatew
 Gateway admission holds appear in the backlog’s Blocked sections with their exit conditions. Only work with no task-level admission hold can appear under **Waiting for a gateway**. A retry hold shows the latest attempt evidence when known, without inferring task impossibility from the counter.
 
 Configured alarm sinks and explicitly marked infrastructure anchors are excluded from gateway scheduling and backlog pickup. Their asks and diagnostic children still follow the normal lifecycle.
+
+Verified route recovery filters retry holds by the exact failed route and current capability requirements. It considers the oldest matching cards first, skipping spent trials and unrelated holds. The cap limits grants, so a fixed prefix of rejected cards cannot hide later eligible work.

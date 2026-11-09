@@ -1,5 +1,5 @@
 import { Miniflare } from "miniflare";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SchedulingOutcomeSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
@@ -16,7 +16,34 @@ async function post(op: string, body: object) {
 // and exceed the CI budget; suite order must not be a scheduler input.
 beforeEach(async () => {
   const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
-  mf = new Miniflare({ workers: [{ name: "main", scriptPath: bundle, modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")), modules: true, compatibilityDate: "2025-09-06", durableObjects: { HUB: { className: "FlowsHub", useSQLite: true }, KB: { className: "KnowledgeHub", useSQLite: true } } }] });
+  const root = bundle.slice(0, bundle.lastIndexOf("/"));
+  const rig = `import { KnowledgeHub } from "./index.js";
+    export class SchedulingRig extends KnowledgeHub {
+      async fetch(request) {
+        if (new URL(request.url).pathname !== "/fixture/spent-route") return super.fetch(request);
+        const { id } = await request.json();
+        const sql = this.state.storage.sql;
+        const row = sql.exec("SELECT * FROM artefacts WHERE id=?", id).toArray()[0];
+        const state = sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0].state;
+        const revision = JSON.parse(row.meta).work_revision;
+        for (let i=0; i<66; i++) {
+          const clone = "BR#" + (10000+i);
+          sql.exec("INSERT INTO artefacts(id,type,title,body_md,status,owner,created_ts,updated_ts,status_ts,project,roles,tags,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            clone,row.type,row.title,row.body_md,row.status,row.owner,1,1,1,row.project,row.roles,row.tags,
+            i < 33 ? row.meta : JSON.stringify({...JSON.parse(row.meta),execution_requirements:{tier:"large",tools:["missing-tool"],environment:[]}}));
+          sql.exec("INSERT INTO execution_state(task_id,state,worker_token_id) VALUES(?,?,'')",clone,state);
+          if (i < 33) sql.exec("INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)",clone,"spent-proxy",
+            JSON.stringify({command:{kind:"begin"}}),JSON.stringify({recovery_permit:{phase:"consumed",task_revision:revision,
+              proof:{witness:{kind:"configured_proxy_request"}}}}));
+        }
+        return Response.json({ok:true});
+      }
+    }
+    export default {fetch(){return new Response("fixture");}};`;
+  mf = new Miniflare({ modulesRoot: root, modules: [
+    { type: "ESModule", path: root + "/scheduling-rig.js", contents: rig },
+    { type: "ESModule", path: bundle, contents: readFileSync(bundle, "utf8") },
+  ], compatibilityDate: "2025-09-06", durableObjects: { KB: { className: "SchedulingRig", useSQLite: true } } });
   const ns = await mf.getDurableObjectNamespace("KB");
   stub = await ns.get(ns.idFromName("scheduler")) as unknown as typeof stub;
 });
@@ -102,6 +129,11 @@ describe("eligibility-first scheduling on real SQLite", () => {
     await g.cmd({ kind: "resume_claims" });
 
     const additional = [];
+    if (event) {
+      const newer = await task(project, { boosted: true, execution_requirements: { tier: "large", tools: [], environment: [] } });
+      await exhaust(newer);
+      expect(await post("fixture/spent-route", { id })).toEqual({ ok: true });
+    }
     if (proxy && !event) {
       for (let i = 0; i < 4; i++) {
         const taskId = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
