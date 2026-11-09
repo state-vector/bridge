@@ -2217,7 +2217,7 @@ fn build_base_state_with_coverage(
     cancelled_runs: &[i64],
 ) -> Value {
     let reconciled_class = match plan {
-        Some(p) => reconcile_base_verdict_with_deploy_coverage(base_class, &p.coverage),
+        Some(p) => reconcile_base_verdict_with_deploy_coverage(base_class, &p.coverage, required),
         None => base_class.clone(),
     };
     let mut base_state = build_base_state(&reconciled_class, required, pass_merged);
@@ -2347,7 +2347,7 @@ fn reconcile_base_deploy(
             }
         }
     }
-    *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage);
+    *base_class = reconcile_base_verdict_with_deploy_coverage(base_class, &plan.coverage, required);
     let base_state = build_base_state_with_coverage(base_class, required, pass_merged, Some(&plan), &cancelled_ok);
     if pass_merged == 0 {
         // Current main evidence is independent of candidate admission. Publish

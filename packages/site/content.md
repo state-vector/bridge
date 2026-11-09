@@ -108,6 +108,9 @@ advance triggers a fresh scan. The executor updates a worker branch only after
 GitHub refuses its exact head as out of date and a trial merge confirms it is
 behind and clean. It stops adding changes if main fails and checks the
 deployment after each batch.
+An active deployment for the exact main tip holds the line while an older
+synthetic deploy-health check still shows red. Failed required jobs and decisive
+deployment failures open a repair for that attempt.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 

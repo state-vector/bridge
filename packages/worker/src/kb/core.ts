@@ -4155,6 +4155,21 @@ function isInProgressWorkflowStatus(status: string | null | undefined): boolean 
   return (status ?? "").trim().toLowerCase() === "in_progress";
 }
 
+export function latestDeployRunAttempts(runs: readonly DeployWorkflowRun[]): DeployWorkflowRun[] {
+  const byId = new Map<number, DeployWorkflowRun>();
+  for (const run of runs) {
+    const previous = byId.get(run.id);
+    if (!previous || (run.run_attempt ?? 1) > (previous.run_attempt ?? 1)) byId.set(run.id, run);
+  }
+  return [...byId.values()].sort((a, b) => b.id - a.id);
+}
+
+function onlyDerivedDeployGateRed(verdict: MainCheckVerdict, required: string[]): boolean {
+  const gate = "Deploy health (merge gate)";
+  return !required.includes(gate) && verdict.red.length > 0 && verdict.red.every(check =>
+    check.name === gate && /^https:\/\/github\.com\/[^/]+\/[^/]+\/runs\/[1-9][0-9]*$/.test(check.url ?? ""));
+}
+
 /** Pure level-based deploy coverage & reconciliation state machine (BR#6179):
  *  - Computes `DeployCoverageState` (closed 6-state union on `phase`).
  *  - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
@@ -4175,9 +4190,7 @@ export function reconcileDeployCoverage(input: {
   const tipSha = (input.tipSha ?? "").trim();
   const tipAgeSecs = Math.max(0, Math.floor(Number(input.tipAgeSecs ?? 0) || 0));
   const graceSecs = Math.max(1, Math.floor(Number(input.graceSecs ?? DEPLOY_RECONCILE_GRACE_SECS) || DEPLOY_RECONCILE_GRACE_SECS));
-  const deployRuns = input.workflowRuns
-    .filter((r) => isDeployWorkflowRun(r, input.required))
-    .sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+  const deployRuns = latestDeployRunAttempts(input.workflowRuns.filter(r => isDeployWorkflowRun(r, input.required)));
 
   const newestGreen = deployRuns.find(
     (r) => (r.status ?? "").toLowerCase() === "completed" && (r.conclusion ?? "").toLowerCase() === "success",
@@ -4252,7 +4265,9 @@ export function reconcileDeployCoverage(input: {
     };
   }
 
-  if (input.baseVerdict.verdict === "red" || decisiveFailure) {
+  const activeSupersedesDerivedRed = tipActive && newestTip?.id === tipActive.id
+    && onlyDerivedDeployGateRed(input.baseVerdict, input.required);
+  if ((input.baseVerdict.verdict === "red" && !activeSupersedesDerivedRed) || decisiveFailure) {
     return {
       coverage: {
         phase: "failed",
@@ -4399,8 +4414,11 @@ export function formatDeployCoverageSummary(cov: DeployCoverageState): string {
 export function reconcileBaseVerdictWithDeployCoverage(
   baseVerdict: MainCheckVerdict,
   coverage: DeployCoverageState,
+  required: string[] = [],
 ): MainCheckVerdict {
-  if (baseVerdict.verdict === "red") return baseVerdict;
+  const activeSupersedesDerivedRed = coverage.phase === "settling" && (coverage.active_run_id ?? 0) > 0
+    && onlyDerivedDeployGateRed(baseVerdict, required);
+  if (baseVerdict.verdict === "red" && !activeSupersedesDerivedRed) return baseVerdict;
   if (coverage.phase === "settling") {
     const label = coverage.active_run_id
       ? `Deploy Dev (run #${coverage.active_run_id} in flight)`
@@ -4409,6 +4427,7 @@ export function reconcileBaseVerdictWithDeployCoverage(
     return {
       ...rest,
       verdict: "unsettled",
+      red: [],
       unsettled: baseVerdict.unsettled.length > 0 ? baseVerdict.unsettled : [label],
     };
   }
@@ -4455,19 +4474,21 @@ export function reconcileBaseVerdictWithDeployCoverage(
  *  `deploy_coverage: { phase: "settling" | "covered" | "failed" }`, the hub
  *  immediately reconciles `verdict`, `red`, `unsettled`, and `alarm` into one
  *  consistent state. */
-export function normalizeBaseStateWithCoverage(baseState: Record<string, unknown> | null | undefined): Record<string, unknown> | null | undefined {
+export function normalizeBaseStateWithCoverage(
+  baseState: Record<string, unknown> | null | undefined, required: string[] = [],
+): Record<string, unknown> | null | undefined {
   if (!baseState || typeof baseState !== "object") return baseState;
   if (!baseState.deploy_coverage) return baseState;
   const parsed = DeployCoverageStateSchema.safeParse(baseState.deploy_coverage);
-  if (!parsed.success) return baseState;
+  if (!parsed.success || (baseState.tip_sha && baseState.tip_sha !== parsed.data.tip_sha)) return baseState;
   const effective = reconcileBaseVerdictWithDeployCoverage({
     verdict: baseState.verdict === "green" ? "green" : baseState.verdict === "red" ? "red" : baseState.verdict === "unsettled" ? "unsettled" : "empty",
     red: Array.isArray(baseState.red) ? baseState.red : [], green: Number(baseState.green ?? 0),
     unsettled: Array.isArray(baseState.unsettled) ? baseState.unsettled.map(String) : [],
-  }, parsed.data);
+  }, parsed.data, required);
   if (effective.verdict === "empty") return baseState;
-  const next: Record<string, unknown> = { ...baseState, verdict: effective.verdict, unsettled: effective.unsettled,
-    ...(effective.red.length ? { red: effective.red } : {}) };
+  const next: Record<string, unknown> = { ...baseState, verdict: effective.verdict, unsettled: effective.unsettled };
+  if (effective.red.length || "red" in baseState) next.red = effective.red;
   delete next.alarm;
   return next;
 }
@@ -4481,7 +4502,7 @@ export function applyDeployObservation(
   required: string[],
   checksObservedAt?: number,
 ): Record<string, unknown> | null | undefined {
-  if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState);
+  if (!observation || (baseState?.tip_sha && baseState.tip_sha !== observation.tip_sha)) return normalizeBaseStateWithCoverage(baseState, required);
   const raw: Record<string, unknown> & { check_observed_at: number } = { ...(baseState ?? { verdict: "empty", red: [], unsettled: [] }),
     check_observed_at: checksObservedAt ?? Number(baseState?.check_observed_at ?? 0) };
   const matchingRuns = observation.runs.filter(r => r.head_sha === observation.tip_sha);
@@ -4496,7 +4517,7 @@ export function applyDeployObservation(
     // a borrowed older green run cannot clear the failure or pending state.
     const receiptAttempt = cov.phase === "covered" ? cov.covered_by_run_attempt ?? 1 : 1;
     if (receipt != null && (receipt > knownRun || (receipt === knownRun && receiptAttempt >= knownAttempt))) {
-      return normalizeBaseStateWithCoverage(raw);
+      return normalizeBaseStateWithCoverage(raw, required);
     }
   }
   const verdict: MainCheckVerdict = {
@@ -4506,7 +4527,7 @@ export function applyDeployObservation(
   const plan = reconcileDeployCoverage({ tipSha: observation.tip_sha, tipAgeSecs: Number(raw.tip_age_secs ?? 0),
     baseVerdict: verdict, required, workflowRuns: observation.runs });
   const normalized = normalizeBaseStateWithCoverage({ ...raw, tip_sha: observation.tip_sha,
-    deploy_coverage: plan.coverage, covered_by: plan.covered_by_sha, coverage_age_secs: plan.coverage_age_secs });
+    deploy_coverage: plan.coverage, covered_by: plan.covered_by_sha, coverage_age_secs: plan.coverage_age_secs }, required);
   if (plan.coverage.phase === "failed") {
     const failedRunId = plan.coverage.failing_run_id;
     const failures = (observation.failures ?? []).filter((f) => f.run_id === failedRunId)

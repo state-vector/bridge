@@ -205,6 +205,39 @@ describe("one line status and recovery contract", () => {
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: undefined } }, observation, required, 300)?.verdict).toBe(expected);
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: 3 } }, observation, required, 300)?.verdict).toBe("green");
   });
+  it("an exact active retry supersedes only the stale synthetic gate and holds for checks", () => {
+    const tip = "e1b6b5954433ccf38c328104447f4af0176a7cf6";
+    const runId = 42562274448;
+    const runUrl = `https://github.com/state-vector/superpositional/actions/runs/${runId}`;
+    const gate = { name: "Deploy health (merge gate)", conclusion: "failure",
+      url: "https://github.com/state-vector/superpositional/runs/128982701091" };
+    const base = { verdict: "red", tip_sha: tip, tip_age_secs: 1350, red: [gate],
+      unsettled: ["Cortex Quality Smoke"], green: 1,
+      deploy_coverage: { phase: "failed", tip_sha: tip, tip_age_secs: 1350, failing_run_id: null } };
+    const first = { id: runId, run_attempt: 1, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml",
+      head_sha: tip, status: "completed" as const, conclusion: "failure" as const, html_url: runUrl };
+    const second = { ...first, run_attempt: 2, status: "in_progress" as const, conclusion: null };
+    const observation = { tip_sha: tip, observed_at: now, runs: [first, second] };
+    const effective = applyDeployObservation(base, observation, required);
+    expect(effective).toMatchObject({ verdict: "unsettled", red: [],
+      deploy_coverage: { phase: "settling", tip_sha: tip, active_run_id: runId, active_run_url: runUrl } });
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#1" }], queue_facts: { at: now, base_state: effective } }), now);
+    expect(line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine", url: runUrl } });
+
+    const native = { ...gate, url: `${runUrl}/job/128986714690` };
+    for (const red of [[native], [gate, { ...native, name: "post-deploy / Lodestar Operational Health" }]]) {
+      expect(applyDeployObservation({ ...base, red }, observation, required)).toMatchObject({ verdict: "red" });
+    }
+    expect(applyDeployObservation(base, observation, [...required, gate.name])).toMatchObject({ verdict: "red" });
+    expect(applyDeployObservation(base, { ...observation, runs: [{ ...second, head_sha: "a".repeat(40) }] }, required))
+      .toMatchObject({ verdict: "red" });
+    expect(normalizeBaseStateWithCoverage({ ...base, deploy_coverage: {
+      phase: "settling", tip_sha: "a".repeat(40), tip_age_secs: 0, active_run_id: runId,
+    } }, required)).toMatchObject({ verdict: "red" });
+    const third = { ...first, run_attempt: 3 };
+    expect(applyDeployObservation(base, { ...observation, runs: [first, second, third] }, required))
+      .toMatchObject({ verdict: "red", deploy_coverage: { phase: "failed", failing_run_id: runId } });
+  });
   it("the original empty-checks plus active Spot build is waiting, never deployment-missing", () => {
     const base_state = { verdict: "empty", red: [], unsettled: [], deploy_coverage: {
       phase: "settling", tip_sha: "20b508b3", tip_age_secs: 147, active_run_id: 41911085476, active_run_url: "https://github.com/run/41911085476",

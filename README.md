@@ -2209,6 +2209,10 @@ startup, capability, local-handoff and other execution blockers explicitly;
 
 ### Stale deploy-health reds self-heal (2026-11-02)
 
+An active deployment attempt for the exact main tip keeps the line waiting while
+an older synthetic deploy-health check still shows red. A failing required job
+or the latest failed deployment attempt stops the line and gets its own repair.
+
 The `Deploy health (merge gate)` check on a PR judges MAIN's deploy state, not
 the PR's own code — so its verdict can go stale exactly when main recovers
 under it (observed 2026-11-02: the gate stamped red at 07:49 while the

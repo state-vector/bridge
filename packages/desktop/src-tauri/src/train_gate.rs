@@ -1700,6 +1700,20 @@ fn is_in_progress_workflow_status(status: Option<&str>) -> bool {
     status.unwrap_or("").trim().eq_ignore_ascii_case("in_progress")
 }
 
+fn only_derived_deploy_gate_red(verdict: &CheckVerdict, required: &[String]) -> bool {
+    const GATE: &str = "Deploy health (merge gate)";
+    !required.iter().any(|name| name == GATE)
+        && !verdict.red.is_empty()
+        && verdict.red.iter().all(|check| {
+            if check.name != GATE { return false; }
+            let Some(path) = check.url.strip_prefix("https://github.com/") else { return false; };
+            let parts: Vec<&str> = path.split('/').collect();
+            matches!(parts.as_slice(), [owner, repo, "runs", id] if !owner.is_empty() && !repo.is_empty()
+                && id.as_bytes().first().is_some_and(|digit| matches!(digit, b'1'..=b'9'))
+                && id.bytes().all(|digit| digit.is_ascii_digit()))
+        })
+}
+
 /// Pure level-based deploy coverage & reconciliation state machine (BR#6179):
 /// - Computes `DeployCoverageState` (closed 6-state union on `phase`).
 /// - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
@@ -1723,7 +1737,8 @@ pub fn reconcile_deploy_coverage(
         .iter()
         .filter(|r| is_deploy_workflow_run(r, required))
         .collect();
-    deploy_runs.sort_by(|a, b| b.id.cmp(&a.id));
+    deploy_runs.sort_by_key(|r| std::cmp::Reverse((r.id, r.run_attempt.unwrap_or(1))));
+    deploy_runs.dedup_by_key(|r| r.id);
 
     let newest_green = deploy_runs.iter().copied().find(|r| {
         r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
@@ -1818,7 +1833,11 @@ pub fn reconcile_deploy_coverage(
         };
     }
 
-    if base_verdict.verdict == MainVerdict::Red
+    // The synthetic push gate can report an unjudged snapshot while the
+    // authoritative Deploy Dev attempt is still running on this exact tip.
+    let active_supersedes_derived_red = tip_active.zip(newest_tip).is_some_and(|(active, latest)| active.id == latest.id)
+        && only_derived_deploy_gate_red(base_verdict, required);
+    if (base_verdict.verdict == MainVerdict::Red && !active_supersedes_derived_red)
         || decisive_failure.is_some()
     {
         return DeployReconcilePlan {
@@ -1990,16 +2009,21 @@ pub fn format_deploy_coverage_summary(cov: &DeployCoverageState) -> String {
 pub fn reconcile_base_verdict_with_deploy_coverage(
     base_verdict: &CheckVerdict,
     coverage: &DeployCoverageState,
+    required: &[String],
 ) -> CheckVerdict {
     // This is the effective line-health reducer, not an empty-checks cosmetic
     // adapter. Deployment failure must override scoped job-subset GREEN.
-    if base_verdict.verdict == MainVerdict::Red {
+    let active_supersedes_derived_red =
+        matches!(coverage, DeployCoverageState::Settling { active_run_id: Some(id), .. } if *id > 0)
+            && only_derived_deploy_gate_red(base_verdict, required);
+    if base_verdict.verdict == MainVerdict::Red && !active_supersedes_derived_red {
         return base_verdict.clone();
     }
     match coverage {
         DeployCoverageState::Settling { active_run_id, .. } => {
             let mut v = base_verdict.clone();
             v.verdict = MainVerdict::Unsettled;
+            v.red.clear();
             v.alarm = None;
             if v.unsettled.is_empty() {
                 let label = match active_run_id {
@@ -2081,6 +2105,46 @@ mod tests {
     }
 
     #[test]
+    fn active_exact_deploy_attempt_supersedes_only_derived_gate_red() {
+        let tip = "e1b6b5954433ccf38c328104447f4af0176a7cf6";
+        let run_id = 42562274448;
+        let run_url = "https://github.com/state-vector/superpositional/actions/runs/42562274448";
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into(), "post-deploy / Lodestar Operational Health".into()];
+        let mut gate = run(128982701091, "Deploy health (merge gate)", Some("failure"));
+        gate.html_url = Some("https://github.com/state-vector/superpositional/runs/128982701091".into());
+        let scoped = classify_base_check_runs(&[gate.clone(), run(128986714690, &required[1], None)], &required);
+        assert_eq!(scoped.verdict, MainVerdict::Red);
+        let first = DeployWorkflowRun {
+            id: run_id, run_attempt: Some(1), name: "Deploy Dev".into(), path: Some(".github/workflows/deploy-dev.yml".into()),
+            head_sha: tip.into(), event: Some("push".into()), status: Some("completed".into()),
+            conclusion: Some("failure".into()), html_url: Some(run_url.into()),
+        };
+        let second = DeployWorkflowRun { run_attempt: Some(2), status: Some("in_progress".into()), conclusion: None, ..first.clone() };
+        let plan = reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[first.clone(), second.clone()], None);
+        assert!(matches!(plan.coverage, DeployCoverageState::Settling { active_run_id: Some(id), .. } if id == run_id));
+        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage, &required);
+        assert_eq!(effective.verdict, MainVerdict::Unsettled);
+        assert!(effective.red.is_empty());
+
+        let mut native_gate = gate.clone();
+        native_gate.html_url = Some(format!("{run_url}/job/128986714690"));
+        for checks in [vec![native_gate], vec![gate.clone(), run(128986714690, &required[1], Some("failure"))]] {
+            let red = classify_base_check_runs(&checks, &required);
+            let plan = reconcile_deploy_coverage(tip, 1350, 300, &red, &required, &[second.clone()], None);
+            assert!(matches!(plan.coverage, DeployCoverageState::Failed { .. }));
+        }
+        let explicitly_required = [required.as_slice(), &[gate.name]].concat();
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &explicitly_required, &[second.clone()], None).coverage,
+            DeployCoverageState::Failed { .. }));
+        let foreign = DeployWorkflowRun { head_sha: "a".repeat(40), ..second.clone() };
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[foreign], None).coverage,
+            DeployCoverageState::Failed { .. }));
+        let third = DeployWorkflowRun { run_attempt: Some(3), ..first.clone() };
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[first, second, third], None).coverage,
+            DeployCoverageState::Failed { failing_run_id: Some(id), .. } if id == run_id));
+    }
+
+    #[test]
     fn decisive_failed_deploy_overrules_scoped_green_and_never_borrows_old_receipt() {
         let required: Vec<String> = vec!["deploy / Deploy to dev".into(), "post-deploy / Post-Deploy Smoke".into(),
             "post-deploy / DNS chain (front doors)".into(), "post-deploy / Lodestar Operational Health".into()];
@@ -2094,7 +2158,7 @@ mod tests {
         let plan = reconcile_deploy_coverage("78760d10", 7800, 300, &scoped, &required, &workflows, None);
         assert!(matches!(plan.coverage, DeployCoverageState::Failed { failing_run_id: Some(41926939169), .. }));
         assert_eq!(plan.covered_by_sha.as_deref(), Some("e99f74f8"));
-        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage);
+        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage, &required);
         assert_eq!(effective.verdict, MainVerdict::Red);
         assert!(effective.red[0].url.ends_with("41926939169"));
         // Effective red cannot dispatch stale-gate recovery or clear a stop.
@@ -3940,7 +4004,7 @@ mod tests {
             plan_spot.coverage,
             DeployCoverageState::Settling { active_run_id: Some(41911085476), .. }
         ));
-        let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage);
+        let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage, &required);
         assert_eq!(reconciled_spot.verdict, MainVerdict::Unsettled);
         assert!(reconciled_spot.alarm.is_none());
         assert_eq!(reconciled_spot.unsettled, vec!["Deploy Dev (run #41911085476 in flight)"]);
@@ -3972,7 +4036,7 @@ mod tests {
             plan_failed_spot.coverage,
             DeployCoverageState::Failed { failing_run_id: Some(41911085476), .. }
         ));
-        let reconciled_failed = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_failed_spot.coverage);
+        let reconciled_failed = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_failed_spot.coverage, &required);
         assert_eq!(reconciled_failed.verdict, MainVerdict::Red);
         assert_eq!(reconciled_failed.red.len(), 1);
         assert_eq!(reconciled_failed.red[0].name, "Deploy Dev (run #41911085476)");

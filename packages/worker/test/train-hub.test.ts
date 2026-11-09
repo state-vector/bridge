@@ -627,6 +627,43 @@ describe("merge train DO drill (real bundled worker)", () => {
     const fake = await command("fake-recovery", { kind: "recovered", task_id: task });
     expect(fake.status).toBe(400);
   });
+  it("BR#9081: an active exact retry holds the lane without a repair, then a new failed attempt owns its repair", async () => {
+    const repo = "state-vector/active-retry-9081", actor = "gw-9081";
+    const tip = "e1b6b5954433ccf38c328104447f4af0176a7cf6";
+    const runId = 42562274448;
+    const runUrl = `https://github.com/${repo}/actions/runs/${runId}`;
+    const required = "Cortex Quality Smoke";
+    const active = { id: runId, run_attempt: 2, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml",
+      head_sha: tip, status: "in_progress", conclusion: null, html_url: runUrl };
+    await acquire(repo, actor, { required_workflows: ["deploy / Deploy to dev", required] });
+    const publish = (base_state: Record<string, unknown>) => kbJson("/train.queue_facts", { repo, actor, base_state });
+    await publish({ verdict: "unsettled", tip_sha: tip, unsettled: [required], red: [] });
+    const observe = (runs: unknown[], failures: unknown[] = []) => kbJson("/train.observe_deploy", {
+      repo, actor: "observer", observation: { tip_sha: tip, observed_at: Date.now(), runs, failures },
+    });
+    expect((await observe([active])).status).toBe(200);
+    const stale = await publish({ verdict: "red", tip_sha: tip, unsettled: [required],
+      red: [{ name: "Deploy health (merge gate)", url: `https://github.com/${repo}/runs/128982701091` }],
+      deploy_coverage: { phase: "failed", tip_sha: tip, tip_age_secs: 1350, failing_run_id: null } });
+    expect(stale.status, JSON.stringify(stale.body)).toBe(200);
+    const waiting = await laneSnap(repo);
+    expect(waiting.queue_facts.base_state).toMatchObject({ verdict: "unsettled", red: [],
+      deploy_coverage: { phase: "settling", active_run_id: runId } });
+    expect(waiting.line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine", url: runUrl } });
+    expect(waiting.line.recoveries ?? []).toHaveLength(0);
+    expect(waiting.base_red_resolution ?? null).toBeNull();
+    expect(waiting.deploy_dispatched ?? null).toBeNull();
+
+    const failed = { ...active, run_attempt: 3, status: "completed", conclusion: "failure" };
+    const result = await observe([active, failed], [{ run_id: runId, name: required, url: `${runUrl}/job/128986714580` }]);
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    const stopped = await laneSnap(repo);
+    expect(stopped.line).toMatchObject({ phase: "stopped", blocker: "main_failed" });
+    expect(stopped.base_red_resolution.fix_card.id).toMatch(/^BR#/);
+    expect(stopped.line.recoveries).toEqual(expect.arrayContaining([expect.objectContaining({
+      episode: expect.objectContaining({ sources: [expect.objectContaining({ run_id: runId, run_attempt: 3 })] }),
+    })]));
+  });
   it("deployment observations stop a failed line independently of the merge lease and survive stale green gateway snapshots", async () => {
     const repo = "state-vector/observe-deploy-6389";
     const tip = "7".repeat(40);

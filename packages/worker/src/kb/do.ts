@@ -153,6 +153,7 @@ import {
   reconcileBaseVerdictWithDeployCoverage,
   normalizeBaseStateWithCoverage,
   applyDeployObservation,
+  latestDeployRunAttempts,
   trainDarkTipAskTitle,
   trainDarkTipAskBrief,
   trainGateBlockedAskTitle,
@@ -10791,8 +10792,9 @@ export class KnowledgeHub {
     const coverage = DeployCoverageStateSchema.safeParse(facts?.base_state?.deploy_coverage);
     const observed = DeployObservationSchema.safeParse(lane.deploy_observation);
     if (facts?.base_state?.verdict === "red" && observed.success) {
-      const failed = [...observed.data.runs].filter((r) => r.head_sha === observed.data.tip_sha && r.status === "completed" && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
-      if (failed && failed.conclusion !== "success") for (const episode of Object.values(ledger)) {
+      const failed = latestDeployRunAttempts(observed.data.runs.filter(r => r.head_sha === observed.data.tip_sha))
+        .find(r => r.conclusion !== "cancelled" && r.conclusion !== "skipped");
+      if (failed?.status === "completed" && failed.conclusion !== "success") for (const episode of Object.values(ledger)) {
         if (episode.head_sha !== failed.head_sha || !recoveryIsOpen(episode) || !episode.verified_receipts.length) continue;
         const newer = episode.verified_receipts.every((r) => failed.id > r.run_id || (failed.id === r.run_id && (failed.run_attempt ?? 1) > r.run_attempt));
         if (!newer) continue;
@@ -10804,7 +10806,8 @@ export class KnowledgeHub {
     }
     if (facts?.base_state?.verdict === "green" && !facts.base_state.gate_blocked && coverage.success && coverage.data.phase === "covered" && observed.success) {
       const cov = coverage.data;
-      const run = observed.data.runs.find((r) => r.id === cov.covered_by_run_id && r.head_sha === cov.tip_sha && r.status === "completed" && r.conclusion === "success");
+      const run = observed.data.runs.find(r => r.id === cov.covered_by_run_id && r.head_sha === cov.tip_sha
+        && (r.run_attempt ?? 1) === (cov.covered_by_run_attempt ?? 1) && r.status === "completed" && r.conclusion === "success");
       if (run) for (const [key, episode] of Object.entries(ledger)) {
         const newestFailure = episode.sources.reduce((a, b) => b.run_id > a.run_id || (b.run_id === a.run_id && b.run_attempt > a.run_attempt) ? b : a);
         if (run.id < newestFailure.run_id || (run.id === newestFailure.run_id && (run.run_attempt ?? 1) < newestFailure.run_attempt)) continue;
@@ -10835,12 +10838,13 @@ export class KnowledgeHub {
     const meta = JSON.parse(row.meta ?? "{}");
     const tip = meta.lane?.queue_facts?.base_state?.tip_sha;
     if (tip && tip !== observation.tip_sha) throw new Error("deployment observation does not match the lane's current tip");
-    if (!observation.runs.some((r) => r.head_sha === observation.tip_sha)) throw new Error("deployment observation lacks a run on the observed tip");
+    const tipRuns = latestDeployRunAttempts(observation.runs.filter(r => r.head_sha === observation.tip_sha));
+    if (!tipRuns.length) throw new Error("deployment observation lacks a run on the observed tip");
     for (const run of observation.runs) {
       if (run.html_url !== `https://github.com/${repo}/actions/runs/${run.id}`) throw new Error("deployment run receipt must match repository and run id");
     }
     for (const failure of observation.failures ?? []) {
-      if (!observation.runs.some((r) => r.id === failure.run_id && r.head_sha === observation.tip_sha && r.conclusion !== "success") ||
+      if (!tipRuns.some(r => r.id === failure.run_id && r.conclusion !== "success") ||
           !failure.url.startsWith(`https://github.com/${repo}/actions/runs/${failure.run_id}/job/`)) throw new Error("failed-job receipt must belong to a failed observed deployment on the current tip");
     }
     if (Number(meta.lane?.deploy_observation?.observed_at ?? 0) > observation.observed_at) throw new Error("deployment observation superseded by a newer observation");
@@ -10857,12 +10861,12 @@ export class KnowledgeHub {
       const receiptMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, row.id)?.meta ?? "{}");
       const knownEpisodes = RecoveryLedgerSchema.parse(receiptMeta.lane?.recovery_episodes ?? {});
       const specificRepair = Object.values(knownEpisodes).some((e) => e.head_sha === observation.tip_sha && e.cause.kind !== "check_failure" && recoveryIsOpen(e));
-      const latestTipRun = [...observation.runs].filter((r) => r.head_sha === observation.tip_sha && r.conclusion !== "cancelled" && r.conclusion !== "skipped").sort((a, b) => b.id - a.id)[0];
+      const latestTipRun = tipRuns.find(r => r.conclusion !== "cancelled" && r.conclusion !== "skipped");
       const failureRows: NonNullable<typeof observation.failures> = observation.failures?.length ? observation.failures
         : !specificRepair && latestTipRun?.status === "completed" && latestTipRun.conclusion !== "success"
           ? [{ run_id: latestTipRun.id, name: latestTipRun.name, url: latestTipRun.html_url }] : [];
       for (const failure of failureRows) {
-        const run = observation.runs.find((r) => r.id === failure.run_id);
+        const run = tipRuns.find(r => r.id === failure.run_id);
         if (!run || !repairId) continue;
         const cause = failure.cause ?? { kind: "check_failure" as const, check: failure.name };
         const current = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, row.id)?.meta ?? "{}");
