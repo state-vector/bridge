@@ -289,7 +289,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                 json!({"kind":"receipt","target_command_id":record.command_id(stage)}))?;
             if receipt["kind"] == "receipt_found" { report.released(Released::from_hub(&record.owner, &receipt["result"])?); return Ok(()); }
             if matches!(record.work, Work::Unstarted { .. }) {
-                let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":ticket.task_id}))?;
+                let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":ticket.task_id,"view":"execution"}))?;
                 report.released(Released::reservation_reconciled(&record.owner, &task)?); return Ok(());
             }
             return Err("gate: terminal journal disappeared without a matching immutable ACK; ownership retained".into());
@@ -322,7 +322,7 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                 Work::Unproven { .. } | Work::UnknownWriter { .. } => return Err("gate: no process-group-empty proof; retain outcome and capacity for host reconciliation".into()),
                 Work::Unstarted { .. } => {
                     let ticket = record.ticket().clone();
-                    let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":ticket.task_id}))?;
+                    let task = mcp_call(&cfg, &mut 0, "get_artefact", json!({"id":ticket.task_id,"view":"execution"}))?;
                     let released = match Released::reservation_reconciled(&record.owner, &task) {
                         Ok(receipt) => receipt,
                         Err(_) => {
@@ -389,7 +389,7 @@ fn reservation_release(cfg: &DispatchConfig, record: &Record) -> Result<Released
         || record.url != cfg.url.trim_end_matches('/') || cfg.label.as_deref() != Some(record.host.as_str()) {
         return Err("gate: reservation observation lacks exact unstarted host/owner proof".into());
     }
-    let task = mcp_call(cfg, &mut 0, "get_artefact", json!({"id":record.ticket().task_id}))?;
+    let task = mcp_call(cfg, &mut 0, "get_artefact", json!({"id":record.ticket().task_id,"view":"execution"}))?;
     Released::reservation_reconciled(&record.owner, &task)
 }
 
@@ -1281,6 +1281,7 @@ pub(crate) mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let observations = reads.clone();
         let hub = Hub::new(move |request| {
             if request["params"]["name"] == "get_artefact" {
+                assert_eq!(request["params"]["arguments"]["view"], "execution");
                 observations.fetch_add(1, Ordering::SeqCst);
                 return Some(json!({"id":"held-reservation","status":if observed.load(Ordering::SeqCst) { "blocked" } else { "in_progress" },"meta":{"session":"original-session"}}));
             }
