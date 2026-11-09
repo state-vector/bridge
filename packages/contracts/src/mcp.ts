@@ -164,7 +164,7 @@ export const TOOL_ARG_SCHEMAS = {
     dst: z.string(),
   }),
   list_agents: z.looseObject({}),
-  stats: z.looseObject({}),
+  stats: z.looseObject({ park_inventory: z.boolean().optional(), after_park: z.string().regex(/^BR#\d+$/).optional() }),
   related_artefacts: z.looseObject({
     id: z.string(),
     limit: z.number().int().max(50).optional(),

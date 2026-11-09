@@ -237,9 +237,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (_args, ctx) => text(JSON.stringify(await ctx.call("agents.list", {}), null, 1)),
   },
   stats: {
-    description: "Board + watchdog liveness: counts by type/status, watchdog last tick and last sweep (stale in_progress/in_review, open asks). Answers 'is the watchdog alive?' and 'how much work is stale?' without touching DO internals.",
+    description: "Board + watchdog liveness: counts by type/status, watchdog last tick and last sweep (stale in_progress/in_review, open asks). Pass park_inventory=true to enumerate blocked task IDs and their current typed waits. Continue with after_park set to the returned next cursor.",
     schema: TOOL_ARG_SCHEMAS.stats,
-    handler: async (_args, ctx) => text(JSON.stringify(await ctx.call("stats", {}), null, 1)),
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("stats", {
+      park_inventory: args.park_inventory === true, after_park: args.after_park,
+    }), null, 1)),
   },
   related_artefacts: {
     description: "Artefacts semantically related to X — what supports, constrains or invalidates it.",

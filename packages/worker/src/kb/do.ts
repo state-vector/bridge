@@ -4026,7 +4026,7 @@ export class KnowledgeHub {
         case "card.force_review": return this.json(await this.cardForceReview(body, actor));
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
-        case "stats": return this.json(await this.stats());
+        case "stats": return this.json(await this.stats(body));
         case "get_history": return this.json(await this.getHistory(String(body.id ?? ""), Number(body.limit ?? 100)));
         // ---- merge train (BR#3516/BR#3517): executor-fed facts, hub decides ----
         case "train.lease": return this.json(await this.trainLease(body, actor));
@@ -7946,7 +7946,26 @@ export class KnowledgeHub {
     };
   }
 
-  private async stats() {
+  private parkInventory(after: string) {
+    const pageSize = 100;
+    const rows = this.state.storage.sql.exec(`
+      SELECT id, title, owner, project, updated_ts, meta FROM artefacts
+      WHERE type='task' AND status='blocked' AND id > ?
+      ORDER BY id LIMIT ?`, after, pageSize + 1).toArray();
+    const items = rows.slice(0, pageSize).map(row => {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      return {
+        id: String(row.id), title: String(row.title), owner: this.displayOwner(row.owner),
+        project: String(row.project), updated_ts: Number(row.updated_ts),
+        await_event: validateAwaitEvent(meta.blocked?.await_event),
+        train_phase: mergePhaseOf(meta),
+        infrastructure: this.isUnclaimableAnchor(row, meta) || !!meta.lane,
+      };
+    });
+    return { items, next: rows.length > pageSize ? items.at(-1)?.id ?? null : null };
+  }
+
+  private async stats(options: { park_inventory?: unknown; after_park?: unknown } = {}) {
     const byType = this.state.storage.sql.exec(
       `SELECT type, status, COUNT(*) AS n FROM artefacts GROUP BY type, status ORDER BY type`,
     ).toArray();
@@ -7990,6 +8009,7 @@ export class KnowledgeHub {
     try { lastFlush = flushedRow ? JSON.parse(flushedRow.value) : null; } catch { /* old shape */ }
     return {
       counts: byType,
+      ...(options.park_inventory === true && { park_inventory: this.parkInventory(String(options.after_park ?? "")) }),
       watchdog,
       channel: {
         window_started_ts: this.routeStatsStarted,

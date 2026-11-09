@@ -199,4 +199,22 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(reparked.meta.blocked.await_event).toEqual({ event: "br_done", id: replacement });
   });
 
+
+  it("lists the same blocked tasks as the census through authenticated stats", async () => {
+    const id = await task("Audit a live typed park");
+    const until = Date.now() + 60_000;
+    const blocked = await call("transition", { id, to: "blocked", actor: "author", note: "Wait for the scheduled check",
+      await_event: { event: "time", until_ts: until } });
+    expect(blocked.status).toBe(200);
+    const runnable = await task("Ready work is outside the park census");
+    expect((await call("stats")).body.park_inventory).toBeUndefined();
+    const report = (await call("stats", { park_inventory: true })).body;
+    const count = report.counts.find((entry: any) => entry.type === "task" && entry.status === "blocked").n;
+    expect(report.park_inventory.next).toBeNull();
+    expect(report.park_inventory.items).toHaveLength(count);
+    expect(report.park_inventory.items).toContainEqual(expect.objectContaining({ id, await_event: { event: "time", until_ts: until } }));
+    expect(report.park_inventory.items.map((entry: { id: string }) => entry.id)).not.toContain(runnable);
+    const continuation = (await call("stats", { park_inventory: true, after_park: id })).body.park_inventory;
+    expect(continuation.items.every((entry: { id: string }) => entry.id > id)).toBe(true);
+  });
 });
