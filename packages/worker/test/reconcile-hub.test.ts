@@ -144,6 +144,12 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect(outcome.status, JSON.stringify(outcome.body)).toBe(200);
     expect((await kbJson("/get", { id: repair })).body.status).toBe("done");
 
+    // The production strand sweep runs between GitHub reports. It must
+    // preserve the accepted recovery until the new head can enter review.
+    const swept = await kbJson("/admin.strand_disposition_sweep", { now: NOW + 4 * 3_600_000 });
+    expect(swept.status).toBe(200);
+    expect((await kbJson("/get", { id: parent })).body.meta.recovery.task_id).toBe(repair);
+
     const observation = prRow(number, { headRefOid: repairedHead, reviewDecision: null, mergeStateStatus: "UNSTABLE", updatedAt: iso(90) });
     const inconclusive = { ...observation, mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
     const reports = await Promise.all([report(repo, [inconclusive]), report(repo, [observation])]);

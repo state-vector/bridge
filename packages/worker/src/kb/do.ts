@@ -15130,7 +15130,16 @@ export class KnowledgeHub {
         switch (plan.kind) {
           case "none": case "owned": break;
           case "restore_queue": if (cls) await this.strandAct(String(r.id), String(r.status), cls, awaitEv); break;
-          case "dispatch": await this.ensureTaskRecovery(String(r.id), plan.reason); break;
+          case "dispatch": {
+            // GitHub reconciliation owns the next step for a completed
+            // repair. The alarm has no fresh head evidence to reopen it.
+            if (r.status === "todo" && meta.merge_train?.state === "bounced"
+              && (this.acceptedRecoveryForBounce(String(r.id), meta.recovery?.task_id, meta.merge_train.bounced_at)
+                || this.openVerifyChildren(String(r.id)) > 0
+                || this.currentTaskReview(String(r.id)).phase === "pending")) break;
+            await this.ensureTaskRecovery(String(r.id), plan.reason);
+            break;
+          }
         }
       } catch (e) {
         this.audit("system:train", "strand_sweep_error", r.id, { error: String((e as Error).message ?? e).slice(0, 200) });
@@ -17298,10 +17307,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       || (wait && (wait.event !== "pr_merged" || wait.repo !== repo || Number(wait.n) !== pr))
       || (hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > Date.now())
       || meta.awaiting_ask || this.staleReviewHasExecutionHold(parent.id, meta)) return false;
-    const duty = meta.recovery?.task_id && this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, String(meta.recovery.task_id));
-    if (duty?.status !== "done" || !this.one(`SELECT 1 FROM artefact_versions WHERE artefact_id=? AND actor='system:recovery'
+    return this.acceptedRecoveryForBounce(parent.id, meta.recovery?.task_id, stamp.bounced_at);
+  }
+
+  private acceptedRecoveryForBounce(parentId: string, dutyId: unknown, bouncedAt: unknown): boolean {
+    if (typeof dutyId !== "string") return false;
+    const duty = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, dutyId);
+    const scheduled = this.one(`SELECT ts FROM artefact_versions WHERE artefact_id=? AND actor='system:recovery'
       AND action='recovery_scheduled' AND json_extract(data,'$.duty')=?
-      AND json_extract(data,'$.reason') IN ('queue_binding','conflict') LIMIT 1`, parent.id, duty.id)) return false;
+      AND json_extract(data,'$.reason') IN ('queue_binding','conflict') ORDER BY seq DESC LIMIT 1`, parentId, dutyId);
+    if (duty?.status !== "done" || !scheduled || Number(scheduled.ts) < Number(bouncedAt ?? 0)) return false;
     const dm = JSON.parse(String(duty.meta ?? "{}"));
     const review = this.currentTaskReview(String(duty.id));
     return review.phase === "accepted" && review.result.kind === "accepted_execution" && review.result.task_id === duty.id
@@ -17516,6 +17531,13 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             AND ((d.duty_id='' AND d.created_ts>?) OR a.status IN ('todo','in_progress','in_review','blocked'))`,
             repo, j.pr, Date.now() - 60_000);
           if (verify || this.currentTaskReview(a.card).phase === "pending") break;
+          const parent = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, a.card);
+          if (a.reason === "queue_binding" && parent) {
+            const meta = JSON.parse(parent.meta ?? "{}");
+            const stamp = meta.merge_train;
+            if (parent.status === "todo" && stamp?.state === "bounced" && stamp.repo === repo && Number(stamp.pr) === j.pr
+              && this.acceptedRecoveryForBounce(a.card, meta.recovery?.task_id, stamp.bounced_at)) break;
+          }
           const duty = await this.ensureTaskRecovery(a.card, a.reason);
           spawned.push({ pr: j.pr, action: "repair", card: a.card, duty });
           break;
