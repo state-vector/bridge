@@ -1836,23 +1836,26 @@ A blocked card without something it is *awaiting* is structurally impossible. `t
 Merges must not land while the destination branch is red — accepted decision BR#3009 makes
 that law, and BR#3008 makes it mechanical instead of discipline. Three halves, same rule:
 
-- **The block**: every PR runs the required `main-green gate` check
-  (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`). It reads the
-  check runs on main's HEAD (`gh api repos/<repo>/commits/<sha>/check-runs`): any failure
-  (or a check still running, or no substantive check runs) fails the gate and GitHub refuses
-  the merge via the `main: main-green gate + substance checks required` ruleset. The
-  newest run per check judges; a cancelled run says nothing. The one exception is written
-  into the gate: a PR green on the *exact* checks main fails passes with a printed
-  **REMEDIATION CARVE-OUT** receipt — BR#3009's remediation-merge path, expressible and
-  receipted, not a loophole.
-  The destination check excludes its own `main-green gate` and `Preflight destination check`
-  labels. GitHub attaches those results to the commit SHA, which can be shared by main
-  and a preflight ref. A manual `workflow_dispatch` drill still requires an explicit
-  historic `main_sha` (BR#5487).
+- **The block (bridge-side since 2026-11-09)**: destination-green is enforced by the
+  merge train's own gate (`decideTrainGate`, `packages/worker/src/kb/core.ts` +
+  `train_gate.rs`): it refuses every merge onto a red base on every tick, with the
+  root-fix fast-track (BR#5189) as the carve-out. Direct-to-main pushes run the
+  required checks on the exact commit first (`scripts/push-main.sh` preflight — a
+  `main-preflight/*` branch must land `Test` + `CLI build (packages/cli)` green
+  before main advances). The repo's own `main-green gate` required check
+  (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`,
+  BR#3008/BR#3009) was DELETED 2026-11-09 (Ray ruling): it repeatedly
+  false-blocked — stale reds while the recovery deploy was mid-flight
+  (2026-11-02), the sha-less drill judging its own run and reding a green main
+  (BR#5487), and the circular deadlock class — and a product cannot require
+  custom GH workflows for a basic base-green check Bridge performs itself.
+  The remediation carve-out (a PR green on the exact checks main fails) lives on
+  bridge-side in the root-fix fast-track.
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
-  head while main was green; main went red and the #211 hotfix followed). The same ruleset
-  now also requires `Test` and `CLI build (packages/cli)` green on the PR's own head, with
+  head while main was green; main went red and the #211 hotfix followed). The ruleset
+  (`main: substance checks required`) still
+  requires `Test` and `CLI build (packages/cli)` green on the PR's own head, with
   `strict_required_status_checks_policy` on: the checks must come from the latest head, so
   a stale green never counts. A red-head PR cannot merge even while main is green — the
   train's gate (`decideTrainGate`, composing the standing `decideMergeAction` in
@@ -2067,10 +2070,12 @@ every tick. Two laws now hold:
 
 Scoped classification fixed the nightly-red park — and opened a new silence: the lane's
 base verdict reads ONLY the required set, so a scoped Green can coexist with the repo's
-own destination gate — `main-green gate`, which judges main's WHOLE tip, no exemptions,
-unsettled fails — red on that same tip. The lane then looks idle-green while every queued
-car's own gate run fails, and a car whose head red is entirely gate-class stands convicted
-forever because nothing ever re-runs the stale gate red on it. The 2026-11-03 receipt
+own destination-gate-class check (a merge gate that judges main's WHOLE tip, no
+exemptions, unsettled fails — e.g. `Deploy health (merge gate)`; this repo's own
+`main-green gate` was deleted 2026-11-09, but the class guard stays for repos that run
+one) red on that same tip. The lane then looks idle-green while every queued
+car's own gate run fails, and a car whose head red is entirely gate-class stands
+convicted forever because nothing ever re-runs the stale gate red on it. The 2026-11-03 receipt
 (BR#5822/BR#5861 diagnosis): the lane starved 3.5h+ with cars held while a `Deploy drift
 alarm` red — correctly outside the scoped set — kept the repo's gate red, the lane reading
 green the whole time; the sibling settle exit had already been fixed (BR#5829), and
@@ -2079,8 +2084,9 @@ COMPUTED from the tip's runs, never read from the required set. Two laws close t
 
 - **The qualifier rides the verdict — computed, never read**: when the scoped base verdict
   is Green but the gate predicate — `classify_main_check_runs`, byte-equivalent to
-  `scripts/main-green-gate.sh` (newest non-cancelled run per name, no exemptions,
-  unsettled fails) — judges the tip non-green, `classify_base_check_runs` attaches a
+  the retired `scripts/main-green-gate.sh` decision rule (newest non-cancelled run
+  per name, no exemptions, unsettled fails) — judges the tip non-green,
+  `classify_base_check_runs` attaches a
   `GateBlock` qualifier. The verdict itself STAYS Green (BR#5265 law intact: non-required
   reds never park the train). The walk's `base_state` stamps `gate_blocked: true` with
   `gate_verdict` / `gate_red[]` / `gate_unsettled[]` (omitted while clean or mid-burst),
@@ -2305,13 +2311,13 @@ reconcile deploy coverage as a closed 6-state machine (`DeployCoverageState`:
 The `Deploy drift alarm` check (`deploy-check` job in `.github/workflows/ci.yml`, probe logic in
 `scripts/deploy-drift-alarm.sh`) compares the live hub's `__version` commit against every main
 push. The hub deploys asynchronously (git push → CF Workers Builds), so a first-probe failure read
-"main is broken" on every push — 6+ false reds in 24h, each also tripping the `main-green gate`
-on the next PR. The alarm now settles first: while the hub still serves an older build it emits
+"main is broken" on every push — 6+ false reds in 24h (each also tripping the repo's
+then-required `main-green gate` check, since deleted, on the next PR). The alarm now settles first: while the hub still serves an older build it emits
 non-failing `::warning::` annotations for up to 10 minutes (`SETTLE_WINDOW_SECONDS`, default 600)
 and goes green the moment the hub serves the pushed SHA — or a newer main tip containing it (a
 faster merge superseding this push's deploy is not drift; drift is "deployed hub ≠ main tip").
 Only a window that elapses stale fails loudly — real drift (CF Builds stalled or bypassed),
-feeding the `main-green gate` and the merge train's base-green leg exactly as before — and so
+feeding the merge train's base-green leg exactly as before — and so
 does a hub that never answers. A failing main-tip lookup never turns a mismatch green
 (fail-closed). Guarded by `npm run test:deploy-drift-alarm`.
 
@@ -3237,7 +3243,7 @@ runs on the merge commit) · `train.lane` (ensure / configure) · `train.history
 ```
 
 `required_workflows` names the checks that must be green to land (the same checks the
-main-green gate ruleset enforces); `ci_typical_minutes` paces the fail-closed CI bound
+required-checks ruleset enforces); `ci_typical_minutes` paces the fail-closed CI bound
 (unknown past 3× typical classifies red — the train never waits forever). Lane identity
 is `repo@base`, so one repo can run several lanes (e.g. `main` and a release branch).
 

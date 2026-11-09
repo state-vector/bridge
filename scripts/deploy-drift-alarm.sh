@@ -5,8 +5,7 @@
 # Compares the live hub's __version commit against the pushed SHA on every
 # main push. The hub deploys asynchronously (git push → CF Workers Builds),
 # so an alarm that failed on the first stale probe read "main is broken" on
-# EVERY push (BR#3289: 6+ false reds in 24h, and each red also tripped the
-# main-green gate on the next PR). The alarm now settles first:
+# EVERY push (BR#3289: 6+ false reds in 24h). The alarm now settles first:
 #
 # Decision rule (per probe, inside the settle window):
 #   - LIVE == EXPECTED_SHA        -> GREEN, exit 0 (fast path — deploy landed).
@@ -19,8 +18,8 @@
 #
 # Window elapses with no green (the LAST probe is the verdict):
 #   - hub answered but never matched -> ::error:: deploy drift, exit 1. Real
-#     drift (CF Builds stalled or bypassed) — fails loudly, feeds the
-#     main-green gate and stopTheLineSweep, exactly as before.
+#     drift (CF Builds stalled or bypassed) — fails loudly, feeds
+#     stopTheLineSweep, exactly as before.
 #   - hub never answered             -> ::error:: unreachable, exit 1
 #     (a stalled deploy or a broken route is real drift too).
 #
@@ -124,7 +123,7 @@ if [ -n "$live" ]; then
   else
     echo "::error::deploy drift — the ${WINDOW}s settle window elapsed and the live hub still runs $(short "$live"), not the pushed $(short "$EXPECTED_SHA") (main-tip lookup failed, so the superseded-push path could not be proven). CF Builds stalled or bypassed?"
   fi
-  echo "  This is real drift: the deployed hub is not main. Fails the run and feeds the main-green gate + stopTheLineSweep."
+  echo "  This is real drift: the deployed hub is not main. Fails the run and feeds stopTheLineSweep."
   exit 1
 fi
 
