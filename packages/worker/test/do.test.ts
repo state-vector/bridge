@@ -1213,6 +1213,30 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
     expect(line.summary).toContain("set: blocked");
     expect(line.summary).toContain("deleted: session");
   });
+
+  it("a UI-style task edit (title/body/tags, meta omitted) is lossless — every meta key survives untouched (BR#1108 edit flow)", async () => {
+    // The detail-panel edit form saves human-owned fields only and carries NO
+    // meta key. Per-key merge (BR#5807) must preserve every pre-existing meta
+    // key — the "lossless metadata round-trip" the edit flow promises: editing
+    // a task amputates nothing, alters nothing it did not touch.
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#1108 lossless edit round-trip", body_md: "original body", tags: ["alpha"] });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    // infrastructure-shaped meta a real card carries (non-lane card: plain keys)
+    const seeded = await kbJson("/update", { id: t.id, actor: "gw-1", meta: { currently: { phase: "editing" }, session: "keep-me" } });
+    expect(seeded.status).toBe(200);
+    const r = await kbJson("/update", { id: t.id, actor: "some-agent", title: "edited title", body_md: "edited body", tags: ["beta", "edited-by-ui"] });
+    expect(r.status).toBe(200);
+    expect(r.body.error).toBeUndefined();
+    const after = await kbJson("/get", { id: t.id });
+    // the edited fields landed
+    expect(after.body.title).toBe("edited title");
+    expect(after.body.body_md).toBe("edited body");
+    expect(after.body.tags).toEqual(["beta", "edited-by-ui"]);
+    // meta: NO key amputated, NO key altered by the meta-less edit
+    const m = metaOf(after.body);
+    expect(m.currently).toEqual({ phase: "editing" });
+    expect(m.session).toBe("keep-me");
+  });
 });
 
 // ---- BR#5874: the verify-round supersede must kill only same-PR duties ----

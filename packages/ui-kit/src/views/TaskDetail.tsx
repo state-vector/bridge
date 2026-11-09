@@ -630,6 +630,10 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
   const [note, setNote] = useState("");
   const [body, setBody] = useState<string | null>(null);
   const [showBody, setShowBody] = useState(false);
+  // BR#1108 full task edit — prefilled from the fetched artefact; meta is
+  // deliberately NOT part of the form (see saveEdit for why).
+  const [title, setTitle] = useState("");
+  const [tags, setTags] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const [versions, setVersions] = useState<KbVersion[]>([]);
@@ -676,6 +680,8 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
         const art = a.value as KbArtefact & { meta?: TaskMeta };
         setTask(art);
         setBody(art.body_md ?? "");
+        setTitle(art.title);
+        setTags(((art.tags as string[] | null) ?? []).join(", "));
         setRelations(((art as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
         setTaskErr("");
       } else {
@@ -722,6 +728,37 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
       // diagnosable from the UI, not a bare "comment failed" (BR#3462 leg 1)
       useKb.getState().reportError("post comment", e);
       setMsg(`comment failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // BR#1108: the detail panel's edit form save. Human-owned fields (title,
+  // body, tags) ride kbApi.update; meta is deliberately OMITTED — the service
+  // merges meta per-key and preserves every omitted key (BR#5807: lane/lease/
+  // blocked/ask/review bindings are machinery-owned state), while echoing a
+  // wholesale meta object back would trip the lane_revision presence gate.
+  // Omission IS the lossless metadata round-trip on the current contract:
+  // every meta key passes through the update untouched, nothing is amputated.
+  const saveEdit = async () => {
+    if (!task || !title.trim()) return;
+    setBusy(true);
+    try {
+      await kbApi.update(taskId, {
+        title: title.trim(),
+        body_md: body ?? "",
+        tags: tags.split(",").map((t) => t.trim()).filter(Boolean),
+      });
+      setMsg("saved");
+      setTimeout(() => setMsg(""), 1500);
+      setShowBody(false);
+      reload();
+    } catch (e) {
+      // surface the server's message — gate rejections (meta ownership,
+      // delivery bindings) must be diagnosable from the UI, not a bare
+      // "save failed" (BR#3462 leg 1 convention)
+      useKb.getState().reportError("save task", e);
+      setMsg(`save failed: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -799,12 +836,15 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
             </label>
             {showBody ? (
               <>
-                <TextArea rows={6} value={body} onChange={(e) => setBody(e.target.value)} />
-                <Btn
-                  onClick={async () => { await kbApi.update(taskId, { body_md: body }); setMsg("saved"); setTimeout(() => setMsg(""), 1500); }}
-                >
-                  Save description
+                <label>Title</label>
+                <TextInput value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" />
+                <TextArea rows={8} value={body} onChange={(e) => setBody(e.target.value)} />
+                <label>Tags</label>
+                <TextInput value={tags} onChange={(e) => setTags(e.target.value)} placeholder="comma-separated" />
+                <Btn disabled={busy || !title.trim()} onClick={() => void saveEdit()}>
+                  Save task
                 </Btn>
+                <span className="muted-note"> edits title, description and tags — metadata (lane, lease, blocked/ask state, review bindings) is preserved server-side.</span>
               </>
             ) : (
               <div className="md-body know-body"><MdRef text={body || "—"} onOpen={nav} repo={(task?.meta as any)?.provenance?.repo} /></div>
