@@ -1952,20 +1952,41 @@ fn integrate_after_strict_refusal(ctx: &mut Ctx, repo: &str, base: &str, cand: &
     Ok(StrictBranchRepair::AwaitingCi { base_sha, head_sha: to_head.into() })
 }
 
+enum BatchCandidateReadiness {
+    Ready,
+    Recomputing(String),
+    Deferred(String),
+}
+
 /// Recheck acceptance, exact head, signatures and CI at the write boundary.
 /// A scan position or an earlier ready result is never permission to merge.
 fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
-    base_verdict: MainVerdict, base_red_names: &[String]) -> Result<bool, String> {
+    base_verdict: MainVerdict, base_red_names: &[String]) -> Result<BatchCandidateReadiness, String> {
+    use crate::train_gate::{classify_candidate_gate_phase, classify_head_checks, CandidateGatePhase};
+    use BatchCandidateReadiness::{Deferred, Ready, Recomputing};
+
     let card = ctx.mcp("get_artefact", json!({ "id": cand.head_id }))?;
     let meta = card.get("meta").cloned().unwrap_or(json!({}));
     let legs = train_legs(&meta);
     let Some((index, _)) = legs.iter().enumerate().find(|(_, leg)| leg.repo == repo
-        && leg.number == cand.pr && leg.base.as_deref().unwrap_or("main") == base) else { return Ok(false); };
+        && leg.number == cand.pr && leg.base.as_deref().unwrap_or("main") == base) else {
+        return Ok(Deferred("the current task no longer carries this train leg".into()));
+    };
     let facts = ctx.pr_facts(repo, cand.pr)?;
-    if vstr(&facts, "state") != Some("OPEN") || vstr(&facts, "headRefOid") != Some(&cand.head_sha) { return Ok(false); }
-    let checks = ctx.check_runs(repo, &cand.head_sha);
+    if vstr(&facts, "state") != Some("OPEN") {
+        return Ok(Deferred("GitHub no longer reports this PR open".into()));
+    }
+    if vstr(&facts, "headRefOid") != Some(&cand.head_sha) {
+        return Ok(Deferred("GitHub no longer reports the selected reviewed head".into()));
+    }
+    if vstr(&facts, "baseRefName").is_some_and(|current| current != base) {
+        return Ok(Deferred("the PR now targets a different base branch".into()));
+    }
+    let CheckRunRead::Complete(checks) = ctx.read_check_runs(repo, &cand.head_sha) else {
+        return Err("GitHub did not return complete candidate check and workflow evidence".into());
+    };
     let commits = ctx.pr_commits(repo, cand.pr);
-    Ok(matches!(decide_train_gate(crate::train_gate::TrainGateInput {
+    let input = crate::train_gate::TrainGateInput {
         pr_number: cand.pr, head_sha: &cand.head_sha, card_meta: &meta,
         card_status: vstr(&card, "status"), base_gate_green: base_verdict == MainVerdict::Green,
         base_verdict, mergeable: facts.get("mergeable").and_then(Value::as_bool),
@@ -1973,7 +1994,28 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
         mechanical_move: None, root_fix: cand.root_fix && is_root_fix_card(&card), base_red_names,
         train_owned_branch: false,
-    }), MergeAction::Merge { .. }))
+    };
+    if let CandidateGatePhase::MergeabilityComputing { reason } = classify_candidate_gate_phase(&input) {
+        let head = classify_head_checks(&checks);
+        match head.verdict {
+            MainVerdict::Red => return Ok(Deferred(format!("head checks failed: {}",
+                head.red.iter().map(|check| check.name.as_str()).collect::<Vec<_>>().join(", ")))),
+            MainVerdict::Unsettled => return Ok(Deferred(format!("head checks are pending: {}", head.unsettled.join(", ")))),
+            MainVerdict::Green | MainVerdict::Empty => {}
+        }
+        if !commits.iter().any(|(sha, _)| sha == &cand.head_sha) || commits.iter().any(|(_, verified)| !verified) {
+            return Ok(Deferred("GitHub did not verify every commit on the exact selected head".into()));
+        }
+        return Ok(Recomputing(reason));
+    }
+    Ok(match decide_train_gate(input) {
+        MergeAction::Merge { .. } => Ready,
+        MergeAction::Skip { reason } | MergeAction::Note { reason } | MergeAction::HumanLeg { reason }
+        | MergeAction::RerunGate { reason } | MergeAction::RootFixBypass { reason }
+        | MergeAction::CloseSuperseded { reason } => Deferred(reason),
+        MergeAction::Bounce { defect, bounce_kind } => Deferred(format!("{defect} [{}]", bounce_kind.as_str())),
+        MergeAction::Carry { receipt, .. } => Deferred(receipt),
+    })
 }
 
 // ---- BR#5633: the Awaiting-park sweep ---------------------------------
@@ -3727,7 +3769,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let selected_method = allowed_methods[0].name();
         ctx.method_sub.insert(repo.to_string(), selected_method.to_string());
     }
-    for (bi, &ci) in batch.iter().enumerate() {
+    'batch: for (bi, &ci) in batch.iter().enumerate() {
         let cand = &candidates[ci];
         let head_id = cand.head_id.as_str();
         let pr = cand.pr;
@@ -3735,49 +3777,81 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission to merge; no further writes".into()); }
         ctx.operation_deadline = Some(Instant::now() + Duration::from_secs(60));
         let expected_tip = if pass_merged > initial_pass_merged { &tip_sha } else { &probed_base_sha };
-        let mut landing_base = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict.clone() };
-        let mut landing_red = base_class.red.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
-        if ctx.base_probe {
-            let (sha, age) = ctx.base_tip_facts(repo, base)?;
-            let checks = ctx.read_check_runs(repo, &sha);
-            let complete = matches!(&checks, CheckRunRead::Complete(_));
-            let runs = checks.into_runs();
-            let mut live = classify_base_check_runs(&runs, &required);
-            // The exact tip we just landed can have no required contexts yet.
-            // Only a complete GitHub read can distinguish that from an outage.
-            let own_batch_still_running = complete && pass_merged > 0 && sha == tip_sha
-                && matches!(live.verdict, MainVerdict::Unsettled | MainVerdict::Empty);
-            if own_batch_still_running && live.verdict == MainVerdict::Empty {
-                log(Some(key), "No required checks on our exact batch tip yet; continuing selected members");
-            }
-            let matching_root_fix = cand.root_fix && sha == probed_base_sha && live.verdict == MainVerdict::Red;
-            if live.verdict != MainVerdict::Green && !own_batch_still_running && !matching_root_fix {
-                ctx.operation_deadline = None;
-                reconcile_base_deploy(ctx, lane, key, repo, base, &sha, age, &mut live, &required, 0)?;
-                if pass_merged > 0 && sha == tip_sha && live.verdict == MainVerdict::Red {
-                    ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": sha, "checks": runs }))?;
-                    return Ok(());
+        let mut recheck_delays = [1, 2, 4].into_iter().map(Duration::from_secs);
+        let mut waited_for_mergeability = false;
+        let ready = loop {
+            let mut exact_own_prefix = false;
+            let mut landing_base = if pass_merged > 0 { MainVerdict::Green } else { base_class.verdict.clone() };
+            let mut landing_red = base_class.red.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+            if ctx.base_probe {
+                let (sha, age) = ctx.base_tip_facts(repo, base)?;
+                let checks = ctx.read_check_runs(repo, &sha);
+                let complete = matches!(&checks, CheckRunRead::Complete(_));
+                let runs = checks.into_runs();
+                let mut live = classify_base_check_runs(&runs, &required);
+                if !complete && live.verdict == MainVerdict::Green {
+                    ctx.operation_deadline = None;
+                    log(Some(key), "GitHub did not return complete main check evidence; stopping further merges");
+                    break 'batch;
                 }
-                log(Some(key), "Main has not passed its current checks; stopping further merges");
-                break;
+                exact_own_prefix = complete && pass_merged > 0 && sha == tip_sha;
+                // The exact tip we just landed can have no required contexts yet.
+                // Only a complete GitHub read can distinguish that from an outage.
+                let own_batch_still_running = exact_own_prefix && matches!(live.verdict, MainVerdict::Unsettled | MainVerdict::Empty);
+                if own_batch_still_running && live.verdict == MainVerdict::Empty {
+                    log(Some(key), "No required checks on our exact batch tip yet; continuing selected members");
+                }
+                let matching_root_fix = cand.root_fix && sha == probed_base_sha && live.verdict == MainVerdict::Red;
+                if live.verdict != MainVerdict::Green && !own_batch_still_running && !matching_root_fix {
+                    ctx.operation_deadline = None;
+                    reconcile_base_deploy(ctx, lane, key, repo, base, &sha, age, &mut live, &required, 0)?;
+                    if pass_merged > 0 && sha == tip_sha && live.verdict == MainVerdict::Red {
+                        ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": sha, "checks": runs }))?;
+                        return Ok(());
+                    }
+                    log(Some(key), "Main has not passed its current checks; stopping further merges");
+                    break 'batch;
+                }
+                // Batch selection belongs to the exact starting tip and any
+                // prefix this executor landed. An unrelated advance needs a new
+                // scan; it does not require rewriting independently green heads.
+                if sha != *expected_tip {
+                    ctx.operation_deadline = None;
+                    log(Some(key), "Main changed outside the selected batch; rescan against the new tip");
+                    break 'batch;
+                }
+                landing_red = live.red.iter().map(|r| r.name.clone()).collect();
+                landing_base = if own_batch_still_running { MainVerdict::Green } else { live.verdict };
             }
-            // Batch selection belongs to the exact starting tip and any
-            // prefix this executor landed. An unrelated advance needs a new
-            // scan; it does not require rewriting independently green heads.
-            if sha != *expected_tip {
+            let ready = candidate_ready_to_land(ctx, repo, base, cand, landing_base, &landing_red);
+            let Ok(BatchCandidateReadiness::Recomputing(reason)) = &ready else { break ready; };
+            if !exact_own_prefix { break ready; }
+            let Some(delay) = recheck_delays.next() else { break ready; };
+            if !ctx.operation_budget(Duration::from_secs(60)).is_ok_and(|remaining| remaining > delay) {
+                break ready;
+            }
+            log(Some(key), &format!("PR #{pr}: {reason}; rechecking in {}s", delay.as_secs()));
+            std::thread::sleep(delay);
+            if !renew_lease(ctx, repo, base) {
                 ctx.operation_deadline = None;
-                log(Some(key), "Main changed outside the selected batch; rescan against the new tip");
+                return Err("Cannot renew permission during candidate recheck; no further writes".into());
+            }
+            // Repeat the live base and candidate guards after each wait.
+            waited_for_mergeability = true;
+        };
+        if waited_for_mergeability && matches!(&ready, Ok(BatchCandidateReadiness::Ready)) {
+            let (live_tip, _) = ctx.base_tip_facts(repo, base)?;
+            if live_tip != *expected_tip {
+                ctx.operation_deadline = None;
+                log(Some(key), "Main changed outside the selected batch during candidate recheck; rescan against the new tip");
                 break;
             }
-            landing_red = live.red.iter().map(|r| r.name.clone()).collect();
-            landing_base = if own_batch_still_running { MainVerdict::Green } else { live.verdict };
         }
-        let ready = candidate_ready_to_land(ctx, repo, base, cand, landing_base, &landing_red);
         ctx.operation_deadline = None;
         match ready {
-            Ok(true) => {},
-            Ok(false) => {
-                log(Some(key), &format!("PR #{pr}: its review or checks changed; leaving it for a fresh check and continuing other changes"));
+            Ok(BatchCandidateReadiness::Ready) => {},
+            Ok(BatchCandidateReadiness::Deferred(reason) | BatchCandidateReadiness::Recomputing(reason)) => {
+                log(Some(key), &format!("PR #{pr}: {} — leaving it for a fresh check and continuing other changes", trunc(&reason, 240)));
                 continue;
             }
             Err(error) => {
@@ -3800,13 +3874,19 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // tip's fed checks — RED stops the line immediately (GH#2261 law);
         // pending/green keeps landing (destination-green is the settle's).
         if pass_merged > 0 && !tip_sha.is_empty() {
-            let tip_runs = ctx.check_runs(repo, &tip_sha);
+            let tip_checks = ctx.read_check_runs(repo, &tip_sha);
+            let complete = matches!(&tip_checks, CheckRunRead::Complete(_));
+            let tip_runs = tip_checks.into_runs();
             if classify_base_check_runs(&tip_runs, &required).verdict == MainVerdict::Red {
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_ci", json!({ "repo": repo, "base": base, "sha": tip_sha, "checks": tip_runs }))?;
                 ctx.note(&format!("batch drain: pass tip {} RED — stop fed (GH#2261)", &tip_sha[..tip_sha.len().min(9)]));
                 log(Some(key), &format!("batch drain: pass tip {} went RED — stop-the-line fed, batch aborted", &tip_sha[..tip_sha.len().min(9)]));
                 return Ok(());
+            }
+            if !complete {
+                log(Some(key), "GitHub did not return complete batch tip checks; stopping further merges");
+                break;
             }
         }
         if !renew_lease(ctx, repo, base) { return Err("Cannot renew permission immediately before merging; no further writes".into()); }
@@ -7046,9 +7126,15 @@ mod tests {
 
     #[test]
     fn reviewed_independent_heads_batch_without_rewrites_and_fence_main_changes() {
+        use std::sync::atomic::AtomicUsize;
+
         for scenario in ["batch-green", "batch-red", "batch-external-advance", "batch-own-checks-starting",
-            "batch-own-checks-unreadable", "batch-own-workflows-unreadable", "batch-starting-base-empty"] {
+            "batch-own-checks-unreadable", "batch-own-workflows-unreadable", "batch-starting-base-empty",
+            "batch-recompute-recovers", "batch-recompute-never", "batch-recompute-head-changed",
+            "batch-recompute-foreign-tip", "batch-recompute-read-error", "batch-recompute-red-check",
+            "batch-recompute-incomplete-checks", "batch-recompute-red-tip"] {
             let red_after_first = scenario == "batch-red";
+            let red_during_recompute = scenario == "batch-recompute-red-tip";
             let external_advance = scenario == "batch-external-advance";
             let repo = Repo::new(scenario);
             let first = repo.side_commit("first", "first reviewed change");
@@ -7066,24 +7152,38 @@ mod tests {
             repo.git(&["commit", "-qm", "independent second change tested on the same base"]);
             let second = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
+            repo.git(&["checkout", "-qb", "third", &base]);
+            std::fs::write(repo.dir.join("third.txt"), "third reviewed change\n").unwrap();
+            repo.git(&["add", "third.txt"]);
+            repo.git(&["commit", "-qm", "independent third reviewed change"]);
+            let third = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["push", "-q", "origin", "HEAD:refs/pull/3/head"]);
             repo.git(&["checkout", "-q", "main"]);
             repo.git(&["merge", "--no-ff", "-qm", "first merge", "first"]);
             let first_merge = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["merge", "--no-ff", "-qm", "second merge", "second"]);
             let second_merge = repo.git(&["rev-parse", "HEAD"]);
+            repo.git(&["merge", "--no-ff", "-qm", "third merge", "third"]);
+            let third_merge = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["reset", "--hard", &base]);
             repo.git(&["commit", "--allow-empty", "-qm", "unrelated main advance during selection"]);
             let unrelated_tip = repo.git(&["rev-parse", "HEAD"]);
             repo.git(&["reset", "--hard", &base]);
-            let heads = [first, second];
+            let heads = [first, second, third];
+            let merge_shas = [first_merge, second_merge, third_merge];
+            let queue = (1..=3).map(|i| json!({"id":format!("BR#{i}")})).collect::<Vec<_>>();
+            let queue_c = queue.clone();
             let cards = heads.iter().enumerate().map(|(i, head)| json!({"id":format!("BR#{}",i+1),"status":"blocked","meta":{
                 "prs":[{"repo":"o/r","number":i+1,"head_sha_at_acceptance":head}],"merge_train":{"state":"queued","pr":i+1}
             }})).collect::<Vec<_>>();
             let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
-                "get_artefact" => Ok(cards[if call_args(params)["id"] == "BR#1" {0} else {1}].clone()),
+                "get_artefact" => {
+                    let i = call_args(params)["id"].as_str().unwrap().trim_start_matches("BR#").parse::<usize>().unwrap() - 1;
+                    Ok(cards[i].clone())
+                },
                 "train_history" => Ok(json!({"events":[]})),
-                "train_status" => Ok(json!({"lanes":[{"lane":"o/r@main","queue":[{"id":"BR#1"},{"id":"BR#2"}]}]})),
-                "train_ci" => Ok(json!({"decided":if red_after_first {"stopped"} else {"pending"}})),
+                "train_status" => Ok(json!({"lanes":[{"lane":"o/r@main","queue":queue_c}]})),
+                "train_ci" => Ok(json!({"decided":if red_after_first || red_during_recompute {"stopped"} else {"pending"}})),
                 "train_lease" | "train_queue_facts" | "train_event" => Ok(json!({})),
                 other => panic!("unexpected hub command {other}"),
             });
@@ -7091,7 +7191,8 @@ mod tests {
             let landed_c = landed.clone();
             let starting_base = base.clone();
             let current_base = Mutex::new(base);
-            let base_reads = std::sync::atomic::AtomicUsize::new(0);
+            let base_reads = AtomicUsize::new(0);
+            let post_merge_reads: [AtomicUsize; 3] = std::array::from_fn(|_| AtomicUsize::new(0));
             let dir = repo.dir.clone();
             let mut ctx = test_ctx(&hub);
             ctx.workdir = repo.dir.to_string_lossy().to_string();
@@ -7100,7 +7201,7 @@ mod tests {
                 if cmd != "gh" { return None; }
                 if args.first() == Some(&"pr") {
                     let i = args[2].parse::<usize>().unwrap()-1;
-                    let merge_sha = if i == 0 { &first_merge } else { &second_merge };
+                    let merge_sha = &merge_shas[i];
                     if args[1] == "merge" {
                         assert!(args.contains(&"--match-head-commit") && args.contains(&heads[i].as_str()));
                         assert!(!args.contains(&"--admin"));
@@ -7109,7 +7210,22 @@ mod tests {
                         *current_base.lock().unwrap() = merge_sha.clone();
                         return Some(Ok(String::new()));
                     }
-                    let done = landed_c.lock().unwrap().contains(&(i+1));
+                    let landed = landed_c.lock().unwrap();
+                    let done = landed.contains(&(i+1));
+                    if scenario.starts_with("batch-recompute-") && !done && !landed.is_empty() {
+                        let read = post_merge_reads[i].fetch_add(1, Ordering::SeqCst);
+                        if read == 0 || scenario == "batch-recompute-never" {
+                            return Some(Ok(json!({"state":"OPEN","headRefOid":heads[i],
+                                "mergeable":null,"mergeStateStatus":"UNKNOWN"}).to_string()));
+                        }
+                        if scenario == "batch-recompute-head-changed" {
+                            return Some(Ok(json!({"state":"OPEN","headRefOid":"a".repeat(40),
+                                "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}).to_string()));
+                        }
+                        if scenario == "batch-recompute-read-error" {
+                            return Some(Err("GitHub PR read timed out".into()));
+                        }
+                    }
                     return Some(Ok(json!({"state":if done {"MERGED"} else {"OPEN"},"headRefOid":heads[i],
                         "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","mergeCommit":if done {json!({"oid":merge_sha})} else {Value::Null}}).to_string()));
                 }
@@ -7122,12 +7238,13 @@ mod tests {
                 }
                 assert!(!endpoint.ends_with("/update-branch"), "the batch must not rewrite an accepted head");
                 if endpoint.ends_with("/commits/main") {
-                    let moved = external_advance && base_reads.fetch_add(1, Ordering::SeqCst) > 0;
+                    let moved = (external_advance && base_reads.fetch_add(1, Ordering::SeqCst) > 0)
+                        || (scenario == "batch-recompute-foreign-tip" && post_merge_reads[1].load(Ordering::SeqCst) > 0);
                     let live_base = if moved { unrelated_tip.clone() } else { current_base.lock().unwrap().clone() };
                     return Some(Ok(json!({"sha":live_base,"committed_at":crate::logging::iso(now_ms())}).to_string()));
                 }
                 if endpoint.contains("/check-runs?") {
-                    if endpoint.contains(&first_merge) {
+                    if endpoint.contains(&merge_shas[0]) {
                         match scenario {
                             "batch-own-checks-starting" | "batch-own-workflows-unreadable" =>
                                 return Some(Ok(json!([{"id":2,"name":"Reasoning path scope","status":"queued","conclusion":null}]).to_string())),
@@ -7138,24 +7255,38 @@ mod tests {
                     if scenario == "batch-starting-base-empty" && endpoint.contains(&starting_base) {
                         return Some(Ok("[]".into()));
                     }
-                    let red = red_after_first && endpoint.contains(&first_merge);
+                    let red_tip = endpoint.contains(&merge_shas[0])
+                        && (red_after_first || (red_during_recompute && post_merge_reads[1].load(Ordering::SeqCst) > 0));
+                    let red_head = scenario == "batch-recompute-red-check" && heads.iter().enumerate().any(|(i, head)| {
+                        endpoint.contains(head) && post_merge_reads[i].load(Ordering::SeqCst) >= 2
+                    });
+                    let red = red_tip || red_head;
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") {
-                    if scenario == "batch-own-workflows-unreadable" && endpoint.contains(&first_merge) {
+                    if (scenario == "batch-own-workflows-unreadable" && endpoint.contains(&merge_shas[0]))
+                        || (scenario == "batch-recompute-incomplete-checks" && heads.iter().enumerate().any(|(i, head)| {
+                            endpoint.contains(head) && post_merge_reads[i].load(Ordering::SeqCst) >= 2
+                        })) {
                         return Some(Err("GitHub workflow read timed out".into()));
                     }
                     return Some(Ok("[]".into()));
                 }
-                if endpoint.ends_with("/commits") { return Some(Ok(signature_fixture(args, json!([{"sha": if endpoint.contains("/pulls/1/") { &heads[0] } else { &heads[1] }, "verified":true}])))); }
+                if let Some(pr) = endpoint.strip_prefix("repos/o/r/pulls/").and_then(|path| path.strip_suffix("/commits")) {
+                    let i = pr.parse::<usize>().unwrap() - 1;
+                    return Some(Ok(signature_fixture(args, json!([{"sha":heads[i],"verified":true}]))));
+                }
                 panic!("unexpected gh command {args:?}");
             }));
-            drive_lane_inner(&mut ctx, &json!({"queue":[{"id":"BR#1"},{"id":"BR#2"}],"required_workflows":["Test"]}),
+            drive_lane_inner(&mut ctx, &json!({"queue":queue,"required_workflows":["Test"]}),
                 "o/r@main","o/r","main",60_000,10).unwrap();
             let expected = match scenario {
                 "batch-external-advance" | "batch-starting-base-empty" => vec![],
-                "batch-red" | "batch-own-checks-unreadable" | "batch-own-workflows-unreadable" => vec![1],
-                _ => vec![1, 2],
+                "batch-red" | "batch-own-checks-unreadable" | "batch-own-workflows-unreadable"
+                | "batch-recompute-never" | "batch-recompute-head-changed" | "batch-recompute-foreign-tip"
+                | "batch-recompute-read-error" | "batch-recompute-red-check" | "batch-recompute-incomplete-checks"
+                | "batch-recompute-red-tip" => vec![1],
+                _ => vec![1, 2, 3],
             };
             assert_eq!(*landed.lock().unwrap(), expected, "{scenario}");
             let calls = calls.lock().unwrap();

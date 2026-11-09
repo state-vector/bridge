@@ -2139,6 +2139,10 @@ main landed nothing. Two laws close the class:
   success still rides the full merged-event path (provenance stamp, awaiting-CI
   settle) — nothing is waved through.
 
+After a merge in a batch, the gateway briefly rechecks GitHub mergeability
+when the provider is still computing it. Before it lands another member, it
+checks the same reviewed head, the current batch tip, signatures and CI again.
+
 ### The root-fix fast lane (BR#5190, steering BR#5189)
 
 Each failing main head gets a repair card tied to its exact commit. Repeat
