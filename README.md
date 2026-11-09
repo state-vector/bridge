@@ -1854,7 +1854,7 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
 - **The substance**: the block judges main's HEAD; it never judged the PR's own head — the
   hole #174 sailed through (merged with `Test` + `CLI build (packages/cli)` FAILURE on its
   head while main was green; main went red and the #211 hotfix followed). The ruleset
-  (`main: main-green gate + substance checks required`, now substance-only) still
+  (`main: substance checks required`) still
   requires `Test` and `CLI build (packages/cli)` green on the PR's own head, with
   `strict_required_status_checks_policy` on: the checks must come from the latest head, so
   a stale green never counts. A red-head PR cannot merge even while main is green — the
