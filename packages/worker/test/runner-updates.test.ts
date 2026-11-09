@@ -26,6 +26,7 @@ describe("runner update publication authority", () => {
 describe("real update-channel durable object", () => {
   it("publishes only verified builds, persists the manifest and rejects replay/downgrade", async () => {
     const sha = "a".repeat(40);
+    const quotaReset = Math.floor(Date.now() / 1000) + 1800;
     const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
     const mf = new Miniflare({ port: 0, workers: [{ name: "updates", scriptPath: bundle, modules: true,
       modulesRoot: bundle.slice(0, bundle.lastIndexOf("/")), compatibilityDate: "2025-09-06",
@@ -33,7 +34,13 @@ describe("real update-channel durable object", () => {
       outboundService: async request => {
         const url = new URL(request.url);
         if (url.hostname === "api.github.com") {
-          if (request.headers.get("authorization") !== "Bearer short-lived-job-token") return new Response("rate limited", { status: 403, headers: { "x-ratelimit-remaining": "0" } });
+          const auth = request.headers.get("authorization");
+          if (auth !== "Bearer short-lived-job-token") return new Response("private upstream message", {
+            status: 403, headers: {
+              "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(quotaReset),
+              ...(auth === "Bearer reset-only" ? {} : { "retry-after": "2000" }),
+            },
+          });
           const ci = url.pathname.endsWith("/10");
           return Response.json({ repository: { full_name: "state-vector/bridge" }, head_sha: sha, head_branch: "main", event: "push",
             status: "completed", conclusion: "success", path: `.github/workflows/${ci ? "ci.yml" : "dev-build.yml"}` });
@@ -46,6 +53,27 @@ describe("real update-channel durable object", () => {
     try {
       const ns = await mf.getDurableObjectNamespace("RUNNER_UPDATES");
       const stub = ns.get(ns.idFromName("channels")) as unknown as { fetch(input: string, init?: RequestInit): Promise<Response> };
+      const quotaProbe = ns.get(ns.idFromName("quota-probe")) as unknown as typeof stub;
+      const sendQuotaProbe = () => quotaProbe.fetch("https://updates/publish", {
+        method: "POST", body: JSON.stringify({ channel: "main", commit: sha, ci_run: 10, build_run: 11 }),
+      });
+      const limited = await sendQuotaProbe();
+      expect(limited.status).toBe(503);
+      expect(limited.headers.get("retry-after")).toBe("2000");
+      expect(await limited.json()).toEqual({ error: "publication temporarily unavailable", stage: "verify_ci", upstream_status: 403, rate_reset_at: quotaReset });
+      const throttled = await sendQuotaProbe();
+      expect(throttled.status).toBe(429);
+      expect(Number(throttled.headers.get("retry-after"))).toBeGreaterThan(0);
+      expect(await throttled.json()).toEqual({ error: "publication temporarily unavailable", stage: "publication_rate" });
+      const resetProbe = ns.get(ns.idFromName("reset-probe")) as unknown as typeof stub;
+      const resetOnly = await resetProbe.fetch("https://updates/publish", {
+        method: "POST", headers: { authorization: "Bearer reset-only" },
+        body: JSON.stringify({ channel: "main", commit: sha, ci_run: 10, build_run: 11 }),
+      });
+      expect(resetOnly.status).toBe(503);
+      const waitForReset = Number(resetOnly.headers.get("retry-after"));
+      expect(waitForReset).toBeGreaterThan(1700);
+      expect(waitForReset).toBeLessThanOrEqual(1800);
       const publish = (ci_run: number) => stub.fetch("https://updates/publish", { method: "POST", headers: { authorization: "Bearer short-lived-job-token" }, body: JSON.stringify({ channel: "main", commit: sha, ci_run, build_run: 11 }) });
       expect((await stub.fetch("https://updates/manifest?channel=main")).status).toBe(404);
       const result = await publish(10);

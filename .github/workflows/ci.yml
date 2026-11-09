@@ -20,6 +20,7 @@ jobs:
       - name: Worker unit tests (kb core) + contracts + webapp build + specs gate
         run: |
           python3 -m unittest discover -s packages/cli/updater -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_promote_runner.py'
           node --test scripts/tests/diagnose-hub.test.mjs
           npm run test:deploy-drift-alarm
           npm run test:main-green-gate
