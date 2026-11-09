@@ -394,8 +394,13 @@ impl RunControl {
     pub fn lease_valid(&self) -> bool {
         self.lease_deadline.lock().map(|d| d.map(|until| Instant::now() < until).unwrap_or(false)).unwrap_or(false)
     }
-    pub fn grant_lease(&self) {
-        if let Ok(mut deadline) = self.lease_deadline.lock() { *deadline = Some(Instant::now() + Duration::from_secs(90)); }
+    pub fn grant_lease_from(&self, requested_at: Instant) {
+        // A replay can return the lease from the first delivery of the RPC.
+        // Anchor the local deadline to that request, never its late receipt.
+        let proved_until = requested_at + Duration::from_secs(90);
+        if let Ok(mut deadline) = self.lease_deadline.lock() {
+            *deadline = Some(deadline.map_or(proved_until, |current| current.max(proved_until)));
+        }
     }
     fn should_stop(&self) -> bool {
         // Local monotonic enforcement keeps working while the gateway tick is
@@ -499,7 +504,7 @@ fn spawn_agent(cmd: &mut Command, control: Option<&Arc<RunControl>>) -> std::io:
 #[test]
 fn all_agent_transports_apply_the_owned_disk_environment_at_the_spawn_boundary() {
     let control = Arc::new(RunControl::default().with_environment(vec![("TMPDIR".into(), "/owned/task/tmp".into()), ("CARGO_TARGET_DIR".into(), "/owned/task/cache/cargo".into())]));
-    control.grant_lease();
+    control.grant_lease_from(Instant::now());
     let mut command = Command::new("/bin/sh");
     command.args(["-c", "printf '%s' \"$TMPDIR|$CARGO_TARGET_DIR\""]).stdout(Stdio::piped());
     let child = spawn_agent(&mut command, Some(&control)).unwrap();
@@ -560,7 +565,7 @@ pub struct OpencodeRun;
 #[test]
 fn local_monotonic_lease_fences_a_writer_while_gateway_tick_is_stalled() {
     let control = RunControl::default();
-    control.grant_lease();
+    control.grant_lease_from(Instant::now());
     assert!(!control.should_stop());
     *control.lease_deadline.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
     assert!(control.should_stop());
@@ -1217,6 +1222,21 @@ pub fn transport_for(backend: crate::opencode::Backend, mode: Option<&str>) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replayed_renewal_cannot_extend_an_expired_local_lease() {
+        let control = RunControl::with_cancel(None);
+        let requested_at = Instant::now() - Duration::from_secs(91);
+        control.grant_lease_from(requested_at);
+        assert!(!control.lease_valid());
+
+        let fresh_request = Instant::now();
+        control.grant_lease_from(fresh_request);
+        control.grant_lease_from(requested_at);
+        assert_eq!(*control.lease_deadline.lock().unwrap(), Some(fresh_request + Duration::from_secs(90)));
+        assert!(control.lease_valid());
+    }
+
 
     // The hermes incident (2026-10-22): a frame shape the extractor didn't
     // match read as a DEAD session — no live line, no session_alive vouches,

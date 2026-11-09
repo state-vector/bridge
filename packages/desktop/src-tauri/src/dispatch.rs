@@ -722,16 +722,19 @@ fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::
     let kind = command.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
     let mut id = 0;
+    // Renewal already has a periodic retry and an independently enforced
+    // local deadline. One normal-budget poll keeps worker shutdown bounded.
+    let attempts = if kind == "poll" { 1 } else { 3 };
     let args = json!({ "id": tid, "command_id": format!("{kind}-{}-{nonce}", std::process::id()), "command": command });
-    for retry in 0..3 {
+    for retry in 0..attempts {
         let result = match session {
             Some(session) => mcp_call_session(cfg, &mut id, "execution", args.clone(), Some(session)),
             None => mcp_call_task(cfg, &mut id, "execution", args.clone(), tid),
         };
         match result {
             Ok(result) => return Ok(result),
-            Err(e) if retry < 2 && retryable_execution_error(&e) => {
-                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/3 with the same command_id", retry + 2));
+            Err(e) if retry + 1 < attempts && retryable_execution_error(&e) => {
+                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/{attempts} with the same command_id", retry + 2));
                 std::thread::sleep(Duration::from_millis(250 * (retry + 1)));
             }
             Err(e) => return Err(e), // named semantic gates are terminal
@@ -867,12 +870,13 @@ impl ExecutionRuntime {
         let mut last_report = Instant::now();
         self.maintenance = Some(Arc::new(LeaseMaintenance::start(interval, move || {
             if control.stop.load(Ordering::SeqCst) || control.quiesced.load(Ordering::SeqCst) { return false; }
+            let requested_at = Instant::now();
             let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
             match state {
                 Ok(state) => {
                     if state.permits_renewal(generation, &attempt_id) {
                         if control.stop.load(Ordering::SeqCst) || control.quiesced.load(Ordering::SeqCst) { return false; }
-                        control.grant_lease();
+                        control.grant_lease_from(requested_at);
                         let line = live.lock().map(|line| line.clone()).unwrap_or_default();
                         if !line.is_empty() && line != reported && last_report.elapsed() >= Duration::from_secs(60) {
                             let _ = mcp_call_session_with_timeout(&cfg, &mut 0, "log_progress",
@@ -1883,7 +1887,7 @@ fn mcp_call(
 /// Operator control exchanges fail promptly; task/effect requests retain their
 /// existing transport budget and the same durable retry/replay contract.
 fn mcp_request_timeout(tool: &str, args: &serde_json::Value) -> Duration {
-    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise" | "stopped" | "finalize" | "cancel_start" | "poll"));
+    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise" | "stopped" | "finalize" | "cancel_start"));
     Duration::from_secs(if control { 8 } else { 30 })
 }
 
@@ -3639,6 +3643,7 @@ fn spawn_opencode(
         }
     }
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
+    let begin_requested_at = Instant::now();
     let begin = begin_with_fresh_readiness(readiness_observed, update_request().is_some(), || {
         // The tick already advertised this exact worker/config inventory. Do
         // not run every local probe + hub advertisement again for every slot.
@@ -3675,11 +3680,12 @@ fn spawn_opencode(
         return;
     }
     let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
-    execution.control.grant_lease();
+    execution.control.grant_lease_from(begin_requested_at);
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
     prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
     execution.start_maintenance(cfg, tid, live.clone());
+    let poll_requested_at = Instant::now();
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
         Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
@@ -3689,12 +3695,17 @@ fn spawn_opencode(
         let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
         if execution_call(cfg, tid, cmd).is_err() { return; }
     }
-    if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) || execution.control.stop.load(Ordering::SeqCst) || !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+    let safe_to_launch = RemoteExecution::parse(safe_point).is_ok_and(|s| {
+        s.permits_renewal(generation, &execution.attempt_id)
+            && matches!(s.attempt.map(|a| a.state), Some(RemoteAttemptState::Running))
+    });
+    if safe_to_launch { execution.control.grant_lease_from(poll_requested_at); }
+    if !safe_to_launch || !execution.control.lease_valid()
+        || cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) || execution.control.stop.load(Ordering::SeqCst) {
         execution.stop_maintenance();
         dlog(tid, "safe-point interruption before spawn; no writer launched");
         return;
     }
-    execution.control.grant_lease();
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
     } else {
@@ -4177,6 +4188,14 @@ mod tests {
         let cfg: DispatchConfig = serde_json::from_value(json!({ "url":url, "label":"control-test", "token":"fixture-only" })).unwrap();
         assert_eq!(execution_claims(&cfg, false).unwrap()["kind"], "claims_resumed");
         let ids = server.join().unwrap(); assert!(!ids[0].is_empty()); assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn lease_renewal_uses_the_normal_transport_budget() {
+        let poll = json!({"command":{"kind":"poll"}});
+        let pause = json!({"command":{"kind":"pause_claims"}});
+        assert_eq!(mcp_request_timeout("execution", &poll), Duration::from_secs(30));
+        assert_eq!(mcp_request_timeout("execution", &pause), Duration::from_secs(8));
     }
 
     #[test]

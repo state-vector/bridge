@@ -362,13 +362,11 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     // Inspect cannot extend a lease. Renew through the original exact fence
     // before granting a fresh local monotonic deadline; retry the SAME command
     // if its response is lost. No begin/new generation is issued on adoption.
-    let mut renewed = Err("worker lease renewal unavailable".to_string());
-    for _ in 0..3 {
-        renewed = execution_request(&spec.cfg, &ticket.task_id, &ticket.session, &spec.record().command_id("worker-start-poll"), json!({"kind":"poll","generation":generation,"attempt_id":attempt_id}));
-        if renewed.as_ref().err().is_none_or(|error| !retryable_execution_error(error)) { break; }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let state = match renewed { Ok(state) => state, Err(error) => return unlaunched(&spec, error) };
+    let poll_requested_at = Instant::now();
+    let state = match execution_request(&spec.cfg, &ticket.task_id, &ticket.session, &spec.record().command_id("worker-start-poll"), json!({"kind":"poll","generation":generation,"attempt_id":attempt_id})) {
+        Ok(state) => state,
+        Err(error) => return unlaunched(&spec, error),
+    };
     if let Err(error) = RemoteExecution::parse(state.clone()) { return unlaunched(&spec, error); }
     let a = &state["attempt"];
     if a["generation"] != *generation || a["attempt_id"] != *attempt_id || a["host"] != *host || a["session"] != ticket.session || a["phase"] != "running" || a["lease_until"].as_u64().unwrap_or(0) < now_ms().saturating_add(90_000) { return unlaunched(&spec, "gate: worker no longer owns its live exact execution fence".into()); }
@@ -376,7 +374,10 @@ fn execute_every(spec: Spec, lease_interval: Duration) -> Result<(), String> {
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(ticket.task_id.clone(), (*generation, attempt_id.clone()));
     let control = match gateway_pipeline::arm_launch(&spec.cfg, &ticket.task_id, *generation, attempt_id, spec.worktree.clone(), None, gateway_pipeline::LaunchStage::MayHaveLaunched) { Ok(control) => control, Err(error) => return unlaunched(&spec, error) };
     let mut runtime = ExecutionRuntime { generation: *generation, attempt_id: attempt_id.clone(), control: Arc::new(control), maintenance: None };
-    runtime.control.grant_lease();
+    runtime.control.grant_lease_from(poll_requested_at);
+    if !runtime.control.lease_valid() {
+        return unlaunched(&spec, "Worker startup reply arrived after the safe local lease window".into());
+    }
     let live = Arc::new(Mutex::new(String::new())); runtime.start_maintenance_every(&spec.cfg, &ticket.task_id, live.clone(), lease_interval);
     let published = live.clone(); let stop = runtime.control.clone(); let owner = spec.owner.clone(); let status_root = root.clone();
     let output_path = workspace::Owner::open(&spec.cfg)?.output_path(ticket)?.unwrap_or_else(|| root.join("output.jsonl"));
