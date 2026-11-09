@@ -520,8 +520,13 @@ else:
                     self.assertEqual(hardware["actions"],["stop","start"])
                     self.assertTrue(hardware["crashed"])
                     self.assertNotEqual(hardware["process"].pid,original_pid)
-                    before=int(output.read_text());time.sleep(.03)
-                    self.assertIsNone(worker.poll());self.assertGreater(int(output.read_text()),before)
+                    before = int(output.read_text())
+                    worker_deadline = time.monotonic() + 2
+                    while int(output.read_text()) <= before:
+                        self.assertIsNone(worker.poll(), "independent worker exited during update")
+                        self.assertLess(time.monotonic(), worker_deadline, "independent worker stopped producing output")
+                        time.sleep(.01)
+                    self.assertIsNone(worker.poll())
                     self.assertFalse(u.request.exists());self.assertEqual(u.build(binary),NEW)
             finally:
                 for p in [hardware["process"],worker]:
