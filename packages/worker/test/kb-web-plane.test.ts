@@ -527,6 +527,6 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
   });
 
   it("the lane status pill consumes only the typed line projection", () => {
-    expect(trainPanelSrc).toContain('tone={tones[line.phase]} title={line.reason}>{line.label}');
+    expect(trainPanelSrc).toContain('tone={trainLineTones[line.phase]} title={line.reason}>{line.label}');
   });
 });
