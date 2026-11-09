@@ -103,6 +103,8 @@ export function normalizePr(raw: unknown): ReconcilePr | null {
 export interface ReconcileBinding {
   /** Observed executable progress; status alone is never progress. */
   progress?: "queued" | "repairing" | "verifying" | "held" | "stranded";
+  /** An independent reviewer accepted the current recovery duty's outcome. */
+  repairAccepted?: boolean;
   card: string;
   status: string;
   pr: number;
@@ -161,6 +163,7 @@ export type ReconcileDecision =
   | { action: "inflight"; duty_id: string; via: "duty" | "verify-children" }
   | { action: "ignored" }
   | { action: "spawn_verify"; card: string | null }
+  | { action: "verify_repaired"; card: string }
   | { action: "spawn_disposition" }
   /** Destination-blocked approved PR (base red/behind): bind it so it is
    *  visible; the verify duty comes when a later cycle sees it mergeable. */
@@ -345,6 +348,21 @@ export function reconcileJoin(args: {
     const b = bindings.get(p.number);
     if (b) {
       if (b.progress) acc[b.progress]++;
+      // A verified recovery owes the bound PR a fresh review at its live head.
+      // GitHub may have dismissed the old approval when the branch changed.
+      if (b.repairAccepted && b.progress === "stranded" && !b.lane && !b.queued && b.open_verify_children === 0
+        && b.status === "todo" && !p.isDraft && !changesRequested && p.headRefOid
+        && p.mergeable === "MERGEABLE" && ["CLEAN", "UNSTABLE"].includes(p.mergeStateStatus ?? "")) {
+        acc.accounted++;
+        if (hasDuty(dutiesByPr, p.number, "verify")) {
+          acc.bound++;
+          judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: "a review duty already owns this repaired head" });
+        } else {
+          acc.spawned++;
+          judgements.push({ pr: p.number, decision: { action: "verify_repaired", card: b.card }, reason: "independently accepted repair needs a fresh review at the live PR head" });
+        }
+        continue;
+      }
       if (b.progress === "stranded" && age > cfg.disposition_age_ms && !b.lane) {
         acc.unaccounted++;
         judgements.push({ pr: p.number, decision: { action: "repair_binding", card: b.card, reason: conflicting ? "conflict" : "queue_binding" }, reason: "binding has no live owner/action or bounded hold — existing recovery must restore executable delivery" });

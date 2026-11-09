@@ -98,6 +98,23 @@ describe("all-open delivery progress", () => {
     }
   });
 
+  it("requests one independent review for an accepted repair without relying on stale GitHub approval", () => {
+    const repaired = binding(99, { status: "todo", progress: "stranded", repairAccepted: true });
+    const observed = pr(99, { reviewDecision: null, mergeStateStatus: "UNSTABLE", updatedAt: iso(50) });
+    const initial = join({ prs: [observed], bindings: [repaired] });
+    expect(initial.judgements[0].decision).toEqual({ action: "verify_repaired", card: repaired.card });
+    for (const changes of [
+      { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" },
+      { isDraft: true },
+      { reviewDecision: "CHANGES_REQUESTED" },
+      { headRefOid: null },
+    ]) {
+      expect(join({ prs: [{ ...observed, ...changes }], bindings: [repaired] }).judgements[0].decision.action).not.toBe("verify_repaired");
+    }
+    expect(join({ prs: [observed], bindings: [repaired], duties: [duty(99)] }).judgements[0].decision.action).not.toBe("verify_repaired");
+    expect(join({ prs: [observed], bindings: [{ ...repaired, open_verify_children: 1 }] }).judgements[0].decision.action).not.toBe("verify_repaired");
+  });
+
   it("an existing card with no executable action is stranded, not accounted", () => {
     const r = join({ prs: [pr(99, { updatedAt: iso(50), mergeable: "CONFLICTING" })], bindings: [binding(99, { progress: "stranded" })] });
     expect(r.accounting.stranded).toBe(1);

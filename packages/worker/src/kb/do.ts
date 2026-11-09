@@ -17237,6 +17237,26 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  can never double-spawn one PR's verify. Returns the duty card id, or
    *  null when the ledger already holds this PR's verify (one per PR ever —
    *  a dead one alarms, not respawns). */
+  private acceptedQueueRepair(parent: { id: string; status: string; meta: string }, repo: string, pr: number): boolean {
+    if (parent.status !== "todo") return false;
+    const meta = JSON.parse(parent.meta ?? "{}");
+    const stamp = meta.merge_train;
+    const wait = meta.blocked?.await_event;
+    const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
+    if (!mergeCompletesTask(meta) || stamp?.state !== "bounced" || stamp.repo !== repo || Number(stamp.pr) !== pr
+      || (wait && (wait.event !== "pr_merged" || wait.repo !== repo || Number(wait.n) !== pr))
+      || (hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > Date.now())
+      || meta.awaiting_ask || this.staleReviewHasExecutionHold(parent.id, meta)) return false;
+    const duty = meta.recovery?.task_id && this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, String(meta.recovery.task_id));
+    if (duty?.status !== "done" || !this.one(`SELECT 1 FROM artefact_versions WHERE artefact_id=? AND actor='system:recovery'
+      AND action='recovery_scheduled' AND json_extract(data,'$.duty')=?
+      AND json_extract(data,'$.reason') IN ('queue_binding','conflict') LIMIT 1`, parent.id, duty.id)) return false;
+    const dm = JSON.parse(String(duty.meta ?? "{}"));
+    const review = this.currentTaskReview(String(duty.id));
+    return review.phase === "accepted" && review.result.kind === "accepted_execution" && review.result.task_id === duty.id
+      && review.subject.task_id === duty.id && review.subject.revision === (dm.work_revision ?? "legacy");
+  }
+
   private async reconcileSpawnVerify(repo: string, pr: number, parentId: string, actor: string, now: number): Promise<string | null> {
     if (!this.reconcileClaimDuty(repo, pr, "verify", now)) return null;
     const parent = this.one(`SELECT id, title, meta, tags FROM artefacts WHERE id = ?`, parentId) as any;
@@ -17249,10 +17269,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const parentIsRootFix =
       isRootFixCard({ tags: parseTags(parent.tags), meta: pm }) &&
       typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
-    const prLink: string =
-      typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
-        ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
-        : `https://github.com/${repo}/pull/${pr}`;
+    const prLink = `https://github.com/${repo}/pull/${pr}`;
     const created = await this.create(
       {
         type: "task",
@@ -17277,32 +17294,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return created.id;
   }
 
-  /** BR#5370 — claim the duties-ledger row FIRST: the INSERT is the dedupe.
-   *  `INSERT OR IGNORE` against the (repo, pr, kind) primary key claims the
-   *  slot atomically; only the caller whose claim read-back shows its own
-   *  empty row may create the duty card. The old pass-level
-   *  SELECT-then-INSERT left a window the occurrence ledger kept falling
-   *  into: two judgements for one (repo, pr) inside a single report
-   *  (BR#5365/5366 — created_ts identical to the ms, the 5th same-ms pair;
-   *  prior: BR#4370/4371, BR#4585/4586, BR#4718/4719, BR#4927/4928) each
-   *  created a card before either ledger row existed. Returns true iff THIS
-   *  call holds the claim. An abandoned '' row (a spawn that died between
-   *  claim and settle) older than a minute is adopted — a crash must never
-   *  silence a PR's duties forever. */
+  /** Claim the review slot once, including simultaneous reports with the
+   * same clock value. A stale empty slot can be adopted after a crash. */
   private reconcileClaimDuty(repo: string, pr: number, kind: "verify" | "disposition" | "reverse", now: number): boolean {
-    this.state.storage.sql.exec(
-      `INSERT OR IGNORE INTO reconcile_duties (repo, pr, kind, duty_id, card_status, created_ts) VALUES (?, ?, ?, '', 'spawning', ?)`,
-      repo, pr, kind, now,
+    return !!this.one(
+      `INSERT INTO reconcile_duties (repo,pr,kind,duty_id,card_status,created_ts) VALUES (?,?,?,'','spawning',?)
+       ON CONFLICT(repo,pr,kind) DO UPDATE SET created_ts=excluded.created_ts
+       WHERE reconcile_duties.duty_id='' AND reconcile_duties.created_ts<?
+       RETURNING pr`, repo, pr, kind, now, now - 60_000,
     );
-    const row = this.one(
-      `SELECT duty_id, created_ts FROM reconcile_duties WHERE repo = ? AND pr = ? AND kind = ?`,
-      repo, pr, kind,
-    ) as any;
-    if (!row) return false; // unreachable absent a storage fault — fail closed
-    if (String(row.duty_id ?? "") !== "") return false; // a prior duty owns the slot
-    const claimedAt = Number(row.created_ts);
-    if (!Number.isFinite(claimedAt)) return false;
-    return claimedAt === now || now - claimedAt > 60_000;
   }
 
   /** Settle a claimed ledger row with the created duty card. */
@@ -17397,6 +17397,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
         const held = hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > now;
         bindings.push({
+          repairAccepted: !queued && !verifying && !recoveryLive && this.acceptedQueueRepair(row, repo, leg.number),
           progress: queued ? "queued" : verifying ? "verifying" : recoveryLive || (row.status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10)) ? "repairing" : held ? "held" : "stranded",
           card: String(row.id),
           status: String(row.status),
@@ -17488,6 +17489,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           );
           break;
         }
+        case "verify_repaired":
         case "spawn_verify": {
           // card given → the standard duty on the EXISTING bound card (never
           // a second card); card null → orphan: project it first, then duty.
@@ -17495,7 +17497,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           // BR#5151: never parent a duty onto a standing lane card — a duty
           // child of the lane is the foothold for the provenance mis-stamp
           // (the BR#5050 class). The join already lane-exempts; defense in depth.
-          const parentRow = parent ? (this.one(`SELECT meta, tags FROM artefacts WHERE id = ?`, parent) as any) : null;
+          const parentRow = parent ? this.one(`SELECT id,status,meta,tags FROM artefacts WHERE id = ?`, parent) : null;
+          if (a.action === "verify_repaired" && (!parentRow || !this.acceptedQueueRepair(parentRow, repo, j.pr)
+            || this.openVerifyChildren(parent) > 0 || this.currentTaskReview(parent).phase === "pending")) break;
           if (parentRow && isStandingCard(JSON.parse(parentRow.meta ?? "{}"), parseTags(parentRow.tags))) {
             this.audit(actor, "reconcile_verify_spawn_skipped_lane", parent, { pr: `${repo}#${j.pr}`, note: "standing lane card — reconcile never parents duties onto it (BR#5151)" });
             break;

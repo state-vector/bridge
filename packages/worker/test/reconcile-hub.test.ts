@@ -119,6 +119,48 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repo)).length).toBe(1);
   });
 
+  it("returns an independently verified repair to the train without a GitHub approval label", async () => {
+    const repo = "state-vector/recovered-pr";
+    const number = 2471;
+    const initialHead = "a".repeat(40);
+    const repairedHead = "b".repeat(40);
+    const parent = (await kbJson("/create", {
+      actor: "author", type: "task", title: "Restore delivery after conflict", qualified: true,
+      meta: { pr: { repo, number, head_sha_at_acceptance: initialHead }, merge_train: { state: "bounced", repo, pr: number } },
+    })).body.id;
+    const conflicted = await report(repo, [prRow(number, { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(90) })]);
+    const repair = conflicted.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(repair).toBeTruthy();
+    const transition = (id: string, to: string, actor: string, fields: object = {}) => kbJson("/transition", { id, to, actor, session: actor, ...fields });
+    expect((await transition(repair, "in_progress", "repairer")).status).toBe(200);
+    const submitted = await transition(repair, "in_review", "repairer", { execution_result: { outcome: "Repaired and tested the PR", receipts: ["GitHub head readback"] } });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    const repairReview = submitted.body.verify_task;
+    expect(repairReview).toBeTruthy();
+    const repairClaim = await transition(repairReview, "in_progress", "outcome-reviewer");
+    const outcome = await transition(repairReview, "done", "outcome-reviewer", { review_result: {
+      kind: "accepted_execution", task_id: repair, subject_revision: repairClaim.body.review_subject.revision, receipts: ["Verified GitHub repair outcome"],
+    } });
+    expect(outcome.status, JSON.stringify(outcome.body)).toBe(200);
+    expect((await kbJson("/get", { id: repair })).body.status).toBe("done");
+
+    const observation = prRow(number, { headRefOid: repairedHead, reviewDecision: null, mergeStateStatus: "UNSTABLE" });
+    const reports = await Promise.all([report(repo, [observation]), report(repo, [observation])]);
+    const reviews = reports.flatMap(r => r.body.spawned.filter((x: { action: string; duty?: string }) => x.action === "verify" && x.duty));
+    expect(reviews).toHaveLength(1);
+    const review = reviews[0].duty;
+    const claim = await transition(review, "in_progress", "pr-reviewer");
+    expect(claim.body.review_subject.task_id).toBe(parent);
+    const verdict = await transition(review, "done", "pr-reviewer", { review_result: {
+      kind: "accepted_pr", task_id: parent, subject_revision: claim.body.review_subject.revision,
+      legs: [{ repo, number, head_sha_at_acceptance: repairedHead }],
+    } });
+    expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
+    const lane = (await kbJson("/train.status", { repo })).body.lanes.find((l: { lane: string }) => l.lane === repo + "@main");
+    expect(lane.queue).toEqual(expect.arrayContaining([expect.objectContaining({ id: parent, pr: number })]));
+    expect((await kbJson("/get", { id: parent })).body.meta.pr.head_sha_at_acceptance).toBe(repairedHead);
+  });
+
   it("destination-blocked binds WITHOUT a verify duty; a later CLEAN cycle spawns the verify on the SAME card", async () => {
     const repo = "state-vector/reconcile-drill-b";
     const r1 = await report(repo, [prRow(2402, { mergeStateStatus: "BLOCKED" })]);
