@@ -3934,6 +3934,48 @@ describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-dedup" });
   });
 
+  it("reuses settled evidence for a separately reviewed exact-head card without touching newer settlement", async () => {
+    const repo = "state-vector/receipt-reuse-drill";
+    const head = "b".repeat(40);
+    const merge = "d".repeat(40);
+    const prior = await queueViaAccept({ repo, pr: 428, head });
+    const later = await queueViaAccept({ repo, pr: 428, head });
+    const stale = await queueViaAccept({ repo, pr: 428, head: "a".repeat(40) });
+    const needsRepair = await queueViaAccept({ repo, pr: 428, head });
+    const child = await kbJson("/create", { type: "task", title: "Open receipt-reuse child", session: "" });
+    await kbJson("/link", { src: String(child.body.id), relation: "child_of", dst: needsRepair });
+    const current = await queueViaAccept({ repo, pr: 429, head });
+    await acquire(repo, "gw-reuse", { required_workflows: ["Test"] });
+    const event = { repo, base: "main", kind: "merged", actor: "gw-reuse",
+      pr: 428, merge_sha: merge, head_sha: head, merged_at: Date.now() - 10 * 60_000 };
+    expect((await kbJson("/train.event", { ...event, task_id: prior })).body.task).toBe(prior);
+    expect((await kbJson("/train.event", { ...event, task_id: later })).body.receipt_reused).toBeUndefined();
+    const settled = await kbJson("/train.ci", {
+      repo, base: "main", actor: "gw-reuse", sha: merge, checks: [check(1, "Test", "success", "https://example/ci/settled")],
+    });
+    expect(settled.body.decided).toBe("landed");
+    expect((await kbJson("/train.event", { ...event, pr: 429, merge_sha: "e".repeat(40), task_id: current, merged_at: Date.now() })).body.task).toBe(current);
+    const before = (await laneSnap(repo)).currently;
+    expect(before.pr).toBe(429);
+
+    expect((await kbJson("/train.event", { ...event, task_id: stale })).body.receipt_reused).toBeUndefined();
+    const replay = await kbJson("/train.event", { ...event, task_id: later });
+    expect(replay.body, JSON.stringify(replay.body)).toMatchObject({ ok: true, receipt_reused: true, task: later });
+    expect((await kbJson("/get", { id: later })).body).toMatchObject({ status: "done", meta: { merge_train: { state: "landed", merge_sha: merge } } });
+    expect((await kbJson("/get", { id: stale })).body.status).toBe("blocked");
+    expect((await kbJson("/train.event", { ...event, task_id: later })).body.receipt_reused).toBeUndefined();
+    const refused = await kbJson("/train.event", { ...event, task_id: needsRepair });
+    expect(refused.body, JSON.stringify(refused.body)).toMatchObject({ ok: true, decided: "bounce_gate", task: needsRepair });
+    expect((await kbJson("/get", { id: needsRepair })).body).toMatchObject({
+      status: "in_progress", meta: { merge_train: { state: "bounced", breach_class: "gate:open-children", landed_merge_sha: merge } },
+    });
+    expect((await kbJson("/train.event", { ...event, task_id: needsRepair })).body).toMatchObject({ deduped: true });
+    expect((await laneSnap(repo)).currently).toEqual(before);
+    const history = (await kbJson("/train.history", { repo })).body.events;
+    expect(history.filter((e: any) => e.pr === 428 && e.kind === "merged")).toHaveLength(1);
+    expect(history.filter((e: any) => e.pr === 428 && e.kind === "landed")).toHaveLength(1);
+  });
+
   it("a merged event naming the standing LANE card is a named reject — nothing stamped, nothing settled", async () => {
     const repo = "state-vector/dedupe-lane-drill";
     const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });

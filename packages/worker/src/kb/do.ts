@@ -11895,7 +11895,7 @@ export class KnowledgeHub {
       // silent overwrite of the provenance stamp. Ledger first, provenance
       // fallback second (the train's own stamp is a merge receipt).
       const priorEv = this.one(
-        `SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
+        `SELECT merge_sha, head_sha, base FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
         repo, pr,
       ) as any;
       const priorProv = priorEv ? null : (this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, repo, pr) as any);
@@ -11903,6 +11903,39 @@ export class KnowledgeHub {
       if (seenSha) {
         if (mergeSha.toLowerCase() !== seenSha.toLowerCase())
           throw new Error(`train:merged ${repo}#${pr} already recorded merged as ${seenSha.slice(0, 9)} — a different merge_sha for a merged PR is a protocol violation (BR#5151)`);
+        // The merge event is global, but a later accepted card can still
+        // need its own close. Reuse only a settled receipt for the exact head.
+        if (chainTask && priorEv?.base === base && headSha && headSha === priorEv.head_sha) {
+          const card = row(chainTask);
+          const cm = JSON.parse(card?.meta ?? "{}");
+          if (card?.status === "blocked" && cm.merge_train?.state === "queued" && mergeCompletesTask(cm)
+            && trainLegsRemaining(cm, repo, base).some(leg => leg.number === pr && leg.head_sha_at_acceptance === headSha)) {
+            const review = this.currentTaskReview(chainTask);
+            if (review.phase === "accepted" && review.subject.task_id === chainTask && review.subject.revision === (cm.work_revision ?? "legacy")
+              && review.result.kind === "accepted_pr" && review.result.task_id === chainTask
+              && review.result.legs.some(leg => leg.repo === repo && leg.number === pr && leg.head_sha_at_acceptance === headSha)) {
+              const landed = this.one(
+                `SELECT detail FROM train_events WHERE repo = ? AND base = ? AND pr = ? AND merge_sha = ? AND kind = 'landed' ORDER BY ts DESC LIMIT 1`,
+                repo, base, pr, seenSha,
+              );
+              if (landed) {
+                const greenRunUrl = JSON.parse(landed.detail ?? "{}").run;
+                try {
+                  await this.landedFlow(lane, meta, actor, { pr, mergeSha: seenSha, greenRunUrl, receiptTaskId: chainTask });
+                } catch (e) {
+                  const error = String((e as Error)?.message ?? e);
+                  const status = this.one(`SELECT status FROM artefacts WHERE id = ?`, chainTask)?.status;
+                  if (status !== "done" && status !== "superseded") {
+                    await this.bounceLandedTask(chainTask, repo, actor, { pr, mergeSha: seenSha, error, klass: breachClass(error), boundFired: false, failures: 1 });
+                    return { ok: true, deduped: true, task: chainTask, decided: "bounce_gate" };
+                  }
+                }
+                this.audit(actor, "train:landed_receipt_reused", chainTask, { repo, base, pr, merge_sha: seenSha, review: review.id });
+                return { ok: true, deduped: true, task: chainTask, receipt_reused: true };
+              }
+            }
+          }
+        }
         this.audit(actor, "train:merged_deduped", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha });
         return { ok: true, deduped: true };
       }
@@ -12937,10 +12970,10 @@ export class KnowledgeHub {
    *  when its LAST leg lands — after a partial landing it stays queued with
    *  an honest reason naming the legs still out, and the train picks the
    *  next leg on a later tick. */
-  private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null }): Promise<any> {
+  private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null; receiptTaskId?: string }): Promise<any> {
     const now = Date.now();
     const laneSpec = laneOfMeta(meta)!;
-    const taskId: string | null = meta.currently?.task_id ?? null;
+    const taskId: string | null = p.receiptTaskId ?? meta.currently?.task_id ?? null;
     if (taskId) {
       const card = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, taskId);
       if (card && card.status !== "done" && card.status !== "superseded") {
@@ -12966,6 +12999,7 @@ export class KnowledgeHub {
           cm.merge_train = { ...cm.merge_train, state: "queued", pr: next.number, repo: next.repo, remaining: remaining.length };
           cm.blocked = { ...(cm.blocked ?? {}), reason: trainQueueRemainingReason(cm) };
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, taskId);
+          if (p.receiptTaskId) return;
           await this.closeBurstParks(lane, meta, actor, p.mergeSha, now);
           meta.currently = null;
           const reason = this.laneSyncReason(lane.id, meta, now);
@@ -12994,6 +13028,7 @@ export class KnowledgeHub {
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(completed), taskId);
       }
     }
+    if (p.receiptTaskId) return;
     // BR#4934: the pass settled green — parked intermediate cards whose fed
     // ancestry proves they ride this pass close here (before currently, and
     // the burst_ancestors it carries, is cleared).
@@ -13007,6 +13042,73 @@ export class KnowledgeHub {
     this.audit(actor, "train:landed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, merge_sha: p.mergeSha });
     this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed — ${p.mergeSha.slice(0, 9)} green on main; card ${taskId ?? "n/a"} closed`, { reason });
     return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, reason };
+  }
+
+  private async bounceLandedTask(taskId: string, repo: string, actor: string, p: {
+    pr: number; mergeSha: string; error: string; klass: ReturnType<typeof breachClass>; boundFired: boolean; failures: number;
+  }): Promise<void> {
+    const { pr, mergeSha, error, klass, boundFired, failures } = p;
+    const card = this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, taskId);
+    if (card) {
+      const now2 = Date.now();
+      const cm = JSON.parse(card.meta ?? "{}");
+      const nextMeta = {
+        ...cm,
+        // starvation law shape (BR#4068): a merged-green card one gate
+        // precondition away from done is the board's highest-value work
+        boosted: now2,
+        merge_train: {
+          ...(cm.merge_train ?? {}),
+          state: "bounced",
+          bounce_kind: "gate",
+          close_bounce: true,
+          defect: error.slice(0, 300),
+          breach_class: klass,
+          landed_merge_sha: mergeSha,
+          bounced_at: now2,
+          pr: pr,
+          repo: repo,
+        },
+      };
+      const brief = trainCloseBounceBrief({ repo: repo, prNumber: pr, mergeSha: mergeSha, gateway: actor, error, breachClass: klass, boundFired, failures });
+      const body = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train close bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), body, now2, taskId);
+      // blocked → in_progress with the brief; a HALF-CLOSED card (a prior
+      // tick already cleared blocked→in_progress, then done was refused)
+      // is already in impl's hands — the brief + boost stand, no illegal
+      // in_progress→in_progress exists.
+      if (card.status === "blocked") {
+        try {
+          await this.transition(
+            {
+              id: taskId,
+              to: "in_progress",
+              // anonymous — the hub acts as the machine, never as the last
+              // session on the token (same rule as the conflict bounce)
+              session: "",
+              note: `merge-train close bounce (BR#4753) — ${klass}: ${error.slice(0, 120)}`,
+            },
+            actor,
+          );
+        } catch (te) {
+          // the bounce transition itself refused (a race) — the brief, the
+          // bounce stamp and the boost already stand; never raw-throw from
+          // the green branch (BR#4753)
+          this.audit(actor, "train:close_bounce_refused", taskId, { error: String((te as Error)?.message ?? te).slice(0, 200) });
+        }
+      }
+      this.audit(actor, "boost", taskId, { root: taskId, via: "train:close_bounce", pr: pr });
+      this.version(taskId, actor, "update", `close-bounced (priority 0 — merged green, board close gate-rejected: ${klass}; repair leg = resolve the named precondition, close citing the merge commit — BR#4753)`, {});
+    }
+    // The failed close is Bridge-owned bookkeeping. The recovery duty is
+    // deduplicated on the actual task; no notification-sink decision is made.
+    try {
+      const recovery = await this.ensureTaskRecovery(taskId, "queue_binding");
+      this.audit(actor, "train:close_recovery_scheduled", taskId, { recovery, merge_sha: mergeSha, breach_class: klass });
+    } catch (ae) {
+      const am = String((ae as Error)?.message ?? ae);
+      this.audit(actor, "train:close_recovery_failed", taskId, { error: am.slice(0, 160) });
+    }
   }
 
   /** BR#4753: the landed close GUARDED. A green-verdict tick whose
@@ -13076,58 +13178,7 @@ export class KnowledgeHub {
       // re-verify bounce: the brief points impl at exactly the named
       // precondition.
       const boundFired = edge.bound_fired;
-      const card = taskId ? this.one(`SELECT id, status, meta, body_md FROM artefacts WHERE id = ?`, taskId) : null;
-      if (card) {
-        const now2 = Date.now();
-        const cm = JSON.parse(card.meta ?? "{}");
-        const nextMeta = {
-          ...cm,
-          // starvation law shape (BR#4068): a merged-green card one gate
-          // precondition away from done is the board's highest-value work
-          boosted: now2,
-          merge_train: {
-            ...(cm.merge_train ?? {}),
-            state: "bounced",
-            bounce_kind: "gate",
-            close_bounce: true,
-            defect: error.slice(0, 300),
-            breach_class: klass,
-            landed_merge_sha: p.mergeSha,
-            bounced_at: now2,
-            pr: p.pr,
-            repo: laneSpec.repo,
-          },
-        };
-        const brief = trainCloseBounceBrief({ repo: laneSpec.repo, prNumber: p.pr, mergeSha: p.mergeSha, gateway: actor, error, breachClass: klass, boundFired, failures });
-        const body = `${String(card.body_md ?? "").replace(/\n\n---\n\nMerge-train close bounce[\s\S]*$/, "")}\n\n---\n\n${brief}`;
-        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(nextMeta), body, now2, taskId);
-        // blocked → in_progress with the brief; a HALF-CLOSED card (a prior
-        // tick already cleared blocked→in_progress, then done was refused)
-        // is already in impl's hands — the brief + boost stand, no illegal
-        // in_progress→in_progress exists.
-        if (card.status === "blocked") {
-          try {
-            await this.transition(
-              {
-                id: taskId!,
-                to: "in_progress",
-                // anonymous — the hub acts as the machine, never as the last
-                // session on the token (same rule as the conflict bounce)
-                session: "",
-                note: `merge-train close bounce (BR#4753) — ${klass}: ${error.slice(0, 120)}`,
-              },
-              actor,
-            );
-          } catch (te) {
-            // the bounce transition itself refused (a race) — the brief, the
-            // bounce stamp and the boost already stand; never raw-throw from
-            // the green branch (BR#4753)
-            this.audit(actor, "train:close_bounce_refused", taskId!, { error: String((te as Error)?.message ?? te).slice(0, 200) });
-          }
-        }
-        this.audit(actor, "boost", taskId!, { root: taskId!, via: "train:close_bounce", pr: p.pr });
-        this.version(taskId!, actor, "update", `close-bounced (priority 0 — merged green, board close gate-rejected: ${klass}; repair leg = resolve the named precondition, close citing the merge commit — BR#4753)`, {});
-      }
+      if (taskId) await this.bounceLandedTask(taskId, laneSpec.repo, actor, { pr: p.pr, mergeSha: p.mergeSha, error, klass, boundFired, failures });
       meta.currently = null;
       const reason2 = this.laneSyncReason(lane.id, meta, Date.now());
       this.state.storage.sql.exec(
@@ -13136,15 +13187,6 @@ export class KnowledgeHub {
       );
       this.audit(actor, "train:landed_close_bounced", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) });
       this.version(lane.id, actor, "train:landed", `PR #${p.pr} merged green but the card close failed ${failures}× (${klass}${boundFired ? ", bound fired" : ""}) — card close-bounced with the repair brief; lane idled, queue advances (BR#4753)`, { reason: reason2 });
-      // The failed close is Bridge-owned bookkeeping. The recovery duty is
-      // deduplicated on the actual task; no notification-sink decision is made.
-      try {
-        const recovery = await this.ensureTaskRecovery(taskId!, "queue_binding");
-        this.audit(actor, "train:close_recovery_scheduled", taskId!, { recovery, merge_sha: p.mergeSha, breach_class: klass });
-      } catch (ae) {
-        const am = String((ae as Error)?.message ?? ae);
-        this.audit(actor, "train:close_recovery_failed", lane.id, { reason: am.slice(0, 160) });
-      }
       return { ok: true, decided: boundFired ? "bounce_bound" : "bounce_gate", pr: p.pr, merge_sha: p.mergeSha, task: taskId, breach_class: klass, bound_fired: boundFired, failures, reason: reason2 };
     }
   }
