@@ -167,7 +167,6 @@ export const SILENT_REDIRECT_CYCLES = 5; // impl/analysis
  *  gate-rejection reaper fuse (do.ts reapAbandoned idleLimit): both
  *  mechanisms promise the same thing — nobody will look at this for a day,
  *  then it comes back on its own. */
-export const CHURN_COOLDOWN_MS = 24 * 60 * 60_000;
 
 // Flood guard: a superseded unblock round still counts while fresh (<60m) and
 // the exit condition is unchanged — the BR#909 class spawned one child per
@@ -590,9 +589,12 @@ export const RULES: Rule[] = [
       if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
       if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
       const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). A br_pr_merged naming the card is legal — the train stamps its provenance row while the card is blocked (BR#3620). Await the real upstream leg.`;
+      const unsupportedIssue = "GitHub issue closure has no machine observer. Use an observable delivery prerequisite or a Bridge recovery task.";
       if (i.body?.await_event !== undefined) {
         const ev = validateAwaitEvent(i.body.await_event);
         if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        if (ev.event === "issue_closed") return unsupportedIssue;
+        if (ev.event === "recovery_required") return "execution recovery waits are created by the scheduler";
         if (isSelfAwait(String(i.id), ev)) return selfMsg;
         return null;
       }
@@ -621,6 +623,7 @@ export const RULES: Rule[] = [
         }
         if (!unparseable && atoms.length === 1) {
           const single = awaitEventFromAtoms(atoms);
+          if (single?.event === "issue_closed") return unsupportedIssue;
           if (single && isSelfAwait(String(i.id), single)) return selfMsg;
           if (single) return null;
         }
@@ -867,14 +870,8 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       status = "blocked";
       patch.blocked = {
         reason: blockReason,
-        // BR#4248: the park awaits a typed cooldown timer — grammar-valid,
-        // machine-readable, sweep-consumed. The prose unblock condition is
-        // annotation for the human who eventually reads the card; it is NOT
-        // the exit condition (BR#3578). The server must not mint the very
-        // "awaits nothing" parks that law kills — the invariant at the end
-        // of decide() refuses a redirect that lands without the typed atom.
-        unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
-        await_event: { event: "time", until_ts: now + CHURN_COOLDOWN_MS },
+        unblock_condition: "Bridge diagnoses the repeated failure and establishes a reviewed recovery condition.",
+        await_event: { event: "recovery_required", cause: "repeated_failure" },
         ts: now,
       };
       patch.attempt = attempt;

@@ -148,4 +148,55 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect((await get(parent)).status).toBe("blocked");
     expect((await get(parent)).meta.operator_gated).toBe("Explicit operator choice");
   });
+
+  it("replaces a historical churn timer with a single diagnostic prerequisite", async () => {
+    const parent = await task("Diagnose prior failures before any retry");
+    const parked = await call("transition", { id: parent, to: "blocked", actor: "author", note: "churn guard: same gate repeatedly refused",
+      await_event: { event: "time", until_ts: Date.now() - 1 } });
+    expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+    const now = Date.now() + 4 * 60 * 60_000;
+    await call("admin.unblock_proxy_sweep", { now });
+    const repaired = await get(parent);
+    const duty = repaired.meta.recovery?.task_id;
+    expect(duty).toBeTruthy();
+    expect(repaired.status).toBe("blocked");
+    expect(repaired.meta.blocked.await_event).toEqual({ event: "br_done", id: duty });
+    await call("admin.unblock_proxy_sweep", { now: now + 60 * 60_000 });
+    expect((await children(parent)).filter(c => c.status !== "superseded").map(c => c.id)).toEqual([duty]);
+    const boardResponse = await stub.fetch("https://kb/board");
+    expect(boardResponse.status).toBe(200);
+    const board = await boardResponse.json() as any;
+    expect(board.tasks.find((t: any) => t.id === parent).work_waits).toContainEqual({
+      kind: "execution_recovery", exit: { event: "reviewed_execution_repair", task_id: parent, duty_id: duty },
+    });
+
+    const replacement = await task("Apply the change that repairs the repeated failure", {}, ["analysis"]);
+    await call("transition", { id: duty, to: "in_progress", actor: "repair", session: "repair" });
+    const receipt = `https://hub.fleetbridge.run/card/${replacement.replace("#", "-")}`;
+    const unsupported = await call("transition", { id: duty, to: "in_review", actor: "repair", session: "repair",
+      note: "Looked at the failure", execution_result: { outcome: "Completed diagnosis", receipts: [receipt] } });
+    expect(unsupported.status).toBe(400);
+    const submitted = await call("transition", { id: duty, to: "in_review", actor: "repair", session: "repair",
+      note: "Recorded the observable replacement condition and its evidence.",
+      execution_result: { outcome: "Diagnosed the failure and established the replacement prerequisite", receipts: [receipt] },
+      unblock_result: { kind: "reblocked", parent_id: parent, reason: "The reviewed repair must finish",
+        next: "Wait for the repair receipt", await_event: { event: "br_done", id: replacement } } });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    await call("admin.unblock_proxy_sweep", { now: now + 2 * 60 * 60_000 });
+    expect((await get(parent)).meta.blocked.await_event).toEqual({ event: "br_done", id: duty });
+    const review = (await children(duty)).find(c => c.roles.includes("review"));
+    expect(review).toBeTruthy();
+    const claimed = await call("transition", { id: review.id, to: "in_progress", actor: "independent", session: "independent" });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    const subject = (await get(review.id)).meta.review_subject;
+    expect(subject).toBeTruthy();
+    const accepted = await call("transition", { id: review.id, to: "done", actor: "independent", session: "independent",
+      review_result: { kind: "accepted_execution", task_id: duty, subject_revision: subject.revision, receipts: [receipt] } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    await call("admin.unblock_proxy_sweep", { now: now + 3 * 60 * 60_000 });
+    const reparked = await get(parent);
+    expect(reparked.status).toBe("blocked");
+    expect(reparked.meta.blocked.await_event).toEqual({ event: "br_done", id: replacement });
+  });
+
 });

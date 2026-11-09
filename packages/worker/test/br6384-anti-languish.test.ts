@@ -419,13 +419,12 @@ describe("BR#6384 Leg 3 — pr_merged proxy probes (real DO)", () => {
     expect((await dutyChildrenOf(id)).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("a conclusive negative (closed unmerged) stamps an honest false — the park stands, no duty", async () => {
+  it("a closed-unmerged upstream prerequisite is replaced by a repair duty", async () => {
     const id = await parkedCard(
       "BR#6384 L3c: closed-unmerged must not flip",
       { event: "pr_merged", repo: "state-vector/br6384-l3", n: 6132 },
       "PR state-vector/br6384-l3#6132 merged (mergeCommit non-null)",
     );
-    const before = await dutyChildrenOf(id);
     await sweep();
     const rep = await kbJson("/proxy.verify", {
       key: "merged:state-vector/br6384-l3#6132",
@@ -436,9 +435,9 @@ describe("BR#6384 Leg 3 — pr_merged proxy probes (real DO)", () => {
     });
     expect(rep.body.verdict).toBe("negative");
     await sweep();
-    const check = await proxyCheck(id);
-    expect(check.verdict).toBe("false"); // the gate has NOT fired — never a flip
-    expect(await dutyChildrenOf(id)).toHaveLength(before.length);
-    expect((await taskById(id)).status).toBe("blocked");
+    const card = await taskById(id);
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.reason).toContain("CLOSED");
+    expect(card.meta.blocked.await_event).toEqual({ event: "br_done", id: card.meta.recovery.task_id });
   });
 });

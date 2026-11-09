@@ -124,10 +124,10 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     const twinIdx = unblockTwinIndex(tasks as any[]);
     const humanAskSubjects = new Set(tasks.filter(isOpenHumanAsk).map(humanAskSubject));
     const admitted = (tasks as any[]).filter((t) =>
-      t.status === "in_progress"
+      t.type !== "question" && t.meta?.kind !== "question" && (t.status === "in_progress"
       || (t.status === "blocked"
         && !isTimeoutBlock(t)
-        && (humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx))),
+        && (humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx)))),
     );
     const taskRows: TopRow[] = admitted.map((t) => {
       const meta = (t.meta ?? {}) as any;
@@ -235,7 +235,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   // human-ask plane: exactly-once placement — nested under a visible subject,
   // else the residual band (2026-10-23 design)
-  const visibleTaskIds = useMemo(() => new Set(rows.map((r) => r.taskId ?? r.key)), [rows]);
+  const visibleTaskIds = useMemo(() => new Set(treeRows.map(({ row }) => row.taskId ?? row.key)), [treeRows]);
   const humanAsks = useHumanAsks(visibleTaskIds);
   const openAskDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const bumpAsks = () => { void refreshKb(); };

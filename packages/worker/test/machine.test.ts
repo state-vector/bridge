@@ -11,7 +11,6 @@ import {
   BREACH_THRESHOLDS,
   silentCycles,
   replayStatus,
-  CHURN_COOLDOWN_MS,
   CHURN_ESCALATE_ATTEMPTS,
   CHURN_REDIRECT_ATTEMPTS,
   SILENT_ESCALATE_CYCLES,
@@ -402,6 +401,17 @@ describe("loop regressions", () => {
     ).toBeNull();
   });
 
+  it("rejects new GitHub issue waits that lack an automated observer", async () => {
+    const event = { event: "issue_closed", repo: "state-vector/bridge", n: 1258 };
+    for (const body of [
+      { await_event: event },
+      { unblock_condition: "typed await_event issue_closed repo=state-vector/bridge n=1258" },
+    ]) {
+      expect(await check(input({ status: "in_progress", to: "blocked", body: { note: "parked", ...body } }), baseCtx()))
+        .toContain("GitHub issue closure has no machine observer");
+    }
+  });
+
   it("BR#4062: EVERY closed-set atom parks through the gate — typed param AND machine-proxy prose", async () => {
     const cases: { label: string; ev: Record<string, unknown>; prose: string }[] = [
       {
@@ -411,10 +421,6 @@ describe("loop regressions", () => {
       {
         label: "br_pr_merged", ev: { event: "br_pr_merged", id: "BR#4015" },
         prose: "Machine proxy (typed await_event br_pr_merged id=BR#4015): the card's fix PR lands on the train.",
-      },
-      {
-        label: "issue_closed", ev: { event: "issue_closed", repo: "state-vector/superpositional", n: 1258 },
-        prose: "Machine proxy (typed await_event issue_closed repo=state-vector/superpositional n=1258): the upstream report closes after the operator purge.",
       },
       {
         label: "br_done", ev: { event: "br_done", id: "BR#3819" },
@@ -1067,17 +1073,17 @@ describe("churn escalate/redirect (attempts + version-log silent cycles)", () =>
   it("impl/analysis redirect to blocked at CHURN_REDIRECT_ATTEMPTS — status override decided by the executor", async () => {
     const v = ok(await released(CHURN_REDIRECT_ATTEMPTS - 1)); // +1 in the executor = 5
     expect(v.status).toBe("blocked");
-    expect(v.meta_patch.blocked).toMatchObject({ unblock_condition: expect.stringContaining("re-claim") });
+    expect(v.meta_patch.blocked).toMatchObject({ unblock_condition: expect.stringContaining("reviewed recovery") });
     expect(v.effects[0]).toMatchObject({ kind: "release_redirect", attempts: CHURN_REDIRECT_ATTEMPTS });
   });
 
-  it("BR#4248: the redirect park carries a grammar-valid typed time atom (24h cooldown) — prose is annotation only", async () => {
+  it("BR#4248: the redirect park carries a typed recovery requirement — prose is annotation only", async () => {
     const v = ok(await released(CHURN_REDIRECT_ATTEMPTS - 1));
     const aw = (v.meta_patch.blocked as any)?.await_event;
-    expect(aw).toEqual({ event: "time", until_ts: 1_000_000 + CHURN_COOLDOWN_MS }); // input() pins now = 1_000_000
-    expect(validateAwaitEvent(aw)?.event).toBe("time"); // the door grammar accepts it — sweep-consumable
+    expect(aw).toEqual({ event: "recovery_required", cause: "repeated_failure" });
+    expect(validateAwaitEvent(aw)?.event).toBe("recovery_required");
     // the prose stays as the human-readable annotation, never the exit condition
-    expect((v.meta_patch.blocked as any).unblock_condition).toContain("re-claim");
+    expect((v.meta_patch.blocked as any).unblock_condition).toContain("reviewed recovery");
   });
 
   it("silent cycles escalate server-side from the version log (3–5 zero-output watchdog stalls)", () => {
@@ -1103,7 +1109,7 @@ describe("churn escalate/redirect (attempts + version-log silent cycles)", () =>
     expect(v.status).toBe("blocked");
     expect(v.meta_patch.blocked).toMatchObject({ reason: expect.stringContaining("silent churn") });
     // BR#4248: the silent-cycle redirect parks typed too — no prose path
-    expect(validateAwaitEvent((v.meta_patch.blocked as any)?.await_event)?.event).toBe("time");
+    expect(validateAwaitEvent((v.meta_patch.blocked as any)?.await_event)?.event).toBe("recovery_required");
   });
 
   it("BR#4248: a proven-unblock release after the timer fires resets the counter — the fresh start never re-trips the guard", async () => {

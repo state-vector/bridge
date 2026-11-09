@@ -1,3 +1,6 @@
+import type { AwaitEvent } from "@bridge/contracts";
+export type { AwaitEvent } from "@bridge/contracts";
+
 // The closure tier's text law (BR#3361) — pure parsing, no I/O. Three jobs:
 //
 // 1. parseProxyCondition: extract machine-checkable atoms from a blocked
@@ -191,7 +194,7 @@ function atomOfAwait(e: AwaitEvent): Omit<ProxyAtom, "raw"> | null {
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit };
     case "ask": return { kind: "ask", repo: null, askId: e.ask_id };
     case "time": return { kind: "time", repo: null, untilTs: e.until_ts };
-    case "local_handoff": case "executor_capability": return null;
+    case "local_handoff": case "executor_capability": case "recovery_required": return null;
   }
 }
 
@@ -563,24 +566,9 @@ export function legLabel(leg: CloseLeg): string {
 // human leg, active in For Me), or a timer. Free text stays as optional
 // human-friendly annotation, DERIVED from the structured event when absent.
 
-export type AwaitEvent =
-  | { event: "lane_health"; repo: string; base: string; head?: string }
-  | { event: "local_handoff"; handoff_id: string; version: number }
-  | { event: "executor_capability"; id: string }
-  | { event: "pr_merged"; repo: string; n: number }
-  | { event: "br_pr_merged"; id: string }
-  | { event: "issue_closed"; repo: string; n: number }
-  | { event: "br_done"; id: string }
-  | { event: "br_answered"; id: string }
-  | { event: "run_success"; repo: string; run_id?: string; newer_than?: string; head?: string }
-  | { event: "pr_checks_green"; repo: string; n: number }
-  | { event: "deployed"; commit: string }
-  | { event: "ask"; ask_id: string }
-  | { event: "time"; until_ts: number };
-
 export const AWAIT_EVENT_KINDS = [
   "lane_health",
-  "local_handoff", "executor_capability",
+  "local_handoff", "executor_capability", "recovery_required",
   "pr_merged", "br_pr_merged", "issue_closed", "br_done",
   "br_answered", "run_success", "pr_checks_green", "deployed", "ask", "time",
 ] as const;
@@ -610,6 +598,7 @@ export function validateAwaitEvent(v: unknown): AwaitEvent | null {
   switch (kind) {
     case "lane_health": return repo && typeof e.base === "string" && e.base.trim() && (e.head === undefined || typeof e.head === "string" && /^[a-f0-9]{40}$/i.test(e.head)) ? { event: "lane_health", repo, base: e.base, ...(e.head ? { head: String(e.head) } : {}) } : null;
     case "local_handoff": return typeof e.handoff_id === "string" && e.handoff_id.length > 0 && num(e.version) ? { event: "local_handoff", handoff_id: e.handoff_id, version: Number(e.version) } : null;
+    case "recovery_required": return e.cause === "repeated_failure" ? { event: "recovery_required", cause: e.cause } : null;
     case "executor_capability": return id(e.id) ? { event: "executor_capability", id: String(e.id) } : null;
     case "pr_merged":
     case "issue_closed":
@@ -660,7 +649,7 @@ export function awaitEventToAtom(e: AwaitEvent): ProxyAtom | null {
     case "run_success": return { kind: "run_success", repo: e.repo, runId: e.run_id, newerThan: e.newer_than, head: e.head, raw: describeAwaitEvent(e) };
     case "pr_checks_green": return { kind: "pr_checks_green", repo: e.repo, number: e.n, raw: describeAwaitEvent(e) };
     case "deployed": return { kind: "deployed", repo: null, commit: e.commit, raw: describeAwaitEvent(e) };
-    case "ask": case "time": case "local_handoff": case "executor_capability": return null;
+    case "ask": case "time": case "local_handoff": case "executor_capability": case "recovery_required": return null;
   }
 }
 
@@ -682,6 +671,7 @@ export function describeAwaitEvent(e: AwaitEvent): string {
     case "ask": return `ask ${e.ask_id} answered`;
     case "time": return `timer elapsed (until_ts ${e.until_ts})`;
     case "local_handoff": return `Explicit authorised local acceptance of ${e.handoff_id} version ${e.version}`;
+    case "recovery_required": return "Bridge establishes an independently reviewed recovery after repeated failure";
     case "executor_capability": return `A live eligible capability becomes usable for ${e.id}, with all other blockers resolved`;
   }
 }

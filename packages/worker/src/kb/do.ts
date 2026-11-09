@@ -9,7 +9,7 @@
  * Transport: the worker forwards JSON op requests via fetch("https://kb/<op>").
  * Ops: create | get | list | search | update | transition | link | stats
  */
-import { WorkerStatusSchema, trainCandidateActivity } from "@bridge/contracts";
+import { WorkerStatusSchema, trainCandidateActivity, type WorkWait } from "@bridge/contracts";
 import { SchemaInitialization } from "./schema-init.ts";
 import type { DeliveryAdmission, DeliveryDisposition, AcceptedPrLeg } from "@bridge/contracts";
 import {
@@ -225,7 +225,7 @@ import {
   prTargetMatch,
   RECEIPTS_DOC,
   churnRelease,
-  blockedParkVerdict,
+  blockedParkVerdict, CHURN_REASON_RX, CHURN_UNBLOCK_RX,
   UNBLOCK_SPAWN_CAP,
   OWNER_RELEASE_EXEMPT,
   HUMAN_ACTOR,
@@ -727,6 +727,7 @@ export class KnowledgeHub {
     // Readiness owns startup waits, not the task churn/timer machinery.
     await this.maintenanceCheckpoint(trace, "startup.maintenance");
     this.reconcileStartupWaits(now0);
+    await this.scheduleAttemptDiagnosis();
     // (0) expire stale open asks. An open ask pauses the watchdog (rule 6) —
     // but an ask to an agent that never answers would pause its task FOREVER
     // (the 19h+ in_progress rows were this). TTL: 24h. Expiry clears the ask
@@ -1022,7 +1023,8 @@ export class KnowledgeHub {
         // folded into the 2026-10-29 "unclassified" breach pile) — check the
         // hold BEFORE the blocked_drained annotation and wait it out.
         if (releaseHold(meta)) continue;
-        const dead = verdict.klass === "churn-park" || verdict.klass === "dead-ask";
+        if (verdict.klass === "churn-park") continue; // the proxy sweep owns diagnosis
+        const dead = verdict.klass === "dead-ask";
         const age = now - Math.max(Number(b.ts ?? 0) || 0, r.status_ts ?? 0, r.updated_ts ?? 0);
         if (!dead && age <= blockedStaleMs) continue; // honest fresh park — not the sweep's business yet
         // annotate BEFORE the transition: it clears meta.blocked (the
@@ -1611,23 +1613,23 @@ export class KnowledgeHub {
    *  run_success/pr_checks_green atoms: unprobed (needs enqueue) | pending |
    *  exhausted (cap reached — loud unresolvable again) | negative (conclusive
    *  no — the gate has not fired). */
-  private dependencyOutcome(id: string): { ok: boolean; receipt: string } {
+  private dependencyOutcome(id: string): { ok: boolean; receipt: string; probeState?: "negative" } {
     const seen = new Set<string>();
     const chain: string[] = [];
     while (!seen.has(id)) {
       seen.add(id);
       const row = this.one(`SELECT status,status_ts,meta FROM artefacts WHERE id=?`, id);
-      if (!row) return { ok: false, receipt: `${chain.join(" -> ")} ${id} not found` };
+      if (!row) return { ok: false, receipt: `${chain.join(" -> ")} ${id} not found`, probeState: "negative" };
       chain.push(`${id} status=${row.status} revision=${row.status_ts}`);
       if (row.status === "done") return { ok: true, receipt: chain.join(" -> ") };
       if (row.status !== "superseded") return { ok: false, receipt: chain.join(" -> ") };
       const meta = JSON.parse(String(row.meta ?? "{}"));
       const successor = meta.delivery_disposition?.kind === "replace" ? meta.delivery_disposition.successor : meta.superseded_by;
       const relation = successor ? null : this.one(`SELECT src_id FROM relations WHERE dst_id=? AND relation='supersedes' ORDER BY created_ts DESC LIMIT 1`, id);
-      if (!successor && !relation) return { ok: false, receipt: `${chain.join(" -> ")} — retired without a replacement outcome` };
+      if (!successor && !relation) return { ok: false, receipt: `${chain.join(" -> ")} — retired without a replacement outcome`, probeState: "negative" };
       id = String(successor || relation.src_id);
     }
-    return { ok: false, receipt: `${chain.join(" -> ")} — replacement cycle, outcome unresolved` };
+    return { ok: false, receipt: `${chain.join(" -> ")} — replacement cycle, outcome unresolved`, probeState: "negative" };
   }
 
   private async evalProxyAtom(
@@ -1960,7 +1962,14 @@ export class KnowledgeHub {
         if (this.startupWait(r.id) || this.protectedExecution(String(r.id), meta)) continue;
         // BR#3578: the typed await (validated at the door) is trusted and
         // evaluated FIRST; the free text is annotation + legacy fallback.
-        let aw = validateAwaitEvent(bmeta.await_event) ?? null;
+        let aw = validateAwaitEvent(bmeta.await_event);
+        const legacyChurn = CHURN_REASON_RX.test(String(bmeta.reason ?? "")) || CHURN_UNBLOCK_RX.test(String(bmeta.unblock_condition ?? ""));
+        if (!aw && legacyChurn && !releaseHold(meta)) {
+          aw = { event: "recovery_required", cause: "repeated_failure" };
+          bmeta.await_event = aw;
+          meta.blocked = bmeta;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(meta), r.id);
+        }
         if (aw?.event === "br_done" && meta.root_blocker === aw.id) {
           const legs = trainLegs(meta);
           const repos = [...new Set(legs.map(l => l.repo))];
@@ -1981,6 +1990,19 @@ export class KnowledgeHub {
           bmeta.unblock_condition = `Recovery ${recovery} repairs the invalid historical self-wait; no delivery outcome is inferred`;
           meta.blocked = bmeta;
           this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(meta), r.id);
+        }
+        if (aw?.event === "br_done" && bmeta.repairing?.duty === aw.id) {
+          this.applyReviewedWaitRepair(String(r.id), meta, aw.id);
+          continue;
+        }
+        if (aw?.event === "issue_closed" || aw?.event === "recovery_required" || (aw?.event === "time" && legacyChurn)) {
+          const reason = aw.event === "issue_closed"
+            ? "Bridge must verify the original GitHub dependency and find an observable continuation."
+            : "Bridge must diagnose repeated failed attempts before dispatching again.";
+          if (await this.repairBlockedWait(String(r.id), aw, bmeta.ts, reason)) continue;
+          // A protected wait remains under its existing owner's control. In
+          // particular, a churn timer cannot authorize another failed attempt.
+          if (aw.event === "time" || aw.event === "recovery_required") continue;
         }
         const cond = String(bmeta.unblock_condition ?? "").trim() || (aw ? describeAwaitEvent(aw) : "");
         if (!cond) continue;
@@ -2060,6 +2082,10 @@ export class KnowledgeHub {
         }
         const results: { atom: ProxyAtom; ok: boolean; receipt: string; probeState?: string }[] = [];
         for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { defaultRepo })) });
+        if (aw && results.some(x => x.probeState === "negative" || x.probeState === "exhausted")) {
+          const failed = results.find(x => x.probeState === "negative" || x.probeState === "exhausted");
+          if (await this.repairBlockedWait(String(r.id), aw, bmeta.ts, `Bridge must reassess the failed prerequisite. ${failed?.receipt}`)) continue;
+        }
         const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
         if (unparseable || unresolvable) {
           // cannot FULLY read the condition — never auto-flip (conservatism law)
@@ -2597,12 +2623,66 @@ export class KnowledgeHub {
       if (current.status !== row.status || current.meta !== row.meta || current.owner !== row.owner) throw new Error("wait continuation changed before commit");
       this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
       this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
-      this.version(id, "system:proxy-watch", "wait_continued", "Completed unblock round left a satisfied prerequisite; continuation returned to the executable pool", { await_event: expected, receipts });
+      this.version(id, "system:proxy-watch", "wait_continued", "Satisfied prerequisite recorded; continuation returned to the executable pool", { await_event: expected, receipts });
       this.audit("system:proxy-watch", "wait_continued", id, { await_event: expected, receipts });
     });
     return true;
   }
 
+
+  private boardWorkWaits(
+    task: { id: string; status: string; meta: { blocked?: { await_event?: unknown; repairing?: { duty: string; original: unknown } }; startup_wait?: unknown }; gateway_dispatch?: GatewayDispatch },
+    state: ExecutionState | undefined,
+    openAsks: { id: string; route: ReturnType<typeof askRoute> }[],
+  ): WorkWait[] {
+    const { id, status, meta, gateway_dispatch: dispatch } = task;
+    if (!["todo", "blocked", "in_review"].includes(status)) return [];
+    const waits: WorkWait[] = [];
+    for (const ask of openAsks) if (ask.route.kind === "human_decision") {
+      waits.push({ kind: "human_decision", exit: { event: "ask_answered", ask_id: ask.id } });
+    }
+    const awaited = validateAwaitEvent(meta.blocked?.await_event);
+    const startup = StartupWaitSchema.safeParse(meta.startup_wait);
+    if (startup.success) waits.push({ kind: "execution_recovery", exit: { event: "startup_ready", previous: startup.data } });
+    if (awaited?.event === "executor_capability" || dispatch?.kind === "gateway_unavailable") {
+      waits.push({ kind: "execution_recovery", exit: { event: "compatible_executor_ready", task_id: id } });
+    }
+    const repair = meta.blocked?.repairing;
+    const original = validateAwaitEvent(repair?.original);
+    if (awaited?.event === "recovery_required" || (repair && (original?.event === "recovery_required" || original?.event === "time"))) {
+      waits.push({ kind: "execution_recovery", exit: { event: "reviewed_execution_repair", task_id: id, ...(repair && { duty_id: repair.duty }) } });
+    } else if (repair) {
+      waits.push({ kind: "prerequisite", exit: { event: "reviewed_wait_replacement", duty_id: repair.duty } });
+    } else if (awaited && awaited.event !== "executor_capability"
+      && !(awaited.event === "ask" && openAsks.some(ask => ask.route.kind === "human_decision" && awaited.ask_id === ask.id))) {
+      waits.push({ kind: "prerequisite", exit: awaited });
+    }
+    const phase = mergePhaseOf(meta);
+    if (status === "in_review") waits.push({ kind: "prerequisite", exit: { event: "review_recorded", task_id: id } });
+    if (status === "blocked" && phase && phase !== "landed") {
+      waits.push({ kind: "prerequisite", exit: { event: "train_advanced", task_id: id, phase } });
+    }
+    if (state) {
+      const writerPending = !!state.attempt && state.attempt.phase !== "quiesced";
+      const operations = state.operations.filter(op => op.state === "prepared" || op.state === "outcome_unknown").map(op => op.id);
+      if (writerPending || operations.length) waits.push({ kind: "prior_attempt_reconciliation",
+        exit: { event: "attempt_reconciled", task_id: id, generation: state.generation, writer_pending: writerPending, operations } });
+    }
+    if (dispatch?.kind === "held") for (const reason of dispatch.reasons) {
+      switch (reason) {
+        case "writer_not_quiescent": case "unknown_operations": break;
+        case "provider_route": case "retry_budget": case "recovery_route": case "host_affinity": case "capability": case "startup_prerequisite":
+          waits.push({ kind: "execution_recovery", exit: { event: "execution_admitted", task_id: id, reason } });
+          break;
+        case "independent_wait":
+          if (awaited || openAsks.length) break;
+          // fall through for a separate lifecycle or review gate
+        case "qualification": case "operator_gate": case "question": case "lifecycle_gate":
+          waits.push({ kind: "prerequisite", exit: { event: "admission_satisfied", task_id: id, reason } });
+      }
+    }
+    return waits;
+  }
 
   async eventsSince(since: number, limit: number) {
     // since=0 → the most recent window (newest first, returned oldest-first);
@@ -2727,12 +2807,18 @@ export class KnowledgeHub {
       `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
        FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question'
+         AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
+         AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
        ORDER BY c.created_ts DESC`,
     ).toArray();
-    const askChildOf = new Map<string, any>();
-    for (const c of openAskChildren as any[]) {
-      if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
+    const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
+    for (const c of openAskChildren) {
+      const ask = JSON.parse(String(c.cmeta ?? "{}")).ask;
+      if (!ask || askLifecycle({ status: "todo", meta: { ask } }).state !== "open") continue;
+      const parent = String(c.parent);
+      const asks = askChildrenByParent.get(parent) ?? [];
+      asks.push({ id: String(c.id), route: askRoute(ask), to: this.askRecipient(ask) });
+      askChildrenByParent.set(parent, asks);
     }
     const progress = this.state.storage.sql.exec(
       `SELECT seq, ts, actor, artefact_id, detail FROM events
@@ -2749,9 +2835,10 @@ export class KnowledgeHub {
     // planes can show "asked to X (offline, N min ago)" without any new
     // permission: the board payload is the ask band's only data source.
     for (const t of tasks) {
-      const pending = askChildOf.get(t.id);
-      const pendingAsk = pending ? JSON.parse(String(pending.cmeta ?? "{}")).ask : undefined;
-      if (pendingAsk) t.meta.awaiting_ask = { ask_id: pending.id, route: askRoute(pendingAsk), to: this.askRecipient(pendingAsk) };
+      const openAsks = askChildrenByParent.get(t.id) ?? [];
+      const openAsk = openAsks.find(ask => ask.route.kind === "human_decision") ?? openAsks[0];
+      if (openAsk) t.meta.awaiting_ask = { ask_id: openAsk.id, route: openAsk.route, to: openAsk.to };
+      t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), openAsks);
       if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
         t.meta.ask.route = askRoute(t.meta.ask);
         if (!isHumanDecisionAsk(t.meta.ask)) t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
@@ -4196,7 +4283,7 @@ export class KnowledgeHub {
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
-    if (["review_result", "review_subject", "work_revision", "human_delivery_approval"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
+    if (["review_result", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
     if (createMeta.delivery_disposition !== undefined) throw new Error("gate: delivery disposition cannot be forged through create metadata");
     if (createMeta.batch_auth !== undefined) throw new Error("gate: disposition authority cannot be forged through create metadata");
     if (createMeta.disposition_request !== undefined) createMeta.disposition_request = DispositionRequestSchema.parse(createMeta.disposition_request);
@@ -4711,7 +4798,7 @@ export class KnowledgeHub {
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
     if (metaDel.includes(LANE_REVISION) || body.meta && Object.hasOwn(body.meta, LANE_REVISION)) throw new Error("gate: lane revisions are owned by canonical persistence");
-    if (["review_result", "execution_review_of", "review_subject", "work_revision", "human_delivery_approval"].some(k => metaDel.includes(k)
+    if (["review_result", "execution_review_of", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
       || (body.meta && Object.hasOwn(body.meta, k) && JSON.stringify(body.meta[k]) !== JSON.stringify(preMeta[k]))))
       throw new Error("gate: review results and subject bindings are owned by the review lifecycle, not metadata updates");
     if (row.type === "task" && !OWNER_RELEASE_EXEMPT.test(actor)) {
@@ -7106,11 +7193,35 @@ export class KnowledgeHub {
       ? body.body_md
       : String(row.body_md ?? "");
     const terminalStartup = ["done", "superseded"].includes(verdict.status);
-    const unblockResult = body.unblock_result;
+    let unblockResult = body.unblock_result;
+    if (verdict.status === "in_review" && meta.machine_duty?.kind === "task-recovery") {
+      delete meta.wait_repair_result;
+      if (meta.machine_duty.wait_episode && unblockResult === undefined) {
+        const parent = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, String(meta.machine_duty.subject ?? ""));
+        const binding = JSON.parse(String(parent?.meta ?? "{}")).blocked?.repairing;
+        if (parent?.status === "blocked" && binding?.duty === id && binding.episode === meta.machine_duty.wait_episode) {
+          throw new Error("gate: this wait recovery must submit an observable replacement or record an authorized disposition before review");
+        }
+      }
+    }
+    if (unblockResult !== undefined && verdict.status === "in_review"
+      && meta.machine_duty?.kind === "task-recovery") {
+      const wait = validateAwaitEvent(unblockResult.await_event);
+      const parentId = String(meta.machine_duty.subject ?? "");
+      const parent = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, parentId);
+      const binding = JSON.parse(String(parent?.meta ?? "{}")).blocked?.repairing;
+      if (parent?.status !== "blocked" || binding?.duty !== id || binding.episode !== meta.machine_duty.wait_episode || unblockResult.parent_id !== parentId
+        || unblockResult.kind !== "reblocked" || !wait || !this.isRepairReplacement(parentId, id, wait, binding.original)
+        || !String(unblockResult.reason ?? "").trim() || !String(unblockResult.next ?? "").trim()) {
+        throw new Error("gate: recovery review requires a different observable condition bound to this blocked task");
+      }
+      meta.wait_repair_result = { parent_id: parentId, episode: binding.episode, revision: meta.work_revision, await_event: wait, reason: String(unblockResult.reason), next: String(unblockResult.next) };
+      unblockResult = undefined;
+    }
     let rebound: { id: string; meta: Record<string, unknown> } | null = null;
     if (unblockResult !== undefined) {
       const wait = validateAwaitEvent(unblockResult.await_event);
-      if (verdict.status !== "done" || !tRoles.includes("unblock") || unblockResult.kind !== "reblocked" || !wait || isSelfAwait(String(unblockResult.parent_id), wait) || !String(unblockResult.reason ?? "").trim() || !String(unblockResult.next ?? "").trim()) throw new Error("gate: invalid unblock rebind result");
+      if (verdict.status !== "done" || !tRoles.includes("unblock") || unblockResult.kind !== "reblocked" || !wait || wait.event === "issue_closed" || wait.event === "recovery_required" || isSelfAwait(String(unblockResult.parent_id), wait) || !String(unblockResult.reason ?? "").trim() || !String(unblockResult.next ?? "").trim()) throw new Error("gate: invalid unblock rebind result");
       const parent = this.one(`SELECT p.* FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=? AND r.relation='child_of' AND p.id=?`, id, String(unblockResult.parent_id));
       if (!parent || parent.status !== "blocked") throw new Error("gate: unblock rebind requires the blocked duty parent");
       const pm = JSON.parse(String(parent.meta ?? "{}"));
@@ -14970,25 +15081,67 @@ export class KnowledgeHub {
     }
   }
 
-  private async ensureTaskRecovery(taskId: string, reason: RecoveryReason): Promise<string> {
-    const pending = this.taskRecoveries.get(taskId);
-    if (pending) return pending;
-    const run = this.createTaskRecovery(taskId, reason);
-    this.taskRecoveries.set(taskId, run);
-    try { return await run; } finally { this.taskRecoveries.delete(taskId); }
+  /** Assign evidence-gathering for exhausted budgets and unknown effects.
+   * The subject's admission fence continues to own its exit. */
+  private async scheduleAttemptDiagnosis(): Promise<void> {
+    const candidates = this.state.storage.sql.exec(`
+      SELECT a.id, a.meta, e.state FROM execution_state e JOIN artefacts a ON a.id=e.task_id
+      WHERE a.type='task' AND a.status='todo' AND a.owner=''
+        AND coalesce(json_extract(a.meta,'$.machine_duty.kind'), '') != 'task-recovery'
+        AND (json_extract(e.state,'$.budget_exhaustions') > 0
+          OR json_extract(e.state,'$.retry_strategy') IS NOT NULL
+          OR EXISTS (SELECT 1 FROM json_each(e.state,'$.operations') op
+            WHERE json_extract(op.value,'$.state') IN ('prepared','outcome_unknown')))
+      ORDER BY a.updated_ts ASC`).toArray();
+    let scheduled = 0;
+    for (const row of candidates) {
+      if (scheduled >= 4) break;
+      const id = String(row.id);
+      try {
+        const meta = JSON.parse(String(row.meta ?? "{}"));
+        const state = ExecutionStateSchema.parse(JSON.parse(String(row.state)));
+        const hold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
+        if ((hold !== "retry_budget" && hold !== "unknown_operations")
+          || (meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis.hold === hold)
+          || (hold === "retry_budget" && recoveryPermitCoversAttempt(state, Date.now()))
+          || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
+          || this.protectedExecution(id, meta) || todoDispatchHold(meta)) continue;
+        const duty = await this.ensureTaskRecovery(id, "execution_environment");
+        const fresh = this.executionState(id);
+        if (fresh?.generation !== state.generation) continue;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?))
+          WHERE id=? AND status='todo' AND owner=''`, JSON.stringify({ generation: state.generation, hold, duty }), id);
+        scheduled++;
+      } catch (e) {
+        this.audit("system:recovery", "execution_diagnosis_failed", id, { error: String(e).slice(0, 240) });
+      }
+    }
   }
 
-  private async createTaskRecovery(taskId: string, reason: RecoveryReason): Promise<string> {
-    const active = this.one(`SELECT id FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' OR (? = 'execution_environment' AND json_extract(meta, '$.machine_duty.kind') IN ('diagnostic','line_recovery'))) AND json_extract(meta, '$.machine_duty.subject') = ? ORDER BY created_ts DESC LIMIT 1`, reason, taskId);
+  private async ensureTaskRecovery(taskId: string, reason: RecoveryReason, waitEpisode?: string): Promise<string> {
+    const key = waitEpisode ? JSON.stringify([taskId, reason, waitEpisode]) : taskId;
+    const pending = this.taskRecoveries.get(key);
+    if (pending) return pending;
+    const run = this.createTaskRecovery(taskId, reason, waitEpisode);
+    this.taskRecoveries.set(key, run);
+    try { return await run; } finally { this.taskRecoveries.delete(key); }
+  }
+
+  private async createTaskRecovery(taskId: string, reason: RecoveryReason, waitEpisode?: string): Promise<string> {
+    const active = this.one(`SELECT id FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' OR (? = 'execution_environment' AND json_extract(meta, '$.machine_duty.kind') IN ('diagnostic','line_recovery'))) AND json_extract(meta, '$.machine_duty.subject') = ?
+      AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
+      ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "");
     if (active) return String(active.id);
-    const parent = this.one(`SELECT title, meta FROM artefacts WHERE id = ?`, taskId);
+    const parent = this.one(`SELECT title, project FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
-    const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
-    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
+    const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "repeated_failure" ? "Diagnose repeated execution failures" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
+    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), project: parent.project, session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason, ...(waitEpisode && { wait_episode: waitEpisode }) } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
 
-Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. For an exhausted execution budget, inspect the durable attempt and distinguish provider, environment, and strategy failure. Obtain a valid recovery permit or independently reviewed strategy before resuming; a cleared counter, timer, or completed diagnostic alone cannot authorize retry. For unknown operations, inspect the external system by operation identity and arrange for the original executor to record the verified result against its existing fence. Never repeat the operation to find out whether it succeeded. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+
+When the affected task is waiting on this recovery duty, submit a replacement condition on transition to in_review with unblock_result {kind:"reblocked",parent_id:"${taskId}",reason,next,await_event}. The independent reviewer verifies that the replacement is causal and observable. If no replacement is feasible, obtain a receipt-backed disposition. Completion alone will not release the task.
 
 Keep changes and disposition receipts on the affected task. Finish this recovery task with execution_result {outcome:"<actual result>",receipts:["<per-action evidence>"]}. If no repair is needed, cite the current executor or delivered outcome as the receipt. Escalate only a concrete missing human authority, information or product choice, with its affected task and explicit consequences.` }, "system:recovery");
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, duty.id, taskId, Date.now());
@@ -15001,8 +15154,100 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return duty.id;
   }
 
-  /** Repair an invalid wait without taking over its executor or dropping the
-   * product outcome. Completion of the repair only resumes the parent's work. */
+  private isRepairReplacement(parent: string, duty: string, next: AwaitEvent, original: unknown): boolean {
+    const previous = validateAwaitEvent(original);
+    return next.event !== "issue_closed" && next.event !== "executor_capability" && next.event !== "local_handoff"
+      && next.event !== "recovery_required" && next.event !== "ask" && next.event !== "br_answered"
+      && !isSelfAwait(parent, next)
+      && !(next.event === "br_done" && (next.id === duty || !this.one(`SELECT 1 FROM artefacts WHERE id=? AND type='task'`, next.id)))
+      && !((previous?.event === "time" || previous?.event === "recovery_required") && next.event === "time")
+      && JSON.stringify(previous) !== JSON.stringify(next);
+  }
+
+  /** A recovery duty owns diagnosis. Only an independently accepted, bound
+   * replacement predicate can replace the failed condition. */
+  private applyReviewedWaitRepair(id: string, evaluated: any, dutyId: string): void {
+    const duty = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, dutyId);
+    if (duty?.status !== "done") return;
+    const dm = JSON.parse(String(duty.meta ?? "{}"));
+    const reviewed = this.currentTaskReview(dutyId);
+    const result = dm.wait_repair_result;
+    const next = validateAwaitEvent(result?.await_event);
+    if (reviewed.phase !== "accepted" || reviewed.result.kind !== "accepted_execution"
+      || reviewed.subject.revision !== dm.work_revision || result?.revision !== dm.work_revision
+      || result?.episode !== evaluated.blocked.repairing.episode || result?.parent_id !== id || !next
+      || !this.isRepairReplacement(id, dutyId, next, evaluated.blocked.repairing.original)) return;
+    const row = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, id);
+    const meta = JSON.parse(String(row?.meta ?? "{}"));
+    if (row?.status !== "blocked" || meta.blocked?.repairing?.duty !== dutyId
+      || meta.blocked.repairing.episode !== result.episode || meta.blocked.ts !== evaluated.blocked.ts || this.protectedExecution(id, meta) || this.startupHasAsk(id)) return;
+    this.state.storage.transactionSync(() => {
+      meta.blocked = { reason: result.reason, unblock_condition: describeAwaitEvent(next), await_event: next, ts: Date.now() };
+      delete meta.proxy_check;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), id);
+      this.version(id, "system:recovery", "wait_repaired", "An independently reviewed recovery established a replacement wait.", { duty: dutyId, await_event: next, review: reviewed.id });
+    });
+  }
+
+  /** Replace the exact failed wait, preserving claims, delivery, and any
+   * independently owned ask or train slot. Recheck after creating the duty. */
+  private async repairBlockedWait(id: string, expected: AwaitEvent, since: unknown, reason: string): Promise<boolean> {
+    const current = () => {
+      const row = this.one(`SELECT status, owner, meta FROM artefacts WHERE id=?`, id);
+      if (row?.status !== "blocked") return null;
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      const execution = this.executionState(id);
+      if (meta.blocked?.ts !== since
+        || JSON.stringify(validateAwaitEvent(meta.blocked?.await_event)) !== JSON.stringify(expected)
+        || this.isUnclaimableAnchor({ id }, meta) || meta.lane || meta.operator_gated || meta.delivery_disposition
+        || meta.interactive_execution || meta.awaiting_ask || this.startupHasAsk(id) || this.protectedExecution(id, meta)
+        || this.strandOwnerLive(row.owner, meta, this.staleMinutes())
+        || (trainLegs(meta).length > 0 && trainOnlyAwait(meta))
+        || ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))
+        || execution?.attempt && execution.attempt.phase !== "quiesced"
+        || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return null;
+      const oldDuties = this.state.storage.sql.exec(`
+        SELECT c.id, c.status, c.owner, c.meta, c.title, c.body_md
+        FROM relations r JOIN artefacts c ON c.id=r.src_id
+        WHERE r.dst_id=? AND r.relation='child_of' AND c.status NOT IN ('done','superseded')
+          AND json_extract(c.meta, '$.machine_duty.kind')='unblock'
+          AND json_extract(c.meta, '$.machine_duty.subject')=?`, id, id).toArray();
+      for (const duty of oldDuties) {
+        if (duty.status !== "todo" || duty.owner
+          || this.staleReviewHasExecutionHold(String(duty.id), JSON.parse(String(duty.meta ?? "{}")))) return null;
+        try { this.conserveDelivery(duty, "", false); } catch { return null; }
+      }
+      return { meta, oldDuties };
+    };
+    const before = current();
+    if (!before || before.meta.machine_duty?.kind === "task-recovery"
+      || (expected.event === "br_done" && before.meta.recovery?.task_id === expected.id)) return false;
+    const episode = JSON.stringify([expected, since]);
+    const duty = await this.ensureTaskRecovery(id, expected.event === "time" || expected.event === "recovery_required" ? "repeated_failure" : "resume_condition", episode);
+    const replacement = current();
+    if (!replacement) return false;
+    const { meta, oldDuties } = replacement;
+    const await_event = { event: "br_done", id: duty } satisfies AwaitEvent;
+    this.state.storage.transactionSync(() => {
+      meta.blocked = { ...meta.blocked, reason, unblock_condition: describeAwaitEvent(await_event), await_event,
+        repairing: { duty, episode, original: expected } };
+      delete meta.proxy_check;
+      delete meta.last_unblock_spawn;
+      const now = Date.now();
+      for (const old of oldDuties) {
+        this.state.storage.sql.exec(`UPDATE artefacts SET status='superseded', status_ts=?, updated_ts=? WHERE id=?`, now, now, old.id);
+        const detail = { from: "todo", to: "superseded", replacement: duty };
+        this.version(String(old.id), "system:recovery", "transition", "The previous wait was replaced by a recovery duty.", detail);
+        this.audit("system:recovery", "transition", String(old.id), detail);
+      }
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta=?, updated_ts=? WHERE id=?`, JSON.stringify(meta), Date.now(), id);
+      this.version(id, "system:recovery", "wait_replaced", reason, { previous: expected, await_event });
+      this.audit("system:recovery", "wait_replaced", id, { previous: expected, await_event });
+    });
+    return true;
+  }
+
+  /** Completion of the repair only resumes the parent's original work. */
   private async parkOnRecovery(taskId: string, dutyId: string, reason: string): Promise<void> {
     const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, taskId);
     if (!row || row.status === "done" || row.status === "superseded") return;

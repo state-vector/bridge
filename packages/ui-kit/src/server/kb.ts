@@ -1,5 +1,5 @@
 import { getKbHubConfig } from "./config";
-import type { ExecutionModelView, GatewayDispatch, LaneOperationalState } from "@bridge/contracts";
+import type { ExecutionModelView, GatewayDispatch, LaneOperationalState, WorkWait } from "@bridge/contracts";
 import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
@@ -25,6 +25,7 @@ export interface KbArtefact {
   /** Read-only model observation projected from the canonical execution attempt. */
   execution?: ExecutionModelView;
   gateway_dispatch?: GatewayDispatch;
+  work_waits?: WorkWait[];
   created_ts: number;
   updated_ts: number;
   status_ts?: number;

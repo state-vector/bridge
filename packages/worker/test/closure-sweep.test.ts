@@ -1037,7 +1037,7 @@ describe("BR#4562 — the blocked-park drain checks the release-hold before atte
     expect(refusals, `expected no transition_rejected for the held park, got ${JSON.stringify(refusals.map((e: any) => String(e.detail?.reason ?? "").slice(0, 90)))}`).toEqual([]);
   });
 
-  it("the drain still drains what it should: a dead park with NO typed wait releases to todo with the stamp", async () => {
+  it("the drain preserves historical churn for diagnosis", async () => {
     // The churn-stamp population: a blocked park carrying guard boilerplate
     // and NO typed event (the shape blockedParkVerdict was written for). The
     // hold check must gate ONLY the held shape — everything else drains.
@@ -1067,8 +1067,8 @@ describe("BR#4562 — the blocked-park drain checks the release-hold before atte
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error).toBeUndefined();
     const after = await taskById(id);
-    expect(after.status, "a dead park with no machine wait is the drain's legitimate work").toBe("todo");
-    expect(after.meta?.blocked_drained?.klass).toBe("churn-park");
+    expect(after.status, "a historical churn park needs diagnosis before another attempt").toBe("blocked");
+    expect(after.meta.blocked_drained).toBeUndefined();
   });
 });
 

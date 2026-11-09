@@ -31,3 +31,5 @@ export * from "./model-policy.ts";
 export * from "./execution-observability.ts";
 export * from "./hub-diagnostics.ts";
 export { WorkerStatusSchema, currentWorkerStatus, WorkerSlotSchema, WorkerOccupancySchema, currentWorkerOccupancy, type WorkerStatus, type WorkerSlot, type WorkerOccupancy } from "./worker-status.ts";
+
+export type { AwaitEvent, WorkWait } from "./work-wait.ts";
