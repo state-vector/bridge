@@ -203,6 +203,83 @@ async function stopAsks(sha9: string): Promise<any[]> {
 }
 
 describe("train stop-the-line (real DO — executor-fed red, hub decides)", () => {
+  it.each(["todo", "in_progress"])("BR#9233: a different failing head does not repurpose a %s repair", async (oldStatus) => {
+    const repo = `state-vector/root-fix-identity-${oldStatus}`, actor = "gw-root-fix-identity";
+    const oldHead = "1".repeat(40), head = "2".repeat(40);
+    const oldFailure = "Cortex Quality Smoke", failure = "Lodestar Operational Health";
+    await acquire(repo, actor, { required_workflows: [failure] });
+    const laneId = (await laneSnap(repo)).card;
+    const oldProgress = { note: "Keep previous incident work", completion_pct: 80, ts: Date.now() - 60_000 };
+    const oldResume = { kind: "terminal_result", generation: 1, attempt_id: "earlier-attempt" };
+    const old = await kbJson("/create", {
+      type: "task", title: `Repair ${oldFailure} at ${oldHead.slice(0, 9)}`, body_md: "Prior investigation and WIP.",
+      qualified: true, roles: ["impl"], tags: ["root_blocker", "main-red", "p0"],
+      meta: { child_of_lane: laneId, root_fix: { repo, base: "main", head_sha: oldHead, failing: [oldFailure] },
+        last_progress: oldProgress, execution_resume: oldResume },
+    });
+    expect(old.status).toBe(200);
+    if (oldStatus === "in_progress") {
+      expect((await kbJson("/transition", {
+        id: old.body.id, to: oldStatus, actor: "previous-repair", session: "previous-repair-session",
+      })).status).toBe(200);
+    }
+    const before = (await kbJson("/get", { id: old.body.id })).body;
+    const stop = () => kbJson("/train.event", {
+      repo, actor, kind: "stopped", merge_sha: head,
+      failing: [{ name: failure, conclusion: "failure", url: "https://example/ci/lodestar" }],
+    });
+    expect((await stop()).status).toBe(200);
+    const fresh = (await laneSnap(repo)).lane_state.fix_card;
+    expect(fresh.id).not.toBe(old.body.id);
+    expect(fresh).toMatchObject({ title: expect.stringContaining(`${head.slice(0, 9)} (${failure})`), status: "todo" });
+    expect(fresh.last_progress).toBeUndefined();
+    const freshTask = (await kbJson("/get", { id: fresh.id })).body;
+    expect(freshTask.meta.root_fix).toMatchObject({ repo, base: "main", head_sha: head, failing: [failure] });
+    expect(freshTask.meta.execution_resume).toBeUndefined();
+    expect(freshTask.body_md).toContain("https://example/ci/lodestar");
+    const after = (await kbJson("/get", { id: old.body.id })).body;
+    expect(after).toMatchObject({ status: oldStatus, title: before.title, body_md: before.body_md,
+      meta: { root_fix: before.meta.root_fix, last_progress: oldProgress, execution_resume: oldResume } });
+
+    expect((await stop()).status).toBe(200);
+    expect((await laneSnap(repo)).lane_state.fix_card.id).toBe(fresh.id);
+    expect((await kbJson("/get", { id: fresh.id })).body.meta.root_fix.bound_at).toBe(freshTask.meta.root_fix.bound_at);
+  });
+
+  it("BR#9233: an already-rebound generated repair projects its exact identity without old progress", async () => {
+    const repo = "state-vector/root-fix-identity-legacy", actor = "gw-root-fix-legacy";
+    const head = "3".repeat(40), failure = "Lodestar Operational Health";
+    await acquire(repo, actor, { required_workflows: [failure] });
+    const laneId = (await laneSnap(repo)).card;
+    const stale = await kbJson("/create", {
+      type: "task", title: "Older generated repair for Cortex", body_md: "Do not overwrite old investigation.",
+      qualified: true, roles: ["impl"], tags: ["root_blocker", "main-red", "p0"],
+      meta: { child_of_lane: laneId, root_fix: { repo, base: "main", head_sha: head, failing: [failure], bound_at: Date.now() },
+        last_progress: { note: "Previous failing head", completion_pct: 80, ts: Date.now() - 60_000 } },
+    });
+    expect(stale.status).toBe(200);
+    const stop = () => kbJson("/train.event", {
+      repo, actor, kind: "stopped", merge_sha: head, failing: [{ name: failure, conclusion: "failure" }],
+    });
+    expect((await stop()).status).toBe(200);
+    const lane = await laneSnap(repo);
+    const fix = lane.lane_state.fix_card;
+    expect(fix).toMatchObject({ id: stale.body.id, title: expect.stringContaining(`${head.slice(0, 9)} (${failure})`) });
+    expect(fix.last_progress).toBeUndefined();
+    expect(lane.line.remediation.task.title).toBe(fix.title);
+    const stored = (await kbJson("/get", { id: stale.body.id })).body;
+    expect(stored).toMatchObject({ title: "Older generated repair for Cortex", body_md: "Do not overwrite old investigation.",
+      meta: { last_progress: { note: "Previous failing head" } } });
+
+    const executor = { actor: "exact-repair", session: "exact-repair-session" };
+    expect((await kbJson("/transition", { id: fix.id, to: "in_progress", ...executor })).status).toBe(200);
+    expect((await kbJson("/progress.log", { id: fix.id, did: "Investigating Lodestar", ...executor })).status).toBe(200);
+    expect((await stop()).status).toBe(200);
+    expect((await laneSnap(repo)).lane_state.fix_card).toMatchObject({
+      id: fix.id, title: fix.title, active_agent: true, last_progress: { note: "Investigating Lodestar" },
+    });
+  });
+
   it("red required runs on the merged commit stop the line: NO stop-time human ask (BR#5631) — the root-fix card spawns at p0 with the blame edge, the culprit bounces with the failing runs", async () => {
     const repo = "state-vector/superpositional";
     const culprit = await parkQueued("IMPL: stop-line drill — culprit");

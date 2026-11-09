@@ -111,6 +111,9 @@ deployment after each batch.
 An active deployment for the exact main tip holds the line while an older
 synthetic deploy-health check still shows red. Failed required jobs and decisive
 deployment failures open a repair for that attempt.
+Repeat observations of a failed main head reuse its repair card. A different
+failed head gets its own card, with the previous investigation kept on its
+original task.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 

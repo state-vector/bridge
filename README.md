@@ -2141,6 +2141,10 @@ main landed nothing. Two laws close the class:
 
 ### The root-fix fast lane (BR#5190, steering BR#5189)
 
+Each failing main head gets a repair card tied to its exact commit. Repeat
+observations reuse the same repair. When a different head fails, the new
+repair starts with its own evidence and the earlier task keeps its progress.
+
 A stop-the-line episode now spawns its own cure, and the cure jumps every queue.
 When the stop fires, the hub ensures ONE root-fix card for the red — tagged
 `root_blocker` + `main-red` + `p0`, role impl, a child of the lane relation —

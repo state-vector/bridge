@@ -11673,14 +11673,20 @@ export class KnowledgeHub {
     culpritId: string | null;
     pr: number | null;
   }): Promise<string | null> {
+    const head = a.sha.toLowerCase();
+    const isExact = (m: unknown) => {
+      const binding = mainRedBinding(m, a.base);
+      return binding?.repo === a.repo && binding.head_sha.toLowerCase() === head;
+    };
     const bind = (m: any) => {
+      const previousBoundAt = isExact(m) ? m.root_fix?.bound_at : undefined;
       m.root_fix = {
         repo: a.repo,
         head_sha: a.sha,
         base: a.base,
         why: a.why,
         failing: a.failing.map((f) => f.name),
-        bound_at: a.now,
+        bound_at: Number.isFinite(previousBoundAt) ? previousBoundAt : a.now,
         lane: laneKey(a.repo, a.base),
         ...(a.pr ? { pr: a.pr } : {}),
       };
@@ -11691,6 +11697,7 @@ export class KnowledgeHub {
       const repair = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, id);
       if (!repair || ["done", "superseded"].includes(repair.status)) continue;
       const rm = JSON.parse(repair.meta ?? "{}");
+      if (mainRedBinding(rm) && !isExact(rm)) continue;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(bind(rm)), id);
       return id;
     }
@@ -11699,44 +11706,36 @@ export class KnowledgeHub {
       const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
       if (c && c.status !== "done" && c.status !== "superseded") {
         const cm = JSON.parse(c.meta ?? "{}");
-        const binding = mainRedBinding(cm, a.base);
-        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && binding?.repo === a.repo && binding.head_sha === a.sha) {
+        if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && isExact(cm)) {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
           this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
           return c.id;
         }
       }
     }
-    // (2) re-bind an open root-fix card for this repo — NEVER rebind a
-    // blocked zombie from an older sha (e.g. BR#5534 parked on pr_merged of a
-    // prior episode's cure PR, which left zero claimable todo card for the
-    // new red). Only reuse todo/in_progress/in_review cards or a blocked card
-    // already bound to THIS exact sha.
+    // (2) reuse an open repair for this exact head. Older incidents retain
+    // their task identity, execution state, and progress even after main moves.
     const open = this.state.storage.sql.exec(
-      `SELECT id, status, meta, tags FROM artefacts
+      `SELECT id, meta, tags FROM artefacts
        WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-        AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR tags LIKE '%main-red%')
-        AND (json_type(meta, '$.root_fix') = 'object' OR json_extract(meta, '$.root_blocker_for_lane') IS NOT NULL
-          OR json_extract(meta, '$.main_tip') IS NOT NULL OR json_extract(meta, '$.tip_sha') IS NOT NULL OR json_extract(meta, '$.red_since') IS NOT NULL)
-        ORDER BY created_ts DESC LIMIT 20`,
-      a.repo, a.repo, a.repo,
-    ).toArray() as any[];
+        AND (lower(json_extract(meta, '$.root_fix.head_sha')) = ?
+          OR lower(json_extract(meta, '$.main_tip')) = ?
+          OR lower(json_extract(meta, '$.tip_sha')) = ?
+          OR lower(json_extract(meta, '$.red_since')) = ?)
+        ORDER BY created_ts DESC`,
+      head, head, head, head,
+    ).toArray();
     for (const o of open) {
-      const om = JSON.parse(o.meta ?? "{}");
-      const binding = mainRedBinding(om, a.base);
-      if (!isRootFixCard({ tags: parseTags(o.tags), meta: om }) || binding?.repo !== a.repo) continue;
-      const sameSha = String(om.root_fix?.head_sha ?? "").toLowerCase() === a.sha.toLowerCase();
-      if (!sameSha && (o.status === "blocked" || trainLegs(om).length > 0 || om.review_pr || om.recovery_links?.length)) continue;
-      if (!sameSha && this.rootFixExhausted(om, String(o.status ?? ""))) continue;
+      const om = JSON.parse(String(o.meta ?? "{}"));
+      if (!isExact(om) || !isRootFixCard({ tags: parseTags(o.tags), meta: om })) continue;
       const nextFailing = a.failing.map((f) => f.name);
       const prevFailing = Array.isArray(om.root_fix?.failing) ? om.root_fix.failing.map(String) : [];
-      const changed = !sameSha || JSON.stringify(prevFailing) !== JSON.stringify(nextFailing);
       om.boosted = om.boosted ?? a.now;
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(om)), o.id);
-      if (changed) {
-        this.version(o.id, a.actor, "update", `root-fix card rebound to the live failing run ${a.sha.slice(0, 9)} (stop-the-line, BR#5190)`, {});
+      if (JSON.stringify(prevFailing) !== JSON.stringify(nextFailing)) {
+        this.version(String(o.id), a.actor, "update", `root-fix checks refreshed for ${a.sha.slice(0, 9)} (BR#5190)`, {});
       }
-      return o.id;
+      return String(o.id);
     }
     // (3) spawn fresh — absolute p0 (boosted + qualified so any gateway/agent claims immediately)
     const created = await this.create(
@@ -12597,7 +12596,7 @@ export class KnowledgeHub {
       // root-fix fast lane (BR#5189 §5). BR#5517's Guilty line survives on
       // the root-fix card's blame edge and the lane's ledger row.
       const askId: string | null = null;
-      // BR#5190: auto-spawn (or re-bind) THE root-fix card at absolute p0 —
+      // BR#5190: ensure the exact-head root-fix card at absolute p0 —
       // it jumps every queue tier, and the stopped executor's walk fast-tracks
       // its PR (or opens the human fast-lane ask for the circular
       // deploy-health class). Best-effort: a spawn failure must never eat the
@@ -15356,6 +15355,13 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     } catch {
       m = {};
     }
+    // Older machine cards could be rebound with their previous title and
+    // progress still attached. Project the exact binding without rewriting WIP.
+    const generatedBinding = typeof m.child_of_lane === "string" && m.root_fix ? mainRedBinding(m) : null;
+    const boundAt = generatedBinding && Number.isFinite(m.root_fix.bound_at) ? m.root_fix.bound_at : 0;
+    const title = generatedBinding && Array.isArray(m.root_fix.failing)
+      ? rootFixCardTitle(generatedBinding.repo, generatedBinding.head_sha, m.root_fix.failing.map(String))
+      : String(r.title ?? "");
     const status = String(r.status ?? "");
     const owner = r.owner ? this.displayOwner(String(r.owner)).trim() || undefined : undefined;
     const executorSession =
@@ -15366,14 +15372,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       Number(m?.session_alive_ts ?? 0),
       Number(m?.last_progress?.ts ?? 0),
     );
-    const activeAgent = status === "in_progress" && !!executorSession && lastSig > 0 && now - lastSig < 10 * 60_000;
+    const activeAgent = status === "in_progress" && !!executorSession && lastSig > 0 && lastSig >= boundAt && now - lastSig < 10 * 60_000;
     const blockedReason =
       status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
         ? m.blocked.reason.trim()
         : undefined;
     const lp = m?.last_progress;
     const lastProgress =
-      lp && typeof lp === "object" && typeof lp.note === "string" && lp.note.trim() && Number.isFinite(Number(lp.ts))
+      lp && typeof lp === "object" && typeof lp.note === "string" && lp.note.trim() && Number.isFinite(Number(lp.ts)) && Number(lp.ts) >= boundAt
         ? {
             note: String(lp.note).trim(),
             ...(typeof lp.will === "string" && lp.will.trim() ? { will: String(lp.will).trim() } : {}),
@@ -15386,7 +15392,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return {
       id: String(r.id),
       url: this.cardUrl(String(r.id)),
-      title: String(r.title ?? ""),
+      title,
       status,
       ...(owner ? { owner } : {}),
       ...(executorSession ? { executor_session: executorSession } : {}),
