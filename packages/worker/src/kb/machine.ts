@@ -1203,6 +1203,26 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // both runners stopped, checkpointed and delivered). The class is named
   // so the Log says WHAT fenced; the pricing is never-a-breach.
   execution_fence: Number.POSITIVE_INFINITY,
+  // BR#7684 — the review round's revision fence (do.ts review-result guard):
+  // a verify duty closing with a verdict whose echoed review_subject revision
+  // is missing or does not match the subject's live work_revision is refused
+  // with "gate: stale or missing review subject_revision — echo this duty's
+  // captured review_subject revision and re-verify changed work in a fresh
+  // review round". The fence refusing a stale verdict binding IS the system
+  // working — the BR#4562/BR#6654/BR#7008 pricing law again: zero state
+  // destroyed, verdicts stay fenced to the exact reviewed submission, and the
+  // refusal's own instruction names the cure (re-verify changed work in a
+  // fresh review round — lifecycle auto-spawns that round with the correct
+  // binding). The specimens complied: 3 fence events on BR#7509 (2026-11-07
+  // 08:35–08:49Z, a duty captured at the attempt-1 'legacy' sentinel while
+  // the parent re-submitted attempt-2) folded "unclassified" and raised
+  // BR#7684; the round closed in the auto-spawned successor duty and the
+  // parent landed done — and 3 further events on BR#7761 (2026-11-07
+  // 16:44–17:09Z, a verify duty holding a stale review_subject capture while
+  // BR#5989's fresh round spun up; breach card BR#8034, which reconciled to
+  // this fix) coalesced the same way while this class awaited its merge.
+  // Named so the Log says WHAT fenced; priced never-a-breach.
+  review_fence: Number.POSITIVE_INFINITY,
   // BR#6740 — the doTransition exit gate for typed execution waits (do.ts,
   // isExecutionWait / local handoff preparing|waiting): ANY ordinary
   // transition/ask/timeout on a card whose exit a durable execution wait owns
@@ -1354,6 +1374,18 @@ export function breachClass(reason: string): string {
   // (BR#3611/BR#3612 wording-drift lesson); it sits ~15 chars in, far inside
   // the 300-char audit slice, so the classification survives any tail.
   if (r.includes("execution mutation fenced")) return "execution_fence";
+  // BR#7684: the review round's revision fence refusing a stale or mismatched
+  // verdict binding — the duty's captured review_subject revision is missing
+  // or does not equal the subject's live work_revision (do.ts review-result
+  // guard, do.ts:6647). Match the structural fragment "stale or missing
+  // review subject_revision", not the whole sentence (BR#3611/BR#3612
+  // wording-drift lesson); it sits ~7 chars in, far inside the 300-char
+  // audit slice, so the classification survives any tail. Specimens: 3
+  // compliant fence events on BR#7509 (2026-11-07, captured 'legacy'
+  // sentinel vs re-submitted parent) folded "unclassified" and raised
+  // BR#7684; second specimen BR#7761 (3 events 2026-11-07 16:44–17:09Z,
+  // breach card BR#8034) coalesced identically; priced never-a-breach above.
+  if (r.includes("stale or missing review subject_revision")) return "review_fence";
   // BR#6740: the doTransition exit gate for typed execution waits — an
   // ordinary transition/ask/timeout on a card whose exit a durable execution
   // wait owns (meta.blocked.await_event local_handoff/executor_capability, or
