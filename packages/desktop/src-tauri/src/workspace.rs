@@ -258,6 +258,17 @@ impl Owner {
         legacy::adopt(self)?;
         let mut records = self.records()?;
         records.sort_by_key(|r| (r.checked_at, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
+        if self.status().is_ok_and(|status| matches!(status.admission, Admission::Held { .. })) {
+            // Keep the normal fair pass, with one pressure slot for the
+            // largest released allocation that can be checked now.
+            let now = now_ms();
+            if let Some((index, _)) = records.iter().enumerate()
+                .filter(|(_, record)| record.observed_bytes > 0 && record.retry_at <= now
+                    && matches!(&record.phase, Phase::Released { owner } if !protected.contains(owner.ticket())))
+                .max_by_key(|(index, record)| (record.observed_bytes, std::cmp::Reverse(*index))) {
+                records[..=index].rotate_right(1);
+            }
+        }
         let mut visited = 0;
         for old in &records {
             if matches!(old.phase, Phase::Removed { .. }) || old.retry_at > now_ms() { continue; }

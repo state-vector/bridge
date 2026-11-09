@@ -249,6 +249,42 @@ fn a_legacy_standalone_build_cache_is_adopted_from_its_standard_disposal_marker(
 }
 
 #[test]
+fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
+    let sandbox = Sandbox::new();
+    let owner = sandbox.owner();
+    ready(&owner);
+    for i in 0..BATCH {
+        let id = format!("legacy-{i}");
+        let path = sandbox.0.join(&id);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("unpublished-input"), "keep this").unwrap();
+        owner.save(&Resource {
+            version: 1, id, location: Location::Legacy { root: path, task: None },
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+        }).unwrap();
+    }
+    let t = ticket("released-under-pressure");
+    let a = owner.allocate(&t, None).unwrap();
+    fs::write(a.root.join("cache/build-object"), vec![7u8; 256 * 1024]).unwrap();
+    let root = a.root.clone();
+    let id = a.id.clone();
+    drop(a);
+    owner.release(&released(&Ownership::Reservation { ticket: t })).unwrap();
+    let mut record = owner.read(&id).unwrap();
+    record.checked_at = now_ms();
+    owner.save(&record).unwrap();
+    assert!(matches!(owner.measure_with_limits(1, 0).unwrap().admission, Admission::Held { .. }));
+
+    owner.reconcile(&[]).unwrap();
+    assert!(!root.exists());
+    let checked = (0..BATCH).filter(|i| owner.read(&format!("legacy-{i}")).unwrap().checked_at > 0).count();
+    assert_eq!(checked, BATCH - 1);
+    for i in 0..BATCH {
+        assert_eq!(fs::read_to_string(sandbox.0.join(format!("legacy-{i}/unpublished-input"))).unwrap(), "keep this");
+    }
+}
+
+#[test]
 fn unique_ignored_evidence_survives_while_its_disposable_build_cache_is_reclaimed() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);let t=ticket("ignored-evidence");
