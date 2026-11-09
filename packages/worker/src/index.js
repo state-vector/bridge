@@ -132,6 +132,15 @@ export default {
       if (r.err) return r.err;
       const body = await request.json().catch(() => ({}));
       const kbId = env.KB.get(env.KB.idFromName(doWs(r.ws)));
+      // Resolve both identities in one hub request on the renewal path.
+      if (typeof body.cached_secret === "string") {
+        const proof = await kbGuard("kb.worker.resolve", kbId.fetch("https://kb/worker.resolve.v2", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secret: body.cached_secret, bearer }),
+        }));
+        // An older Durable Object cannot adjudicate the new proof protocol.
+        return proof.status === 404 ? json({ error: "Worker proof protocol updating; retry" }, 503) : proof;
+      }
       // BR#4212: classified infra-vs-auth — a faulted identify is 503 infra,
       // never "unauthorized"
       let ident = null, identInfra = false;
@@ -149,10 +158,6 @@ export default {
       // the label is free-form, so class is read from the tag
       const identTags = Array.isArray(ident.tags) ? ident.tags.map((t) => String(t).toLowerCase()) : [];
       if (!identTags.includes("gateway")) return json({ error: "agent provisioning requires a gateway-class token (gateway tag) — this token is not a gateway" }, 403);
-      if (typeof body.cached_secret === "string") return kbGuard("kb.worker.resolve", kbId.fetch("https://kb/worker.resolve", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ secret: body.cached_secret, token_id: ident.token_id, actor: ident.label }),
-      }));
       return kbGuard("kb.agent.provision", kbId.fetch("https://kb/agent.provision", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ label: body.label, rotate: !!body.rotate, provisioned_by: ident.label }),

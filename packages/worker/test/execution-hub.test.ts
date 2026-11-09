@@ -612,15 +612,20 @@ describe("durable executor on real SQLite", () => {
     const worker = (await post<{ secret: string }>("agent.provision", { label: "cache-host/old", actor: "cache-host" })).data;
     const renamed = await post("token.rename", { bearer: worker.secret, label: "cache-host/current" });
     expect(renamed.data.error).toBeUndefined();
-    const resolve = (cached_secret: string) => mf.dispatchFetch("https://hub.test/api/kb-machine/provision", {
-      method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${gw.secret}` },
+    const resolve = (cached_secret: string, bearer = gw.secret) => mf.dispatchFetch("https://hub.test/api/kb-machine/provision", {
+      method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${bearer}` },
       body: JSON.stringify({ label: "cache-host/old", cached_secret, actor: "web:spoof" }),
     });
+    const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data;
+    const legacy = await post("worker.resolve", { token_id: identity.token_id, actor: "cache-host", secret: worker.secret });
+    expect(legacy.status).toBe(503);
     const proof = await resolve(worker.secret);
     expect(proof.status).toBe(200);
     expect(await proof.json()).toMatchObject({ cached: true, label: "cache-host/current" });
     expect((await resolve(gw.secret)).status).toBe(403);
     expect((await resolve("not-a-credential")).status).toBe(401);
+    expect((await resolve(worker.secret, worker.secret)).status).toBe(403);
+    expect((await resolve(worker.secret, "not-a-gateway")).status).toBe(401);
     const foreign = (await post<{ secret: string }>("admin.mint", { label: "foreign", tags: ["gateway"] })).data;
     const foreignWorker = (await post<{ secret: string }>("agent.provision", { label: "foreign/worker", actor: "foreign" })).data;
     expect((await resolve(foreignWorker.secret)).status).toBe(403);
