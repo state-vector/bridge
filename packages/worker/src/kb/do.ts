@@ -5185,10 +5185,16 @@ export class KnowledgeHub {
     const taskHolds = new Map<string, SchedulingReason>();
     const routeCandidates: { id: string; created: number }[] = [];
     const sinks = this.alarmSinkIds();
-    const eligible = rows.filter(row => {
+    const work = this.executionWork();
+    let readiness: ExecutorReadiness | undefined;
+    const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
       const state = this.executionState(id);
+      let requirements: ReturnType<ExecutionWork["schedulingRequirements"]> | undefined;
+      const schedulingRequirements = () => requirements ??= work.schedulingRequirements(
+        id, state?.requirements ?? ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), state ?? undefined,
+      );
       let reason: SchedulingReason | null = null;
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
@@ -5198,18 +5204,18 @@ export class KnowledgeHub {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state ?? undefined, revision);
         const permit = (hold === "retry_budget" || hold === "provider_route") && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
-          usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
+          usableFor(schedulingRequirements(), c, host, String(row.project ?? ""))
           && recoveryPermitMatches(state, c, host, revision, Date.now()));
         const awaitingPermitHost = (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
           && state.recovery_permit?.task_revision === revision;
         reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
       }
       if (!reason && capabilities) {
-        const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
+        const requirements = schedulingRequirements();
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
         else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
         else {
-          const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
+          readiness ??= this.executorReadiness(tokenId, host, capabilities, Date.now());
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
@@ -5219,7 +5225,7 @@ export class KnowledgeHub {
         && capabilities && [capabilities, ...capabilities.alternatives].some(candidate =>
           candidate.backend === retryRoute.backend && candidate.model === retryRoute.model
           && candidate.config_revision === retryRoute.config_revision
-          && usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), candidate, host, String(row.project ?? "")))
+          && usableFor(schedulingRequirements(), candidate, host, String(row.project ?? "")))
         && state.terminal.generation === state.attempt.generation && state.terminal.attempt_id === state.attempt.attempt_id
         && providerRecoveryDiagnosis(state.terminal.outcome) === "provider_route_unavailable"
         && !this.proxyTrialConsumed(id, String(meta.work_revision ?? "legacy"))) {
@@ -5227,7 +5233,7 @@ export class KnowledgeHub {
       }
       if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
-    });
+    }));
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))

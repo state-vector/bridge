@@ -25,6 +25,24 @@ beforeEach(async () => {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
         }
+        if (path === "/fixture/dispatch-inventory") {
+          const { host } = await request.json();
+          const executor = this.state.storage.sql.exec(
+            "SELECT h.token_id,h.capabilities FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=?", host,
+          ).toArray()[0];
+          const work = this.executionWork();
+          const inventory = work.hostInventory.bind(work);
+          let scans = 0;
+          work.hostInventory = () => { scans++; return inventory(); };
+          const original = this.executionWork;
+          this.executionWork = () => work;
+          try {
+            const selection = this.dispatchCandidates(executor.token_id, host, JSON.parse(executor.capabilities));
+            return Response.json({ scans, eligible: selection.eligible.map(row => row.id) });
+          } finally {
+            this.executionWork = original;
+          }
+        }
         if (path !== "/fixture/spent-route" && path !== "/fixture/watchdog-release") return super.fetch(request);
         const { id } = await request.json();
         const sql = this.state.storage.sql;
@@ -93,6 +111,16 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([older, newer]);
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: older });
+  });
+
+  it("resolves fresh tasks from one fleet inventory without changing their order", async () => {
+    const project = "fleet-inventory", g = await gateway(project);
+    const expected = [];
+    for (let i = 0; i < 12; i++) expected.push(await task(project));
+    const response = await stub.fetch("https://kb/fixture/dispatch-inventory", {
+      method: "POST", body: JSON.stringify({ host: g.host }),
+    });
+    expect(await response.json()).toEqual({ scans: 1, eligible: expected });
   });
 
   it("never reserves or claims the configured standing alarm sink", async () => {

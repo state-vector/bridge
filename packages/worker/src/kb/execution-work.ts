@@ -29,7 +29,7 @@ export function ownsInteractiveClaim(meta: TaskMeta, tokenId: string, session: s
 }
 
 export class ExecutionWork {
-  private hostSnapshot: HostInventory[] | null = null;
+  private hostSnapshot: (() => HostInventory[]) | null = null;
   constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace: string,
     private readiness: (token: string, host: string, capabilities: ExecutorCapabilities, now: number) => ExecutorReadiness,
     private modelPolicy: () => ModelPolicy = () => DEFAULT_MODEL_POLICY,
@@ -134,7 +134,7 @@ export class ExecutionWork {
      }; });
   }
   private hosts(taskId?: string): CapabilityObservation[] {
-    return (this.hostSnapshot ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
+    return (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
       readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities) }));
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
@@ -355,11 +355,16 @@ export class ExecutionWork {
   /** Expiry is level-triggered. Only queued capability waits resume; never
    * interfere with a healthy active writer or clear a human/local dependency. */
   sweep(now = Date.now()) {
-    // A synchronous pass cannot observe an intervening host/occupancy change.
-    // Reuse its inventory instead of rescanning every writer for every task.
-    this.hostSnapshot = this.hostInventory();
-    try { this.sweepBatch(now); }
-    finally { this.hostSnapshot = null; }
+    this.withHostSnapshot(() => this.sweepBatch(now));
+  }
+  /** Share the fleet inventory across a synchronous pass. Per-task readiness
+   * and the final reservation transaction still check their own fences. */
+  withHostSnapshot<T>(run: () => T): T {
+    const previous = this.hostSnapshot;
+    let inventory: HostInventory[] | undefined;
+    this.hostSnapshot ??= () => inventory ??= this.hostInventory();
+    try { return run(); }
+    finally { this.hostSnapshot = previous; }
   }
   private sweepBatch(now: number) {
     // Legacy workspaces without any managed executor inventory retain their
