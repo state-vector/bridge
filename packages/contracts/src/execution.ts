@@ -513,7 +513,7 @@ export function typedProviderFailure(outcome: z.infer<typeof TerminalOutcomeSche
     && c.class !== "diagnostic";
 }
 
-/** Recognize the exact archived ACP auth envelope, not empty stdout or prose
+/** Recognize exact archived ACP failure envelopes, not empty stdout or prose
  * anywhere in a task result. Ambiguous legacy failures remain held for diagnosis. */
 export function providerRecoveryDiagnosis(outcome: z.infer<typeof TerminalOutcomeSchema>): z.infer<typeof recoveryPermitFields.diagnosis> | null {
   if (typedProviderFailure(outcome)) {
@@ -521,6 +521,12 @@ export function providerRecoveryDiagnosis(outcome: z.infer<typeof TerminalOutcom
     return name === "provider.auth" ? "provider_authentication" : name === "provider.quota" ? "provider_quota" : "provider_route_unavailable";
   }
   if (outcome.kind === "failed" && /^acp session\/(?:prompt|new|set_model) failed: Authentication required[:.] provider authentication required\s*$/i.test(outcome.stderr_tail.trim())) return "provider_authentication";
+  // Archived LiteLLM routing failures identify an unavailable route, not a
+  // quota or authentication cause. The recovery command still needs a fresh
+  // request receipt and the original attempt's lifecycle fences.
+  if (outcome.kind === "failed" && /^acp session\/prompt failed: Internal error: No deployments available for selected model, Try again in \d+ seconds\. Passed model=[\w./:-]+\. pre-call-checks=(?:True|False), cooldown_list=\[(?:'[a-f0-9]{64}'(?:, '[a-f0-9]{64}')*)?\]$/.test(outcome.stderr_tail.trim())) {
+    return "provider_route_unavailable";
+  }
   return null;
 }
 

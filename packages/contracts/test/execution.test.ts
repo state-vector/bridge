@@ -162,6 +162,11 @@ describe("witnessed legacy recovery fences", () => {
     expect(next.recovery_permit?.phase).toBe("consumed");
     expect(next.terminal).toEqual(s.terminal);
   });
+  it("recognizes the archived ACP routing failure without inferring exhausted credit", () => {
+    const stderr_tail = `acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=glm-5.3-flash. pre-call-checks=False, cooldown_list=['${"a".repeat(64)}'] `;
+    expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail})).toBe("provider_route_unavailable");
+    expect(providerRecoveryDiagnosis({kind:"failed",exit_code:null,stdout_tail:"",stderr_tail:`tool output: ${stderr_tail}`})).toBeNull();
+  });
   it("does not turn missing output or generic errors into provider diagnoses", () => {
     for (const stderr_tail of ["No deployments available", "provider quota maybe", "test failed", ""]) {
       expect(providerRecoveryDiagnosis({kind:"failed",exit_code:1,stdout_tail:"",stderr_tail})).toBeNull();
