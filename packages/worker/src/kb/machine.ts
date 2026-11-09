@@ -1262,6 +1262,22 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   "recovery-priority": "release_held",
   "takeover-verdict-duty": "gate:separation",
   "takeover-stale-holder": "claim_race",
+  // BR#8996 — the BR#6432 batch-authorization gate's typed refusals
+  // (do.ts applyBatchAuthorization). A refusal means a recorded human
+  // decision stayed unapplied and the executor was sent back — real
+  // consequence, so the class stays observable at the default threshold
+  // (3) rather than never-a-breach; the name says WHAT refused so the
+  // Log reads as the gate working or a defect, not "unclassified".
+  // Specimen: BR#8911, batch-auth-not-batch on ask BR#8931, 3 events
+  // 2026-11-09 02:59:51–03:07:40Z, breach card BR#8996.
+  "batch-auth-ask-id": "gate:batch-auth",
+  "batch-auth-ask-missing": "gate:batch-auth",
+  "batch-auth-unanswered": "gate:batch-auth",
+  "batch-auth-not-human": "gate:batch-auth",
+  "batch-auth-not-batch": "gate:batch-auth",
+  "batch-auth-target-out-of-scope": "gate:batch-auth",
+  "batch-auth-target-not-parked": "gate:batch-auth",
+  "batch-auth-target-protected": "gate:batch-auth",
 };
 
 export function breachClass(reason: string): string {
@@ -1354,6 +1370,11 @@ export function breachClass(reason: string): string {
   // (BR#3611/BR#3612 wording-drift lesson); it sits ~15 chars in, far inside
   // the 300-char audit slice, so the classification survives any tail.
   if (r.includes("execution mutation fenced")) return "execution_fence";
+  // BR#8996: the BR#6432 batch-authorization refusals for when the
+  // "[rule: …]" tag is cut by the 300-char audit slice — the not-batch
+  // refusal interpolates an 80-char answer slice between fixed stems;
+  // this tail is its invariant fragment (BR#3611 wording-drift lesson).
+  if (r.includes("per-card drops ride their own answered asks")) return "gate:batch-auth";
   // BR#6740: the doTransition exit gate for typed execution waits — an
   // ordinary transition/ask/timeout on a card whose exit a durable execution
   // wait owns (meta.blocked.await_event local_handoff/executor_capability, or

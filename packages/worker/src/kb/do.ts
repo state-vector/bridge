@@ -6493,11 +6493,32 @@ export class KnowledgeHub {
     // subject, using the same conservation/quiescence checks as the web verb.
     // The executor supplies an ask reference, never human authority itself.
     const subject = String(am.ask?.artefact_id ?? "");
+    // BR#8996: rule-6e typed human_decision asks record the CHOSEN OPTION
+    // LABEL as the answer, and the typed grammar has no supersede action —
+    // a "Supersede BR#N" choice must ride action:"release" (contracts/
+    // ask.ts). The old `!am.ask?.decision` guard excluded EVERY typed ask
+    // from this per-card path, so the documented per-target recovery
+    // (mcp-tools BR#6432 grammar) refused the now-canonical ask format
+    // with batch-auth-not-batch and the recorded drop was stranded:
+    // specimen BR#8911 — 3 audited events 2026-11-09 02:59:51–03:07:40Z,
+    // breach card BR#8996 (ghost BR#5733 stranded the same way, BR#7635).
+    // Typed asks join the single path only when the answer IS a declared
+    // choice of an AUTHORITY decision bound to this target with a bridge
+    // executor (the human clicked the drop button; free-text steering
+    // still cannot authorize) — every guard below is unchanged.
+    const choice = am.ask?.decision
+      ? (Array.isArray(am.ask.decision.choices) ? am.ask.decision.choices : [])
+        .find((c: any) => c && c.label === answer)
+      : undefined;
+    const typedAuthority = !!(am.ask?.decision && choice
+      && am.ask.decision.kind === "authority"
+      && String(am.ask.decision.task_id ?? "") === id
+      && choice.executor === "bridge");
     const explicitRetire = !/^(?:NO|KEEP|HOLD|WAIT|RETAIN|DO\s+NOT|DON'T)\b/i.test(stripped)
       && [...stripped.matchAll(/(?:^|[;—–]\s*)retire\s+(BR#\d+)\b/gi)].some(m => m[1].toUpperCase() === id);
     const namedSupersede = /^SUPERSEDE\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
     const recordedWebRetirement = /^GO\s*[—–-]\s*superseded\s+via\s+web\s+now\b/i.test(stripped);
-    const single = subject === id && !am.ask?.decision && (!namedSupersede || namedSupersede === id)
+    const single = subject === id && (!am.ask?.decision || typedAuthority) && (!namedSupersede || namedSupersede === id)
       && (/^SUPERSEDE\b(?!\s+(?:all|only|\d+)\b)/i.test(stripped) || explicitRetire || recordedWebRetirement);
     if (single) {
       const prior = JSON.parse(String(row.meta ?? "{}"));
@@ -9082,7 +9103,28 @@ export class KnowledgeHub {
           // deliberate-park semantics.
           const stripRecommended = (s: string): string =>
             s.trim().replace(/^\(recommended\)\s*/i, "").trim();
-          const strippedAnswer = decisionAction ? ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]) : stripRecommended(answer);
+          // BR#8996: the typed decision grammar has no supersede action
+          // (contracts/ask.ts — choices declare resume|hold|release|
+          // local_handoff), so a "Supersede BR#N" choice must be authored
+          // with action:"release" — and the action→verb mapping flattened
+          // that click to plain RELEASE: the recorded supersede executed
+          // as a pool release and the terminal drop was left stranded for
+          // the executors to recover (specimen ask BR#8931 → BR#8911,
+          // 2026-11-09 02:57Z, breach card BR#8996; ghost BR#5733 the same
+          // shape, BR#7635). Dispatch like the button click (BR#3912: the
+          // typed answer must dispatch like the click on the same option)
+          // when the chosen label is a PER-CARD supersede of this ask's
+          // bound subject; batch-census labels keep the declared release
+          // mapping (BR#6395: a batch authorization resumes its bound
+          // task — the targets ride batch_auth per-target).
+          const labelDrop = decisionAction === "release"
+            ? /^SUPERSEDE\s+(BR#\d+)\b/i.exec(stripRecommended(answer))
+            : null;
+          const strippedAnswer = decisionAction
+            ? (labelDrop && labelDrop[1]?.toUpperCase() === String(subject.id).toUpperCase()
+              ? stripRecommended(answer)
+              : ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]))
+            : stripRecommended(answer);
           // BR#6395: a batch-authorization answer ("SUPERSEDE all 29 — ...",
           // "SUPERSEDE only the 6 dead parks") authorizes the bound disposition
           // task to supersede target cards — it must resume the bound task,

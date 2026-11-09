@@ -1390,6 +1390,52 @@ describe("breach fold (dedupe by task+class)", () => {
   });
 });
 
+// ---------- BR#8996: the batch-authorization gate's refusals classify ----------
+
+describe("batch-authorization gate refusals classify as gate:batch-auth (BR#8996)", () => {
+  // the exact specimen: ask BR#8931's typed answer (a supersede authored with
+  // the typed grammar's action:"release") was refused 3 times by the BR#6432
+  // batch_auth gate (BR#8911, 2026-11-09 02:59:51–03:07:40Z) — a recorded
+  // HUMAN decision stranded unapplied is real consequence, so the class is
+  // observable at the default threshold (3), never priced never-a-breach.
+  const refusal = (rule: string) =>
+    `ask BR#8931's recorded answer is not a batch SUPERSEDE authorization ('Supersede BR#8911 (drop the single-verdict Candidate CI approach)') — per-card drops ride their own answered asks [rule: ${rule}]`;
+  const events = [0, 1, 2].map((n) => ({
+    ts: 1_000_000 + n * 60_000,
+    task: "BR#8911",
+    op: "transition_rejected",
+    reason: refusal("batch-auth-not-batch"),
+  }));
+
+  it("every batch-auth-* refusal rule folds into gate:batch-auth, priced at the default threshold", () => {
+    for (const rule of [
+      "batch-auth-ask-id", "batch-auth-ask-missing", "batch-auth-unanswered",
+      "batch-auth-not-human", "batch-auth-not-batch",
+      "batch-auth-target-out-of-scope", "batch-auth-target-not-parked", "batch-auth-target-protected",
+    ]) {
+      expect(breachClass(refusal(rule))).toBe("gate:batch-auth");
+    }
+    // observable, not never-a-breach: no infinite threshold entry — a stranded
+    // human decision is a defect to fix, not the system working
+    expect(BREACH_THRESHOLDS["gate:batch-auth"]).toBeUndefined();
+  });
+
+  it("the specimen's 3 refusals raise exactly one card, classed gate:batch-auth", () => {
+    expect(detectBreaches(events.slice(0, 2), new Set())).toHaveLength(0); // below the default threshold
+    const breaches = detectBreaches(events, new Set());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].klass).toBe("gate:batch-auth");
+  });
+
+  it("classifies even when the [rule:] tag is cut by the audit slice (BR#3611 law — match the stem, not the tag)", () => {
+    const stem = "per-card drops ride their own answered asks";
+    const specimen = refusal("batch-auth-not-batch");
+    const cut = specimen.slice(0, specimen.indexOf(stem) + stem.length + 1); // mid " [rule:…" — the anchored tag regex fails
+    expect(cut.includes("[rule:")).toBe(false);
+    expect(breachClass(cut)).toBe("gate:batch-auth");
+  });
+});
+
 // ---------- BR#3337: claim races are retryable, never breaches ----------
 
 describe("claim-race classification (BR#3337)", () => {

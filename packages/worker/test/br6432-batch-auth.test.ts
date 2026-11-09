@@ -335,3 +335,188 @@ describe("batch_auth supersede (BR#6432)", () => {
     expect((await kbJson("/get", { id: laneCard })).body.status).toBe("blocked");
   });
 });
+
+// ---------- BR#8996: typed AUTHORITY decision asks join the dispatch law ----------
+
+/**
+ * BR#8996 — the specimen: rayh answered typed ask BR#8931 by clicking
+ * "Supersede BR#8911 (drop the single-verdict Candidate CI approach)" — a
+ * choice that, per the typed grammar (contracts/ask.ts: choices declare
+ * resume|hold|release|local_handoff, no supersede), had to be authored with
+ * action:"release". Two defects then stranded the recorded drop and 3 audited
+ * gate refusals raised the breach card (BR#8911, 2026-11-09
+ * 02:59:51–03:07:40Z; the ghost BR#5733 stranded the same way, BR#7635):
+ *   1. askAnswer's action→verb map flattened the click to plain RELEASE —
+ *      the recorded superside dispatched as a pool release (the BR#6395
+ *      batch-census mapping applied to a per-card label);
+ *   2. applyBatchAuthorization's single path excluded EVERY typed ask
+ *      (`!am.ask?.decision`), so the documented recovery
+ *      `transition {to:"superseded", batch_auth:{ask}}` refused
+ *      batch-auth-not-batch three times.
+ * The fix: the answer dispatch treats a SUPERSEDE-labelled release choice
+ * naming the ask's bound subject as the DROP (dispatch like the click,
+ * BR#3912) while batch-census labels keep their declared release; the
+ * batch_auth single path accepts typed AUTHORITY decision asks whose
+ * recorded answer IS a declared bridge-executor choice. breachClass gains
+ * gate:batch-auth (machine.test.ts).
+ */
+describe("typed AUTHORITY decision asks dispatch and authorize the drop (BR#8996)", () => {
+  /** The specimen's typed decision shape: an AUTHORITY decision bound to
+   * `subjectId` whose first choice is the per-card supersede. The typed
+   * grammar has no supersede action, so the drop choice rides action:"release"
+   * — exactly what the old dispatch flattened. */
+  const authorityDecision = (subjectId: string, dropLabel: string, keepLabel: string) => ({
+    kind: "authority" as const,
+    task_id: subjectId,
+    context: `The parked task ${subjectId} awaits the operator's disposition choice.`,
+    why_human: "Supersede is human-authority — the operator owns the drop choice.",
+    choices: [
+      { label: dropLabel, executor: "bridge" as const, consequence: `Bridge dispatches the recorded disposition for ${subjectId}.`, action: "release" as const },
+      { label: keepLabel, executor: "bridge" as const, consequence: `Bridge keeps ${subjectId} parked; the human owns the rewrite.`, action: "hold" as const },
+    ],
+  });
+
+  /** A typed human_decision ask bound to `subjectId` (artefact_id must equal
+   * decision.task_id — requireHumanDecision). */
+  const typedAsk = async (subjectId: string, dropLabel: string, keepLabel: string, decision?: unknown) => {
+    const r = await kbJson("/ask.create", {
+      to: "human",
+      question: `Drop parked ${subjectId} on the recorded supersede answer?`,
+      reason: "Supersede is human-authority — requesting the drop decision.",
+      details: `Drill brief: ${subjectId} is a parked authority-drill target; the answer below is the recorded human disposition. No live decision rides on this fixture.`,
+      decision: decision ?? authorityDecision(subjectId, dropLabel, keepLabel),
+      artefact_id: subjectId,
+      actor: "drill-drain-owner",
+    });
+    expect(r.status, `ask failed: ${JSON.stringify(r.body)}`).toBe(200);
+    return String(r.body.id);
+  };
+
+  /** The specimen's answer-time state: a live claim holds the card while the
+   * ask is answered, so the blocked-only dispatch leg never fires — the
+   * executor's batch_auth apply is then the recovery path. */
+  const reclaimedSpecimen = async (owner: string) => {
+    const victim = await task(`typed-ask specimen target (${owner})`);
+    await kbJson("/transition", { id: victim, to: "in_progress", actor: owner, note: "claim" });
+    const dropLabel = `Supersede ${victim} (drop the single-verdict Candidate CI approach)`;
+    const askId = await typedAsk(victim, dropLabel, "KEEP — stay parked");
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("blocked"); // askCreate parked it
+    const claim = await kbJson("/transition", { id: victim, to: "in_progress", actor: owner, note: "picking the drop up" });
+    expect(claim.status, JSON.stringify(claim.body)).toBe(200);
+    return { victim, askId, dropLabel };
+  };
+
+  const reparkForApply = async (id: string, actor: string) => {
+    const p = await kbJson("/transition", {
+      id, to: "blocked", actor,
+      note: "recorded drop pending — re-parked for the batch_auth apply",
+      await_event: { event: "time", until_ts: Date.now() + 24 * 3_600_000 },
+    });
+    expect(p.status, `re-park failed: ${JSON.stringify(p.body)}`).toBe(200);
+  };
+
+  it("answer-time: clicking the SUPERSEDE-labelled release choice dispatches the DROP, not a pool release (the BR#8931 misfire)", async () => {
+    const victim = await task("typed-ask drop target (BR#8996 drill)");
+    await park(victim, "state-vector/bridge", 8911, "typed-owner-a");
+    const dropLabel = `Supersede ${victim} (drop the single-verdict Candidate CI approach)`;
+    const askId = await typedAsk(victim, dropLabel, "KEEP — stay parked");
+    const ans = await kbJson("/ask.answer", { id: askId, answer: dropLabel, actor: "web:rayh" });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    expect(ans.body.task_status).toBe("superseded");
+    const after = (await kbJson("/get", { id: victim })).body;
+    expect(after.status).toBe("superseded");
+    // the human's answered-ask verdict — the system actor is only the pen
+    const hist = (await kbJson(`/history?id=${encodeURIComponent(victim)}&limit=5`)).body;
+    const dropRow = (hist.versions ?? []).find((v: any) => v.action === "transition" && v.data?.to === "superseded");
+    expect(dropRow).toBeTruthy();
+    expect(String(dropRow.actor)).toBe("system:question(web:rayh)");
+  });
+
+  it("recovery: batch_auth applies a typed AUTHORITY ask's recorded drop (old code refused batch-auth-not-batch — the 3 audited events)", async () => {
+    const { victim, askId, dropLabel } = await reclaimedSpecimen("typed-owner-b");
+    // the answer lands while the card is claimed — nothing dispatches
+    const ans = await kbJson("/ask.answer", { id: askId, answer: dropLabel, actor: "web:rayh" });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("in_progress");
+    await reparkForApply(victim, "typed-owner-b");
+    const r = await apply(victim, askId);
+    expect(r.status, `apply failed: ${JSON.stringify(r.body)}`).toBe(200);
+    expect(r.body.status).toBe("superseded");
+    expect(r.body.batch_auth).toMatchObject({ ask: askId, answered_by: "web:rayh" });
+    expect((await kbJson("/get", { id: victim })).body.meta.batch_auth).toMatchObject({
+      ask: askId, answered_by: "web:rayh", applied_by: "drill-agent", applied_session: "bridge-task-BR-6432",
+    });
+    const hist = (await kbJson(`/history?id=${encodeURIComponent(victim)}&limit=5`)).body;
+    const dropRow = (hist.versions ?? []).find((v: any) => v.action === "transition" && v.data?.to === "superseded");
+    expect(String(dropRow.actor)).toBe("system:question(web:rayh)");
+  });
+
+  it("no double-apply: after the answer-time drop executed, a batch_auth replay is refused — the card is no longer an open park", async () => {
+    const victim = await task("typed-ask no-double-apply target (BR#8996 drill)");
+    await park(victim, "state-vector/bridge", 8912, "typed-owner-c");
+    const dropLabel = `Supersede ${victim} (drop it)`;
+    const askId = await typedAsk(victim, dropLabel, "KEEP — stay parked");
+    const ans = await kbJson("/ask.answer", { id: askId, answer: dropLabel, actor: "web:rayh" });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("superseded");
+    const r = await apply(victim, askId);
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("batch-auth-target-not-parked");
+  });
+
+  it("guard: a typed free-text answer (not the declared choice) cannot authorize the replay — batch-auth-not-batch", async () => {
+    const { victim, askId, dropLabel } = await reclaimedSpecimen("typed-owner-d");
+    await kbJson("/ask.answer", { id: askId, answer: `SUPERSEDE ${victim}`, actor: "web:rayh" });
+    await reparkForApply(victim, "typed-owner-d");
+    const r = await apply(victim, askId);
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("batch-auth-not-batch");
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("blocked");
+    expect(dropLabel).toBeTruthy(); // the declared choice was never clicked — the answer was free text
+  });
+
+  it("guard: a kind:preference decision cannot authorize the replay — authority binds batch_auth, not preference", async () => {
+    const victim = await task("typed-ask preference-guard target (BR#8996 drill)");
+    await park(victim, "state-vector/bridge", 8913, "typed-owner-e");
+    const dropLabel = `Supersede ${victim} (drop it)`;
+    const askId = await typedAsk(victim, dropLabel, "KEEP — stay parked", decisionFixture(victim, [dropLabel, "KEEP — stay parked"]));
+    await kbJson("/ask.answer", { id: askId, answer: dropLabel, actor: "web:rayh" });
+    const r = await apply(victim, askId);
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("batch-auth-not-batch");
+    expect((await kbJson("/get", { id: victim })).body.status).not.toBe("superseded");
+  });
+
+  it("guard: a supersede label naming a DIFFERENT card drops nothing via replay — the label must name the bound subject", async () => {
+    const bound = await task("typed-ask bound subject (BR#8996 drill)");
+    const other = await task("typed-ask other named card (BR#8996 drill)");
+    await park(bound, "state-vector/bridge", 8914, "typed-owner-f");
+    await park(other, "state-vector/bridge", 8915, "typed-owner-f2");
+    const askId = await typedAsk(bound, `Supersede ${other} (drop it)`, "KEEP — stay parked");
+    const ans = await kbJson("/ask.answer", { id: askId, answer: `Supersede ${other} (drop it)`, actor: "web:rayh" });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    // answer time: the label names a different card, so the declared release
+    // action wins — the bound subject is released to the pool, never dropped
+    expect((await kbJson("/get", { id: bound })).body.status).toBe("todo");
+    expect((await kbJson("/get", { id: other })).body.status).toBe("blocked");
+    // replay: the label's supersede names BR#<other>, not this ask's subject —
+    // the per-card path refuses and the batch-census path never matches
+    const r = await apply(other, askId);
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("batch-auth-not-batch");
+    expect((await kbJson("/get", { id: other })).body.status).toBe("blocked");
+  });
+
+  it("BR#6395 intact: a batch-census release choice on a typed ask still releases the bound task (never drops it)", async () => {
+    const drain = await task("typed-ask census disposition task (BR#8996 drill)");
+    await park(drain, "state-vector/bridge", 311, "typed-owner-g");
+    const censusLabel = "(Recommended) SUPERSEDE all 2 — dead + conflicting parks";
+    const askId = await typedAsk(drain, censusLabel, "NO — leave parked");
+    const ans = await kbJson("/ask.answer", { id: askId, answer: censusLabel, actor: "web:rayh" });
+    expect(ans.status, `answer failed: ${JSON.stringify(ans.body)}`).toBe(200);
+    // the batch answer releases the bound disposition task; its targets ride
+    // batch_auth per-target — the labelDrop must NOT capture census labels
+    expect(ans.body.task_status).toBe("todo");
+    expect((await kbJson("/get", { id: drain })).body.status).toBe("todo");
+  });
+});

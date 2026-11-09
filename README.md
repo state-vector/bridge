@@ -1622,8 +1622,13 @@ The alarm also consumes persisted disposition requests, so a crash between reque
 and application cannot skip the cleanup. Semantic refusals become terminal receipts;
 storage faults leave the command pending for retry.
 Recorded **per-card** human retirement decisions are replayable through that same
-gate: an explicit `SUPERSEDE` answer, or a `retire BR#N` clause naming the ask's
-bound task, can retire its still-unclaimed `todo`/`blocked` card. KEEP/NO answers,
+gate: an explicit `SUPERSEDE` answer, a `retire BR#N` clause naming the ask's
+bound task, or the recorded answer of an answered typed `human_decision` ask
+when it is that ask's chosen bridge-executor choice and a per-card `SUPERSEDE`
+of the bound subject (kind `authority` — BR#8996: the typed grammar has no
+supersede action, so those choices ride `action:"release"`; they used to fall
+out of the replay with `batch-auth-not-batch`), can retire its
+still-unclaimed `todo`/`blocked` card. KEEP/NO answers, free-text steering,
 unrelated targets, active writers and outstanding PR responsibility remain
 protected. Replaying the same completed retirement is an idempotent acknowledgement.
 That exact recorded retirement can cancel an unstarted capability wait; local
@@ -1735,7 +1740,14 @@ clicks: an answer starting with a RE-SCOPE/KEEP option verb keeps the subject pa
 RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resumes it —
 the verb is matched after a leading `(Recommended)` marker is stripped (BR#5570), so a
 rule-6c recommended option dispatches like a verb-first one and a `(Recommended) KEEP`
-click stays a deliberate park instead of silently resuming.
+click stays a deliberate park instead of silently resuming. A typed
+`human_decision` ask's chosen label dispatches by the same verb law when it
+can: the decision grammar has no supersede action, so a `Supersede BR#N …`
+choice is authored with `action:"release"` and the click now executes the
+drop it names (BR#8996 — the action mapping used to flatten it to a plain
+pool release, stranding the recorded supersede) while batch-census labels
+(`SUPERSEDE all N …`) keep releasing their bound task and ride `batch_auth`
+per target (BR#6395).
 **The ask renders whole, and a click never moves the cards (BR#6390).** Every ask-band row
 and For Me card renders the FULL question title (no ellipsis kernel), the full escalation
 reason, and the ask's `body_md` as rendered markdown inline in the card itself — the human

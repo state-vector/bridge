@@ -155,7 +155,12 @@ export const TOOL_ARG_SCHEMAS = {
      *  authorization ask (batch_auth.ask, "BR#N"). The hub verifies the
      *  human answer server-side, scopes the drop to the card ids the ask
      *  names, rechecks the target's current state, and executes the drop
-     *  as system:question(<answered_by>) — the agent never writes it. */
+     *  as system:question(<answered_by>) — the agent never writes it.
+     *  BR#8996: an answered typed human_decision ask also applies per
+     *  target when the recorded answer is that ask's chosen bridge-
+     *  executor choice and a per-card SUPERSEDE of the ask's own bound
+     *  subject (kind authority) — the same single-card replay the prose
+     *  answers already had. */
     batch_auth: z.object({ ask: z.string() }).loose().optional(),
   }),
   link_artefacts: z.looseObject({

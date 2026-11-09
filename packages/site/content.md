@@ -615,7 +615,7 @@ One task type, five kinds. The status machine is shared. Each kind has its own f
    │        │                │  └── todo (released, owner/human only, stamps "attempted")
    │        ├── in_progress | todo (unblocked / retry)
    │        ├── dead or aged park (watchdog, BR#2893) ──► todo (owner released)
-   │        └── superseded (a SUPERSEDE answer on the ask it parks on, or the web — never an agent session; an ANSWERED batch-authorization ask may be applied per named target via transition batch_auth, BR#6432)
+   │        └── superseded (a SUPERSEDE answer on the ask it parks on, or the web — never an agent session; an ANSWERED batch-authorization ask may be applied per named target via transition batch_auth, BR#6432; a typed AUTHORITY decision ask whose chosen choice labels the supersede dispatches the drop itself at answer time, and batch_auth accepts such recorded answers as per-target authorization, BR#8996)
    └── expired or stale review (watchdog) ──► todo (attempt count++)
 ```
 
