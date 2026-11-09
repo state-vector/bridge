@@ -7399,7 +7399,7 @@ export class KnowledgeHub {
     // The hub parses the PR + head from BOARD data only (no hub GitHub calls).
     if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().sweep();
     if (row.type === "task" && verdict.status === "done" && parseTags(row.roles ?? "").includes("review") && reviewResult?.kind !== "stronger_implementation_required") {
-      await this.replayDeliveryAdmissions();
+      await this.replayDeliveryAdmissions(id);
       if (!this.one(`SELECT review_id FROM delivery_admissions WHERE review_id=?`, id)) {
       try {
         const captured = ReviewSubjectSchema.safeParse(meta.review_subject);
@@ -8576,15 +8576,35 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO delivery_admissions(review_id,record) VALUES(?,?)`, reviewId, JSON.stringify(record));
   }
 
-  private async replayDeliveryAdmissions(): Promise<void> {
-    // Historical held acceptances can number in the thousands. Bound each
-    // pass and persist a round-robin cursor so a held prefix cannot starve
-    // new admissions or exhaust a Durable Object's CPU budget.
+  private readonly admissionReplay = new Set<string>();
+
+  private async replayDeliveryAdmissions(reviewId?: string): Promise<void> {
+    // Process the verdict that just committed immediately. Background replay
+    // still rotates past held history and also catches recent pending verdicts
+    // whose close hooks stopped before the exact replay ran.
     const cursor = Number(this.one(`SELECT value FROM settings WHERE key='delivery_admission_cursor'`)?.value ?? 0);
-    const rows = this.state.storage.sql.exec(`SELECT rowid AS cursor,review_id,record FROM delivery_admissions WHERE rowid>? AND json_extract(record,'$.state.phase') IN ('pending','held') ORDER BY rowid LIMIT 10`, cursor).toArray();
-    if (!rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
-    for (const row of rows) {
-      const a = JSON.parse(String(row.record)) as DeliveryAdmission;
+    const rows = reviewId
+      ? this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM delivery_admissions WHERE review_id=?
+          AND json_extract(record,'$.state.phase') IN ('pending','held')`, reviewId).toArray()
+      : this.state.storage.sql.exec(`SELECT rowid AS cursor,review_id FROM delivery_admissions
+          WHERE rowid>? AND json_extract(record,'$.state.phase') IN ('pending','held') ORDER BY rowid LIMIT 10`, cursor).toArray();
+    if (!reviewId && !rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
+    const recent = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM (
+      SELECT review_id,record FROM delivery_admissions ORDER BY rowid DESC LIMIT 32
+    ) WHERE json_extract(record,'$.state.phase')='pending' LIMIT 4`).toArray();
+    const attempted = new Set<string>();
+    for (const row of [...recent, ...rows]) {
+      const id = String(row.review_id);
+      const advance = () => {
+        if (row.cursor != null) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
+      };
+      if (attempted.has(id) || this.admissionReplay.has(id)) { advance(); continue; }
+      const current = this.one(`SELECT record FROM delivery_admissions WHERE review_id=?
+        AND json_extract(record,'$.state.phase') IN ('pending','held')`, id);
+      if (!current) { advance(); continue; }
+      const a = JSON.parse(String(current.record)) as DeliveryAdmission;
+      this.admissionReplay.add(id);
+      attempted.add(id);
       const save = () => this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
       try {
         const reviewed = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, a.review_id);
@@ -8637,7 +8657,8 @@ export class KnowledgeHub {
         // Keep the pending row on errors. Audit is diagnostic, NOT the retry queue.
         this.audit("system:delivery", "admission_retry", a.task_id, { review: a.review_id, error: String(e) });
       } finally {
-        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
+        this.admissionReplay.delete(id);
+        advance();
       }
     }
   }

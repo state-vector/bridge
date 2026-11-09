@@ -183,7 +183,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect((await get(duty.id)).status).toBe("done");
   });
 
-  it("bounded replay progresses past a cohort of held acceptances without clearing their blockers", async () => {
+  it("admits a fresh verdict immediately past held historical acceptances", async () => {
     const held: string[] = [];
     let fresh = "";
     for (let i = 0; i < 14; i++) {
@@ -195,14 +195,18 @@ describe("delivery responsibility (real SQLite hub)", () => {
       if (i < 13) {
         held.push(id);
         await call("transition", { id, to: "blocked", actor: "bulk-impl", session: `impl-${number}`, note: "Independent dependency hold", await_event: { event: "time", until_ts: Date.now() + 86_400_000 } });
-      } else fresh = id;
+      } else {
+        fresh = id;
+        await call("admin.settings_set", { settings: { delivery_admission_cursor: "0" } });
+      }
       const review = submitted.body.verify_task;
       await call("transition", { id: review, to: "in_progress", actor: "bulk-reviewer", session: `review-${number}` });
       const accepted = await call("transition", { id: review, to: "done", actor: "bulk-reviewer", session: `review-${number}`, note: `Verified https://github.com/${repo}/pull/${number} head ${head}`, review_result: await resultFor(review, { kind: "accepted_pr", task_id: id, legs: [{ repo, number, head_sha_at_acceptance: head }] }) });
       expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     }
-    for (let pass = 0; pass < 4; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
-    expect((await get(fresh)).meta.merge_train.state).toBe("queued");
+    const admitted = await get(fresh);
+    expect(admitted.meta.merge_train.state).toBe("queued");
+    expect(admitted.delivery_admissions).toEqual(expect.arrayContaining([expect.objectContaining({ state: expect.objectContaining({ phase: "admitted" }) })]));
     for (const id of held) {
       const source = await get(id);
       expect(source.status).toBe("blocked");
