@@ -156,6 +156,39 @@ function registryThenEnv(identify: () => Response): any {
   };
 }
 
+describe("cached gateway readiness during a hub rollout", () => {
+  it.each([404, 403])("uses the authenticated legacy route only for an unknown v2 operation (%i)", async (status) => {
+    const bearer = "bkw_state-vector_" + "a".repeat(48);
+    const called: string[] = [];
+    const env = rejectingEnv();
+    env.KB.get = () => ({
+      fetch: async (url: string, init: RequestInit) => {
+        const op = new URL(url).pathname;
+        called.push(op);
+        const body = JSON.parse(String(init.body));
+        if (op === "/worker.resolve.v2") {
+          expect(body).toEqual({ bearer, secret: "cached-worker" });
+          return Response.json({ error: "proof not available" }, { status });
+        }
+        if (op === "/auth.identify") {
+          expect(body).toEqual({ bearer });
+          return Response.json({ label: "gateway", token_id: "gateway-id", tags: ["gateway"] });
+        }
+        expect(op).toBe("/worker.resolve");
+        expect(body).toEqual({ actor: "gateway", token_id: "gateway-id", secret: "cached-worker" });
+        return Response.json({ cached: true, label: "gateway/worker" });
+      },
+    });
+    const response = await worker.fetch(new Request("https://hub/api/kb-machine/provision", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({ cached_secret: "cached-worker", actor: "spoofed" }),
+    }), env);
+    expect(response.status).toBe(status === 404 ? 200 : 403);
+    expect(called).toEqual(status === 404 ? ["/worker.resolve.v2", "/auth.identify", "/worker.resolve"] : ["/worker.resolve.v2"]);
+  });
+});
+
 describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mislabel", () => {
   it("GET /api/kb/stats with a rejecting DO → JSON 503 typed", async () => {
     const res = await worker.fetch(new Request("https://hub/api/kb/stats", {

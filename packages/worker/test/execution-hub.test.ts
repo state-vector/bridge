@@ -618,7 +618,9 @@ describe("durable executor on real SQLite", () => {
     });
     const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data;
     const legacy = await post("worker.resolve", { token_id: identity.token_id, actor: "cache-host", secret: worker.secret });
-    expect(legacy.status).toBe(503);
+    expect(legacy.status).toBe(200);
+    expect(legacy.data).toMatchObject({ cached: true, label: "cache-host/current" });
+    expect((await post("worker.resolve", { token_id: identity.token_id, actor: "foreign", secret: worker.secret })).status).toBe(403);
     const proof = await resolve(worker.secret);
     expect(proof.status).toBe(200);
     expect(await proof.json()).toMatchObject({ cached: true, label: "cache-host/current" });
