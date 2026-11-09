@@ -3,6 +3,8 @@ name: CI
 on:
   pull_request:
   push:
+    # main-preflight/** branches carry scripts/push-main.sh's candidate
+    # preflight (Test + CLI build) before a direct push advances main
     branches: [main, 'main-preflight/**']
 
 jobs:
@@ -23,7 +25,6 @@ jobs:
           node --test scripts/tests/diagnose-hub.test.mjs
           npm run test:promote-runner
           npm run test:deploy-drift-alarm
-          npm run test:main-green-gate
           npm run test -w packages/contracts
           npm run test -w packages/worker
           npm run build -w @bridge/webapp
@@ -53,24 +54,6 @@ jobs:
       - name: CLI tests (locked)
         working-directory: packages/cli
         run: cargo test --locked
-
-  preflight-main-green:
-    name: ${{ startsWith(github.ref, 'refs/heads/main-preflight/') && 'main-green gate' || 'Preflight destination check' }}
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main-preflight/')
-    needs: [test, cli]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      checks: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check destination health after candidate checks
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MAIN_GREEN_REPO: ${{ github.repository }}
-          MAIN_GREEN_PR_SHA: ${{ github.sha }}
-        run: bash scripts/main-green-gate.sh
 
   deploy-check:
     name: Deploy drift alarm

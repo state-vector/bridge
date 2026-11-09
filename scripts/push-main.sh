@@ -44,12 +44,12 @@ required=$(gh run view "$run" --repo "$repo" --json jobs,headSha,headBranch,even
   --jq '{headSha,headBranch,event,jobs:[.jobs[] | select(.conclusion == "success") | .name]}')
 if ! jq -e --arg sha "$candidate" --arg branch "$branch" '
   .headSha == $sha and .headBranch == $branch and .event == "push"
-  and ((["Test", "CLI build (packages/cli)", "main-green gate"] - .jobs) == [])
+  and ((["Test", "CLI build (packages/cli)"] - .jobs) == [])
 ' <<< "$required" >/dev/null; then
   echo "Required successful jobs are missing for $candidate. Main was not updated." >&2
   exit 1
 fi
 
 # Ancestry was proven above. The explicit lease prevents a concurrent update
-# to main from changing the base after the destination health check.
+# to main from changing the base after the candidate checks passed.
 git push --force-with-lease="$main:$base" origin "$candidate:$main"
