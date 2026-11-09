@@ -3772,3 +3772,5 @@ OpenCode provider retry notifications retain their typed, sanitized failure caus
 Archived ACP routing failures with the complete LiteLLM unavailable-route error can use the existing one-attempt recovery permit. The error does not identify a billing problem. A fresh configured request and a quiesced attempt with no unresolved external effects are still required.
 
 A successful request through the configured proxy can authorize one trial per task revision for an unavailable route. This receipt verifies the tested request ceiling. Authentication and quota recovery still require the configured output ceiling to be verified. The hub keeps the consumed trial in the original begin receipt even if a later permit replaces it.
+
+An unowned review of an older task revision no longer blocks closure after the current revision is accepted. The hub retains reviews with active claims, unresolved operations, or delivery obligations for reconciliation.

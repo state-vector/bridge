@@ -6261,12 +6261,34 @@ export class KnowledgeHub {
     return { phase: "accepted", ...base, subject: subject.data, result };
   }
 
+  private staleReviewHasExecutionHold(id: string, meta: Record<string, unknown>): boolean {
+    const execution = this.executionState(id);
+    return !!((execution?.attempt && execution.attempt.phase !== "quiesced")
+      || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      || this.protectedExecution(id, meta) || meta.operator_gated || this.startupHasAsk(id)
+      || this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=?`, id));
+  }
+
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
   private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
-    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.meta FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
+    const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.owner, c.roles, c.meta, c.title, c.body_md FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
       const meta = JSON.parse(String(child.meta ?? "{}"));
       if (meta.machine_duty || meta.ask?.review_leg) return false;
+      if (body.to === "done" && child.type === "task" && child.status === "todo" && !child.owner
+        && parseTags(String(child.roles ?? "")).includes("review")) {
+        const subject = ReviewSubjectSchema.safeParse(meta.review_subject);
+        const revision = JSON.parse(String(row.meta ?? "{}")).work_revision ?? "legacy";
+        if (subject.success && subject.data.task_id === id && subject.data.revision !== revision) {
+          const current = this.currentTaskReview(id);
+          if (current.phase === "accepted" && current.subject.task_id === id && current.subject.revision === revision) {
+            if (this.staleReviewHasExecutionHold(String(child.id), meta)) return true;
+            // The old round no longer covers this submission. Retain any
+            // separately bound delivery obligation for its own reconciliation.
+            try { this.conserveDelivery(child, "", false); return false; } catch { return true; }
+          }
+        }
+      }
       // Peer coordination is retired on terminal work; it is not unfinished
       // implementation and must not deadlock completion behind itself.
       return !(child.type === "question" && meta.ask && !isHumanDecisionAsk(meta.ask));
@@ -7374,7 +7396,7 @@ export class KnowledgeHub {
           const parentRow = fx.keep_newest ? this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id) : null;
           const parentTargets = fx.keep_newest ? prTargetsOf(parentRow) : [];
           const kids = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
+            `SELECT c.id AS id, c.status AS status, c.owner AS owner, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
              WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
             id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
           ).toArray() as any[];
@@ -7391,6 +7413,9 @@ export class KnowledgeHub {
               if (!keptNewestRound) { keptNewestRound = true; return; } // newest round survives for re-entry
             }
             const vm = JSON.parse(v.meta ?? "{}");
+            const subject = ReviewSubjectSchema.safeParse(vm.review_subject);
+            if (subject.success && subject.data.task_id === id && subject.data.revision !== (meta.work_revision ?? "legacy")
+              && (v.status !== "todo" || v.owner || this.staleReviewHasExecutionHold(String(v.id), vm))) return;
             vm.superseded_reason = fx.cause;
             this.state.storage.sql.exec(
               `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
