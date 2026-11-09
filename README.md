@@ -511,7 +511,9 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 The hub selects work for the requesting gateway **before** applying a candidate
 limit. Host-affine or unavailable work cannot hide runnable work behind a global
-top-ten queue. `execution {id:"gateway", command:{kind:"schedule",mode:"reserve"},
+top-ten queue. Within the same priority and boost, the oldest-created eligible
+task goes first, even when its card has been edited.
+`execution {id:"gateway", command:{kind:"schedule",mode:"reserve"},
 command_id:"<unique request>"}` reserves one eligible task and its gateway slot
 through the normal lifecycle gates. Replaying a request returns its original
 reservation; a reservation still requires fenced `begin` before any worker starts.

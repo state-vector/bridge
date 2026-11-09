@@ -306,7 +306,7 @@ without spending task retries, while unpublished work stays on its original host
 
 Use `bridge execution schedule-status [hostname]` to see occupied slots,
 reservations, capacity, eligible work, exclusion reasons and the last scheduling
-outcome. Idle capacity with eligible work for two minutes produces one
+outcome. Within the same priority and boost, the oldest-created eligible task goes first. Idle capacity with eligible work for two minutes produces one
 `dispatch_starved` incident per episode. Repository refusals are task-scoped hub
 state, re-evaluated when prerequisite inputs change; a stale local give-up cache
 cannot override a released task. Repeated runtime failures use a visible bounded

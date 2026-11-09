@@ -5134,7 +5134,7 @@ export class KnowledgeHub {
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
-      || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
+      || Number(a.created_ts) - Number(b.created_ts) || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
     return { eligible, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id) };
   }

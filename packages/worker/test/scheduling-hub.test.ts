@@ -74,6 +74,16 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
+  it("keeps the oldest eligible task first after its card is updated", async () => {
+    const project = "oldest-eligible", g = await gateway(project);
+    const older = await task(project), newer = await task(project);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect((await post("update", { id: older, actor: "author", title: "Older task with updated evidence" })).error).toBeUndefined();
+    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].candidates.slice(0, 2)).toEqual([older, newer]);
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: older });
+  });
+
   it("never reserves or claims the configured standing alarm sink", async () => {
     const project = "anchor", g = await gateway(project);
     const sink = await task(project);
