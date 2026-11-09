@@ -1,3 +1,4 @@
+import type { GatewayDispatch, SchedulingReason } from "@bridge/contracts";
 import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
@@ -31,6 +32,27 @@ function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<strin
   if (t.type === "question") return { rank: 3, why: "question — open for contributions" };
   if (roles.includes("analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
   return { rank: 4, why: "todo" };
+}
+
+const gatewayHoldLabels: Record<SchedulingReason, string> = {
+  qualification: "Needs qualification",
+  operator_gate: "Waiting for an operator decision",
+  question: "Waiting for an answer",
+  independent_wait: "Waiting on a separate review or prerequisite",
+  writer_not_quiescent: "Previous worker has not confirmed it stopped",
+  unknown_operations: "Previous operation needs reconciliation",
+  retry_budget: "Retry budget exhausted; needs recovery evidence or a changed approach",
+  host_affinity: "Work is retained on another host",
+  capability: "No ready gateway matches the required model, tools, or environment",
+  startup_prerequisite: "Previous startup failed; needs a changed prerequisite",
+  lifecycle_gate: "Task ownership or lifecycle prevents dispatch",
+};
+
+function gatewayReason(dispatch?: GatewayDispatch): string {
+  if (!dispatch) return "Gateway eligibility has not been reported";
+  if (dispatch.kind === "gateway_unavailable") return "No live gateway is ready to take work";
+  if (dispatch.kind === "eligible") return "";
+  return dispatch.reasons.map(reason => gatewayHoldLabels[reason]).join(" · ");
 }
 
 interface BlGroup {
@@ -73,13 +95,16 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     };
     const byUpdated = (a: any, b: any) => (b.updated_ts ?? 0) - (a.updated_ts ?? 0);
 
-    const ready = ts.filter((t) => t.status === "todo" && t.is_claimable !== false).map(decorate)
+    const ready = ts.filter((t) => t.status === "todo" && t.gateway_dispatch?.kind === "eligible").map(decorate)
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
     // every parked card files under its exit condition (typed await_event
     // class with prose fallback) — one group per class, ordered by
     // EXIT_CLASS_ORDER; in_review rides the same classifier ("Awaiting PR
     // verification"). The live unblock duty is a chip on the row, not a group.
-    const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false && !t.meta?.startup_wait).sort(byUpdated);
+    const questions = ts.filter((t) => t.status === "todo" && t.type === "question" && !t.meta?.startup_wait).sort(byUpdated);
+    const parked = ts.filter((t) => t.status === "todo" && t.type !== "question" && t.is_claimable === false && !t.meta?.startup_wait && !t.gateway_dispatch).sort(byUpdated);
+    const gatewayHeld = ts.filter((t) => t.status === "todo" && t.type !== "question"
+      && t.gateway_dispatch?.kind !== "eligible" && !t.meta?.startup_wait && (t.gateway_dispatch || t.is_claimable !== false)).sort(byUpdated);
     const byExit = new Map<string, any[]>();
     for (const t of ts) {
       if (t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
@@ -114,7 +139,9 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     }
 
     return [
-      { key: "ready", title: "Next — ready to go", note: "claim-ranked: verify duties → unblock duties → questions → todo (verify first — in_review work parks its owner). ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
+      { key: "ready", title: "Ready for gateway", note: "Eligible for at least one ready gateway. A free slot is still required.", rows: ready, showRank: true, showBoost: true },
+      { key: "gateway-held", title: "Waiting for gateway eligibility", note: "The reason each task cannot start is shown on its row.", rows: gatewayHeld, showRank: false, showBoost: false },
+      { key: "questions", title: "Open questions", note: "Waiting for an answer or contribution.", rows: questions, showRank: false, showBoost: false },
       ...exitGroups,
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
     ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))
@@ -194,7 +221,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
       <div className="view-head">
         <h2>Backlog</h2>
-        <span className="muted-note">{total} items — next · blocked by reason · timeout · parked</span>
+        <span className="muted-note">{total} items — gateway eligibility · open questions · blocked by reason</span>
         {msg && <span className="ok">{msg}</span>}
       </div>
       <TagThemeBar theme={tagTheme} />
@@ -240,6 +267,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
                     <TagChips tags={t.tags} />
+                    {g.key === "gateway-held" && <span className="backlog-why">{gatewayReason(t.gateway_dispatch)}</span>}
                     {bs && (
                       <span className="backlog-why">
                         <Chip tone={bs.unblockedTone}>{bs.whatUnblocks}</Chip>{" "}

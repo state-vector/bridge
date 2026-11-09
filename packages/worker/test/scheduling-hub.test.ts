@@ -75,6 +75,13 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
     const terminal = await exhaust(id);
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
+    const boardTask = async () => {
+      const response = await stub.fetch("https://kb/board", { method: "GET" });
+      const board = await response.json() as { tasks: { id: string; gateway_dispatch: unknown }[] };
+      return board.tasks.find(task => task.id === id);
+    };
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } });
+
     const additional = [];
     if (proxy && !event) {
       for (let i = 0; i < 4; i++) {
@@ -113,6 +120,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
     const grant = await recover("grant");
     expect(grant).toMatchObject({kind:"provider_recovery_granted",budget_exhaustions:3});
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "eligible" } });
     expect(await recover("grant")).toEqual(grant);
     expect((await recover("grant-again")).error).toMatch(/already granted/);
     const resumed = await reserve(g);

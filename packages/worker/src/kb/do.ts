@@ -243,7 +243,7 @@ import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
-import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth } from "@bridge/contracts";
+import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
@@ -2641,6 +2641,8 @@ export class KnowledgeHub {
     const executionNow = Date.now();
     for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
+    const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo").map(t => String(t.id)), executionNow);
+    for (const task of tasks) task.gateway_dispatch = dispatch.get(String(task.id));
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
@@ -5056,10 +5058,15 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities) {
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities, taskIds?: string[]) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
-    const rows = this.state.storage.sql.exec(`SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''`).toArray();
+    const filter = taskIds ? " AND id IN (SELECT value FROM json_each(?))" : "";
+    const rows = this.state.storage.sql.exec(
+      `SELECT id,title,body_md,project,meta,roles,tags,updated_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''` + filter,
+      ...(taskIds ? [JSON.stringify(taskIds)] : []),
+    ).toArray();
+    const taskHolds = new Map<string, SchedulingReason>();
     const eligible = rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       const state = this.executionState(id);
@@ -5082,14 +5089,43 @@ export class KnowledgeHub {
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
-      if (reason) { reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
+      if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
     });
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
       || Number(a.updated_ts) - Number(b.updated_ts) || String(a.id).localeCompare(String(b.id)));
-    return { eligible, reasons, held };
+    return { eligible, reasons, held, taskHolds };
+  }
+
+  private boardDispatch(ids: string[], now: number): Map<string, GatewayDispatch> {
+    const result = new Map<string, GatewayDispatch>();
+    if (!ids.length) return result;
+    const hosts = this.state.storage.sql.exec(`SELECT h.token_id,t.label,h.capabilities FROM execution_hosts h
+      JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL AND h.observed_ts>?`, now - 120_000).toArray();
+    let ready = false;
+    const eligible = new Set<string>();
+    const holds = new Map<string, Set<SchedulingReason>>();
+    for (const row of hosts) {
+      const tokenId = String(row.token_id), host = String(row.label);
+      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+      if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
+      ready = true;
+      const candidates = this.dispatchCandidates(tokenId, host, capabilities, ids);
+      for (const task of candidates.eligible) eligible.add(String(task.id));
+      for (const [id, reason] of candidates.taskHolds) {
+        const reasons = holds.get(id) ?? new Set<SchedulingReason>();
+        reasons.add(reason);
+        holds.set(id, reasons);
+      }
+    }
+    for (const id of ids) {
+      if (eligible.has(id)) result.set(id, { kind: "eligible" });
+      else if (ready) result.set(id, { kind: "held", reasons: [...(holds.get(id) ?? ["lifecycle_gate"])] });
+      else result.set(id, { kind: "gateway_unavailable" });
+    }
+    return result;
   }
 
   private reconcileDispatchReservations(now = Date.now()) {

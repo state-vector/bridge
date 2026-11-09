@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ExecutionModelViewSchema } from "@bridge/contracts";
 import { ExecutionModel, ExecutionStatus } from "../../ui-kit/src/views/ExecutionModel.tsx";
 import { TaskHistoryLine } from "../../ui-kit/src/views/TaskDetail.tsx";
+import { BacklogView } from "../../ui-kit/src/views/BacklogView.tsx";
 import { TopView } from "../../ui-kit/src/views/TopView.tsx";
 import { useKb } from "../../ui-kit/src/server/kbStore.ts";
 import { readFileSync } from "node:fs";
@@ -73,4 +74,18 @@ it("renders structured escalation history with the complete reason, actor, and s
     data: { kind: "model_escalated", from_tier: "medium", to_tier: "large", reason, source: "review", review_id: "BR#101", generation: 1 } }} />);
   expect(html).toContain("escalation"); expect(html).toContain("medium → large"); expect(html).toContain("review BR#101");
   expect(html).toContain(reason.trim()); expect(html).toContain("reviewer"); expect(html).not.toContain("bounded ledger summary");
+});
+
+it("separates gateway-held tasks from eligible work and keeps open questions visible", () => {
+  const previous = useKb.getState();
+  const task = { id: "BR#500", type: "task", title: "Eligible repair", status: "todo", created_ts: 1, updated_ts: 1 };
+  useKb.setState({ tasks: [
+    { ...task, gateway_dispatch: { kind: "eligible" } },
+    { ...task, id: "BR#501", title: "Held repair", gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } },
+    { ...task, id: "BR#502", type: "question", title: "Open clarification" },
+  ] });
+  try {
+    const html = renderToStaticMarkup(<BacklogView />);
+    expect(html).toMatch(/Ready for gateway[\s\S]*Eligible repair[\s\S]*Waiting for gateway eligibility[\s\S]*Held repair[\s\S]*Retry budget exhausted[\s\S]*Open questions[\s\S]*Open clarification/);
+  } finally { useKb.setState(previous); }
 });

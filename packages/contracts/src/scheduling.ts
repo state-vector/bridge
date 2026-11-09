@@ -7,6 +7,11 @@ export const SchedulingReasonSchema = z.enum([
   "unknown_operations", "retry_budget", "host_affinity", "capability", "startup_prerequisite", "lifecycle_gate",
 ]);
 export type SchedulingReason = z.infer<typeof SchedulingReasonSchema>;
+export type GatewayDispatch =
+  | { kind: "eligible" }
+  | { kind: "held"; reasons: SchedulingReason[] }
+  | { kind: "gateway_unavailable" };
+
 export const RecoveryPreemptionSchema = z.object({
   phase: z.enum(["stopping_verification", "slot_available"]), recovery_id: z.string(), victim_id: z.string(),
   generation: z.number().int().positive(), attempt_id: z.string(), session: z.string(), requested_at: z.number(), checkpoint_commit: z.string(),
