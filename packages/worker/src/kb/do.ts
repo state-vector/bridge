@@ -11272,7 +11272,8 @@ export class KnowledgeHub {
     if (!lane) return null;
     const queueFacts = meta.lane?.queue_facts;
     const opState = resolveLaneOperationalState({
-      baseState: queueFacts?.base_state ?? null,
+      baseState: queueFacts?.base_state
+        ? applyDeployObservation(queueFacts.base_state, meta.lane?.deploy_observation, lane.required_workflows) : null,
       baseObservedAt: trainBaseObservedAt(queueFacts),
       stop: meta.stop ?? null,
       currently: meta.currently ?? null,
@@ -15313,7 +15314,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const meta = JSON.parse(row?.meta ?? "{}");
     const queueFacts = meta.lane?.queue_facts;
     const stopped = resolveLaneOperationalState({
-      baseState: queueFacts?.base_state,
+      baseState: queueFacts?.base_state
+        ? applyDeployObservation(queueFacts.base_state, meta.lane?.deploy_observation, laneOfMeta(meta)?.required_workflows ?? []) : null,
       baseObservedAt: trainBaseObservedAt(queueFacts),
       stop: meta.stop,
       now: Date.now(),
@@ -16083,9 +16085,17 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         && queue.length > 0
         ? brQf.base_state : null;
       const stopActive: any = meta.stop ?? null;
+      let lane_state = resolveLaneOperationalState({
+        baseState: brQf?.base_state ?? null,
+        baseObservedAt: trainBaseObservedAt(brQf),
+        stop: stopActive,
+        currently: meta.currently ?? null,
+        now: now0,
+      });
+      const verifyingBase = lane_state.phase === "verifying_base" ? lane_state : null;
       const repairScope = this.trainRepairScope(lane.repo, lane.base);
       let base_red_resolution: any = null;
-      if (brBase || stopActive || brGateBlocked) {
+      if (!verifyingBase && (brBase || stopActive || brGateBlocked)) {
         const nowActionObj: any = meta.lane?.now_action ?? null;
         const nowActionFresh = nowActionObj && now0 - Number(nowActionObj.at ?? 0) < 15 * 60_000;
         const mNowRed = nowActionFresh ? /^main still red \(red: ([^)]+)\)/.exec(String(nowActionObj.note ?? "")) : null;
@@ -16294,14 +16304,6 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           unblock: "restart the merge-train gateway/executor onto the current build",
         };
       }
-      let lane_state = this.laneStore().operational(String(l.id)) ?? resolveLaneOperationalState({
-        baseState: brQf?.base_state ?? null,
-        baseObservedAt: trainBaseObservedAt(brQf),
-        stop: meta.stop ?? null,
-        currently: meta.currently ?? null,
-        fixCard: base_red_resolution?.fix_card ?? null,
-        now: now0,
-      });
       const diagnosticId = brQf?.base_state?.gate_blocked ? meta.lane?.gate_blocked?.duty_id
         : starved && !isBaseRedNow && !stopActive ? meta.lane?.starvation?.duty_id ?? meta.starvation?.duty_id : null;
       const diagnostic = diagnosticId ? this.enrichFixCardRow(String(diagnosticId), now0) : null;
@@ -16319,7 +16321,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const mergeResponse = mergeProbe ? { phase: "observed_merged", pr: responsePr, at: Number(mergeProbe.updated_ts), receipt: String(mergeProbe.receipt) }
         : pendingMerge && responsePr > 0 ? { phase: "recorded", pr: responsePr, at: Number(pendingMerge.at) } : null;
       const lineFacts = TrainLineFactsSchema.safeParse({
-        queue, currently: meta.currently ?? null, stop: meta.stop ?? null,
+        queue, currently: meta.currently ?? null, stop: meta.stop ?? null, verifying_base: verifyingBase,
         lease: meta.lease ?? null, capable, queue_facts: brQf,
         base_red_resolution, diagnostic, merge_response: mergeResponse,
         diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,

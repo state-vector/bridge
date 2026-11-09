@@ -246,6 +246,21 @@ describe("BR#6776 durable check recovery", () => {
     })).status).toBe(200);
     const oldLane = await laneSnap(repo);
     const oldRepair = oldLane.base_red_resolution.fix_card.id;
+    expect((await kbJson("/transition", {
+      id: oldRepair, to: "in_progress", actor: "old-repair-8945", session: "old-repair-8945",
+    })).status).toBe(200);
+    const beforePending = (await kbJson("/relations", { id: oldLane.card })).body.relations;
+    expect((await kbJson("/train.queue_facts", {
+      repo, actor, entries: [], base_state: { verdict: "unsettled", tip_sha: head, red: [], unsettled: ["Deploy Dev"] },
+    })).status).toBe(200);
+    const pending = await laneSnap(repo);
+    expect(pending.stop.sha).toBe(oldHead);
+    expect(pending.line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine" } });
+    expect(pending.lane_state).toMatchObject({ phase: "verifying_base", tip_sha: head });
+    expect(pending.red_main).toBeNull();
+    expect(pending.base_red_resolution).toBeUndefined();
+    expect((await kbJson("/relations", { id: oldLane.card })).body.relations).toEqual(beforePending);
+
     const diagnostic = (await kbJson("/create", {
       type: "task", title: "Yesterday's starvation diagnostic", qualified: true,
       meta: { machine_duty: { kind: "diagnostic", subject: oldLane.card } },

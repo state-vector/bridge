@@ -3814,14 +3814,21 @@ export function trainBaseRedAskWarranted(fix: {
   return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
 }
 
-/** BR#6012 canonical 4-state operational state machine for a merge lane.
+/** BR#6012 canonical operational state machine for a merge lane.
  *  Resolves `stop`, `currently`, and `base_red_resolution` into a single
- *  mutually-exclusive `LaneOperationalState` (`idle` | `draining_batch` |
- *  `settling_ci` | `stopped_red`), persisted atomically in the `lane_state`
+ *  mutually exclusive `LaneOperationalState`, persisted atomically in the `lane_state`
  *  SQLite table so the hub and UI never reconstruct state from contradictory
  *  fragments. */
 export function resolveLaneOperationalState(input: {
-  baseState?: { verdict?: string; tip_sha?: string; red?: { name: string; url?: string }[] } | null;
+  baseState?: {
+    verdict?: string;
+    tip_sha?: string;
+    red?: { name: string; url?: string }[];
+    gate_blocked?: boolean;
+    gate_red?: { name: string }[];
+    gate_unsettled?: string[];
+    deploy_coverage?: { phase: string } | null;
+  } | null;
   baseObservedAt?: number;
   stop?: {
     sha?: string;
@@ -3843,9 +3850,17 @@ export function resolveLaneOperationalState(input: {
   fixCard?: TrainFixCard | null;
   now: number;
 }): LaneOperationalState {
-  const { currently, episodeState, fixCard, now } = input;
-  const redTip = input.baseState?.verdict === "red" && input.baseState.tip_sha;
-  const stop = redTip && (input.baseObservedAt ?? now) >= (input.stop?.at ?? 0)
+  const { baseState, currently, episodeState, fixCard, now } = input;
+  const observedAfterStop = (input.baseObservedAt ?? now) >= (input.stop?.at ?? 0);
+  const verdict = baseState?.verdict;
+  const tip = baseState?.tip_sha;
+  const gateFailed = baseState?.gate_blocked && (!!baseState.gate_red?.length || !baseState.gate_unsettled?.length);
+  if (input.stop?.sha && tip && /^[0-9a-f]{40}$/.test(tip) && tip !== input.stop.sha && observedAfterStop && !gateFailed
+    && baseState?.deploy_coverage?.phase !== "failed" && (verdict === "unsettled" || verdict === "green")) {
+    return { phase: "verifying_base", tip_sha: tip, verdict, updated_ts: now };
+  }
+  const redTip = verdict === "red" && tip;
+  const stop = redTip && observedAfterStop
     ? { sha: redTip, failing: input.baseState?.red ?? [],
         culprit_task: input.stop?.sha === redTip ? input.stop.culprit_task : null }
     : input.stop;

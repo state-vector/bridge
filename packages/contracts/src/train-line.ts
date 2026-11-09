@@ -94,6 +94,7 @@ export const TrainLineFactsSchema = z.object({
   queue: z.array(z.object({ id: z.string() })).default([]),
   currently: z.object({ phase: z.string().optional(), pr: z.number().nullable().optional() }).nullable().optional(),
   stop: z.object({ reason: z.string().optional(), failing: z.array(EvidenceSchema).optional() }).nullable().optional(),
+  verifying_base: z.object({ tip_sha: z.string().min(1), verdict: z.enum(["unsettled", "green"]) }).nullable().optional(),
   lease: z.object({ holder: z.string(), heartbeat_ts: z.number() }).nullable().optional(),
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
@@ -173,6 +174,18 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       : "Automatic recovery has no active repair task. The recovery monitor must assign one; work remains held." };
   };
   if (f.retired) return make("retired", "retired", "This line is retired.");
+  if (f.verifying_base) {
+    const tip = f.verifying_base.tip_sha.slice(0, 9);
+    if (!fresh) return make("unknown", "Current main observation overdue",
+      `Changes remain held while Bridge refreshes the required checks at ${tip}.`, "stale_observation", [],
+      { kind: "attention", text: "Bridge must refresh deployment evidence for the current main commit." });
+    const green = f.verifying_base.verdict === "green";
+    return make("waiting", "Verifying current main",
+      green ? `Required checks passed at ${tip}. Changes remain held until the executor releases the stop.`
+        : `Changes are held while the required checks at ${tip} run.`,
+      "checks_running", [], { kind: "machine", text: "The executor rechecks current main and releases the stop once its required checks pass.",
+        url: cov?.phase === "settling" ? cov.active_run_url ?? null : null });
+  }
   if ((fresh && (bs?.verdict === "red" || (bs?.gate_blocked && !gatePending) || cov?.phase === "failed")) || f.stop) {
     const failure = cov?.phase === "failed" ? [{ name: `Deploy Dev${cov.failing_run_id ? ` run #${cov.failing_run_id}` : ""}`, ...(cov.failing_run_url ? { url: cov.failing_run_url } : {}) }] : [];
     const evidence = fresh ? [...(bs?.gate_blocked ? bs.gate_red ?? [] : bs?.red ?? f.stop?.failing ?? []), ...failure] : f.stop?.failing ?? [];

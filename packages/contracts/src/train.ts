@@ -171,7 +171,7 @@ export const BaseRedResolutionSchema = z.object({
 });
 export type BaseRedResolution = z.infer<typeof BaseRedResolutionSchema>;
 
-/** Canonical 4-state operational state machine for a merge lane (BR#6012):
+/** Canonical operational state machine for a merge lane (BR#6012):
  *  stored atomically in the `lane_state` SQLite table so the hub and UI never
  *  reconstruct lane state from contradictory fragments. */
 export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
@@ -194,6 +194,12 @@ export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
     merge_sha: z.string(),
     task_id: z.string().nullable(),
     merged_at: z.number(),
+    updated_ts: z.number(),
+  }),
+  z.object({
+    phase: z.literal("verifying_base"),
+    tip_sha: z.string().min(1),
+    verdict: z.enum(["unsettled", "green"]),
     updated_ts: z.number(),
   }),
   z.object({
