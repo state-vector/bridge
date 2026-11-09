@@ -54,6 +54,21 @@ it("gives actual size its own Top column with matching header, parent and child 
     }
   } finally { useKb.setState(previous); }
 });
+it("keeps a running background subprocess in Top even without an agent", () => {
+  const previous = useKb.getState();
+  const task = { id: "BR#103", type: "task", title: "Generate integration artifacts", status: "blocked",
+    owner: "", created_ts: Date.now(), updated_ts: Date.now(),
+    meta: { subprocess: { started_at: Date.now() }, blocked: { class: "subprocess", unblock_condition: "Artifact publication completes" } } };
+  useKb.setState({ tasks: [task], sessions: [], agents: [], events: [] });
+  try {
+    const html = renderToStaticMarkup(<TopView />);
+    expect(html).toContain("Generate integration artifacts");
+    expect(html).toContain(">machine<");
+    expect(html).toContain("background work");
+    expect(html).toContain("Artifact publication completes");
+  } finally { useKb.setState(previous); }
+});
+
 it("renders missing/expired receipts honestly instead of claiming large is running", () => {
   const unknown = renderToStaticMarkup(<ExecutionModel value={{ minimum_tier: "large", current: { kind: "unreported" } }} now={1} />);
   expect(unknown).toContain(">unknown<"); expect(unknown).not.toContain("=&gt;");

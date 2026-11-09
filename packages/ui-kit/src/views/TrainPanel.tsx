@@ -233,10 +233,9 @@ export function HubRequestDiagnostics({ now }: { now: number }) {
     </>}
   </details>;
 }
-export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
+export function useTrainStatus() {
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [now, setNow] = useState(Date.now());
   useEffect(() => {
     let dead = false;
     const load = async () => {
@@ -247,10 +246,19 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
     };
     void load();
     const poll = setInterval(load, REFRESH_MS);
-    const clock = setInterval(() => setNow(Date.now()), 1000);
-    return () => { dead = true; clearInterval(poll); clearInterval(clock); };
+    return () => { dead = true; clearInterval(poll); };
   }, []);
-  return <TrainPanelView lanes={lanes} error={error} now={now} openTask={openTask} />;
+  return { lanes, error };
+}
+
+export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
+  const train = useTrainStatus();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, []);
+  return <TrainPanelView {...train} now={now} openTask={openTask} />;
 }
 
 export function TrainPanelView({ lanes, error, now, openTask }: {

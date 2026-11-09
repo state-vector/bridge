@@ -4,7 +4,7 @@ import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { expect, it } from "vitest";
 import { activityBuckets, DashboardSummary, ThroughputSummary } from "../../ui-kit/src/views/Dashboard";
 import { TrainPanelView } from "../../ui-kit/src/views/TrainPanel";
-import { TopSectionHeader } from "../../ui-kit/src/views/TopView";
+import { TopSectionHeader, TrainMachineRows } from "../../ui-kit/src/views/TopView";
 
 const now = Date.now();
 const recovery = { kind: "agent", text: "An agent is fixing the failed check.", task: { id: "BR#1", url: "https://hub.fleetbridge.run/card/BR-1", title: "Restore the required service check", owner: "test-agent", status: "in_progress", last_progress: { note: "Checked the failing service.", will: "Verify the repair and rerun the service check.", ts: now - 40_000, completion_pct: 45 } } };
@@ -47,6 +47,23 @@ it("routine deployment waits stay compact while stopped and unknown lines retain
     expect(alert).toContain('role="alert"');
     expect(alert).toContain("train-lane-interrupted");
   }
+});
+
+it("renders active train work as a Top machine row with an exact PR link", () => {
+  const waiting = {
+    ...ready,
+    currently: { pr: 325, task_id: "BR#7818", merged_at: now - 30_000 },
+    line: { ...ready.line, phase: "waiting", label: "Build and deployment running",
+      blocker: "checks_running", remediation: { kind: "machine", text: "Watching deployment.", url: null } },
+  };
+  const html = render(h(TrainMachineRows, { lanes: [waiting, ready, { ...waiting, retired: true }], now }));
+  expect(html.match(/class="ktable-row top-row/g)).toHaveLength(1);
+  expect(html).toContain("BR#7818");
+  expect(html).toContain("https://github.com/state-vector/bridge/pull/325");
+  expect(html).toContain(">machine<");
+  expect(html).toContain("Build and deployment running");
+  expect(html).toContain("Watching deployment.");
+  expect([...html.matchAll(/class="topc-(?:task|agent|model|session|goal|status|score|gauge|bar|age)(?: [^"]*)?"/g)]).toHaveLength(13);
 });
 
 it("theme filters start closed; the subtitle sits in the title block; chart units and periods are explicit", () => {
