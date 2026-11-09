@@ -47,13 +47,16 @@ async function reserve(g: Awaited<ReturnType<typeof gateway>>, key?: string) {
 }
 
 describe("eligibility-first scheduling on real SQLite", () => {
-  it("admits one witnessed provider recovery through scheduler and begin without erasing failures", async () => {
+  it.each(["configured_route_observed", "configured_proxy_request"])("admits one %s recovery through scheduler and begin without erasing failures", async (witnessKind) => {
+    const proxy = witnessKind === "configured_proxy_request";
     const project = "provider-recovery", g = await gateway(project);
     const larger = {...g.capabilities,tier:"large"};
     await g.cmd({kind:"advertise",capabilities:{...g.capabilities,alternatives:[larger]}});
     const id = await task(project,{execution_requirements:{tier:"large",tools:[],environment:[]}});
     const outcome = { kind: "failed", exit_code: 1, stdout_tail: "Preserved partial work",
-      stderr_tail: "acp session/prompt failed: Authentication required: provider authentication required " };
+      stderr_tail: proxy
+        ? "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]"
+        : "acp session/prompt failed: Authentication required: provider authentication required " };
     let terminal: Record<string, unknown> = {};
     for (let generation = 1; generation <= 3; generation++) {
       const claim = await reserve(g);
@@ -72,9 +75,9 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const auth = { actor: `recovery-reviewer-${serial}`, token_id: identity.token_id, session: "recovery-review" };
     const proof = { id: "request-one", host:g.host, backend:g.capabilities.backend, model:g.capabilities.model, config_revision:"one",
       result:{kind:"succeeded",response_receipt:"ssm:request"},observed_at:Date.now(), request:{kind:"configured_model_request",max_output_tokens:32000,tools:"none"}, actual_model:"provider/small",
-      configuration_receipt:"ssm:config", receipts:["ssm:request"], witness:{kind:"configured_route_observed",configured_model:g.capabilities.model,
+      configuration_receipt:"ssm:config", receipts:["ssm:request"], witness:{kind:witnessKind,configured_model:g.capabilities.model,
         allowed_actual_models:["provider/small"],configured_max_output_tokens:32000,observed_max_output_tokens:32000,configuration_receipt:"ssm:config"} };
-    const command = {kind:"recover_provider_failure",terminal,proof,diagnosis:"provider_authentication",continuation:"Inspect PR before any push",evidence:["ssm:request"]};
+    const command = {kind:"recover_provider_failure",terminal,proof,diagnosis:proxy ? "provider_route_unavailable" : "provider_authentication",continuation:"Inspect PR before any push",evidence:["ssm:request"]};
     const recover = (command_id: string, c: object = command) => post("execution", {...auth,id,command_id,command:c});
     for (const wrong of [{...proof,actual_model:"different"},{...proof,request:{...proof.request,max_output_tokens:10}},{...proof,observed_at:1}]) {
       expect((await recover(`wrong-${++serial}`,{...command,proof:wrong})).error).toMatch(/proof|request/);
@@ -92,6 +95,18 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(next).toMatchObject({generation:4,budget_exhaustions:3,recovery_permit:{phase:"consumed",consumed_generation:4,continuation:command.continuation,terminal}});
     expect(await g.cmd(begin,"recovered-begin",id,resumed.session)).toEqual(next);
     expect((await g.cmd({...begin,attempt_id:"duplicate"},"duplicate-begin",id,resumed.session)).error).toMatch(/quiescence|budget/);
+    if (proxy) {
+      const stopped = { generation: 4, attempt_id: begin.attempt_id, writers: "process_group_empty", outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, "proxy-stop", id, resumed.session)).error).toBeUndefined();
+      const final = await g.cmd({ kind: "finalize", ...stopped }, "proxy-final", id, resumed.session);
+      expect(final.error).toBeUndefined();
+      const fresh = { ...proof, id: "full-witness", observed_at: Date.now() + 1,
+        witness: { ...proof.witness, kind: "configured_route_observed" } };
+      while (Date.now() < fresh.observed_at) await new Promise(resolve => setTimeout(resolve, 1));
+      expect(await recover("replacement", { ...command, terminal: final.terminal, proof: fresh })).toMatchObject({ kind: "provider_recovery_granted" });
+      expect((await recover("repeat-proxy", { ...command, terminal: final.terminal,
+        proof: { ...proof, id: "second-proxy", observed_at: fresh.observed_at } })).error).toMatch(/trial already ran/);
+    }
   });
 
   it("carries the effective reasoning tier from reservation through begin", async () => {

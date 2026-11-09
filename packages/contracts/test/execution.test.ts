@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, openLargerModelStrategy, providerRecoveryDiagnosis, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -142,6 +142,14 @@ describe("witnessed legacy recovery fences", () => {
     return s;
   }
   const capability = {backend:"opencode",model:"route",config_revision:"config"} as const;
+  it("accepts a configured proxy receipt only for route recovery, with the observed request ceiling", () => {
+    const proof = held().recovery_permit!.proof;
+    const witness = { ...proof.witness, kind: "configured_proxy_request" as const };
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_route_unavailable")).toBe(true);
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_quota")).toBe(false);
+    expect(validRecoveryRequestProof({ ...proof, witness }, "provider_authentication")).toBe(false);
+    expect(validRecoveryRequestProof({ ...proof, witness: { ...witness, observed_max_output_tokens: 1 } }, "provider_route_unavailable")).toBe(false);
+  });
   it("invalidates proof for changed evidence, routing, work and age while preserving the record", () => {
     const s=held();
     expect(recoveryPermitMatches(s,capability,"mac","revision",200)).toBe(true);

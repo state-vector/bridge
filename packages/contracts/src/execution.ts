@@ -241,16 +241,27 @@ export const ProviderRecoveryProofSchema = z.object({
   observed_at: z.number().int().positive(),
   request: z.object({ kind: z.literal("configured_model_request"), max_output_tokens: z.number().int().positive(), tools: z.literal("none") }),
   actual_model: text, configuration_receipt: text, receipts: z.array(text).min(1),
-  witness: z.object({ kind: z.literal("configured_route_observed"), configured_model: text,
-    allowed_actual_models: z.array(text).min(1), configured_max_output_tokens: z.number().int().positive(),
-    observed_max_output_tokens: z.number().int().positive(), configuration_receipt: text }),
+  witness: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("configured_route_observed"), configured_model: text,
+      allowed_actual_models: z.array(text).min(1), configured_max_output_tokens: z.number().int().positive(),
+      observed_max_output_tokens: z.number().int().positive(), configuration_receipt: text }),
+    z.object({ kind: z.literal("configured_proxy_request"), configured_model: text,
+      allowed_actual_models: z.array(text).min(1), observed_max_output_tokens: z.number().int().positive(),
+      configuration_receipt: text }),
+  ]),
 });
-export function validRecoveryRequestProof(proof: z.infer<typeof ProviderRecoveryProofSchema>): boolean {
-  return proof.witness.configured_model === proof.model
-    && proof.witness.allowed_actual_models.includes(proof.actual_model)
-    && proof.witness.configuration_receipt === proof.configuration_receipt
-    && proof.witness.configured_max_output_tokens === proof.request.max_output_tokens
-    && proof.witness.observed_max_output_tokens === proof.request.max_output_tokens;
+export function validRecoveryRequestProof(
+  proof: z.infer<typeof ProviderRecoveryProofSchema>,
+  diagnosis: "provider_authentication" | "provider_quota" | "provider_route_unavailable",
+): boolean {
+  const witness = proof.witness;
+  return witness.configured_model === proof.model
+    && witness.allowed_actual_models.includes(proof.actual_model)
+    && witness.configuration_receipt === proof.configuration_receipt
+    && witness.observed_max_output_tokens === proof.request.max_output_tokens
+    && (witness.kind === "configured_proxy_request"
+      ? diagnosis === "provider_route_unavailable"
+      : witness.configured_max_output_tokens === proof.request.max_output_tokens);
 }
 const recoveryPermitFields = {
   id: text, generation: z.number().int().nonnegative(), attempt_id: text,
@@ -532,7 +543,7 @@ export function providerRecoveryDiagnosis(outcome: z.infer<typeof TerminalOutcom
 
 export function recoveryPermitCoversAttempt(state: ExecutionState, now: number): boolean {
   const p = state.recovery_permit, a = state.attempt;
-  return !!p && validRecoveryRequestProof(p.proof) && p.phase === "available" && !!a && a.phase === "quiesced"
+  return !!p && validRecoveryRequestProof(p.proof, p.diagnosis) && p.phase === "available" && !!a && a.phase === "quiesced"
     && p.generation === a.generation && p.attempt_id === a.attempt_id
     && p.checkpoint_commit === (a.checkpoint?.commit ?? null)
     && JSON.stringify(p.terminal) === JSON.stringify(state.terminal)

@@ -5452,7 +5452,7 @@ export class KnowledgeHub {
       // This is an audited human/full-agent diagnosis, never a worker's own
       // retry request. It preserves the failed attempt and grants one begin.
       if (!this.executionWork().isInteractive(tokenId) || !req.session) throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
-      if (!validRecoveryRequestProof(command.proof)) throw new Error("gate: recovery proof must bind the actual model and observed allowance to the witnessed configured request");
+      if (!validRecoveryRequestProof(command.proof, command.diagnosis)) throw new Error("gate: recovery proof must bind the actual model and observed request ceiling to the configured route and failure diagnosis");
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
       if (replay) { if (replay.request !== encoded) throw new Error("gate: command_id reused with different input"); return JSON.parse(replay.result); }
@@ -5464,6 +5464,13 @@ export class KnowledgeHub {
       if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
       if (current.budget_exhaustions < 3) throw new Error("gate: task does not require an exhausted-budget recovery permit");
       if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
+      if (command.proof.witness.kind === "configured_proxy_request" && this.one(
+        `SELECT 1 FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
+           AND json_extract(result,'$.recovery_permit.phase')='consumed'
+           AND json_extract(result,'$.recovery_permit.task_revision')=?
+           AND json_extract(result,'$.recovery_permit.proof.witness.kind')='configured_proxy_request' LIMIT 1`,
+        req.id, String(meta.work_revision ?? "legacy"),
+      )) throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
       if (current.recovery_permit?.phase === "available" && current.recovery_permit.proof.id === command.proof.id) throw new Error("gate: recovery proof already granted; use the original command receipt");
       const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
         .find(r => Number(JSON.parse(String(r.data)).generation) === a.generation);
