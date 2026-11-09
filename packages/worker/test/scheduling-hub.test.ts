@@ -25,6 +25,14 @@ beforeEach(async () => {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
         }
+        if (path === "/fixture/equal-queue-timestamps") {
+          const { first, second } = await request.json();
+          this.state.storage.sql.exec(
+            "UPDATE artefacts SET created_ts=(SELECT last_reserved_at FROM dispatch_queue_turns WHERE task_id=?) WHERE id=?",
+            first, second,
+          );
+          return Response.json({ok:true});
+        }
         if (path === "/fixture/dispatch-inventory") {
           const { host } = await request.json();
           const executor = this.state.storage.sql.exec(
@@ -111,6 +119,25 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([older, newer]);
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: older });
+  });
+
+  it("lets the next equally ranked repair run after a startup reservation is cancelled", async () => {
+    const project = "fair-repair-retry", g = await gateway(project);
+    const recovery = { machine_duty: { kind: "task-recovery", reason: "execution_environment" } };
+    const first = await task(project, recovery), second = await task(project, recovery);
+    const reservation = await reserve(g);
+    expect(reservation).toMatchObject({ kind: "reserved", task_id: first });
+    if (reservation.kind !== "reserved") throw new Error("expected a reservation");
+    const equal = await stub.fetch("https://kb/fixture/equal-queue-timestamps", {
+      method: "POST", body: JSON.stringify({ first, second }),
+    });
+    expect(await equal.json()).toEqual({ok:true});
+    const cancelled = await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true },
+      undefined, first, reservation.session);
+    expect(cancelled.kind).toBe("released");
+    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].candidates.slice(0, 2)).toEqual([second, first]);
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: second });
   });
 
   it("resolves fresh tasks from one fleet inventory without changing their order", async () => {

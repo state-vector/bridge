@@ -3259,6 +3259,10 @@ export class KnowledgeHub {
         task_id TEXT NOT NULL, head_sha TEXT NOT NULL, duty_id TEXT NOT NULL,
         PRIMARY KEY(task_id,head_sha)
       );
+      CREATE TABLE IF NOT EXISTS dispatch_queue_turns (
+        task_id TEXT PRIMARY KEY,
+        last_reserved_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS dispatch_reservations (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL,
         generation INTEGER NOT NULL, expires_at INTEGER NOT NULL
@@ -5177,9 +5181,12 @@ export class KnowledgeHub {
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string }) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
-    const filter = taskIds ? " AND id IN (SELECT value FROM json_each(?))" : "";
+    const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
     const rows = this.state.storage.sql.exec(
-      `SELECT id,title,body_md,project,meta,roles,tags,updated_ts,created_ts FROM artefacts WHERE type='task' AND status='todo' AND owner=''` + filter,
+      `SELECT a.id,a.title,a.body_md,a.project,a.meta,a.roles,a.tags,a.updated_ts,a.created_ts,
+        MAX(a.created_ts, COALESCE(q.last_reserved_at, 0)) AS queue_ts, q.task_id IS NOT NULL AS reserved_before
+        FROM artefacts a LEFT JOIN dispatch_queue_turns q ON q.task_id=a.id
+        WHERE a.type='task' AND a.status='todo' AND a.owner=''` + filter,
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
     const taskHolds = new Map<string, SchedulingReason>();
@@ -5237,7 +5244,10 @@ export class KnowledgeHub {
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
-      || Number(a.created_ts) - Number(b.created_ts) || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
+      // A failed or cancelled reservation takes one turn within its priority
+      // class. Generic card updates never change FIFO position.
+      || Number(a.queue_ts) - Number(b.queue_ts) || Number(a.reserved_before) - Number(b.reserved_before)
+      || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
     return { eligible, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id) };
   }
@@ -7362,7 +7372,10 @@ export class KnowledgeHub {
           const credential = this.one(`SELECT tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, body.token_id);
           if (credential && tagsSayGateway(parseTags(credential.tags))) {
             this.state.storage.sql.exec(`INSERT INTO executor_start_claims (task_id, token_id, session) VALUES (?, ?, ?)`, id, body.token_id, String(meta.session ?? ""));
-            this.state.storage.sql.exec(`INSERT INTO dispatch_reservations(task_id,token_id,session,generation,expires_at) VALUES(?,?,?,?,?)`, id, body.token_id, String(meta.session ?? ""), this.executionState(id)?.generation ?? 0, Date.now() + DISPATCH_RESERVATION_MS);
+            const reservedAt = Date.now();
+            this.state.storage.sql.exec(`INSERT INTO dispatch_reservations(task_id,token_id,session,generation,expires_at) VALUES(?,?,?,?,?)`, id, body.token_id, String(meta.session ?? ""), this.executionState(id)?.generation ?? 0, reservedAt + DISPATCH_RESERVATION_MS);
+            this.state.storage.sql.exec(`INSERT INTO dispatch_queue_turns(task_id,last_reserved_at) VALUES(?,?)
+              ON CONFLICT(task_id) DO UPDATE SET last_reserved_at=MAX(excluded.last_reserved_at, dispatch_queue_turns.last_reserved_at+1)`, id, reservedAt);
             this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, body.token_id);
           }
         }
