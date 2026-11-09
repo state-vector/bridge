@@ -88,6 +88,29 @@ describe("durable execution failure boundaries", () => {
     expect(s.attempt).toMatchObject({ phase: "running", host: "linux", generation: 2, checkpoint: null, restored_tree: null });
     expect(() => step(s, { kind: "checkpoint", ...fence, checkpoint: cp })).toThrow(/fenced/);
   });
+  it("does not deliver retired writers' claim-ended stops to a replacement", () => {
+    const text = "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.";
+    const previousStop = { kind: "message", message_id: "claim-ended:1:one", priority: "interrupt", text } as const;
+    let s = step(started(), previousStop);
+    s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    const legacyInbox = s.messages;
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    s.messages = legacyInbox; // A previously persisted replacement left the older stop queued.
+    const secondFence = { generation: 2, attempt_id: "two" };
+    s = step(s, { ...previousStop, message_id: "claim-ended:2:two" }, 201);
+    s = step(s, { kind: "quiesce", ...secondFence, writers: "process_group_empty" }, 202);
+
+    const replacement = step(s, { ...begin, attempt_id: "three" }, 300);
+    expect(replacement.messages.map(m => m.state)).toEqual(["acted", "acted"]);
+    const poll = { kind: "poll", generation: 3, attempt_id: "three" } as const;
+    expect(step(replacement, poll, 301).attempt?.phase).toBe("running");
+
+    s = step(s, { kind: "message", message_id: "operator-stop", priority: "interrupt", text: "Stop before the next push" });
+    const held = step(step(s, { ...begin, attempt_id: "three" }, 300), poll, 301);
+    expect(held.attempt?.phase).toBe("stopping");
+    expect(held.messages.at(-1)).toMatchObject({ id: "operator-stop", state: "delivered" });
+  });
+
   it("rejects content-unbound test evidence", () => {
     expect(() => step(started(), { kind: "checkpoint", ...fence, checkpoint: { ...cp, tests: [{ tree: cp.base, command: "test", outcome: "passed", receipt: "run/1" }] } })).toThrow(/evidence/);
   });

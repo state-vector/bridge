@@ -399,6 +399,21 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       if (needsRecoveryPermit && !(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now))) throw new Error("gate: retry budget or provider route requires a current recovery permit");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
+      if (a) {
+        // Older hubs put the previous claim's stop in the task mailbox. Its
+        // exact writer is now quiescent, so that stop has already taken effect.
+        const legacyStopText = "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.";
+        for (const message of s.messages) {
+          if (message.priority !== "interrupt" || message.text !== legacyStopText) continue;
+          const [kind, generation, ...attemptParts] = message.id.split(":");
+          const stoppedGeneration = Number(generation);
+          const stoppedAttempt = attemptParts.join(":");
+          if (kind !== "claim-ended" || !Number.isSafeInteger(stoppedGeneration) || stoppedGeneration < 1 || !stoppedAttempt) continue;
+          if (stoppedGeneration < a.generation || (stoppedGeneration === a.generation && stoppedAttempt === a.attempt_id)) {
+            message.state = "acted";
+          }
+        }
+      }
       s.generation += 1;
       if (needsRecoveryPermit && s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {

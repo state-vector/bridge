@@ -7333,14 +7333,12 @@ export class KnowledgeHub {
       if (row.type === "task" && (verdict.status === "todo" || terminalStartup)) delete meta.interactive_execution;
       if (row.type === "task" && (verdict.status === "todo" || terminalStartup)) {
         const execution = this.executionState(id);
-        if (execution?.attempt && execution.attempt.phase !== "quiesced") {
-          // Releasing the card fences its writer, not just its tools. Keep the
-          // slot charged until the host stops and proves quiescence.
-          const stopped = reduceExecution(execution, { kind: "message", priority: "interrupt",
-            message_id: `claim-ended:${execution.generation}:${execution.attempt.attempt_id}`,
-            text: "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution." },
-            execution.attempt.host, execution.attempt.session, ts);
-          this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(stopped), id);
+        if (execution?.attempt && !["quiesced", "finalizing", "stopping"].includes(execution.attempt.phase)) {
+          // Stopping belongs to this attempt. The mailbox belongs to the task
+          // and is delivered again when a replacement takes ownership.
+          execution.attempt.phase = "stopping";
+          execution.revision += 1;
+          this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(execution), id);
         }
       }
       if (reviewResult?.kind === "stronger_implementation_required") this.executionWork().strongerImplementation(reviewResult.task_id, reviewResult.summary, actor, true, id);

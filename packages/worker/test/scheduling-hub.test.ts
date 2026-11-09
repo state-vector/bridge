@@ -586,13 +586,15 @@ describe("eligibility-first scheduling on real SQLite", () => {
     if (r.kind !== "reserved") throw new Error("no reservation");
     let status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 0, starting: 1, unconfirmed: 0, held: 1 });
-    expect((await g.cmd({ kind: "begin", attempt_id: "retained-writer", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-retained", id, r.session)).error).toBeUndefined();
+    const begun = await g.cmd({ kind: "begin", attempt_id: "retained-writer", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-retained", id, r.session);
+    expect(begun.error).toBeUndefined();
     status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 1, starting: 0, unconfirmed: 0, held: 1 });
     expect((await post("transition", { id, to: "todo", actor: "system:test", note: "Card released, but no stopped-process evidence exists" })).error).toBeUndefined();
+    const released = await g.cmd({ kind: "inspect" }, "released-writer-inspect", id, r.session);
+    expect(released).toMatchObject({ attempt: { phase: "stopping" }, revision: begun.revision + 1, messages: [] });
     const fenced = await g.cmd({ kind: "poll", generation: 1, attempt_id: "retained-writer" }, "released-writer-poll", id, r.session);
     expect(fenced.attempt.phase).toBe("stopping");
-    expect(fenced.messages).toEqual(expect.arrayContaining([expect.objectContaining({ priority: "interrupt", text: expect.stringContaining("Task claim ended") })]));
     status = await g.cmd({ kind: "schedule_status", host: g.host });
     expect(status.hosts[0]).toMatchObject({ active: 1, reserved: 0, occupancy: { leased: 0, starting: 0, unconfirmed: 1, held: 1,
       slots: [{ kind: "unconfirmed", task_id: id, generation: 1, attempt_id: "retained-writer", session: r.session, reason: "claim_changed", task_status: "todo" }] } });
