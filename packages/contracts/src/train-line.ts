@@ -13,6 +13,16 @@ export function repairProgressText(task: TrainFixCard): string {
   return "Agent session is active; next action has not yet been reported.";
 }
 
+// Executor evidence for one exact reviewed head. Eligibility adds current
+// selection after the GitHub gate and cumulative conflict checks.
+export const TrainCarReadinessSchema = z.object({
+  phase: z.enum(["reviewed", "eligible"]),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  base_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  observed_at: z.number().int().positive(),
+});
+export type TrainCarReadiness = z.infer<typeof TrainCarReadinessSchema>;
+
 const EvidenceSchema = z.object({ name: z.string(), url: z.string().optional() });
 const ActionSchema = z.object({ id: z.string(), url: z.string(), question: z.string(), options: z.array(z.string()) });
 export const LineRemediationSchema = z.discriminatedUnion("kind", [

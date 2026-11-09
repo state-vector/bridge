@@ -9,7 +9,7 @@ it("renders actual PR blocks without overlapping multiplication labels and expla
     queue: [{ id: "BR#2", pr: 2, priority: "normal" }],
     line: { phase: "ready", label: "ready", reason: "Executor available", blocker: null, remediation: null, held: 1, observed_at: now, evidence: [] },
     pr_stats: { in_progress: 0, verifying: 0, ready: 1 },
-    batches: [[{ id: "BR#2", pr: 2, state: "ready", bounces: 34, over_budget: false, detail: "Current queue gates passed" }]],
+    batches: [[{ id: "BR#2", pr: 2, state: "ready", eligibility: "reviewed", bounces: 34, over_budget: false, detail: "Reviewed and conflict-free" }]],
   };
   const html = renderToStaticMarkup(<TrainPanelView lanes={[lane]} error={null} now={now} />);
   expect(html).toContain("Each block is a PR");
@@ -17,8 +17,13 @@ it("renders actual PR blocks without overlapping multiplication labels and expla
   expect(html).not.toContain("×34");
   expect(html).not.toContain("train-bounce-chip");
   expect(html).not.toContain("de-queued");
-  expect(html).toContain("Ready to merge: verified, no conflicts with base");
-  expect(html).toContain(">1 ready</span>");
+  expect(html).toContain(">1 reviewed &amp; clean</span>");
+  expect(html).toContain(">0 eligible</span>");
+  expect(html).toContain("train-block tb-reviewed");
+  lane.batches![0][0].eligibility = "eligible";
+  const eligible = renderToStaticMarkup(<TrainPanelView lanes={[lane]} error={null} now={now} />);
+  expect(eligible).toContain(">1 eligible</span>");
+  expect(eligible).toContain("train-block tb-ready");
 });
 
 

@@ -234,7 +234,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -13560,6 +13560,7 @@ export class KnowledgeHub {
     const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
     for (const entry of entriesArr) {
       if (entry.bypass !== undefined) entry.bypass = RecoveryMergeGateSchema.parse(entry.bypass);
+      if (entry.readiness !== undefined) entry.readiness = TrainCarReadinessSchema.parse(entry.readiness);
     }
     const scan = TrainQueueScanSchema.parse(body.scan ?? meta.lane?.queue_facts?.scan ?? { phase: "complete" });
     // BR#5265 Fix A: the executor stamps the walk's base verdict
@@ -16030,10 +16031,12 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // - "waiting"   → orange solid (.tb-wait): waiting to be verified
       const { prStats, batches } = (() => {
         const facts = meta.lane?.queue_facts?.entries ?? [];
-        const factFor = (id: string, pr?: number) => String((
-          facts.find((e: any) => e.id === id && e.pr === pr) ??
-          facts.find((e: any) => e.id === id && e.pr == null)
-        )?.cls ?? "");
+        const factFor = (id: string, pr?: number) =>
+          facts.find((e: { id: string; pr?: number }) => e.id === id && e.pr === pr) ??
+          facts.find((e: { id: string; pr?: number }) => e.id === id && e.pr == null);
+        const observedBase = applyDeployObservation(meta.lane?.queue_facts?.base_state, meta.lane?.deploy_observation, lane.required_workflows);
+        const laneCanLand = capable?.ready && !meta.stop && !meta.currently
+          && observedBase?.verdict === "green" && !observedBase?.gate_blocked;
         const mergedPrs = new Set<number>(
           (this.state.storage.sql.exec(`SELECT pr FROM provenance WHERE repo = ?`, lane.repo).toArray() as any[])
             .map((r) => Number(r.pr ?? 0))
@@ -16098,7 +16101,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           ) {
             continue;
           }
-          const cls = factFor(q.id, q.pr);
+          const fact = factFor(q.id, q.pr);
+          const cls = String(fact?.cls ?? "");
+          const readiness = TrainCarReadinessSchema.safeParse(fact?.readiness);
+          const fresh = readiness.success && readiness.data.base_sha === observedBase?.tip_sha
+            && readiness.data.observed_at >= now0 - TRAIN_READY_MS;
+          const eligibility = fresh
+            ? readiness.data.phase === "eligible" && laneCanLand ? "eligible" : "reviewed"
+            : undefined;
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
           if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
@@ -16112,16 +16122,18 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
               detail: "waiting to be verified — needs a fresh review",
             });
           } else {
-            // Accepted and no base conflict/repair or invalidated review:
-            // ready is a PR property. Lane stops, main CI/deploy and executor
-            // waits do not undo verification or change this car's colour.
+            // Keep accepted cars in the backlog; only a fresh executor
+            // observation can establish conflict freedom and eligibility.
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
               ...(q.bounces != null ? { bounces: q.bounces } : {}),
               ...(q.over_budget ? { over_budget: true } : {}),
               state: "ready",
-              detail: "ready to merge — verified, no conflicts with base",
+              ...(eligibility ? { eligibility } : {}),
+              detail: eligibility === "eligible" ? "Eligible to merge now — selected for the current batch"
+                : eligibility === "reviewed" ? "Reviewed and conflict-free — waiting to become eligible"
+                : "Review accepted — waiting for a current mergeability check",
             });
           }
         }

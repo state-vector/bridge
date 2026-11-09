@@ -274,6 +274,9 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
       const machine = l.lease?.holder ?? l.capable?.holder;
       const repo = l.lane.split("@")[0];
       const stats = l.pr_stats ?? { in_progress: 0, verifying: 0, ready: 0 };
+      const cars = l.batches?.flat() ?? [];
+      const eligible = cars.filter(q => q.eligibility === "eligible").length;
+      const reviewed = cars.filter(q => q.eligibility != null).length;
       const progress = l.currently?.phase === "bursting"
         ? `${l.currently.burst_merged ?? 0} merged this batch`
         : l.currently ? "Merged — checking deployment" : `${line.held} changes queued`;
@@ -292,10 +295,10 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog"><span className="train-stats">
-          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready" title="Ready to merge: verified, no conflicts with base">{stats.ready} ready</span>
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> <span className="train-stat ts-verifying">{stats.verifying} verifying</span> <span className="train-stat" title="Reviewed and conflict-free, including eligible PRs">{reviewed} reviewed &amp; clean</span> <span className="train-stat ts-ready" title="Eligible to merge now: selected by the executor for the current batch">{eligible} eligible</span>
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
-          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
+          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.eligibility === "eligible" ? "tb-ready" : q.eligibility === "reviewed" ? "tb-reviewed" : q.state === "ready" ? "tb-unknown" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
             title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · Returned to repair/review ${q.bounces} time(s) across tracked history${q.over_budget ? " — active bounce-budget escalation" : ""}` : ""}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
       </div>

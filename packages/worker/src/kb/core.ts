@@ -1902,6 +1902,7 @@ export interface TrainBatchCar {
   id: string;
   pr?: number;
   state: "ready" | "verifying" | "waiting";
+  eligibility?: "reviewed" | "eligible";
   detail?: string;
   /** BR#4688: ledger bounce count for the PR leg + the over-budget mirror —
    *  the Top panel's batch blocks render the same bounce chip the queue rows

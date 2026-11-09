@@ -362,7 +362,7 @@ export interface KbTrainLane {
    *  iterative selectBatch (conflict_pairs + burst_max). Inside each batch,
    *  state drives the block colour: "ready" (green solid), "verifying"
    *  (orange pulsing), "waiting" (orange solid). */
-  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; detail?: string;
+  batches?: { id: string; pr?: number; state: "ready" | "verifying" | "waiting"; eligibility?: "reviewed" | "eligible"; detail?: string;
     bounces?: number; over_budget?: boolean }[][];  // BR#4688: bounce chip facts ride the batch blocks too
   /** BR#5114: the executor's per-tick per-entry gate verdicts, in walk
    *  (rank) order — the queue block row. cls: ready (merges this pass) |

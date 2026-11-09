@@ -3378,6 +3378,13 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             MergeAction::RerunGate { .. } => "waiting",
             _ => "blocked",
         } }));
+        if !probed_base_sha.is_empty() && verdict_covers_head_leg(Some(&leg), &head_sha)
+            && facts.get("mergeable").and_then(Value::as_bool) == Some(true)
+        {
+            qfacts.last_mut().unwrap()["readiness"] = json!({
+                "phase": "reviewed", "observed_at": now_ms(), "head_sha": head_sha, "base_sha": probed_base_sha
+            });
+        }
         let head_verdict = crate::train_gate::classify_head_checks(&head_checks);
         if matches!(&gate, MergeAction::Note { .. }) && !head_verdict.red.is_empty() {
             qfacts.last_mut().unwrap()["repair"] = json!({ "kind": "head_checks", "head_sha": head_sha,
@@ -3688,6 +3695,16 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         ctx.operation_deadline = None;
         batch = crate::train_gate::select_batch(&clean, &conflict_pairs, if burst_cap == 0 { usize::MAX } else { burst_cap as usize });
         batch.sort_by_key(|&i| candidates[i].qi);
+        for &i in &batch {
+            let c = &candidates[i];
+            if let Some(entry) = qfacts.iter_mut().find(|entry| {
+                vstr(entry, "id") == Some(c.head_id.as_str())
+                    && entry.get("pr").and_then(Value::as_i64) == Some(c.pr)
+                    && entry.pointer("/readiness/head_sha").and_then(Value::as_str) == Some(c.head_sha.as_str())
+            }) {
+                entry["readiness"]["phase"] = json!("eligible");
+            }
+        }
         if batch.len() < candidates.len() {
             let dropped: Vec<String> = candidates
                 .iter()
