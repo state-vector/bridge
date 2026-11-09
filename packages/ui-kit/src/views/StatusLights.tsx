@@ -21,7 +21,9 @@ export function StatusDetails({ hub, realtime, workers, lastError }: {
     {workers?.map(worker => <div key={worker.host} className="light-worker">
       <div className="light-row"><span className="light-worker-name" title={worker.host}>{worker.host}</span>
         <span className={`light-worker-state worker-${worker.state}`} title={worker.reason}>
-          {({ ready: "Ready", busy: "Busy", offline: "Offline", draining: "Draining", unavailable: "Unavailable" })[worker.state]}
+          {({ ready: "Ready", busy: "Busy", offline: "Offline",
+            draining: worker.readiness?.kind === "updating" ? "Upgrading" : "Draining",
+            unavailable: "Unavailable" })[worker.state]}
         </span>
       </div>
       <div className="light-worker-detail">{worker.occupancy
