@@ -307,15 +307,18 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
             record.work = Work::Stopped { outcome, writers, worktree, step: Step::Stop };
             journal::save(&root, &record)?;
         }
-        if let Work::Stopped { outcome, writers, step, .. } = &record.work {
-            if !matches!(step, Step::Acknowledged { .. }) {
-                let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("gate: stopped journal has no attempt fence".into()); };
-                let ticket = record.ticket();
-                let bounded = bounded_outcome(outcome);
-                let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("stopped"),
-                    json!({"kind":"stopped","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded}))?;
-                report.released(Released::from_hub(&record.owner, &reply)?);
-            }
+        if let Work::Stopped { outcome, writers, worktree, step: Step::Stop | Step::Capture | Step::Publish { .. } | Step::Register { .. } } = record.work.clone() {
+            let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("gate: stopped journal has no attempt fence".into()); };
+            let ticket = record.ticket();
+            let bounded = bounded_outcome(&outcome);
+            let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("stopped"),
+                json!({"kind":"stopped","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded}))?;
+            report.released(Released::from_hub(&record.owner, &reply)?);
+            // Finalize has always followed the hub's stopped receipt. Persist
+            // that boundary so a delivery failure resumes at finalize.
+            record.work = Work::Stopped { outcome, writers, worktree, step: Step::Finalize };
+            record.disposition = Disposition::Pending;
+            journal::save(&root, &record)?;
         }
         loop {
             match record.work.clone() {
@@ -342,7 +345,8 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                     let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("gate: stopped journal has no attempt fence".into()); };
                     let ticket = record.ticket().clone();
                     let next = match step {
-                        Step::Stop | Step::Capture | Step::Publish { .. } | Step::Register { .. } | Step::Finalize => {
+                        Step::Stop | Step::Capture | Step::Publish { .. } | Step::Register { .. } => unreachable!("stopped receipt must precede finalization"),
+                        Step::Finalize => {
                             let bounded = bounded_outcome(&outcome);
                             let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("finalize"),
                                 json!({"kind":"finalize","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded}))?;
@@ -1446,6 +1450,10 @@ pub(crate) mod tests {
             }
             assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1));
         }
+        let pending = journal::pending(&terminal_root(&cfg).unwrap(), cfg.label.as_ref().unwrap(), &cfg.url).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].work, Work::Stopped { step: Step::Finalize, .. }),
+            "a failed finalize must preserve the acknowledged stopped boundary");
         drop(first); // injected daemon loss: journal, not the old memory, recovers
         let mut restored = Controller::new(&cfg, &ready, &snap);
         while !restored.idle() {
