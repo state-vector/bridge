@@ -688,10 +688,11 @@ from another workflow. Retry routing uses the actual job or workflow-run ID,
 with a durable reservation before dispatch and one attempt per candidate head
 and obligation; uncertain calls are not blindly repeated after restart. Failed
 queued heads receive a deduplicated repair duty even when their parent has no
-active owner. Candidates integrate current base and run fresh CI before merging;
-clean machine updates carry substance review, never stale test evidence. This
-is rechecked between batch members to catch semantic cross-file integration
-breaks. Initial worker launch is authorized by the exact authenticated scheduler
+active owner. Candidates merge at their exact reviewed heads, and a worker
+branch updates only after GitHub refuses its exact head as up to date and a
+trial merge confirms it behind and clean; clean machine updates carry substance
+review, never stale test evidence. This is rechecked between batch members to
+catch semantic cross-file integration breaks. Initial worker launch is authorized by the exact authenticated scheduler
 reservation. Recovery banners show actual startup/capability/handoff blockers,
 rather than describing an unlaunchable `todo` task as waiting for an agent.
 
