@@ -46,6 +46,18 @@ describe("durable execution failure boundaries", () => {
     expect(nextExecutorStartBarrier(three, "worker/config-repaired", "new prerequisite failure", 300_000)).toMatchObject({ kind: "cooldown", failures: 1 });
     expect(() => step(started(), { kind: "start_failed", stage: "begin", reason: "unknown start outcome", retained_work: false, failure_class: "transport" })).toThrow(/unquiesced/);
   });
+  it("retries a begin that raced a readiness hold while preserving identity failures", () => {
+    const legacy = "ERROR: gate: begin requires the provisioned worker from the runner's live readiness proof";
+    const current = "ERROR: gate: gateway admission changed before begin; retry through the scheduler";
+    const barrier = { kind: "repair_required", fingerprint: "worker/config", failures: 2, reason: legacy } as const;
+    const recovered = recoverResourceStartBarrier(barrier, 100);
+    expect(recovered).toMatchObject({ kind: "cooldown", until_ts: 60_100 });
+    expect(recoverResourceStartBarrier(recovered, 200)).toBe(recovered);
+    expect(nextExecutorStartBarrier(null, barrier.fingerprint, current, 200, "prerequisite")).toMatchObject({ kind: "cooldown", until_ts: 60_200 });
+    const mismatch = nextExecutorStartBarrier(null, barrier.fingerprint, "gate: begin worker identity differs from the advertised credential", 200, "prerequisite");
+    expect(mismatch.kind).toBe("repair_required");
+    expect(recoverResourceStartBarrier(mismatch, 300)).toBe(mismatch);
+  });
   it("keeps a fault's retry budget/history across unrelated commits without carrying verification coverage", () => {
     const cause: RecoveryCause = { kind: "check_failure", check: "Smoke" };
     let episode = reduceRecoveryEpisode(undefined, { head_sha: cp.base, cause, event_id: "failed", actor: "runner", now: 1,

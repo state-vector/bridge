@@ -408,6 +408,34 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const board = await response.json() as { workers: { host: string; state: string; reason: string }[] };
     expect(board.workers.find(worker => worker.host === g.host)).toMatchObject({ state: "unavailable", reason });
   });
+  it("backs off a begin that raced a gateway cooldown and releases its task after fresh readiness", async () => {
+    const project = "begin-readiness-race", g = await gateway(project);
+    const id = await task(project), reservation = await reserve(g);
+    if (reservation.kind !== "reserved") throw new Error("no reservation");
+    await g.cmd({ kind: "gateway_failure", reason: "advertise timeout", cooldown_ms: 10_000 });
+    const begin = await g.cmd({ kind: "begin", attempt_id: "readiness-race", worker: g.capabilities.worker.label,
+      action_budget_ms: 60_000 }, "begin-race", id, reservation.session);
+    expect(begin.error).toContain("gateway admission changed before begin");
+    const failed = await g.cmd({ kind: "start_failed", stage: "begin", reason: begin.error, retained_work: false,
+      failure_class: "prerequisite" }, "begin-race-failed", id, reservation.session);
+    expect(failed).toMatchObject({ kind: "released", barrier: { kind: "cooldown", failures: 1 } });
+    await post("admin.startup_sweep", { now: failed.barrier.until_ts + 1 });
+    expect((await post("get", { id })).meta.startup_wait).toBeUndefined();
+  });
+  it("keeps a gateway upgrade hold when beginning on an alternative model", async () => {
+    const project = "alternative-upgrade-hold", g = await gateway(project);
+    const id = await task(project), reservation = await reserve(g);
+    if (reservation.kind !== "reserved") throw new Error("no reservation");
+    const alternate = { ...g.capabilities, model: "test/alternate" };
+    const reason = "Managed gateway upgrade";
+    const advertised = await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [alternate],
+      admission_hold: { kind: "update_handoff", reason } } });
+    expect(advertised.readiness).toMatchObject({ kind: "updating" });
+    const begin = await g.cmd({ kind: "begin", attempt_id: "upgrade-race", worker: g.capabilities.worker.label,
+      selection: { backend: alternate.backend, model: alternate.model, tier: alternate.tier },
+      action_budget_ms: 60_000 }, "begin-alternate", id, reservation.session);
+    expect(begin.error).toContain("gateway admission changed before begin");
+  });
   it("separates an operator admission pause from model readiness and preserves active writer control", async () => {
     const project = "operator-pause", g = await gateway(project, 2);
     const first = await task(project), claimed = await reserve(g);

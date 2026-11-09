@@ -32,14 +32,20 @@ export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
 export function isSigningScratchResourceFailure(reason: string): boolean {
   return reason.includes("sign-check scratch dir: No space left on device (os error 28)");
 }
+export function isBeginReadinessRetry(reason: string): boolean {
+  // Older hubs used this same rejection for a temporary readiness hold and
+  // a credential mismatch. A bounded retry still requires fresh hub proof.
+  return reason.includes("gate: begin requires the provisioned worker from the runner's live readiness proof")
+    || reason.includes("gate: gateway admission changed before begin; retry through the scheduler");
+}
 export function recoverResourceStartBarrier(barrier: ExecutorStartBarrier | null, now: number): ExecutorStartBarrier | null {
-  return barrier?.kind === "repair_required" && isSigningScratchResourceFailure(barrier.reason)
+  return barrier?.kind === "repair_required" && (isSigningScratchResourceFailure(barrier.reason) || isBeginReadinessRetry(barrier.reason))
     ? nextExecutorStartBarrier(barrier, barrier.fingerprint, barrier.reason, now, "resource") : barrier;
 }
 export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" | "resource" = "transport"): ExecutorStartBarrier {
   // Resource recovery changes neither credential nor configuration. Repeated
   // ENOSPC must back off, not permanently require a new identity fingerprint.
-  if (failureClass === "resource" || isSigningScratchResourceFailure(reason)) return ExecutorStartBarrierSchema.parse({
+  if (failureClass === "resource" || isSigningScratchResourceFailure(reason) || isBeginReadinessRetry(reason)) return ExecutorStartBarrierSchema.parse({
     kind: "cooldown", fingerprint, failures: 1, until_ts: now + 60_000, reason,
   });
   const failures = previous?.fingerprint === fingerprint ? previous.failures + 1 : 1;
