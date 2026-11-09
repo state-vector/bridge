@@ -111,7 +111,17 @@ export const ModelCapabilitySchema = z.object({
 
 });
 export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alternatives: z.array(ModelCapabilitySchema).max(20).default([]), worker: WorkerReadinessSchema.default({ kind: "unprovisioned" }), inventory_revision: z.union([z.literal(1), z.literal(2)]).optional(),
-  admission_hold: z.object({ kind: z.literal("update_handoff"), reason: text }).optional() });
+  runtime: z.object({
+    version: z.string().min(1).max(80),
+    commit: z.string().max(64).nullable(),
+    channel: z.enum(["main", "stable"]).nullable(),
+  }).optional(),
+  admission_hold: z.object({
+    kind: z.literal("update_handoff"), reason: text,
+    target: z.string().regex(/^[0-9a-f]{40}$/).nullish(),
+    deadline: z.number().int().nonnegative().nullish(),
+  }).optional(),
+});
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {
   const tiers: ReasoningTier[] = ["small", "medium", "large"];

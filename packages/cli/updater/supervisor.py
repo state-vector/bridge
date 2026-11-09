@@ -367,7 +367,8 @@ class Supervisor:
         value = read(self.request)
         if value is not None and value.get("nonce") != op.nonce:
             raise RuntimeError("another recovery owns the admission hold")
-        atomic(self.request, {"nonce": op.nonce, "worker_protocol": op.worker_protocol})
+        atomic(self.request, {"nonce": op.nonce, "worker_protocol": op.worker_protocol,
+                              "source": op.source, "target": op.target, "deadline": op.deadline})
 
     def release_request(self, op):
         value = read(self.request)
@@ -538,6 +539,16 @@ class Supervisor:
                 return
             if not current or current.commit != op.source:
                 raise RuntimeError("source controller changed build; preserve the recovery hold")
+            if (op.intent is Intent.UPDATE and self.config().get("role") != "train"
+                    and self.info(self.binary).get("upgrade_notice_protocol") == 1):
+                notice = read(self.root / "upgrade-notice.json", {})
+                if notice.get("nonce") != op.nonce or notice.get("pid") != current.pid:
+                    if now >= op.deadline:
+                        self.release_request(op)
+                        self.save(Idle(max(op.next_attempt_at, now + USEFUL_WORK_SECONDS * 1000)))
+                    else:
+                        self.wait(Reason.HANDOFF, "Waiting for the hub to record the planned gateway upgrade", state, 5)
+                    return
             if self.idle(op, current):
                 # A same-build controller restart is a participant reconnect,
                 # not a failed update or a new retry budget.

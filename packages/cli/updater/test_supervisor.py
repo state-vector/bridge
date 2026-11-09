@@ -52,6 +52,7 @@ class Machine:
         self.did_crash = False
         self.doctor_ok = True
         self.export_source = None
+        self.notice_protocol = 0
 
     def fetch(self, url, timeout):
         self.fetches.append(url)
@@ -81,6 +82,7 @@ class Harness(m.Supervisor):
         data = Path(binary).read_bytes()
         return {"commit": self.machine.target if data == self.machine.binary else OLD,
                 "update_protocol": 1, "worker_protocol": 1,
+                "upgrade_notice_protocol": self.machine.notice_protocol,
                 "recovery_protocol": 1 if self.machine.export_source or not self.machine.ack else 0,
                 "coordinator_revision":m.COORDINATOR_REVISION if self.machine.export_source else 0}
 
@@ -204,6 +206,24 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(effect=effect):
                 self.setUp();self.machine.crash_effect=effect;self.drive()
                 self.assertEqual(self.machine.actions,["stop","start","notify"])
+
+    def test_upgrade_waits_for_notice_from_exact_controller(self):
+        self.machine.notice_protocol = 1
+        self.u.reconcile()
+        self.u.reconcile()
+        self.assertIsInstance(self.u.state, m.Waiting)
+        self.assertIsInstance(self.u.state.resume, m.Handoff)
+        op = self.u.state.resume.operation
+        notice = self.u.root / "upgrade-notice.json"
+        for nonce, pid in ((None, None), (NONCE, self.machine.current.pid), (op.nonce, 999)):
+            m.atomic(notice, {"nonce": nonce, "pid": pid})
+            self.machine.clock += 6
+            self.u.reconcile()
+            self.assertIsInstance(self.u.state.resume, m.Handoff)
+            self.assertEqual(self.machine.actions, [])
+        m.atomic(notice, {"nonce": op.nonce, "pid": self.machine.current.pid})
+        self.drive()
+        self.assertEqual(self.machine.actions, ["stop", "start", "notify"])
 
     def test_swap_crash_replays_saved_digest_without_needing_moved_staging_file(self):
         replace=os.replace

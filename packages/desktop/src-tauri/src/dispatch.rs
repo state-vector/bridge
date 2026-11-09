@@ -191,12 +191,19 @@ pub enum UpdateChannel { Main, Stable, Pinned }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum UpdateHandoff { FullDrain, AdoptWorkerV1 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum UpdateRequest { Handoff { nonce:String, mode:UpdateHandoff }, Held { reason:String } }
+enum UpdateRequest {
+    Handoff { nonce: String, mode: UpdateHandoff, source: Option<String>, target: Option<String>, deadline: Option<u64> },
+    Held { reason: String },
+}
 impl UpdateRequest {
     fn parse(bytes:&[u8])->Self {
-        #[derive(Deserialize)] struct Wire { nonce:String, #[serde(default)] worker_protocol:Option<u32> }
+        #[derive(Deserialize)]
+        struct Wire { nonce: String, worker_protocol: Option<u32>, source: Option<String>, target: Option<String>, deadline: Option<u64> }
         match serde_json::from_slice::<Wire>(bytes) {
-            Ok(Wire { nonce, worker_protocol }) if !nonce.is_empty() => Self::Handoff {nonce, mode:if worker_protocol==Some(worker_session::PROTOCOL) {UpdateHandoff::AdoptWorkerV1} else {UpdateHandoff::FullDrain}},
+            Ok(Wire { nonce, worker_protocol, source, target, deadline }) if !nonce.is_empty() => Self::Handoff {
+                nonce, source, target, deadline,
+                mode: if worker_protocol == Some(worker_session::PROTOCOL) { UpdateHandoff::AdoptWorkerV1 } else { UpdateHandoff::FullDrain },
+            },
             _=>Self::Held {reason:"Recovery request is unreadable; preserve admission hold".into()},
         }
     }
@@ -209,8 +216,8 @@ mod recovery_request_tests {
         for bytes in [b"{".as_slice(),b"{}",b"{\"nonce\":\"\"}",b"{\"nonce\":\"n\",\"worker_protocol\":\"bad\"}"] {
             assert!(matches!(UpdateRequest::parse(bytes),UpdateRequest::Held {..}));
         }
-        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\",\"worker_protocol\":1}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::AdoptWorkerV1});
-        assert_eq!(UpdateRequest::parse(b"{\"nonce\":\"n\"}"),UpdateRequest::Handoff {nonce:"n".into(),mode:UpdateHandoff::FullDrain});
+        assert!(matches!(UpdateRequest::parse(b"{\"nonce\":\"n\",\"worker_protocol\":1}"), UpdateRequest::Handoff { mode: UpdateHandoff::AdoptWorkerV1, .. }));
+        assert!(matches!(UpdateRequest::parse(b"{\"nonce\":\"n\"}"), UpdateRequest::Handoff { mode: UpdateHandoff::FullDrain, .. }));
     }
 }
 fn update_request() -> Option<UpdateRequest> {
@@ -412,10 +419,8 @@ impl GatewayReadiness {
             }
             let available = available_backends(cfg);
             if available.is_empty() {
-                if let Some(name) = cfg.backends.keys().next() {
-                    let capabilities = capability_inventory(cfg, &[], None, name);
-                    execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
-                }
+                let name = cfg.backends.keys().next().map(String::as_str).unwrap_or("opencode");
+                advertise_gateway_inventory(cfg, capability_inventory_unheld(cfg, &[], None, name))?;
                 return Err("no runnable configured backend".into());
             }
             let (worker, _, admission) = probe_worker_with_progress(cfg, &available, &|_| {})?;
@@ -537,9 +542,8 @@ fn probe_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend],
     report("ready: probing local tools and configured model inventory (2s limit per probe)");
     let raw = capability_inventory_unheld(cfg, avail, Some(&worker), name);
     let backend_ready = inventory_has_usable_model(&raw);
-    let capabilities = inventory_dispatch_hold(raw, update_request().is_some());
     report("ready: advertising capabilities to the hub (8s limit per request)");
-    let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
+    let reply = advertise_gateway_inventory(cfg, raw)?;
     let admission = worker_connection_proof(&reply, backend_ready)?;
     Ok((worker, reply, admission))
 }
@@ -639,7 +643,41 @@ fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_js
 }
 
 fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
-    inventory_dispatch_hold(capability_inventory_unheld(cfg, avail, worker, primary), update_request().is_some())
+    inventory_with_runtime(cfg, capability_inventory_unheld(cfg, avail, worker, primary), update_request().as_ref())
+}
+
+fn advertise_gateway_inventory(cfg: &DispatchConfig, raw: serde_json::Value) -> Result<serde_json::Value, String> {
+    let request = update_request();
+    let capabilities = inventory_with_runtime(cfg, raw, request.as_ref());
+    let reply = execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
+    if let Some(UpdateRequest::Handoff { nonce, .. }) = request {
+        if reply["upgrade_notice_recorded"] == true {
+            update_receipt("upgrade-notice.json", &json!({"nonce":nonce,"pid":std::process::id()}));
+        }
+    }
+    Ok(reply)
+}
+
+fn inventory_with_runtime(cfg: &DispatchConfig, facts: serde_json::Value, request: Option<&UpdateRequest>) -> serde_json::Value {
+    let mut facts = inventory_dispatch_hold(facts, request.is_some());
+    let channel = cfg.auto_update.as_ref().filter(|update| update.enabled)
+        .and_then(|update| match update.channel {
+            UpdateChannel::Main => Some("main"),
+            UpdateChannel::Stable => Some("stable"),
+            UpdateChannel::Pinned => None,
+        });
+    facts["runtime"] = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("BRIDGE_BUILD_COMMIT"),
+        "channel": channel,
+    });
+    if let Some(UpdateRequest::Handoff { target, deadline, .. }) = request {
+        facts["admission_hold"]["target"] = json!(target);
+        facts["admission_hold"]["deadline"] = json!(deadline);
+    } else if let Some(UpdateRequest::Held { reason }) = request {
+        facts["admission_hold"]["reason"] = json!(reason);
+    }
+    facts
 }
 fn inventory_has_usable_model(facts: &serde_json::Value) -> bool {
     let usable = |model: &serde_json::Value| model["availability"]["kind"] == "usable" && model["model"].as_str().is_some_and(|m| !m.is_empty());

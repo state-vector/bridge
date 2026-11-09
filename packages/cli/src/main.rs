@@ -81,7 +81,7 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
-        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1,"worker_protocol":dispatch::WORKER_PROTOCOL,"recovery_protocol":1,"coordinator_revision":2})),
+        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1,"upgrade_notice_protocol":1,"worker_protocol":dispatch::WORKER_PROTOCOL,"recovery_protocol":1,"coordinator_revision":2})),
         "recovery" => {
             if args.get(2).map(String::as_str) == Some("source") { print!("{}",include_str!("../updater/supervisor.py"));return; }
             let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found");std::process::exit(1); });

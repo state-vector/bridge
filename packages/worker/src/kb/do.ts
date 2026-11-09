@@ -5579,7 +5579,8 @@ export class KnowledgeHub {
       // Renewal is the control-plane liveness path. Backlog reconciliation and
       // board construction must not delay its acknowledgement. The scheduler
       // and alarm own bounded reconciliation and always recheck claim safety.
-      return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000, lifecycle_protocol: 2 };
+      return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000, lifecycle_protocol: 2,
+        upgrade_notice_recorded: !keepReady && !!command.capabilities.admission_hold };
     }
     const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
     if (!row) throw new Error("gate: durable execution requires a task");
@@ -10635,7 +10636,10 @@ export class KnowledgeHub {
 
   private async tokenList() {
     const rows = this.state.storage.sql.exec(
-      `SELECT id, label, tags, transport, created_ts, last_seen_ts, revoked_ts FROM auth_tokens ORDER BY created_ts DESC`,
+      `SELECT t.id, t.label, t.tags, t.transport, t.created_ts, t.last_seen_ts, t.revoked_ts,
+        h.capabilities, h.observed_ts AS gateway_observed_at
+       FROM auth_tokens t LEFT JOIN execution_hosts h ON h.token_id = t.id
+       ORDER BY t.created_ts DESC`,
     ).toArray();
     const sessions = this.state.storage.sql.exec(
       `SELECT token_id, name, first_seen_ts, last_seen_ts FROM sessions ORDER BY last_seen_ts DESC`,
@@ -10644,7 +10648,15 @@ export class KnowledgeHub {
     const gateway_agents = this.state.storage.sql.exec(
       `SELECT gateway, agent, last_seen_ts FROM gateway_agents ORDER BY last_seen_ts DESC LIMIT 200`,
     ).toArray();
-    return { tokens: rows.map((r) => ({ ...r, tags: parseTags(r.tags) })), sessions, gateway_agents };
+    return { tokens: rows.map(({ capabilities, gateway_observed_at, ...row }) => {
+      const inventory = capabilities ? ExecutorCapabilitiesSchema.parse(JSON.parse(String(capabilities))) : null;
+      return {
+        ...row, tags: parseTags(row.tags),
+        ...(inventory ? { gateway_runtime: {
+          ...inventory.runtime, observed_at: Number(gateway_observed_at), update: inventory.admission_hold,
+        } } : {}),
+      };
+    }), sessions, gateway_agents };
   }
 
   private async tokenRevoke(body: any) {

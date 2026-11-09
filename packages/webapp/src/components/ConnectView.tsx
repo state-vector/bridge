@@ -84,6 +84,13 @@ function AgentSetupModal({ label, secret, projectName, onClose }: { label: strin
 type TokenRow = {
   id: string; label: string; tags?: string[]; created_ts: number;
   last_seen_ts?: number; revoked_ts?: number;
+  gateway_runtime?: {
+    version?: string;
+    commit?: string | null;
+    channel?: "main" | "stable" | null;
+    observed_at: number;
+    update?: { reason: string; target?: string | null; deadline?: number | null };
+  };
 };
 
 /** Identity class from label + tags (BR#2455 law + provisioning provenance):
@@ -102,11 +109,33 @@ export function ConnectView() {
   const settings = useKb((s) => s.settings);
   const mint = useKb((s) => s.mint);
   const revoke = useKb((s) => s.revoke);
+  const refreshAdmin = useKb((s) => s.refreshAdmin);
 
   const [label, setLabel] = useState("");
   const [setupFor, setSetupFor] = useState<{ label: string; secret: string | null } | null>(null);
   const [msg, setMsg] = useState("");
+  const [latestBuild, setLatestBuild] = useState<Partial<Record<"main" | "stable", string>>>({});
   const projectName = settings.project_name || "Superpositional";
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function refreshBuilds() {
+      void refreshAdmin();
+      const builds = await Promise.allSettled((["main", "stable"] as const).map(async (channel) => {
+        const response = await fetch(`${getConfig().url}/api/runner-updates/manifest?channel=${channel}`, {
+          signal: controller.signal,
+        });
+        const manifest = response.ok ? await response.json() : null;
+        return [channel, typeof manifest?.commit === "string" ? manifest.commit : undefined] as const;
+      }));
+      if (!controller.signal.aborted) {
+        setLatestBuild(Object.fromEntries(builds.flatMap((build) => build.status === "fulfilled" ? [build.value] : [])));
+      }
+    }
+    void refreshBuilds();
+    const timer = window.setInterval(refreshBuilds, 30_000);
+    return () => { controller.abort(); window.clearInterval(timer); };
+  }, [refreshAdmin]);
 
   const { gateways, workersByGateway, agents } = useMemo(() => {
     const rows = tokens as TokenRow[];
@@ -212,10 +241,20 @@ export function ConnectView() {
             {gateways.map((t) => {
               const workers = workersByGateway.get(t.label) ?? [];
               const { own, viaWorkers } = sessionsOf(t.id, t.label);
+              const runtime = t.gateway_runtime;
+              const latest = runtime?.channel ? latestBuild[runtime.channel] : undefined;
+              const now = Date.now();
+              const fresh = runtime && now - runtime.observed_at < 120_000;
+              const update = runtime?.update;
+              const upgradeTarget = now < (update?.deadline ?? 0) ? update?.target : undefined;
               return (
                 <tr key={t.id}>
                   <td>
                     <Chip tone="scope">gateway</Chip> {t.label}
+                    {runtime?.version && <div className="muted-note" title={runtime.commit ?? undefined}>
+                      v{runtime.version}{runtime.commit && ` · ${runtime.commit.slice(0, 8)}`}
+                      {latest && runtime.commit && latest !== runtime.commit && !upgradeTarget && ` · Update available (${latest.slice(0, 8)})`}
+                    </div>}
                   </td>
                   <td>
                     {workers.length === 0 && <span className="muted-note">none</span>}
@@ -239,7 +278,10 @@ export function ConnectView() {
                     ))}
                   </td>
                   <td>{t.last_seen_ts ? rel(t.last_seen_ts) : "never"}</td>
-                  <td><StateCell t={t} /></td>
+                  <td>{t.revoked_ts || !runtime ? <StateCell t={t} /> : upgradeTarget ?
+                    <span title={update?.reason}>Upgrading to {upgradeTarget.slice(0, 8)}</span> :
+                    fresh && update ? <span title={update.reason}>Admission held</span> :
+                    fresh ? <span className="ok">Connected</span> : <span>Offline</span>}</td>
                   <td>
                     {!t.revoked_ts && (
                       <Btn variant="danger" onClick={() => void revoke(t.id)}>revoke</Btn>

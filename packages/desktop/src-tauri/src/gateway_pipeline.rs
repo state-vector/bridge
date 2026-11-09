@@ -835,9 +835,30 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
     let published = snap.clone();
     let publisher = LeaseMaintenance::start(Duration::from_secs(1), move || { write_runner_state(&published); true });
     let mut last_update_receipt = Instant::now() - Duration::from_secs(1);
-    dlog("gateway", &format!("bounded lifecycle controller started: {} execution slots; preparation/finalization <=4 each", cfg.max_sessions));
+    let startup_request = update_request();
+    let commit = option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown");
+    let startup_cause = match &startup_request {
+        Some(UpdateRequest::Handoff { target: Some(target), .. }) if target == commit => "managed upgrade restart",
+        Some(UpdateRequest::Handoff { .. }) => "managed handoff in progress",
+        _ => "service start",
+    };
+    let mut previous_request = None;
+    dlog("gateway", &format!(
+        "Gateway controller started: version {}, commit {}, PID {}, {} execution slots ({startup_cause})",
+        env!("CARGO_PKG_VERSION"), commit, std::process::id(), cfg.max_sessions
+    ));
     loop {
         let request = update_request();
+        if request != previous_request {
+            if let Some(UpdateRequest::Handoff { source, target, .. }) = &request {
+                dlog("gateway", &format!("Managed upgrade handoff: {} → {}",
+                    source.as_deref().unwrap_or("unknown"), target.as_deref().unwrap_or("unknown")));
+            } else if request.is_none() {
+                dlog("gateway", "Managed upgrade handoff ended");
+            }
+            readiness.maintenance.wake();
+            previous_request = request.clone();
+        }
         if let Some(controller) = &mut controller {
             if let Err(error) = controller.tick(&snap, stop.load(Ordering::SeqCst), request.is_some()) {
                 dlog("gateway", &error);
@@ -847,7 +868,7 @@ pub(super) fn run(cfg: DispatchConfig, stop: Arc<AtomicBool>, running: Arc<Atomi
         let active = controller.as_ref().map(Controller::active).unwrap_or(0);
         if let Some(request) = request {
             if last_update_receipt.elapsed() >= Duration::from_secs(1) {
-            if let UpdateRequest::Handoff { nonce, mode } = &request {
+            if let UpdateRequest::Handoff { nonce, mode, .. } = &request {
             let adopting = matches!(mode,UpdateHandoff::AdoptWorkerV1);
             let restart_ready = adopting && controller.as_ref().map(Controller::controller_ready).unwrap_or(true);
             if matches!(update_train_barrier(if restart_ready { 0 } else { active }, &train_stop, &mut train)?, UpdateTrainBarrier::Quiescent) {
