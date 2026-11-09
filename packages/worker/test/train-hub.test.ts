@@ -235,6 +235,58 @@ describe("BR#6901 idle main-health observation", () => {
 });
 
 describe("BR#6776 durable check recovery", () => {
+  it("BR#9000: a late historical merge receipt records the PR without displacing newer settlement", async () => {
+    const repo = "state-vector/historical-9000", actor = "gw-historical-9000";
+    const oldHead = "a".repeat(40), oldMerge = "b".repeat(40), liveHead = "c".repeat(40), liveMerge = "d".repeat(40);
+    const liveMergedAt = Date.now() - 1_000;
+    const oldMergedAt = liveMergedAt - 16 * 86_400_000;
+    const oldCard = await queueViaAccept({ repo, pr: 2266, head: oldHead });
+    const liveCard = await queueViaAccept({ repo, pr: 2973, head: liveHead });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const latest = await kbJson("/train.event", {
+      repo, actor, kind: "merged", pr: 2973, task_id: liveCard, head_sha: liveHead, merge_sha: liveMerge, merged_at: liveMergedAt,
+    });
+    expect(latest.status).toBe(200);
+    const before = await laneSnap(repo);
+    expect(before.lane_state).toMatchObject({ phase: "settling_ci", pr: 2973, merge_sha: liveMerge });
+
+    const report = { repo, actor, kind: "merged", pr: 2266, task_id: oldCard,
+      head_sha: oldHead, merge_sha: oldMerge, merged_at: oldMergedAt };
+    const historical = await kbJson("/train.event", report);
+    expect(historical.status).toBe(200);
+    const after = await laneSnap(repo);
+    expect(after.currently).toEqual(before.currently);
+    expect(after.lane_state).toMatchObject({ phase: "settling_ci", pr: 2973, merge_sha: liveMerge, merged_at: liveMergedAt });
+    expect(after.last_merge).toEqual(before.last_merge);
+    expect(after.stop).toBeNull();
+    expect((await kbJson("/get", { id: oldCard })).body.meta.provenance).toMatchObject({
+      pr: 2266, merge_sha: oldMerge, merged_at: oldMergedAt,
+    });
+    expect((await kbJson("/train.event", report)).body).toMatchObject({ ok: true, deduped: true });
+    const history = (await kbJson("/train.history", { repo, kind: "merged", pr: 2266 })).body.events;
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ pr: 2266, merge_sha: oldMerge, ts: oldMergedAt, detail: { historical: true } });
+  });
+
+  it("BR#9000: a late merge cannot start settlement behind a newer independently deployed tip", async () => {
+    const repo = "state-vector/observed-tip-9000", actor = "gw-observed-tip-9000";
+    const head = "a".repeat(40), merge = "b".repeat(40), tip = "c".repeat(40);
+    const card = await queueViaAccept({ repo, pr: 3014, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    expect((await kbJson("/train.queue_facts", {
+      repo, actor, entries: [], base_state: { verdict: "green", tip_sha: tip, tip_age_secs: 0, red: [], unsettled: [] },
+    })).status).toBe(200);
+    const result = await kbJson("/train.event", {
+      repo, actor, kind: "merged", pr: 3014, task_id: card, head_sha: head, merge_sha: merge, merged_at: Date.now() - 3_600_000,
+    });
+    expect(result.body).toMatchObject({ ok: true, historical: true });
+    const lane = await laneSnap(repo);
+    expect(lane.lane_state.phase).toBe("idle");
+    expect(lane.currently).toBeNull();
+    expect(lane.queue_facts.base_state).toMatchObject({ verdict: "green", tip_sha: tip });
+    expect(lane.last_merge).toBeNull();
+  });
+
   it("BR#8945: a fresh failed head keeps its exact recovery instead of an old stop or starvation task", async () => {
     const repo = "state-vector/recovery-owner-8945", actor = "gw-recovery-owner-8945";
     const oldHead = "a".repeat(40), head = "b".repeat(40);

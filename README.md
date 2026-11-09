@@ -2304,6 +2304,8 @@ starvation diagnostic stays in history. If the current failure lacks an active
 repair, Bridge queues recovery for that commit.
 If main advances while a stop is in force, Bridge holds merges while checking
 the new commit. It assigns repair work only when that commit fails.
+Bridge records a late GitHub merge receipt at the actual merge time and keeps
+the lane checking any newer merge already in progress.
 
 Train leases belong to the authenticated merger. Omit the optional `holder` or set it to that identity. Pass session labels separately.
 

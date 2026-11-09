@@ -11729,6 +11729,15 @@ export class KnowledgeHub {
       // the executor may report its own merge wall-clock (BR#4804 settle
       // clock): clamp to now — a future stamp would fake a settled lane
       const mergedAt = Math.min(Number(body.merged_at) || now, now);
+      const latestLaneMergeAt = Math.max(Number(meta.currently?.merged_at) || 0, Number(meta.lane?.last_merge_ts) || 0);
+      const queueFacts = meta.lane?.queue_facts;
+      const baseTip = queueFacts?.base_state;
+      const tipAge = baseTip?.tip_age_secs;
+      // GitHub merge timestamps and the observed tip age have second
+      // resolution. Require a full second of separation for this comparison.
+      const laterObservedTip = /^[0-9a-f]{40}$/.test(String(baseTip?.tip_sha ?? "")) && baseTip.tip_sha !== mergeSha
+        && typeof tipAge === "number" && tipAge >= 0 && trainBaseObservedAt(queueFacts) - tipAge * 1_000 > mergedAt + 1_000;
+      const historical = Number(meta.currently?.pr) !== pr && (mergedAt < latestLaneMergeAt || laterObservedTip);
       // BR#4934 burst payload: the drain pass rides the merged event —
       // burst_merged (merges in this pass, including this one), burst_cap,
       // burst_settling (true = the pass's FINAL merge; the lane settles on
@@ -11741,6 +11750,10 @@ export class KnowledgeHub {
       // order kept); absent → legacy byte-identical rows.
       const batchMembers = sanitizeBatchMembers(body.batch_members);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
+      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      const receipt = { task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")),
+        ...burstFields, burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}),
+        ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) };
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
       // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
@@ -11780,14 +11793,19 @@ export class KnowledgeHub {
           // blocked stays blocked (lifecycle forbids blocked→blocked) — the
           // state rides meta.merge_train; the reason says awaiting-CI.
           if (card.status === "blocked") {
-            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, main settling (build/deploy)` };
+            next.blocked = { ...(next.blocked ?? {}), reason: `merge-train: awaiting-ci — PR #${pr} merged as ${mergeSha.slice(0, 9)}, ${historical ? "waiting for covering deployment" : "main settling (build/deploy)"}` };
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, chain.task_id);
           } else {
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
           }
         }
       }
-      const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      // A late GitHub observation accounts for the PR without replacing the
+      // newer merge that the lane is checking or marking its starvation cured.
+      if (historical) {
+        ev({ ...receipt, historical: true }, chain.task_id, mergedAt);
+        return { ok: true, kind, lane: laneKey(repo, base), pr, merge_sha: mergeSha, task: chain.task_id, historical: true };
+      }
       meta.currently = {
         pr,
         merge_sha: mergeSha,
@@ -11821,7 +11839,7 @@ export class KnowledgeHub {
       }
       const reason = this.laneSyncReason(lane.id, meta, now);
       this.saveLaneState(lane.id, meta, now);
-      ev({ task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")), ...(burstFields), burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}), ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) }, chain.task_id, mergedAt);
+      ev(receipt, chain.task_id, mergedAt);
       const laneNote = burstMerged == null
         ? `PR #${pr} merged as ${mergeSha.slice(0, 9)} — awaiting main CI`
         : burstSettling
@@ -16363,7 +16381,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const repairCreated = recordedRepair ? this.one(`SELECT created_ts FROM artefacts WHERE id = ?`, recordedRepair.id) : null;
       const lastMerge = this.state.storage.sql.exec(
         `SELECT ts, pr, task_id, gateway, merge_sha FROM train_events
-         WHERE kind = 'merged' AND repo = ? AND base = ? ORDER BY seq DESC LIMIT 1`,
+         WHERE kind = 'merged' AND repo = ? AND base = ? AND json_extract(detail, '$.historical') IS NOT 1
+         ORDER BY seq DESC LIMIT 1`,
         lane.repo, lane.base,
       ).toArray()[0] ?? null;
       // BR#4688: this lane's ACTIVE bounce-budget escalations — de-queued

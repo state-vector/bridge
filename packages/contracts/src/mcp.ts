@@ -250,6 +250,7 @@ export const TOOL_ARG_SCHEMAS = {
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
     merge_sha: z.string().optional(),
+    merged_at: z.number().int().positive().nullish(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
     run_url: z.string().optional(),
