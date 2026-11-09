@@ -42,6 +42,50 @@ fn configure(path: &Path, root: &Path) {
 }
 
 #[test]
+fn nested_legacy_caches_are_discovered_without_adopting_unpublished_inputs() {
+    let sandbox = Sandbox::new();
+    let owner = sandbox.owner();
+    let scratch = sandbox.0.canonicalize().unwrap().join("scratch");
+    let repository = scratch.join("repo");
+    let target = repository.join("target");
+    let standalone = scratch.join("old-target");
+    for path in [&target, &standalone] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+    }
+    git(&repository, &["init"]).unwrap();
+    fs::write(repository.join(".gitignore"), "target/\n").unwrap();
+    fs::write(repository.join("draft"), "unpublished work").unwrap();
+    fs::write(standalone.join(".rustc_info.json"), "{}").unwrap();
+    legacy::adopt_nested_caches(&owner, &scratch).unwrap();
+    assert_eq!(owner.records().unwrap().len(), 2);
+
+    fs::write(target.join("input"), "tracked input").unwrap();
+    git(&repository, &["add", "-f", "target/input"]).unwrap();
+    assert!(!legacy::is_nested_cache(&target).unwrap());
+    let launches = gateway_pipeline::root(&owner.cfg).unwrap().join("launches");
+    fs::create_dir_all(&launches).unwrap();
+    let launch = launches.join("active.json");
+    let cache_id = legacy::allocation_id("generated", &standalone).unwrap();
+    let mut cache = owner.read(&cache_id).unwrap();
+    fs::write(&launch, json!({"scratch": scratch.parent().unwrap()}).to_string()).unwrap();
+    assert!(owner.advance(&mut cache).unwrap_err().contains("active execution journal"));
+    fs::write(&launch, json!({"cfg": {"workdir": scratch.parent().unwrap()}}).to_string()).unwrap();
+    let status = owner.reconcile(&[]).unwrap();
+    if standalone.exists() {
+        // Other Linux test processes can temporarily deny /proc visibility.
+        let retained = owner.read(&cache_id).unwrap();
+        assert!(retained.error.as_deref().is_some_and(|error| error.contains("incomplete")),
+            "unexpected cache hold: {:?}", retained.error);
+        assert_eq!(status.reclaimed_bytes, 0);
+    } else {
+        assert!(status.reclaimed_bytes > 0);
+    }
+    assert!(target.join("input").exists());
+    assert_eq!(fs::read_to_string(repository.join("draft")).unwrap(), "unpublished work");
+}
+
+#[test]
 fn allocation_is_write_ahead_unique_per_claim_and_cannot_be_rebound_to_another_fence() {
     let sandbox=Sandbox::new(); let owner=sandbox.owner(); ready(&owner);
     let t=ticket("one"); let allocation=owner.allocate(&t,None).unwrap();

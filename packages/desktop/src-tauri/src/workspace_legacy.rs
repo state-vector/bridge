@@ -33,7 +33,7 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
     // not a recursive hunt through the human's home directory.
     let mut roots = vec![PathBuf::from(&owner.cfg.workdir).join("sessions")];
     if let Some(home) = &home { roots.push(home.join("opencode-tmp")); }
-    for root in roots {
+    for root in &roots {
         let entries = match fs::read_dir(&root) { Ok(e) => e, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(e.to_string()) };
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -41,7 +41,7 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
                 // This exact basename is the retired runner's allocation
                 // protocol, not a task-title guess. Other tmp names stay unbound.
                 let name=entry.file_name().to_string_lossy().into_owned();
-                let task=if root==PathBuf::from(&owner.cfg.workdir).join("sessions") {
+                let task=if *root==PathBuf::from(&owner.cfg.workdir).join("sessions") {
                     name.strip_prefix("bridge-BR-").filter(|n|!n.is_empty()&&n.chars().all(|c|c.is_ascii_digit())).map(|n|format!("BR#{n}"))
                 } else {None};
                 paths.push((entry.path(), task));
@@ -55,6 +55,9 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
         let path = path.canonicalize().map_err(|e| e.to_string())?;
         if adopted.iter().any(|parent| path.starts_with(parent)) { continue; }
         adopted.push(path.clone());
+        if task.is_none() && roots.iter().any(|root| path.parent() == Some(root.as_path())) {
+            adopt_nested_caches(owner, &path)?;
+        }
         let id = allocation_id("legacy",&path)?;
         let Some(_lock) = owner.lock(&id)? else { continue; };
         if owner.file(&id).exists() { continue; }
@@ -80,12 +83,72 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
             let path = entry.map_err(|e| e.to_string())?.path();
             if !cache_tag(&path) { continue; }
             let path = path.canonicalize().map_err(|e| e.to_string())?;
-            let id = allocation_id("generated",&path)?;
-            let Some(_lock) = owner.lock(&id)? else { continue; };
-            if !owner.file(&id).exists() {
-                owner.save(&Resource { version:1, id, location:Location::GeneratedCache {root:path}, phase:Phase::LegacyUnproved,
-                    observed_bytes:0, checked_at:0, retry_at:0, error:None })?;
-            }
+            adopt_cache(owner, path, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn adopt_cache(owner: &Owner, root: PathBuf, legacy_scope: Option<PathBuf>) -> Result<(), String> {
+    let id = allocation_id("generated", &root)?;
+    let Some(_lock) = owner.lock(&id)? else { return Ok(()); };
+    if !owner.file(&id).exists() {
+        owner.save(&Resource { version: 1, id, location: Location::GeneratedCache { root, legacy_scope },
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None })?;
+    }
+    Ok(())
+}
+
+pub(super) fn adopt_nested_caches(owner: &Owner, root: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() { continue; }
+        let path = entry.path();
+        let candidate = if path.join(".git").exists() { path.join("target") } else { path };
+        if cache_tag(&candidate) && candidate.canonicalize().is_ok_and(|path| path == candidate) {
+            let scope = candidate.parent().ok_or("legacy cache parent missing")?.to_path_buf();
+            adopt_cache(owner, candidate, Some(scope))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn is_nested_cache(path: &Path) -> Result<bool, String> {
+    if !path.is_dir() || !cache_tag(path) || path.canonicalize().map_err(|e| e.to_string())? != path {
+        return Ok(false);
+    }
+    let parent = path.parent().ok_or("legacy cache parent missing")?;
+    if parent.ancestors().any(|dir| dir.join(".git").exists()) {
+        return Ok(parent.join(".git").exists() && path == parent.join("target")
+            && is_ignored_output(parent, path, "target")?);
+    }
+    // Standalone Cargo output uses a cache marker and a recognisable layout.
+    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !matches!(entry.file_name().to_str(), Some("CACHEDIR.TAG" | ".rustc_info.json" | ".rustdoc_fingerprint.json" | "debug" | "release" | "tmp" | "doc")) {
+            return Ok(false);
+        }
+    }
+    Ok(path.join(".rustc_info.json").is_file())
+}
+
+pub(super) fn prove_cache_scope(owner: &Owner, scope: &Path) -> Result<(), String> {
+    for directory in ["launches", "terminal", "workers"] {
+        let directory = gateway_pipeline::root(&owner.cfg)?.join(directory);
+        if journal_references(&directory, scope, true)? {
+            return Err("legacy cache scope is referenced by an active execution journal".into());
+        }
+    }
+    no_readers(scope, ReaderAuthority::UnattributedLegacy)
+}
+
+pub(super) fn no_nested_mounts(_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    for line in fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?.lines() {
+        let path = line.split_whitespace().nth(4).ok_or("malformed mount inventory")?
+            .replace(r"\040", " ").replace(r"\011", "\t").replace(r"\012", "\n").replace(r"\134", "\\");
+        if Path::new(&path).starts_with(_root) {
+            return Err("legacy cache contains a mounted filesystem; retained".into());
         }
     }
     Ok(())
@@ -98,7 +161,7 @@ pub(super) fn cache_tag(path: &Path) -> bool {
 }
 
 pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String> {
-    let (root, task) = match &resource.location { Location::Legacy { root, task } => (root.clone(), task.clone()), Location::RepositoryCache { root, .. } | Location::GeneratedCache { root } => (root.clone(), None), _ => return Err("legacy resource location missing".into()) };
+    let (root, task) = match &resource.location { Location::Legacy { root, task } => (root.clone(), task.clone()), Location::RepositoryCache { root, .. } | Location::GeneratedCache { root, .. } => (root.clone(), None), _ => return Err("legacy resource location missing".into()) };
     if !root.exists() {
         resource.phase = Phase::Removed { reclaimed_bytes: 0, at: now_ms() };
         return Ok(());
@@ -107,9 +170,15 @@ pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String
     // when a historical task has been moved/closed by another session.
     for directory in ["launches", "terminal", "workers"] {
         let directory = gateway_pipeline::root(&owner.cfg)?.join(directory);
-        if journal_references(&directory, &root)? { return Err("legacy workspace is referenced by an active execution journal".into()); }
+        if journal_references(&directory, &root, false)? { return Err("legacy workspace is referenced by an active execution journal".into()); }
     }
-    if matches!(resource.location, Location::GeneratedCache { .. }) {
+    if let Location::GeneratedCache { legacy_scope, .. } = &resource.location {
+        if let Some(scope) = legacy_scope {
+            prove_cache_scope(owner, scope)?;
+            if !is_nested_cache(&root)? {
+                return Err("legacy cache no longer matches its disposal proof".into());
+            }
+        }
         no_readers(&root,ReaderAuthority::UnattributedLegacy)?;
         if !cache_tag(&root) { return Err("generated cache lost its disposal marker; retained".into()); }
         resource.phase = Phase::Reclaimable { snapshots:vec![] };
@@ -149,24 +218,30 @@ pub(super) fn prove(owner: &Owner, resource: &mut Resource) -> Result<(), String
     owner.save(resource)
 }
 
-fn journal_references(directory: &Path, root: &Path) -> Result<bool, String> {
+fn journal_references(directory: &Path, root: &Path, include_ancestors: bool) -> Result<bool, String> {
     let entries = match fs::read_dir(directory) { Ok(e) => e, Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false), Err(e) => return Err(e.to_string()) };
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.file_name().and_then(|s| s.to_str()) == Some("archive") { continue; }
-        if path.is_dir() { if journal_references(&path, root)? { return Ok(true); } }
+        if path.is_dir() { if journal_references(&path, root, include_ancestors)? { return Ok(true); } }
         else if path.extension().and_then(|s| s.to_str()) == Some("json") {
             let value: serde_json::Value = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            if references(&value, root) { return Ok(true); }
+            if references(&value, root, include_ancestors) { return Ok(true); }
         }
     }
     Ok(false)
 }
-fn references(value: &serde_json::Value, root: &Path) -> bool {
+fn references(value: &serde_json::Value, root: &Path, include_ancestors: bool) -> bool {
     match value {
-        serde_json::Value::String(path) if path.starts_with('/') => Path::new(path).starts_with(root),
-        serde_json::Value::Array(values) => values.iter().any(|v| references(v, root)),
-        serde_json::Value::Object(values) => values.values().any(|v| references(v, root)),
+        serde_json::Value::String(path) if path.starts_with('/') => {
+            Path::new(path).starts_with(root)
+        }
+        serde_json::Value::Array(values) => values.iter().any(|v| references(v, root, include_ancestors)),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            (include_ancestors && matches!(key.as_str(), "worktree" | "scratch")
+                && value.as_str().is_some_and(|path| path.starts_with('/') && root.starts_with(path)))
+                || references(value, root, include_ancestors)
+        }),
         _ => false,
     }
 }

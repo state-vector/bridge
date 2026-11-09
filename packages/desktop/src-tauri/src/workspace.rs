@@ -24,11 +24,11 @@ enum Location {
     Legacy { root: PathBuf, task: Option<String> },
     AdoptedExecution { root: PathBuf, task: String },
     RepositoryCache { root: PathBuf, #[serde(default)] authority:CacheAuthority },
-    GeneratedCache { root: PathBuf },
+    GeneratedCache { root: PathBuf, #[serde(default, skip_serializing_if = "Option::is_none")] legacy_scope: Option<PathBuf> },
     OwnedDisposable { root: PathBuf, parent_id: String },
 }
 impl Location {
-    fn root(&self) -> &Path { match self { Self::Managed { root } | Self::Legacy { root, .. } | Self::AdoptedExecution {root,..} | Self::RepositoryCache { root, .. } | Self::GeneratedCache { root } | Self::OwnedDisposable {root,..} => root } }
+    fn root(&self) -> &Path { match self { Self::Managed { root } | Self::Legacy { root, .. } | Self::AdoptedExecution {root,..} | Self::RepositoryCache { root, .. } | Self::GeneratedCache { root, .. } | Self::OwnedDisposable {root,..} => root } }
     fn work(&self) -> PathBuf { match self { Self::Managed { root } => root.join("work"), _=>self.root().to_path_buf() } }
 }
 
@@ -352,6 +352,9 @@ impl Owner {
         if let Phase::Removing { operation_id, bytes_before, repositories, snapshots, trash } = record.phase.clone() {
             if !trash.exists() {
                 legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
+                if let Location::GeneratedCache { legacy_scope: Some(scope), .. } = &record.location {
+                    legacy::prove_cache_scope(self, scope)?;
+                }
                 verify_inputs(record,&snapshots)?;
                 for snapshot in snapshots {
                     legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
@@ -368,6 +371,9 @@ impl Owner {
             // A newly created directory at the original path is never touched.
             // Only the journalled atomic-rename destination is ours to delete.
             legacy::no_readers(&trash,self.reader_authority(record)?)?;
+            if matches!(record.location, Location::GeneratedCache { legacy_scope: Some(_), .. }) {
+                legacy::no_nested_mounts(&trash)?;
+            }
             remove_tree(&trash)?;
             if trash.exists() { return Err("workspace removal incomplete; retry retained".into()); }
             for repository in repositories { let _ = git(&repository, &["worktree", "prune"]); }
@@ -654,7 +660,15 @@ fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
         }
         return Ok(());
     }
-    if matches!(record.location,Location::GeneratedCache { .. }) {return Ok(());}
+    if let Location::GeneratedCache { root, legacy_scope } = &record.location {
+        if legacy_scope.is_some() {
+            if !legacy::is_nested_cache(root)? {
+                return Err("legacy cache no longer matches its disposal proof".into());
+            }
+            legacy::no_nested_mounts(root)?;
+        }
+        return Ok(());
+    }
     verify_layout(record)?;
     let paths:Vec<_>=snapshots.iter().map(|s|s.path.clone()).collect();
     if uncovered_inputs(&record.location.work(),&paths)? {return Err("new unpublished scratch inputs arrived before retirement; retained".into());}
