@@ -1484,6 +1484,14 @@ solid if waiting to be"):
    or held/starved on failing checks (`⚠ held` / `⚠ starved`), and `attempt` targets
    the first `ready` car rather than FIFO `queue[0]`. Stale base-health merge gates
    (`Deploy health (merge gate)` and `main-green gate`) self-heal via `rerun_gate` on a green base.
+   Since BR#9268 the self-heal is PRODUCER-TYPED: it re-requests the actual native Actions job
+   (the `/actions/runs/<run>/job/<job>` URL shape) — a same-named API-published check-run report
+   (the `/runs/<id>` shape, which can share name, app id and even check suite with the job) is
+   never re-requested, because GitHub's rerequest re-executes nothing for it (the BR#9081 no-op
+   burn), and an unclassifiable observation is fail-closed and surfaced loud instead of burning a
+   dispatch. The judge law is per-producer: a newer published green never supersedes — masks — an
+   older native job's failure while GitHub keeps the PR BLOCKED, and each producer class judges
+   its own latest run.
    The self-heal's retry budget is a closed purpose/evidence pair (BR#8824): the
    executor names WHY it re-requests a check — `stale_destination_gate` (the red
    was stamped against a destination that has since recovered) or
@@ -1502,7 +1510,11 @@ solid if waiting to be"):
    which GitHub reruns create — is a changed receipt that can recover the
    gate), while an ordinary head check keeps its permanent
    one-dispatch budget (old ledger rows and receipts are preserved, never
-   reset). A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
+   reset). The obligation identity is producer-typed (BR#9268): a native
+   Actions job and an API-published report sharing a name are distinct retry
+   scopes, the pre-split collapsed key survives as a fenced legacy identity,
+   and a reservation recorded under either identity fences both.
+   A prior `prepared`/`outcome_unknown` dispatch of the same scope stays
    fenced until its receipts reconcile — the fence is scope-wide and evaluated
    before any purpose branch, so NO purpose (stale or ordinary) re-dispatches
    past an unreconciled external effect, and a fresh green stamp never licenses
@@ -3716,7 +3728,7 @@ The train reads canonical task state using `get_artefact` with `view: "execution
 
 The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
 
-Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).
+Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824). The retry ledger's obligation identity is producer-typed (BR#9268): a native Actions job and an API-published check-run report sharing a name are distinct scopes with their own budgets, a legacy pre-split reservation and a producer-typed one fence each other's unreconciled effects, and a terminal pre-split row never consumes the freshly-identified native job's own dispatch budget.
 
 
 ### Provider failure evidence and bounded historical recovery

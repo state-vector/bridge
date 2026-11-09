@@ -359,4 +359,84 @@ describe("BR#8824 scoped stale deployment-gate retries", () => {
     expect(ok.body.kind).toBe("reserved");
     await kbJson("/train.lease", { repo, actor, action: "release" });
   });
+
+  /** BR#9268 — the obligation identity carries the check-run producer class
+   *  (native Actions job vs API-published report, derived from the GitHub
+   *  URL shape). The live SP #3057 shape: a published gate report and the
+   *  native job share name + app 15368 + suite — they are DISTINCT
+   *  obligations in the ledger, and the producer split is fenced BOTH ways:
+   *  an unreconciled dispatch of the pre-split collapsed identity stays
+   *  fenced (an unknown effect is never re-armed by an identity migration),
+   *  while a TERMINAL collapsed row does not consume the freshly-identified
+   *  native job's own one-dispatch-ever budget. */
+  describe("BR#9268 producer identity in the durable retry ledger", () => {
+    const reserveCheckRun = (rigged: Awaited<ReturnType<typeof rig>>, source: object, purpose?: string, who?: string) =>
+      kbJson("/train.queue_facts", { repo: rigged.repo, actor: who ?? rigged.actor, check_retry: {
+        kind: "reserve", pr: 1, task_id: rigged.task, head_sha: rigged.head, name: "Deploy health (merge gate)",
+        source, target: { kind: "actions_job", id: 128984021963 }, ...(purpose ? { purpose } : {}) } });
+    const nativeJob = (suite = 115286627637) => ({ kind: "check_run", suite_id: suite, app_id: 15368, producer: "actions_job" });
+    const publishedReport = (suite = 115286627637) => ({ kind: "check_run", suite_id: suite, app_id: 15368, producer: "published" });
+    const legacyUntyped = (suite = 115286627637) => ({ kind: "check_run", suite_id: suite, app_id: 15368 });
+
+    it("an unreconciled dispatch of the collapsed pre-split identity fences the producer-typed reservation (the split never re-arms an unknown effect)", async () => {
+      const r = await rig("producer-fence-unknown");
+      await stampBase(r, greenCoverage(r.tip, 500));
+      // Legacy era: an untyped dispatch of the same name/app/suite scope was
+      // sent and its POST response was lost (outcome_unknown).
+      const legacy = await reserveCheckRun(r, legacyUntyped());
+      expect(legacy.body.kind, JSON.stringify(legacy.body)).toBe("reserved");
+      expect((await result(r, legacy.body.key, "outcome_unknown", "Response lost after POST")).body.kind).toBe("recorded");
+      // Now the observation carries the producer class (native Actions job).
+      // The identity is finer, but the unreconciled effect of the collapsed
+      // scope fences it — repeating the external effect is never licensed by
+      // an identity migration.
+      const typed = await reserveCheckRun(r, nativeJob());
+      expect(typed.status, JSON.stringify(typed.body)).toBe(200);
+      expect(typed.body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+      await kbJson("/train.lease", { repo: r.repo, actor: r.actor, action: "release" });
+    });
+
+    it("a terminal collapsed row does not consume the native job's own budget; same-producer supersession holds and cross-producer scopes stay distinct", async () => {
+      const r = await rig("producer-budgets");
+      await stampBase(r, greenCoverage(r.tip, 500));
+      // A legacy-era terminal dispatch of the collapsed scope: it dispatched
+      // SOME check of the obligation (historically the report shell — the
+      // BR#9081 no-op burn), provably not the native job's own dispatch.
+      const legacy = await reserveCheckRun(r, legacyUntyped());
+      expect(legacy.body.kind).toBe("reserved");
+      expect((await result(r, legacy.body.key, "dispatched", "check-runs/129027020330/rerequest")).body.kind).toBe("recorded");
+      // The producer-typed native job reserve is a FRESH budget — one
+      // dispatch of the actual Actions job, ever, is still available.
+      const native = await reserveCheckRun(r, nativeJob());
+      expect(native.status, JSON.stringify(native.body)).toBe(200);
+      expect(native.body.kind).toBe("reserved");
+      expect(native.body.key).not.toBe(legacy.body.key);
+      // The native job's dispatch lands (the actions-jobs rerun endpoint —
+      // the exact target a producer-typed dispatch re-requests).
+      expect((await result(r, native.body.key, "dispatched", "repos/o/r/actions/jobs/128984021963/rerun")).body.kind).toBe("recorded");
+      // Same-producer supersession: the native job's own row holds it after
+      // the dispatch (one dispatch ever, unchanged law within the class).
+      expect((await reserveCheckRun(r, nativeJob())).body).toMatchObject({ kind: "held", state: "dispatched" });
+      // The published report of the same name/app/suite is a DIFFERENT
+      // obligation with its own budget — the native job's consumed row never
+      // holds it.
+      const report = await reserveCheckRun(r, publishedReport());
+      expect(report.status, JSON.stringify(report.body)).toBe(200);
+      expect(report.body.kind).toBe("reserved");
+      expect(report.body.key).not.toBe(native.body.key);
+      await kbJson("/train.lease", { repo: r.repo, actor: r.actor, action: "release" });
+    });
+
+    it("a producer-typed unknown dispatch fences the collapsed identity too — the fence is symmetric across the migration", async () => {
+      const r = await rig("producer-fence-reverse");
+      await stampBase(r, greenCoverage(r.tip, 500));
+      const native = await reserveCheckRun(r, nativeJob());
+      expect(native.body.kind).toBe("reserved");
+      expect((await result(r, native.body.key, "outcome_unknown", "Response lost after POST")).body.kind).toBe("recorded");
+      // An untyped (legacy-shape) reserve of the same scope reads the same
+      // fence: no purpose dispatches past the unknown effect.
+      expect((await reserveCheckRun(r, legacyUntyped())).body).toMatchObject({ kind: "held", state: "outcome_unknown" });
+      await kbJson("/train.lease", { repo: r.repo, actor: r.actor, action: "release" });
+    });
+  });
 });

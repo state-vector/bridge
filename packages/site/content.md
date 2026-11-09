@@ -992,7 +992,7 @@ The train reads canonical task state using `get_artefact` with `view: "execution
 
 The merge-line status and main-failure banner follow the current typed line projection. An open historical repair task cannot override a green working line or create a new status label.
 
-Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824).
+Stale deployment-gate retries bind the exact repository, PR and current head. Reading saved coverage does not refresh its observation time; a successful earlier attempt cannot override a newer failed or pending rerun of the same workflow run (BR#8824). The retry ledger's obligation identity is producer-typed (BR#9268): a native Actions job and an API-published check-run report sharing a name are distinct scopes with their own budgets, a legacy pre-split reservation and a producer-typed one fence each other's unreconciled effects, and a terminal pre-split row never consumes the freshly-identified native job's own dispatch budget.
 
 
 ### Provider failure evidence and bounded historical recovery

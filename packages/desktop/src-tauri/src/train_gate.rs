@@ -2188,6 +2188,23 @@ fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
     MainCheckRun { id, source: CheckSource::Unknown, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
 }
 
+/// BR#9268 test helper: a NATIVE Actions job check run — the dispatchable
+/// execution class (`/actions/runs/{run}/job/{job}` URL, Actions app, the
+/// live gate suite). The plain `run()` helper stays `Unknown` for the
+/// fail-closed tests; anything asserting DISPATCH must use a genuinely
+/// dispatchable provider shape, or the test passes for the wrong reason.
+#[cfg(test)]
+fn native_run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
+    MainCheckRun {
+        id,
+        source: CheckSource::CheckRun { suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+        name: name.into(),
+        status: Some("completed".into()),
+        conclusion: conclusion.map(String::from),
+        html_url: Some(format!("https://github.com/state-vector/superpositional/actions/runs/42563228107/job/{id}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2460,11 +2477,14 @@ mod tests {
         // healed check and flip the head back to unsettled next tick.
         // (The live fetch itself — ctx.check_runs, a paginated gh read — is
         // not unit-testable here; this newest-wins law over the fetched set
-        // is the testable half of the invariant.)
+        // is the testable half of the invariant.) BR#9268: the fixtures are
+        // NATIVE jobs so the empty set comes from supersession, not from
+        // non-dispatchability — every one of them would dispatch if it were
+        // the judge.
         let runs = vec![
-            run(125_040_321_562, "Deploy health (merge gate)", Some("failure")),
-            run(125_041_293_759, "Deploy health (merge gate)", Some("failure")),
-            run(126_074_493_096, "Deploy health (merge gate)", Some("success")),
+            native_run(125_040_321_562, "Deploy health (merge gate)", Some("failure")),
+            native_run(125_041_293_759, "Deploy health (merge gate)", Some("failure")),
+            native_run(126_074_493_096, "Deploy health (merge gate)", Some("success")),
         ];
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
     }
@@ -2474,8 +2494,8 @@ mod tests {
         // A REAL red (the judge run — highest id, non-cancelled — is red):
         // exactly that run is dispatchable, never the superseded older red.
         let runs = vec![
-            run(100, "Deploy health (merge gate)", Some("failure")),
-            run(200, "Deploy health (merge gate)", Some("timed_out")),
+            native_run(100, "Deploy health (merge gate)", Some("failure")),
+            native_run(200, "Deploy health (merge gate)", Some("timed_out")),
         ];
         let got = latest_red_deploy_health_runs(&runs);
         assert_eq!(got.len(), 1);
@@ -2487,8 +2507,8 @@ mod tests {
         // Same judge law as classify_head_checks: a CANCELLED newest run is
         // not the judge — the next non-cancelled run down decides.
         let runs = vec![
-            run(300, "Deploy health (merge gate)", Some("cancelled")),
-            run(200, "Deploy health (merge gate)", Some("failure")),
+            native_run(300, "Deploy health (merge gate)", Some("cancelled")),
+            native_run(200, "Deploy health (merge gate)", Some("failure")),
         ];
         let got = latest_red_deploy_health_runs(&runs);
         assert_eq!(got.len(), 1);
@@ -2501,6 +2521,31 @@ mod tests {
         // heals only the stale main-deploy-judging gate class).
         let runs = vec![run(400, "Rust Tests", Some("failure"))];
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
+
+    /// BR#9268: an unclassified red judge (no recognizable provider URL
+    /// shape) is fail-closed — GitHub's rerequest would aim at nothing, so
+    /// it is never dispatched; `red_report_gate_judges` reports it as the
+    /// LOUD variant so payload drift surfaces instead of burning no-op
+    /// rerequests (the BR#9081 class).
+    #[test]
+    fn unclassified_red_judge_is_fail_closed_never_dispatched_br9268() {
+        // Live shape: a real check run whose html_url carries no recognizable
+        // GitHub URL shape (payload drift) — the read classifies it
+        // CheckRun/Unclassified, never an execution.
+        let unclassified = MainCheckRun {
+            id: 500,
+            source: CheckSource::CheckRun { suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Unclassified },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some("https://example.com/other".into()),
+        };
+        let runs = vec![unclassified];
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+        let loud = red_report_gate_judges(&runs);
+        assert_eq!(loud.len(), 1);
+        assert!(loud[0].2, "the unclassified judge is the loud variant");
     }
 
     #[test]
