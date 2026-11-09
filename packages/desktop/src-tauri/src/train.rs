@@ -209,6 +209,19 @@ fn clone_cache_base() -> String {
         .unwrap_or_else(|| format!("{}/.bridge/train", std::env::var("HOME").unwrap_or_else(|_| ".".into())))
 }
 
+enum CheckRunRead {
+    Complete(Vec<MainCheckRun>),
+    Incomplete(Vec<MainCheckRun>),
+}
+
+impl CheckRunRead {
+    fn into_runs(self) -> Vec<MainCheckRun> {
+        match self {
+            Self::Complete(runs) | Self::Incomplete(runs) => runs,
+        }
+    }
+}
+
 struct Ctx {
     /// Local time budget only; progress and merge authority live on the hub.
     operation_deadline: Option<Instant>,
@@ -721,6 +734,10 @@ impl Ctx {
     /// any gh/parse failure still yields an EMPTY vec (→ Empty verdict →
     /// lane blocked → fail-closed), never a partial read.
     fn check_runs(&self, repo: &str, sha: &str) -> Vec<MainCheckRun> {
+        self.read_check_runs(repo, sha).into_runs()
+    }
+
+    fn read_check_runs(&self, repo: &str, sha: &str) -> CheckRunRead {
         let mut pages: Vec<Option<Vec<Value>>> = Vec::new();
         for page in 1..=10 {
             let out = self.gh_json(&[
@@ -743,6 +760,7 @@ impl Ctx {
                 }
             }
         }
+        let checks_complete = pages.last().and_then(Option::as_ref).is_some_and(|page| page.len() < 100);
         let mut runs = check_runs_from_pages(&pages);
         // BR#6142: when a GitHub Actions workflow fails with `conclusion ==
         // "startup_failure"` (e.g. invalid reusable workflow permissions or YAML
@@ -752,15 +770,22 @@ impl Ctx {
         // a PR whose CI workflow died at startup reads 0 red checks (Green), and
         // a main deploy that died at startup reads 0 required checks (Empty /
         // 60m pending settle).
-        if let Ok(Value::Array(wf_runs)) = self.gh_json(&[
+        let workflows_complete = if let Ok(Value::Array(wf_runs)) = self.gh_json(&[
             "api",
             &format!("repos/{repo}/actions/runs?head_sha={sha}&per_page=100"),
             "--jq",
             "[.workflow_runs[] | {id, name, status, conclusion, html_url, workflow_id, run_attempt}]",
         ]) {
             runs.extend(workflow_startup_failures(&wf_runs));
+            wf_runs.len() < 100
+        } else {
+            false
+        };
+        if checks_complete && workflows_complete {
+            CheckRunRead::Complete(runs)
+        } else {
+            CheckRunRead::Incomplete(runs)
         }
-        runs
     }
 
     /// BR#6179: Read the base branch tip SHA and its commit age in seconds
@@ -3714,9 +3739,17 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         let mut landing_red = base_class.red.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
         if ctx.base_probe {
             let (sha, age) = ctx.base_tip_facts(repo, base)?;
-            let runs = ctx.check_runs(repo, &sha);
+            let checks = ctx.read_check_runs(repo, &sha);
+            let complete = matches!(&checks, CheckRunRead::Complete(_));
+            let runs = checks.into_runs();
             let mut live = classify_base_check_runs(&runs, &required);
-            let own_batch_still_running = pass_merged > 0 && sha == tip_sha && live.verdict == MainVerdict::Unsettled;
+            // The exact tip we just landed can have no required contexts yet.
+            // Only a complete GitHub read can distinguish that from an outage.
+            let own_batch_still_running = complete && pass_merged > 0 && sha == tip_sha
+                && matches!(live.verdict, MainVerdict::Unsettled | MainVerdict::Empty);
+            if own_batch_still_running && live.verdict == MainVerdict::Empty {
+                log(Some(key), "No required checks on our exact batch tip yet; continuing selected members");
+            }
             let matching_root_fix = cand.root_fix && sha == probed_base_sha && live.verdict == MainVerdict::Red;
             if live.verdict != MainVerdict::Green && !own_batch_still_running && !matching_root_fix {
                 ctx.operation_deadline = None;
@@ -7013,7 +7046,8 @@ mod tests {
 
     #[test]
     fn reviewed_independent_heads_batch_without_rewrites_and_fence_main_changes() {
-        for scenario in ["batch-green", "batch-red", "batch-external-advance"] {
+        for scenario in ["batch-green", "batch-red", "batch-external-advance", "batch-own-checks-starting",
+            "batch-own-checks-unreadable", "batch-own-workflows-unreadable", "batch-starting-base-empty"] {
             let red_after_first = scenario == "batch-red";
             let external_advance = scenario == "batch-external-advance";
             let repo = Repo::new(scenario);
@@ -7055,6 +7089,7 @@ mod tests {
             });
             let landed = std::sync::Arc::new(Mutex::new(Vec::new()));
             let landed_c = landed.clone();
+            let starting_base = base.clone();
             let current_base = Mutex::new(base);
             let base_reads = std::sync::atomic::AtomicUsize::new(0);
             let dir = repo.dir.clone();
@@ -7092,16 +7127,36 @@ mod tests {
                     return Some(Ok(json!({"sha":live_base,"committed_at":crate::logging::iso(now_ms())}).to_string()));
                 }
                 if endpoint.contains("/check-runs?") {
+                    if endpoint.contains(&first_merge) {
+                        match scenario {
+                            "batch-own-checks-starting" | "batch-own-workflows-unreadable" =>
+                                return Some(Ok(json!([{"id":2,"name":"Reasoning path scope","status":"queued","conclusion":null}]).to_string())),
+                            "batch-own-checks-unreadable" => return Some(Err("GitHub check read timed out".into())),
+                            _ => {},
+                        }
+                    }
+                    if scenario == "batch-starting-base-empty" && endpoint.contains(&starting_base) {
+                        return Some(Ok("[]".into()));
+                    }
                     let red = red_after_first && endpoint.contains(&first_merge);
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
-                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                if endpoint.contains("/actions/runs?") {
+                    if scenario == "batch-own-workflows-unreadable" && endpoint.contains(&first_merge) {
+                        return Some(Err("GitHub workflow read timed out".into()));
+                    }
+                    return Some(Ok("[]".into()));
+                }
                 if endpoint.ends_with("/commits") { return Some(Ok(signature_fixture(args, json!([{"sha": if endpoint.contains("/pulls/1/") { &heads[0] } else { &heads[1] }, "verified":true}])))); }
                 panic!("unexpected gh command {args:?}");
             }));
             drive_lane_inner(&mut ctx, &json!({"queue":[{"id":"BR#1"},{"id":"BR#2"}],"required_workflows":["Test"]}),
                 "o/r@main","o/r","main",60_000,10).unwrap();
-            let expected = if external_advance { vec![] } else if red_after_first { vec![1] } else { vec![1, 2] };
+            let expected = match scenario {
+                "batch-external-advance" | "batch-starting-base-empty" => vec![],
+                "batch-red" | "batch-own-checks-unreadable" | "batch-own-workflows-unreadable" => vec![1],
+                _ => vec![1, 2],
+            };
             assert_eq!(*landed.lock().unwrap(), expected, "{scenario}");
             let calls = calls.lock().unwrap();
             let receipts = calls.iter().filter(|p| call_name(p)=="train_event" && call_args(p)["kind"]=="merged").count();
