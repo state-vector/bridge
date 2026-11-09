@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { reviewOutcome } from "./completion-fixture";
 
 /** BR#8824 — scoped stale deployment-gate retries. The closed retry
@@ -14,12 +14,9 @@ import { reviewOutcome } from "./completion-fixture";
  *  stays fenced until its receipts reconcile; a fresh green stamp never
  *  licenses repeating an unknown effect. */
 let mf: Miniflare;
-let kbNs: any;
-let scenario = 0;
-let hubName = "bootstrap";
+let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
 
 const kbJson = async (path: string, body?: unknown): Promise<{ status: number; body: any }> => {
-  const stub: any = await kbNs.get(kbNs.idFromName(hubName));
   const res = await stub.fetch(`https://kb${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { "content-type": "application/json", "x-kb-admin": "1" },
@@ -31,7 +28,10 @@ const kbJson = async (path: string, body?: unknown): Promise<{ status: number; b
 const acceptedPr = (task_id: string, repo: string, number: number, head: string) =>
   ({ kind: "accepted_pr" as const, task_id, legs: [{ repo, number, head_sha_at_acceptance: head }] });
 
-beforeAll(async () => {
+// Each scenario owns its runtime and cached stub. A failed synchronous
+// Miniflare proxy request must not poison every following scenario, and
+// ordinary HTTP calls must not repeatedly cross the synchronous proxy.
+beforeEach(async () => {
   const bundle = realpathSync(new URL("../../../.kb-bundle/index.js", import.meta.url).pathname);
   if (!existsSync(bundle)) {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (before vitest)");
@@ -47,15 +47,12 @@ beforeAll(async () => {
       durableObjects: { KB: { className: "KnowledgeHub", useSQLite: true } },
     }],
   });
-  kbNs = await mf.getDurableObjectNamespace("KB");
-});
-
-beforeEach(async () => {
-  hubName = `br8824-scenario-${++scenario}`;
+  const ns = await mf.getDurableObjectNamespace("KB");
+  stub = await ns.get(ns.idFromName("stale-gate")) as unknown as typeof stub;
   await kbJson("/orient", {});
 });
 
-afterAll(async () => {
+afterEach(async () => {
   await mf?.dispose();
 });
 
