@@ -96,48 +96,50 @@ describe("eligibility-first scheduling on real SQLite", () => {
       stderr_tail: proxy
         ? "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]"
         : "acp session/prompt failed: Authentication required: provider authentication required " };
-    async function exhaust(taskId: string) {
+    async function holdForRecovery(taskId: string) {
       let terminal: Record<string, unknown> = {};
       for (let generation = 1; generation <= 3; generation++) {
         const claim = await reserve(g);
         if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
         const attempt_id = `failed-${generation}`, fence = { generation, attempt_id };
         expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,selection:{backend:g.capabilities.backend,model:g.capabilities.model,tier:"large"} }, `begin-${generation}`, taskId, claim.session)).error).toBeUndefined();
-        const stopped = { ...fence, writers: "process_group_empty", outcome };
+        const terminalOutcome = proxy && generation < 3 ? { ...outcome, stderr_tail: "Task failed before delivery" } : outcome;
+        const stopped = { ...fence, writers: "process_group_empty", outcome: terminalOutcome };
         expect((await g.cmd({ kind: "stopped", ...stopped }, `stop-${generation}`, taskId, claim.session)).error).toBeUndefined();
         const final = await g.cmd({ kind: "finalize", ...stopped }, `final-${generation}`, taskId, claim.session);
         expect(final.error).toBeUndefined(); terminal = final.terminal;
-        expect(final.budget_exhaustions).toBe(generation);
+        expect(final.budget_exhaustions).toBe(proxy ? Math.min(generation, 2) : generation);
       }
       return terminal;
     }
-    const terminal = await exhaust(id);
-    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
+    const terminal = await holdForRecovery(id);
+    const hold = proxy ? "provider_route" : "retry_budget";
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { [hold]: 1 } });
     const boardTask = async (taskId = id) => {
       const response = await stub.fetch("https://kb/board", { method: "GET" });
       const board = await response.json() as { tasks: { id: string; gateway_dispatch: unknown }[] };
       return board.tasks.find(task => task.id === taskId);
     };
-    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } });
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: [hold] } });
     const needsHost = await task(project, { execution_requirements: { tier: "small", tools: ["fixture-missing-tool"], environment: [] } });
     expect(await boardTask(needsHost)).toMatchObject({ status: "blocked", meta: {
       execution_wait: { kind: "capability" }, execution_blockers: [{ kind: "capability_unavailable" }],
     } });
     expect((await g.cmd({ kind: "pause_claims", budget_ms: 60_000, reason: "fixture: temporarily unavailable" })).kind).toBe("claims_paused");
-    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: ["retry_budget"] } });
+    expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: [hold] } });
     expect(await boardTask(needsHost)).toMatchObject({ status: "blocked" });
     await g.cmd({ kind: "resume_claims" });
 
     const additional = [];
     if (event) {
       const newer = await task(project, { boosted: true, execution_requirements: { tier: "large", tools: [], environment: [] } });
-      await exhaust(newer);
+      await holdForRecovery(newer);
       expect(await post("fixture/spent-route", { id })).toEqual({ ok: true });
     }
     if (proxy && !event) {
       for (let i = 0; i < 4; i++) {
         const taskId = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
-        additional.push({ taskId, terminal: await exhaust(taskId) });
+        additional.push({ taskId, terminal: await holdForRecovery(taskId) });
       }
     }
     const token = await post("admin.mint", { label: `recovery-reviewer-${serial}`, tags: [] });
@@ -165,12 +167,12 @@ describe("eligibility-first scheduling on real SQLite", () => {
       const begun = await g.cmd({ kind: "begin", attempt_id: "event-recovered", worker: g.auth.agent,
         action_budget_ms: 60_000, selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } },
         "event-begin", id, resumed.session);
-      expect(begun).toMatchObject({ generation: 4, budget_exhaustions: 3, recovery_permit: { phase: "consumed" } });
+      expect(begun).toMatchObject({ generation: 4, budget_exhaustions: 2, recovery_permit: { phase: "consumed" } });
       expect(await submit("different-transport-command")).toEqual(receipt);
       return;
     }
     const grant = await recover("grant");
-    expect(grant).toMatchObject({kind:"provider_recovery_granted",budget_exhaustions:3});
+    expect(grant).toMatchObject({kind:"provider_recovery_granted",budget_exhaustions:proxy ? 2 : 3});
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "eligible" } });
     await g.cmd({ kind: "pause_claims", budget_ms: 60_000, reason: "fixture: permit route paused" });
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "gateway_unavailable", reasons: ["recovery_route"] } });
@@ -183,7 +185,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(resumed.task?.meta).toMatchObject({execution_recovery_selection:{backend:g.capabilities.backend,model:g.capabilities.model,config_revision:"one",tier:"large"}});
     const begin = {kind:"begin",attempt_id:"recovered",worker:g.auth.agent,action_budget_ms:60_000,selection:{backend:g.capabilities.backend,model:g.capabilities.model,tier:"large"}};
     const next = await g.cmd(begin,"recovered-begin",id,resumed.session);
-    expect(next).toMatchObject({generation:4,budget_exhaustions:3,recovery_permit:{phase:"consumed",consumed_generation:4,continuation:command.continuation,terminal}});
+    expect(next).toMatchObject({generation:4,budget_exhaustions:proxy ? 2 : 3,recovery_permit:{phase:"consumed",consumed_generation:4,continuation:command.continuation,terminal}});
     expect(await g.cmd(begin,"recovered-begin",id,resumed.session)).toEqual(next);
     expect((await g.cmd({...begin,attempt_id:"duplicate"},"duplicate-begin",id,resumed.session)).error).toMatch(/quiescence|budget/);
     if (proxy) {

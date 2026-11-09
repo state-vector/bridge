@@ -82,6 +82,7 @@ it("separates gateway-held tasks from eligible work and keeps open questions vis
   useKb.setState({ tasks: [
     { ...task, gateway_dispatch: { kind: "eligible" } },
     { ...task, id: "BR#501", title: "Held repair", gateway_dispatch: { kind: "held", reasons: ["retry_budget"], last_attempt: "provider_route" } },
+    { ...task, id: "BR#505", title: "Route interrupted repair", gateway_dispatch: { kind: "held", reasons: ["provider_route"] } },
     { ...task, id: "BR#502", type: "question", title: "Open clarification" },
     { ...task, id: "BR#503", title: "Needs another gateway", gateway_dispatch: { kind: "gateway_unavailable", reasons: ["capability"] } },
     { ...task, id: "BR#504", title: "Configured capability missing", status: "blocked",
@@ -91,6 +92,7 @@ it("separates gateway-held tasks from eligible work and keeps open questions vis
   try {
     const html = renderToStaticMarkup(<BacklogView />);
     expect(html).toMatch(/Ready for gateway[\s\S]*Eligible repair[\s\S]*Open questions[\s\S]*Open clarification[\s\S]*Blocked — retry budget exhausted[\s\S]*Held repair[\s\S]*Last attempt: provider route unavailable[\s\S]*Waiting for a gateway[\s\S]*Needs another gateway/);
+    expect(html).toMatch(/Waiting for executor recovery[\s\S]*Route interrupted repair[\s\S]*Provider route failed; waiting for verified recovery[\s\S]*Blocked — retry budget exhausted/);
     expect(html).toMatch(/Waiting for a gateway[\s\S]*Configured capability missing/);
     expect(html).not.toContain("Blocked — other");
     expect(html).not.toContain("Waiting for gateway eligibility");

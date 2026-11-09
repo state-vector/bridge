@@ -264,7 +264,7 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
     icon: "◷",
     unblockedBy: "System (verified executor readiness)",
     unblockedTone: "warn",
-    note: "No worker has started. Readiness reconciliation owns the exit; this is not task churn.",
+    note: "Bridge checks readiness for startup holds and requires a fresh verified route or a reviewed change of approach for provider failures.",
   },
   retry: {
     key: "retry", title: "Blocked — retry budget exhausted", icon: "↻",
@@ -306,6 +306,7 @@ export function dispatchExitClass(dispatch: GatewayDispatch): ExitClass {
   if (dispatch.kind === "gateway_unavailable") return EXIT_CLASSES.gateway;
   if (dispatch.kind !== "held") return EXIT_CLASSES.other;
   if (dispatch.reasons.includes("unknown_operations")) return EXIT_CLASSES.operations;
+  if (dispatch.reasons.includes("provider_route")) return EXIT_CLASSES.executor;
   if (dispatch.reasons.includes("retry_budget")) return EXIT_CLASSES.retry;
   return EXIT_CLASSES.prerequisite;
 }

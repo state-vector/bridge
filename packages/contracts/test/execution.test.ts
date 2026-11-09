@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -165,10 +165,24 @@ describe("witnessed legacy recovery fences", () => {
       const unknown=structuredClone(s); unknown.operations=[{id:"write",action:"publish",input_revision:"old",deadline:1100,state,receipts:[]}];
       expect(recoveryPermitMatches(unknown,capability,"mac","revision",200)).toBe(false);
     }
-    const next=step(s,{...begin,attempt_id:"recovered"},200);
+    const next=reduceExecution(s,{...begin,attempt_id:"recovered"},"mac","dispatch-BR-1",200,"revision");
     expect(next.budget_exhaustions).toBe(3);
     expect(next.recovery_permit?.phase).toBe("consumed");
     expect(next.terminal).toEqual(s.terminal);
+  });
+  it("does not consume a provider permit when starting a reviewed larger-model strategy", () => {
+    const state = held();
+    const terminal = state.terminal!;
+    terminal.outcome.stderr_tail = "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]";
+    const permit = state.recovery_permit!;
+    permit.terminal = structuredClone(terminal);
+    permit.diagnosis = "provider_route_unavailable";
+    permit.proof.witness = { ...permit.proof.witness, kind: "configured_proxy_request" };
+    expect(recoveryPermitMatches(state, capability, "mac", "revision", 200)).toBe(true);
+    openLargerModelStrategy(state, "medium", "Reviewed different model", "independent_review", "revision");
+    const next = reduceExecution(state, { ...begin, attempt_id: "larger-model" }, "mac", "dispatch-BR-1", 200, "revision");
+    expect(next.generation).toBe(2);
+    expect(next.recovery_permit?.phase).toBe("available");
   });
   it("recognizes the archived ACP routing failure without inferring exhausted credit", () => {
     const stderr_tail = `acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=glm-5.3-flash. pre-call-checks=False, cooldown_list=['${"a".repeat(64)}'] `;
@@ -201,6 +215,19 @@ describe("cause-preserving strategy attempts", () => {
     chargeExecutionFailure(s,1); chargeExecutionFailure(s,1);
     expect(s.budget_exhaustions).toBe(1);
     chargeExecutionFailure(s,2); expect(s.budget_exhaustions).toBe(2);
+  });
+  it("requires recovery for a route failure when a larger-model strategy belongs to another revision", () => {
+    const outcome = { kind: "failed", exit_code: 1, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" } as const;
+    const receipt = { ...fence, writers: "process_group_empty", outcome } as const;
+    const state = step(step(started(), { kind: "stopped", ...receipt }), { kind: "finalize", ...receipt });
+    expect(executionAdmissionHold(state, "reviewed")).toBe("provider_route");
+    openLargerModelStrategy(state, "medium", "Reviewed different model", "independent_review", "reviewed");
+    const resume = { ...begin, attempt_id: "different-strategy" };
+    expect(executionAdmissionHold(state, "edited")).toBe("provider_route");
+    expect(() => reduceExecution(state, resume, "mac", "dispatch-BR-1", 200, "edited")).toThrow(/provider route/);
+    expect(executionAdmissionHold(state, "reviewed")).toBeNull();
+    expect(reduceExecution(state, resume, "mac", "dispatch-BR-1", 200, "reviewed").generation).toBe(2);
   });
   it("admits a genuinely larger strategy with preserved history and bounded new failures", () => {
     const s=started(); s.budget_exhaustions=3;

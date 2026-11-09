@@ -376,13 +376,14 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       return s;
     }
     case "begin": {
+      const needsRecoveryPermit = executionNeedsRecoveryPermit(s, taskRevision);
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
-      if (executionAttemptBudgetExhausted(s, taskRevision) && !recoveryPermitCoversAttempt(s, now)) throw new Error("gate: action retry budget exhausted; diagnose/reconcile instead of restarting again");
+      if (needsRecoveryPermit && !(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now))) throw new Error("gate: retry budget or provider route requires a current recovery permit");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
       if (a && a.host !== host && !a.checkpoint) throw new Error("gate: cross-host transfer requires a published checkpoint");
       s.generation += 1;
-      if (s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
+      if (needsRecoveryPermit && s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {
         generation: s.generation, attempt_id: command.attempt_id, host, session,
         lease_until: now + EXECUTION_LEASE_MS,
@@ -588,13 +589,22 @@ export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTi
   state.retry_strategy = {kind:"larger_model",epoch:(state.retry_strategy?.epoch ?? 0)+1,task_revision:taskRevision,
     minimum_tier:tier,first_generation:state.generation+1,failures:0,reason,source};
 }
+export function executionNeedsRecoveryPermit(state: ExecutionState, revision: string): boolean {
+  const hold = executionAdmissionHold(state, revision);
+  return hold === "provider_route" || hold === "retry_budget";
+}
+
 /** Intrinsic attempt fences precede gateway availability. A compatible
  * gateway alone cannot clear any of these conditions. */
 export function executionAdmissionHold(state: ExecutionState | undefined, revision: string):
-  "writer_not_quiescent" | "unknown_operations" | "retry_budget" | null {
+  "writer_not_quiescent" | "unknown_operations" | "provider_route" | "retry_budget" | null {
   if (!state) return null;
   if (state.attempt && state.attempt.phase !== "quiesced") return "writer_not_quiescent";
   if (state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return "unknown_operations";
+  const { attempt, terminal } = state;
+  if (attempt && terminal && terminal.generation === attempt.generation && terminal.attempt_id === attempt.attempt_id
+    && !(state.retry_strategy?.task_revision === revision && attempt.generation < state.retry_strategy.first_generation)
+    && providerRecoveryDiagnosis(terminal.outcome) === "provider_route_unavailable") return "provider_route";
   if (executionAttemptBudgetExhausted(state, revision)) return "retry_budget";
   return null;
 }

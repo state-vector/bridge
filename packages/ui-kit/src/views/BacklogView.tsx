@@ -42,6 +42,7 @@ const gatewayHoldLabels: Record<SchedulingReason, string> = {
   writer_not_quiescent: "Previous worker has not confirmed it stopped",
   unknown_operations: "Previous operation needs reconciliation",
   retry_budget: "Retry budget exhausted; needs recovery evidence or a changed approach",
+  provider_route: "Provider route failed; waiting for verified recovery or a reviewed change of approach",
   host_affinity: "Work is retained on another host",
   recovery_route: "Verified retry permit is waiting for its selected gateway and model",
   capability: "No ready gateway matches the required model, tools, or environment",

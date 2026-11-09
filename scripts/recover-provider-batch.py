@@ -40,7 +40,8 @@ def choose(status, proof, inspect, limit):
     if not count or not status["live"] or status["readiness"]["kind"] != "ready":
         return []
     candidates = []
-    for task in status["held"].get("retry_budget", [])[:32]:
+    held = status["held"]
+    for task in [*held.get("provider_route", []), *held.get("retry_budget", [])][:32]:
         state = inspect(task)
         attempt = state.get("attempt") or {}
         executor = attempt.get("executor") or {}

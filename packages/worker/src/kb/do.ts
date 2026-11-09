@@ -236,7 +236,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionAttemptBudgetExhausted, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -5105,10 +5105,10 @@ export class KnowledgeHub {
       else {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state ?? undefined, revision);
-        const permit = hold === "retry_budget" && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
+        const permit = (hold === "retry_budget" || hold === "provider_route") && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
           usableFor(this.executionSchedulingRequirements(id, meta.execution_requirements), c, host, String(row.project ?? ""))
           && recoveryPermitMatches(state, c, host, revision, Date.now()));
-        const awaitingPermitHost = hold === "retry_budget" && state && recoveryPermitCoversAttempt(state, Date.now())
+        const awaitingPermitHost = (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
           && state.recovery_permit?.task_revision === revision;
         reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
       }
@@ -5121,7 +5121,7 @@ export class KnowledgeHub {
           if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
         }
       }
-      if (retryRoute && reason === "retry_budget" && state?.terminal && state.attempt?.host === host
+      if (retryRoute && reason === "provider_route" && state?.terminal && state.attempt?.host === host
         && state.attempt.executor?.backend === retryRoute.backend && state.attempt.executor.model === retryRoute.model
         && state.attempt.executor.config_revision === retryRoute.config_revision
         && capabilities && [capabilities, ...capabilities.alternatives].some(candidate =>
@@ -5309,7 +5309,7 @@ export class KnowledgeHub {
           const meta = JSON.parse(String(assigned.meta ?? "{}"));
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           const execution = this.executionState(id);
-          if (execution?.recovery_permit?.phase === "available") {
+          if (execution && executionNeedsRecoveryPermit(execution, String(meta.work_revision ?? "legacy"))) {
             const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
               && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
             if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
@@ -5612,7 +5612,7 @@ export class KnowledgeHub {
       if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: unresolved external effects prohibit provider recovery");
       if (JSON.stringify(command.terminal) !== JSON.stringify(terminal)) throw new Error("gate: provider recovery terminal evidence changed");
       if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
-      if (current.budget_exhaustions < 3) throw new Error("gate: task does not require an exhausted-budget recovery permit");
+      if (!executionNeedsRecoveryPermit(current, String(meta.work_revision ?? "legacy"))) throw new Error("gate: task does not require a recovery permit");
       if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
       if (command.proof.witness.kind === "configured_proxy_request" && this.proxyTrialConsumed(req.id, String(meta.work_revision ?? "legacy")))
         throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
@@ -5796,7 +5796,7 @@ export class KnowledgeHub {
       const selection = command.selection;
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
-      if (executionAttemptBudgetExhausted(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: exhausted budget requires a current one-use recovery permit for the exact selected route");
+      if (executionNeedsRecoveryPermit(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: retry budget or provider route requires a current one-use recovery permit for the exact selected route");
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, capabilities, now);
       if (readiness.kind !== "ready" || capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin requires the provisioned worker from the runner's live readiness proof");
@@ -5834,7 +5834,8 @@ export class KnowledgeHub {
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
-    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted") chargeExecutionFailure(next,command.generation);
+    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted"
+      && providerRecoveryDiagnosis(command.outcome) !== "provider_route_unavailable") chargeExecutionFailure(next,command.generation);
     if (canRescheduleFinalized && !next.attempt?.checkpoint) next.requirements = { ...next.requirements, host: actor };
     if (begunExecutor && next.attempt) {
       next.attempt.executor = begunExecutor;
