@@ -181,6 +181,22 @@ pub(super) fn no_external_worktrees(repository: &Path, root: &Path) -> Result<()
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn proc_entry_disappeared(error: &io::Error) -> bool {
+    // A PID can exit between enumerating /proc and reading its entries.
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn proc_entry_disappearance_only_accepts_vanished_entries() {
+    assert!(proc_entry_disappeared(&io::Error::from_raw_os_error(libc::ENOENT)));
+    assert!(proc_entry_disappeared(&io::Error::from_raw_os_error(libc::ESRCH)));
+    for errno in [libc::EACCES, libc::EPERM, libc::EIO] {
+        assert!(!proc_entry_disappeared(&io::Error::from_raw_os_error(errno)));
+    }
+}
+
 pub(super) fn no_readers(root: &Path, authority: ReaderAuthority) -> Result<(), String> {
     if !root.exists() { return Ok(()); }
     if fs::symlink_metadata(root).map_err(|e| e.to_string())?.file_type().is_symlink() { return Err("workspace root is a symlink; retained".into()); }
@@ -190,18 +206,18 @@ pub(super) fn no_readers(root: &Path, authority: ReaderAuthority) -> Result<(), 
         for process in fs::read_dir("/proc").map_err(|e| e.to_string())? {
             let process = process.map_err(|e| e.to_string())?.path();
             if !process.file_name().is_some_and(|p| p.to_string_lossy().chars().all(|c| c.is_ascii_digit())) { continue; }
-            let metadata = match fs::metadata(&process) { Ok(m) => m, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) => return Err(e.to_string()) };
+            let metadata = match fs::metadata(&process) { Ok(m) => m, Err(e) if proc_entry_disappeared(&e) => continue, Err(e) => return Err(e.to_string()) };
             if metadata.uid() != uid { continue; }
             // Exited processes can remain as zombies while their parent reaps
             // them. Linux denies their ptrace-gated cwd/exe links, but their
             // kernel state proves they cannot hold files or perform writes.
-            let stat=match fs::read_to_string(process.join("stat")) {Ok(raw)=>raw,Err(e) if e.kind()==io::ErrorKind::NotFound=>continue,Err(e)=>return Err(format!("workspace process state incomplete at {}: {e}",process.display()))};
+            let stat=match fs::read_to_string(process.join("stat")) {Ok(raw)=>raw,Err(e) if proc_entry_disappeared(&e)=>continue,Err(e)=>return Err(format!("workspace process state incomplete at {}: {e}",process.display()))};
             let state=crate::transport::proc_stat(&stat).ok_or_else(||format!("workspace process state malformed at {}",process.display()))?.0;
             if matches!(state,'Z'|'X') {continue;}
             for link in ["cwd", "exe"] {
                 match fs::read_link(process.join(link)) {
                     Ok(path) if path.starts_with(root) => return Err(format!("workspace is held by process {}", process.display())),
-                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                    Ok(_) => {}, Err(e) if proc_entry_disappeared(&e) => {},
                     Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{},
                     Err(e) => return Err(format!("workspace process visibility incomplete at {}/{} (state {state}): {e}",process.display(),link)),
                 }
@@ -210,7 +226,7 @@ pub(super) fn no_readers(root: &Path, authority: ReaderAuthority) -> Result<(), 
             // directory. Its declared environment/argv and mapped files count
             // as readers too; checking only cwd/fds would miss that interval.
             for name in ["cmdline", "environ"] {
-                let bytes = match fs::read(process.join(name)) { Ok(b) => b, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace process scope incomplete: {e}")) };
+                let bytes = match fs::read(process.join(name)) { Ok(b) => b, Err(e) if proc_entry_disappeared(&e) => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace process scope incomplete: {e}")) };
                 for value in bytes.split(|b| *b == 0) {
                     let value = String::from_utf8_lossy(value);
                     let path = value.split_once('=').map(|(_, value)| value).unwrap_or(&value);
@@ -219,14 +235,14 @@ pub(super) fn no_readers(root: &Path, authority: ReaderAuthority) -> Result<(), 
             }
             match fs::read_to_string(process.join("maps")) {
                 Ok(maps) if maps.lines().filter_map(|line| line.split_whitespace().nth(5)).any(|path| path.starts_with('/') && Path::new(path).starts_with(root)) => return Err(format!("workspace is mapped by process {}", process.display())),
-                Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(format!("workspace mapping visibility incomplete: {e}")),
+                Ok(_) => {}, Err(e) if proc_entry_disappeared(&e) => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(format!("workspace mapping visibility incomplete: {e}")),
             }
-            let descriptors = match fs::read_dir(process.join("fd")) { Ok(fd) => fd, Err(e) if e.kind() == io::ErrorKind::NotFound => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace FD visibility incomplete: {e}")) };
+            let descriptors = match fs::read_dir(process.join("fd")) { Ok(fd) => fd, Err(e) if proc_entry_disappeared(&e) => continue, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>continue, Err(e) => return Err(format!("workspace FD visibility incomplete: {e}")) };
             for fd in descriptors {
                 let fd = fd.map_err(|e| e.to_string())?;
                 match fs::read_link(fd.path()) {
                     Ok(path) if path.starts_with(root) => return Err(format!("workspace has an open process descriptor: {}", fd.path().display())),
-                    Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(e.to_string()),
+                    Ok(_) => {}, Err(e) if proc_entry_disappeared(&e) => {}, Err(e) if e.kind()==io::ErrorKind::PermissionDenied && matches!(authority,ReaderAuthority::FencedAllocation)=>{}, Err(e) => return Err(e.to_string()),
                 }
             }
         }
