@@ -1,6 +1,8 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { reviewOutcome } from "./completion-fixture";
+import type { ReviewResult } from "@bridge/contracts";
 
 let mf: Miniflare;
 let stub: any;
@@ -11,6 +13,7 @@ async function call(op: string, body: object = {}) {
   return { status: res.status, body: await res.json() as any };
 }
 const get = async (id: string) => (await call("get", { id })).body;
+const resultFor = (id: string, result: ReviewResult) => reviewOutcome((path, body) => call(path.slice(1), body), id, result);
 async function create(number: number) {
   const r = await call("create", { type: "task", title: `Delivery ${number}`, qualified: true, actor: "impl", meta: { pr: { repo, number } } });
   expect(r.status, JSON.stringify(r.body)).toBe(200);
@@ -82,7 +85,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect((await get(id)).status).toBe("blocked");
     const review = submitted.body.verify_task;
     await call("transition", { id: review, to: "in_progress", actor: "closure-reviewer", session: "closure-review-4" });
-    const accepted = await call("transition", { id: review, to: "done", actor: "closure-reviewer", session: "closure-review-4", note: `Verified actual closure ${receipt}`, review_result: { kind: "accepted_execution", task_id: close, receipts: [receipt] } });
+    const accepted = await call("transition", { id: review, to: "done", actor: "closure-reviewer", session: "closure-review-4", note: `Verified actual closure ${receipt}`, review_result: await resultFor(review, { kind: "accepted_execution", task_id: close, receipts: [receipt] }) });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await get(id)).status).toBe("superseded");
     expect((await get(id)).meta.delivery_disposition.closure.phase).toBe("closed");
@@ -114,7 +117,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
     const review = submitted.body.verify_task;
     expect((await call("transition", { id: review, to: "in_progress", actor: "reviewer", session: "review-20" })).status).toBe(200);
-    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "review-20", review_result: { kind: "accepted_pr", task_id: id, legs: [{ repo, number: 20, head_sha_at_acceptance: head }] }, note: `Verified https://github.com/${repo}/pull/20 head ${head}` });
+    const accepted = await call("transition", { id: review, to: "done", actor: "reviewer", session: "review-20", review_result: await resultFor(review, { kind: "accepted_pr", task_id: id, legs: [{ repo, number: 20, head_sha_at_acceptance: head }] }), note: `Verified https://github.com/${repo}/pull/20 head ${head}` });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await get(id)).meta.pr.head_sha_at_acceptance).toBe(head);
     expect((await get(id)).meta.merge_train.state).toBe("queued");
@@ -123,14 +126,14 @@ describe("delivery responsibility (real SQLite hub)", () => {
   });
 
   it("a standalone historical ACCEPT restores delivery even when its exact bound parent is already done", async () => {
-    const original = await call("create", { type: "task", title: "Historical done parent", roles: ["analysis"], actor: "old-impl", meta: { pr: { repo, number: 2329 } } });
+    const original = await call("create", { type: "task", title: "Historical done parent", roles: ["analysis"], actor: "old-impl", meta: { completion: { kind: "delivery" }, pr: { repo, number: 2329 } } });
     const id = original.body.id;
     expect((await call("transition", { id, to: "in_progress", actor: "old-impl" })).status).toBe(200);
-    expect((await call("transition", { id, to: "done", actor: "old-impl", note: "Analysis outcome complete" })).status).toBe(200);
+    expect((await call("transition", { id, to: "done", actor: "old-impl", execution_result: { outcome: "Historical analysis outcome", receipts: [id] }, note: "Analysis outcome complete" })).status).toBe(200);
     await call("reconcile.report", { repo, prs: [{ number: 2329, state: "OPEN", headRefOid: head, updatedAt: new Date().toISOString() }] });
-    const review = (await call("create", { type: "task", title: "Standalone review", roles: ["review"], actor: "fresh-reviewer" })).body.id;
+    const review = (await call("create", { type: "task", title: "Standalone review", roles: ["review"], meta: { execution_review_of: id }, actor: "fresh-reviewer" })).body.id;
     expect((await call("transition", { id: review, to: "in_progress", actor: "fresh-reviewer", session: "fresh-2329" })).status).toBe(200);
-    const accepted = await call("transition", { id: review, to: "done", actor: "fresh-reviewer", session: "fresh-2329", note: `VERDICT: ACCEPT — head ${head}. PR https://github.com/${repo}/pull/2329. Scope ${id}. A prior attempt was rejected; this acceptance is at the live head.` });
+    const accepted = await call("transition", { id: review, to: "done", actor: "fresh-reviewer", session: "fresh-2329", review_result: await resultFor(review, { kind: "accepted_pr", task_id: id, legs: [{ repo, number: 2329, head_sha_at_acceptance: head }] }), note: `VERDICT: ACCEPT — head ${head}. PR https://github.com/${repo}/pull/2329. Scope ${id}. A prior attempt was rejected; this acceptance is at the live head.` });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await get(id)).status).toBe("done");
     // Fresh observation AFTER the acceptance seals the historical handoff.
@@ -158,7 +161,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     await call("admin.unblock_proxy_sweep", { now: Date.now() + 60 * 60_000 });
     expect((await get(dependent)).meta.proxy_check.verdict).toBe("false");
     await call("transition", { id: successor, to: "in_progress", actor: "successor" });
-    await call("transition", { id: successor, to: "done", actor: "successor", note: "Replacement outcome completed" });
+    await call("transition", { id: successor, to: "done", actor: "successor", execution_result: { outcome: "Replacement outcome completed", receipts: [successor] }, note: "Replacement outcome completed" });
     await call("admin.unblock_proxy_sweep", { now: Date.now() + 90 * 60_000 });
     expect((await get(dependent)).meta.proxy_check.verdict).toBe("true");
   });
@@ -180,7 +183,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
     expect((await get(duty.id)).status).toBe("done");
   });
 
-  it("bounded replay progresses past a cohort of held acceptances without clearing their blockers", async () => {
+  it("admits a fresh verdict immediately past held historical acceptances", async () => {
     const held: string[] = [];
     let fresh = "";
     for (let i = 0; i < 14; i++) {
@@ -192,14 +195,18 @@ describe("delivery responsibility (real SQLite hub)", () => {
       if (i < 13) {
         held.push(id);
         await call("transition", { id, to: "blocked", actor: "bulk-impl", session: `impl-${number}`, note: "Independent dependency hold", await_event: { event: "time", until_ts: Date.now() + 86_400_000 } });
-      } else fresh = id;
+      } else {
+        fresh = id;
+        await call("admin.settings_set", { settings: { delivery_admission_cursor: "0" } });
+      }
       const review = submitted.body.verify_task;
       await call("transition", { id: review, to: "in_progress", actor: "bulk-reviewer", session: `review-${number}` });
-      const accepted = await call("transition", { id: review, to: "done", actor: "bulk-reviewer", session: `review-${number}`, note: `Verified https://github.com/${repo}/pull/${number} head ${head}`, review_result: { kind: "accepted_pr", task_id: id, legs: [{ repo, number, head_sha_at_acceptance: head }] } });
+      const accepted = await call("transition", { id: review, to: "done", actor: "bulk-reviewer", session: `review-${number}`, note: `Verified https://github.com/${repo}/pull/${number} head ${head}`, review_result: await resultFor(review, { kind: "accepted_pr", task_id: id, legs: [{ repo, number, head_sha_at_acceptance: head }] }) });
       expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     }
-    for (let pass = 0; pass < 4; pass++) await call("admin.ask_escalation_sweep", { now: Date.now() });
-    expect((await get(fresh)).meta.merge_train.state).toBe("queued");
+    const admitted = await get(fresh);
+    expect(admitted.meta.merge_train.state).toBe("queued");
+    expect(admitted.delivery_admissions).toEqual(expect.arrayContaining([expect.objectContaining({ state: expect.objectContaining({ phase: "admitted" }) })]));
     for (const id of held) {
       const source = await get(id);
       expect(source.status).toBe("blocked");

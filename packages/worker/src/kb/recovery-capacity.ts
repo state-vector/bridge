@@ -51,7 +51,7 @@ export class RecoveryCapacity {
     if (!row) return null;
     const pending = RecoveryPreemptionSchema.parse(JSON.parse(String(row.state)));
     const attempt = this.state(pending.victim_id)?.attempt;
-    return { ...pending, phase: attempt && (attempt.generation > pending.generation || attempt.generation === pending.generation && attempt.attempt_id === pending.attempt_id && attempt.phase === "quiesced")
+    return { ...pending, phase: attempt && (attempt.generation > pending.generation || attempt.generation === pending.generation && attempt.attempt_id === pending.attempt_id && ["quiesced", "finalizing"].includes(attempt.phase))
       ? "slot_available" : "stopping_verification" };
   }
   forRecovery(id: string): RecoveryPreemption | null {
@@ -88,13 +88,13 @@ export class RecoveryCapacity {
       if (typeof meta.execution_review_of === "string") parents.push(...this.sql.exec(`SELECT meta,tags,roles FROM artefacts WHERE id=?`, meta.execution_review_of).toArray());
       if (parents.some(p => schedulingRank(JSON.parse(String(p.meta)), parseTags(p.tags), parseTags(p.roles)) <= 1)) continue;
       const state = ExecutionStateSchema.parse(JSON.parse(String(row.state))), a = state.attempt;
-      if (!a || a.phase !== "running" || a.session !== meta.session || a.lease_until <= now || a.action_deadline <= now || !a.checkpoint
+      if (!a || a.phase !== "running" || a.session !== meta.session || a.lease_until <= now || a.action_deadline <= now
         || !["none", "returned"].includes(state.handoff.phase) || state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
         || state.messages.some(m => m.priority === "interrupt" && m.state !== "acted")) continue;
       const pending: RecoveryPreemption = { phase: "stopping_verification", recovery_id: recovery.id, victim_id: id,
-        generation: a.generation, attempt_id: a.attempt_id, session: a.session, requested_at: now, checkpoint_commit: a.checkpoint.commit };
+        generation: a.generation, attempt_id: a.attempt_id, session: a.session, requested_at: now, checkpoint_commit: a.checkpoint?.commit ?? null };
       const stopped = reduceExecution(state, { kind: "message", message_id: `recovery-preempt:${recovery.id}:${a.generation}:${a.attempt_id}`,
-        priority: "interrupt", text: `Priority line recovery ${recovery.id} needs this slot. Stop safely, preserve and publish your current checkpoint, confirm process-group quiescence and yield. Your verification returns to todo and resumes from its checkpoint after recovery. Do not discard work or relax review separation.` }, host, a.session, now);
+        priority: "interrupt", text: `Priority line recovery ${recovery.id} needs this slot. Stop safely, confirm process-group quiescence and yield. Record findings on the task. Verification starts fresh after recovery. Keep review separation.` }, host, a.session, now);
       this.storage.transactionSync(() => {
         this.sql.exec(`INSERT INTO recovery_preemptions(token_id,state) VALUES (?,?)`, token, JSON.stringify(pending));
         this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(stopped), id);

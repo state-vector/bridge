@@ -1,17 +1,14 @@
+import type { GatewayDispatch, SchedulingReason, WorkWait } from "@bridge/contracts";
 import { useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { kbApi } from "../server/kb";
 import { TaskDetail } from "./TaskDetail";
-import { kindOf, rel, exitClassOf, blockedSummaryOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
+import { kindOf, rel, exitClassOf, dispatchExitClass, blockedSummaryOf, EXIT_CLASSES, EXIT_CLASS_ORDER, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Btn, Chip } from "./index-kit";
 import { TagThemeBar, TagChips, useTagTheme } from "./TagFilter";
 
-/** Backlog + Completed: the whole queue (2026-10-29 spec, Ray): NEXT (todo,
- *  claim-ranked) then every parked card filed under its EXIT CONDITION —
- *  the typed await_event class (awaiting you · PR verification · PR merge ·
- *  CI · deploy · another task · GitHub issue · a date · green main · other ·
- *  timeout churn parks). Completed = done work, newest first. Same ktable
- *  primitive as Top; only --cols differ. Top renders no parking lot. */
+/** Backlog shows runnable work, discussions and the hub's four wait classes.
+ * Completed shares the table layout with Top and Backlog. */
 
 function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<string>): { rank: number; why: string } {
   const roles: string[] = t.roles ?? [];
@@ -32,6 +29,47 @@ function rankOf(t: any, parentIdOf: Map<string, string>, inReviewIds?: Set<strin
   if (roles.includes("analysis")) return { rank: 3, why: "analysis — qualifies downstream impl" };
   return { rank: 4, why: "todo" };
 }
+
+const gatewayHoldLabels: Record<SchedulingReason, string> = {
+  qualification: "Needs qualification",
+  operator_gate: "Waiting for an operator decision",
+  question: "Waiting for an answer",
+  independent_wait: "Waiting on a separate review or prerequisite",
+  writer_not_quiescent: "Previous worker has not confirmed it stopped",
+  unknown_operations: "Previous operation needs reconciliation",
+  retry_budget: "Retry budget exhausted; needs recovery evidence or a changed approach",
+  provider_route: "Provider route failed; waiting for verified recovery or a reviewed change of approach",
+  host_affinity: "Work is retained on another host",
+  recovery_route: "Verified retry permit is waiting for its selected gateway and model",
+  capability: "No ready gateway matches the required model, tools, or environment",
+  startup_prerequisite: "Previous startup failed; needs a changed prerequisite",
+  lifecycle_gate: "Task ownership or lifecycle prevents dispatch",
+};
+
+function gatewayReason(dispatch?: GatewayDispatch): string {
+  if (!dispatch) return "Gateway eligibility has not been reported";
+  if (dispatch.kind === "gateway_unavailable") return dispatch.reasons?.length
+    ? dispatch.reasons.map(reason => gatewayHoldLabels[reason]).join(" · ")
+    : "No live gateway is ready to take work";
+  if (dispatch.kind === "eligible") return "";
+  const attempt = dispatch.last_attempt && {
+    provider_route: "Last attempt: provider route unavailable.",
+    provider_auth: "Last attempt: provider authentication failed.",
+    provider_quota: "Last attempt: provider quota error.",
+    completed: "Last process exited; the task still lacks a recorded completion.",
+    interrupted: "Last attempt stopped; earlier failures still count.",
+    timed_out: "Last attempt timed out; cause needs diagnosis.",
+    unclassified: "The recorded attempt does not establish a cause.",
+  }[dispatch.last_attempt];
+  return [...dispatch.reasons.map(reason => gatewayHoldLabels[reason]), ...(attempt ? [attempt] : [])].join(" · ");
+}
+
+const waitGroups = {
+  human_decision: { title: "Awaiting your decision", icon: "⚑", note: "Answer the linked question in Top or For Me." },
+  prerequisite: { title: "Awaiting a prerequisite", icon: "◈", note: "Bridge observes the named dependency and continues when it is satisfied." },
+  execution_recovery: { title: "Awaiting execution recovery", icon: "↻", note: "Bridge needs verified readiness or a reviewed change of approach." },
+  prior_attempt_reconciliation: { title: "Reconciling a previous attempt", icon: "▪", note: "Bridge verifies writer shutdown and resolves the previous operation receipts." },
+} satisfies Record<WorkWait["kind"], { title: string; icon: string; note: string }>;
 
 interface BlGroup {
   key: string;
@@ -55,7 +93,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
   const tagTheme = useTagTheme(tasks.filter((t) => !["done", "superseded"].includes((t as any).status)));
 
   const groups = useMemo<BlGroup[]>(() => {
-    const ts = tasks as any[];
+    const ts = (tasks as any[]).filter(t => !t.meta?.infra_anchor);
     const parentOf = new Map<string, string>();
     for (const t of ts) if (t.part_of) parentOf.set(t.id, t.part_of);
     const inReviewIds = new Set(ts.filter((t) => t.status === "in_review").map((t) => t.id));
@@ -73,29 +111,49 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     };
     const byUpdated = (a: any, b: any) => (b.updated_ts ?? 0) - (a.updated_ts ?? 0);
 
-    const ready = ts.filter((t) => t.status === "todo" && t.is_claimable !== false).map(decorate)
+    const ready = ts.filter((t) => t.status === "todo" && t.gateway_dispatch?.kind === "eligible").map(decorate)
       .sort((a, b) => (b.boosted ? 1 : 0) - (a.boosted ? 1 : 0) || a.rank - b.rank || a.t.updated_ts - b.t.updated_ts);
-    // every parked card files under its exit condition (typed await_event
-    // class with prose fallback) — one group per class, ordered by
-    // EXIT_CLASS_ORDER; in_review rides the same classifier ("Awaiting PR
-    // verification"). The live unblock duty is a chip on the row, not a group.
-    const parked = ts.filter((t) => t.status === "todo" && t.is_claimable === false && !t.meta?.startup_wait).sort(byUpdated);
+    const questions = ts.filter((t) => t.status === "todo" && t.type === "question" && !t.meta?.ask && !t.meta?.startup_wait).sort(byUpdated);
+    const parked = ts.filter((t) => t.status === "todo" && t.type !== "question" && !t.meta?.startup_wait && !t.gateway_dispatch).sort(byUpdated);
     const byExit = new Map<string, any[]>();
+    const byWait = new Map<WorkWait["kind"], any[]>();
+    const needsRepair: any[] = [];
     for (const t of ts) {
-      if (t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
+      if (t.type === "question") continue;
+      const dispatch = t.status === "todo" && t.type !== "question" && !t.meta?.startup_wait
+        && t.gateway_dispatch?.kind !== "eligible" ? t.gateway_dispatch as GatewayDispatch | undefined : undefined;
+      if (!dispatch && t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
       // Standing merge-lane cards and infra anchors belong to the Trains panel /
       // infra sinks, not the task backlog (BR#6395).
       if (t.meta?.lane?.key || t.meta?.infra_anchor) continue;
-      const cls = exitClassOf(t);
+      const typedWait = dispatch?.kind === "held" && dispatch.reasons.includes("independent_wait") && t.meta?.blocked?.await_event;
+      const row = { t, dispatch, typedWait, duty: !!activeUnblockTwinOf(t, twinIdx) };
+      const waits: WorkWait[] = t.work_waits ?? [];
+      const wait = waits.find(w => w.kind === "human_decision")
+        ?? waits.find(w => w.kind === "prior_attempt_reconciliation") ?? waits[0];
+      if (wait) {
+        const list = byWait.get(wait.kind) ?? [];
+        list.push({ ...row, waits });
+        byWait.set(wait.kind, list);
+        continue;
+      }
+      if (t.work_waits) {
+        needsRepair.push(row);
+        continue;
+      }
+      // Older hub builds do not yet project the typed wait contract.
+      const cls = typedWait ? exitClassOf({ ...t, status: "blocked" }) : dispatch ? dispatchExitClass(dispatch) : exitClassOf(t);
       const list = byExit.get(cls.key) ?? [];
-      list.push({ t, duty: !!activeUnblockTwinOf(t, twinIdx) });
+      list.push(row);
       byExit.set(cls.key, list);
     }
     // boost-first WITHIN each exit group (BR#4068 rank seam — the ▲ pins
     // priority 0 everywhere; the awaiting filter reads it hot: a boosted
     // Awaiting park is one human leg from landed), then newest first.
-    for (const list of byExit.values()) list.sort((a: any, b: any) => (!!b.t.meta?.boosted ? 1 : 0) - (!!a.t.meta?.boosted ? 1 : 0) || (b.t.updated_ts ?? 0) - (a.t.updated_ts ?? 0));
-    const exitGroups: BlGroup[] = [];
+    for (const list of [...byWait.values(), ...byExit.values()]) list.sort((a: any, b: any) => (!!b.t.meta?.boosted ? 1 : 0) - (!!a.t.meta?.boosted ? 1 : 0) || (b.t.updated_ts ?? 0) - (a.t.updated_ts ?? 0));
+    const exitGroups: BlGroup[] = (Object.keys(waitGroups) as WorkWait["kind"][]).map(key => ({
+      key, ...waitGroups[key], rows: byWait.get(key) ?? [], showRank: false, showBoost: false,
+    }));
     for (const key of EXIT_CLASS_ORDER) {
       const rows = byExit.get(key) ?? [];
       if (rows.length === 0) continue;
@@ -114,8 +172,10 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
     }
 
     return [
-      { key: "ready", title: "Next — ready to go", note: "claim-ranked: verify duties → unblock duties → questions → todo (verify first — in_review work parks its owner). ▲ boost pins priority 0; park from the card.", rows: ready, showRank: true, showBoost: true },
+      { key: "ready", title: "Ready for gateway", note: "Eligible for at least one ready gateway. A free slot is still required.", rows: ready, showRank: true, showBoost: true },
+      { key: "questions", title: "Open discussions", note: "Questions for agent or community contribution.", rows: questions, showRank: false, showBoost: false },
       ...exitGroups,
+      { key: "wait_repair", title: "Historical waits under repair", note: "Bridge must establish an observable exit condition.", rows: needsRepair, showRank: false, showBoost: false },
       { key: "parked", title: "Parked — not dispatchable", note: "deliberately out of the pool; bring one back from its card.", rows: parked, showRank: false, showBoost: false },
     ].filter((g) => g.rows.length > 0 && g.rows.some((r: any) => tagTheme.passes(r.t ?? r)))
       .map((g) => ({ ...g, rows: g.rows.filter((r: any) => tagTheme.passes(r.t ?? r)) }));
@@ -194,7 +254,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}
       <div className="view-head">
         <h2>Backlog</h2>
-        <span className="muted-note">{total} items — next · blocked by reason · timeout · parked</span>
+        <span className="muted-note">{total} items — gateway eligibility · discussions · waits</span>
         {msg && <span className="ok">{msg}</span>}
       </div>
       <TagThemeBar theme={tagTheme} />
@@ -225,7 +285,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
               const rank = r.rank;
               const boosted = !!r.boosted;
               const attempts = r.attempts ?? t.meta?.attempt?.attempts ?? 0;
-              const bs = (t.status === "blocked" || t.status === "in_review" || t.meta?.startup_wait) ? blockedSummaryOf(t) : null;
+              const bs = r.typedWait ? blockedSummaryOf({ ...t, status: "blocked" }) : (t.status === "blocked" || t.status === "in_review" || t.meta?.startup_wait) ? blockedSummaryOf(t) : null;
               return (
                 <div
                   key={t.id}
@@ -240,6 +300,19 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     <span className={`kind-pill kp-${kind}`}>{kind}</span>
                     <span className="backlog-title">{t.title}</span>
                     <TagChips tags={t.tags} />
+                    {r.dispatch && !r.typedWait && <span className="backlog-why">
+                      {g.unblockedBy && <Chip tone={g.unblockedTone ?? "warn"}>{g.unblockedBy}</Chip>}{" "}
+                      {gatewayReason(r.dispatch)}
+                    </span>}
+                    {(r.waits as WorkWait[] | undefined)?.map(w => {
+                      if (w.kind === "human_decision") return <span className="backlog-why" key={w.exit.ask_id}>Awaiting your answer to {w.exit.ask_id}</span>;
+                      if (w.kind !== "prior_attempt_reconciliation") return null;
+                      const { writer_pending, operations, generation } = w.exit;
+                      return <span className="backlog-why" key={generation}>
+                        Attempt {generation}{writer_pending ? " · verify writer shutdown" : ""}
+                        {operations.length ? ` · reconcile ${operations.join(", ")}` : ""}
+                      </span>;
+                    })}
                     {bs && (
                       <span className="backlog-why">
                         <Chip tone={bs.unblockedTone}>{bs.whatUnblocks}</Chip>{" "}

@@ -1,3 +1,4 @@
+import type { GatewayDispatch } from "@bridge/contracts";
 import type { Decision, EventView, Presence } from "@bridge/specs";
 import { mergeCompletesTask, StartupWaitSchema, startupWaitReason } from "@bridge/contracts";
 import { relTime } from "../relTime";
@@ -263,7 +264,27 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
     icon: "◷",
     unblockedBy: "System (verified executor readiness)",
     unblockedTone: "warn",
-    note: "No worker has started. Readiness reconciliation owns the exit; this is not task churn.",
+    note: "Bridge checks readiness for startup holds and requires a fresh verified route or a reviewed change of approach for provider failures.",
+  },
+  retry: {
+    key: "retry", title: "Blocked — retry budget exhausted", icon: "↻",
+    unblockedBy: "Verified recovery or a changed approach", unblockedTone: "warn",
+    note: "A retry count does not establish the cause. An eligible recovery permit or a new, bounded strategy can make the task eligible.",
+  },
+  operations: {
+    key: "operations", title: "Blocked — unresolved operations", icon: "▪",
+    unblockedBy: "Reconcile the previous operation", unblockedTone: "warn",
+    note: "A receipt must establish what the previous attempt did before Bridge can dispatch another.",
+  },
+  prerequisite: {
+    key: "prerequisite", title: "Blocked — task prerequisites", icon: "▪",
+    unblockedBy: "Resolve the prerequisite on the card", unblockedTone: "warn",
+    note: "A review, prerequisite, or lifecycle condition must clear before dispatch.",
+  },
+  gateway: {
+    key: "gateway", title: "Waiting for a gateway", icon: "◷",
+    unblockedBy: "A ready, compatible gateway", unblockedTone: "scope",
+    note: "The task has no other recorded admission hold. A compatible gateway must become ready.",
   },
   timeout: {
     key: "timeout",
@@ -277,11 +298,20 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "executor", "time", "main", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "executor", "time", "main", "retry", "operations", "prerequisite", "gateway", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed phase and await_event outrank prose. */
-export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
+export function dispatchExitClass(dispatch: GatewayDispatch): ExitClass {
+  if (dispatch.kind === "gateway_unavailable") return EXIT_CLASSES.gateway;
+  if (dispatch.kind !== "held") return EXIT_CLASSES.other;
+  if (dispatch.reasons.includes("unknown_operations")) return EXIT_CLASSES.operations;
+  if (dispatch.reasons.includes("provider_route")) return EXIT_CLASSES.executor;
+  if (dispatch.reasons.includes("retry_budget")) return EXIT_CLASSES.retry;
+  return EXIT_CLASSES.prerequisite;
+}
+
+export function exitClassOf(t: { id?: string; status?: string; meta?: any }): ExitClass {
   const m = t.meta ?? {};
   if (StartupWaitSchema.safeParse(m.startup_wait).success) return EXIT_CLASSES.executor;
   const b = m.blocked ?? {};
@@ -290,6 +320,11 @@ export function exitClassOf(t: { status?: string; meta?: any }): ExitClass {
   const ev = b.await_event?.event as string | undefined;
   if (t.status === "in_review") return EXIT_CLASSES.verify;
   if (t.status !== "blocked") return EXIT_CLASSES.other;
+  if (m.execution_wait?.kind === "capability" && m.blocked?.await_event?.event === "executor_capability"
+    && m.blocked.await_event.id === t.id
+    && Array.isArray(m.execution_blockers) && m.execution_blockers.length > 0
+    && m.execution_blockers.every((blocker: { kind?: string }) => blocker.kind === "capability_unavailable" || blocker.kind === "executor_not_ready"))
+    return EXIT_CLASSES.gateway;
   if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return EXIT_CLASSES.timeout;
   // the Awaiting park outranks the typed leg it preserves (BR#4962): the
   // pr_merged await_event rides along on an Awaiting park, but the HUMAN

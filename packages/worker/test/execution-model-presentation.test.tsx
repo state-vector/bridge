@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ExecutionModelViewSchema } from "@bridge/contracts";
 import { ExecutionModel, ExecutionStatus } from "../../ui-kit/src/views/ExecutionModel.tsx";
 import { TaskHistoryLine } from "../../ui-kit/src/views/TaskDetail.tsx";
+import { BacklogView } from "../../ui-kit/src/views/BacklogView.tsx";
 import { TopView } from "../../ui-kit/src/views/TopView.tsx";
 import { useKb } from "../../ui-kit/src/server/kbStore.ts";
 import { readFileSync } from "node:fs";
@@ -53,6 +54,21 @@ it("gives actual size its own Top column with matching header, parent and child 
     }
   } finally { useKb.setState(previous); }
 });
+it("keeps a running background subprocess in Top even without an agent", () => {
+  const previous = useKb.getState();
+  const task = { id: "BR#103", type: "task", title: "Generate integration artifacts", status: "blocked",
+    owner: "", created_ts: Date.now(), updated_ts: Date.now(),
+    meta: { subprocess: { started_at: Date.now() }, blocked: { class: "subprocess", unblock_condition: "Artifact publication completes" } } };
+  useKb.setState({ tasks: [task], sessions: [], agents: [], events: [] });
+  try {
+    const html = renderToStaticMarkup(<TopView />);
+    expect(html).toContain("Generate integration artifacts");
+    expect(html).toContain(">machine<");
+    expect(html).toContain("background work");
+    expect(html).toContain("Artifact publication completes");
+  } finally { useKb.setState(previous); }
+});
+
 it("renders missing/expired receipts honestly instead of claiming large is running", () => {
   const unknown = renderToStaticMarkup(<ExecutionModel value={{ minimum_tier: "large", current: { kind: "unreported" } }} now={1} />);
   expect(unknown).toContain(">unknown<"); expect(unknown).not.toContain("=&gt;");
@@ -73,4 +89,27 @@ it("renders structured escalation history with the complete reason, actor, and s
     data: { kind: "model_escalated", from_tier: "medium", to_tier: "large", reason, source: "review", review_id: "BR#101", generation: 1 } }} />);
   expect(html).toContain("escalation"); expect(html).toContain("medium → large"); expect(html).toContain("review BR#101");
   expect(html).toContain(reason.trim()); expect(html).toContain("reviewer"); expect(html).not.toContain("bounded ledger summary");
+});
+
+it("separates gateway-held tasks from eligible work and keeps open questions visible", () => {
+  const previous = useKb.getState();
+  const task = { id: "BR#500", type: "task", title: "Eligible repair", status: "todo", created_ts: 1, updated_ts: 1 };
+  useKb.setState({ tasks: [
+    { ...task, gateway_dispatch: { kind: "eligible" } },
+    { ...task, id: "BR#501", title: "Held repair", gateway_dispatch: { kind: "held", reasons: ["retry_budget"], last_attempt: "provider_route" } },
+    { ...task, id: "BR#505", title: "Route interrupted repair", gateway_dispatch: { kind: "held", reasons: ["provider_route"] } },
+    { ...task, id: "BR#502", type: "question", title: "Open clarification" },
+    { ...task, id: "BR#503", title: "Needs another gateway", gateway_dispatch: { kind: "gateway_unavailable", reasons: ["capability"] } },
+    { ...task, id: "BR#504", title: "Configured capability missing", status: "blocked",
+      meta: { execution_wait: { kind: "capability" }, execution_blockers: [{ kind: "capability_unavailable" }],
+        blocked: { reason: "No matching tool", unblock_condition: "Compatible gateway ready", await_event: { event: "executor_capability", id: "BR#504" } } } },
+  ] });
+  try {
+    const html = renderToStaticMarkup(<BacklogView />);
+    expect(html).toMatch(/Ready for gateway[\s\S]*Eligible repair[\s\S]*Open discussions[\s\S]*Open clarification[\s\S]*Blocked — retry budget exhausted[\s\S]*Held repair[\s\S]*Last attempt: provider route unavailable[\s\S]*Waiting for a gateway[\s\S]*Needs another gateway/);
+    expect(html).toMatch(/Waiting for executor recovery[\s\S]*Route interrupted repair[\s\S]*Provider route failed; waiting for verified recovery[\s\S]*Blocked — retry budget exhausted/);
+    expect(html).toMatch(/Waiting for a gateway[\s\S]*Configured capability missing/);
+    expect(html).not.toContain("Blocked — other");
+    expect(html).not.toContain("Waiting for gateway eligibility");
+  } finally { useKb.setState(previous); }
 });

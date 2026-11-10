@@ -44,6 +44,16 @@ it("shows grouped connection states and independent per-host occupancy", () => {
   expect(currentWorkerStatus(worker, worker.observed_at + 120_000).state).toBe("offline");
 });
 
+it("shows an upgrade separately from an operator drain and a stale heartbeat", () => {
+  const updating = { ...worker, state: "draining", readiness: { kind: "updating", reason: "Managed update" } } as const;
+  const render = (entry: typeof worker) => renderToStaticMarkup(
+    <StatusDetails hub="open" realtime="open" lastError={null} workers={[entry]} />,
+  );
+  expect(render(updating)).toContain(">Upgrading</span>");
+  expect(render({ ...updating, readiness: { kind: "draining", reason: "Operator drain" } })).toContain(">Draining</span>");
+  expect(render(currentWorkerStatus(updating, updating.observed_at + 120_000))).toContain(">Offline</span>");
+});
+
 it("separates lease evidence, starts and old unconfirmed capacity without inventing process counts", () => {
   const now = Date.now();
   const leased: WorkerSlot = { kind: "leased", task_id: "BR#1", generation: 2, attempt_id: "old-daemon-attempt", session: "dispatch-one",

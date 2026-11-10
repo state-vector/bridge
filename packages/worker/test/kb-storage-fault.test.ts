@@ -67,6 +67,12 @@ const kbPost = (hub: KnowledgeHub, path: string, body = "{}") =>
   }));
 
 describe("DO fetch entry: injected storage faults (BR#4212)", () => {
+  it("serves stateful build provenance independently of SQL readiness", async () => {
+    const hub = new KnowledgeHub(fakeState({ sql: true }), {});
+    const response = await hub.fetch(new Request("https://kb/version"));
+    expect(response.status).toBe(200);
+    expect((await jsonBody(response)).lifecycle_protocol).toBe(2);
+  });
   it("ensureSchema fault → typed JSON 503, never a throw, never HTML", async () => {
     const hub = new KnowledgeHub(fakeState({ sql: true }), {});
     const res = await kbPost(hub, "/orient");
@@ -150,6 +156,39 @@ function registryThenEnv(identify: () => Response): any {
   };
 }
 
+describe("cached gateway readiness during a hub rollout", () => {
+  it.each([404, 403])("uses the authenticated legacy route only for an unknown v2 operation (%i)", async (status) => {
+    const bearer = "bkw_state-vector_" + "a".repeat(48);
+    const called: string[] = [];
+    const env = rejectingEnv();
+    env.KB.get = () => ({
+      fetch: async (url: string, init: RequestInit) => {
+        const op = new URL(url).pathname;
+        called.push(op);
+        const body = JSON.parse(String(init.body));
+        if (op === "/worker.resolve.v2") {
+          expect(body).toEqual({ bearer, secret: "cached-worker" });
+          return Response.json({ error: "proof not available" }, { status });
+        }
+        if (op === "/auth.identify") {
+          expect(body).toEqual({ bearer });
+          return Response.json({ label: "gateway", token_id: "gateway-id", tags: ["gateway"] });
+        }
+        expect(op).toBe("/worker.resolve");
+        expect(body).toEqual({ actor: "gateway", token_id: "gateway-id", secret: "cached-worker" });
+        return Response.json({ cached: true, label: "gateway/worker" });
+      },
+    });
+    const response = await worker.fetch(new Request("https://hub/api/kb-machine/provision", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({ cached_secret: "cached-worker", actor: "spoofed" }),
+    }), env);
+    expect(response.status).toBe(status === 404 ? 200 : 403);
+    expect(called).toEqual(status === 404 ? ["/worker.resolve.v2", "/auth.identify", "/worker.resolve"] : ["/worker.resolve.v2"]);
+  });
+});
+
 describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mislabel", () => {
   it("GET /api/kb/stats with a rejecting DO → JSON 503 typed", async () => {
     const res = await worker.fetch(new Request("https://hub/api/kb/stats", {
@@ -180,6 +219,45 @@ describe("worker arms: DO faults surface typed JSON, never HTML, never a 401 mis
     expect(res.status).toBe(503);
     expect(res.headers.get("content-type")).toContain("application/json");
     expect((await res.json()).result_class).toBe("infra_storage_fault");
+  });
+
+  it.each(["stats", "list", "search?q=authority"])("legacy machine %s keeps identify faults retryable and typed", async route => {
+    const env = registryThenEnv(() => new Response("<!doctype html>runtime unavailable", { status: 503 }));
+    const res = await worker.fetch(new Request(`https://hub/api/kb-machine/${route}`, {
+      headers: { authorization: "Bearer bkw_" + "e".repeat(40) },
+    }), env);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = await jsonBody(res);
+    expect(body.result_class).toBe("infra_storage_fault");
+    expect(JSON.stringify(body)).not.toMatch(HTML_NEVER);
+  });
+
+  it("awaits the legacy password-cookie signature before granting human decision authority", async () => {
+    const password = "legacy-test-password";
+    const exp = String(Date.now() + 60_000);
+    const env = { BRIDGE_UI_PASSWORD: password, KB: rejectingEnv().KB };
+    const denied = await worker.fetch(new Request("https://hub/api/kb-machine/act", {
+      method: "POST", headers: { cookie: `bridge_session=${exp}.forged-signature`, "content-type": "application/json" },
+      body: JSON.stringify({ op: "transition", id: "BR#1", to: "accepted" }),
+    }), env);
+    expect(denied.status).toBe(401);
+
+    // A real signed legacy session still reaches the decision action as human.
+    const sig = createHmac("sha256", password).update(exp).digest("hex");
+    let transition: Record<string, unknown> | undefined;
+    env.KB.get = () => ({ fetch: async (url: string, init?: RequestInit) => {
+      if (url.includes("/artefact?")) return Response.json({ id: "BR#1", type: "decision" });
+      transition = JSON.parse(String(init?.body));
+      return Response.json({ id: "BR#1", status: "accepted" });
+    } });
+    const allowed = await worker.fetch(new Request("https://hub/api/kb-machine/act", {
+      method: "POST", headers: { cookie: `bridge_session=${exp}.${sig}`, "content-type": "application/json" },
+      body: JSON.stringify({ op: "transition", id: "BR#1", to: "accepted", actor: "web:forged", token_id: "forged", gateway: true }),
+    }), env);
+    expect(allowed.status).toBe(200);
+    expect(transition).toMatchObject({ actor: "web:anon", gateway: false });
+    expect(transition).not.toHaveProperty("token_id");
   });
 
   it("POST /mcp: registry infra fault → JSON-RPC 503 infra, NOT 'unauthorized' 401 (the BR#4117 mislabel)", async () => {

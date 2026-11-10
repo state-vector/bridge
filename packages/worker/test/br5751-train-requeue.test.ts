@@ -100,6 +100,8 @@ describe("BR#5751: the direct 'merge-train: queued' parent park rides trainQueue
       await_event: { event: "pr_merged", repo: REPO, n: 25181 },
     });
     expect(park.status).toBe(200);
+    expect((await getOne(id)).meta.pr.head_sha_at_acceptance).toBe(OLD);
+    await completePrReview(post, id, [{ repo: REPO, number: 25181, head_sha_at_acceptance: NEW }]);
     const now = await getOne(id);
     expect(now.status).toBe("blocked");
     // the stamp moved to the note's live head — the drain walk's coverage leg
@@ -205,3 +207,4 @@ describe("BR#5751: the awaiting lane is base-scoped (BR#4977 law on the awaiting
     expect(main.pr_stats?.in_progress ?? 0).toBe(0);
   });
 });
+import { completePrReview } from "./completion-fixture";

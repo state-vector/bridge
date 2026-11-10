@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import type { TrainLineProjection } from "@bridge/contracts";
 import { kbApi, type KbArtefact, type KbTrainLane, type KbVersion } from "../server/kb";
-import { Btn, Chip, type ChipTone } from "./index-kit";
-import { LaneRecoveryHistory, LineStopBanner } from "./TrainPanel";
+import { Btn, Chip } from "./index-kit";
+import { LaneRecoveryHistory, LineStopBanner, trainLineTones } from "./TrainPanel";
 
 /** Infrastructure identity comes from structured metadata, never the title. */
 export function isLaneCard(task: KbArtefact): boolean {
@@ -11,9 +11,6 @@ export function isLaneCard(task: KbArtefact): boolean {
     && typeof lane.repo === "string" && typeof lane.base === "string";
 }
 
-const tones: Record<TrainLineProjection["phase"], ChipTone> = {
-  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "err", retired: "muted",
-};
 const unknown: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "Waiting for a current lane status from the hub.",
   blocker: "stale_observation", evidence: [], held: 0, observed_at: 0,
@@ -93,7 +90,7 @@ export function LaneDetailView({ task, lane, loaded, error, receivedAt, now, ver
     <aside className="detail-panel lane-detail" aria-label="Merge lane detail">
       <header className="detail-head"><Chip tone="scope">merge lane</Chip><button className="icon-btn" aria-label="Close lane detail" onClick={onClose}>✕</button></header>
       <h2 className="detail-question">{lane?.lane ?? task.title}</h2>
-      <div className="lane-detail-status"><Chip pill tone={tones[line.phase]}>{!loaded ? "Loading lane…" : line.label}</Chip>
+      <div className="lane-detail-status"><Chip pill tone={trainLineTones[line.phase]}>{!loaded ? "Loading lane…" : line.label}</Chip>
         {receivedAt > 0 && <span className="muted-note">Updated {age(receivedAt, now)} ago · refreshes every 30s</span>}</div>
       {error && <div className="k-err" role="alert">Lane refresh failed: {error}. Previous observations are not current. <Btn size="sm" onClick={onRetry}>Retry</Btn></div>}
       {stale && <div className="k-err" role="alert">Lane observations are out of date. <Btn size="sm" onClick={onRetry}>Refresh</Btn></div>}

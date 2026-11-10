@@ -99,7 +99,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
   },
   execution: {
-    description: "Durable executor protocol v1: eligibility-first schedule (inspect/reserve/request_capacity), read-only schedule_status, full-agent gateway_control (draining/enabled), inspect/advertise, fenced begin/poll, checkpoint/restore/quiesce, mailbox, escalation and effect receipts. request_capacity arranges safe recovery preemption without reserving work. Reservations count against gateway capacity; lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
+    description: "Durable executor protocol: eligibility-first schedule (inspect/reserve/request_capacity), schedule_status, gateway_control, inspect/advertise, fenced begin/poll, checkpoint/restore, stopped/finalize and immutable receipt lookup, cancel_start, mailbox, escalation and effect receipts. Lifecycle v2 requires stopped-writer proof before finalization: execution capacity is released while result delivery remains exclusively owned. Legacy quiesce remains supported. request_capacity arranges safe recovery preemption without reserving work. Lease expiry never proves writer quiescence. Stable command_id retries return the original result; never repeat an unknown external effect.",
     schema: TOOL_ARG_SCHEMAS.execution,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("execution", { ...args, session: args.session ?? ctx.sessionName }))),
   },
@@ -137,6 +137,9 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.get_artefact,
     handler: async (args, ctx) => {
       const a = await ctx.call("get", { id: args.id });
+      // Mechanical execution must not wait on optional semantic discovery.
+      // This is the same canonical record, including admission and carry data.
+      if (args.view === "execution") return text(JSON.stringify(a));
       const rel = await ctx.call("relations", { id: args.id });
       // proactive surfacing: related work + docs, so agents discover overlap
       // and existing knowledge before they build. see seeAlso() above.
@@ -234,9 +237,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (_args, ctx) => text(JSON.stringify(await ctx.call("agents.list", {}), null, 1)),
   },
   stats: {
-    description: "Board + watchdog liveness: counts by type/status, watchdog last tick and last sweep (stale in_progress/in_review, open asks). Answers 'is the watchdog alive?' and 'how much work is stale?' without touching DO internals.",
+    description: "Board + watchdog liveness: counts by type/status, watchdog last tick and last sweep (stale in_progress/in_review, open asks). Pass park_inventory=true to enumerate blocked task IDs and their current typed waits. Continue with after_park set to the returned next cursor.",
     schema: TOOL_ARG_SCHEMAS.stats,
-    handler: async (_args, ctx) => text(JSON.stringify(await ctx.call("stats", {}), null, 1)),
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("stats", {
+      park_inventory: args.park_inventory === true, after_park: args.after_park,
+    }), null, 1)),
   },
   related_artefacts: {
     description: "Artefacts semantically related to X — what supports, constrains or invalidates it.",

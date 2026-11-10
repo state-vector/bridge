@@ -192,6 +192,7 @@ describe("real-SQLite rig: a rich card with ≥15 children closes through the ga
     const created = await post("/create", {
       type: "task",
       title: "BR#4390 regression — rich card with a large child set closes cleanly",
+      roles: ["analysis"],
       body_md: "Regression parent for the BR#4390 write-path incident. Rich meta, fifteen-plus child relations, parked on a typed merge proxy.",
       meta: {
         pr: { repo: "state-vector/bridge", number: 261, head_sha_at_acceptance: "5cd3314620d6a9ab8fdf14b1c504f3f10b54e3b8" },
@@ -207,7 +208,7 @@ describe("real-SQLite rig: a rich card with ≥15 children closes through the ga
     // 16 children, linked child_of — 15 close over the run, 1 stays open
     const kids: string[] = [];
     for (let i = 0; i < 16; i++) {
-      const r = await post("/create", { type: "task", title: `BR#4390 regression child ${i + 1} of 16`, body_md: "child leg" });
+      const r = await post("/create", { type: "task", title: `BR#4390 regression child ${i + 1} of 16`, roles: ["analysis"], body_md: "child leg" });
       expect(r.status).toBe(200);
       const kid = ((await r.json()) as any).id as string;
       const link = await post("/link", { src: kid, relation: "child_of", dst: parent });
@@ -241,7 +242,7 @@ describe("real-SQLite rig: a rich card with ≥15 children closes through the ga
     // close 15 of the 16 children (todo → in_progress → done)
     for (const kid of kids.slice(0, 15)) {
       expect((await post("/transition", { id: kid, to: "in_progress" })).status).toBe(200);
-      expect((await post("/transition", { id: kid, to: "done", note: "child leg complete" })).status).toBe(200);
+      expect((await post("/transition", { id: kid, to: "done", execution_result: { outcome: "Child graph leg inspected", receipts: [kid] }, note: "child leg complete" })).status).toBe(200);
     }
 
     // unblock (needs a resolution note — the BR#3578 law), then attempt done
@@ -250,7 +251,8 @@ describe("real-SQLite rig: a rich card with ≥15 children closes through the ga
 
     // REFUSAL 2 — done-open-children: the refusal that was hidden behind the
     // infra 503 costume on the live board.
-    const openKid = await post("/transition", { id: parent, to: "done", note: "close" });
+    const execution_result = { outcome: "Rich graph inspected", receipts: kids };
+    const openKid = await post("/transition", { id: parent, to: "done", execution_result, note: "close" });
     expect(openKid.status).toBe(400);
     const openKidBody = (await openKid.json()) as Record<string, any>;
     expect(openKidBody.result_class).toBe("gate_rejected");
@@ -261,11 +263,11 @@ describe("real-SQLite rig: a rich card with ≥15 children closes through the ga
 
     // close the last child, then the legal close lands
     expect((await post("/transition", { id: kids[15], to: "in_progress" })).status).toBe(200);
-    expect((await post("/transition", { id: kids[15], to: "done", note: "child leg complete" })).status).toBe(200);
+    expect((await post("/transition", { id: kids[15], to: "done", execution_result: { outcome: "Last child graph leg inspected", receipts: [kids[15]] }, note: "child leg complete" })).status).toBe(200);
 
     const close = await post("/transition", {
-      id: parent, to: "done",
-      note: "closed citing the merged PR receipt (mergeCommit 0e155dd, merged outside the train)",
+      id: parent, to: "done", execution_result,
+      note: "Rich relation graph analysis complete; every child outcome recorded",
     });
     expect(close.status).toBe(200);
     const closeBody = (await close.json()) as Record<string, any>;

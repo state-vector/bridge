@@ -16,9 +16,10 @@
  */
 import { z } from "zod";
 import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
-import { ExecutionResultSchema } from "./work.ts";
+import { ExecutionResultSchema, UnblockResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
+import { TrainQueueScanSchema } from "./train-scan.ts";
 import { RecoveryCommandSchema } from "./train-recovery.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema, CandidateIntegrationSchema } from "./train-checks.ts";
 import { ExecutionRequestSchema, HandoffReadSchema, HandoffAcceptSchema, HandoffCheckpointSchema } from "./execution.ts";
@@ -90,7 +91,7 @@ export const TOOL_ARG_SCHEMAS = {
     type: z.string().optional(),
     limit: z.number().int().max(100).optional(),
   }),
-  get_artefact: z.looseObject({ id: z.string() }),
+  get_artefact: z.looseObject({ id: z.string(), view: z.enum(["full", "execution"]).optional().describe("Execution returns canonical task state without related-work discovery; full is the default agent view.") }),
   claim_takeover: z.looseObject({
     id: z.string(),
     note: z.string().optional(),
@@ -127,9 +128,10 @@ export const TOOL_ARG_SCHEMAS = {
     roles: z.array(z.string()).optional(),
   }),
   transition: z.looseObject({
-    execution_result: ExecutionResultSchema.optional().describe("Execution tasks complete only after their actual outcome is achieved. Supply an outcome and per-action receipts; a prerequisite PR merge is not completion."),
-    review_result: ReviewResultSchema.optional().describe("Independent acceptance: accepted_pr binds task_id plus exact repo/PR/head legs durably; accepted_direct_main carries verified commit and CI; findings is not acceptance."),
-    unblock_result: z.object({ kind: z.literal("reblocked"), parent_id: z.string(), reason: z.string().min(1), next: z.string().min(1), await_event: z.record(z.string(), z.unknown()) }).optional().describe("An unblock duty finding a different blocker atomically replaces the parent's wait before closing."),
+    subject_revision: z.string().min(1).optional().describe("Compatibility transport for the explicit captured review revision. Must agree with review_result.subject_revision when both are supplied; never inferred by the hub."),
+    execution_result: ExecutionResultSchema.optional().describe("Required for analysis/diagnostic completion and execution outcomes: actual outcome plus per-action receipts. Process exit or a prerequisite PR merge is not completion. An unblock duty may use this for its observed findings instead of a reblocked result."),
+    review_result: ReviewResultSchema.optional().describe("Required when a review duty closes done. Acceptance must echo subject_revision from this duty's captured review_subject (claim response or metadata), fencing the exact task submission. accepted_pr binds task_id plus exact repo/PR/head legs; accepted_direct_main carries verified commit and CI; findings is not acceptance. A runner cannot author a verdict."),
+    unblock_result: UnblockResultSchema.optional().describe("An unblock duty finding a different blocker atomically replaces the parent's wait before closing. Supply this or an execution_result with observed findings."),
     id: z.string(),
     to: z.string(),
     note: z.string().optional(),
@@ -162,7 +164,7 @@ export const TOOL_ARG_SCHEMAS = {
     dst: z.string(),
   }),
   list_agents: z.looseObject({}),
-  stats: z.looseObject({}),
+  stats: z.looseObject({ park_inventory: z.boolean().optional(), after_park: z.string().regex(/^BR#\d+$/).optional() }),
   related_artefacts: z.looseObject({
     id: z.string(),
     limit: z.number().int().max(50).optional(),
@@ -248,6 +250,7 @@ export const TOOL_ARG_SCHEMAS = {
     pr: z.number().int().optional(),
     head_sha: z.string().optional(),
     merge_sha: z.string().optional(),
+    merged_at: z.number().int().positive().nullish(),
     task_id: z.string().optional(),
     signer: z.string().optional(),
     run_url: z.string().optional(),
@@ -331,6 +334,7 @@ export const TOOL_ARG_SCHEMAS = {
   train_queue_facts: z.looseObject({
     repo: z.string(),
     base: z.string().optional(),
+    scan: TrainQueueScanSchema.optional(),
     entries: z.array(z.looseObject({
       id: z.string(),
       pr: z.number().int().optional(),

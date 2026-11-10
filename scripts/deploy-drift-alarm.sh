@@ -5,8 +5,7 @@
 # Compares the live hub's __version commit against the pushed SHA on every
 # main push. The hub deploys asynchronously (git push → CF Workers Builds),
 # so an alarm that failed on the first stale probe read "main is broken" on
-# EVERY push (BR#3289: 6+ false reds in 24h, and each red also tripped the
-# main-green gate on the next PR). The alarm now settles first:
+# EVERY push (BR#3289: 6+ false reds in 24h). The alarm now settles first:
 #
 # Decision rule (per probe, inside the settle window):
 #   - LIVE == EXPECTED_SHA        -> GREEN, exit 0 (fast path — deploy landed).
@@ -19,8 +18,8 @@
 #
 # Window elapses with no green (the LAST probe is the verdict):
 #   - hub answered but never matched -> ::error:: deploy drift, exit 1. Real
-#     drift (CF Builds stalled or bypassed) — fails loudly, feeds the
-#     main-green gate and stopTheLineSweep, exactly as before.
+#     drift (CF Builds stalled or bypassed) — fails loudly, feeds
+#     stopTheLineSweep, exactly as before.
 #   - hub never answered             -> ::error:: unreachable, exit 1
 #     (a stalled deploy or a broken route is real drift too).
 #
@@ -35,6 +34,7 @@
 #   DEPLOY_DRIFT_REPO       repo for the main-tip lookup (default state-vector/bridge)
 #   SETTLE_WINDOW_SECONDS   how long a stale hub is "settling" (default 600; 0 = old fail-fast behavior)
 #   POLL_INTERVAL_SECONDS   sleep between probes (default 60)
+#   VERSION_SCOPE           edge | stateful | both (default edge)
 #
 # Guarded by scripts/tests/deploy-drift-alarm.test.sh
 # (npm run test:deploy-drift-alarm) — stub curl + gh on PATH, windows
@@ -47,13 +47,27 @@ set -euo pipefail
 REPO="${DEPLOY_DRIFT_REPO:-state-vector/bridge}"
 WINDOW="${SETTLE_WINDOW_SECONDS:-600}"
 POLL="${POLL_INTERVAL_SECONDS:-60}"
+SCOPE="${VERSION_SCOPE:-edge}"
+case "$SCOPE" in edge|stateful|both) ;; *) echo "invalid VERSION_SCOPE: use edge, stateful or both" >&2; exit 1 ;; esac
 
 short() { printf '%.9s' "${1:-?}"; }
 
-probe() {
+probe_scope() {
   # -f: a 4xx/5xx from the hub is no answer, same as a refused connection.
-  curl -sf --max-time 15 "$HUB_URL/__version" 2>/dev/null \
+  curl -sf --max-time 15 "$HUB_URL/__version?scope=$1" 2>/dev/null \
     | jq -r '.commit // empty' 2>/dev/null || true
+}
+
+probe() {
+  if [ "$SCOPE" != "both" ]; then probe_scope "$SCOPE"; return; fi
+  local edge stateful
+  edge="$(probe_scope edge)"
+  stateful="$(probe_scope stateful)"
+  if [ -n "$edge" ] && [ "$edge" = "$stateful" ]; then
+    printf '%s' "$edge"
+  elif [ -n "$edge" ] || [ -n "$stateful" ]; then
+    printf 'edge=%s,stateful=%s' "${edge:-unreachable}" "${stateful:-unreachable}"
+  fi
 }
 
 tip() {
@@ -109,7 +123,7 @@ if [ -n "$live" ]; then
   else
     echo "::error::deploy drift — the ${WINDOW}s settle window elapsed and the live hub still runs $(short "$live"), not the pushed $(short "$EXPECTED_SHA") (main-tip lookup failed, so the superseded-push path could not be proven). CF Builds stalled or bypassed?"
   fi
-  echo "  This is real drift: the deployed hub is not main. Fails the run and feeds the main-green gate + stopTheLineSweep."
+  echo "  This is real drift: the deployed hub is not main. Fails the run and feeds stopTheLineSweep."
   exit 1
 fi
 

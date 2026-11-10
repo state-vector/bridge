@@ -6,7 +6,7 @@ import { useKb } from "../server/kbStore";
 import { decisionFrame, groupDecisions, DecisionPopover, useDecisionAct, AskOptions } from "./decide";
 import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
-import { isHumanDecisionAsk } from "@bridge/contracts";
+import { askLifecycle, isHumanDecisionAsk } from "@bridge/contracts";
 import { AskContext } from "./AskContext";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
@@ -36,7 +36,7 @@ export interface HumanAsks {
 /** Only a live human-directed request can put a task in the human ask plane. */
 export function isOpenHumanAsk(t: KbArtefact): boolean {
   return t.type === "question" && ["todo", "in_progress", "blocked"].includes(t.status)
-    && isHumanDecisionAsk(t.meta?.ask ?? {});
+    && askLifecycle(t).state === "open" && isHumanDecisionAsk(t.meta?.ask ?? {});
 }
 
 export function humanAskSubject(t: KbArtefact): string | null {
@@ -69,8 +69,7 @@ export function useHumanAsks(visibleTaskIds: Set<string>): HumanAsks {
   }, [evSeq]);
 
   return useMemo(() => {
-    if (proposed === null) return { ready: false, byTask: new Map(), residual: [], total: 0 };
-    const { verdictCards, generic } = groupDecisions(proposed);
+    const { verdictCards, generic } = groupDecisions(proposed ?? []);
     const byTask = new Map<string, AskEntry[]>();
     const residual: AskEntry[] = [];
     const put = (target: string | null, e: AskEntry) => {

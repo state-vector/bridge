@@ -63,16 +63,19 @@ Rules, in force:
     (BR#3204/BR#3633 law — never another session's discard), restore main,
     work in your tree. Abandoned trees are the #1 disk leak on this repo
     (185 strays / 471 GB observed on 2026-11-02; three stray trees plus a
-    stale merged branch found the same day). The gateway's hygiene sweep
-    is the backstop, not the owner — it enumerates the registry plus the
-    runner's own clones (preserving uncommitted WIP onto
-    `wip/<task>-<date>` branches first, BR#3204/BR#3633 law), so a
-    registered tree is swept by status/age rules even if its session died.
+    stale merged branch found the same day). The native gateway's workspace
+    owner adopts registered interactive trees and owns dispatched allocations
+    from creation through reclamation. It requires stopped-writer authority,
+    verified source checkpoints and current-input/reader checks before removal;
+    review status and age alone are never deletion authority. Retained work has
+    an explicit reason and retry in `bridge workspaces status`.
  7. **Land direct to main.** Commit in your worktree, push straight to
     main — no PR round-trip, no merge-train wait (Ray directive
     2026-11-02: "EVERYTHING DIRECT TO MAIN"). The PR/verify ceremony is
     gone for this repo's day-to-day changes; main's mechanical gates still
-    apply (signed commits, CI on the push). If main is red, land the fix
+    apply. Sign the commit and run `scripts/push-main.sh` from the registered
+    worktree. It runs required Linux checks on the exact commit before
+    advancing main and rejects concurrent changes to the base. If main is red, land the fix
     first or hold — never stack work on a red main silently. Bigger or
     riskier changes still get a second pair of eyes — ask, don't assume.
  8. **Closed state machines, single source of truth, and end-to-end tracing
@@ -93,6 +96,18 @@ Rules, in force:
     - **Self-heal mechanical work:** Conflicts, rebases, stale gate re-runs,
       and landing a verified root-fix PR through a circular base-red gate
       are 100% machine work — never punt them to the human.
+ 9. **Architecture-first repair is the default, not something the human must
+    request.** Before adding a retry, recovery branch, watchdog or state store:
+    identify the existing authoritative owner and trace its whole production
+    path. Multiple competing owners or parallel recovery paths are a design
+    defect to consolidate, not a reason to add another exception. State the
+    surviving owner and the code being replaced; delete the superseded decision
+    paths in the same change. Keep only evidence-preserving migration adapters,
+    never two active authorities. Prove the complete workflow, including crash,
+    restart and lost acknowledgements, rather than stopping at green component
+    tests. Repeated incidents require a category-level repair before another
+    symptom patch. Ask the human only for genuinely missing authority or a user
+    preference, not whether to perform this engineering discipline.
 
 The signature failure mode of this repo is not bugs in code — it is two
 sessions each holding a stale model of the tree. Every rule above exists

@@ -23,6 +23,34 @@ mod stopped_outbox;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 
+#[path = "attempt_journal.rs"]
+mod attempt_journal;
+#[path = "gateway_pipeline.rs"]
+mod gateway_pipeline;
+#[path = "worker_session.rs"]
+mod worker_session;
+#[path = "workspace.rs"]
+mod workspace;
+#[path = "recovery.rs"]
+mod recovery;
+
+pub fn workspaces_command(cfg: &DispatchConfig, reconcile: bool) -> Result<serde_json::Value, String> {
+    let owner = workspace::Owner::open(cfg)?;
+    if reconcile {
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("gateway home missing")?);
+        let Some(_lock) = worker_session::Lock::acquire(&home.join(".bridge/gateway-runtime.lock"))? else {
+            return Err("running gateway owns workspace reconciliation; read bridge workspaces status".into());
+        };
+        owner.reconcile(&[])?;
+    }
+    owner.report()
+}
+
+pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
+pub const WORKER_PROTOCOL: u32 = worker_session::PROTOCOL;
+pub fn workers_command(cfg: &DispatchConfig, stop: bool, task: Option<&str>) -> Result<serde_json::Value, String> { worker_session::command(cfg, stop, task) }
+pub fn recovery_command(cfg: &DispatchConfig, args: &[String]) -> Result<serde_json::Value, String> { recovery::command(cfg, args) }
+
 /// Dispatch lines ride the single logging mechanism (BR#4400) — the claimed
 /// card (or agent label) is the scope; process-global lines pass "".
 fn dlog(scope: &str, msg: &str) {
@@ -160,12 +188,46 @@ pub enum UpdateChannel { Main, Stable, Pinned }
 
 /// Local request is written only by the separately supervised updater. It is
 /// deliberately fail-closed across crashes: only its owner removes the hold.
-fn update_request() -> Option<serde_json::Value> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateHandoff { FullDrain, AdoptWorkerV1 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateRequest {
+    Handoff { nonce: String, mode: UpdateHandoff, source: Option<String>, target: Option<String>, deadline: Option<u64> },
+    Held { reason: String },
+}
+impl UpdateRequest {
+    fn parse(bytes:&[u8])->Self {
+        #[derive(Deserialize)]
+        struct Wire { nonce: String, worker_protocol: Option<u32>, source: Option<String>, target: Option<String>, deadline: Option<u64> }
+        match serde_json::from_slice::<Wire>(bytes) {
+            Ok(Wire { nonce, worker_protocol, source, target, deadline }) if !nonce.is_empty() => Self::Handoff {
+                nonce, source, target, deadline,
+                mode: if worker_protocol == Some(worker_session::PROTOCOL) { UpdateHandoff::AdoptWorkerV1 } else { UpdateHandoff::FullDrain },
+            },
+            _=>Self::Held {reason:"Recovery request is unreadable; preserve admission hold".into()},
+        }
+    }
+}
+#[cfg(test)]
+mod recovery_request_tests {
+    use super::*;
+    #[test]
+    fn malformed_request_retains_hold_instead_of_reopening_admission() {
+        for bytes in [b"{".as_slice(),b"{}",b"{\"nonce\":\"\"}",b"{\"nonce\":\"n\",\"worker_protocol\":\"bad\"}"] {
+            assert!(matches!(UpdateRequest::parse(bytes),UpdateRequest::Held {..}));
+        }
+        assert!(matches!(UpdateRequest::parse(b"{\"nonce\":\"n\",\"worker_protocol\":1}"), UpdateRequest::Handoff { mode: UpdateHandoff::AdoptWorkerV1, .. }));
+        assert!(matches!(UpdateRequest::parse(b"{\"nonce\":\"n\"}"), UpdateRequest::Handoff { mode: UpdateHandoff::FullDrain, .. }));
+    }
+}
+fn update_request() -> Option<UpdateRequest> {
     if std::env::var("BRIDGE_MANAGED_UPDATES").as_deref() != Ok("1") { return None; }
     let home = std::env::var("HOME").ok()?;
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PathBuf::from(home).join(".bridge/update/request.json")).ok()?).ok()?;
-    value["nonce"].as_str().filter(|s| !s.is_empty())?;
-    Some(value)
+    match std::fs::read(PathBuf::from(home).join(".bridge/update/request.json")) {
+        Ok(bytes)=>Some(UpdateRequest::parse(&bytes)),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,
+        Err(e)=>Some(UpdateRequest::Held {reason:format!("Recovery request is not visible; preserve admission hold: {e}")}),
+    }
 }
 
 fn update_receipt(name: &str, value: &serde_json::Value) {
@@ -250,6 +312,12 @@ fn selected_model(cfg: &DispatchConfig, backend: opencode::Backend, meta: &serde
     let name = if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" };
     let bc = cfg.backends.get(name)?;
     if !bc.enabled || !bc.projects.iter().any(|p| p == "*" || Some(p.as_str()) == meta["execution_project"].as_str()) { return None; }
+    if let Some(recovery) = meta.get("execution_recovery_selection") {
+        if recovery["backend"].as_str() != Some(name) { return None; }
+        return configured_models(cfg, bc).into_iter().find(|(tier, model)| *tier >= required
+            && recovery["tier"] == serde_json::to_value(tier).unwrap_or_default()
+            && recovery["model"].as_str() == Some(model.as_str()));
+    }
     let initial_selection = meta.get("execution_scheduling_requirements").is_some() && meta.get("execution_last_model").is_none();
     configured_models(cfg, bc).into_iter().filter(|(tier, _)| if initial_selection { *tier == required } else { *tier >= required }).min_by_key(|(tier, _)| *tier)
 }
@@ -293,6 +361,32 @@ struct GatewayReadyProof { worker: WorkerCredential, observed: Instant }
 enum GatewayReadinessState {
     Unavailable(String),
     Ready(GatewayReadyProof),
+    Connected { observed: Instant },
+    AdmissionHeld { observed: Instant, reason: String },
+}
+impl GatewayReadinessState {
+    fn connection_fresh(&self, age: Duration) -> bool {
+        match self {
+            Self::Ready(proof) => proof.observed.elapsed() < age,
+            Self::Connected { observed } | Self::AdmissionHeld { observed, .. } => observed.elapsed() < age,
+            Self::Unavailable(_) => false,
+        }
+    }
+}
+enum GatewayProbe { Worker(WorkerCredential), Connection, AdmissionHeld { reason: String } }
+#[derive(Deserialize)]
+#[serde(tag="kind",rename_all="snake_case")]
+enum HubAdmissionReadiness { Ready { worker_id: String, fingerprint: String }, Paused { reason: String, until_ts: u64 }, Updating { reason: String } }
+enum WorkerAdmission { Ready, Held { reason: String } }
+fn worker_connection_proof(reply: &serde_json::Value, backend_ready: bool) -> Result<WorkerAdmission, String> {
+    if reply["lifecycle_protocol"] != 2 { return Err("serving hub has not adopted the fenced lifecycle protocol; no fresh connection proof".into()); }
+    if !backend_ready { return Err("configured backend has no verified usable model".into()); }
+    match serde_json::from_value::<HubAdmissionReadiness>(reply["readiness"].clone()) {
+        Ok(HubAdmissionReadiness::Ready { worker_id, fingerprint }) if reply["ok"] == true && !worker_id.is_empty() && !fingerprint.is_empty() => Ok(WorkerAdmission::Ready),
+        Ok(HubAdmissionReadiness::Paused { reason, until_ts }) if !reason.is_empty() && until_ts > now_ms() => Ok(WorkerAdmission::Held { reason }),
+        Ok(HubAdmissionReadiness::Updating { reason }) if !reason.is_empty() => Ok(WorkerAdmission::Held { reason }),
+        _ => Err(format!("executor readiness held: {}",reply["readiness"])),
+    }
 }
 
 struct GatewayReadinessData {
@@ -317,37 +411,67 @@ fn gateway_readiness_key(cfg: &DispatchConfig) -> String {
 
 impl GatewayReadiness {
     fn start(cfg: &DispatchConfig) -> Self {
-        Self::with_probe(cfg, Duration::from_secs(20), |cfg| {
+        Self::with_probe_and_repair(cfg, Duration::from_secs(20), |cfg| {
+            if cfg.role.as_deref() == Some("train") {
+                let status = mcp_call_session_with_timeout(cfg, &mut 0, "train_status", json!({}), None, Duration::from_secs(8))?;
+                if !status["lanes"].is_array() { return Err("train connection protocol drift; no fresh health proof".into()); }
+                return Ok(GatewayProbe::Connection);
+            }
             let available = available_backends(cfg);
             if available.is_empty() {
-                if let Some(name) = cfg.backends.keys().next() {
-                    let capabilities = capability_inventory(cfg, &[], None, name);
-                    execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
-                }
+                let name = cfg.backends.keys().next().map(String::as_str).unwrap_or("opencode");
+                advertise_gateway_inventory(cfg, capability_inventory_unheld(cfg, &[], None, name))?;
                 return Err("no runnable configured backend".into());
             }
-            prepare_worker(cfg, &available).map(|(worker, _)| worker)
-        })
+            let (worker, _, admission) = probe_worker_with_progress(cfg, &available, &|_| {})?;
+            match admission {
+                WorkerAdmission::Ready if update_request().is_none() => Ok(GatewayProbe::Worker(worker)),
+                WorkerAdmission::Ready => Ok(GatewayProbe::AdmissionHeld { reason:"Managed update has paused new admission".into() }),
+                WorkerAdmission::Held { reason } => Ok(GatewayProbe::AdmissionHeld { reason }),
+            }
+        }, true)
     }
 
     fn with_probe(cfg: &DispatchConfig, interval: Duration,
         mut probe: impl FnMut(&DispatchConfig) -> Result<WorkerCredential, String> + Send + 'static) -> Self {
+        Self::with_probe_and_repair(cfg, interval, move |cfg| probe(cfg).map(GatewayProbe::Worker), false)
+    }
+    fn with_probe_and_repair(cfg: &DispatchConfig, interval: Duration,
+        mut probe: impl FnMut(&DispatchConfig) -> Result<GatewayProbe, String> + Send + 'static, repair: bool) -> Self {
         let initial = match probe(cfg) {
-            Ok(worker) => GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() }),
+            Ok(GatewayProbe::Worker(worker)) => GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() }),
+            Ok(GatewayProbe::Connection) => GatewayReadinessState::Connected { observed: Instant::now() },
+            Ok(GatewayProbe::AdmissionHeld { reason }) => GatewayReadinessState::AdmissionHeld { observed: Instant::now(), reason },
             Err(error) => GatewayReadinessState::Unavailable(error),
         };
         let data = Arc::new(Mutex::new(GatewayReadinessData { cfg: cfg.clone(), key: gateway_readiness_key(cfg), state: initial }));
         let shared = data.clone();
+        let mut heal = AuthHeal::new();
         let maintenance = LeaseMaintenance::start(interval, move || {
             let (cfg, key) = { let data = shared.lock().expect("gateway readiness poisoned"); (data.cfg.clone(), data.key.clone()) };
             let result = probe(&cfg); // no shared lock held across bounded probes/network
+            let epoch_changed = epoch_repair_needed(TOKEN_EPOCH_VEND.load(Ordering::Relaxed), TOKEN_EPOCH_SEEN.load(Ordering::Relaxed));
+            let auth_failed = result.as_ref().err().is_some_and(|error| classify_hub_error(error) == HubErrClass::Auth);
+            if repair && (epoch_changed || auth_failed) && matches!(heal.on_auth_failure(Instant::now()), HealStep::Attempt) {
+                if let Ok(fresh) = auth_repair_ladder(&cfg) {
+                    let mut data = shared.lock().expect("gateway readiness poisoned");
+                    if data.key == key && data.cfg.token == cfg.token {
+                        data.key = gateway_readiness_key(&fresh); data.cfg = fresh;
+                        data.state = GatewayReadinessState::Unavailable("credential repaired; awaiting a fresh probe".into());
+                        heal.on_repair_success(); TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed);
+                    }
+                    return true;
+                }
+            } else if result.is_ok() { heal.on_hub_accepted(); }
             let mut data = shared.lock().expect("gateway readiness poisoned");
             if data.key == key && data.cfg.token == cfg.token {
                 data.state = match result {
-                    Ok(worker) => {
+                    Ok(GatewayProbe::Worker(worker)) => {
                         dlog("gateway", "readiness renewed independently of dispatch");
                         GatewayReadinessState::Ready(GatewayReadyProof { worker, observed: Instant::now() })
                     }
+                    Ok(GatewayProbe::Connection) => GatewayReadinessState::Connected { observed: Instant::now() },
+                    Ok(GatewayProbe::AdmissionHeld { reason }) => GatewayReadinessState::AdmissionHeld { observed: Instant::now(), reason },
                     Err(error) => {
                         dlog("gateway", &format!("readiness renewal failed: {error}; no fresh local admission proof"));
                         GatewayReadinessState::Unavailable(error)
@@ -380,6 +504,8 @@ impl GatewayReadiness {
         match &data.state {
             GatewayReadinessState::Ready(proof) if proof.observed.elapsed() < max_age => Ok(proof.clone()),
             GatewayReadinessState::Ready(_) => Err("local gateway readiness proof expired".into()),
+            GatewayReadinessState::Connected { .. } => Err("connection-only gateway has no worker readiness proof".into()),
+            GatewayReadinessState::AdmissionHeld { reason, .. } => Err(format!("new admission held: {reason}")),
             GatewayReadinessState::Unavailable(error) => Err(error.clone()),
         }
     }
@@ -399,6 +525,13 @@ fn begin_with_fresh_readiness<T>(
 }
 
 fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value), String> {
+    let (worker, reply, admission) = probe_worker_with_progress(cfg, avail, report)?;
+    if !matches!(admission,WorkerAdmission::Ready) || update_request().is_some() {
+        return Err(format!("executor readiness held: {}", reply["readiness"]));
+    }
+    Ok((worker, reply))
+}
+fn probe_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend], report: &dyn Fn(&str)) -> Result<(WorkerCredential, serde_json::Value, WorkerAdmission), String> {
     let backend = avail.iter().max_by_key(|b| {
         let name = if **b == opencode::Backend::Kiro { "kiro" } else { "opencode" };
         cfg.backends.get(name).map(|bc| bc.reasoning_tier).unwrap_or_default()
@@ -407,13 +540,12 @@ fn prepare_worker_with_progress(cfg: &DispatchConfig, avail: &[opencode::Backend
     report("ready: checking the gateway worker credential");
     let worker = provision_agent_token(cfg, &requested_worker_label(cfg))?;
     report("ready: probing local tools and configured model inventory (2s limit per probe)");
-    let capabilities = capability_inventory(cfg, avail, Some(&worker), name);
+    let raw = capability_inventory_unheld(cfg, avail, Some(&worker), name);
+    let backend_ready = inventory_has_usable_model(&raw);
     report("ready: advertising capabilities to the hub (8s limit per request)");
-    let reply = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }))?;
-    if reply["ok"] != true || reply.pointer("/readiness/kind").and_then(|v| v.as_str()) != Some("ready") {
-        return Err(format!("executor readiness held: {}", reply["readiness"]));
-    }
-    Ok((worker, reply))
+    let reply = advertise_gateway_inventory(cfg, raw)?;
+    let admission = worker_connection_proof(&reply, backend_ready)?;
+    Ok((worker, reply, admission))
 }
 
 /// A bounded paired-operator preflight; never claims or launches a task.
@@ -454,7 +586,7 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
                 let ours = expected_attempt.is_some() && expected_attempt == a["attempt_id"].as_str()
                     && a["host"].as_str() == cfg.label.as_deref() && a["session"].as_str() == Some(session.as_str());
                 if !ours { return Err("prior writer is not this never-launched attempt; retain claim/WIP".into()); }
-                execution_call(cfg, tid, json!({ "kind": "quiesce", "generation": a["generation"], "attempt_id": a["attempt_id"], "writers": "process_group_empty" }))?;
+                return Err("begun preparation is retained for the canonical terminal finalizer; no writer launched".into());
             }
         }
         let retained_work = path.map(|p| {
@@ -498,16 +630,60 @@ fn backend_capabilities(cfg: &DispatchConfig, name: &str, runnable: bool, worker
 /// Otherwise running medium temporarily erases this host's large capability.
 fn inventory_dispatch_hold(mut facts: serde_json::Value, held: bool) -> serde_json::Value {
     if held {
-        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update is draining active workers before restart; new claims are paused".into() });
-        facts["availability"] = availability.clone();
+        facts["admission_hold"] = json!({"kind":"update_handoff","reason":"Managed update has paused new claims for controller handoff and health verification"});
+        // Keep older hubs fail-closed while the typed admission-hold protocol
+        // rolls out. Backend health uses the unheld inventory, never this mask.
+        let availability = json!(ModelAvailability::Unavailable { reason: "Managed update has paused new claims for controller handoff and health verification".into() });
+        if facts["availability"]["kind"] != "disabled" { facts["availability"] = availability.clone(); }
         if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
-            for model in models { model["availability"] = availability.clone(); }
+            for model in models { if model["availability"]["kind"] != "disabled" { model["availability"] = availability.clone(); } }
         }
     }
     facts
 }
 
 fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
+    inventory_with_runtime(cfg, capability_inventory_unheld(cfg, avail, worker, primary), update_request().as_ref())
+}
+
+fn advertise_gateway_inventory(cfg: &DispatchConfig, raw: serde_json::Value) -> Result<serde_json::Value, String> {
+    let request = update_request();
+    let capabilities = inventory_with_runtime(cfg, raw, request.as_ref());
+    let reply = execution_call(cfg, "gateway", json!({"kind":"advertise","capabilities":capabilities}))?;
+    if let Some(UpdateRequest::Handoff { nonce, .. }) = request {
+        if reply["upgrade_notice_recorded"] == true {
+            update_receipt("upgrade-notice.json", &json!({"nonce":nonce,"pid":std::process::id()}));
+        }
+    }
+    Ok(reply)
+}
+
+fn inventory_with_runtime(cfg: &DispatchConfig, facts: serde_json::Value, request: Option<&UpdateRequest>) -> serde_json::Value {
+    let mut facts = inventory_dispatch_hold(facts, request.is_some());
+    let channel = cfg.auto_update.as_ref().filter(|update| update.enabled)
+        .and_then(|update| match update.channel {
+            UpdateChannel::Main => Some("main"),
+            UpdateChannel::Stable => Some("stable"),
+            UpdateChannel::Pinned => None,
+        });
+    facts["runtime"] = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("BRIDGE_BUILD_COMMIT"),
+        "channel": channel,
+    });
+    if let Some(UpdateRequest::Handoff { target, deadline, .. }) = request {
+        facts["admission_hold"]["target"] = json!(target);
+        facts["admission_hold"]["deadline"] = json!(deadline);
+    } else if let Some(UpdateRequest::Held { reason }) = request {
+        facts["admission_hold"]["reason"] = json!(reason);
+    }
+    facts
+}
+fn inventory_has_usable_model(facts: &serde_json::Value) -> bool {
+    let usable = |model: &serde_json::Value| model["availability"]["kind"] == "usable" && model["model"].as_str().is_some_and(|m| !m.is_empty());
+    usable(facts) || facts["alternatives"].as_array().is_some_and(|models| models.iter().any(usable))
+}
+fn capability_inventory_unheld(cfg: &DispatchConfig, avail: &[opencode::Backend], worker: Option<&WorkerCredential>, primary: &str) -> serde_json::Value {
     let mut inventory = Vec::new();
     for (name, bc) in &cfg.backends {
         let runnable = avail.iter().any(|b| opencode::Backend::parse(Some(name)) == *b);
@@ -520,9 +696,9 @@ fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worke
         } }
     }
     let index = inventory.iter().enumerate().filter(|(_, c)| c["backend"] == primary).max_by_key(|(_, c)| serde_json::from_value::<ReasoningTier>(c["tier"].clone()).unwrap_or_default()).map(|(i, _)| i).unwrap_or(0);
-    if inventory.is_empty() { return inventory_dispatch_hold(backend_capabilities(cfg, primary, false, worker), update_request().is_some()); }
+    if inventory.is_empty() { return backend_capabilities(cfg, primary, false, worker); }
     let mut main = inventory.remove(index); main["alternatives"] = json!(inventory);
-    inventory_dispatch_hold(main, update_request().is_some())
+    main
 }
 
 static EXECUTION_FENCES: std::sync::OnceLock<Mutex<HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
@@ -531,20 +707,34 @@ fn execution_call(cfg: &DispatchConfig, tid: &str, command: serde_json::Value) -
     execution_call_session(cfg, tid, command, None)
 }
 
+fn retryable_execution_error(error: &str) -> bool {
+    !error.contains("gate:") && !error.contains("[rule:")
+        && (error.contains("bridge unreachable") || error.contains("bridge 5") || error.contains("infra_storage_fault")
+            || error.contains("error sending request") || error.contains("timed out"))
+}
+
+fn execution_request(cfg: &DispatchConfig, tid: &str, session: &str, command_id: &str, command: serde_json::Value) -> Result<serde_json::Value, String> {
+    mcp_call_session(cfg, &mut 0, "execution", json!({"id":tid,"session":session,"command_id":command_id,
+        "runner_protocol":"worker-ready-v2","inventory_protocol":2,"agent":requested_worker_label(cfg),"command":command}), Some(session))
+}
+
 fn execution_call_session(cfg: &DispatchConfig, tid: &str, command: serde_json::Value, session: Option<&str>) -> Result<serde_json::Value, String> {
     let kind = command.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
     let mut id = 0;
+    // Renewal already has a periodic retry and an independently enforced
+    // local deadline. One normal-budget poll keeps worker shutdown bounded.
+    let attempts = if kind == "poll" { 1 } else { 3 };
     let args = json!({ "id": tid, "command_id": format!("{kind}-{}-{nonce}", std::process::id()), "command": command });
-    for retry in 0..3 {
+    for retry in 0..attempts {
         let result = match session {
             Some(session) => mcp_call_session(cfg, &mut id, "execution", args.clone(), Some(session)),
             None => mcp_call_task(cfg, &mut id, "execution", args.clone(), tid),
         };
         match result {
             Ok(result) => return Ok(result),
-            Err(e) if retry < 2 && (e.contains("bridge unreachable") || e.contains("bridge 5") || e.contains("infra_storage_fault")) => {
-                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/3 with the same command_id", retry + 2));
+            Err(e) if retry + 1 < attempts && retryable_execution_error(&e) => {
+                logging::emit("cli", tid, &format!("execution {kind}: transient request failure; retry {}/{attempts} with the same command_id", retry + 2));
                 std::thread::sleep(Duration::from_millis(250 * (retry + 1)));
             }
             Err(e) => return Err(e), // named semantic gates are terminal
@@ -580,7 +770,6 @@ struct ExecutionRuntime {
     attempt_id: String,
     control: Arc<crate::transport::RunControl>,
     maintenance: Option<Arc<LeaseMaintenance>>,
-    last_checkpoint: Instant,
 }
 
 /// One clock per attempt: preparing other workers, Git publication and the
@@ -620,9 +809,10 @@ impl Drop for LeaseMaintenance {
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum RemoteAttemptState {
-    Restoring { checkpoint: crate::checkpoint::Checkpoint },
+    Restoring,
     Running,
     Stopping,
+    Finalizing,
     Quiesced,
 }
 #[derive(Deserialize)]
@@ -636,7 +826,10 @@ struct RemoteAttempt {
 #[serde(rename_all = "snake_case")]
 enum MailboxState { Queued, Delivered, Acknowledged, Acted }
 #[derive(Deserialize)]
-struct RemoteMessage { state: MailboxState }
+struct RemoteMessage { state: MailboxState, #[serde(default)] priority: MessagePriority }
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum MessagePriority { #[default] Interrupt, Normal }
 #[derive(Deserialize)]
 struct RemoteExecution {
     policy_version: u32,
@@ -644,14 +837,16 @@ struct RemoteExecution {
     messages: Vec<RemoteMessage>,
     #[serde(default)]
     handoff: RemoteHandoff,
+    #[serde(default)]
+    terminal: Option<attempt_journal::TerminalReceipt>,
 }
 #[derive(Deserialize, Default, Clone, Copy)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum RemoteHandoff { #[default] None, Preparing, Waiting, Accepted, Returned }
 impl RemoteExecution {
     fn permits_renewal(&self, generation: u64, attempt_id: &str) -> bool {
-        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring { .. }))
-            && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered))
+        self.attempt.as_ref().is_some_and(|a| a.generation == generation && a.attempt_id == attempt_id && matches!(a.state, RemoteAttemptState::Running | RemoteAttemptState::Restoring))
+            && !self.messages.iter().any(|m| matches!(m.state, MailboxState::Delivered) && matches!(m.priority, MessagePriority::Interrupt))
     }
     fn parse(value: serde_json::Value) -> Result<Self, String> {
         let state: Self = serde_json::from_value(value).map_err(|e| format!("durable execution contract drift: {e}"))?;
@@ -660,7 +855,10 @@ impl RemoteExecution {
     }
 }
 impl ExecutionRuntime {
-    fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str) {
+    fn start_maintenance(&mut self, cfg: &DispatchConfig, tid: &str, live: Arc<Mutex<String>>) {
+        self.start_maintenance_every(cfg, tid, live, Duration::from_secs(20));
+    }
+    fn start_maintenance_every(&mut self, cfg: &DispatchConfig, tid: &str, live: Arc<Mutex<String>>, interval: Duration) {
         let cfg = cfg.clone();
         let session = claim_session(&cfg, tid);
         let tid = tid.to_string();
@@ -668,17 +866,33 @@ impl ExecutionRuntime {
         let attempt_id = self.attempt_id.clone();
         let command = self.command("poll");
         let control = self.control.clone();
-        self.maintenance = Some(Arc::new(LeaseMaintenance::start(Duration::from_secs(20), move || {
-            if control.stop.load(Ordering::SeqCst) { return false; }
+        let mut reported = String::new();
+        let mut last_report = Instant::now();
+        self.maintenance = Some(Arc::new(LeaseMaintenance::start(interval, move || {
+            if control.stop.load(Ordering::SeqCst) || control.quiesced.load(Ordering::SeqCst) { return false; }
+            let requested_at = Instant::now();
             let state = execution_call_session(&cfg, &tid, command.clone(), Some(&session)).and_then(RemoteExecution::parse);
             match state {
                 Ok(state) => {
                     if state.permits_renewal(generation, &attempt_id) {
-                        control.grant_lease();
+                        if control.stop.load(Ordering::SeqCst) || control.quiesced.load(Ordering::SeqCst) { return false; }
+                        control.grant_lease_from(requested_at);
+                        let line = live.lock().map(|line| line.clone()).unwrap_or_default();
+                        if !line.is_empty() && line != reported && last_report.elapsed() >= Duration::from_secs(60) {
+                            let _ = mcp_call_session_with_timeout(&cfg, &mut 0, "log_progress",
+                                json!({"id":tid,"agent":requested_worker_label(&cfg),"note":format!("runner: agent output — {line}"),"sentiment":"neutral"}), Some(&session), Duration::from_secs(8));
+                            reported = line; last_report = Instant::now();
+                        }
                         return true;
                     }
                 }
-                Err(error) => dlog(&tid, &format!("execution lease/inbox unavailable: {error}; stopping writer and retaining WIP")),
+                Err(error) => {
+                    if retryable_execution_error(&error) && control.lease_valid() {
+                        dlog(&tid, &format!("execution transport unavailable within the existing local lease; retrying without extending it: {error}"));
+                        return true;
+                    }
+                    dlog(&tid, &format!("execution lease/inbox unavailable: {error}; stopping writer and retaining WIP"));
+                },
             }
             control.stop.store(true, Ordering::SeqCst);
             false
@@ -689,13 +903,6 @@ impl ExecutionRuntime {
     }
     fn command(&self, kind: &str) -> serde_json::Value {
         json!({ "kind": kind, "generation": self.generation, "attempt_id": self.attempt_id })
-    }
-    fn checkpoint(&self, cfg: &DispatchConfig, tid: &str, path: &Path) -> Result<(), String> {
-        let checkpoint = crate::checkpoint::publish(path, tid, self.generation, "Read task history and checkpoint; continue the remaining action, preserving any newer local WIP.", vec![std::env::consts::OS.into(), std::env::consts::ARCH.into()])?;
-        let mut cmd = self.command("checkpoint");
-        cmd["checkpoint"] = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
-        execution_call(cfg, tid, cmd)?;
-        Ok(())
     }
 }
 
@@ -1680,7 +1887,7 @@ fn mcp_call(
 /// Operator control exchanges fail promptly; task/effect requests retain their
 /// existing transport budget and the same durable retry/replay contract.
 fn mcp_request_timeout(tool: &str, args: &serde_json::Value) -> Duration {
-    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise"));
+    let control = tool == "execution" && matches!(args.pointer("/command/kind").and_then(|v| v.as_str()), Some("pause_claims" | "resume_claims" | "advertise" | "stopped" | "finalize" | "cancel_start"));
     Duration::from_secs(if control { 8 } else { 30 })
 }
 
@@ -1739,7 +1946,7 @@ fn mcp_call_session_with_timeout(
         .send()
         .map_err(|e| if e.is_timeout() {
             format!("bridge unreachable: {tool}/{} timed out after {}s (command_id={}); the request may have reached the hub", args.pointer("/command/kind").and_then(|v| v.as_str()).unwrap_or("call"), timeout.as_secs(), args["command_id"].as_str().unwrap_or("none"))
-        } else { format!("bridge unreachable: {e}") })?;
+        } else { format!("bridge unreachable: {e:?}") })?;
     if !resp.status().is_success() {
         return Err(format!("bridge {} on /mcp", resp.status()));
     }
@@ -1856,6 +2063,10 @@ pub struct DispatchSnapshot {
     pub workdir: Option<String>,
     pub max_sessions: usize,
     pub in_flight: Vec<InFlightView>,
+    /// Derived solely from the lifecycle registry; stopped/delivering work is
+    /// never relabelled as an actively running agent.
+    pub lifecycle: Option<lifecycle::Counts>,
+    pub workspaces: Option<workspace::Status>,
     pub activity: Vec<DispatchActivity>, // newest first, capped
     // BR#2532: set when the runner INVOLUNTARILY signs the desktop out
     // (identity-law run gate). The pair screen renders it
@@ -1911,13 +2122,12 @@ fn snap_activity(snap: &SharedSnapshot, kind: &str, msg: &str) {
 }
 
 #[derive(Clone, Copy)]
-enum DispatchStage { Starting, Readiness, Checkpoint, Finalizing, Admission, Preparing, Hygiene, Waiting }
+enum DispatchStage { Starting, Readiness, Finalizing, Admission, Preparing, Hygiene, Waiting }
 
 fn dispatch_stage(snap: &SharedSnapshot, stage: DispatchStage) {
     let label = match stage {
         DispatchStage::Starting => "starting",
         DispatchStage::Readiness => "checking worker readiness",
-        DispatchStage::Checkpoint => "publishing checkpoint",
         DispatchStage::Finalizing => "draining completed workers",
         DispatchStage::Admission => "reserving eligible work",
         DispatchStage::Preparing => "preparing reserved worker",
@@ -2079,6 +2289,8 @@ fn write_runner_state(snap: &SharedSnapshot) {
             "workdir": s.workdir,
             "max_sessions": s.max_sessions,
             "in_flight": s.in_flight,
+            "lifecycle": s.lifecycle,
+            "workspaces": s.workspaces,
             "activity": s.activity.iter().take(10).collect::<Vec<_>>(),
             // BR#2532: an auto-logout in a HEADLESS runner must reach the
             // desktop UI too — it observes this file from another process and
@@ -2218,6 +2430,7 @@ struct InFlight {
     rx: std::sync::mpsc::Receiver<opencode::RunOutcome>,
     live: Arc<std::sync::Mutex<String>>, // agent's latest output line (mid-run)
     execution: ExecutionRuntime,
+    worker: Option<worker_session::Handle>,
 }
 
 impl InFlight {
@@ -2376,18 +2589,6 @@ fn source_repo(body_md: &str, meta: &serde_json::Value) -> Option<String> {
 // never encodes gate verdicts as state — it releases claims and skips
 // candidates. The drift-alarm test at the bottom of this file enforces it.
 
-/// BR#2460 scratch session dir for repo-less dispatches:
-/// <workdir>/sessions/bridge-<tid>/. Litter control and a deterministic cwd,
-/// NOT a sandbox — agents hold full user permissions. Removed when the run
-/// outcome lands; runner startup sweeps orphans.
-fn ensure_scratch_dir(workdir: &str, tid: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(workdir)
-        .join("sessions")
-        .join(format!("bridge-{}", slugify(tid)));
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
 /// Clone-on-demand cache: one bare-enough working clone per task repo under
 /// <workdir>/repos/<slug>, fetched on reuse. Returns the repo path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2441,7 +2642,7 @@ fn classify_clone_failure(stderr: &str) -> CloneFailure {
     }
 }
 
-fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
+fn repo_cache_path(workdir: &str, repo_url: &str) -> PathBuf {
     let tail: String = repo_url
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -2453,13 +2654,27 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
         .collect::<Vec<_>>()
         .join("-");
     let slug = slugify(&tail);
-    let repos_dir = PathBuf::from(workdir).join("repos");
+    let identity=attempt_journal::stable_key(&[repo_url.trim_end_matches('/').trim_end_matches(".git")]);
+    PathBuf::from(workdir).join("repos").join(format!("{slug}-{identity}"))
+}
+
+fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFailure> {
+    let path = repo_cache_path(workdir, repo_url);
+    let repos_dir = path.parent().expect("repository cache has a parent");
     std::fs::create_dir_all(&repos_dir).map_err(|e| CloneFailure::Transient(e.to_string()))?;
-    let path = repos_dir.join(&slug);
     if path.join(".git").exists() {
+        let remote=Command::new("git").current_dir(&path).args(["remote","get-url","origin"]).output().map_err(|e|CloneFailure::Transient(e.to_string()))?;
+        if !remote.status.success() || String::from_utf8_lossy(&remote.stdout).trim().trim_end_matches('/').trim_end_matches(".git")!=repo_url.trim_end_matches('/').trim_end_matches(".git") {
+            return Err(CloneFailure::Transient("repository cache identity changed; retained".into()));
+        }
+        let default = Command::new("git").current_dir(&path).args(["symbolic-ref", "refs/remotes/origin/HEAD"]).output()
+            .map_err(|e| CloneFailure::Transient(e.to_string()))?;
+        if !default.status.success() { return Err(CloneFailure::Transient("repository default branch unavailable".into())); }
+        let default = String::from_utf8_lossy(&default.stdout).trim().to_string();
+        let branch = default.strip_prefix("refs/remotes/origin/").ok_or_else(|| CloneFailure::Transient("repository default ref invalid".into()))?;
         let out = Command::new("git")
             .current_dir(&path)
-            .args(["fetch", "--all", "--prune"])
+            .args(["fetch", "origin", &format!("+refs/heads/{branch}:{default}")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -2471,7 +2686,7 @@ fn ensure_repo_clone(workdir: &str, repo_url: &str) -> Result<PathBuf, CloneFail
         };
     }
     let out = Command::new("git")
-        .args(["clone", repo_url])
+        .args(["clone", "--single-branch", repo_url])
         .arg(&path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2502,188 +2717,50 @@ fn worktree_owner(path: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/// YYYY-MM-DD (UTC) — civil-from-days, no chrono dependency. Suffix for the
-/// WIP preservation branches the teardown sweep writes.
-fn iso_date_utc() -> String {
-    let secs = (now_ms() / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
-/// BR#3204 teardown sweep: a worktree being torn down must not take
-/// uncommitted work with it — that is exactly the 10-24 failure mode (a
-/// 32-file WIP pile frozen in the shared checkout, preserved only afterwards
-/// as `wip/preserved-2026-10-24`, whose diffs turned out to be stale tree
-/// state). If the tree is dirty, commit everything onto a preservation branch
-/// `wip/<task>-<date>` (branch, never main) and push it best-effort so
-/// preservation survives host loss. Returns the branch name when preservation
-/// happened, None when the tree was clean.
-///
-/// `git add -A` here is the documented teardown-sweep exception to the no-`add
-/// -A` rule: this worktree is being destroyed and the branch is its only
-/// record; no shared checkout is touched.
-fn preserve_wip(worktree_path: &Path, task_id: &str) -> Option<String> {
-    let dirty = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
-    if !dirty {
-        return None;
-    }
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .current_dir(worktree_path)
-            .args(args)
-            .output()
-    };
-    let slug = slugify(task_id);
-    let date = iso_date_utc();
-    // branch at the current HEAD — the dirty tree carries over unchanged.
-    // A same-day preservation name collision gets a -2/-3… suffix.
-    let mut branch = format!("wip/{slug}-{date}");
-    let mut created = false;
-    for n in 1..10 {
-        let name = if n == 1 { branch.clone() } else { format!("wip/{slug}-{date}-{n}") };
-        if git(&["switch", "-c", &name]).map(|o| o.status.success()).unwrap_or(false) {
-            branch = name;
-            created = true;
-            break;
-        }
-    }
-    if !created {
-        return None; // mid-merge or branch lock — best-effort only, teardown proceeds
-    }
-    let _ = git(&["add", "-A"]);
-    let committed = git(&[
-        "commit",
-        "-m",
-        &format!("WIP preservation sweep: {task_id} teardown (BR#3204 — branch, never main; {date})"),
-    ])
-    .map(|o| o.status.success())
-    .unwrap_or(false);
-    if !committed {
-        // race or nothing actually committable — undo the empty branch
-        let _ = git(&["switch", "--detach"]);
-        let _ = git(&["branch", "-D", &branch]);
-        return None;
-    }
-    // preservation should survive host loss: best-effort push, failures ignored
-    let _ = git(&["push", "--set-upstream", "origin", &branch]);
-    Some(branch)
-}
-
-/// Provision (or reuse) an isolated worktree for a task on branch bridge/<slug>,
-/// branched from the task repo's default branch. Location (BR#3204): inside
-/// the checkout at <repo>/.worktrees/<slug> — the per-session tree convention
-/// (the repo's .gitignore carries `.worktrees/`, so the checkout stays clean).
-/// The legacy ~/.bridge/worktrees/<slug> location is checked and kept as the
-/// fallback so pre-change worktrees re-attach on resume and repos whose
-/// clone predates the convention still isolate.
-/// On resume the branch already exists — attach to it.
-/// 2026-11-02: every provisioned tree is REGISTERED (the machine-local
-/// worktree registry) so the sweep knows it mechanically — see
-/// worktree_registry_append.
-fn ensure_worktree(repo_path: &PathBuf, task_id: &str, resume: bool) -> Option<PathBuf> {
-    let slug = slugify(task_id);
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let nested = repo_path.join(".worktrees").join(&slug);
-    let legacy = home.as_ref().map(|h| {
-        h.join(".bridge").join("worktrees").join(&slug)
-    });
-    // reuse: nested first (the convention), legacy second (resume compat)
-    if nested.exists() {
-        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
-        return Some(nested);
-    }
-    if legacy.as_ref().map(|p| p.exists()).unwrap_or(false) {
-        worktree_registry_append(home.as_deref(), legacy.as_ref().unwrap(), &repo_path.to_string_lossy(), task_id);
-        return legacy;
-    }
-    std::fs::create_dir_all(nested.parent()?).ok()?;
-    // Self-heal stale registrations: a worktree dir deleted without
-    // deregistration leaves a "prunable" ghost whose branch lock fails both
-    // worktree adds below, and the isolation guard then refuses dispatch —
-    // churning the task through the watchdog (BR#2421 class). Prune is
-    // idempotent and cheap.
-    let _ = Command::new("git")
-        .current_dir(repo_path)
-        .args(["worktree", "prune"])
-        .output();
-    let branch = format!("bridge/{slug}");
-    // Base = the clone's default branch. `origin/HEAD` is set by clone.
-    let add_at = |path: &PathBuf| {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(repo_path);
-        if resume {
-            cmd.args(["worktree", "add"]).arg(path).arg(&branch);
-        } else {
-            cmd.args(["worktree", "add", "-b"]).arg(&branch).arg(path).arg("origin/HEAD");
-        }
-        cmd.output().map(|o| o.status.success()).unwrap_or(false)
-    };
-    if add_at(&nested) {
-        worktree_registry_append(home.as_deref(), &nested, &repo_path.to_string_lossy(), task_id);
-        return Some(nested);
-    }
-    // nested add refused (clone predates the .gitignore convention) — fall
-    // back to the legacy location so isolation still holds.
-    let Some(path) = legacy else { return None };
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    if add_at(&path) {
-        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
-        return Some(path);
-    }
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo_path)
-        .args(["worktree", "add"])
-        .arg(&path)
-        .arg(&branch);
-    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
-    if ok {
-        worktree_registry_append(home.as_deref(), &path, &repo_path.to_string_lossy(), task_id);
-    }
-    ok.then_some(path)
-}
-
 /// Run a command with a hard deadline: kill on expiry and report. The sign
 /// check must never hang the dispatch loop (a misconfigured signingProgram —
 /// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
 /// not stall dispatch). ssh-keygen from file signs instantly; 15s is generous.
 pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
-    cmd.stdin(std::process::Stdio::null());
+    use std::io::{Read, Seek};
+    // A child can fill a pipe before it exits. File-backed capture lets the
+    // timeout poll independently of output volume or inherited descriptors.
+    let capture = || -> std::io::Result<_> {
+        let file = tempfile::NamedTempFile::new()?;
+        let writer = file.reopen()?;
+        Ok((file.into_file(), writer))
+    };
+    let capture = || capture().map_err(|e| format!("open command capture: {e}"));
+    let (mut stdout, stdout_writer) = capture()?;
+    let (mut stderr, stderr_writer) = capture()?;
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| format!("wait failed: {e}"));
+            Ok(Some(status)) => {
+                let read = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+                    // Limit the read to bytes captured at exit even if a
+                    // descendant inherited the output descriptor.
+                    let len = file.metadata()?.len();
+                    file.rewind()?;
+                    let mut bytes = Vec::new();
+                    file.take(len).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                };
+                let read = |file| read(file).map_err(|e| format!("read command capture: {e}"));
+                return Ok(std::process::Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? });
             }
             Ok(None) => {
                 if started.elapsed() >= Duration::from_secs(secs) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "timed out after {secs}s — a signing program that blocks (locked agent, hung bridge) must fail loudly, never stall dispatch"
+                        "timed out after {secs}s — bounded host operation retained for retry"
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2785,86 +2862,6 @@ fn sign_check(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), Str
     result
 }
 
-/// Tear down a worktree: preserve any WIP onto `wip/<task>-<date>` first
-/// (the teardown sweep — losing tree state is the 10-24 incident), then
-/// deregister + remove it, and optionally drop the task branch.
-/// drop_branch=true is terminal (done): the work is merged or rejected and
-/// bridge/<slug> has no future — the preservation branch survives it, since
-/// the WIP commit is reachable from it. On todo releases the branch is KEPT:
-/// a re-claim attaches to it (committed-but-unpushed stall work survives;
-/// uncommitted WIP went to the wip branch). Returns the preservation branch
-/// when one was written.
-fn cleanup_worktree_at(path: &PathBuf, task_id: &str, drop_branch: bool) -> Option<String> {
-    if !path.exists() { return None; }
-    // No lossy best-effort teardown. A failed status/publication probe retains
-    // the registered tree; only remotely reachable committed content is swept.
-    let status = Command::new("git").current_dir(path).args(["status", "--porcelain"]).output();
-    if !matches!(&status, Ok(o) if o.status.success() && o.stdout.is_empty()) {
-        return Some(format!("retained {}: local WIP requires a published checkpoint before cleanup", path.display()));
-    }
-    let remote = Command::new("git").current_dir(path).args(["branch", "-r", "--contains", "HEAD"]).output();
-    if !matches!(&remote, Ok(o) if o.status.success() && !o.stdout.is_empty()) {
-        return Some(format!("retained {}: unpublished committed work", path.display()));
-    }
-    if !path.exists() {
-        return None;
-    }
-    // 2026-11-02: deregister FIRST — the teardown owns this tree, the
-    // registry must not outlive it (a stale line prunes on next read, but
-    // the contract is explicit).
-    worktree_registry_remove(std::env::var("HOME").ok().map(PathBuf::from).as_deref(), path);
-    let preserved = preserve_wip(path, task_id);
-    let slug = slugify(task_id);
-    // Owning repo: a worktree's .git FILE points at <clone>/.git/worktrees/<name>.
-    let owner = worktree_owner(path, &path.to_string_lossy());
-    let _ = Command::new("git")
-        .current_dir(&owner)
-        .args(["worktree", "remove", "--force"])
-        .arg(path)
-        .output();
-    if drop_branch {
-        // terminal (done): bridge/<slug> has no future. The WIP commit survives
-        // on the preservation branch — deleting this branch does not orphan it.
-        let _ = Command::new("git")
-            .current_dir(&owner)
-            .args(["branch", "-D"])
-            .arg(&format!("bridge/{slug}"))
-            .output();
-    }
-    // belt-and-braces: a failed deregistration leaves the dir behind
-    let _ = std::fs::remove_dir_all(path);
-    preserved
-}
-
-/// Reconcile on-disk worktrees with live task status. Terminal tasks (done,
-/// superseded) and released tasks (todo) must not hold worktrees on disk — the
-/// finalize path cleans `done` handoffs, but yielded runs, pre-sweep history
-/// and handoff-rejections leave stragglers. Fresh in_progress/in_review/blocked
-/// worktrees are kept: they are the session's resume assets — but nothing
-/// parks forever (BR#3633): a tree not held by an in-flight session that is
-/// older than WORKTREE_STALE_SECS is swept regardless of status or id
-/// resolvability (WIP preserved first, branch kept, so a re-claim re-attaches).
-/// Capped per tick, oldest first, so a large backlog always drains the worst
-/// offenders.
-/// Scans BOTH locations (BR#3204): the nested <repo>/.worktrees/<slug> trees
-/// and the legacy ~/.bridge/worktrees/<slug> roots — a missing root is a
-/// scoped skip, never a sweep abort (the old early-return there silently
-/// disabled the entire sweep on hosts where the legacy root never existed:
-/// post-BR#3204 hosts provision nested-only, so the reconciler was dead code
-/// while provisioning kept allocating — the BR#3618/BR#3633 leak). Before any
-/// teardown the sweep preserves uncommitted state onto wip/<task>-<date>
-/// (never main).
-const WORKTREE_SWEEP_CAP: usize = 4;
-const WORKTREE_SWEEP_PROBE_BUDGET: Duration = Duration::from_secs(3);
-const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
-/// Eventual-consistency horizon (BR#3633): a worktree not held by an in-flight
-/// session is swept once older than this, whatever its board status — an id
-/// that no longer resolves, a hub outage, or a parked blocked task all drain
-/// eventually instead of pinning disk forever. Branch is kept on the age path
-/// so re-claims re-attach; drop-branch stays the explicit terminal-status path.
-const WORKTREE_STALE_SECS: u64 = 7 * 24 * 3600;
-static SWEEP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// BR#3787 — negotiated token catch-up. The hub stamps every authenticated
 /// /mcp response with the row's epoch (bumped at each rotation);
 /// TOKEN_EPOCH_VEND is the epoch of the secret this runner holds. 0 = unknown
@@ -2886,40 +2883,6 @@ struct WorktreeCandidate {
     slug: String,
     path: PathBuf,
     mtime: std::time::SystemTime,
-}
-
-/// Persist a round's remaining paths, rather than starting from the same kept
-/// trees every tick. Newly registered paths enter at the next oldest-first round.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct WorktreeSweepCursor {
-    remaining: std::collections::VecDeque<PathBuf>,
-}
-
-fn sweep_candidate_batch(
-    candidates: Vec<WorktreeCandidate>,
-    cursor: &mut WorktreeSweepCursor,
-    budget: Duration,
-    mut status: impl FnMut(&WorktreeCandidate, Duration) -> Option<String>,
-    mut cleanup: impl FnMut(&WorktreeCandidate, bool, &str),
-) -> (usize, usize) {
-    if cursor.remaining.is_empty() {
-        cursor.remaining.extend(candidates.iter().map(|c| c.path.clone()));
-    }
-    let mut by_path: HashMap<_, _> = candidates.into_iter().map(|c| (c.path.clone(), c)).collect();
-    let deadline = Instant::now() + budget;
-    let (mut inspected, mut swept) = (0, 0);
-    while inspected < WORKTREE_SWEEP_CAP && Instant::now() < deadline {
-        let Some(path) = cursor.remaining.pop_front() else { break; };
-        let Some(candidate) = by_path.remove(&path) else { continue; };
-        inspected += 1; // retained/unresolvable trees consume the budget too
-        let age = std::time::SystemTime::now().duration_since(candidate.mtime).map(|d| d.as_secs()).unwrap_or(u64::MAX);
-        let state = if age < WORKTREE_STALE_SECS {
-            status(&candidate, WORKTREE_STATUS_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
-        } else { None };
-        let (remove, drop_branch, reason) = sweep_disposition(age, state.as_deref());
-        if remove { cleanup(&candidate, drop_branch, &reason); swept += 1; }
-    }
-    (inspected, swept)
 }
 
 // ---- worktree registry (2026-11-02, Ray: "you can both direct agents AND
@@ -2959,6 +2922,7 @@ fn worktree_registry_load(home: &Path) -> Vec<WorktreeRegEntry> {
 /// Best-effort registration — the path IS the record; a failed append never
 /// blocks provisioning (the sweep's dir scans still cover the runner's own
 /// trees). Home comes from the caller so tests inject a scratch root.
+#[cfg(test)]
 fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: &str) {
     use std::io::Write;
     let Some(home) = home else { return };
@@ -2985,6 +2949,7 @@ fn worktree_registry_append(home: Option<&Path>, path: &Path, repo: &str, task: 
 /// Deregistration: drop every line naming this path — the teardown owns the
 /// tree, the registry must not outlive it. Home comes from the caller so
 /// tests inject a scratch root.
+#[cfg(test)]
 fn worktree_registry_remove(home: Option<&Path>, path: &Path) {
     let Some(home) = home else {
         return;
@@ -3013,35 +2978,6 @@ fn reverse_task_slug(slug: &str) -> String {
     match slug.strip_prefix("BR-") {
         Some(num) if num.chars().all(|c| c.is_ascii_digit()) => format!("BR#{num}"),
         _ => slug.to_string(),
-    }
-}
-
-/// Sweep decision for one candidate — pure so it is unit-testable. `status`
-/// is the board status when it could be fetched (None = unresolvable id or
-/// MCP/network error). Returns (sweep, drop_branch, reason).
-fn sweep_disposition(age_secs: u64, status: Option<&str>) -> (bool, bool, String) {
-    match status {
-        // explicit terminal statuses sweep at any age — the board is the
-        // authority and these trees hold nothing the board doesn't have
-        Some(s @ ("done" | "superseded")) => (true, true, format!("task is {s}")),
-        Some("todo") => (
-            true,
-            false,
-            "task released to todo (branch kept for re-claim)".into(),
-        ),
-        // fresh non-terminal trees are resume assets — keep
-        _ if age_secs < WORKTREE_STALE_SECS => (false, false, String::new()),
-        // stale non-terminal (in_progress/blocked/in_review/unknown id/MCP
-        // outage): eventual sweep — WIP preserved, branch kept for re-claim
-        _ => (
-            true,
-            false,
-            format!(
-                "stale ≥{}d — swept regardless of status ({})",
-                WORKTREE_STALE_SECS / 86_400,
-                status.unwrap_or("id unresolvable or status unknown")
-            ),
-        ),
     }
 }
 
@@ -3129,7 +3065,7 @@ fn collect_worktree_candidates(
                 continue;
             };
             let path = PathBuf::from(p);
-            if path == root {
+            if path == root || path.canonicalize().ok().zip(root.canonicalize().ok()).is_some_and(|(path, root)| path == root) {
                 continue; // the repo's own main worktree is not a candidate
             }
             let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -3155,11 +3091,9 @@ fn collect_worktree_candidates(
     // `active` set above; the disposition rules then apply as usual.
     if let Some(home) = home {
         let entries = worktree_registry_load(home);
-        let mut dead = false;
         for e in &entries {
             let p = PathBuf::from(&e.path);
             if !p.exists() {
-                dead = true;
                 continue;
             }
             let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -3176,79 +3110,11 @@ fn collect_worktree_candidates(
                 .unwrap_or(std::time::UNIX_EPOCH);
             found.push(WorktreeCandidate { slug: name, path: p, mtime });
         }
-        if dead {
-            let kept: Vec<String> = entries
-                .iter()
-                .filter(|e| PathBuf::from(&e.path).exists())
-                .filter_map(|e| serde_json::to_string(e).ok())
-                .collect();
-            let _ = std::fs::write(
-                worktree_registry_path(home),
-                if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" },
-            );
-        }
+        // Read-only migration input: rewriting this JSONL can erase a live
+        // interactive session's concurrent append. New ownership lives solely
+        // in the workspace journal; absent paths contribute no allocations.
     }
     found
-}
-
-fn sweep_stale_worktrees(cfg: &DispatchConfig, id: &mut i64, in_flight: &[InFlight], msgs: &mut Vec<String>) {
-    let active: HashSet<String> = in_flight
-        .iter()
-        .filter_map(|inf| inf.worktree.as_ref())
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .collect();
-    let mut found = collect_worktree_candidates(
-        Path::new(&cfg.workdir),
-        std::env::var("HOME").ok().map(PathBuf::from).as_deref(),
-        &active,
-        &cfg.sweep_repos,
-    );
-    // dedup by slug (same name in both roots → nested wins), then drain
-    // oldest-first: the cap must always bite the worst offenders
-    found.sort_by(|a, b| a.slug.cmp(&b.slug));
-    found.dedup_by(|a, b| a.slug == b.slug);
-    found.sort_by(|a, b| a.mtime.cmp(&b.mtime).then(a.path.cmp(&b.path)));
-    let cursor_path = dispatch_dir().map(|p| p.join("worktree-sweep-cursor.json"));
-    let mut cursor: WorktreeSweepCursor = cursor_path.as_ref().and_then(|p| std::fs::read(p).ok())
-        .and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default();
-    let (inspected, swept) = sweep_candidate_batch(found, &mut cursor, WORKTREE_SWEEP_PROBE_BUDGET,
-        |candidate, timeout| {
-            mcp_call_session_with_timeout(cfg, id, "get_artefact", json!({ "id": reverse_task_slug(&candidate.slug) }), None, timeout)
-                .ok().and_then(|v| v["status"].as_str().map(String::from))
-        },
-        |candidate, drop_branch, reason| {
-            let preserved = cleanup_worktree_at(&candidate.path, &reverse_task_slug(&candidate.slug), drop_branch);
-            msgs.push(format!("swept worktree {} — {}{}", candidate.slug, reason,
-                preserved.map(|b| format!("; WIP preserved on {b}")).unwrap_or_default()));
-        });
-    if let Some(path) = cursor_path {
-        if let Ok(data) = serde_json::to_vec(&cursor) {
-            let staged = path.with_extension("tmp");
-            if std::fs::write(&staged, data).is_ok() { let _ = std::fs::rename(staged, path); }
-        }
-    }
-    dlog("", &format!("worktree hygiene: inspected {inspected}, swept {swept}, {} pending in round", cursor.remaining.len()));
-    if swept > 0 {
-        // prune the clones that actually own the registrations. cfg.workdir is
-        // scratch space, NOT a repo — the old prune against it was a silent
-        // no-op that left ghost registrations in the owning clones (BR#2421).
-        let mut prune_roots: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(&cfg.workdir).join("repos"))
-            .map(|it| it.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
-        prune_roots.extend(
-            cfg.sweep_repos
-                .iter()
-                .map(PathBuf::from)
-                .filter(|p| p.join(".git").exists()),
-        );
-        for repo in prune_roots {
-            let _ = Command::new("git")
-                .current_dir(repo)
-                .arg("worktree")
-                .arg("prune")
-                .output();
-        }
-    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -3368,6 +3234,14 @@ fn result_lost_receipts(worktree: Option<&str>, pr: Option<&str>) -> String {
     } else {
         format!("; side effects: {}", bits.join(", "))
     }
+}
+
+/// Only the permit consumed by this exact begin may direct this worker.
+fn append_recovery_continuation(prompt: &mut String, state: &serde_json::Value, generation: u64, attempt_id: &str) {
+    let permit = &state["recovery_permit"];
+    if permit["phase"] != "consumed" || permit["consumed_generation"].as_u64() != Some(generation)
+        || permit["consumed_attempt_id"].as_str() != Some(attempt_id) { return; }
+    prompt.push_str(&format!("\n# Authorized recovery continuation\n{}\nStart from the current repository and reconcile the prior terminal evidence above. Follow the continuation instructions; reconcile receipts before any external effect. This permission is for this attempt only.\n", permit));
 }
 
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
@@ -3570,9 +3444,11 @@ fn spawn_opencode(
     in_flight: &mut Vec<InFlight>,
     worker: &WorkerCredential,
     readiness_observed: &mut Instant,
+    cancel: Option<Arc<AtomicBool>>,
 ) {
     let preparation_started = Instant::now();
-    dispatch_stage(snap, DispatchStage::Preparing);
+    dlog(tid, "preparing reserved worker");
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) { return; }
     let eligible: Vec<_> = avail.iter().copied().filter(|b| backend_satisfies(cfg, *b, task_meta)).collect();
     if eligible.is_empty() {
         failed_start(cfg, tid, StartStage::Begin, "gate: selected capability no longer available on this host", None, None);
@@ -3589,11 +3465,6 @@ fn spawn_opencode(
     // declined repo-less tasks parked claimed cards with no session
     // (BR#2456 class).
     let repo_url = source_repo(body_md, task_meta);
-    let scratch = if repo_url.is_none() {
-        ensure_scratch_dir(&cfg.workdir, tid)
-    } else {
-        None
-    };
     let backend_name = match backend {
         opencode::Backend::OpenCode => "opencode",
         opencode::Backend::Kiro => "kiro",
@@ -3606,135 +3477,29 @@ fn spawn_opencode(
     let agent_profile = bc.agent.or_else(|| cfg.agent.clone());
     let model = Some(model_id);
     let model_str = model.clone().unwrap_or_default();
-    // A different model gets a fresh session, preserving the checkpoint/WIP.
+    // A different model gets a fresh session.
     let previous = task_meta.get("execution_last_model");
     let model_changed = previous.and_then(|p| p["model"].as_str()) != model.as_deref()
         || previous.and_then(|p| serde_json::from_value::<ReasoningTier>(p["tier"].clone()).ok()) != Some(model_tier)
         || previous.and_then(|p| p["backend"].as_str()) != Some(backend_name);
-    let resume_session = if model_changed { None } else if resume_session.is_none() && backend == opencode::Backend::Kiro {
-        load_session_registry().get(tid).cloned() // kiro resume via sidecar registry
-    } else {
-        resume_session
-    };
+    let resume_session = if model_changed { None } else { resume_session };
     let resume = resume_session.is_some();
-    // BR#3204 exemptions: some dispatches must NOT get a per-task worktree.
-    //   1. Surgical-by-declaration tasks — meta.surgical (or meta.surgical_by_
-    //      declaration): short, surgical changes to the shared checkout are the
-    //      declared deliverable, and a fresh worktree would orphan them.
-    //   2. Exempt repos (cfg.worktree_exempt_repos) — the webapp-only checkout
-    //      class, where the checkout itself is the deploy surface and shared-
-    //      tree editing is the design. Matched case-insensitively against the
-    //      repo URL and its tail (owner/name, with or without .git).
-    let surgical = task_meta
-        .get("surgical")
-        .or_else(|| task_meta.get("surgical_by_declaration"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || body_md.contains("surgical-by-declaration");
-    let repo_exempt = match &repo_url {
-        Some(url) => {
-            let u = url.to_ascii_lowercase();
-            let tail = u.rsplit('/').next().unwrap_or(&u).trim_end_matches(".git");
-            cfg.worktree_exempt_repos.iter().any(|r| {
-                let r = r.trim().trim_end_matches(".git").to_ascii_lowercase();
-                !r.is_empty() && (u.contains(&r.as_str()) || tail == r.as_str())
-            })
-        }
-        None => false,
+    let ticket = lifecycle::Ticket { task_id: tid.into(), session: claim_session(cfg, tid) };
+    let allocation = match workspace::Owner::open(cfg).and_then(|owner| owner.allocate(&ticket, repo_url.as_deref())) {
+        Ok(allocation) => allocation,
+        Err(error) => { dlog(tid, &format!("workspace allocation deferred: {error}")); return; },
     };
-    let skip_worktree = surgical || repo_exempt;
-    if skip_worktree {
-        dlog(
-            tid,
-            &format!(
-                "per-task worktree skipped — {}",
-                if surgical {
-                    "task is surgical-by-declaration"
-                } else {
-                    "repo is worktree-exempt"
-                }
-            ),
-        );
-    }
-    let worktree = if let Some(url) = &repo_url {
-        let repo_path = match ensure_repo_clone(&cfg.workdir, url) {
-            Ok(p) => p,
-            Err(e) => {
-                dlog(
-                    tid,
-                    &format!(
-                        "error: clone failed for {url} — {} — skipping spawn",
-                        e.detail()
-                    ),
-                );
-                snap_activity(
-                    snap,
-                    "error",
-                    &format!("{tid}: clone failed ({url}): {}", e.detail()),
-                );
-                let reason = format!("{}clone of {url} failed: {}", if e.fatal() { "gate: " } else { "" }, e.detail());
-                failed_start(cfg, tid, StartStage::Begin, &reason, None, None);
-                return;
-            }
-        };
-        let worktree = if cfg.isolate && !skip_worktree {
-            ensure_worktree(&repo_path, tid, resume)
-        } else {
-            None
-        };
-        // isolation guard: a shared checkout is a shared branch and a shared git
-        // index — dispatched sessions have switched branches under humans and
-        // reverted committed work (three times). If isolation was requested and
-        // failed, refuse: never dispatch into cfg.workdir. Exempt dispatches
-        // (surgical / exempt-repo) opted into the shared tree knowingly, so the
-        // guard does not apply to them.
-        if cfg.isolate && !skip_worktree && worktree.is_none() {
-            let detail =
-                "worktree isolation unavailable — refusing to dispatch into the shared checkout (fix git state or set isolate=false knowingly)";
-            dlog(tid, &format!("error: {detail}"));
-            snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
-            failed_start(cfg, tid, StartStage::Begin, &format!("gate: {detail}"), None, Some(&repo_path));
+    let worktree = allocation.checkout.clone();
+    let scratch = worktree.is_none().then(|| allocation.work.clone());
+    let run_dir = allocation.work.to_string_lossy().to_string();
+    let branch = "detached worktree";
+    if let Some(wt) = &worktree {
+        let profile = cfg.identity_profile();
+        if let Err(error) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
+            failed_start(cfg, tid, StartStage::Inspect, &format!("gate: identity profile failed: {error}"), None, Some(wt));
             return;
         }
-        // Identity leg (BR#3185): write the profile's repo-local git config and
-        // prove it can sign BEFORE dispatching. A failed sign check refuses the
-        // dispatch loudly — killing the unsigned-PR bounce class at source
-        // (BR#3042/BR#3134). Global git config is never touched: `git config`
-        // inside a linked worktree writes at repo scope into the runner's own
-        // clone (shared by that clone's worktrees) — the host checkout, the
-        // shared checkout, and the host's global config stay exactly as they were.
-        if let Some(wt) = &worktree {
-            let profile = cfg.identity_profile();
-            if let Err(e) = apply_identity(wt, &profile).and_then(|()| sign_check(wt, &profile)) {
-                let detail = format!(
-                    "identity profile failed — refusing to dispatch ({e}). Fix the runner's identity config or provision the signing key."
-                );
-                dlog(tid, &format!("error: {detail}"));
-                snap_activity(snap, "error", &format!("ERROR: {tid}: {detail}"));
-                note_task(
-                    cfg,
-                    tid,
-                    &format!(
-                        "runner: identity profile failed — {} (task not dispatched; will retry next cycle)",
-                        e
-                    ),
-                );
-                failed_start(cfg, tid, StartStage::Inspect, &format!("gate: {detail}"), None, Some(wt));
-                return;
-            }
-        }
-        worktree
-    } else {
-        None
-    };
-    let run_dir = if let Some(wt) = &worktree {
-        wt.to_string_lossy().to_string()
-    } else if let Some(s) = &scratch {
-        s.to_string_lossy().to_string()
-    } else {
-        cfg.workdir.clone()
-    };
-    let branch = format!("bridge/{}", slugify(tid));
+    }
     let resume_note = resume_session
         .as_ref()
         .map(|s| format!("\n\nYou are resuming opencode session `{s}` — an opencode id, NOT a bridge session name; your bridge session is stated under # Environment. Pick up where you left off; do not restart the task from scratch."))
@@ -3796,7 +3561,7 @@ fn spawn_opencode(
         }
     } else {
         format!(
-            "- You are working in {run_dir} — a scratch session directory, not a git checkout; it is deleted when your run ends. If the work turns out to need code, clone what you need yourself (`git` and `gh` are authenticated). Deliver anything of value to the board — the scratch dir is not a deliverable."
+            "- You are working in {run_dir}, a gateway-owned scratch workspace. Clone any required repositories inside this directory. The workspace owner reclaims clean, published source after confirmed writer stop; deliver findings and receipts to the board."
         )
     };
     let bridge_session = claim_session(cfg, tid);
@@ -3871,9 +3636,14 @@ fn spawn_opencode(
             return;
         }
         Err(e) => { failed_start(cfg, tid, StartStage::Inspect, &e, None, worktree.as_deref()); return; }
-        _ => {}
+        Ok(s) => {
+            if let Some(terminal) = s.terminal {
+                prompt.push_str(&format!("\n# Captured prior attempt\n{}\nReconcile this durable result and existing receipts before taking further action. Do not repeat unknown external effects or redo already-delivered work merely because a process exited. Complete the task through its explicit Bridge lifecycle, or request a stronger tier if the remaining action exceeds this model.\n", serde_json::to_string(&terminal).unwrap_or_default()));
+            }
+        }
     }
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
+    let begin_requested_at = Instant::now();
     let begin = begin_with_fresh_readiness(readiness_observed, update_request().is_some(), || {
         // The tick already advertised this exact worker/config inventory. Do
         // not run every local probe + hub advertisement again for every slot.
@@ -3897,30 +3667,25 @@ fn spawn_opencode(
     };
     let generation = remote.generation;
     let attempt_id = remote.attempt_id;
-    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(crate::transport::RunControl::default()), maintenance: None, last_checkpoint: Instant::now() };
-    execution.control.grant_lease();
-    prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
-    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner publishes your checkpoint, stops writers and yields the task. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
-    EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
-    execution.start_maintenance(cfg, tid);
-    if let RemoteAttemptState::Restoring { checkpoint: cp } = remote.state {
-        let restored = (|| -> Result<(), String> {
-            let path = worktree.as_deref().ok_or("portable checkpoint requires an isolated Git worktree")?;
-            crate::checkpoint::restore(path, &cp)?;
-            let mut cmd = execution.command("restore"); cmd["tree"] = json!(cp.tree); cmd["commit"] = json!(cp.commit);
-            execution_call(cfg, tid, cmd)?;
-            Ok(())
-        })();
-        if let Err(e) = restored {
-            execution.stop_maintenance();
-            dlog(tid, &format!("checkpoint restore held: {e}; no agent spawned"));
-            // This attempt has never spawned a child. Preserve checkpoint/WIP;
-            // don't leave an imaginary writer lease blocking reconciliation.
-            let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
-            let _ = execution_call(cfg, tid, cmd);
-            return;
-        }
+    append_recovery_continuation(&mut prompt, &state, generation, &attempt_id);
+    if let Err(error) = allocation.bind(&lifecycle::Ownership::Attempt { ticket, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: attempt_id.clone() }) {
+        dlog(tid, &format!("workspace exact ownership could not be persisted; no writer launched: {error}")); return;
     }
+    let control = match gateway_pipeline::arm_launch(cfg, tid, generation, &attempt_id, worktree.clone(), cancel.clone(), gateway_pipeline::LaunchStage::Preparing) {
+        Ok(control) => control,
+        Err(error) => { dlog(tid, &format!("launch intent could not be persisted; no writer launched: {error}")); return; },
+    };
+    if matches!(remote.state, RemoteAttemptState::Restoring) {
+        dlog(tid, "Hub requested a retired checkpoint restore; no writer launched");
+        return;
+    }
+    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
+    execution.control.grant_lease_from(begin_requested_at);
+    prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
+    prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
+    EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
+    execution.start_maintenance(cfg, tid, live.clone());
+    let poll_requested_at = Instant::now();
     let safe_point = match execution_call(cfg, tid, execution.command("poll")) {
         Ok(s) => s,
         Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
@@ -3930,14 +3695,17 @@ fn spawn_opencode(
         let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
         if execution_call(cfg, tid, cmd).is_err() { return; }
     }
-    if execution.control.stop.load(Ordering::SeqCst) || !matches!(RemoteExecution::parse(safe_point).ok().and_then(|s| s.attempt).map(|a| a.state), Some(RemoteAttemptState::Running)) {
+    let safe_to_launch = RemoteExecution::parse(safe_point).is_ok_and(|s| {
+        s.permits_renewal(generation, &execution.attempt_id)
+            && matches!(s.attempt.map(|a| a.state), Some(RemoteAttemptState::Running))
+    });
+    if safe_to_launch { execution.control.grant_lease_from(poll_requested_at); }
+    if !safe_to_launch || !execution.control.lease_valid()
+        || cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) || execution.control.stop.load(Ordering::SeqCst) {
         execution.stop_maintenance();
-        let mut cmd = execution.command("quiesce"); cmd["writers"] = json!("process_group_empty");
-        let _ = execution_call(cfg, tid, cmd);
         dlog(tid, "safe-point interruption before spawn; no writer launched");
         return;
     }
-    execution.control.grant_lease();
     let mcp_json = if cfg.url.is_empty() || agent_token.is_empty() {
         None
     } else {
@@ -3956,13 +3724,31 @@ fn spawn_opencode(
             .to_string(),
         )
     };
+    if let Err(error) = gateway_pipeline::cross_launch_boundary(cfg, tid, generation, &execution.attempt_id) {
+        execution.stop_maintenance();
+        dlog(tid, &format!("launch boundary could not be persisted; no writer launched: {error}"));
+        return;
+    }
     let completed = Arc::new(AtomicBool::new(false));
+    if worker_session::supported() {
+        execution.stop_maintenance();
+        let spec = worker_session::Spec { protocol: WORKER_PROTOCOL,
+            owner: lifecycle::Ownership::Attempt { ticket: lifecycle::Ticket { task_id: tid.into(), session: claim_session(cfg, tid) }, host: cfg.label.clone().unwrap_or_default(), generation, attempt_id: execution.attempt_id.clone() },
+            cfg: cfg.clone(), title: title.into(), worktree: worktree.clone(), scratch: scratch.clone(), started_at: now_ms(),
+            agent: worker_session::Agent { workdir: run_dir.clone(), bin: bc.bin.clone().unwrap_or_else(|| cfg.opencode_bin.clone()), backend: if backend == opencode::Backend::Kiro { "kiro" } else { "opencode" }.into(), agent: agent_profile.clone(), model: model_str.clone(), prompt: prompt.clone(), resume: resume_session.clone(), config: mcp_json.clone(), mode: bc_mode.clone() } };
+        match worker_session::launch(spec, cancel.clone()) {
+            Ok(worker) => in_flight.push(worker),
+            Err(error) => dlog(tid, &format!("independent worker launch held: {error}; retain exact attempt ownership")),
+        }
+        return;
+    }
     let outcome = {
         let cfg2 = cfg.clone();
         let tid2 = tid.to_string();
         let bin = bc.bin.clone();
         let control = execution.control.clone();
         let execution_for_task = execution.clone();
+        let terminal_worktree = worktree.clone();
         let completion_signal = CompletionSignal(completed.clone());
         let (tx, rx) = std::sync::mpsc::channel::<opencode::RunOutcome>();
         std::thread::spawn(move || {
@@ -3986,10 +3772,8 @@ fn spawn_opencode(
             // Capture at transport return, not after the main loop gets around
             // to draining this receiver. A daemon crash during another task's
             // network finalization must not lose this stopped-writer proof.
-            if execution_for_task.control.quiesced.load(Ordering::SeqCst) {
-                if let Err(error) = persist_stopped_receipt(&cfg2, &tid2, &execution_for_task, true) {
-                    dlog(&tid2, &format!("transport stopped proof could not be persisted: {error}"));
-                }
+            if let Err(error) = gateway_pipeline::capture(&cfg2, &tid2, &execution_for_task, &out, terminal_worktree) {
+                dlog(&tid2, &format!("terminal result could not be persisted; retain ownership: {error}"));
             }
             if backend == opencode::Backend::Kiro {
                 if let Some(sid) = &out.session_id {
@@ -4013,6 +3797,7 @@ fn spawn_opencode(
         rx: outcome,
         live,
         execution,
+        worker: None,
     });
     // ephemeral state file: headless observability (removed on completion)
     write_task_state(
@@ -4026,8 +3811,6 @@ fn spawn_opencode(
             "worktree": in_flight.last().and_then(|i| i.worktree.clone()).map(|p| p.to_string_lossy().to_string()),
         }),
     );
-    snap_in_flight_list(snap, in_flight);
-    write_runner_state(snap);
     dlog(tid, &format!("worker launched after {}ms preparation", preparation_started.elapsed().as_millis()));
 }
 
@@ -4074,1331 +3857,31 @@ impl CircuitBreaker {
     fn tripped(&self) -> bool { self.tripped }
 }
 
-fn tick(
-    cfg: &DispatchConfig,
-    readiness: &GatewayReadiness,
-    id: &mut i64,
-    in_flight: &mut Vec<InFlight>,
-    attempts: &mut HashMap<String, Instant>,
-    fail_counts: &mut HashMap<String, u32>,
-    finished_no_pr: &mut HashSet<String>,
-    gave_up: &mut HashSet<String>,
-    snap: &SharedSnapshot,
-    avail: &mut Vec<opencode::Backend>,
-    last_avail_ok: &mut bool,
-    breaker: &mut CircuitBreaker,
-    live_notes: &mut HashMap<String, (String, Instant, Instant)>,
-    gated_announced: &mut HashSet<String>,
-    stop: &AtomicBool,
-) -> Result<Vec<String>, String> {
-    let mut msgs = Vec::new();
-
-    dispatch_stage(snap, DispatchStage::Readiness);
-    // dispatchability gate: re-check every tick (cheap: one --version per
-    // backend). No dispatchable agent -> never claim, never orient; drain
-    // in-flight sessions, then EXIT non-zero. This is fatal, not a wait
-    // state: the old behaviour edge-printed the error once and sat silent
-    // behind a "healthy" systemd unit for hours (hermes, 2026-10-23 — the
-    // single stderr line landed in an unreadable journal). Now: loud every
-    // tick while draining, then exit(1) — systemd reports the failure and
-    // Restart=on-failure retries every 10s, re-reporting until fixed.
-    *avail = available_backends(cfg);
-    let avail_ok = !avail.is_empty();
-    if !avail_ok {
-        if let Some(name) = cfg.backends.keys().next() {
-            let capabilities = capability_inventory(cfg, &[], None, name);
-            let _ = execution_call(cfg, "gateway", json!({ "kind": "advertise", "capabilities": capabilities }));
-        }
-        let msg = "FATAL: no dispatchable agents (CLI missing/unrunnable or model unconfigured) — run `bridge doctor`; exiting so systemd reports it (in-flight sessions drain first)";
-        dlog("", msg);
-        snap_activity(snap, "error", msg);
-        if in_flight.is_empty() {
-            std::process::exit(1);
-        }
-    } else if !*last_avail_ok {
-        dlog("", "agents available — resuming claims");
-        snap_activity(snap, "info", "agents available — resuming claims");
-    }
-    *last_avail_ok = avail_ok;
-    let mut prepared_worker = match readiness.proof(cfg) {
-        Ok(proof) => Some((proof.worker, proof.observed)),
-        Err(error) => {
-            // A refused background credential must still reach the existing
-            // gateway auth-heal ladder, rather than silently waiting forever.
-            if classify_hub_error(&error) == HubErrClass::Auth { return Err(error); }
-            dlog("", &format!("execution protocol not ready: {error}; waiting for independent readiness renewal"));
-            None
-        }
-    };
-
-    // Lease/action/inbox clocks are independent of stdout. A lost hub or an
-    // expired action budget stops the process group; it never buys more work
-    // merely because the model keeps printing. No hot interrupt API is assumed.
-    for inf in in_flight.iter_mut() {
-        if !inf.execution.control.stop.load(Ordering::SeqCst) && inf.execution.last_checkpoint.elapsed() >= Duration::from_secs(300) {
-            dispatch_stage(snap, DispatchStage::Checkpoint);
-            if let Some(path) = inf.worktree.as_deref() {
-                if let Err(e) = inf.execution.checkpoint(cfg, &inf.task_id, path) {
-                    dlog(&inf.task_id, &format!("checkpoint publication failed: {e}; retain local WIP/host affinity"));
-                }
-            }
-            inf.execution.last_checkpoint = Instant::now();
-        }
-    }
-
-    // 1. drain finished sessions: finalize each (progress + in_review + cleanup)
-    dispatch_stage(snap, DispatchStage::Finalizing);
-    let mut finished: Vec<(InFlight, opencode::RunOutcome)> = Vec::new();
-    in_flight.retain_mut(|inf| match inf.rx.try_recv() {
-        Ok(outcome) => {
-            finished.push((
-                InFlight {
-                    task_id: inf.task_id.clone(),
-                    completed: inf.completed.clone(),
-                    task_title: inf.task_title.clone(),
-                    role_work: inf.role_work,
-                    started: inf.started,
-                    last_note: inf.last_note.clone(),
-                    pr_url: inf.pr_url.clone(),
-                    worktree: inf.worktree.clone(),
-                    scratch: inf.scratch.clone(),
-                    rx: std::sync::mpsc::channel().1,
-                    live: inf.live.clone(),
-                    execution: inf.execution.clone(),
-                },
-                outcome,
-            ));
-            false
-        }
-        Err(TryRecvError::Empty) => true,
-        Err(TryRecvError::Disconnected) => {
-            // sender thread died without sending (panic) — treat as failure
-            finished.push((
-                InFlight {
-                    task_id: inf.task_id.clone(),
-                    completed: inf.completed.clone(),
-                    task_title: inf.task_title.clone(),
-                    role_work: inf.role_work,
-                    started: inf.started,
-                    last_note: inf.last_note.clone(),
-                    pr_url: inf.pr_url.clone(),
-                    worktree: inf.worktree.clone(),
-                    scratch: inf.scratch.clone(),
-                    rx: std::sync::mpsc::channel().1,
-                    live: inf.live.clone(),
-                    execution: inf.execution.clone(),
-                },
-                opencode::RunOutcome {
-                    ok: false,
-                    exit_code: None,
-                    timed_out: false,
-                    stdout_tail: String::new(),
-                    stderr_tail: "runner thread died (no outcome)".into(),
-                    session_id: None,
-                },
-            ));
-            false
-        }
-    });
-    if !finished.is_empty() {
-        snap_in_flight_list(snap, in_flight);
-    }
-    // liveness vouch: a session whose stdout/ACP stream is moving is WORKING.
-    // Vouch via the session_alive op (watchdog signal only — no board event,
-    // no progress entry), throttled to one call per ~4m per task and only
-    // when the live line actually changed. The watchdog's 10m stall release
-    // then fires on genuinely dead sessions — not on long quiet stretches of
-    // real work (the churn epidemic: TASK-001 11x, BR#50 11x, BR#552 18x,
-    // BR#911 19x were all live sessions released as "stalled"). Agent
-    // narration keeps flowing over MCP log_progress as before; this is the
-    // runner vouching for the machinery underneath it.
-    for inf in in_flight.iter() {
-        let line = inf.live_line();
-        let e = live_notes
-            .entry(inf.task_id.clone())
-            .or_insert_with(|| (line.clone(), Instant::now(), Instant::now()));
-        if e.0 != line {
-            // operator-visible chatter: the agent's latest output line, head
-            // only, throttled to 1/60s per task. A quiet console here reads
-            // as "hung" to anyone watching (fleet incident 2026-10-22: three
-            // healthy sessions declared timed out looked dead because none
-            // of their output was visible until the verdict).
-            if e.2.elapsed() >= Duration::from_secs(60) && !line.is_empty() {
-                dlog(
-                    &inf.task_id,
-                    &format!("{}m in · {}", inf.started.elapsed().as_secs() / 60, line),
-                );
-                e.2 = Instant::now();
-            }
-            if e.1.elapsed() >= Duration::from_secs(240) {
-                let _ = mcp_call(
-                    cfg,
-                    id,
-                    "session_alive",
-                    json!({ "id": inf.task_id }),
-                );
-                e.1 = Instant::now();
-            }
-            e.0 = line;
-        }
-    }
-
-    for (mut inf, outcome) in finished {
-        write_task_state(&inf.task_id, &json!({ "task_id": inf.task_id, "status": "result_captured", "generation": inf.execution.generation, "attempt_id": inf.execution.attempt_id, "exit_code": outcome.exit_code, "stdout_tail": outcome.stdout_tail, "stderr_tail": outcome.stderr_tail, "worktree": inf.worktree }));
-        // Capture actual stopped-writer proof durably BEFORE any publication
-        // or hub call. A failed finalization used to discard this proof forever
-        // and charge a stopped process against capacity after every outage.
-        inf.execution.stop_maintenance();
-        let stopped = inf.execution.control.quiesced.load(Ordering::SeqCst);
-        let receipt = persist_stopped_receipt(cfg, &inf.task_id, &inf.execution, stopped);
-        if let Err(error) = &receipt { dlog(&inf.task_id, &format!("stopped-writer receipt not recorded: {error}; capacity retained")); }
-        // Transfer/cleanup still needs a real portable checkpoint. Capacity
-        // reconciliation alone never deletes WIP or resolves unknown effects.
-        let published = inf.worktree.as_deref().map(|p| inf.execution.checkpoint(cfg, &inf.task_id, p)).unwrap_or(Ok(()));
-        if let Err(e) = &published { dlog(&inf.task_id, &format!("final checkpoint failed: {e}; worktree retained")); }
-        let quiesced = match receipt {
-            Ok((path, receipt)) => stopped_outbox::deliver(&path, &receipt, now_ms(), |r| send_stopped_receipt(cfg, r))
-                .map_err(|error| dlog(&inf.task_id, &format!("stopped-writer delivery deferred to durable outbox: {error}"))).is_ok(),
-            Err(_) => false,
-        };
-        if inf.execution.control.stop.load(Ordering::SeqCst) {
-            // Deliberate interruption is not a failed implementation/review.
-            // Resume only after the durable checkpoint/quiescence barrier.
-            if quiesced && published.is_ok() {
-                if let Ok(state) = execution_call(cfg, &inf.task_id, json!({ "kind": "inspect" })) {
-                    for m in state["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
-                        let mut cmd = inf.execution.command("ack"); cmd["message_id"] = m["id"].clone(); cmd["state"] = json!("acknowledged");
-                        let _ = execution_call(cfg, &inf.task_id, cmd);
-                    }
-                    let _ = execution_call(cfg, &inf.task_id, inf.execution.command("yield"));
-                }
-                note_task(cfg, &inf.task_id, "runner: writer stopped; checkpoint published and process group quiescent. Coordination/budget interrupt will resume from verified content, not a stdout-based restart.");
-            }
-            attempts.insert(inf.task_id.clone(), Instant::now());
-            continue;
-        }
-        if !quiesced || published.is_err() {
-            note_task(cfg, &inf.task_id, "runner: result captured but portable checkpoint/process quiescence barrier is incomplete. Local work retained; automatic transfer and cleanup held.");
-            attempts.insert(inf.task_id.clone(), Instant::now());
-            continue;
-        }
-        // BR#2460: scratch dirs are disposable on every exit path (yield
-        // included) — the board is the only deliverable, and a resumed run
-        // gets a fresh scratch dir. Unlike worktrees, they hold no resume
-        // assets.
-        live_notes.remove(&inf.task_id);
-        if let Some(s) = inf.scratch.take() {
-            let _ = std::fs::remove_dir_all(s);
-        }
-        let mins = inf.started.elapsed().as_secs() / 60;
-        let pr_url = extract_pr(&outcome.stdout_tail);
-        inf.pr_url = pr_url.clone();
-        let tail = if outcome.stdout_tail.is_empty() {
-            outcome.stderr_tail.clone()
-        } else {
-            outcome.stdout_tail.clone()
-        };
-        let exit_txt = match outcome.exit_code {
-            Some(0) => "exit 0".to_string(),
-            Some(c) => format!("exit {c}"),
-            None if outcome.timed_out => "killed on timeout".to_string(),
-            None => "no exit (crashed?)".to_string(),
-        };
-        let mut note = format!(
-            "runner: run finished — {}, ~{mins}m — {}",
-            exit_txt, tail
-        );
-        if let Some(pr) = &pr_url {
-            note.push_str(&format!("\nPR: {pr}"));
-        }
-        // CLI log: the agent's final reply (first lines, capped) — the full
-        // note goes to the bridge via log_progress below.
-        let reply_excerpt: String = {
-            let lines: Vec<&str> = tail.lines().take(4).collect();
-            let mut s = lines.join(" | ");
-            if s.chars().count() > 300 {
-                s = s.chars().take(300).collect::<String>() + "…";
-            }
-            s
-        };
-        let outcome_ok = outcome.ok && !void_run(&outcome.stdout_tail, &outcome.stderr_tail);
-        // BR#3352: an ok run with an EMPTY result payload is a delivery loss,
-        // not a clean finish — the hub would receive a bare "run finished"
-        // with nothing to verify while the side effects (worktree, PRs) sit
-        // on disk/GitHub. Record the outcome class + the local receipts so
-        // the board can distinguish "ran, report lost" from "abandoned" and
-        // flag the delivery channel instead of scoring an abandonment.
-        let result_lost = outcome_ok && tail.trim().is_empty();
-        if result_lost {
-            note.push_str(&format!(
-                "\ncompleted_result_lost — agent reply was empty (result payload lost in capture){}",
-                result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
-            ));
-        }
-        dlog(
-            &inf.task_id,
-            &format!(
-                "{} in ~{}m — agent reply: {}",
-                if outcome.timed_out {
-                    "TIMED OUT"
-                } else if !outcome_ok {
-                    "FAILED"
-                } else {
-                    "finished"
-                },
-                mins,
-                reply_excerpt
-            ),
-        );
-        // final progress (with 100% on success) is logged AFTER the handoff —
-        // a task must never sit in_progress showing 100% because a gate
-        // rejected the close. See the handoff match below.
-        // hard rule (BR#877): a run that performed no work — non-zero exit,
-        // timeout, or a guardrail-void dispatch — can NEVER hand off. Void
-        // runs still exit 0, so the exit code alone is not enough.
-        if outcome_ok {
-            breaker.record_success();
-        } else if claim_race_run(&outcome.stdout_tail, &outcome.stderr_tail) {
-            // BR#3337: a session that died racing for a claim performed no
-            // work and proves nothing about the agent CLI — not a dispatch
-            // failure, the breaker stays untouched.
-            dlog(
-                &inf.task_id,
-                "lost a claim race (gate rejections, no work) — not a dispatch failure",
-            );
-            snap_activity(snap, "info", &format!("{} — claim race, not a dispatch failure", inf.task_id));
-        } else {
-            breaker.record_failure(&outcome.stdout_tail, &outcome.stderr_tail);
-        }
-        // persist final state (incl. PR link and exit code) before handoff
-        write_task_state(
-            &inf.task_id,
-            &serde_json::json!({
-                "task_id": &inf.task_id,
-                "task_title": &inf.task_title,
-                "status": if outcome_ok { "finished" } else { "failed" },
-                "started_ts": now_ms() - inf.started.elapsed().as_millis() as u64,
-                "ended_ts": now_ms(),
-                "exit_code": outcome.exit_code,
-                "pr_url": &pr_url,
-                "last_note": &note,
-                "stdout_tail": &outcome.stdout_tail,
-                "result_lost": result_lost,
-            }),
-        );        if outcome_ok {
-            // YIELD check first: the agent may have blocked/bounced/closed the
-            // task mid-run (ask filed, yielded per the contract). Query the live
-            // status — if the task is no longer in_progress, the agent's state
-            // change is authoritative: release the slot, KEEP the worktree and
-            // session (they're the resume assets), touch nothing server-side.
-            let live_status = mcp_call(cfg, id, "get_artefact", json!({ "id": inf.task_id }))
-                .ok()
-                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from));
-            if let Some(st) = &live_status {
-                if st != "in_progress" {
-                    attempts.remove(&inf.task_id);
-                    // the task left the runner (agent blocked/bounced/closed it
-                    // mid-run) — drop the ephemeral state file too, not just on
-                    // handoff; a retained file made finished tasks look in-flight
-                    remove_task_state(&inf.task_id);
-                    // BR#3352: a completed run's result must reach the hub
-                    // even when the claim was lost mid-run. A watchdog release
-                    // ("stalled") while the session kept working is NOT the
-                    // agent yielding — dropping the result here is exactly the
-                    // "ran, report lost" class the board then scored as
-                    // abandoned. todo → re-claim and hand the finished work
-                    // off below; any other state was the agent's own deliberate
-                    // move → deliver the result as a note and touch nothing.
-                    if st == "todo" {
-                        match mcp_call_task(
-                            cfg,
-                            id,
-                            "transition",
-                            json!({
-                                "id": inf.task_id,
-                                "to": "in_progress",
-                                "note": "runner: re-claiming a COMPLETED run — the watchdog released it mid-run while the session kept working; handing the finished work off",
-                            }),
-                            &inf.task_id,
-                        ) {
-                            Ok(_) => {
-                                snap_activity(snap, "info", &format!("{} re-claimed a completed run (was released mid-run) — handing off", inf.task_id));
-                                msgs.push(format!("{} — completed run re-claimed after a mid-run release; handing off", inf.task_title));
-                            }
-                            Err(e) => {
-                                // claim raced (another agent picked it up) or a
-                                // gate refused — fall back to delivering the
-                                // result as a note; the hub still learns what
-                                // happened either way.
-                                snap_activity(snap, "info", &format!("{} re-claim after release failed: {} — delivering result as a note", inf.task_id, truncate(&e, 80)));
-                                let late_note = if tail.trim().is_empty() {
-                                    format!(
-                                        "completed_result_lost — run finished ({exit_txt}, ~{mins}m) after the claim was lost; agent reply was empty (result payload lost in capture){} — result delivered late by the runner",
-                                        result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
-                                    )
-                                } else {
-                                    format!("runner: run finished AFTER release ({exit_txt}, ~{mins}m) — result delivered late: {}", truncate(&tail, 400))
-                                };
-                                let _ = mcp_call_task(
-                                    cfg,
-                                    id,
-                                    "log_progress",
-                                    json!({ "id": inf.task_id, "note": late_note, "sentiment": "neutral" }),
-                                    &inf.task_id,
-                                );
-                                msgs.push(format!("{} — completed after release; result delivered as a note (re-claim failed: {})", inf.task_title, truncate(&e, 60)));
-                                continue;
-                            }
-                        }
-                    } else {
-                        let late_note = if tail.trim().is_empty() {
-                            format!(
-                                "completed_result_lost — run finished ({exit_txt}, ~{mins}m) but the task is now {st}; agent reply was empty (result payload lost in capture){} — result delivered late by the runner",
-                                result_lost_receipts(inf.worktree.as_ref().and_then(|p| p.to_str()), pr_url.as_deref())
-                            )
-                        } else {
-                            format!("runner: run finished AFTER the task moved to {st} ({exit_txt}, ~{mins}m) — result delivered late: {}", truncate(&tail, 400))
-                        };
-                        let _ = mcp_call_task(
-                            cfg,
-                            id,
-                            "log_progress",
-                            json!({ "id": inf.task_id, "note": late_note, "sentiment": "neutral" }),
-                            &inf.task_id,
-                        );
-                    }
-                    if st != "todo" {
-                        snap_activity(snap, "info", &format!("{} yielded — task now {}, session retained for resume", inf.task_id, st));
-                        msgs.push(format!("{} yielded ({}) — released, worktree + session kept", inf.task_title, st));
-                        continue;
-                    }
-                }
-            }
-            // VERIFY/ANALYSIS tasks ARE the review: their completion closes them
-            // (done with receipts in the note) — pushing them to in_review would
-            // demand a review of a review and loop forever. IMPL tasks hand off
-            // to in_review (a Verify child then checks the PR).
-            // role tags recorded at claim time are authoritative; the title
-            // heuristic remains as fallback for legacy in-flight entries
-            let title_lower = inf.task_title.to_lowercase();
-            let is_review_work = inf.role_work
-                || title_lower.starts_with("verify:") || title_lower.contains("verify ")
-                || title_lower.contains("analysis child") || title_lower.contains("review child")
-                || title_lower.starts_with("receipt");
-            let receipt_note = if pr_url.is_some() {
-                note.clone()
-            } else {
-                format!("{note}\nverified against: task artefact + history receipts (exit 0, session {})", claim_session(cfg, &inf.task_id))
-            };
-            // worker-lane signal: a session that ended with BR-BLOCKED: hit a
-            // blocker mid-run. The gateway files the block (and the ask the
-            // session cannot file itself — it has no bridge access). This
-            // takes precedence over done/in_review handoff.
-            let blocked_marker = outcome
-                .stdout_tail
-                .lines()
-                .rev()
-                .find_map(|l| l.trim().strip_prefix("BR-BLOCKED:").map(|r| r.trim().to_string()));
-            let (transition_to, handoff_note) = if let Some(reason) = &blocked_marker {
-                ("blocked", format!("worker session blocked itself — {reason}"))
-            } else if is_review_work {
-                ("done", receipt_note)
-            } else {
-                ("in_review", note)
-            };
-            match mcp_call_task(
-                cfg,
-                id,
-                "transition",
-                json!({
-                    "id": inf.task_id,
-                    "to": transition_to,
-                    "note": handoff_note,
-                    "unblock_condition": blocked_marker.as_deref().unwrap_or(""),
-                }),
-                &inf.task_id,
-            ) {
-                Ok(_) => {
-                    // handoff succeeded — NOW the task may show 100%: the run's
-                    // duty is complete (done, or impl complete awaiting verify)
-                    let _ = mcp_call_task(
-                        cfg,
-                        id,
-                        "log_progress",
-                        json!({
-                            "id": inf.task_id,
-                            "note": format!("runner: handed off to {} — complete", transition_to),
-                            "sentiment": "converging",
-                            "completion_pct": 100,
-                        }),
-                        &inf.task_id,
-                    );
-                    remove_task_state(&inf.task_id);
-                    attempts.remove(&inf.task_id);
-                    finished_no_pr.insert(inf.task_id.clone());
-                    if transition_to == "done" && inf.worktree.is_some() {
-                        // terminal: worktree + branch served their purpose —
-                        // the teardown sweep preserves uncommitted state onto
-                        // wip/<task>-<date> before the tree goes (BR#3204:
-                        // branch, never main; the PR branch itself is dropped)
-                        if let Some(preserved) = cleanup_worktree_at(inf.worktree.as_ref().unwrap(), &inf.task_id, true) {
-                            msgs.push(format!("{} — teardown sweep preserved WIP on {preserved}", inf.task_id));
-                        }
-                    }
-                    msgs.push(format!(
-                        "{} → {}{}",
-                        inf.task_title,
-                        transition_to,
-                        pr_url.as_ref().map(|p| format!(" — PR {p}")).unwrap_or_default()
-                    ));
-                }
-                Err(e) => {
-                    // gate rejected the handoff (e.g. receipts rejected, no PR).
-                    // BR#2419: the runner owns no state semantics — release the
-                    // claim back to the pool with the rejection as the note.
-                    // The worker owns consequences: its gates emitted this
-                    // rejection, its churn guard redirects repeats (escalate
-                    // verdict duties at 3 releases, redirect impl at 5), its
-                    // audit records everything.
-                    let release_note = format!(
-                        "runner: handoff to {transition_to} rejected — {e}. Run completed (~{mins}m, exit 0); session + worktree retained.",
-                    );
-                    match mcp_call_task(
-                        cfg,
-                        id,
-                        "transition",
-                        json!({ "id": inf.task_id, "to": "todo", "note": release_note }),
-                        &inf.task_id,
-                    ) {
-                        Ok(_) => {
-                            snap_activity(snap, "info", &format!("{} released after handoff rejection", inf.task_id));
-                            msgs.push(format!("{} → todo (handoff rejected: {}) — worker churn guard owns repeats", inf.task_title, truncate(&e, 100)));
-                        }
-                        Err(e2) => {
-                            msgs.push(format!("{} handoff AND release failed: {e2} — manual attention needed", inf.task_title));
-                        }
-                    }
-                    finished_no_pr.insert(inf.task_id.clone());
-                    remove_task_state(&inf.task_id);
-                }
-            }
-        } else {
-            // deterministic config errors (bad agent profile, bad model id,
-            // auth) replay identically on every retry — retrying is pure
-            // churn. BR#2419: release the claim (state semantics live in the
-            // worker); stop retrying ON THIS HOST only.
-            if is_config_error(&outcome.stdout_tail) || is_config_error(&outcome.stderr_tail) {
-                let release_note = format!(
-                    "runner: agent CLI config error (deterministic — not retrying on this host): {}",
-                    truncate(&tail, 220)
-                );
-                let _ = mcp_call(
-                    cfg,
-                    id,
-                    "transition",
-                    json!({
-                        "id": inf.task_id,
-                        "to": "todo",
-                        "note": release_note,
-                    }),
-                );
-                gave_up.insert(inf.task_id.clone());
-                attempts.remove(&inf.task_id);
-                fail_counts.remove(&inf.task_id);
-                remove_task_state(&inf.task_id);
-                msgs.push(format!("{} released (agent config error — no retries on this host): {}", inf.task_title, truncate(&tail, 120)));
-                snap_activity(snap, "error", &format!("{} released — deterministic agent config error", inf.task_id));
-                if let Some(wt) = &inf.worktree {
-                    // released (config error): branch kept for re-claim, WIP
-                    // preserved onto wip/<task>-<date> before the tree goes
-                    if let Some(preserved) = cleanup_worktree_at(wt, &inf.task_id, false) {
-                        msgs.push(format!("{} — teardown sweep preserved WIP on {preserved}", inf.task_id));
-                    }
-                }
-                snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
-                continue;
-            }
-            // failed/timed out — backoff and retry, capped. Retry loops must
-            // NOT keep logging progress on the task: every runner note
-            // refreshes last_progress.ts and defeats the watchdog (the task
-            // then looks alive forever while the session does nothing).
-            let n = fail_counts.entry(inf.task_id.clone()).or_insert(0);
-            *n += 1;
-            let fails = *n;
-            if fails >= 3 {
-                let void_cause = void_run(&outcome.stdout_tail, &outcome.stderr_tail);
-                let note = if void_cause {
-                    format!("runner: dispatch VOID — no valid completion, 3 attempts — released for execution repair; cause: {}", truncate(&tail, 300))
-                } else {
-                    "runner: opencode failed 3 attempts (last: timed out or exited non-zero) — released for attention".to_string()
-                };
-                let _ = mcp_call(
-                    cfg,
-                    id,
-                    "transition",
-                    json!({
-                        "id": inf.task_id,
-                        "to": "todo",
-                        "note": note,
-                    }),
-                );
-                gave_up.insert(inf.task_id.clone());
-                attempts.remove(&inf.task_id);
-                fail_counts.remove(&inf.task_id);
-                remove_task_state(&inf.task_id);
-                msgs.push(format!("{} failed {}x — released for attention (no more runner retries on this host)", inf.task_title, fails));
-            } else {
-                attempts.insert(inf.task_id.clone(), Instant::now());
-                msgs.push(format!("{} failed/timed out — left in_progress (backoff, attempt {}/3)", inf.task_title, fails));
-            }
-        }
-        // PR monitoring v1: record the handoff so the review flow can be tracked;
-        // automated verdict reaction (CI fail → bounce + fix) lands with the PR watch loop
-        if let Some(pr) = pr_url {
-            let _ = mcp_call(
-                cfg,
-                id,
-                "log_progress",
-                json!({ "id": inf.task_id, "note": format!("runner: watching PR {pr} — awaiting verify verdict"), "sentiment": "neutral" }),
-            );
-        }
-        // worktree + branch persist through in_review / bounce / failure — they
-        // are the handoff assets (session resume or branch checkout). Only a
-        // terminal `done` (handled above) tears them down.
-        snap_activity(snap, "finish", &msgs.last().cloned().unwrap_or_default());
-    }
-
-    // relay, not heartbeat: the AGENT owns progress callbacks. The runner only
-    // RELAYS the agent's actual stdout line — real agent output, attributed as
-    // a relay — so the board never shows fabricated progress. With human-style
-    // reporting (the default), agents narrate milestones in their stdout, so
-    // the relay is the liveness signal; when the agent is silent (no output
-    // yet, or unchanged since the last poll) the relay stays quiet — a bare
-    // "alive Nm" line every poll doubles context re-reads for no information.
-    // A liveness fallback only exists in explicit report_minutes mode.
-    for inf in in_flight.iter_mut() {
-        let live = inf.live_line();
-        if live.is_empty() {
-            if cfg.report_minutes.is_some() {
-                let mins = inf.started.elapsed().as_secs() / 60;
-                if let Err(e) = mcp_call(
-                    cfg,
-                    id,
-                    "log_progress",
-                    json!({
-                        "id": inf.task_id,
-                        "note": format!("runner: alive ~{mins}m, no agent output yet"),
-                        "sentiment": "neutral",
-                    }),
-                ) {
-                    dlog(&inf.task_id, &format!("error: relay failed: {e}"));
-                }
-            }
-            continue;
-        }
-        if inf.last_note == live {
-            continue; // unchanged since last poll — nothing new to relay
-        }
-        let note = format!("runner: agent output — {live}");
-        if let Err(e) = mcp_call(
-            cfg,
-            id,
-            "log_progress",
-            json!({
-                "id": inf.task_id,
-                "note": note,
-                "sentiment": "neutral",
-            }),
-        ) {
-            dlog(&inf.task_id, &format!("error: relay failed: {e}"));
-        } else if let Ok(mut s) = snap.lock() {
-            if let Some(f) = s.in_flight.iter_mut().find(|f| f.task_id == inf.task_id) {
-                f.last_note = live.clone();
-            }
-        }
-    }
-    if !in_flight.is_empty() {
-        snap_in_flight_list(snap, in_flight);
-    }
-
-    // 3. capacity? nothing to schedule if all sessions busy
-    if in_flight.len() >= cfg.max_sessions {
-        return Ok(msgs);
-    }
-
-    // 3b. dispatchability gate: no agents -> do not orient, do not claim
-    if !avail_ok || stop.load(Ordering::SeqCst) || update_request().is_some() {
-        return Ok(msgs);
-    }
-    let Some((worker_credential, readiness_observed)) = prepared_worker.as_mut() else { return Ok(msgs); };
-
-    // 3c. circuit breaker: agent CLI is failing deterministically — stop
-    // claiming. Persist a bounded cooldown at the hub so operators see the
-    // cause and recovery does not require a process restart.
-    if breaker.tripped() {
-        let reason = format!("{} consecutive dispatch failures ({})", breaker.consecutive_failures, breaker.last_signature);
-        execution_call(cfg, "gateway", json!({ "kind": "gateway_failure", "reason": reason, "cooldown_ms": 300_000 }))?;
-        msgs.push(format!("CIRCUIT BREAKER — {reason}; hub cooldown for 5m, then readiness is re-proved"));
-        *breaker = CircuitBreaker::default();
-        return Ok(msgs);
-    }
-
-    // 4. orient — once per tick when we have capacity
-    dispatch_stage(snap, DispatchStage::Admission);
-    let orient = mcp_call(cfg, id, "orient", json!({}))?;
-    // BR#2844: silent zeros die here. A drifted orient shape (the renamed-key
-    // incident that emptied the work lists) is now a loud tick error naming
-    // the drift, not an empty candidate list that looks like a quiet board.
-    orient_contract_error(&orient)?;
-    // BR#4113: orient got through — the hub accepted this device's token.
-    // Clear any sustained-auth-failure park; run_loop re-arms its heal
-    // pacing from this flag on the Ok arm.
-    snap_needs_attention_clear(snap);
-    let policy = orient
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Follow the bridge protocol card: claim before coding, heartbeat every 10 min, ask when uncertain, finish with a PR.")
-        .to_string();
-
-    // 5. previously-dispatched work still open → RESUME it first (claims persist;
-    // the opencode session is rediscoverable by its deterministic title
-    // bridge-<task_id>, so mid-flight runs survive runner/app restarts).
-    let my_tasks = orient
-        .get("my_tasks")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let sessions = session_map(&cfg.opencode_bin, &cfg.workdir);
-    let open_mine: Vec<&serde_json::Value> = my_tasks
-        .iter()
-        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
-        .collect();
-    // BR#2844: a malformed item (missing id/title) is tolerated — one weird
-    // row must not zero the list — but it is never silent.
-    let mut malformed_my_tasks = 0usize;
-    for t in open_mine {
-        if in_flight.len() >= cfg.max_sessions {
-            break;
-        }
-        let (Some(tid), Some(title)) = (
-            t.get("id").and_then(|v| v.as_str()),
-            t.get("title").and_then(|v| v.as_str()),
-        ) else {
-            malformed_my_tasks += 1;
-            continue;
-        };
-        if in_flight.iter().any(|inf| inf.task_id == tid) {
-            continue; // already running
-        }
-        // terminal: opencode already finished this task without a PR (analysis
-        // /verification work). Never re-dispatch a completed session.
-        if finished_no_pr.contains(tid) || gave_up.contains(tid) {
-            continue;
-        }
-        // backoff: a task that just failed to spawn shouldn't retry every tick
-        if gave_up.contains(tid) {
-            continue; // handed off for attention — the watchdog owns it now
-        }
-        if attempts
-            .get(tid)
-            .map(|a| a.elapsed() < Duration::from_secs(300))
-            .unwrap_or(false)
-        {
-            continue; // silent backoff: runner bookkeeping must not look like agent activity
-        }
-        // BR#3337: liveness check FIRST — never claim-and-fail a race.
-        // get_artefact re-reads the card fresh (the orient slice can be
-        // seconds stale) and carries the hub heartbeat in meta
-        // (session_alive_ts / last_progress.ts).
-        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-        if let Some(session) = art.pointer("/meta/session").and_then(|v| v.as_str()) { remember_claim_session(cfg, tid, session); }
-        let body_md = art.get("body_md").and_then(|b| b.as_str()).map(String::from).unwrap_or_default();
-        let mut task_meta = art.get("meta").cloned().unwrap_or(json!({}));
-        task_meta["execution_project"] = art["project"].clone();
-        if !avail.iter().any(|b| backend_satisfies(cfg, *b, &task_meta)) {
-            if gated_announced.insert(format!("{tid}:reasoning")) { dlog(tid, "SKIP: persistent minimum reasoning tier unavailable on this host"); }
-            continue;
-        }
-        let meta_obj = task_meta.as_object();
-        let sess = find_session(&sessions, tid);
-        if execution_call(cfg, tid, json!({ "kind": "inspect" })).map(|state| quiesced_claim_can_resume(&state, &art, cfg.label.as_deref())).unwrap_or(false) {
-            let role_work = art["roles"].as_array().map(|roles| roles.iter().any(|role| matches!(role.as_str(), Some("analysis" | "review" | "unblock")))).unwrap_or(false);
-            // Authoritative quiescence beats an old conversation's recent
-            // timestamp. Keep the claim/session; begin restores/fences anew.
-            spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, sess.map(|s| s.id.clone()), role_work, "task", avail, in_flight, worker_credential, readiness_observed);
-            attempts.insert(tid.to_string(), Instant::now());
-            continue;
-        }
-        let disposition = claim_liveness(
-            sess.and_then(|s| s.updated_ms),
-            meta_obj.and_then(|m| m.get("session_alive_ts")).and_then(|v| v.as_u64()),
-            meta_obj
-                .and_then(|m| m.get("last_progress"))
-                .and_then(|p| p.get("ts"))
-                .and_then(|v| v.as_u64()),
-            now_ms(),
-        );
-        match disposition {
-            ClaimLiveness::Live => {
-                // a live session owns this card — skip silently. Re-dispatching
-                // into a live session would double-spawn it; resuming a live
-                // session would race it. Its own MCP calls deliver the work.
-                continue;
-            }
-            ClaimLiveness::Stale => {
-                // the dispatched session died holding its claim: release the
-                // stale claim (in_progress → todo), then claim fresh and spawn
-                // a new session (never resume a dead conversation).
-                // BR#3823: only when the LIVE card still says so. The slice +
-                // liveness verdict can be stale by the time we act — the
-                // watchdog stall-release may have already redirected the card
-                // (blocked) or another dispatcher may hold it. Re-check the
-                // freshly-fetched card: still in_progress AND still attributed
-                // to this runner, else skip the release, the note, and the
-                // re-claim (debug only — the card is not ours to release).
-                let mine = agent_identity(cfg);
-                if !stale_claim_live(&art, &mine) {
-                    dlog(
-                        tid,
-                        &format!(
-                            "stale-claim check — card now {status}/{owner} (not in_progress/not mine) — skipping release + re-claim (BR#3823)",
-                            status = art.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-                            owner = art.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
-                        ),
-                    );
-                    snap_activity(
-                        snap,
-                        "info",
-                        &format!("{tid} stale-claim skipped — card moved on, not ours to release (BR#3823)"),
-                    );
-                    continue;
-                }
-                match release_claim(cfg, tid, "runner: stale claim released — session died") {
-                    ReleaseOutcome::Released => {}
-                    ReleaseOutcome::ClaimRace => {
-                        // the release was refused (claim race) — the card was
-                        // NOT released, so there is nothing to re-claim: the
-                        // card is the watchdog's or another dispatcher's now.
-                        dlog(tid, "stale release raced (gate refused) — card not released, skipping re-claim (BR#3823)");
-                        snap_activity(
-                            snap,
-                            "info",
-                            &format!("{tid} stale release raced — skipped (BR#3823)"),
-                        );
-                        continue;
-                    }
-                    ReleaseOutcome::Failed(e) => {
-                        dlog(tid, &format!("error: stale release failed: {e}"));
-                        snap_activity(snap, "error", &format!("stale release {tid} failed: {e}"));
-                        attempts.insert(tid.to_string(), Instant::now());
-                        continue;
-                    }
-                }
-                // BR#3823: the re-claim leg carries a resolution note — if the
-                // card was redirected to blocked between our release and this
-                // claim, the note re-stamps the card's own blocked reason +
-                // unblock condition so the blocked → in_progress leg passes
-                // unblock-needs-resolution (a note-less re-claim there folded
-                // as a second breach-'other', specimen BR#3299).
-                let live = mcp_call(cfg, id, "get_artefact", json!({ "id": tid })).unwrap_or(json!({}));
-                let reclaim_note = reclaim_resolution_note(&live);
-                match mcp_call_task(
-                    cfg,
-                    id,
-                    "transition",
-                    json!({ "id": tid, "to": "in_progress", "note": reclaim_note }),
-                    &tid,
-                ) {
-                    Ok(_) => {}
-                    Err(e) if is_claim_race_error(&e) => {
-                        // raced between release and re-claim — another
-                        // dispatcher won the card; skip, it is theirs now
-                        dlog(tid, "stale claim released, re-claim raced — skipping");
-                        snap_activity(
-                            snap,
-                            "info",
-                            &format!("{tid} re-claim raced after stale release — skipped"),
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        dlog(tid, &format!("error: re-claim failed: {e}"));
-                        snap_activity(snap, "error", &format!("re-claim {tid} failed: {e}"));
-                        attempts.insert(tid.to_string(), Instant::now());
-                        continue;
-                    }
-                }
-                let _ = mcp_call_task(
-                    cfg,
-                    id,
-                    "log_progress",
-                    json!({ "id": tid, "note": "runner: re-claimed — stale claim released (session died), starting fresh", "sentiment": "neutral" }),
-                    &tid,
-                );
-                let msg = format!("re-claimed {tid} — stale claim released (session died), started fresh");
-                let (role_work, role_type) = t.get("tags").and_then(|v| v.as_array()).map(|a| {
-                    let rt = a.iter().filter_map(|x| x.as_str()).find(|s| s.starts_with("role:")).map(|s| s.trim_start_matches("role:").to_string());
-                    (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
-                }).unwrap_or((false, "task".to_string()));
-                spawn_opencode(cfg, snap, tid, title, &body_md, &task_meta, &policy, None, role_work, &role_type, avail, in_flight, worker_credential, readiness_observed);
-                attempts.insert(tid.to_string(), Instant::now());
-                snap_activity(snap, "dispatch", &msg);
-                msgs.push(msg);
-            }
-        }
-    }
-    if malformed_my_tasks > 0 {
-        msgs.push(format!(
-            "WARN: {malformed_my_tasks} my_tasks item(s) missing id/title — hub contract drift (BR#2844, packages/contracts)"
-        ));
-    }
-
-    // New work is selected AND reserved by the hub. Local history is not a
-    // second scheduling authority: a human release re-enters this path even
-    // when this process previously gave up or cached a refused reference.
-    // Full runners still ask the hub to arrange safe recovery capacity. This
-    // mode cannot reserve more work if local and hub counts temporarily differ.
-    if in_flight.len() >= cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
-        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "request_capacity" }))?;
-        let outcome = serde_json::from_value::<SchedulingOutcome>(scheduling)
-            .map_err(|error| format!("hub scheduling contract drift: {error}"))?;
-        dlog("", &format!("hub capacity request: {outcome:?}"));
-    }
-    let mut reserved_this_tick = HashSet::new();
-    while in_flight.len() < cfg.max_sessions && !stop.load(Ordering::Relaxed) && update_request().is_none() {
-        let scheduling = execution_call(cfg, "gateway", json!({ "kind": "schedule", "mode": "reserve" }))?;
-        let reservation = match serde_json::from_value::<SchedulingOutcome>(scheduling) {
-            Ok(SchedulingOutcome::Reserved { task_id, session, .. }) => (task_id, session),
-            Ok(other) => {
-                let message = format!("hub scheduling: {other:?}");
-                dlog("", &message);
-                snap_activity(snap, "schedule", &message);
-                break;
-            }
-            Err(error) => return Err(format!("hub scheduling contract drift: {error}")),
-        };
-        let (tid, session) = (&reservation.0, &reservation.1);
-        if !reserved_this_tick.insert(tid.clone()) {
-            return Err(format!("{tid}: repeated startup reservation in one refill; stop rather than churn"));
-        }
-        remember_claim_session(cfg, tid, session);
-        let art = mcp_call(cfg, id, "get_artefact", json!({ "id": tid }))?;
-        if art["status"].as_str() != Some("in_progress") || art.pointer("/meta/session").and_then(|v| v.as_str()) != Some(session.as_str()) {
-            return Err(format!("{tid}: reservation changed before launch; preserving current holder"));
-        }
-        if in_flight.iter().any(|inf| inf.task_id == *tid) {
-            return Err(format!("{tid}: hub reserved a task with a local writer; refusing duplicate launch"));
-        }
-        gave_up.remove(tid);
-        finished_no_pr.remove(tid);
-        let title = art["title"].as_str().ok_or("reserved task is missing title")?;
-        let body_md = art["body_md"].as_str().unwrap_or("");
-        let mut task_meta = art["meta"].clone();
-        task_meta["execution_project"] = art["project"].clone();
-        let resume_sess = None; // a new reservation is a fresh executor session; WIP remains in the registered worktree
-        let _ = mcp_call_task(
-            cfg,
-            id,
-            "log_progress",
-            json!({ "id": tid, "note": "runner: claimed — preparing verified worker launch", "sentiment": "going_well" }),
-            &tid,
-        );
-        let msg = match &resume_sess {
-            Some(s) => format!("claimed {tid} — resuming opencode session {s}"),
-            None => format!("claimed {tid} — worker launch requested"),
-        };
-        let (role_work, role_type) = art.get("roles").and_then(|v| v.as_array()).map(|a| {
-            let rt = a.iter().filter_map(|x| x.as_str()).find(|s| matches!(*s, "review" | "analysis" | "unblock")).map(str::to_string);
-            (rt.is_some(), rt.unwrap_or_else(|| "task".into()))
-        }).unwrap_or((false, "task".to_string()));
-        let before_launch = in_flight.len();
-        spawn_opencode(cfg, snap, tid, title, body_md, &task_meta, &policy, resume_sess, role_work, &role_type, avail, in_flight, worker_credential, readiness_observed);
-        attempts.insert(tid.to_string(), Instant::now());
-        if in_flight.len() > before_launch {
-            snap_activity(snap, "dispatch", &msg);
-            msgs.push(msg);
-        } else {
-            snap_activity(snap, "error", &format!("{tid}: startup did not launch a worker; claim reconciliation recorded"));
-            // A task-specific pre-spawn interruption must not leave every
-            // other slot idle for another poll interval. Continue only after
-            // authoritative no-writer proof; schedule rechecks gateway readiness
-            // and capacity for EVERY next reservation. Unknown effects stay held.
-            match execution_call(cfg, tid, json!({ "kind": "inspect" })) {
-                Ok(state) if failed_launch_has_no_writer(&state) && reserved_this_tick.len() < cfg.max_sessions + 8 => {
-                    dlog(tid, "no writer after startup reconciliation; continuing capacity refill");
-                }
-                _ => break,
-            }
-        }
-    }
-
-    Ok(msgs)
-}
 pub fn run_loop(cfg: Option<DispatchConfig>, stop: Arc<AtomicBool>, running: Arc<AtomicBool>, last_error: Arc<Mutex<Option<String>>>, snap: SharedSnapshot) {
-    // no config → device pairing (needs BRIDGE_URL; prints the code to console)
     let cfg = match cfg {
-        Some(c) => c,
-        None => match std::env::var("BRIDGE_URL") {
-            Ok(url) => match pair_device(url.trim_end_matches('/')) {
-                Ok(c) => {
-                    if let Err(e) = c.save() {
-                        dlog("", &format!("error: config save failed: {e}"));
-                    }
-                    c
-                }
-                Err(e) => {
-                    if let Ok(mut g) = last_error.lock() {
-                        *g = Some(e.clone());
-                    }
-                    dlog("", &format!("error: pairing failed: {e}"));
-                    running.store(false, Ordering::Relaxed);
-                    return;
-                }
-            },
-            Err(_) => {
-                let msg = "no config and no BRIDGE_URL — set BRIDGE_URL (or ~/.bridge/config.json) to pair".to_string();
-                dlog("", &msg);
-                if let Ok(mut g) = last_error.lock() {
-                    *g = Some(msg);
-                }
-                running.store(false, Ordering::Relaxed);
-                return;
-            }
+        Some(cfg) => cfg,
+        None => match std::env::var("BRIDGE_URL").map_err(|e| e.to_string()).and_then(|url| pair_device(url.trim_end_matches('/'))) {
+            Ok(cfg) => { if let Err(error) = cfg.save() { dlog("gateway", &error); } cfg },
+            Err(error) => { if let Ok(mut state) = last_error.lock() { *state = Some(error); } running.store(false, Ordering::SeqCst); return; },
         },
     };
-    // Identity law (BR#2455): this app is a gateway. Self-provision and
-    // pairing vend a gateway-class token (gw-*); running on an agent-class
-    // token is an invalid credential state — per-agent provisioning is
-    // impossible and every claim would carry the wrong identity class. Log
-    // out automatically: clear the dead credential and await the next login
-    // (self-provision re-vends, replace-by-principal — no human click beyond
-    // the login). BR#2532: a WRONG-CLASS token is a forced sign-out — the
-    // reason rides the snapshot as a structured notice (an upgrading desktop
-    // gets a guided sign-in, not a silent logout). An EMPTY token is plain
-    // first-run onboarding: no notice, nothing was taken away.
-    if cfg.token.is_empty() || cfg.gateway != Some(true) {
-        let msg = if cfg.token.is_empty() {
-            "no gateway token — sign in to provision this desktop's gateway".to_string()
-        } else {
-            let msg = "signed out automatically — the identity law reserves gateway dispatch for gateway-class tokens, and this device's saved token is not one (it predates gateway-class vending). Nothing was lost: hub URL and settings are kept, and signing in again re-vends a gateway-class token for this same device.";
-            snap_logout(&snap, msg);
-            msg.to_string()
-        };
-        dlog("", &msg);
+    if !cfg.token.is_empty() && cfg.gateway != Some(true) {
+        let msg = "The identity law requires a gateway credential for dispatch. Sign in and reconnect to provision it. Nothing was lost: your hub URL and settings are kept.";
+        snap_logout(&snap, msg);
         logout_core(&stop, &running, &snap, true);
-        if let Ok(mut g) = last_error.lock() {
-            *g = Some(msg.to_string());
-        }
+        if let Ok(mut state) = last_error.lock() { *state = Some(msg.into()); }
         return;
     }
-    running.store(true, Ordering::Relaxed);
-    // BR#2460: scratch session dirs are per-run — anything left under
-    // <workdir>/sessions is an orphan from a previous run (crash/kill);
-    // nothing is in flight at startup, so sweep unconditionally. Normal-path
-    // cleanup happens when each run's outcome lands.
-    let sessions_root = PathBuf::from(&cfg.workdir).join("sessions");
-    if let Ok(entries) = std::fs::read_dir(&sessions_root) {
-        for e in entries.flatten() {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
+    if cfg.token.is_empty() {
+        let error = "gateway execution requires a provisioned gateway-class credential; no workers launched".to_string();
+        if let Ok(mut state) = last_error.lock() { *state = Some(error.clone()); }
+        snap_needs_attention(&snap, &error); running.store(false, Ordering::SeqCst); return;
     }
-    // BR#4104 — gateway-native merge train: this daemon IS an opportunistic
-    // train executor now (BR#3516 edge-executor law, Ray-directed 2026-10-28).
-    // The leg runs on its own thread at MERGE_TRAIN_INTERVAL_SECS (45s
-    // default), contends the per-lane CAS lease exactly like `bridge train`,
-    // and enforces the identity law itself: write legs only under the
-    // worker-class gh credential — a personally-authed gateway reconciles and
-    // reports, then stands down LOUDLY from merge legs (BR#3181). Lease
-    // renewals carry proof-of-progress; MERGE_TRAIN_ENABLED=0 disables
-    // (deploy.md §7).
-    let mut train_stop = Arc::new(AtomicBool::new(update_request().is_some()));
-    let mut train_handle = if update_request().is_none() {
-        crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone())
-    } else { None };
-    // BR#4489 `role: "train"`: a dedicated merge-train node is a normal
-    // gateway in a named mode — the daemon legs (train thread above, WS
-    // connection/transport, epoch self-heal, liveness) keep running; the
-    // DISPATCH loop below skips task claiming entirely. Nothing to dispatch,
-    // nothing claimed. Default (role absent) is unchanged.
-    let dispatch_enabled = cfg.role.as_deref() != Some("train");
-    if !dispatch_enabled {
-        // BR#4400/BR#4412: operator log line — rides the single emit() door,
-        // process-global scope (BR#4733 verify finding: raw tagged eprintln
-        // here survived the original conversion pass).
-        dlog(
-            "",
-            "role: train — dedicated merge-train node: task dispatch OFF, train + connection legs ON",
-        );
+    if let Err(error) = gateway_pipeline::run(cfg, stop, running.clone(), last_error.clone(), snap) {
+        dlog("gateway", &error);
+        if let Ok(mut state) = last_error.lock() { *state = Some(error); }
     }
-    let mut id: i64 = 0;
-    let mut in_flight: Vec<InFlight> = Vec::new();
-    let mut attempts: HashMap<String, Instant> = HashMap::new();
-    let mut fail_counts: HashMap<String, u32> = HashMap::new();
-    let mut finished_no_pr: HashSet<String> = HashSet::new();
-    let mut gave_up: HashSet<String> = HashSet::new();
-    let mut avail: Vec<opencode::Backend> = Vec::new();
-    let mut last_avail_ok = true;
-    let mut breaker = CircuitBreaker::default();
-    let mut live_notes: HashMap<String, (String, Instant, Instant)> = HashMap::new();
-    // gated tasks announce ONCE per app run — visibility without a flood
-    let mut gated_announced: HashSet<String> = HashSet::new();
-    dlog(
-        &cfg.url,
-        &format!(
-            "loop started — poll every {}s, workdir {}, up to {} concurrent sessions",
-            cfg.poll_secs, cfg.workdir, cfg.max_sessions
-        ),
-    );
-    if let Ok(mut s) = snap.lock() {
-        s.running = true;
-        s.url = Some(cfg.url.clone());
-        s.workspace = cfg.ws.clone();
-        s.label = cfg.label.clone();
-        s.agent = cfg.agent.clone();
-        s.workdir = Some(cfg.workdir.clone());
-        s.max_sessions = cfg.max_sessions;
-        s.in_flight.clear();
-    }
-    dispatch_stage(&snap, DispatchStage::Starting);
-    // Self-healing law (BR#2840, BR#3787, BR#4113): a hub-rejected token gets
-    // a repair LADDER — keychain reload (another process may have re-vended),
-    // agent-plane principal repair (headless-safe), then desktop
-    // self-provision (human plane). Bounded: exponential backoff 5s→300s,
-    // then a LOUD needs-attention park — but the loop STAYS RUNNING while
-    // desired state is "running": it keeps polling (each poll re-detects a
-    // hub-side heal) and retries the ladder on the capped cadence, resuming
-    // dispatch on its own the moment the hub accepts this device again.
-    // Never a silent permanent stop, never a credential wipe, never a
-    // wait-for-a-human halt. Every failure reason is logged; a successful
-    // repair re-arms for the NEXT rotation. (The old "loud logout last" tail
-    // and its did_logout footer died with BR#4113: the loop no longer
-    // self-logs-out — the identity-law gate returns before this footer, and
-    // auth failures park instead of exiting.)
-    let mut heal = AuthHeal::new();
-    let mut cfg = cfg;
-    let readiness = dispatch_enabled.then(|| {
-        dispatch_stage(&snap, DispatchStage::Readiness);
-        GatewayReadiness::start(&cfg)
-    });
-    // Separate from admission and per-writer leases: replay survives a stopped
-    // worker, a blocked dispatch tick and daemon replacement. Use the readiness
-    // producer's current credential/config; never keep a rotated token alive.
-    let stopped_delivery = readiness.as_ref().map(|readiness| {
-        let config = readiness.data.clone();
-        let delivery = LeaseMaintenance::start(Duration::from_secs(20), move || {
-            let cfg = config.lock().expect("gateway readiness poisoned").cfg.clone();
-            if let (Some(root), Some(host)) = (stopped_outbox_root(), cfg.label.as_deref()) {
-                for message in stopped_outbox::flush(&root, host, &cfg.url, now_ms(), |r| send_stopped_receipt(&cfg, r)) {
-                    dlog("gateway", &message);
-                }
-            }
-            true
-        });
-        delivery.wake();
-        delivery
-    });
-    loop {
-        if let Some(request) = update_request() {
-            // Natural completion only: do not signal worker stop, discard
-            // receivers, infer quiescence from a lease or kill a live writer.
-            match update_train_barrier(in_flight.len(), &train_stop, &mut train_handle) {
-                Ok(UpdateTrainBarrier::DrainingWorkers) => dlog("", "managed update: worker drain in progress; train stop deferred to final restart barrier"),
-                Ok(UpdateTrainBarrier::Quiescent) => update_receipt("idle.json", &json!({"nonce":request["nonce"],"pid":std::process::id(),"phase":"idle"})),
-                Err(reason) => { dlog("", reason); return; }
-            }
-        } else if train_stop.load(Ordering::SeqCst) {
-            train_stop = Arc::new(AtomicBool::new(false));
-            train_handle = crate::train::spawn_daemon_leg(&cfg.url, &cfg.token, cfg.label.as_deref(), train_stop.clone());
-        }
-        if stop.load(Ordering::Relaxed) {
-            if in_flight.is_empty() { break; }
-            // Stop is a bounded checkpoint/quiesce drain, not dropping the
-            // result receivers while detached writer threads keep running.
-            for inf in &in_flight { inf.execution.control.stop.store(true, Ordering::SeqCst); }
-        }
-        // BR#3787 — negotiated catch-up at the tick boundary: the hub's epoch
-        // header moved past the epoch we vended (another login/repair rotated
-        // our row). Re-vend NOW, proactively — never by mid-dispatch 401.
-        {
-            let seen = TOKEN_EPOCH_SEEN.load(Ordering::Relaxed);
-            let vend = TOKEN_EPOCH_VEND.load(Ordering::Relaxed);
-            if epoch_repair_needed(vend, seen) {
-                match reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|client| repair_by_principal(&client, &cfg.url))
-                {
-                    Ok(fresh) => {
-                        cfg = fresh;
-                        dlog("", &format!("token epoch {vend} → {seen}: re-vended by principal (proactive catch-up)"));
-                        snap_activity(
-                            &snap,
-                            "dispatch",
-                            "token rotated elsewhere — re-vended proactively (epoch catch-up)",
-                        );
-                        write_runner_state(&snap);
-                    }
-                    Err(pe) => {
-                        // the reason is logged; the hub-side rate limiter is
-                        // the backstop against tick-loop churn
-                        dlog("", &format!("error: proactive epoch catch-up failed: {pe}"));
-                        snap_activity(
-                            &snap,
-                            "error",
-                            &format!("proactive epoch catch-up failed: {pe}"),
-                        );
-                    }
-                }
-                TOKEN_EPOCH_SEEN.store(0, Ordering::Relaxed); // re-adopt from the next response
-            } else if vend == 0 && seen > 0 {
-                TOKEN_EPOCH_VEND.store(seen, Ordering::Relaxed); // first observation adopts
-            }
-        }
-        // BR#4489 role:"train" — skip ONLY the dispatch tick; the tail of the
-        // loop (runner-state sync + responsive stop) still runs every pass.
-        if dispatch_enabled {
-            let readiness = readiness.as_ref().expect("dispatch has a readiness producer");
-            readiness.update_config(&cfg);
-            match tick(
-                &cfg,
-                readiness,
-                &mut id,
-                &mut in_flight,
-                &mut attempts,
-                &mut fail_counts,
-                &mut finished_no_pr,
-                &mut gave_up,
-                &snap,
-                &mut avail,
-                &mut last_avail_ok,
-                &mut breaker,
-                &mut live_notes,
-                &mut gated_announced,
-                &stop,
-            ) {
-            Ok(msgs) => {
-                if update_request().is_some() && !avail.is_empty() && readiness.proof(&cfg).is_ok() && snap.lock().map(|s| s.needs_attention.is_none()).unwrap_or(false) {
-                    update_receipt("health.json", &json!({"pid":std::process::id(),"commit":option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),"observed_at":now_ms(),"phase":"ready"}));
-                }
-                for msg in msgs {
-                    dlog("", &msg);
-                }
-                // BR#4113: tick clears the needs-attention flag when its
-                // orient gets through — the hub accepted our token again
-                // (rotation grace, rollback, row restore). Re-arm the heal
-                // pacing to match; the next tick dispatches normally.
-                let hub_accepted = snap
-                    .lock()
-                    .ok()
-                    .map(|s| s.needs_attention.is_none())
-                    .unwrap_or(false);
-                if hub_accepted {
-                    heal.on_hub_accepted();
-                }
-            }
-            Err(e) => {
-                // BR#4113 — classify first. Auth failures (401/403: revoked,
-                // expired, rotated away) run the bounded self-heal ladder and
-                // NEVER stop the loop while desired state is "running".
-                // Everything else is transient (the hub may just be
-                // deploying): log, snapshot, keep polling.
-                match classify_hub_error(&e) {
-                    HubErrClass::Transient => {
-                        dlog("", &format!("error: {e}"));
-                        snap_activity(&snap, "error", &e);
-                        if let Ok(mut g) = last_error.lock() {
-                            *g = Some(e);
-                        }
-                    }
-                    HubErrClass::Auth => match heal.on_auth_failure(Instant::now()) {
-                        HealStep::Wait => {
-                            // backoff cadence — keep polling quietly; the
-                            // poll itself is the hub-side-heal detector
-                        }
-                        HealStep::Attempt => match auth_repair_ladder(&cfg) {
-                            Ok(fresh) => {
-                                cfg = fresh;
-                                let was_parked = heal.parked;
-                                heal.on_repair_success();
-                                snap_needs_attention_clear(&snap);
-                                let msg = if was_parked {
-                                    "gateway self-healed — credential re-vended after sustained hub auth rejection; parked state cleared, dispatch resumes now".to_string()
-                                } else {
-                                    "gateway self-healed — credential re-vended after hub auth rejection; dispatch resumes now".to_string()
-                                };
-                                dlog("", &msg);
-                                snap_activity(&snap, "dispatch", &msg);
-                                if let Ok(mut g) = last_error.lock() {
-                                    *g = None;
-                                }
-                                write_runner_state(&snap);
-                                continue; // immediate re-tick with the fresh credential
-                            }
-                            Err(failures) => {
-                                for f in &failures {
-                                    dlog("", &format!("self-heal ladder: {f}"));
-                                    snap_activity(
-                                        &snap,
-                                        "error",
-                                        &format!("self-heal ladder: {f}"),
-                                    );
-                                }
-                                // park EXACTLY once per episode — on the run
-                                // that crosses the threshold
-                                if heal.parked && heal.streak == AUTH_PARK_ATTEMPTS {
-                                    let msg = format!(
-                                        "needs attention — the hub has rejected this device's credential through {} self-heal attempts (last: {}). The gateway STAYS connected (desired state \"running\") and keeps retrying every {}s: it resumes dispatch on its own the moment the hub accepts this device again — rotation grace, rollback, or row restore; zero human action. To fix by hand now: sign in (re-vends this device's token) or re-pair. Nothing was lost: hub URL and settings are kept.",
-                                        heal.streak,
-                                        failures.last().map(|s| s.as_str()).unwrap_or("unknown"),
-                                        AUTH_BACKOFF_CAP_SECS
-                                    );
-                                    dlog("", &format!("parked: {msg}"));
-                                    snap_needs_attention(&snap, &msg);
-                                    if let Ok(mut g) = last_error.lock() {
-                                        *g = Some(msg);
-                                    }
-                                    write_runner_state(&snap);
-                                }
-                            }
-                        },
-                    },
-                }
-            }
-            }
-        }
-        // Admission and completion handling always precede optional hygiene.
-        // Never restart a backlog of status reads before filling free slots.
-        if dispatch_enabled && !stop.load(Ordering::Relaxed) && update_request().is_none()
-            && SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
-            dispatch_stage(&snap, DispatchStage::Hygiene);
-            let mut messages = Vec::new();
-            sweep_stale_worktrees(&cfg, &mut id, &in_flight, &mut messages);
-            for message in messages { dlog("", &message); }
-        }
-        // ephemeral flat-file state: keep ~/.bridge/dispatch/runner.json in sync
-        write_runner_state(&snap);
-        if update_request().is_some() { std::thread::sleep(Duration::from_secs(2)); }
-        dispatch_stage(&snap, DispatchStage::Waiting);
-        // A returned/disconnected worker is new capacity: do not spend the
-        // whole fallback poll interval leaving its result and slot undrained.
-        wait_for_dispatch_wake(Duration::from_secs(cfg.poll_secs), ||
-            stop.load(Ordering::Relaxed) || update_request().is_some()
-                || in_flight.iter().any(|inf| inf.completed.load(Ordering::SeqCst)));
-    }
-    if let Some(delivery) = stopped_delivery { delivery.stop(); }
-    running.store(false, Ordering::Relaxed);
-    train_stop.store(true, Ordering::SeqCst);
-    if let Some(handle) = train_handle { let _ = handle.join(); }
-    if let Ok(mut s) = snap.lock() {
-        s.running = false;
-        s.in_flight = Vec::new();
-        // BR#4113: a stop-signal exit is NOT a logout — if a needs-attention
-        // park was up, it survives the stop so the UI still says why the
-        // gateway is not dispatching.
-    }
-    write_runner_state(&snap);
-    dlog("", "loop stopped");
+    running.store(false, Ordering::SeqCst);
 }
 
 pub fn start(state: &DispatchState, mut cfg: Option<DispatchConfig>) -> Result<(), String> {
@@ -5547,6 +4030,21 @@ pub fn logout(state: &DispatchState) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_continuation_reaches_only_the_exact_consuming_worker() {
+        let permit = serde_json::json!({"phase":"consumed","consumed_generation":4,"consumed_attempt_id":"next",
+            "continuation":"Inspect PR first; do not repeat the push", "checkpoint_commit":"preserved-sha",
+            "terminal":{"generation":3,"attempt_id":"old","outcome":{"kind":"failed"}},"diagnosis":"provider_authentication"});
+        let state = serde_json::json!({"recovery_permit":permit});
+        let mut prompt = String::new();
+        super::append_recovery_continuation(&mut prompt, &state, 4, "next");
+        for expected in ["Inspect PR first", "preserved-sha", "provider_authentication", "old"] { assert!(prompt.contains(expected)); }
+        for (generation, attempt) in [(3,"next"),(4,"other")] {
+            let mut stale = String::new();
+            super::append_recovery_continuation(&mut stale, &state, generation, attempt);
+            assert!(stale.is_empty());
+        }
+    }
+    #[test]
     fn failed_launch_refill_requires_conclusive_no_writer_not_expiry_or_transport_failure() {
         assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":null})));
         assert!(super::failed_launch_has_no_writer(&serde_json::json!({"attempt":{"phase":"quiesced"}})));
@@ -5644,40 +4142,6 @@ mod tests {
         assert!(worker.join().is_err());
     }
 
-    fn retained_sweep_candidates(n: usize) -> Vec<WorktreeCandidate> {
-        (0..n).map(|i| WorktreeCandidate {
-            slug: format!("BR-{i}"), path: PathBuf::from(format!("/fixture/BR-{i}")),
-            mtime: std::time::SystemTime::now(),
-        }).collect()
-    }
-
-    #[test]
-    fn retained_sweep_backlog_is_bounded_and_fair_across_restarts() {
-        let mut cursor = WorktreeSweepCursor::default();
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(11), &mut cursor,
-                Duration::from_secs(1), |candidate, _| { seen.push(candidate.slug.clone()); Some("in_progress".into()) },
-                |_, _, _| panic!("retained work must not be removed"));
-            assert!(inspected <= WORKTREE_SWEEP_CAP);
-            assert_eq!(swept, 0);
-            cursor = serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
-        }
-        assert_eq!(seen.len(), 11);
-        seen.sort(); seen.dedup();
-        assert_eq!(seen.len(), 11, "restarts must not keep probing just the oldest retained trees");
-    }
-
-    #[test]
-    fn slow_sweep_reads_exhaust_the_probe_budget_without_losing_the_cursor() {
-        let mut cursor = WorktreeSweepCursor::default();
-        let (inspected, swept) = sweep_candidate_batch(retained_sweep_candidates(20), &mut cursor,
-            Duration::from_millis(20), |_, limit| { std::thread::sleep(limit); None },
-            |_, _, _| panic!("a failed status probe cannot delete fresh work"));
-        assert_eq!((inspected, swept), (1, 0));
-        assert_eq!(cursor.remaining.len(), 19);
-    }
-
     #[test]
     fn hygiene_status_probe_has_a_real_short_http_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5727,6 +4191,14 @@ mod tests {
     }
 
     #[test]
+    fn lease_renewal_uses_the_normal_transport_budget() {
+        let poll = json!({"command":{"kind":"poll"}});
+        let pause = json!({"command":{"kind":"pause_claims"}});
+        assert_eq!(mcp_request_timeout("execution", &poll), Duration::from_secs(30));
+        assert_eq!(mcp_request_timeout("execution", &pause), Duration::from_secs(8));
+    }
+
+    #[test]
     fn operator_rpc_has_a_short_real_timeout_instead_of_a_silent_thirty_second_wait() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -5741,6 +4213,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(12));
     }
     #[test]
+    fn admission_hold_is_fresh_connection_health_but_never_worker_admission() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://fixture","label":"hold-proof","token":"fixture"})).unwrap();
+        let ready = GatewayReadiness::with_probe_and_repair(&cfg,Duration::from_secs(3600),|_|Ok(GatewayProbe::AdmissionHeld {reason:"operator paused".into()}),false);
+        assert!(ready.data.lock().unwrap().state.connection_fresh(Duration::from_secs(60)));
+        assert!(ready.proof(&cfg).err().unwrap().contains("new admission held"));
+        let expired=GatewayReadinessState::AdmissionHeld {observed:Instant::now()-Duration::from_secs(61),reason:"old".into()};
+        assert!(!expired.connection_fresh(Duration::from_secs(60)));
+        assert!(!GatewayReadinessState::Unavailable("transport failed".into()).connection_fresh(Duration::from_secs(60)));
+        ready.maintenance.stop();
+    }
+    #[test]
+    fn worker_connection_proof_requires_backend_auth_protocol_and_typed_hold() {
+        let paused=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"paused","reason":"operator","until_ts":now_ms()+60_000}});
+        assert!(matches!(worker_connection_proof(&paused,true),Ok(WorkerAdmission::Held {..})));
+        assert!(worker_connection_proof(&paused,false).is_err(),"a pause cannot hide an unavailable backend");
+        let updating=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"updating","reason":"handoff"}});
+        assert!(matches!(worker_connection_proof(&updating,true),Ok(WorkerAdmission::Held {..})));
+        for readiness in [json!({"kind":"cooldown","reason":"real failure","until_ts":now_ms()+60_000}),json!({"kind":"repair_required","reason":"identity"}),json!({"kind":"paused","reason":"expired","until_ts":1}),json!({"kind":"updating"}),json!({"kind":"ready"})] {
+            assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":2,"readiness":readiness}),true).is_err());
+        }
+        assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":1,"readiness":{"kind":"ready","worker_id":"worker","fingerprint":"proof"}}),true).is_err());
+    }
+    #[test]
     fn managed_update_hold_cannot_advertise_usable_spare_models() {
         let supply = json!({"tier":"large","model":"large-model","availability":{"kind":"usable"},
             "alternatives":[{"tier":"small","model":"small-model","availability":{"kind":"usable"}},
@@ -5750,6 +4245,9 @@ mod tests {
         assert!(held["availability"]["reason"].as_str().unwrap().contains("Managed update"));
         assert!(held["alternatives"].as_array().unwrap().iter().all(|m| m["availability"]["kind"] == "unavailable"));
         assert_eq!(held["model"], supply["model"]);
+        assert_eq!(held["admission_hold"]["kind"],"update_handoff");
+        assert!(inventory_has_usable_model(&supply));
+        assert!(!inventory_has_usable_model(&held),"masked legacy inventory is not backend-health proof");
         assert_eq!(inventory_dispatch_hold(supply.clone(), false), supply, "fresh inventory resumes without changing model identity");
     }
     #[test]
@@ -5911,7 +4409,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_renewal_requires_exact_active_attempt_and_no_pending_mailbox_delivery() {
+    fn lease_renewal_requires_exact_active_attempt_and_no_interrupt_delivery() {
         let base = json!({ "policy_version": 1, "attempt": { "generation": 7, "attempt_id": "attempt", "phase": "running" }, "messages": [] });
         let state = RemoteExecution::parse(base.clone()).unwrap();
         assert!(state.permits_renewal(7, "attempt"));
@@ -5928,6 +4426,10 @@ mod tests {
         let mut missing = base.clone(); missing["attempt"] = serde_json::Value::Null;
         assert!(!RemoteExecution::parse(missing).unwrap().permits_renewal(7, "attempt"));
         let mut delivered = base; delivered["messages"] = json!([{ "state": "delivered" }]);
+        assert!(!RemoteExecution::parse(delivered.clone()).unwrap().permits_renewal(7, "attempt"));
+        delivered["messages"][0]["priority"] = json!("normal");
+        assert!(RemoteExecution::parse(delivered.clone()).unwrap().permits_renewal(7, "attempt"), "normal coordination is not a stop request");
+        delivered["messages"][0]["priority"] = json!("interrupt");
         assert!(!RemoteExecution::parse(delivered).unwrap().permits_renewal(7, "attempt"));
     }
 
@@ -5954,6 +4456,11 @@ mod tests {
         } } })).unwrap();
         let task = json!({ "execution_project": "bridge", "execution_scheduling_requirements": { "tier": "medium" } });
         assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &task), Some((ReasoningTier::Medium, "glm-5.3".into())));
+        let mut recovered = task.clone();
+        recovered["execution_recovery_selection"] = json!({"backend":"opencode","model":"provider/sol","tier":"large","config_revision":"one"});
+        assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &recovered), Some((ReasoningTier::Large,"provider/sol".into())));
+        recovered["execution_recovery_selection"]["model"] = json!("not-configured");
+        assert!(selected_model(&cfg,opencode::Backend::OpenCode,&recovered).is_none());
         let mut large = task.clone(); large["execution_scheduling_requirements"]["tier"] = json!("large");
         assert_eq!(selected_model(&cfg, opencode::Backend::OpenCode, &large), Some((ReasoningTier::Large, "provider/sol".into())));
         large["execution_project"] = json!("other");
@@ -6113,23 +4620,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scratch_dirs_are_per_task_deterministic_paths() {
-        // BR#2460: repo-less dispatches provision <workdir>/sessions/bridge-<slug>.
-        // Creation must be idempotent (resume re-enters the same dir) and
-        // task-scoped (no cross-task bleed).
-        let base = std::env::temp_dir().join(format!("bridge-scratch-test-{}", std::process::id()));
-        let a = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
-        let b = ensure_scratch_dir(base.to_str().unwrap(), "BR#123");
-        assert_eq!(a, b);
-        let dir = a.expect("scratch dir created");
-        assert!(dir.is_dir());
-        assert!(dir.to_string_lossy().contains("sessions"));
-        let other = ensure_scratch_dir(base.to_str().unwrap(), "BR#456").expect("second task dir");
-        assert_ne!(dir, other);
-        let _ = std::fs::remove_dir_all(base);
-    }
-
     // ---- BR#3633: worktree sweep eventual-consistency ----
 
     #[test]
@@ -6142,35 +4632,6 @@ mod tests {
         assert_eq!(reverse_task_slug("hotfix-ext"), "hotfix-ext");
         assert_eq!(reverse_task_slug("br-3620-stale-ledger"), "br-3620-stale-ledger");
         assert_eq!(reverse_task_slug("BR-x"), "BR-x");
-    }
-
-    #[test]
-    fn sweep_disposition_eventual_rules() {
-        // explicit terminal statuses sweep at any age; done/superseded drop
-        // the branch (the WIP preservation branch survives it)
-        assert_eq!(
-            sweep_disposition(0, Some("done")),
-            (true, true, "task is done".to_string())
-        );
-        assert_eq!(
-            sweep_disposition(0, Some("superseded")),
-            (true, true, "task is superseded".to_string())
-        );
-        // todo sweeps but keeps the branch (a re-claim re-attaches to it)
-        let (sweep, drop, _) = sweep_disposition(0, Some("todo"));
-        assert!(sweep && !drop);
-        // fresh non-terminal trees are resume assets — kept whatever the state
-        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
-            let (sweep, _, _) = sweep_disposition(0, s);
-            assert!(!sweep, "fresh tree with status {s:?} must be kept");
-        }
-        // stale trees sweep regardless of status — the eventual guarantee
-        // (hub outage, unresolvable id, parked blocked task all drain)
-        let stale = WORKTREE_STALE_SECS + 1;
-        for s in [Some("in_progress"), Some("in_review"), Some("blocked"), None] {
-            let (sweep, drop, _) = sweep_disposition(stale, s);
-            assert!(sweep && !drop, "stale tree with status {s:?} must sweep with branch kept");
-        }
     }
 
     #[test]
@@ -6244,7 +4705,7 @@ mod tests {
         // lives; the dead line is not — and prunes on read
         let found = collect_worktree_candidates(&base.join("workdir"), Some(&home), &HashSet::new(), &[]);
         assert!(found.iter().any(|c| c.path == live), "registered live path enumerated");
-        assert_eq!(worktree_registry_load(&home).len(), 1, "dead line pruned on read");
+        assert_eq!(worktree_registry_load(&home).len(), 2, "migration reads must not overwrite concurrent registry appends");
 
         // an in-flight slug is protected even though registered
         let mut active = HashSet::new();
@@ -6254,6 +4715,7 @@ mod tests {
 
         // teardown deregisters: the registry must not outlive the tree
         worktree_registry_remove(Some(&home), &live);
+        worktree_registry_remove(Some(&home), &dead);
         assert!(worktree_registry_load(&home).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6814,6 +5276,16 @@ mod tests {
         let out = run_with_timeout(quick, 5).expect("a quick program completes");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bridge");
+    }
+
+    #[test]
+    fn run_with_timeout_captures_output_larger_than_a_pipe() {
+        let mut noisy = Command::new("sh");
+        noisy.args(["-c", "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2; exit 7"]);
+        let output = run_with_timeout(noisy, 5).expect("large output must not stall the process");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout.len(), 262144);
+        assert_eq!(output.stderr.len(), 262144);
     }
 
     // ---- BR#3337 drill: claim races are skipped, stale claims released ----

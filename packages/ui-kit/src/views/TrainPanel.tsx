@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import type { LineRemediation, TrainLineProjection } from "@bridge/contracts";
+import type { HubDiagnostics, LineRemediation, TrainLineProjection } from "@bridge/contracts";
 import { recoveryCauseLabel, recoveryIsOpen } from "@bridge/contracts";
 import { kbApi, type KbTrainLane } from "../server/kb";
-import { Chip, type ChipTone } from "./index-kit";
+import { Btn, Chip, type ChipTone } from "./index-kit";
 
 function age(ts: number | undefined, now: number): string {
   if (!ts) return "unknown";
@@ -12,8 +12,9 @@ function age(ts: number | undefined, now: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
 }
 
-const tones: Record<TrainLineProjection["phase"], ChipTone> = {
-  ready: "ok", working: "live", waiting: "warn", stopped: "err", unknown: "err", retired: "muted",
+export const trainLineTones: Record<TrainLineProjection["phase"], ChipTone> = {
+  idle: "muted", ready: "ok", working: "live", waiting: "warn", base_red: "err",
+  error: "err", unknown: "warn", action_required: "warn", retired: "muted",
 };
 const unavailable: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
@@ -57,6 +58,11 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
       const task = action.task;
       return <>
         <span className="train-banner-line">{action.text}</span>
+        {task.pr && task.pr_url && <span className="train-banner-line">
+          <a href={task.pr_url} target="_blank" rel="noreferrer">PR #{task.pr}</a>
+          {" · "}<TaskLink id={task.id} url={task.url} openTask={openTask}>Repair {task.id}</TaskLink>
+          {task.owner && ` · ${task.owner}`}
+        </span>}
         <details className="train-banner-line">
           <summary>Repair details · {task.id}</summary>
           <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.title}</TaskLink>
@@ -80,7 +86,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
  * come from the hub's typed `line` projection, shared with its row and message. */
 export function LineStopBanner({ lane, now, openTask }: { lane: KbTrainLane; now: number; openTask?: (id: string) => void }) {
   const line = lane.line ?? unavailable;
-  return <div className={`train-blocked-banner${line.phase === "waiting" ? " train-blocked-banner-amber" : ""}`} role="alert">
+  return <div className={`train-blocked-banner${trainLineTones[line.phase] === "warn" ? " train-blocked-banner-amber" : ""}`} role="alert">
     <div className="train-banner-cause">
     <span className="train-banner-line"><strong>{line.label}</strong> · {line.held} changes held</span>
     <span className="train-banner-line">{line.reason}</span>
@@ -142,10 +148,120 @@ export function trainQueueDepthLabel(l: Pick<KbTrainLane, "queue" | "open_prs">)
  *  Data: GET /api/kb/train (the DO's train.status snapshot — lease is
  *  executor-fed, queue/pr_stats/batches/open_prs are hub-computed). Polls
  *  every 30s (the tick is 45s); errors surface in-panel, never silent. */
-export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
+
+/** BR#4849: the stop-the-line banner — a red main must be the FIRST thing the
+ *  Top view says (Ray 2026-10-29: "its critical we reflect this and show a)
+ *  who broke it and b) who is fixing it"). Two accountability lines:
+ *  - broke it: the recorded culprit, or the landing at the failing commit
+ *    (labeled unconfirmed);
+ *  - fixing it: a pending action from the current line, or the root repair
+ *    with its owner/executor. Keep unclaimed repair work visible. */
+function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; openTask?: (id: string) => void }) {
+  const repo = l.lane.split("@")[0];
+  const line = l.line ?? unavailable;
+  const remediation = line.remediation;
+  const red = remediation && (remediation.kind === "agent" || remediation.kind === "queued" || remediation.kind === "blocked") ? remediation.task : null;
+  const stopped = l.lane_state?.phase === "stopped_red" ? l.lane_state : null;
+  const failingSha = stopped?.failing_sha ?? l.stop?.sha;
+  const culprit = stopped ? stopped.culprit_task : l.stop?.culprit_task ?? null;
+  const lastMerge = failingSha && l.last_merge?.merge_sha === failingSha ? l.last_merge : null;
+  const fixer = red?.active_agent ? red.owner || red.executor_session : "";
+  const pendingAsk = remediation?.kind === "blocked"
+    ? remediation.task.execution_blockers?.find((blocker) => blocker.kind === "human_answer_required")
+    : undefined;
+  return (
+    <div className="train-stopline" role="alert">
+      <div className="train-stopline-head">
+        <span className="train-stopline-flag">⛔ STOP-THE-LINE</span>
+        <span className="train-stopline-line">main RED — {l.lane}</span>
+      </div>
+      <div
+        className="train-stopline-why"
+        title={[line.reason, ...line.evidence.map((f) => f.name)].join(" · ")}
+      >
+        {line.reason}
+        {failingSha ? <span className="top-num"> @ {failingSha.slice(0, 9)}</span> : null}
+      </div>
+      <div className="train-stopline-who">
+        <span
+          className="train-stopline-cell"
+          title="The recorded culprit or the landing at the failing commit"
+        >
+          broke it:{" "}
+          {culprit ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(culprit)}>{culprit}</a>
+          ) : lastMerge?.pr ? (
+            <>
+              <a className="train-stopline-who-link" href={`https://github.com/${repo}/pull/${lastMerge.pr}`} target="_blank" rel="noreferrer">#{lastMerge.pr}</a>
+              {" "}by {lastMerge.gateway ?? "?"}
+              {lastMerge.task_id ? <> — <a className="train-stopline-who-link" onClick={() => openTask?.(lastMerge.task_id!)}>{lastMerge.task_id}</a></> : null}
+              {" "}<span className="muted-note">(landing at the failing commit, unconfirmed)</span>
+            </>
+          ) : (
+            <span className="muted-note">unconfirmed for this commit</span>
+          )}
+        </span>
+        <span className="train-stopline-cell" title="Recovery for the failing commit">
+          fixing it:{" "}
+          {remediation?.kind === "merge" ? (
+            <a className="train-stopline-who-link" href={remediation.request?.url ?? remediation.url}
+              target="_blank" rel="noreferrer" title={remediation.text}>Awaiting merge action for PR #{remediation.pr}</a>
+          ) : remediation?.kind === "human" ? (
+            <TaskLink id={remediation.action.id} url={remediation.action.url} openTask={openTask}>Awaiting action · {remediation.action.id}</TaskLink>
+          ) : pendingAsk ? (
+            <a className="train-stopline-who-link" onClick={() => openTask?.(pendingAsk.ask_id)}
+              title={pendingAsk.text}>Awaiting action · {pendingAsk.ask_id}</a>
+          ) : red ? (
+            <>
+              <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
+              {fixer ? (
+                <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
+              ) : remediation?.kind === "queued" ? (
+                <Chip tone="warn" title={remediation.text}>Recovery queued</Chip>
+              ) : (
+                <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
+                  ⚠ UNOWNED — nobody is fixing it
+                </Chip>
+              )}
+            </>
+          ) : (
+            remediation ? <Recovery action={remediation} now={now} openTask={openTask} /> : <span className="muted-note">Recovery status unavailable</span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export function HubRequestDiagnostics({ now }: { now: number }) {
+  const [snapshot, setSnapshot] = useState<HubDiagnostics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = async () => {
+    if (loading) return;
+    setLoading(true);
+    try { setSnapshot(await kbApi.diagnostics()); setError(null); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { setLoading(false); }
+  };
+  return <details className="muted-note" onToggle={event => { if (event.currentTarget.open && !snapshot) void load(); }}>
+    <summary>Hub request diagnostics</summary>
+    <div>Request timings and current processing stages. Loaded on demand; opening this view does not run scheduler or repair sweeps.</div>
+    <Btn onClick={() => void load()} disabled={loading}>{loading ? "Reading hub…" : "Refresh diagnostics"}</Btn>
+    {error && <div role="alert">Diagnostics unavailable: {error}</div>}
+    {snapshot && <>
+      <div>Observed {age(snapshot.observed_at, now)} ago · instance running since {new Date(snapshot.started_at).toISOString()} · timings reset on hub restart</div>
+      <div>{snapshot.active.length} tracked requests in progress</div>
+      {snapshot.active.map(r => <div key={r.id}>{r.operation}: {r.stage} · {r.elapsed_ms}ms elapsed at observation</div>)}
+      {[...snapshot.operations].sort((a, b) => b.max_ms - a.max_ms).slice(0, 12).map(r => <div key={r.operation}>
+        {r.operation}: {r.count} requests · {r.errors} server errors · max ingress {r.max_ingress_ms}ms · max processing {r.max_ms}ms
+      </div>)}
+    </>}
+  </details>;
+}
+export function useTrainStatus() {
   const [lanes, setLanes] = useState<KbTrainLane[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [now, setNow] = useState(Date.now());
   useEffect(() => {
     let dead = false;
     const load = async () => {
@@ -156,10 +272,28 @@ export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
     };
     void load();
     const poll = setInterval(load, REFRESH_MS);
-    const clock = setInterval(() => setNow(Date.now()), 1000);
-    return () => { dead = true; clearInterval(poll); clearInterval(clock); };
+    return () => { dead = true; clearInterval(poll); };
   }, []);
-  return <TrainPanelView lanes={lanes} error={error} now={now} openTask={openTask} />;
+  return { lanes, error };
+}
+
+/** Merge-trains panel (BR#5658 v2, Ray 2026-11-03): one row per lane on the
+ *  shared justified grid — the lane's PRs column carries the 3-bucket stat
+ *  line (`N in progress · M verifying · K ready`) above the sequential merge
+ *  batches, and the BR#5106 honest depth line (`queue N · open M`) rides the
+ *  same cell so the buckets never read as the whole truth. Interruptions
+ *  render through the hub's typed `line` projection (LineStopBanner).
+ *  Data: GET /api/kb/train (the DO's train.status snapshot — lease is
+ *  executor-fed, queue/pr_stats/batches/open_prs are hub-computed). Polls
+ *  every 30s (the tick is 45s); errors surface in-panel, never silent. */
+export function TrainPanel({ openTask }: { openTask?: (id: string) => void }) {
+  const train = useTrainStatus();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, []);
+  return <TrainPanelView {...train} now={now} openTask={openTask} />;
 }
 
 export function TrainPanelView({ lanes, error, now, openTask }: {
@@ -170,17 +304,25 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
     <div className="train-head"><h2>Merge trains</h2><span className="muted-note">Live status and recovery · updates every 30s</span>
       <span className="muted-note">Each block is a PR; repair/review return counts are in its details.</span></div>
     {error && <div className="train-lane train-lane-err" role="alert">⚠ train status unavailable — {error}</div>}
+    {!error && (activeLanes ?? []).filter((l) => l.line?.phase === "base_red").map((l) => (
+      <StopLineBanner key={`stopline-${l.lane}`} l={l} now={now} openTask={openTask} />
+    ))}
     {activeLanes?.length === 0 && <div className="muted-note">No active merge lines.</div>}
     {!!activeLanes?.length && <div className="ktable-head train-head-cols">
       <span title="Executor heartbeat" aria-label="Executor heartbeat">●</span><span>line</span><span>status</span><span>progress</span><span>message</span><span>rate</span><span>PRs</span>
     </div>}
     {(activeLanes ?? []).map((l) => {
       const line = l.line ?? unavailable;
-      const needsAttention = line.phase === "stopped" || line.phase === "unknown";
+      const needsAttention = line.phase === "base_red" || line.phase === "error" || line.phase === "unknown" || line.phase === "action_required";
       const live = !!l.lease && now - l.lease.heartbeat_ts < 300_000;
       const machine = l.lease?.holder ?? l.capable?.holder;
       const repo = l.lane.split("@")[0];
       const stats = l.pr_stats ?? { in_progress: 0, verifying: 0, ready: 0 };
+      const cars = l.batches?.flat() ?? [];
+      const verifying = stats.waiting == null ? cars.filter(q => q.state === "verifying").length : stats.verifying;
+      const waiting = stats.waiting ?? cars.filter(q => q.state === "waiting").length;
+      const eligible = cars.filter(q => q.eligibility === "eligible").length;
+      const reviewed = cars.filter(q => q.eligibility != null).length;
       const progress = l.currently?.phase === "bursting"
         ? `${l.currently.burst_merged ?? 0} merged this batch`
         : l.currently ? "Merged — checking deployment" : `${line.held} changes queued`;
@@ -189,7 +331,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         <span className="trainc-dot"><span className={`train-dot td-${live ? "live" : "free"}`} title={machine
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
         <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
-        <span className="trainc-status"><Chip pill tone={tones[line.phase]} title={line.reason}>{line.label}</Chip>
+        <span className="trainc-status"><Chip pill tone={trainLineTones[line.phase]} title={line.reason}>{line.label}</Chip>
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>
@@ -202,17 +344,17 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
           <span className="train-depth top-num" title={`${l.queue?.length ?? 0} card(s) waiting to merge — the derived queue, the actionable subset (verdict-stamped, gate-clean heads)${l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} additionally bounced and waiting on a fresh review` : ""}${l.open_prs ? `\nopen = every open PR the repo's last reconcile pass listed (${age(l.open_prs.ts, now)} ago) — the verification buckets are not the whole truth; the derived queue is only the actionable subset (BR#5106/BR#5022)` : "\nno reconcile data yet — queue alone, never a made-up zero (BR#5106/BR#5022)"}`}>
             {trainQueueDepthLabel(l)}{l.queue_awaiting_review ? ` · ${l.queue_awaiting_review} need reviews` : ""}
           </span>
-          <span className="train-stats">
-            <span className="train-stat ts-ip">{stats.in_progress} in progress</span> · <span className="train-stat ts-verifying">{stats.verifying} verifying</span> · <span className="train-stat ts-ready">{stats.ready} verified</span>
-          </span>
-          <span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
+        <span className="train-stats">
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> <span className="train-stat ts-verifying">{verifying} verifying</span> <span className="train-stat" title="Waiting for a reviewer to start">{waiting} waiting for review</span> <span className="train-stat" title="Reviewed and conflict-free, including eligible PRs">{reviewed} reviewed &amp; clean</span> <span className="train-stat ts-ready" title="Eligible to merge now: selected by the executor for the current batch">{eligible} eligible</span>
+        </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
-          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.state === "ready" ? "tb-ready" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
+          {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.eligibility === "eligible" ? "tb-ready" : q.eligibility === "reviewed" ? "tb-reviewed" : q.state === "ready" ? "tb-unknown" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}
             title={`Batch ${bi + 1} · ${q.id}${q.pr ? ` · PR #${q.pr}` : ""} — ${q.detail ?? q.state}${q.bounces != null ? ` · Returned to repair/review ${q.bounces} time(s) across tracked history${q.over_budget ? " — active bounce-budget escalation" : ""}` : ""}`} onClick={() => openTask?.(q.id)} />)}
         </span>)}</span></span>
       </div>
       {needsAttention && <LineStopBanner lane={l} now={now} openTask={openTask} />}
       </section>;
     })}
+    <HubRequestDiagnostics now={now} />
   </div>;
 }

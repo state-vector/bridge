@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 import { parseCardIdRefs } from "../src/kb/core.ts";
 
 /**
@@ -75,6 +76,7 @@ const authAsk = async (subject: string, targets: string[], options: string[]) =>
     reason: "Supersede is human-authority — requesting batch drop authorization.",
     details: `Census of stale parks (receipts on each card): ${targets.join(" / ")} — dead + conflicting parks.`,
     options,
+    decision: decisionFixture(subject, options),
     artefact_id: subject,
     actor: "drill-drain-owner",
   });
@@ -323,7 +325,8 @@ describe("batch_auth supersede (BR#6432)", () => {
     const drain = await task("EXECUTE: lane-card drain (drill)");
     const laneCard = await task("Merge lane: drill repo@main (drill)");
     await park(laneCard, "state-vector/bridge", 333, "drill-owner-j");
-    await kbJson("/update", { id: laneCard, meta: { lane: { key: "state-vector/bridge@main", now_action: null } } });
+    const configured = await kbJson("/update", { id: laneCard, meta: { lane: { repo: "state-vector/batch-auth-protection", base: "main", key: "state-vector/batch-auth-protection@main", now_action: null } } });
+    expect(configured.status, JSON.stringify(configured.body)).toBe(200);
     const askId = await authAsk(drain, [laneCard], ["(Recommended) SUPERSEDE all 1", "NO"]);
     await kbJson("/ask.answer", { id: askId, answer: "SUPERSEDE all 1", actor: "web:rayh" });
     const r = await apply(laneCard, askId);

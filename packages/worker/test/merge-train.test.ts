@@ -595,6 +595,12 @@ describe("decideTrainGate (executor-side, fail-closed — ONE impl with the hub)
     ...over,
   });
 
+  it("requires signature evidence covering the live head and waits for pending substantive checks beside a circular failure", () => {
+    expect(decideTrainGate(clean({ commits: [] })).kind).toBe("skip");
+    expect(decideTrainGate(clean({ commits: [{ sha: "9".repeat(40), verified: true }] })).kind).toBe("skip");
+    expect(classifyCandidateGatePhase(clean({ headChecks: [{ ...green(1, "Deploy health (merge gate)"), conclusion: "failure" }, { ...green(2, "Test"), status: "in_progress", conclusion: null }] }))).toMatchObject({ phase: "mechanically_sound", headState: { kind: "pending" } });
+  });
+
   it("a superseded card closes its PR without review (the work is gone)", () => {
     const d = decideTrainGate(clean({ cardStatus: "superseded" }));
     expect(d.kind).toBe("close_superseded");
@@ -1256,11 +1262,12 @@ describe("trainParseNoteLegs (the close-note leg parser — BR#3659)", () => {
       { id: "BR#3", pr: 103, state: "waiting" as const },
       { id: "BR#4", pr: 104, state: "ready" as const },
     ];
-    // PR 101 and PR 104 conflict → Batch 1 takes [101, 102, 103], Batch 2 takes [104]
+    // PR 101 and PR 104 conflict. Both ready cars precede unverified cars,
+    // even though they need separate batches.
     const batches = partitionMergeBatches(cars, [[101, 104]], 10);
     expect(batches.map((b) => b.map((c) => c.pr))).toEqual([
-      [101, 102, 103],
-      [104],
+      [101],
+      [104, 102, 103],
     ]);
     // burst_max cap = 2 with no conflicts → ready cars [101, 104] first in Batch 1, then [102, 103] in Batch 2
     const capped = partitionMergeBatches(cars, [], 2);
@@ -2044,6 +2051,19 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     ]);
   });
 
+  it("ready cars in later conflict batches still precede every unverified car", () => {
+    const cars = [
+      { id: "BR#4", pr: 104, state: "waiting" as const },
+      { id: "BR#1", pr: 101, state: "ready" as const },
+      { id: "BR#5", pr: 105, state: "verifying" as const },
+      { id: "BR#2", pr: 102, state: "ready" as const },
+      { id: "BR#3", pr: 103, state: "ready" as const },
+    ];
+    const batches = partitionMergeBatches(cars, [[101, 102], [101, 103], [102, 103]], 2);
+    expect(batches.map(batch => batch.map(car => car.pr))).toEqual([[101], [102], [103, 105], [104]]);
+    expect(batches.flat().map(car => car.state)).toEqual(["ready", "ready", "ready", "verifying", "waiting"]);
+  });
+
   it("decideTrainGate self-heals stale main-green gate reds on a green base via rerun_gate", () => {
     const head = "d".repeat(40);
     const gate = decideTrainGate({
@@ -2252,6 +2272,43 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(isDeployWorkflowRun(wfRunsWithDhr[1], required)).toBe(true);
     expect(inferDeployWorkflow(required, wfRunsWithDhr)).toBe("deploy-dev.yml");
     expect(inferDeployWorkflow(required, [])).toBe("deploy-dev.yml");
+
+    // BR#7572: the bridge repo's own deploy pipeline `dev-build` (dev-build.yml,
+    // push-to-main Workers + CLI binaries) is the decisive deploy workflow —
+    // recognized by name alone (older observation payloads carry no path) and
+    // by path; a differently-named lookalike stays unrecognized.
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588979, name: "dev-build", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588979, name: "dev-build", path: ".github/workflows/dev-build.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        { id: 42361588980, name: "dev-build canary", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(false);
+    expect(
+      isDeployWorkflowRun(
+        // renamed display on the genuine path: the path identifies the workflow file
+        { id: 42361588979, name: "dev-build canary", path: ".github/workflows/dev-build.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(true);
+    expect(
+      isDeployWorkflowRun(
+        // lookalike on its own path stays unrecognized (not "/dev-build.yml")
+        { id: 42361588980, name: "dev-build canary", path: ".github/workflows/dev-build-canary.yml", head_sha: darkTip, status: "completed", conclusion: "success" },
+        required,
+      ),
+    ).toBe(false);
 
     // 2. Inside grace window (age 120s < 300s): uncovered_grace, no dispatch yet
     const planGrace = reconcileDeployCoverage({

@@ -81,7 +81,26 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
-        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1})),
+        "build-info" | "--version" => println!("{}", serde_json::json!({"commit":env!("BRIDGE_BUILD_COMMIT"),"version":env!("CARGO_PKG_VERSION"),"update_protocol":1,"upgrade_notice_protocol":1,"worker_protocol":dispatch::WORKER_PROTOCOL,"recovery_protocol":1,"coordinator_revision":2})),
+        "recovery" => {
+            if args.get(2).map(String::as_str) == Some("source") { print!("{}",include_str!("../updater/supervisor.py"));return; }
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found");std::process::exit(1); });
+            match dispatch::recovery_command(&cfg,&args[2..]) { Ok(value)=>println!("{}",serde_json::to_string_pretty(&value).unwrap()),Err(error)=>{eprintln!("recovery: {error}");std::process::exit(1);} }
+        }
+        "internal-worker" => {
+            let path = args.get(2).map(PathBuf::from).unwrap_or_else(|| { eprintln!("worker manifest required"); std::process::exit(2); });
+            if let Err(error) = dispatch::worker_entry(&path) { eprintln!("independent worker: {error}"); std::process::exit(1); }
+        }
+        "workers" => {
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found"); std::process::exit(1); });
+            let stop = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("stop") => true, _ => { eprintln!("usage: bridge workers status|stop [BR#task]; use bridge recovery for supervised recovery"); std::process::exit(2); } };
+            match dispatch::workers_command(&cfg, stop, args.get(3).map(String::as_str)) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workers: {error}"); std::process::exit(1); } }
+        }
+        "workspaces" => {
+            let cfg = DispatchConfig::resolve().unwrap_or_else(|| { eprintln!("no gateway pairing found"); std::process::exit(1); });
+            let reconcile = match args.get(2).map(String::as_str) { None | Some("status") => false, Some("reconcile") => true, _ => { eprintln!("usage: bridge workspaces status|reconcile"); std::process::exit(2); } };
+            match dispatch::workspaces_command(&cfg, reconcile) { Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()), Err(error) => { eprintln!("workspaces: {error}"); std::process::exit(1); } }
+        }
         "update" => {
             if let Err(error) = update::command(&args[2..]) { eprintln!("update: {error}"); std::process::exit(1); }
         }

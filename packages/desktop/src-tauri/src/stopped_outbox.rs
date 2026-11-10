@@ -20,6 +20,13 @@ pub struct StoppedReceipt {
     delivery: Delivery,
 }
 impl StoppedReceipt {
+    pub fn ready_for_replay(&self, now: u64) -> bool {
+        match self.delivery {
+            Delivery::Pending { retry_after } => retry_after <= now,
+            Delivery::Finalizing { owner_pid } => process_absent(owner_pid),
+            Delivery::Rejected { .. } => false,
+        }
+    }
     pub fn capture(host: &str, url: &str, task_id: &str, session: &str, generation: u64, attempt_id: &str, observed_at: u64, group_empty: bool) -> Result<Self, String> {
         if !group_empty || host.is_empty() || generation == 0 || attempt_id.is_empty() {
             return Err("no process-group-empty proof; retain capacity".into());
@@ -71,6 +78,13 @@ pub fn persist(root: &Path, receipt: &StoppedReceipt) -> Result<PathBuf, String>
     }
     write(&path, receipt)?;
     Ok(path)
+}
+pub fn retained(root:&Path,receipt:&StoppedReceipt)->bool {
+    // Legacy filename hashes were compiler-dependent. Match the full saved
+    // receipt, never infer continuation authority from a filename.
+    fs::read_dir(root).ok().is_some_and(|entries|entries.filter_map(Result::ok).any(|entry|
+        fs::read(entry.path()).ok().and_then(|bytes|serde_json::from_slice::<StoppedReceipt>(&bytes).ok()).is_some_and(|saved|
+            saved.host==receipt.host && saved.url==receipt.url && saved.request()==receipt.request())))
 }
 pub fn deliver(path: &Path, receipt: &StoppedReceipt, now: u64, mut send: impl FnMut(&StoppedReceipt) -> Result<(), String>) -> Result<(), String> {
     match send(receipt) {

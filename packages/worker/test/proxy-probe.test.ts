@@ -179,7 +179,6 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
       { event: "run_success", repo: "state-vector/superpositional", run_id: "40350887298", head: "ca18675f0f" },
       "GitHub run state-vector/superpositional/40350887298 conclusion=success at head ca18675f0f",
     );
-    const before = await dutyChildrenOf(id);
     await sweep();
     const rep = await kbJson("/proxy.verify", {
       key: "run:state-vector/superpositional:40350887298",
@@ -190,10 +189,10 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
     });
     expect(rep.body.verdict).toBe("negative");
     await sweep();
-    const check = await proxyCheck(id);
-    expect(check.verdict).toBe("false"); // the gate has NOT fired — honest false, never a flip
-    expect(await dutyChildrenOf(id)).toHaveLength(before.length);
-    expect(String(JSON.stringify(check.atoms ?? []))).toContain("head mismatch");
+    const card = (await kbJson("/get", { id })).body;
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.reason).toContain("head mismatch");
+    expect(card.meta.blocked.await_event).toEqual({ event: "br_done", id: card.meta.recovery.task_id });
   });
 
   it("receipts must be GitHub URLs — an URL-less satisfaction is refused and the probe stays pending", async () => {
@@ -217,13 +216,12 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
     expect(await dutyChildrenOf(id)).toHaveLength(before.length);
   });
 
-  it("transient gh failures back off; an exhausted probe returns the park to a LOUD unresolvable (never a silent loop)", async () => {
+  it("transient gh failures are bounded and exhausted probes schedule a reassessment", async () => {
     const id = await parkedCard(
       "probe rig E: gh keeps failing",
       { event: "pr_checks_green", repo: "state-vector/superpositional", n: 2504 },
       "all checks green on PR state-vector/superpositional#2504",
     );
-    const before = await dutyChildrenOf(id);
     await sweep();
     expect((await proxyCheck(id)).verdict).toBe("probe_pending");
     for (let i = 0; i < 12; i++) {
@@ -235,10 +233,10 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
       expect(rep.body.error ?? null).toBeNull();
     }
     await sweep();
-    const check = await proxyCheck(id);
-    expect(check.verdict).toBe("unresolvable"); // loud again — visible, not invisible
-    expect(String(check.detail ?? "")).toContain("probe exhausted");
-    expect(await dutyChildrenOf(id)).toHaveLength(before.length);
+    const card = (await kbJson("/get", { id })).body;
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.reason).toContain("probe exhausted");
+    expect(card.meta.blocked.await_event).toEqual({ event: "br_done", id: card.meta.recovery.task_id });
   });
 
   it("one probe per atom across cards: a second park on the same run shares the queue row (dedupe)", async () => {

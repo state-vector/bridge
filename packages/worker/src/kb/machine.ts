@@ -14,7 +14,7 @@
 // supersede cascades) are DECIDED here and EXECUTED by do.ts. No legality and
 // no spawn/escalate decision lives outside this file.
 import { parseTags, validateTransition, releaseHold, trainPrLeg } from "./core";
-import { mergeCompletesTask, ExecutionResultSchema } from "@bridge/contracts";
+import { mergeCompletesTask, ExecutionResultSchema, dutyOutcome } from "@bridge/contracts";
 import { ownsInteractiveClaim } from "./execution-work";
 import { parseCloseLegs, parseClosureReceipt, doneWhenSection, legLabel, RECEIPT_CONTRACT, parseForceClose, FORCE_CLOSE_DOC, validateAwaitEvent, parseProxyCondition, awaitEventFromAtoms, describeAwaitEvent, isSelfAwait, AWAIT_GRAMMAR_DOC, type CloseLeg } from "./closure";
 
@@ -35,14 +35,14 @@ export const VERDICT_ROLES: Role[] = ["review", "unblock"];
 
 // BR#6432: exported for the batch-auth application leg in do.ts — the same
 // human-principal test the answer dispatch's authority rests on.
-const HUMAN_ACTOR = /^web(:|$)|^human:/;
+const HUMAN_ACTOR = /^(web:|human:)/;
 export { HUMAN_ACTOR };
 // system actors (watchdog, churn-guard, separation) act ON claims — releases
 // they perform are the machinery working, not agents dumping each other's work.
 // Exported for the BR#5807 meta-integrity guard (do.ts update): the same
 // human/machinery authority that protects lane cards from closing protects
 // their lane-config meta keys from meta_delete.
-export const OWNER_RELEASE_EXEMPT = /^(web(:|$)|human:|system:)/;
+export const OWNER_RELEASE_EXEMPT = /^(web:|human:|system:)/;
 
 export interface RuleInput {
   id: string;
@@ -167,7 +167,6 @@ export const SILENT_REDIRECT_CYCLES = 5; // impl/analysis
  *  gate-rejection reaper fuse (do.ts reapAbandoned idleLimit): both
  *  mechanisms promise the same thing — nobody will look at this for a day,
  *  then it comes back on its own. */
-export const CHURN_COOLDOWN_MS = 24 * 60 * 60_000;
 
 // Flood guard: a superseded unblock round still counts while fresh (<60m) and
 // the exit condition is unchanged — the BR#909 class spawned one child per
@@ -372,22 +371,6 @@ export const UNBLOCK_SPAWN_CAP = 3;
 
 export const RULES: Rule[] = [
   {
-    name: "verdict-no-in_review",
-    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
-  },
-  {
-    name: "verdict-no-blocked",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "blocked" &&
-      VERDICT_ROLES.includes(role(i)) &&
-      !i.body?.awaiting_ask_id, // an ask-gate pauses the duty; it auto-resumes on the answer
-    guard: (i) =>
-      `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
-  },
-  {
     // BR#6135 interactive claim takeover — the stand-down half. A takeover
     // atomically flips meta.session to the taker; the EX-holder (the
     // dispatched runner session named in meta.taken_over.from_session) must
@@ -413,6 +396,21 @@ export const RULES: Rule[] = [
     guard: (i) =>
       `the claim on ${i.id} was taken over by ${String(i.meta.taken_over?.to_session ?? i.meta.taken_over?.by ?? "another session")} (interactive takeover, BR#6135/BR#6436) — you are the superseded holder. ` +
       "STAND DOWN: checkpoint your state via log_progress (last_will: worktree, branch, done/next — log_progress stays open to you), push nothing to this card, and end your run. Do not retry this transition; the claim is not yours to finish.",
+  },
+  {
+    name: "gateway-cannot-author-completion",
+    when: (i) => isTask(i) && ["in_review", "done"].includes(i.to) && i.body?.gateway === true,
+    guard: (i) => `gateway infrastructure cannot submit or complete ${i.id}. Report the exact process outcome through execution.finalize; the task agent submits its outcome and an independent reviewer authors acceptance. Exit status, output and task titles are not verdicts.`,
+  },
+  {
+    name: "verdict-no-in_review",
+    when: (i) => isTask(i) && i.to === "in_review" && VERDICT_ROLES.includes(role(i)),
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verification is its own terminal state. ${role(i) === "review" ? "Verify" : "Unblock"} tasks close directly via done with receipts; they are never reviewed again.`,
+  },
+  {
+    name: "verdict-no-blocked",
+    when: (i) => isTask(i) && i.to === "blocked" && VERDICT_ROLES.includes(role(i)) && !i.body?.awaiting_ask_id,
+    guard: (i) => `${i.id} is a ${role(i) === "review" ? "verify" : "unblock"} task — verdict duties cannot block. They either render the verdict (done with receipts) or record findings and close done; "cannot proceed" is itself a verdict. Escalate via ask_agent instead.`,
   },
   {
     name: "release-needs-ownership",
@@ -531,18 +529,6 @@ export const RULES: Rule[] = [
     },
   },
   {
-    name: "done-unreviewed",
-    when: (i) =>
-      isTask(i) &&
-      i.to === "done" &&
-      !["analysis", "review", "unblock"].includes(role(i)),
-    guard: async (i, c) => {
-      const r = await c.qualify("review");
-      if (r.ok) return null;
-      return `task ${i.id} cannot be completed unreviewed — complete a verify (review-role) child task or link an accepted decision (e.g. a Superpositional verdict) first`;
-    },
-  },
-  {
     name: "question-not-claimable",
     when: (i) => i.type === "question" && i.to === "in_progress",
     guard: (i) =>
@@ -561,6 +547,18 @@ export const RULES: Rule[] = [
       noteOf(i)
         ? null
         : `moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`,
+  },
+  {
+    name: "execution-submission-needs-outcome",
+    when: (i) => isTask(i) && i.to === "in_review" && (role(i) === "analysis" || !mergeCompletesTask(i.meta ?? {})),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result).success ? null
+      : `execution submission for ${i.id} requires execution_result {outcome,receipts} from this submission. A commit link, old result or process exit cannot establish the actual outcome.`,
+  },
+  {
+    name: "execution-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && !i.meta?.lane && !mergeCompletesTask(i.meta ?? {}) && !VERDICT_ROLES.includes(role(i)),
+    guard: (i) => ExecutionResultSchema.safeParse(i.body?.execution_result ?? i.meta?.execution_result).success ? null
+      : `execution completion for ${i.id} requires execution_result {outcome,receipts}; prerequisite delivery is not task completion.`,
   },
   {
     name: "review-needs-pr",
@@ -591,9 +589,12 @@ export const RULES: Rule[] = [
       if (i.body?.awaiting_ask_id) return null; // bound open ask — the active human leg
       if (i.body?.merge_train || i.body?.class === "subprocess") return null; // machine-managed park, own trip-wires
       const selfMsg = `self-referential await — ${i.id} cannot await its own done: a br_done event naming the parked card can never fire while the card is blocked (the BR#136 deadlock, BR#3986). A br_pr_merged naming the card is legal — the train stamps its provenance row while the card is blocked (BR#3620). Await the real upstream leg.`;
+      const unsupportedIssue = "GitHub issue closure has no machine observer. Use an observable delivery prerequisite or a Bridge recovery task.";
       if (i.body?.await_event !== undefined) {
         const ev = validateAwaitEvent(i.body.await_event);
         if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
+        if (ev.event === "issue_closed") return unsupportedIssue;
+        if (ev.event === "recovery_required") return "execution recovery waits are created by the scheduler";
         if (isSelfAwait(String(i.id), ev)) return selfMsg;
         return null;
       }
@@ -622,6 +623,7 @@ export const RULES: Rule[] = [
         }
         if (!unparseable && atoms.length === 1) {
           const single = awaitEventFromAtoms(atoms);
+          if (single?.event === "issue_closed") return unsupportedIssue;
           if (single && isSelfAwait(String(i.id), single)) return selfMsg;
           if (single) return null;
         }
@@ -633,9 +635,15 @@ export const RULES: Rule[] = [
     name: "verdict-done-needs-receipts",
     when: (i) => isTask(i) && i.to === "done" && (role(i) === "review" || role(i) === "unblock"),
     guard: (i) =>
-      hasReceipts(noteOf(i))
+      dutyOutcome(role(i), i.body ?? {})
         ? null
-        : `${role(i) === "unblock" ? "unblock" : "review"} ${i.id} cannot complete without receipts — the note must cite receipts: ${RECEIPTS_DOC}.`,
+        : `${role(i)} ${i.id} cannot complete without a typed outcome: ${role(i) === "review" ? "supply review_result (accepted_pr, accepted_direct_main, accepted_execution, findings, or stronger_implementation_required)" : "supply execution_result {outcome,receipts} or unblock_result {kind:reblocked,parent_id,reason,next,await_event}"}. Notes, exit zero and transcripts are not outcome receipts.`,
+  },
+  {
+    name: "analysis-done-needs-outcome",
+    when: (i) => isTask(i) && i.to === "done" && role(i) === "analysis",
+    guard: (i) => dutyOutcome("analysis", i.body ?? {}) ? null
+      : `analysis ${i.id} requires execution_result {outcome,receipts} describing its actual findings. A process exit or a completed diagnostic does not prove the incident recovered.`,
   },
   {
     name: "review-separation-of-duties",
@@ -705,6 +713,12 @@ export const RULES: Rule[] = [
       const labeled = unowned.map((l) => `${l.repo ? `${l.repo}#` : "#"}${l.number}`).join(", ");
       return `terminal close leg(s) not receipted: ${labeled} — a done card claiming a GH close must carry the closure receipt (${RECEIPT_CONTRACT}) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361).`;
     },
+  },
+  {
+    name: "done-unreviewed",
+    when: (i) => isTask(i) && i.to === "done" && !["analysis", "review", "unblock"].includes(role(i)),
+    guard: async (i, c) => (await c.qualify("review")).ok ? null
+      : `task ${i.id} cannot be completed unreviewed — require an independent typed acceptance of its actual delivered code or execution outcome; a findings close, decision note or absent claim bars is not acceptance`,
   },
 ];
 
@@ -856,14 +870,8 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
       status = "blocked";
       patch.blocked = {
         reason: blockReason,
-        // BR#4248: the park awaits a typed cooldown timer — grammar-valid,
-        // machine-readable, sweep-consumed. The prose unblock condition is
-        // annotation for the human who eventually reads the card; it is NOT
-        // the exit condition (BR#3578). The server must not mint the very
-        // "awaits nothing" parks that law kills — the invariant at the end
-        // of decide() refuses a redirect that lands without the typed atom.
-        unblock_condition: "read the task history (get_history) and the last gate error, resolve what it names, then re-claim or re-issue the task",
-        await_event: { event: "time", until_ts: now + CHURN_COOLDOWN_MS },
+        unblock_condition: "Bridge diagnoses the repeated failure and establishes a reviewed recovery condition.",
+        await_event: { event: "recovery_required", cause: "repeated_failure" },
         ts: now,
       };
       patch.attempt = attempt;
@@ -1192,6 +1200,38 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // both runners stopped, checkpointed and delivered). The class is named
   // so the Log says WHAT fenced; the pricing is never-a-breach.
   execution_fence: Number.POSITIVE_INFINITY,
+  // BR#7684 — the review round's revision fence (do.ts review-result guard):
+  // a verify duty closing with a verdict whose echoed review_subject revision
+  // is missing or does not match the subject's live work_revision is refused
+  // with "gate: stale or missing review subject_revision — echo this duty's
+  // captured review_subject revision and re-verify changed work in a fresh
+  // review round". The fence refusing a stale verdict binding IS the system
+  // working — the BR#4562/BR#6654/BR#7008 pricing law again: zero state
+  // destroyed, verdicts stay fenced to the exact reviewed submission, and the
+  // refusal's own instruction names the cure (re-verify changed work in a
+  // fresh review round — lifecycle auto-spawns that round with the correct
+  // binding). The specimens complied: 3 fence events on BR#7509 (2026-11-07
+  // 08:35–08:49Z, a duty captured at the attempt-1 'legacy' sentinel while
+  // the parent re-submitted attempt-2) folded "unclassified" and raised
+  // BR#7684; the round closed in the auto-spawned successor duty and the
+  // parent landed done — and 3 further events on BR#7761 (2026-11-07
+  // 16:44–17:09Z, a verify duty holding a stale review_subject capture while
+  // BR#5989's fresh round spun up; breach card BR#8034, which reconciled to
+  // this fix) coalesced the same way while this class awaited its merge.
+  // Named so the Log says WHAT fenced; priced never-a-breach.
+  review_fence: Number.POSITIVE_INFINITY,
+  // BR#6740 — the doTransition exit gate for typed execution waits (do.ts,
+  // isExecutionWait / local handoff preparing|waiting): ANY ordinary
+  // transition/ask/timeout on a card whose exit a durable execution wait owns
+  // is refused with "gate: typed local/capability wait owns this exit;
+  // ordinary transitions/asks/timeout cannot release it" — a bare throw, no
+  // [rule:] tag. The gate refusing IS the wait owning the exit (the BR#4067
+  // law: zero state destroyed, the sweep/writer just doesn't get to move the
+  // card), so it joins the BR#4562/BR#6654/BR#7008 never-a-breach pricing
+  // family. Specimen: 3 watchdog release attempts on BR#6642, 2026-11-05
+  // 23:30:41–58Z, folded "unclassified" (default threshold 3) and raised
+  // breach card BR#6740. The class is named so the Log says WHAT held.
+  "release:held-execution-wait": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1331,6 +1371,29 @@ export function breachClass(reason: string): string {
   // (BR#3611/BR#3612 wording-drift lesson); it sits ~15 chars in, far inside
   // the 300-char audit slice, so the classification survives any tail.
   if (r.includes("execution mutation fenced")) return "execution_fence";
+  // BR#7684: the review round's revision fence refusing a stale or mismatched
+  // verdict binding — the duty's captured review_subject revision is missing
+  // or does not equal the subject's live work_revision (do.ts review-result
+  // guard, do.ts:6647). Match the structural fragment "stale or missing
+  // review subject_revision", not the whole sentence (BR#3611/BR#3612
+  // wording-drift lesson); it sits ~7 chars in, far inside the 300-char
+  // audit slice, so the classification survives any tail. Specimens: 3
+  // compliant fence events on BR#7509 (2026-11-07, captured 'legacy'
+  // sentinel vs re-submitted parent) folded "unclassified" and raised
+  // BR#7684; second specimen BR#7761 (3 events 2026-11-07 16:44–17:09Z,
+  // breach card BR#8034) coalesced identically; priced never-a-breach above.
+  if (r.includes("stale or missing review subject_revision")) return "review_fence";
+  // BR#6740: the doTransition exit gate for typed execution waits — an
+  // ordinary transition/ask/timeout on a card whose exit a durable execution
+  // wait owns (meta.blocked.await_event local_handoff/executor_capability, or
+  // a local handoff preparing/waiting). The refusal IS the wait owning the
+  // exit — the BR#4562 pricing law again: the gate succeeding is the system
+  // working. Match the structural fragment "typed local/capability wait owns
+  // this exit", not the whole sentence (BR#3611/BR#3612 wording-drift
+  // lesson); the throw carries no [rule:] tag and runs ~104 chars, well
+  // inside the 300-char audit slice, so the classification survives any tail.
+  // Specimen: BR#6642, 3 events 2026-11-05 23:30:41–58Z (breach card BR#6740).
+  if (r.includes("typed local/capability wait owns this exit")) return "release:held-execution-wait";
   return "unclassified";
 }
 

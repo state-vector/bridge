@@ -98,6 +98,23 @@ describe("all-open delivery progress", () => {
     }
   });
 
+  it("requests one independent review for an accepted repair without relying on stale GitHub approval", () => {
+    const repaired = binding(99, { status: "todo", progress: "stranded", repairAccepted: true });
+    const observed = pr(99, { reviewDecision: null, mergeStateStatus: "UNSTABLE", updatedAt: iso(50) });
+    const initial = join({ prs: [observed], bindings: [repaired] });
+    expect(initial.judgements[0].decision).toEqual({ action: "verify_repaired", card: repaired.card });
+    for (const changes of [
+      { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" },
+      { isDraft: true },
+      { reviewDecision: "CHANGES_REQUESTED" },
+      { headRefOid: null },
+    ]) {
+      expect(join({ prs: [{ ...observed, ...changes }], bindings: [repaired] }).judgements[0].decision.action).not.toBe("verify_repaired");
+    }
+    expect(join({ prs: [observed], bindings: [repaired], duties: [duty(99)] }).judgements[0].decision.action).not.toBe("verify_repaired");
+    expect(join({ prs: [observed], bindings: [{ ...repaired, open_verify_children: 1 }] }).judgements[0].decision.action).not.toBe("verify_repaired");
+  });
+
   it("an existing card with no executable action is stranded, not accounted", () => {
     const r = join({ prs: [pr(99, { updatedAt: iso(50), mergeable: "CONFLICTING" })], bindings: [binding(99, { progress: "stranded" })] });
     expect(r.accounting.stranded).toBe(1);
@@ -173,7 +190,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       ...PROGRESS,
       repo: "r", open_reviewed: 3, bound: 1, ignored: 1, inflight: 0, spawned: 1,
-      grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
+      grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0, reverse_verifying: 0,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 3, ok: true,
     });
     expect(line).toContain("3 open reviewed / 1 bound / 1 ignored-with-reason / 1 in-flight — 3 accounted");
@@ -183,7 +200,7 @@ describe("accountingLine", () => {
     const a = {
       ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 0, ignored: 0, inflight: 0, spawned: 0,
-      grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
+      grace: 0, unaccounted: 1, unreviewed: 0, reverse_missing: 0, reverse_closed: 0, reverse_verifying: 0,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 0, ok: false,
     };
     expect(accountingLine(a)).toContain("ALARM: 1 unaccounted");
@@ -194,7 +211,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
-      grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1,
+      grace: 2, unaccounted: 0, unreviewed: 3, reverse_missing: 1, reverse_closed: 1, reverse_verifying: 0,
       reverse_dutied: 0, reverse_lane_exempt: 0, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("(+2 in age grace, +3 unreviewed)");
@@ -205,7 +222,7 @@ describe("accountingLine", () => {
     const line = accountingLine({
       ...PROGRESS,
       repo: "r", open_reviewed: 1, bound: 1, ignored: 0, inflight: 0, spawned: 0,
-      grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0,
+      grace: 0, unaccounted: 0, unreviewed: 0, reverse_missing: 0, reverse_closed: 0, reverse_verifying: 0,
       reverse_dutied: 0, reverse_lane_exempt: 2, reverse_train_exempt: 0, observed_merged: 0, accounted: 1, ok: true,
     });
     expect(line).toContain("[reverse: 2 lane-exempt]");
@@ -436,11 +453,12 @@ describe("reconcileJoin — reverse", () => {
       bindings: [binding(1, { missing: true, missing_set_before_report: true, provenance: { merge_sha: "f".repeat(40), signer: "detached-cody" } })],
     });
     const d: any = one(r, 1).decision;
-    expect(d.action).toBe("reverse_close");
+    expect(d.action).toBe("reverse_verify");
     expect(d.card).toBe("BR#9001");
     expect(d.merge_sha).toBe("f".repeat(40));
     expect(d.signer).toBe("detached-cody");
-    expect(r.accounting.reverse_closed).toBe(1);
+    expect(r.accounting.reverse_closed).toBe(0);
+    expect(r.accounting.reverse_verifying).toBe(1);
   });
 
   it("second miss with NO provenance → a ruling duty, never a silent close", () => {
@@ -559,8 +577,9 @@ describe("reconcileJoin — lane exemption (BR#5151)", () => {
       prs: [],
       bindings: [binding(1, { missing: true, missing_set_before_report: true, provenance: { merge_sha: "b".repeat(40), signer: "detached-cody" } })],
     });
-    expect(one(r, 1).decision.action).toBe("reverse_close");
-    expect(r.accounting.reverse_closed).toBe(1);
+    expect(one(r, 1).decision.action).toBe("reverse_verify");
+    expect(r.accounting.reverse_closed).toBe(0);
+    expect(r.accounting.reverse_verifying).toBe(1);
     expect(r.accounting.reverse_lane_exempt).toBe(0);
   });
 
@@ -614,7 +633,7 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
       cfg: CFG,
     });
     const j = r.judgements.find((x) => x.pr === 11);
-    expect(j?.decision).toEqual({ action: "observed_merge_close", card: "BR#90011", merge_sha: sha });
+    expect(j?.decision).toEqual({ action: "observed_merge_verify", card: "BR#90011", merge_sha: sha });
     expect(r.accounting.observed_merged).toBe(1);
   });
 
@@ -633,7 +652,7 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
     expect(r.accounting.open_reviewed).toBe(0);
     expect(r.accounting.grace).toBe(0);
     expect(r.accounting.accounted).toBe(1);
-    expect(accountingLine(r.accounting)).toContain("1 observed-merged closed");
+    expect(accountingLine(r.accounting)).toContain("1 awaiting delivery verification");
   });
 
   it("a MERGED row with no bound card is silence — no judgement, no count", () => {
@@ -675,8 +694,8 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
       cfg: CFG,
     });
     const actions = r.judgements.map((x) => x.decision.action);
-    expect(actions).toContain("observed_merge_close");
-    expect(actions).not.toContain("reverse_close");
+    expect(actions).toContain("observed_merge_verify");
+    expect(actions).not.toContain("reverse_verify");
     expect(actions).not.toContain("mark_missing");
     expect(actions).not.toContain("spawn_reverse");
     expect(r.accounting.reverse_missing).toBe(0);
@@ -697,7 +716,7 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
       cfg: CFG,
     });
     const actions = r.judgements.map((x) => x.decision.action);
-    expect(actions).toContain("observed_merge_close");
+    expect(actions).toContain("observed_merge_verify");
     expect(actions).toContain("mark_missing");
     expect(r.accounting.reverse_missing).toBe(1);
     expect(r.accounting.reverse_dutied).toBe(0);
@@ -758,7 +777,7 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
       duties: [],
       cfg: CFG,
     });
-    expect(r.judgements[0]?.decision).toEqual({ action: "observed_merge_close", card: "BR#90021", merge_sha: "e".repeat(40) });
+    expect(r.judgements[0]?.decision).toEqual({ action: "observed_merge_verify", card: "BR#90021", merge_sha: "e".repeat(40) });
     expect(r.accounting.observed_merged).toBe(1);
   });
 });

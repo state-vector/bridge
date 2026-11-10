@@ -31,11 +31,61 @@ const MERGE_EXEMPT_CHECK_PATTERNS: [&str; 7] = [
     "superpositional",
 ];
 
+/// BR#9268: the producer class of a check-run observation — derived from the
+/// provider payload itself (the check run's GitHub URL shape), never
+/// caller-asserted. GitHub files an API-created check run into the creating
+/// app's most recent check suite for the head SHA, so a published report can
+/// share name + app id (GitHub Actions = 15368) + suite id with a native job
+/// while enforcing nothing on its own (live SP PR #3057 head: check-run
+/// 129034449798 `/runs/129034449798` vs job check-run 128984021963
+/// `/actions/runs/42563228107/job/128984021963`, identical name/app/suite).
+/// MUST stay behaviour-identical to contracts train-checks.ts
+/// `CheckRunProducerSchema` / `checkRunProducer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckRunProducer {
+    /// A NATIVE Actions job (`…/actions/runs/{run}/job/{job}`) — the
+    /// enforcing execution; a dispatch re-runs THIS.
+    ActionsJob,
+    /// An API-created check run (`…/runs/{check_run_id}`) — a report; a
+    /// newer one supersedes only other published reports and can never mask
+    /// (or be masked by) the native job's verdict.
+    Published,
+    /// URL missing or an unrecognized shape — its own obligation (never
+    /// merges with a classified one), never dispatchable (fail-closed).
+    Unclassified,
+}
+
+/// GitHub's own Actions app id (BR#9268): every GITHUB_TOKEN-created check
+/// run — native job AND published report — carries it; it can never separate
+/// the two. MUST stay identical to contracts train-checks.ts
+/// GITHUB_ACTIONS_APP_ID.
+pub const GITHUB_ACTIONS_APP_ID: i64 = 15368;
+
+/// MUST stay behaviour-identical to contracts train-checks.ts `checkRunProducer`.
+pub fn check_run_producer(url: Option<&str>) -> CheckRunProducer {
+    let u = url.unwrap_or("").trim();
+    let rest = match u.strip_prefix("https://github.com/") { Some(r) => r, None => return CheckRunProducer::Unclassified };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        // {owner}/{repo}/actions/runs/{run}/job/{job}
+        [_, _, "actions", "runs", run, "job", job]
+            if is_positive_digits(run) && is_positive_digits(job) => CheckRunProducer::ActionsJob,
+        // {owner}/{repo}/runs/{check_run_id}
+        [_, _, "runs", id] if is_positive_digits(id) => CheckRunProducer::Published,
+        _ => CheckRunProducer::Unclassified,
+    }
+}
+
+fn is_positive_digits(s: &str) -> bool {
+    !s.is_empty() && s.as_bytes()[0].is_ascii_digit() && s.as_bytes()[0] != b'0' && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckSource {
     Unknown,
-    CheckRun { suite_id: i64, app_id: i64 },
+    CheckRun { suite_id: i64, app_id: i64, producer: CheckRunProducer },
     WorkflowRun { workflow_id: i64, run_attempt: u64 },
 }
 
@@ -136,10 +186,18 @@ fn parse_runs(runs: &[MainCheckRun]) -> Vec<(String, Vec<&MainCheckRun>)> {
     by_name
 }
 
+/// BR#9268: two check runs are the SAME enforcing obligation only when their
+/// producer class also matches — a native Actions job and an API-published
+/// report of the same name/app/suite are distinct obligations (a newer
+/// published green must never supersede — mask — an older native red, and
+/// vice versa; GitHub keeps BLOCKED in exactly that shape). Supersession
+/// stays WITHIN one producer class.
 fn same_check_obligation(a: &CheckSource, b: &CheckSource) -> bool {
     match (a, b) {
         (CheckSource::Unknown, CheckSource::Unknown) => true,
-        (CheckSource::CheckRun { suite_id: a, app_id: aa }, CheckSource::CheckRun { suite_id: b, app_id: ba }) => a == b && aa == ba,
+        (CheckSource::CheckRun { suite_id: a, app_id: aa, producer: pa }, CheckSource::CheckRun { suite_id: b, app_id: ba, producer: pb }) => {
+            a == b && aa == ba && pa == pb
+        }
         (CheckSource::WorkflowRun { workflow_id: a, .. }, CheckSource::WorkflowRun { workflow_id: b, .. }) => a == b,
         _ => false,
     }
@@ -372,6 +430,15 @@ fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<
 /// therefore: per check name, the judge run (highest id, skipping
 /// cancelled) — kept only when THAT run is red-concluded and the check
 /// name matches the deploy-health gate class.
+/// BR#9268: the set is also PRODUCER-TYPED — only an actually dispatchable
+/// execution. A published check run (`/runs/{id}`, the API-created report
+/// that can share name/app/suite with the native job) is re-requested by
+/// nobody: GitHub's rerequest re-executes nothing for it (the BR#9081
+/// no-op burn), and the native job's own verdict is the enforcing one —
+/// dispatch the ACTUAL native Actions job, once, on a canonical green
+/// base. Unclassified observations are fail-closed: never dispatched. A
+/// workflow-run source (a startup-failed workflow folded by BR#6142) is a
+/// real run and stays dispatchable.
 pub fn latest_red_deploy_health_runs(runs: &[MainCheckRun]) -> Vec<MainCheckRun> {
     let mut out = Vec::new();
     for (name, list) in parse_runs(runs) {
@@ -379,10 +446,48 @@ pub fn latest_red_deploy_health_runs(runs: &[MainCheckRun]) -> Vec<MainCheckRun>
         sorted.sort_by(|a, b| b.id.cmp(&a.id));
         let judge = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled"));
         if let Some(r) = judge {
-            if r.conclusion.as_deref().is_some_and(is_red_conclusion)
+            let dispatchable = match &r.source {
+                CheckSource::WorkflowRun { .. } => true,
+                CheckSource::CheckRun { producer: CheckRunProducer::ActionsJob, .. } => true,
+                _ => false,
+            };
+            if dispatchable
+                && r.conclusion.as_deref().is_some_and(is_red_conclusion)
                 && is_base_health_gate_name(&name)
             {
                 out.push((*r).clone());
+            }
+        }
+    }
+    out
+}
+
+/// BR#9268: the red judge runs of the deploy-health gate class that are NOT
+/// dispatchable executions — published reports (`/runs/{id}`) and
+/// unclassified observations. The RerunGate arm reads this when its native
+/// dispatch set comes up empty, to tell "waiting on the publisher"
+/// (published red: the republisher refreshes it; no native gate job is red)
+/// apart from "payload drift — fail-closed and loud" (unclassified red).
+pub fn red_report_gate_judges(runs: &[MainCheckRun]) -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    for (name, list) in parse_runs(runs) {
+        if !is_base_health_gate_name(&name) {
+            continue;
+        }
+        let mut sorted: Vec<&&MainCheckRun> = list.iter().collect();
+        sorted.sort_by(|a, b| b.id.cmp(&a.id));
+        let judge = sorted.into_iter().find(|r| r.conclusion.as_deref() != Some("cancelled"));
+        if let Some(r) = judge {
+            if r.conclusion.as_deref().is_some_and(is_red_conclusion) {
+                match &r.source {
+                    CheckSource::CheckRun { producer: CheckRunProducer::Published, .. } => {
+                        out.push((name.clone(), r.html_url.clone().unwrap_or_default(), false))
+                    }
+                    CheckSource::CheckRun { producer: CheckRunProducer::Unclassified, .. } => {
+                        out.push((name.clone(), r.html_url.clone().unwrap_or_default(), true))
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -748,6 +853,7 @@ pub enum MergeAction {
     Note { reason: String },
     Skip { reason: String },
     HumanLeg { reason: String },
+    RootFixBypass { reason: String },
     /// BR#4689 L1.4: the head moved MECHANICALLY (same patch-ids) — stamp
     /// the carry leg (hub event `carried`) and let the next tick merge the
     /// covered head. Never a bounce, never a re-verify duty, never a
@@ -933,6 +1039,7 @@ pub enum CandidateGatePhase {
     HeadUncovered { leg_number: usize, stamped: String },
     MergeabilityComputing { reason: String },
     Conflicting,
+    CommitEvidenceMissing,
     UnverifiedCommits { count: usize },
     UnhandledMergeState { state: String },
     MechanicallySound {
@@ -999,6 +1106,7 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
         "blocked" => CandidateMergeState::Blocked,
         _ => return CandidateGatePhase::UnhandledMergeState { state },
     };
+    if !i.commits.iter().any(|(sha, _)| sha == i.head_sha) { return CandidateGatePhase::CommitEvidenceMissing; }
     let unverified = i.commits.iter().filter(|(_, v)| !v).count();
     if unverified > 0 {
         return CandidateGatePhase::UnverifiedCommits { count: unverified };
@@ -1012,7 +1120,9 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
             let all_base_health = !names.is_empty() && names.iter().all(|n| is_base_health_gate_name(n));
             let all_main_green = !names.is_empty() && names.iter().all(|n| n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
             let none_main_green = names.iter().all(|n| !n.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN));
-            if all_base_health && none_main_green {
+            if all_base_health && !head.unsettled.is_empty() {
+                CandidateHeadCheckState::Pending { unsettled: head.unsettled }
+            } else if all_base_health && none_main_green {
                 CandidateHeadCheckState::RedCircularDeployGate { names }
             } else if all_main_green {
                 CandidateHeadCheckState::RedCircularMainGreenGate { names }
@@ -1109,6 +1219,9 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
             ),
             bounce_kind: BounceKind::Gate,
         },
+        CandidateGatePhase::CommitEvidenceMissing => MergeAction::Skip {
+            reason: "Commit signature evidence does not cover the live head; wait for a complete GitHub read".into(),
+        },
         CandidateGatePhase::UnverifiedCommits { count } => MergeAction::HumanLeg {
             reason: format!(
                 "PR #{n} has {count} commit(s) not GitHub-verified — signing-environment class, never per-PR",
@@ -1168,13 +1281,8 @@ pub fn decide_train_gate(i: TrainGateInput) -> MergeAction {
                         | CandidateHeadCheckState::RedCircularMainGreenGate { .. }
                         | CandidateHeadCheckState::RedCircularMixedGates { .. }
                 );
-                let base_circular = i
-                    .base_red_names
-                    .iter()
-                    .any(|n| n.to_lowercase().contains(DEPLOY_HEALTH_PATTERN))
-                    && !matches!(&head_state, CandidateHeadCheckState::RedSubstantive { .. });
-                if head_circular || base_circular {
-                    return MergeAction::HumanLeg {
+                if head_circular {
+                    return MergeAction::RootFixBypass {
                         reason: format!(
                             "PR #{n} is the bound main-breakage fix but the circular deploy-health class stands (BR#5189, SP #2617 precedent): the gate is red because MAIN is red — the head cannot go green while the line it fixes is stopped; the one-click human merge ask is the fast lane",
                             n = i.pr_number
@@ -1453,6 +1561,12 @@ pub enum DeployCoverageState {
         covered_by_sha: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_run_id: Option<i64>,
+        /// BR#8824: canonical same-run rerun identity — a new attempt of the
+        /// same run id on the same tip is a CHANGED coverage receipt (it can
+        /// recover the gate), so the executor stamps the attempt alongside the
+        /// run id. Mirrored in `DeployCoverageStateSchema` + `deployCoverageReceipt`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered_by_run_attempt: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         covered_by_url: Option<String>,
     },
@@ -1614,6 +1728,15 @@ pub fn is_deploy_workflow_run(r: &DeployWorkflowRun, required: &[String]) -> boo
     {
         return true;
     }
+    // The bridge repo's own deploy pipeline is `dev-build` (dev-build.yml, on:
+    // push to main): it builds every CLI target and publishes the Cloudflare
+    // Worker + manifest — the decisive deployment this lane actually waits on.
+    // Without recognizing it, deploy coverage stamps `covered` with no run id
+    // and recovery episodes on this lane can never verify (BR#7572). Mirrors
+    // core.ts isDeployWorkflowRun.
+    if path_lower.ends_with("/dev-build.yml") || path_lower == "dev-build.yml" || name_lower == "dev-build" {
+        return true;
+    }
     if name_lower == "deploy dev" || name_lower == "deploy" || name_lower.starts_with("deploy to ") {
         return true;
     }
@@ -1682,6 +1805,20 @@ fn is_in_progress_workflow_status(status: Option<&str>) -> bool {
     status.unwrap_or("").trim().eq_ignore_ascii_case("in_progress")
 }
 
+fn only_derived_deploy_gate_red(verdict: &CheckVerdict, required: &[String]) -> bool {
+    const GATE: &str = "Deploy health (merge gate)";
+    !required.iter().any(|name| name == GATE)
+        && !verdict.red.is_empty()
+        && verdict.red.iter().all(|check| {
+            if check.name != GATE { return false; }
+            let Some(path) = check.url.strip_prefix("https://github.com/") else { return false; };
+            let parts: Vec<&str> = path.split('/').collect();
+            matches!(parts.as_slice(), [owner, repo, "runs", id] if !owner.is_empty() && !repo.is_empty()
+                && id.as_bytes().first().is_some_and(|digit| matches!(digit, b'1'..=b'9'))
+                && id.bytes().all(|digit| digit.is_ascii_digit()))
+        })
+}
+
 /// Pure level-based deploy coverage & reconciliation state machine (BR#6179):
 /// - Computes `DeployCoverageState` (closed 6-state union on `phase`).
 /// - Decides whether to dispatch `workflow_dispatch` (`dispatch_workflow`) once
@@ -1705,7 +1842,8 @@ pub fn reconcile_deploy_coverage(
         .iter()
         .filter(|r| is_deploy_workflow_run(r, required))
         .collect();
-    deploy_runs.sort_by(|a, b| b.id.cmp(&a.id));
+    deploy_runs.sort_by_key(|r| std::cmp::Reverse((r.id, r.run_attempt.unwrap_or(1))));
+    deploy_runs.dedup_by_key(|r| r.id);
 
     let newest_green = deploy_runs.iter().copied().find(|r| {
         r.status.as_deref().unwrap_or("").eq_ignore_ascii_case("completed")
@@ -1790,6 +1928,7 @@ pub fn reconcile_deploy_coverage(
                 tip_age_secs,
                 covered_by_sha: tip_sha.clone(),
                 covered_by_run_id: tip_green.map(|r| r.id),
+                covered_by_run_attempt: tip_green.and_then(|r| r.run_attempt),
                 covered_by_url: tip_green.and_then(|r| r.html_url.clone()),
             },
             dispatch_workflow: None,
@@ -1799,7 +1938,11 @@ pub fn reconcile_deploy_coverage(
         };
     }
 
-    if base_verdict.verdict == MainVerdict::Red
+    // The synthetic push gate can report an unjudged snapshot while the
+    // authoritative Deploy Dev attempt is still running on this exact tip.
+    let active_supersedes_derived_red = tip_active.zip(newest_tip).is_some_and(|(active, latest)| active.id == latest.id)
+        && only_derived_deploy_gate_red(base_verdict, required);
+    if (base_verdict.verdict == MainVerdict::Red && !active_supersedes_derived_red)
         || decisive_failure.is_some()
     {
         return DeployReconcilePlan {
@@ -1971,16 +2114,21 @@ pub fn format_deploy_coverage_summary(cov: &DeployCoverageState) -> String {
 pub fn reconcile_base_verdict_with_deploy_coverage(
     base_verdict: &CheckVerdict,
     coverage: &DeployCoverageState,
+    required: &[String],
 ) -> CheckVerdict {
     // This is the effective line-health reducer, not an empty-checks cosmetic
     // adapter. Deployment failure must override scoped job-subset GREEN.
-    if base_verdict.verdict == MainVerdict::Red {
+    let active_supersedes_derived_red =
+        matches!(coverage, DeployCoverageState::Settling { active_run_id: Some(id), .. } if *id > 0)
+            && only_derived_deploy_gate_red(base_verdict, required);
+    if base_verdict.verdict == MainVerdict::Red && !active_supersedes_derived_red {
         return base_verdict.clone();
     }
     match coverage {
         DeployCoverageState::Settling { active_run_id, .. } => {
             let mut v = base_verdict.clone();
             v.verdict = MainVerdict::Unsettled;
+            v.red.clear();
             v.alarm = None;
             if v.unsettled.is_empty() {
                 let label = match active_run_id {
@@ -2040,6 +2188,23 @@ fn run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
     MainCheckRun { id, source: CheckSource::Unknown, name: name.into(), status: Some("completed".into()), conclusion: conclusion.map(String::from), html_url: None }
 }
 
+/// BR#9268 test helper: a NATIVE Actions job check run — the dispatchable
+/// execution class (`/actions/runs/{run}/job/{job}` URL, Actions app, the
+/// live gate suite). The plain `run()` helper stays `Unknown` for the
+/// fail-closed tests; anything asserting DISPATCH must use a genuinely
+/// dispatchable provider shape, or the test passes for the wrong reason.
+#[cfg(test)]
+fn native_run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
+    MainCheckRun {
+        id,
+        source: CheckSource::CheckRun { suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+        name: name.into(),
+        status: Some("completed".into()),
+        conclusion: conclusion.map(String::from),
+        html_url: Some(format!("https://github.com/state-vector/superpositional/actions/runs/42563228107/job/{id}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2047,18 +2212,235 @@ mod tests {
     #[test]
     fn same_name_different_suites_remain_independent_obligations() {
         let mut original = run(126988470498, "Deploy health (merge gate)", Some("failure"));
-        original.source = CheckSource::CheckRun { suite_id: 10, app_id: 1 };
+        original.source = CheckSource::CheckRun { suite_id: 10, app_id: 1, producer: CheckRunProducer::Published };
         let mut republished = run(127642055356, "Deploy health (merge gate)", Some("success"));
-        republished.source = CheckSource::CheckRun { suite_id: 20, app_id: 1 };
+        republished.source = CheckSource::CheckRun { suite_id: 20, app_id: 1, producer: CheckRunProducer::Published };
         let mut runs = vec![original.clone(), republished];
         assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
         assert_eq!(classify_main_check_runs(&runs).verdict, MainVerdict::Red);
-        assert_eq!(latest_red_deploy_health_runs(&runs)[0].id, original.id);
+        // BR#9268: a published report is a report — never in the dispatch set
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+        assert_eq!(red_report_gate_judges(&runs)[0].0, "Deploy health (merge gate)");
         original.id = 127653739994;
         original.conclusion = Some("success".into());
         runs.push(original);
         assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Green);
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
+        assert!(red_report_gate_judges(&runs).is_empty());
+    }
+
+    /// BR#9268 live shape — SP PR #3057 head b6e84012 (2026-11-09): the
+    /// GitHub Actions app (15368) filed an API-created `Deploy health (merge
+    /// gate)` check run into the SAME check suite as the native gate job —
+    /// identical name, app id and suite id; only the URL shape separates
+    /// them. A newer published green must never supersede — mask — the
+    /// older native job's failure while GitHub keeps the PR BLOCKED.
+    #[test]
+    fn published_report_cannot_mask_native_job_failure_same_suite() {
+        let repo = "state-vector/superpositional";
+        let suite = 115286627637;
+        let native = MainCheckRun {
+            id: 128984021963,
+            source: CheckSource::CheckRun { suite_id: suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some(format!("https://github.com/{repo}/actions/runs/42563228107/job/128984021963")),
+        };
+        let published_green = MainCheckRun {
+            id: 129034449798,
+            source: CheckSource::CheckRun { suite_id: suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Published },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            html_url: Some(format!("https://github.com/{repo}/runs/129034449798")),
+        };
+        let runs = vec![native.clone(), published_green.clone()];
+        // The pre-split collapse judged this obligation by the newest id —
+        // the published green — and read the head green while GitHub held it
+        // BLOCKED. The producer split keeps the native red speaking.
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        assert_eq!(classify_main_check_runs(&runs).verdict, MainVerdict::Red);
+        assert_eq!(classify_head_checks(&runs).red[0].url, native.html_url.clone().unwrap());
+        // The dispatch set is the ACTUAL native job — the published report
+        // is never re-requested.
+        let stale = latest_red_deploy_health_runs(&runs);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, native.id);
+        assert!(red_report_gate_judges(&runs).is_empty()); // the published judge here is green
+        // Mirror direction: a newer published FAILURE is its own red even
+        // against an older native GREEN — never masked, never masked by.
+        let native_green = MainCheckRun { conclusion: Some("success".into()), ..native.clone() };
+        let published_red = MainCheckRun { conclusion: Some("failure".into()), ..published_green.clone() };
+        let runs = vec![native_green, published_red];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        let stale = latest_red_deploy_health_runs(&runs);
+        assert!(stale.is_empty());
+        let reports = red_report_gate_judges(&runs);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].2); // published, not unclassified
+    }
+
+    /// BR#9268: supersession stays WITHIN one producer class. A newer
+    /// native attempt supersedes an older native attempt; a fresher
+    /// publication supersedes an older report; neither class touches the
+    /// other's judge.
+    #[test]
+    fn same_producer_supersession_stays_within_class() {
+        let repo = "state-vector/superpositional";
+        let suite = 114954645548;
+        let native_red = MainCheckRun {
+            id: 128960757729,
+            source: CheckSource::CheckRun { suite_id: suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some(format!("https://github.com/{repo}/actions/runs/42433292307/job/128960757729")),
+        };
+        let native_green_rerun = MainCheckRun {
+            id: 129099999999,
+            html_url: Some(format!("https://github.com/{repo}/actions/runs/42433292307/job/129099999999")),
+            conclusion: Some("success".into()),
+            ..native_red.clone()
+        };
+        let published_green = MainCheckRun {
+            id: 129034481458,
+            source: CheckSource::CheckRun { suite_id: suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Published },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            html_url: Some(format!("https://github.com/{repo}/runs/129034481458")),
+        };
+        let published_red_older = MainCheckRun { id: 128000000000, conclusion: Some("failure".into()), ..published_green.clone() };
+        // A native re-run that succeeded supersedes the older native failure
+        // (same class); the published green (other class) neither masks the
+        // older native red nor is masked by it — but with the native judge
+        // now green, the head is green.
+        let runs = vec![native_red.clone(), native_green_rerun.clone(), published_green.clone()];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Green);
+        // Drop the native re-run: the native red speaks again even though a
+        // newer published green exists (the live #3057 masking shape).
+        let runs = vec![native_red.clone(), published_green.clone()];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        // A fresher publication supersedes an older report of its own class:
+        // the older published red cannot survive a newer published green.
+        let runs = vec![native_green_rerun.clone(), published_red_older, published_green.clone()];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Green);
+        // Unclassified observations are their own class: they never merge
+        // with a classified obligation, so they can never vouch over (or be
+        // masked by) the native job's verdict.
+        let unclassified = MainCheckRun {
+            id: 130000000000,
+            source: CheckSource::CheckRun { suite_id: suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Unclassified },
+            conclusion: Some("success".into()),
+            html_url: None,
+            ..native_red.clone()
+        };
+        let runs = vec![native_red, unclassified];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+    }
+
+    /// BR#9268 retired push-workflow shape — SP PR #2942 head ae303a44: the
+    /// head carries THREE `Deploy health (merge gate)` runs across TWO
+    /// suites. The retired push-triggered Deploy Dev's suite (114954639280)
+    /// holds a native job failure AND the republished report; the PR CI
+    /// suite (114954645548) holds a native job success. Suite separation
+    /// keeps the PR CI green independent; within the push suite the native
+    /// failure must stay visible next to the report.
+    #[test]
+    fn retired_push_workflow_two_suite_shape_stays_distinct() {
+        let repo = "state-vector/superpositional";
+        let push_suite = 114954639280;
+        let ci_suite = 114954645548;
+        let native_push_failure = MainCheckRun {
+            id: 128586665979,
+            source: CheckSource::CheckRun { suite_id: push_suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some(format!("https://github.com/{repo}/actions/runs/42433289639/job/128586665979")),
+        };
+        let published_push_report = MainCheckRun {
+            id: 129034481458,
+            source: CheckSource::CheckRun { suite_id: push_suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Published },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some(format!("https://github.com/{repo}/runs/129034481458")),
+        };
+        let native_ci_success = MainCheckRun {
+            id: 128960757729,
+            source: CheckSource::CheckRun { suite_id: ci_suite, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::ActionsJob },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            html_url: Some(format!("https://github.com/{repo}/actions/runs/42433292307/job/128960757729")),
+        };
+        let runs = vec![native_push_failure.clone(), published_push_report.clone(), native_ci_success.clone()];
+        assert_eq!(classify_head_checks(&runs).verdict, MainVerdict::Red);
+        // The self-heal dispatches the ACTUAL native job once — the push
+        // suite's red job, never the report, never the green CI job.
+        let stale = latest_red_deploy_health_runs(&runs);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, native_push_failure.id);
+        let reports = red_report_gate_judges(&runs);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].1, published_push_report.html_url.clone().unwrap());
+    }
+
+    /// BR#9268: the producer class comes from the provider URL shape — never
+    /// caller-asserted. MUST stay behaviour-identical to contracts
+    /// train-checks.ts `checkRunProducer`.
+    #[test]
+    fn check_run_producer_derivation_is_provider_shaped() {
+        let repo = "state-vector/superpositional";
+        assert_eq!(check_run_producer(Some(&format!("https://github.com/{repo}/actions/runs/42563228107/job/128984021963"))), CheckRunProducer::ActionsJob);
+        assert_eq!(check_run_producer(Some(&format!("https://github.com/{repo}/runs/129034449798"))), CheckRunProducer::Published);
+        assert_eq!(check_run_producer(Some(&format!("https://github.com/{repo}/runs/0123"))), CheckRunProducer::Unclassified);
+        assert_eq!(check_run_producer(Some(&format!("https://github.com/{repo}/actions/runs/42563228107"))), CheckRunProducer::Unclassified);
+        assert_eq!(check_run_producer(Some("https://example.com/other")), CheckRunProducer::Unclassified);
+        assert_eq!(check_run_producer(None), CheckRunProducer::Unclassified);
+        assert_eq!(check_run_producer(Some("  ")), CheckRunProducer::Unclassified);
+    }
+
+    #[test]
+    fn active_exact_deploy_attempt_supersedes_only_derived_gate_red() {
+        let tip = "e1b6b5954433ccf38c328104447f4af0176a7cf6";
+        let run_id = 42562274448;
+        let run_url = "https://github.com/state-vector/superpositional/actions/runs/42562274448";
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into(), "post-deploy / Lodestar Operational Health".into()];
+        let mut gate = run(128982701091, "Deploy health (merge gate)", Some("failure"));
+        gate.html_url = Some("https://github.com/state-vector/superpositional/runs/128982701091".into());
+        let scoped = classify_base_check_runs(&[gate.clone(), run(128986714690, &required[1], None)], &required);
+        assert_eq!(scoped.verdict, MainVerdict::Red);
+        let first = DeployWorkflowRun {
+            id: run_id, run_attempt: Some(1), name: "Deploy Dev".into(), path: Some(".github/workflows/deploy-dev.yml".into()),
+            head_sha: tip.into(), event: Some("push".into()), status: Some("completed".into()),
+            conclusion: Some("failure".into()), html_url: Some(run_url.into()),
+        };
+        let second = DeployWorkflowRun { run_attempt: Some(2), status: Some("in_progress".into()), conclusion: None, ..first.clone() };
+        let plan = reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[first.clone(), second.clone()], None);
+        assert!(matches!(plan.coverage, DeployCoverageState::Settling { active_run_id: Some(id), .. } if id == run_id));
+        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage, &required);
+        assert_eq!(effective.verdict, MainVerdict::Unsettled);
+        assert!(effective.red.is_empty());
+
+        let mut native_gate = gate.clone();
+        native_gate.html_url = Some(format!("{run_url}/job/128986714690"));
+        for checks in [vec![native_gate], vec![gate.clone(), run(128986714690, &required[1], Some("failure"))]] {
+            let red = classify_base_check_runs(&checks, &required);
+            let plan = reconcile_deploy_coverage(tip, 1350, 300, &red, &required, &[second.clone()], None);
+            assert!(matches!(plan.coverage, DeployCoverageState::Failed { .. }));
+        }
+        let explicitly_required = [required.as_slice(), &[gate.name]].concat();
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &explicitly_required, &[second.clone()], None).coverage,
+            DeployCoverageState::Failed { .. }));
+        let foreign = DeployWorkflowRun { head_sha: "a".repeat(40), ..second.clone() };
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[foreign], None).coverage,
+            DeployCoverageState::Failed { .. }));
+        let third = DeployWorkflowRun { run_attempt: Some(3), ..first.clone() };
+        assert!(matches!(reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[first, second, third], None).coverage,
+            DeployCoverageState::Failed { failing_run_id: Some(id), .. } if id == run_id));
     }
 
     #[test]
@@ -2075,7 +2457,7 @@ mod tests {
         let plan = reconcile_deploy_coverage("78760d10", 7800, 300, &scoped, &required, &workflows, None);
         assert!(matches!(plan.coverage, DeployCoverageState::Failed { failing_run_id: Some(41926939169), .. }));
         assert_eq!(plan.covered_by_sha.as_deref(), Some("e99f74f8"));
-        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage);
+        let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage, &required);
         assert_eq!(effective.verdict, MainVerdict::Red);
         assert!(effective.red[0].url.ends_with("41926939169"));
         // Effective red cannot dispatch stale-gate recovery or clear a stop.
@@ -2095,11 +2477,14 @@ mod tests {
         // healed check and flip the head back to unsettled next tick.
         // (The live fetch itself — ctx.check_runs, a paginated gh read — is
         // not unit-testable here; this newest-wins law over the fetched set
-        // is the testable half of the invariant.)
+        // is the testable half of the invariant.) BR#9268: the fixtures are
+        // NATIVE jobs so the empty set comes from supersession, not from
+        // non-dispatchability — every one of them would dispatch if it were
+        // the judge.
         let runs = vec![
-            run(125_040_321_562, "Deploy health (merge gate)", Some("failure")),
-            run(125_041_293_759, "Deploy health (merge gate)", Some("failure")),
-            run(126_074_493_096, "Deploy health (merge gate)", Some("success")),
+            native_run(125_040_321_562, "Deploy health (merge gate)", Some("failure")),
+            native_run(125_041_293_759, "Deploy health (merge gate)", Some("failure")),
+            native_run(126_074_493_096, "Deploy health (merge gate)", Some("success")),
         ];
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
     }
@@ -2109,8 +2494,8 @@ mod tests {
         // A REAL red (the judge run — highest id, non-cancelled — is red):
         // exactly that run is dispatchable, never the superseded older red.
         let runs = vec![
-            run(100, "Deploy health (merge gate)", Some("failure")),
-            run(200, "Deploy health (merge gate)", Some("timed_out")),
+            native_run(100, "Deploy health (merge gate)", Some("failure")),
+            native_run(200, "Deploy health (merge gate)", Some("timed_out")),
         ];
         let got = latest_red_deploy_health_runs(&runs);
         assert_eq!(got.len(), 1);
@@ -2122,8 +2507,8 @@ mod tests {
         // Same judge law as classify_head_checks: a CANCELLED newest run is
         // not the judge — the next non-cancelled run down decides.
         let runs = vec![
-            run(300, "Deploy health (merge gate)", Some("cancelled")),
-            run(200, "Deploy health (merge gate)", Some("failure")),
+            native_run(300, "Deploy health (merge gate)", Some("cancelled")),
+            native_run(200, "Deploy health (merge gate)", Some("failure")),
         ];
         let got = latest_red_deploy_health_runs(&runs);
         assert_eq!(got.len(), 1);
@@ -2136,6 +2521,31 @@ mod tests {
         // heals only the stale main-deploy-judging gate class).
         let runs = vec![run(400, "Rust Tests", Some("failure"))];
         assert!(latest_red_deploy_health_runs(&runs).is_empty());
+    }
+
+    /// BR#9268: an unclassified red judge (no recognizable provider URL
+    /// shape) is fail-closed — GitHub's rerequest would aim at nothing, so
+    /// it is never dispatched; `red_report_gate_judges` reports it as the
+    /// LOUD variant so payload drift surfaces instead of burning no-op
+    /// rerequests (the BR#9081 class).
+    #[test]
+    fn unclassified_red_judge_is_fail_closed_never_dispatched_br9268() {
+        // Live shape: a real check run whose html_url carries no recognizable
+        // GitHub URL shape (payload drift) — the read classifies it
+        // CheckRun/Unclassified, never an execution.
+        let unclassified = MainCheckRun {
+            id: 500,
+            source: CheckSource::CheckRun { suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: CheckRunProducer::Unclassified },
+            name: "Deploy health (merge gate)".into(),
+            status: Some("completed".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some("https://example.com/other".into()),
+        };
+        let runs = vec![unclassified];
+        assert!(latest_red_deploy_health_runs(&runs).is_empty());
+        let loud = red_report_gate_judges(&runs);
+        assert_eq!(loud.len(), 1);
+        assert!(loud[0].2, "the unclassified judge is the loud variant");
     }
 
     #[test]
@@ -2383,7 +2793,7 @@ mod tests {
         // conviction must re-run — never bounce, never a human leg.
         let head = [run(1, "Test", Some("success")), run(2, "main-green gate", Some("failure"))];
         let g = MainVerdict::Green;
-        let commits = [(format!("{:040x}", 1), true)];
+        let commits = [(format!("{:040x}", 2), true)];
         let action = decide_train_gate(crate::train_gate::TrainGateInput {
             pr_number: 377,
             head_sha: &format!("{:040x}", 2),
@@ -3338,7 +3748,7 @@ mod tests {
             train_owned_branch: false,
         });
         match gate {
-            MergeAction::HumanLeg { reason } => {
+            MergeAction::RootFixBypass { reason } => {
                 assert!(reason.contains("circular deploy-health class") && reason.contains("BR#5189"), "{reason}");
             }
             other => panic!("expected human fast lane, got {other:?}"),
@@ -3408,6 +3818,35 @@ mod tests {
             train_owned_branch: false,
         });
         assert!(!matches!(gate, MergeAction::Merge { .. }) && !matches!(gate, MergeAction::HumanLeg { .. }), "got {gate:?}");
+    }
+
+    #[test]
+    fn bypass_requires_settled_verified_covered_head() {
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let meta = root_fix_meta(head);
+        for (verified, live_head, pending, missing) in [(true, head, true, false), (false, head, false, false),
+            (true, "dddddddddddddddddddddddddddddddddddddddd", false, false), (true, head, false, true)] {
+            let mut checks = vec![run(1, "Deploy health (merge gate)", Some("failure"))];
+            if pending { checks.push(run(2, "Rust Tests", None)); }
+            let commits = if missing { vec![] } else { vec![(live_head.into(), verified)] };
+            let gate = decide_train_gate(TrainGateInput {
+                pr_number: 339, head_sha: live_head, card_meta: &meta, card_status: Some("blocked"),
+                base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
+                commits: &commits, head_checks: &checks, leg_number: Some(1),
+                mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
+                base_gate_green: false, train_owned_branch: false,
+            });
+            assert!(!matches!(gate, MergeAction::RootFixBypass { .. } | MergeAction::Merge { .. }), "{gate:?}");
+        }
+        let truncated = vec![("9".repeat(40), true)];
+        let gate = decide_train_gate(TrainGateInput {
+            pr_number: 339, head_sha: head, card_meta: &meta, card_status: Some("blocked"),
+            base_verdict: MainVerdict::Red, mergeable: Some(true), merge_state_status: Some("blocked".into()),
+            commits: &truncated, head_checks: &[run(1, "Deploy health (merge gate)", Some("failure"))], leg_number: Some(1),
+            mechanical_move: None, root_fix: true, base_red_names: &["Deploy health (merge gate)".into()],
+            base_gate_green: false, train_owned_branch: false,
+        });
+        assert!(matches!(gate, MergeAction::Skip { .. }), "{gate:?}");
     }
 
     #[test]
@@ -3625,7 +4064,7 @@ mod tests {
             train_owned_branch: false,
         });
         assert!(
-            matches!(circular_blocked, MergeAction::HumanLeg { .. }),
+            matches!(circular_blocked, MergeAction::RootFixBypass { .. }),
             "expected HumanLeg on BLOCKED circular root-fix PR, got {circular_blocked:?}"
         );
         // 3. A CONFLICTING PR (`mergeable == Some(false)`) ALWAYS bounces as Conflict,
@@ -3702,6 +4141,42 @@ mod tests {
         assert!(is_deploy_workflow_run(&wf_runs_with_dhr[1], &required));
         assert_eq!(infer_deploy_workflow(&required, &wf_runs_with_dhr), Some("deploy-dev.yml".into()));
         assert_eq!(infer_deploy_workflow(&required, &[]), Some("deploy-dev.yml".into()));
+
+        // BR#7572: the bridge repo's own deploy pipeline `dev-build`
+        // (dev-build.yml, push-to-main Workers + CLI binaries) is the decisive
+        // deploy workflow — recognized by name alone and by path; a
+        // differently-named lookalike stays unrecognized.
+        let dev_build_run = DeployWorkflowRun {
+            id: 42361588979,
+            run_attempt: Some(1),
+            name: "dev-build".into(),
+            path: Some(".github/workflows/dev-build.yml".into()),
+            head_sha: dark_tip.into(),
+            event: Some("push".into()),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            html_url: None,
+        };
+        assert!(is_deploy_workflow_run(&dev_build_run, &required));
+        let dev_build_name_only = DeployWorkflowRun {
+            path: None,
+            ..dev_build_run.clone()
+        };
+        assert!(is_deploy_workflow_run(&dev_build_name_only, &required));
+        // renamed display on the genuine path: the path identifies the workflow file
+        let dev_build_renamed = DeployWorkflowRun {
+            name: "dev-build canary".into(),
+            ..dev_build_run.clone()
+        };
+        assert!(is_deploy_workflow_run(&dev_build_renamed, &required));
+        // a differently-named lookalike on its own path stays unrecognized
+        // (dev-build-canary.yml does not end with "/dev-build.yml")
+        let dev_build_lookalike = DeployWorkflowRun {
+            name: "dev-build canary".into(),
+            path: Some(".github/workflows/dev-build-canary.yml".into()),
+            ..dev_build_run.clone()
+        };
+        assert!(!is_deploy_workflow_run(&dev_build_lookalike, &required));
 
         // 2. Inside grace window (age 120s < 300s): UncoveredGrace, no dispatch yet
         let plan_grace = reconcile_deploy_coverage(
@@ -3856,7 +4331,7 @@ mod tests {
             plan_spot.coverage,
             DeployCoverageState::Settling { active_run_id: Some(41911085476), .. }
         ));
-        let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage);
+        let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage, &required);
         assert_eq!(reconciled_spot.verdict, MainVerdict::Unsettled);
         assert!(reconciled_spot.alarm.is_none());
         assert_eq!(reconciled_spot.unsettled, vec!["Deploy Dev (run #41911085476 in flight)"]);
@@ -3888,7 +4363,7 @@ mod tests {
             plan_failed_spot.coverage,
             DeployCoverageState::Failed { failing_run_id: Some(41911085476), .. }
         ));
-        let reconciled_failed = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_failed_spot.coverage);
+        let reconciled_failed = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_failed_spot.coverage, &required);
         assert_eq!(reconciled_failed.verdict, MainVerdict::Red);
         assert_eq!(reconciled_failed.red.len(), 1);
         assert_eq!(reconciled_failed.red[0].name, "Deploy Dev (run #41911085476)");

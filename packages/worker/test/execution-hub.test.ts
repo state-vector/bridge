@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 import { ExecutionStateSchema, WorkerStatusSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
@@ -36,7 +37,6 @@ async function runtimeTask() {
   expect((await post("execution", { ...auth, command_id: "begin", command: { kind: "begin", attempt_id: "one", worker: `${name}/worker`, action_budget_ms: 60_000 } })).data.error).toBeUndefined();
   const oldFence = { generation: 1, attempt_id: "one" };
   const before = (command_id: string, command: object) => post("execution", { ...auth, command_id, command: { ...oldFence, ...command } });
-  await before("first-checkpoint", { kind: "checkpoint", checkpoint });
   await before("first-quiet", { kind: "quiesce", writers: "process_group_empty" });
   expect((await before("first-yield", { kind: "yield" })).data.error).toBeUndefined();
   const note = await post("progress.log", { ...auth, note: "Late runner result after yield", completion_pct: 100 });
@@ -44,12 +44,10 @@ async function runtimeTask() {
   expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("todo");
   expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
   expect((await post("execution", { ...auth, command_id: "second-begin", command: { kind: "begin", attempt_id: "two", worker: `${name}/worker`, action_budget_ms: 60_000 } })).data.error).toBeUndefined();
-  expect((await post("execution", { ...auth, command_id: "restore", command: { kind: "restore", generation: 2, attempt_id: "two", tree: checkpoint.tree, commit: checkpoint.commit } })).data.error).toBeUndefined();
   const fence = { generation: 2, attempt_id: "two" };
   const command = async (command_id: string, command: object) => post("execution", { ...auth, command_id, command: { ...fence, ...command } });
-  await command("handoff", { kind: "local_handoff", reason: "Needs local workspace", action: "Repair dataset", findings: "Remote dataset missing", tried: "Inspected remote", next: "Restore exact checkpoint", evidence: ["https://github.com/state-vector/bridge/actions/runs/1"], approvals: [], recipient: null });
-  expect((await command("too-early-yield", { kind: "yield" })).data.error).toMatch(/checkpoint/);
-  await command("checkpoint", { kind: "checkpoint", checkpoint });
+  await command("handoff", { kind: "local_handoff", reason: "Needs local workspace", action: "Repair dataset", findings: "Remote dataset missing", tried: "Inspected remote", next: "Start fresh from task history", evidence: ["https://github.com/state-vector/bridge/actions/runs/1"], approvals: [], recipient: null });
+  expect((await command("too-early-yield", { kind: "yield" })).data.error).toMatch(/quiescent/);
   await command("quiet", { kind: "quiesce", writers: "process_group_empty" });
   const yielded = await command("yield", { kind: "yield" });
   expect(yielded.data.error).toBeUndefined();
@@ -62,6 +60,59 @@ async function interactive(label: string) {
   const identity = (await post<{ token_id: string }>("auth.identify", { bearer: token.secret })).data;
   return { ...token, ...identity, label };
 }
+
+describe("historical stopped-writer receipts", () => {
+  async function setup() {
+    const host = `writer-proof-host-${++serial}`;
+    const gateway = (await post<{ secret: string }>("admin.mint", { label: host, tags: ["gateway"] })).data;
+    const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gateway.secret })).data;
+    const worker = (await post<{ id: string }>("agent.provision", { label: `${host}/worker`, actor: host })).data;
+    const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `writer-proof-${serial}` };
+    expect((await post("execution", { ...auth, id: "gateway", command_id: "ready", command: { kind: "advertise", capabilities: {
+      ...localCapabilities, backend: "opencode", capacity: 4, worker: { kind: "provisioned", label: `${host}/worker` },
+    } } })).data.error).toBeUndefined();
+    const id = (await post<{ id: string }>("create", { type: "task", title: `Writer proof ${serial}`, project: "bridge", roles: ["impl"], qualified: true })).data.id;
+    expect((await post("transition", { ...auth, id, to: "in_progress" })).data.error).toBeUndefined();
+    const command = (command_id: string, command: object, extra: object = {}) => post("execution", { ...auth, id, command_id, command, ...extra });
+    expect((await command("begin-old", { kind: "begin", attempt_id: "old", worker: `${host}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
+    return { id, auth, worker, command };
+  }
+
+  it("reads the original immutable proof without releasing a newer active attempt", async () => {
+    const r = await setup(), fence = { generation: 1, attempt_id: "old" };
+    expect((await r.command("lookup", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    await post("update", { id: r.id, meta: { fake_stopped_proof: { ...fence, phase: "quiesced" } } });
+    expect((await r.command("lookup", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    expect((await r.command("actual-old-stop", { kind: "quiesce", ...fence, writers: "process_group_empty" })).data.error).toBeUndefined();
+    expect((await r.command("begin-new", { kind: "begin", attempt_id: "new", worker: `${r.auth.actor}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
+    const before = ExecutionStateSchema.parse((await r.command("before", { kind: "inspect" })).data);
+    expect(before.attempt).toMatchObject({ generation: 2, attempt_id: "new", phase: "running" });
+    const found = await r.command("lookup", { kind: "writer_receipt", ...fence });
+    expect(found.data).toMatchObject({ kind: "writer_receipt_found", task_id: r.id, command_id: "actual-old-stop", source: "quiesce",
+      proof: { host: r.auth.actor, session: r.auth.session, ...fence, phase: "quiesced", writers: "process_group_empty" } });
+    for (const wrong of [{ generation: 2, attempt_id: "new" }, { generation: 1, attempt_id: "different" }]) {
+      expect((await r.command("wrong", { kind: "writer_receipt", ...wrong })).data.kind).toBe("writer_receipt_missing");
+    }
+    expect((await r.command("wrong-session", { kind: "writer_receipt", ...fence }, { session: "different" })).data.kind).toBe("writer_receipt_missing");
+    const peer = await setup();
+    expect((await post("execution", { ...peer.auth, id: r.id, command_id: "foreign", command: { kind: "writer_receipt", ...fence } })).data.kind).toBe("writer_receipt_missing");
+    expect((await r.command("forged", { kind: "writer_receipt", ...fence }, { token_id: r.worker.id, actor: `${r.auth.actor}/worker`, gateway: true })).data.error).toMatch(/originating runner/);
+    expect(ExecutionStateSchema.parse((await r.command("after", { kind: "inspect" })).data)).toEqual(before);
+  });
+
+  it("keeps unresolved outside actions and unfinished result delivery protected", async () => {
+    const r = await setup(), fence = { generation: 1, attempt_id: "old" };
+    await r.command("outside-intent", { kind: "prepare", ...fence, operation_id: "outside", action: "Outside action", input_revision: "one", budget_ms: 10_000 });
+    await r.command("physical-stop", { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    expect((await r.command("held", { kind: "writer_receipt", ...fence })).data).toMatchObject({ kind: "writer_receipt_held" });
+    expect(ExecutionStateSchema.parse((await r.command("inspect-held", { kind: "inspect" })).data).operations[0].state).toBe("prepared");
+    const pending = await setup();
+    await pending.command("captured-stop", { kind: "stopped", ...fence, writers: "process_group_empty",
+      outcome: { kind: "completed", exit_code: 0, stdout_tail: "Captured result still needs delivery", stderr_tail: "" } });
+    expect((await pending.command("not-finalized", { kind: "writer_receipt", ...fence })).data.kind).toBe("writer_receipt_missing");
+    expect(ExecutionStateSchema.parse((await pending.command("inspect-finalizing", { kind: "inspect" })).data).attempt?.phase).toBe("finalizing");
+  });
+});
 
 describe("local handoff authority and lifecycle", () => {
   it("projects direct human-directed sessions as custom without assigning an autonomous tier", async () => {
@@ -120,7 +171,7 @@ describe("local handoff authority and lifecycle", () => {
     expect(history.versions.find(v => v.action === "interactive_handoff")?.data?.previous_attempt?.attempts).toBe(7);
     expect((await post("transition", { ...auth, to: "in_progress", note: "Human resumes the released work" })).data.error).toBeUndefined();
   });
-  it("atomically consumes a prepared local pickup, preserves checkpoints and accepts exactly one direct claimant", async () => {
+  it("atomically consumes a prepared local pickup, accepts exactly one direct claimant", async () => {
     const r = await runtimeTask(); const a = await interactive(`direct-a-${serial}`); const b = await interactive(`direct-b-${serial}`);
     const claim = (agent: typeof a) => post("transition", { id: r.id, token_id: agent.token_id, actor: agent.label, session: `human-${agent.label}`, to: "in_progress", note: "Human-directed local pickup" });
     const results = await Promise.all([claim(a), claim(b)]);
@@ -130,8 +181,8 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("progress.log", { ...auth, note: "Preserved checkpoint inspected", completion_pct: 90 })).data.kind).not.toBe("commentary");
     expect((await post("get", { id: r.id })).data.meta).toMatchObject({ last_progress: { completion_pct: 90, session: auth.session } });
     const state = ExecutionStateSchema.parse((await post("execution", { ...auth, command_id: "direct-inspect", command: { kind: "inspect" } })).data);
-    expect(state.handoff).toMatchObject({ phase: "returned", checkpoint });
-    expect(state.attempt?.checkpoint).toEqual(checkpoint);
+    expect(state.handoff).toMatchObject({ phase: "returned", checkpoint: null });
+    expect(state.attempt?.checkpoint).toBeNull();
     expect((await post("transition", { ...auth, to: "in_review", note: "Executed recovery: https://github.com/state-vector/bridge/actions/runs/1" })).data.error).toBeUndefined();
     expect((await post("get", { id: r.id })).data.status).toBe("in_review");
     expect((await post("progress.log", { ...r.auth, note: "Late runner must not overwrite current progress" })).data.kind).toBe("commentary");
@@ -190,7 +241,7 @@ describe("local handoff authority and lifecycle", () => {
     const pause = await r.command("pause-gateway", { kind: "pause_claims", reason: "Operator update drain", budget_ms: 60_000 });
     expect(pause.data.kind).toBe("claims_paused");
     const availability = await post<{ hosts: { host: string; readiness: { kind: string } }[] }>("execution", { ...auth, command_id: "paused-availability", command: { kind: "availability" } });
-    expect(availability.data.hosts.find(host => host.host === r.auth.actor)?.readiness.kind).toBe("cooldown");
+    expect(availability.data.hosts.find(host => host.host === r.auth.actor)?.readiness.kind).toBe("paused");
     const release = await post("execution", { ...auth, command_id: "drain-start", command: { kind: "start_failed", stage: "begin", reason: "gate: operator paused launch", retained_work: false, failure_class: "prerequisite" } });
     expect(release.data).toMatchObject({ kind: "released", barrier: null });
     expect((await r.command("resume-gateway", { kind: "resume_claims" })).data.kind).toBe("claims_resumed");
@@ -211,7 +262,7 @@ describe("local handoff authority and lifecycle", () => {
     const state = ExecutionStateSchema.parse((await post("execution", { id: task.id, actor: "manual-author", token_id: (await interactive("manual-reader")).token_id, command_id: "read-manual", command: { kind: "inspect" } })).data);
     if (state.handoff.phase !== "preparing") throw new Error("human choice did not prepare local handoff");
     const control = { id: task.id, handoff_id: state.handoff.id, version: 1, actor: "web:test" };
-    expect((await post("handoff.control", { ...control, kind: "confirm_preparation", checkpoint, writers: "human_confirmed_quiescent", evidence: "Human verified remote publication and stopped the manual writer" })).data.kind).toBe("preparation_confirmed");
+    expect((await post("handoff.control", { ...control, kind: "confirm_preparation", writers: "human_confirmed_quiescent", evidence: "Human stopped the manual writer" })).data.kind).toBe("preparation_confirmed");
     const local = await interactive("manual-local");
     const accept = { id: task.id, handoff_id: state.handoff.id, version: 2, session: "local-manual", token_id: local.token_id };
     expect((await post("handoff.control", { ...control, version: 2, kind: "authorize", label: local.label, session: accept.session, host: "manual-host", evidence: "Restored exact snapshot with the stated model/access", capabilities: localCapabilities, ttl_ms: 1 })).data.kind).toBe("authorized");
@@ -227,7 +278,7 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("transition", { ...r.auth, to: "in_progress" })).data.error).toMatch(/wait owns/);
     expect((await post("update", { id: r.id, meta: { blocked: {} } })).data.error).toMatch(/lifecycle infrastructure/);
     expect((await post("progress.log", { ...r.auth, note: "A comment is not acceptance" })).data.kind).toBe("commentary");
-    const ask = await post<{ id: string }>("ask.create", { actor: "coordinator", to: "human", artefact_id: r.id, question: "Is the dataset approved?", reason: "Dataset choice", details: "Choose the data source for the local repair.", options: ["GO", "Hold"] });
+    const ask = await post<{ id: string }>("ask.create", { actor: "coordinator", to: "human", artefact_id: r.id, question: "Is the dataset approved?", decision: decisionFixture(r.id, ["GO", "Hold"]) });
     expect(ask.data.error).toBeUndefined();
     expect((await post("ask.answer", { id: ask.data.id, answer: "GO", actor: "web:test" })).data.error).toBeUndefined();
     await post("admin.stall_sweep", { now: Date.now() + 7 * 86_400_000 });
@@ -237,6 +288,22 @@ describe("local handoff authority and lifecycle", () => {
     const read1 = await post("handoff.read", {}); const read2 = await post("handoff.read", {});
     expect(read1.data).toEqual(read2.data);
     const card = await post<{ status: string }>("get", { id: r.id }); expect(card.data.status).toBe("blocked");
+  });
+  it("recorded retirement cannot consume an independently protected local pickup", async () => {
+    const r = await runtimeTask();
+    const answer = `Close the old wrapper — retire ${r.id}`;
+    const ask = await post<{ id: string }>("ask.create", { to: "legacy-peer", artefact_id: r.id, actor: "fixture-owner",
+      question: "Retire this local-only task?", reason: "The owner decides whether the task is retained.", details: `Local pickup ${r.id} still has a checkpoint and its own authoritative exit.`,
+      options: [answer, "KEEP the local pickup"] });
+    expect(ask.data.error).toBeUndefined();
+    await post("ask.answer", { id: ask.data.id, answer, actor: "web:rayh" });
+    const agent = await interactive(`retirement-reader-${serial}`);
+    const refused = await post("transition", { id: r.id, to: "superseded", actor: agent.label, token_id: agent.token_id, session: "retirement-reader", batch_auth: { ask: ask.data.id } });
+    expect(refused.data.error).toMatch(/wait|quiescen/i);
+    expect((await post("get", { id: r.id })).data.status).toBe("blocked");
+    const state = ExecutionStateSchema.parse((await post("execution", { id: r.id, actor: agent.label, token_id: agent.token_id, command_id: "read-retirement-fence", command: { kind: "inspect" } })).data);
+    expect(state.handoff.phase).toBe("waiting");
+    expect(state.attempt?.checkpoint).toBeNull();
   });
   it("rejects worker impersonation over real MCP, requires scoped human grants, and chooses exactly one local acceptor", async () => {
     const r = await runtimeTask(); const a = await interactive(`local-a-${serial}`); const b = await interactive(`local-b-${serial}`);
@@ -277,6 +344,7 @@ describe("local handoff authority and lifecycle", () => {
     const ready = await post("execution", { actor: "cap-restoration", token_id: identity.token_id,
       id: "gateway", command_id: "restore", command: { kind: "advertise", capabilities: { tier: "large", backend: "opencode", model: "test/large", tools: ["cargo"], environment: ["special-access"], projects: ["bridge"], worker: { kind: "provisioned", label: "cap-restoration/worker" } } } });
     expect(ready.data.error).toBeUndefined();
+    await post("admin.execution_sweep", {}); // maintenance is separate from renewal
     expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("todo");
     await post("admin.execution_sweep", { now: Date.now() + 121_000 });
     expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("blocked");
@@ -296,12 +364,15 @@ describe("durable executor on real SQLite", () => {
     const capabilities = { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], config_revision: "initial" };
     const cmd = (command_id: string, command: object) => post("execution", { ...auth, command_id, command });
     expect((await cmd("legacy", { kind: "advertise", capabilities })).data.ok).toBe(false);
-    expect((await cmd("unavailable", { kind: "availability" })).data.phase).toBe("unavailable");
+    const unprovisioned = await cmd("unavailable", { kind: "availability" });
+    expect(unprovisioned.data.phase).toBe("executor_not_ready");
+    expect(unprovisioned.data.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "executor_not_ready", causes: expect.arrayContaining([expect.objectContaining({ readiness: expect.objectContaining({ kind: "unprovisioned" }) })]) })]));
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/worker|readiness/);
     expect((await post("get", { id: task.id })).data.status).toBe("blocked"); // global policy exposes unavailable worker capacity
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     expect((await cmd("ready", { kind: "advertise", capabilities: ready })).data.ok).toBe(true);
+    await post("admin.execution_sweep", {});
     const obsolete = await post("execution", { ...auth, runner_protocol: undefined, command_id: "obsolete",
       command: { kind: "advertise", capabilities: ready } });
     expect(obsolete.data.ok).toBe(false);
@@ -329,7 +400,7 @@ describe("durable executor on real SQLite", () => {
     expect((await cmd("cooldown", { kind: "advertise", capabilities: ready })).data.ok).toBe(false);
     expect((await cmd("changed-prerequisite", { kind: "advertise", capabilities: { ...ready, config_revision: "repaired" } })).data.ok).toBe(true);
   });
-  it("keeps task prerequisites from poisoning the gateway and projects persisted checkpoint affinity before claim", async () => {
+  it("keeps task prerequisites from poisoning the gateway and allows fresh pickup on another host", async () => {
     const provision = async (host: string) => {
       const gw = (await post<{ secret: string }>("admin.mint", { label: host, tags: ["gateway"] })).data;
       const token_id = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data.token_id;
@@ -350,18 +421,19 @@ describe("durable executor on real SQLite", () => {
     expect((await post("execution", { ...auth, command_id: "still-ready", command: { kind: "advertise", capabilities: original.capabilities } })).data.ok).toBe(true);
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/startup prerequisite|Startup prerequisite/);
     await post("execution", { ...auth, command_id: "repaired-task-prerequisite", command: { kind: "advertise", capabilities: { ...original.capabilities, config_revision: "task-repaired" } } });
+    await post("admin.startup_sweep", {});
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toBeUndefined();
     expect((await cmd("begin", { kind: "begin", worker: "affinity-original/worker", attempt_id: "prior", action_budget_ms: 60_000 })).data.error).toBeUndefined();
     await cmd("quiet", { kind: "quiesce", generation: 1, attempt_id: "prior", writers: "process_group_empty" });
     expect((await cmd("release", { kind: "start_failed", stage: "begin", reason: "gate: task prerequisite missing", retained_work: false })).data.kind).toBe("released");
-    // Legacy metadata may predate the execution record. Durable affinity must win.
+    // Stopped work can be claimed on a different eligible host.
     await post("update", { id: task.id, meta: { execution_requirements: {} } });
     const foreign = { ...other.auth, id: task.id };
     const availability = await post<{ requirements: { host: string }; hosts: { host: string; blockers: string[] }[] }>("execution", { ...foreign, command_id: "availability", command: { kind: "availability" } });
-    expect(availability.data.requirements.host).toBe("affinity-original");
-    expect(availability.data.hosts.find(h => h.host === "affinity-other")?.blockers).toContain("host:affinity-original");
-    expect((await post("transition", { ...foreign, to: "in_progress" })).data.error).toMatch(/host:affinity-original/);
-    expect((await post("get", { id: task.id })).data.status).toBe("todo");
+    expect(availability.data.requirements.host).toBeUndefined();
+    expect(availability.data.hosts.find(h => h.host === "affinity-other")?.blockers).not.toContain("host:affinity-original");
+    expect((await post("transition", { ...foreign, to: "in_progress" })).data.error).toBeUndefined();
+    expect((await post("get", { id: task.id })).data.status).toBe("in_progress");
     expect((await post("execution", { ...foreign, command_id: "other-still-ready", command: { kind: "advertise", capabilities: other.capabilities } })).data.ok).toBe(true);
   });
   it("recovers only proven legacy never-launched credential failures, retaining WIP affinity and real execution fences", async () => {
@@ -418,6 +490,7 @@ describe("durable executor on real SQLite", () => {
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     await Promise.all(["ready-one", "ready-two"].map(command_id => post("execution", { ...auth, id: "gateway", command_id, command: { kind: "advertise", capabilities: ready } })));
+    await post("admin.startup_sweep", {});
     const recovered = (await post("get", { id })).data;
     expect(recovered).toMatchObject({ status: "todo", meta: { execution_requirements: { host, tier: "medium", tools: ["git"] }, startup_recovery: { previous_attempts: { attempts: 5 } } } });
     expect(recovered.meta).not.toHaveProperty("blocked");
@@ -451,6 +524,7 @@ describe("durable executor on real SQLite", () => {
     expect((await post("get", { id: ids[0] })).data.meta).not.toHaveProperty("startup_wait");
     expect((await post("get", { id: ids[1] })).data).toMatchObject({ status: "blocked", meta: { startup_wait: { host } } });
     await advertise();
+    await post("admin.startup_sweep", {});
     expect((await post("get", { id: ids[0] })).data.status).toBe("blocked");
     expect((await post("get", { id: ids[1] })).data.status).toBe("todo");
   });
@@ -479,6 +553,7 @@ describe("durable executor on real SQLite", () => {
     const other = (await post<{ id: string }>("create", { type: "task", title: "Unrelated dispatch remains healthy", qualified: true })).data;
     expect((await post("transition", { ...auth, id: other.id, session: "unrelated-work", to: "in_progress" })).data.error).toBeUndefined();
     await advertise("after-repair");
+    await post("admin.startup_sweep", {});
     expect((await post("get", { id })).data.meta).not.toHaveProperty("startup_wait");
     expect((await post("transition", { ...auth, id, session: "repaired-work", to: "in_progress" })).data.error).toBeUndefined();
     const localId = (await post<{ id: string }>("create", { type: "task", title: "Explicit local conversion of startup wait", qualified: true })).data.id;
@@ -537,28 +612,35 @@ describe("durable executor on real SQLite", () => {
     const worker = (await post<{ secret: string }>("agent.provision", { label: "cache-host/old", actor: "cache-host" })).data;
     const renamed = await post("token.rename", { bearer: worker.secret, label: "cache-host/current" });
     expect(renamed.data.error).toBeUndefined();
-    const resolve = (cached_secret: string) => mf.dispatchFetch("https://hub.test/api/kb-machine/provision", {
-      method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${gw.secret}` },
+    const resolve = (cached_secret: string, bearer = gw.secret) => mf.dispatchFetch("https://hub.test/api/kb-machine/provision", {
+      method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${bearer}` },
       body: JSON.stringify({ label: "cache-host/old", cached_secret, actor: "web:spoof" }),
     });
+    const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gw.secret })).data;
+    const legacy = await post("worker.resolve", { token_id: identity.token_id, actor: "cache-host", secret: worker.secret });
+    expect(legacy.status).toBe(200);
+    expect(legacy.data).toMatchObject({ cached: true, label: "cache-host/current" });
+    expect((await post("worker.resolve", { token_id: identity.token_id, actor: "foreign", secret: worker.secret })).status).toBe(403);
     const proof = await resolve(worker.secret);
     expect(proof.status).toBe(200);
     expect(await proof.json()).toMatchObject({ cached: true, label: "cache-host/current" });
     expect((await resolve(gw.secret)).status).toBe(403);
     expect((await resolve("not-a-credential")).status).toBe(401);
+    expect((await resolve(worker.secret, worker.secret)).status).toBe(403);
+    expect((await resolve(worker.secret, "not-a-gateway")).status).toBe(401);
     const foreign = (await post<{ secret: string }>("admin.mint", { label: "foreign", tags: ["gateway"] })).data;
     const foreignWorker = (await post<{ secret: string }>("agent.provision", { label: "foreign/worker", actor: "foreign" })).data;
     expect((await resolve(foreignWorker.secret)).status).toBe(403);
     const stillLive = await post("auth.identify", { bearer: worker.secret });
     expect(stillLive.data.error).toBeUndefined();
   });
-  it("atomically replays commands, fences missing/stale worker scope, and holds the cross-host restoration barrier", async () => {
+  it("atomically replays commands, fences missing/stale worker scope, and yields without a snapshot", async () => {
     const gateway = await post<{ secret: string }>("admin.mint", { label: "exec-host", tags: ["gateway"] });
     const identity = await post<{ token_id: string }>("auth.identify", { bearer: gateway.data.secret });
     const worker = await post<{ secret: string }>("agent.provision", { label: "exec-host/worker", actor: "exec-host" });
     expect(worker.data.error).toBeUndefined();
     const workerId = await post<{ token_id: string }>("auth.identify", { bearer: worker.data.secret });
-    const task = await post<{ id: string }>("create", { type: "task", title: "Checkpoint transfer test", roles: ["impl"], qualified: true, actor: "exec-host" });
+    const task = await post<{ id: string }>("create", { type: "task", title: "Fresh attempt fence test", roles: ["impl"], qualified: true, actor: "exec-host" });
     const id = task.data.id;
     const auth = { actor: "exec-host", token_id: identity.data.token_id, gateway: true, agent: "exec-host/worker", session: "dispatch-test", id };
     const advertised = await post("execution", { ...auth, command_id: "capabilities", command: { kind: "advertise", capabilities: { tier: "medium", model: "test/medium", tools: ["git"], environment: ["linux"], worker: { kind: "provisioned", label: "exec-host/worker" } } } });
@@ -581,7 +663,7 @@ describe("durable executor on real SQLite", () => {
     const fence = { generation: 1, attempt_id: "one" };
     const quiesced = await post("execution", { ...auth, command_id: "quiet", command: { kind: "quiesce", ...fence, writers: "process_group_empty" } });
     expect(quiesced.data.error).toBeUndefined();
-    expect((await post("execution", { ...auth, command_id: "yield-without-content", command: { kind: "yield", ...fence } })).data.error).toMatch(/checkpoint/);
+    expect((await post("execution", { ...auth, command_id: "yield-without-content", command: { kind: "yield", ...fence } })).data.error).toBeUndefined();
     expect((await post("execution", { ...auth, command_id: "pretend-new-host", actor: "other", command: { ...cmd.command, attempt_id: "two" } })).data.error).toBeDefined();
     const state = await post("execution", { ...auth, command_id: "inspect", command: { kind: "inspect" } });
     expect(ExecutionStateSchema.parse(state.data).attempt?.phase).toBe("quiesced");

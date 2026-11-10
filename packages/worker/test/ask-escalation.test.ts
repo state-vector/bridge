@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decisionFixture } from "./ask-fixture";
 
 /**
  * Ask TTL escalation (BR#3942) — real DO drill against the bundled worker.
@@ -137,8 +138,10 @@ describe("ask TTL escalation (real DO)", () => {
   });
 
   it("human-directed, open-floor and session-scoped asks never escalate — only agent-identity targets re-route", async () => {
+    const subject = (await kbJson("/create", { type: "task", title: "Human escalation policy" })).body.id;
     const human = await kbJson("/ask.create", {
       to: "ray", question: "Human ruling drill — never re-route this?",
+      decision: decisionFixture(subject, ["GO", "NO-GO"]),
       reason: "drill", options: ["GO", "NO-GO"], artefact_id: null,
       details: "drill brief: fixture ask exercising that ray-directed asks never re-route to agent identities.",
     });
@@ -244,7 +247,7 @@ describe("ask TTL escalation (real DO)", () => {
     };
 
     // alarmSweep's body
-    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep()"));
+    const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     expect(sweepOpen).toBeGreaterThan(-1);
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
 

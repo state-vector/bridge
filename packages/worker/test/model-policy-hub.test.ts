@@ -30,33 +30,68 @@ it("atomically closes a stronger-implementation verdict and requeues its idle su
   const label = "review-models";
   const minted = await post("admin.mint", { label, tags: ["gateway"] });
   const identity = await post("auth.identify", { bearer: minted.secret });
-  await post("agent.provision", { actor: label, label: `${label}/worker` });
+  const provisioned = await post("agent.provision", { actor: label, label: `${label}/worker` });
+  const worker = { actor: `${label}/worker`, token_id: provisioned.id, gateway: false };
   const base = { actor: label, token_id: identity.token_id, gateway: true, agent: `${label}/worker`, session: "dispatch-impl-models" };
   const medium = { tier: "medium", backend: "opencode", model: "test/medium", tools: [], environment: [], projects: ["bridge"] };
   expect((await post("execution", { ...base, id: "gateway", command_id: "review-inventory", command: { kind: "advertise", capabilities: { ...medium, worker: { kind: "provisioned", label: `${label}/worker` }, alternatives: [{ ...medium, tier: "large", model: "test/large" }] } } })).ok).toBe(true);
   const parent = await post("create", { type: "task", title: "Implementation requiring better reasoning", roles: ["impl"], project: "bridge", qualified: true, actor: "author" });
   const auth = { ...base, id: parent.id };
+  // Two actual failed generations plus a third deadline failure exhaust the
+  // original strategy before the independent larger-model verdict.
+  for (let generation=1;generation<=2;generation++) {
+    expect((await post("transition",{...auth,to:"in_progress"})).error).toBeUndefined();
+    const attempt_id=`prior-${generation}`;
+    expect((await post("execution",{...auth,command_id:`prior-begin-${generation}`,command:{kind:"begin",attempt_id,worker:`${label}/worker`,action_budget_ms:60_000}})).error).toBeUndefined();
+    const terminal={generation,attempt_id,writers:"process_group_empty",outcome:{kind:"failed",exit_code:1,stdout_tail:"Implementation attempt retained",stderr_tail:"Cross-system invariant unresolved"}};
+    expect((await post("execution",{...auth,command_id:`prior-stop-${generation}`,command:{kind:"stopped",...terminal}})).error).toBeUndefined();
+    expect((await post("execution",{...auth,command_id:`prior-final-${generation}`,command:{kind:"finalize",...terminal}})).error).toBeUndefined();
+  }
+
   expect((await post("transition", { ...auth, to: "in_progress" })).error).toBeUndefined();
-  expect((await post("execution", { ...auth, command_id: "impl-begin", command: { kind: "begin", attempt_id: "impl", worker: `${label}/worker`, action_budget_ms: 60_000 } })).error).toBeUndefined();
-  await post("execution", { ...auth, command_id: "impl-quiet", command: { kind: "quiesce", generation: 1, attempt_id: "impl", writers: "process_group_empty" } });
-  const delivery = await post("transition", { ...auth, to: "in_review", note: "PR https://github.com/state-vector/bridge/pull/123 — implementation delivered; request independent verification" });
-  expect(delivery.error).toBeUndefined();
-  expect(delivery.verify_task).toBeTruthy();
+  expect((await post("execution", { ...auth, command_id: "impl-begin", command: { kind: "begin", attempt_id: "impl", worker: `${label}/worker`, action_budget_ms: 10_000 } })).error).toBeUndefined();
+  await new Promise(resolve=>setTimeout(resolve,10_020));
+  const expired=ExecutionStateSchema.parse(await post("execution",{...auth,command_id:"impl-deadline",command:{kind:"poll",generation:3,attempt_id:"impl"}}));
+  expect(expired.budget_exhaustions).toBe(3);
+  const terminal={generation:3,attempt_id:"impl",writers:"process_group_empty",outcome:{kind:"timed_out",exit_code:null,stdout_tail:"Partial implementation preserved",stderr_tail:"Deadline exceeded"}};
+  await post("execution",{...auth,command_id:"impl-stopped",command:{kind:"stopped",...terminal}});
+  const final=ExecutionStateSchema.parse(await post("execution",{...auth,command_id:"impl-final",command:{kind:"finalize",...terminal}}));
+  expect(final.budget_exhaustions).toBe(3);
+  const human=await post("admin.mint",{label:"recovery-owner",tags:[]});
+  const who=await post("auth.identify",{bearer:human.secret});
+  const recovery={actor:"recovery-owner",token_id:who.token_id,id:parent.id,session:"recover-preserved-implementation"};
+  expect((await post("transition",{...recovery,to:"in_progress"})).error).toBeUndefined();
+  const delivery=await post("transition",{...recovery,to:"in_review",note:"PR https://github.com/state-vector/bridge/pull/123 — preserved implementation needs independent assessment"});
+  expect(delivery.error).toBeUndefined(); expect(delivery.verify_task).toBeTruthy();
   const reviewer = { ...base, id: delivery.verify_task, session: "dispatch-review-models" };
   expect((await post("transition", { ...reviewer, to: "in_progress" })).error).toBeUndefined();
-  const result = await post("transition", { ...reviewer, to: "done", note: "Findings for https://github.com/state-vector/bridge/pull/123: deeper cross-system reasoning required; implementation is not accepted.", review_result: { kind: "stronger_implementation_required", task_id: parent.id, summary: "The implementation misses the cross-system invariant; retry with stronger reasoning." } });
+  expect((await post("execution", { ...reviewer, command_id: "review-begin", command: { kind: "begin", attempt_id: "review", worker: `${label}/worker`, action_budget_ms: 60_000 } })).error).toBeUndefined();
+  const result = await post("transition", { ...worker, id: delivery.verify_task, session: reviewer.session,
+    execution_scope: { id: delivery.verify_task, generation: 1, attempt_id: "review" },
+    to: "done", note: "Findings for https://github.com/state-vector/bridge/pull/123: deeper cross-system reasoning required; implementation is not accepted.", review_result: { kind: "stronger_implementation_required", task_id: parent.id, summary: "The implementation misses the cross-system invariant; retry with stronger reasoning." } });
   expect(result.error).toBeUndefined();
   const escalated = await post("get", { id: parent.id });
   expect(escalated.status).toBe("todo");
   expect(escalated.meta).toMatchObject({ execution_requirements: { tier: "large" }, execution_escalation: { kind: "review", tier: "large" } });
   const state = ExecutionStateSchema.parse(await post("execution", { ...auth, command_id: "read-delivery", command: { kind: "inspect" } }));
   expect(state.delivery).toMatchObject({ model: "test/medium", tier: "medium" });
+  expect(state.budget_exhaustions).toBe(3);
+  expect(state.retry_strategy).toMatchObject({kind:"larger_model",failures:0,minimum_tier:"large",source:"independent_review"});
+  await post("update",{id:parent.id,meta:{execution_requirements:{tier:"medium",tools:[],environment:[]}}});
+  expect((await post("get",{id:parent.id})).meta.execution_scheduling_requirements.tier).toBe("large");
+  await post("execution",{...reviewer,command_id:"review-quiet",command:{kind:"quiesce",generation:1,attempt_id:"review",writers:"process_group_empty"}});
+  const reservation=await post("execution",{...base,id:"gateway",command_id:"strategy-reserve",command:{kind:"schedule",mode:"reserve"}}) as unknown as {kind:string;task_id:string;session:string};
+  expect(reservation).toMatchObject({kind:"reserved",task_id:parent.id});
+  const downgrade=await post("execution",{...auth,session:reservation.session,command_id:"strategy-wrong-tier",command:{kind:"begin",attempt_id:"wrong-tier",worker:`${label}/worker`,action_budget_ms:60_000,selection:{backend:"opencode",model:"test/medium",tier:"medium"}}});
+  expect(downgrade.error).toMatch(/tier|capability|requirement/);
+  const resumed=ExecutionStateSchema.parse(await post("execution",{...auth,session:reservation.session,command_id:"strategy-begin",command:{kind:"begin",attempt_id:"large-continuation",worker:`${label}/worker`,action_budget_ms:60_000,selection:{backend:"opencode",model:"test/large",tier:"large"}}}));
+  expect(resumed).toMatchObject({generation:4,budget_exhaustions:3,attempt:{executor:{tier:"large",model:"test/large"}}});
   expect((await post("get", { id: delivery.verify_task })).status).toBe("done");
   const history = await post("get_history", { id: parent.id, limit: 100 });
   expect(history.versions.filter(v => v.action === "execution" && v.data.kind === "model_escalated")).toEqual([
     expect.objectContaining({ data: expect.objectContaining({ from_tier: "medium", to_tier: "large", source: "review", review_id: delivery.verify_task }) }),
   ]);
-});
+},30_000);
 afterAll(async () => { await mf?.dispose(); });
 
 it("selects globally, binds the actual model, preserves review floors and blocks/restores explicit escalation", async () => {
@@ -97,11 +132,13 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   expect((await cmd("yield", { kind: "yield" })).error).toBeUndefined();
   expect((await post("get_history", { id: impl.id, limit: 100 })).versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "execution_yielded", destination: "agent_pool", minimum_tier: "large" }) })]));
   await advertise(false, "remove-large");
+  await post("admin.execution_sweep", {});
   const blocked = await post("get", { id: impl.id });
   expect(blocked.status).toBe("blocked");
   expect(blocked.meta.execution_blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable", reason: "not_configured" })]));
   expect((await post("execution", { ...auth, command_id: "old-writer", command: { kind: "escalate", generation: 1, attempt_id: "one", tier: "large", reason: "Late old writer" } })).error).toMatch(/claim|session/);
   await advertise(true, "restore-large");
+  await post("admin.execution_sweep", {});
   expect((await post("get", { id: impl.id })).status).toBe("todo");
   expect((await post("transition", { ...auth, to: "in_progress" })).error).toBeUndefined();
   const wrong = await post("execution", { ...auth, command_id: "wrong-model", command: { kind: "begin", attempt_id: "two", worker: `${label}/worker`, action_budget_ms: 60_000, selection: { backend: "opencode", model: "test/medium", tier: "medium" } } });

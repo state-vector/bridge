@@ -4,7 +4,7 @@ export type AcceptedPrLeg = { repo: string; number: number; head_sha_at_acceptan
 export type AdmissionState =
   | { phase: "pending" }
   | { phase: "held"; reason: string }
-  | { phase: "admitted"; task_id: string }
+  | { phase: "admitted"; task_id: string; subject_revision: string }
   | { phase: "replaced"; review_id: string };
 
 export interface DeliveryAdmission {
@@ -13,6 +13,7 @@ export interface DeliveryAdmission {
   delivery_owner: string;
   actor: string;
   accepted_at: number;
+  subject_revision: string;
   legs: AcceptedPrLeg[];
   state: AdmissionState;
 }

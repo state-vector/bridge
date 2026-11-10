@@ -119,6 +119,72 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repo)).length).toBe(1);
   });
 
+  it("returns an independently verified repair to the train without a GitHub approval label", async () => {
+    const repo = "state-vector/recovered-pr";
+    const number = 2471;
+    const initialHead = "a".repeat(40);
+    const repairedHead = "b".repeat(40);
+    const parent = (await kbJson("/create", {
+      actor: "author", type: "task", title: "Restore delivery after conflict", qualified: true,
+      meta: { pr: { repo, number, head_sha_at_acceptance: initialHead }, merge_train: { state: "bounced", repo, pr: number } },
+    })).body.id;
+    const conflicted = await report(repo, [prRow(number, { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(90) })]);
+    const repair = conflicted.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(repair).toBeTruthy();
+    const transition = (id: string, to: string, actor: string, fields: object = {}) => kbJson("/transition", { id, to, actor, session: actor, ...fields });
+    expect((await transition(repair, "in_progress", "repairer")).status).toBe(200);
+    const submitted = await transition(repair, "in_review", "repairer", { execution_result: { outcome: "Repaired and tested the PR", receipts: ["GitHub head readback"] } });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    const repairReview = submitted.body.verify_task;
+    expect(repairReview).toBeTruthy();
+    const repairClaim = await transition(repairReview, "in_progress", "outcome-reviewer");
+    const outcome = await transition(repairReview, "done", "outcome-reviewer", { review_result: {
+      kind: "accepted_execution", task_id: repair, subject_revision: repairClaim.body.review_subject.revision, receipts: ["Verified GitHub repair outcome"],
+    } });
+    expect(outcome.status, JSON.stringify(outcome.body)).toBe(200);
+    expect((await kbJson("/get", { id: repair })).body.status).toBe("done");
+
+    // The production strand sweep runs between GitHub reports. It must
+    // preserve the accepted recovery until the new head can enter review.
+    const swept = await kbJson("/admin.strand_disposition_sweep", { now: NOW + 4 * 3_600_000 });
+    expect(swept.status).toBe(200);
+    expect((await kbJson("/get", { id: parent })).body.meta.recovery.task_id).toBe(repair);
+
+    const observation = prRow(number, { headRefOid: repairedHead, reviewDecision: null, mergeStateStatus: "UNSTABLE", updatedAt: iso(90) });
+    const inconclusive = { ...observation, mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
+    const reports = await Promise.all([report(repo, [inconclusive]), report(repo, [observation])]);
+    const reviews = reports.flatMap(r => r.body.spawned.filter((x: { action: string; duty?: string }) => x.action === "verify" && x.duty));
+    expect(reviews).toHaveLength(1);
+    const review = reviews[0].duty;
+    const claim = await transition(review, "in_progress", "pr-reviewer");
+    expect(claim.body.review_subject.task_id).toBe(parent);
+    const verdict = await transition(review, "done", "pr-reviewer", { review_result: {
+      kind: "accepted_pr", task_id: parent, subject_revision: claim.body.review_subject.revision,
+      legs: [{ repo, number, head_sha_at_acceptance: repairedHead }],
+    } });
+    expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
+    const lane = (await kbJson("/train.status", { repo })).body.lanes.find((l: { lane: string }) => l.lane === repo + "@main");
+    expect(lane.queue).toEqual(expect.arrayContaining([expect.objectContaining({ id: parent, pr: number })]));
+    expect((await kbJson("/get", { id: parent })).body.meta.pr.head_sha_at_acceptance).toBe(repairedHead);
+  });
+
+  it("keeps merged delivery reviews out of the next-batch review count", async () => {
+    const repo = "state-vector/terminal-review-drill";
+    const number = 2472;
+    expect((await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "train" })).status).toBe(200);
+    const parent = (await kbJson("/create", { actor: "author", type: "task", title: "Deliver and verify", qualified: true,
+      meta: { pr: { repo, number } } })).body.id;
+    const transition = (to: string, fields: object = {}) => kbJson("/transition", { id: parent, to, actor: "author", session: "author", ...fields });
+    expect((await transition("in_progress")).status).toBe(200);
+    expect((await transition("in_review", { note: `PR https://github.com/${repo}/pull/${number}` })).status).toBe(200);
+    const lane = async () => (await kbJson("/train.status", { repo })).body.lanes.find((l: { lane: string }) => l.lane === repo + "@main");
+    await report(repo, [prRow(number)]);
+    expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 1 });
+    await report(repo, [prRow(number, { state: "MERGED", mergeCommit: "b".repeat(40) })]);
+    expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 0 });
+    expect((await kbJson("/get", { id: parent })).body.status).toBe("in_review");
+  });
+
   it("destination-blocked binds WITHOUT a verify duty; a later CLEAN cycle spawns the verify on the SAME card", async () => {
     const repo = "state-vector/reconcile-drill-b";
     const r1 = await report(repo, [prRow(2402, { mergeStateStatus: "BLOCKED" })]);
@@ -137,7 +203,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repo)).map((d: any) => d.kind)).toEqual(["verify"]);
   });
 
-  it("a dead duty on an unbound actionable PR fails the run, alarms the drill sink, and dedupes the ask", async () => {
+  it("a dead duty on an unbound actionable PR fails the report and schedules one durable agent repair", async () => {
     const repo = "state-vector/reconcile-drill-c";
     // cycle 1: orphan → projection + verify duty
     const r1 = await report(repo, [prRow(2403)]);
@@ -149,9 +215,13 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     const trackingId: string = r1.body.spawned[0].card;
     for (const id of [dutyId, trackingId]) {
       await kbJson("/transition", { id, to: "in_progress", actor: "drill", note: "drill: cycling" });
+      const isReview = (await kbJson("/get", { id })).body.roles.includes("review");
       // review-role closes need receipts — the drill cites the PR it (didn't) verify
       const c = await kbJson("/transition", {
-        id, to: "done", actor: "drill",
+        // Deliberately seed a historical human-closed binding; machine duties
+        // themselves finish with findings, never a forged acceptance.
+        id, to: "done", actor: isReview ? "drill" : "web:fixture",
+        review_result: isReview ? { kind: "findings", summary: "Died unbound; no PR delivery is accepted." } : undefined,
         note: "drill: died unbound — PR https://github.com/state-vector/reconcile-drill-c/pull/2403 still open, nothing merged, no receipts filed",
       });
       expect(c.status, `kill close failed: ${JSON.stringify(c.body)}`).toBeLessThan(400);
@@ -165,17 +235,16 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect(r2.body.line).toContain("ALARM: 1 unaccounted");
     const found = await kbJson("/search", { q: "reconcile ALARM", limit: 50 });
     const asks = (found.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo));
-    expect(asks.length).toBe(1);
-    const ask = (await kbJson("/get", { id: asks[0].id })).body;
-    expect(ask.meta?.ask?.artefact_id).toBe(sinkId);
-    expect(ask.meta?.ask?.urgency).toBe("time-sensitive");
-    expect(String(ask.title)).toContain("#2403");
-    expect(String(ask.title).endsWith("?")).toBe(true);
-    // the identical re-report dedupes the ask (one per class), still failing
+    expect(asks.length).toBe(0);
+    const recovery = (await kbJson("/get", { id: r2.body.spawned[0].card })).body;
+    expect(recovery.meta.machine_duty).toEqual({ kind: "reconcile-accounting", subject: repo });
+    expect(recovery.body_md).toContain(`https://github.com/${repo}/pull/2403`);
+    // The identical re-report reuses the repair rather than duplicating it.
     const r3 = await report(repo, [prRow(2403)]);
     expect(r3.body.ok).toBe(false);
     const again = await kbJson("/search", { q: "reconcile ALARM", limit: 50 });
-    expect((again.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo)).length).toBe(1);
+    expect((again.body?.artefacts ?? []).filter((a: any) => a.type === "question" && String(a.title).includes(repo)).length).toBe(0);
+    expect(r3.body.spawned).toHaveLength(0);
     // and the report history is the alarm's receipt
     const st = (await kbJson("/reconcile.status", { repo })).body;
     expect(st.reports.length).toBe(3);
@@ -223,8 +292,9 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await kbJson("/get", { id: bindingId })).body.status).not.toBe("done");
     // second miss: the provenance row is the machine proxy — the zombie closes
     const m2 = await report(repoE, []);
-    expect(m2.body.accounting.reverse_closed).toBe(1);
-    expect((await kbJson("/get", { id: bindingId })).body.status).toBe("done");
+    expect(m2.body.accounting.reverse_closed).toBe(0);
+    expect(m2.body.accounting.reverse_verifying).toBe(1);
+    expect((await kbJson("/get", { id: bindingId })).body.status).toBe("in_review");
 
     // -- the no-provenance half: a PR vanishes with NO merge record --
     const repoF = "state-vector/reconcile-drill-f";

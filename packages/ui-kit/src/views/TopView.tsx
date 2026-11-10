@@ -2,14 +2,15 @@ import { useEffect, useMemo, useState } from "react";
 import { useKb } from "../server/kbStore";
 import { TaskDetail, SENTIMENT_CHIP } from "./TaskDetail";
 import { DashboardSummary } from "./Dashboard";
-import { TrainPanel } from "./TrainPanel";
+import { TrainPanelView, trainLineTones, useTrainStatus } from "./TrainPanel";
+import type { KbTrainLane } from "../server/kb";
 import { WorkerAvailabilityBanner } from "./WorkerAvailability";
 import { AskBand, useHumanAsks, AskEntries, isOpenHumanAsk, humanAskSubject, type AskEntry } from "./AskBand";
 import { TagThemeBar, TagChips, useTagTheme, type TagTheme } from "./TagFilter";
 import { kindOf, isTimeoutBlock, unblockTwinIndex, activeUnblockTwinOf } from "../server/views";
 import { Chip, type ChipTone } from "./index-kit";
 import { ExecutionModel } from "./ExecutionModel";
-import type { ExecutionModelView } from "@bridge/contracts";
+import type { ExecutionModelView, TrainLineProjection } from "@bridge/contracts";
 
 const SENT_DOT: Record<string, string> = {
   going_well: "var(--green)", converging: "var(--accent)", neutral: "#3a4356",
@@ -97,6 +98,49 @@ interface TopRow {
   prov?: { repo: string; pr: number; verdict_id?: string | null; session?: string | null; signer?: string };
 }
 
+type ActiveTrainLane = KbTrainLane & { line: Extract<TrainLineProjection, { phase: "working" | "waiting" }> };
+
+function isActiveTrainLane(lane: KbTrainLane): lane is ActiveTrainLane {
+  return !lane.retired && (lane.line?.phase === "working" || lane.line?.phase === "waiting");
+}
+
+export function TrainMachineRows({ lanes, now, openTask }: {
+  lanes: KbTrainLane[]; now: number; openTask?: (id: string) => void;
+}) {
+  return lanes.filter(isActiveTrainLane).map(lane => {
+    const action = lane.now_action;
+    const preparation = action && lane.lease && action.holder === lane.lease.holder
+      && lane.lease.expires_ts > now && now - action.at < 60_000 ? action.preparation : undefined;
+    const preparingTask = preparation && lane.queue?.find(candidate => candidate.pr === preparation.pr);
+    const task = preparingTask?.id ?? lane.currently?.task_id ?? lane.attempt?.card ?? lane.card;
+    const pr = preparation?.pr ?? lane.currently?.pr ?? lane.queue?.find(candidate => candidate.id === task)?.pr;
+    const repo = lane.lane.split("@")[0];
+    const holder = lane.lease?.holder ?? "Merge train";
+    const reason = preparation && action ? action.note : lane.line.remediation?.text ?? lane.line.reason;
+    const label = preparation ? (preparation.phase === "updating" ? "Preparing next batch" : "Waiting for updated head") : lane.line.label;
+    const signal = lane.now_action?.at ?? lane.line.observed_at;
+    return <div key={lane.lane} className="ktable-row top-row top-click" onClick={() => openTask?.(task)}>
+      <span className="topc-task"><span className="task-id top-task-id">{task}</span></span>
+      <span className="topc-agent"><span className="top-agent-name">{holder}</span></span>
+      <span className="topc-model"><Chip tone="scope">machine</Chip></span>
+      <span className="topc-session top-num">—</span>
+      <span className="topc-goal" title={reason}>
+        {lane.lane}
+        {pr && <a className="topc-prov" href={`https://github.com/${repo}/pull/${pr}`} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()}><Chip tone="scope">PR #{pr}</Chip></a>}
+        <span className="top-will">{reason}</span>
+      </span>
+      <span className="topc-status"><Chip tone={trainLineTones[lane.line.phase]} pill>{label}</Chip></span>
+      <span className="topc-score" />
+      <span className="topc-gauge top-num">—</span>
+      <span className="topc-gauge top-num">—</span>
+      <span className="topc-gauge top-num">—</span>
+      <span className="topc-bar" />
+      <span className="topc-age top-num">{age(lane.currently?.merged_at, now)}</span>
+      <span className="topc-age top-num">{age(signal, now)}</span>
+    </div>;
+  });
+}
+
 /** Compact gateway strip: ONLY gateway identity sessions (dispatch-<gw>),
  *  never dispatched agent sessions — those are rows in the table, not
  *  infrastructure. Per-task dispatch sessions only feed the in-flight count. */
@@ -106,6 +150,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
   const conn = useKb((s) => s.conn);
   const refreshKb = useKb((s) => s.refresh);
   const tasks = useKb((s) => s.tasks);
+  const train = useTrainStatus();
+  const machineLanes = train.error ? [] : train.lanes ?? [];
   const sessions = useKb((s) => s.sessions);
   const agents = useKb((s) => s.agents);
   const events = useKb((s) => s.events);
@@ -118,16 +164,16 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     const scoreBy = new Map(agents.map((a) => [a.label, a]));
     // top = what is RUNNING right now, plus ONLY the blocked rows a human or
     // an active duty can move (2026-10-24 spec, Ray): in_progress always;
-    // blocked only with an actual open human-directed question or a live
-    // "Unblock:" twin. Churn/rework machine parks and blocked-with-no-lever
+    // blocked only with a running subprocess, an open human-directed question
+    // or a live "Unblock:" twin. Churn/rework parks and blocked-with-no-lever
     // rows live in Backlog (TIMEOUT / blocked groups), not here.
     const twinIdx = unblockTwinIndex(tasks as any[]);
     const humanAskSubjects = new Set(tasks.filter(isOpenHumanAsk).map(humanAskSubject));
     const admitted = (tasks as any[]).filter((t) =>
-      t.status === "in_progress"
+      t.type !== "question" && t.meta?.kind !== "question" && (t.status === "in_progress"
       || (t.status === "blocked"
         && !isTimeoutBlock(t)
-        && (humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx))),
+        && (t.meta?.subprocess || humanAskSubjects.has(t.id) || activeUnblockTwinOf(t, twinIdx)))),
     );
     const taskRows: TopRow[] = admitted.map((t) => {
       const meta = (t.meta ?? {}) as any;
@@ -235,7 +281,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
 
   // human-ask plane: exactly-once placement — nested under a visible subject,
   // else the residual band (2026-10-23 design)
-  const visibleTaskIds = useMemo(() => new Set(rows.map((r) => r.taskId ?? r.key)), [rows]);
+  const visibleTaskIds = useMemo(() => new Set(treeRows.map(({ row }) => row.taskId ?? row.key)), [treeRows]);
   const humanAsks = useHumanAsks(visibleTaskIds);
   const openAskDetails = (id: string) => (openTask ? openTask(id) : setSelectedTaskId(id));
   const bumpAsks = () => { void refreshKb(); };
@@ -243,19 +289,18 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
     if (useKb.getState().awaitingHuman !== humanAsks.total) useKb.setState({ awaitingHuman: humanAsks.total });
   }, [humanAsks.total]);
 
-  // 2026-10-29 (Ray): Top is the actionable fleet ONLY — sin-bin and
-  // awaiting-external parks moved to Backlog, filed under their exit
-  // condition (exitClassOf groups). No parking lot renders here anymore.
+  // Inactive parks stay in Backlog under their exit condition. Top includes
+  // the train's current action and tasks waiting for a running subprocess.
 
   return (
     <div className="top-wrap">
       <WorkerAvailabilityBanner />
-      <TrainPanel openTask={openDetails} />
+      <TrainPanelView {...train} now={now} openTask={openDetails} />
       <DashboardSummary tasks={tasks} events={events} />
       <AskBand asks={humanAsks} onChanged={bumpAsks} openDecision={openAskDetails} />
       <TopSectionHeader theme={tagTheme} />
 
-      <div className="top-table" role="region" aria-label="Active fleet tasks" tabIndex={0}>
+      <div className="top-table" role="region" aria-label="Active work" tabIndex={0}>
       <div className="top-table-body">
       <div className="ktable-head top-head">
         <span className="topc-task" title="task id">task id</span>
@@ -273,6 +318,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
         <span className="topc-age" title="time since the agent's last signal on this task">last signal</span>
       </div>
 
+      <TrainMachineRows lanes={machineLanes} now={now} openTask={openDetails} />
       {treeRows.flatMap(({ row: r, depth }) => {
         const asks: AskEntry[] = humanAsks.byTask.get(r.taskId ?? r.key) ?? [];
         return [
@@ -292,7 +338,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
             <span className="top-agent-name">{r.agent}</span>
           </span>
           <span className="topc-model">
-            <ExecutionModel value={r.execution} now={now} />
+            {r.subprocess ? <Chip tone="scope">machine</Chip> : <ExecutionModel value={r.execution} now={now} />}
           </span>
           <span className="topc-session top-num" title="the session working this task — agents can run many">{r.session ?? "—"}</span>
           <span className="topc-goal" title={r.will ? `will: ${r.will}` : r.goal ?? ""}>
@@ -343,7 +389,7 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
               </Chip>
             )}
             {r.status && r.status !== "in_progress" && (
-              <Chip pill tone={r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "warn"}>{r.status.replace("_", " ")}</Chip>
+              <Chip pill tone={r.status === "done" ? "ok" : r.status === "blocked" ? "err" : "warn"}>{r.subprocess && r.status === "blocked" ? "background work" : r.status.replace("_", " ")}</Chip>
             )}
             {r.sentiment && <span className="s-dot" style={{ background: SENT_DOT[r.sentiment] ?? "#3a4356" }} title={`agent mood: ${r.sentiment.replace("_", " ")}`} />}
             {r.sentiment && <Chip tone={SENTIMENT_CHIP[r.sentiment] ?? "neutral"} className="top-sent">{r.sentiment.replace("_", " ")}</Chip>}
@@ -385,8 +431,8 @@ export function TopView({ openTask }: { openTask?: (id: string) => void }) {
       </div>
       </div>
 
-      {treeRows.length === 0 && (
-        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No fleet activity — agents appear here when they claim work. Parked cards file in Backlog under their exit condition."}</p>
+      {treeRows.length === 0 && !machineLanes.some(isActiveTrainLane) && (
+        <p className="empty">{conn === "closed" ? "Hub unreachable — check your sign-in / hub url." : "No active work. Parked cards appear in Backlog under their exit condition."}</p>
       )}
 
       {selectedTaskId && <TaskDetail taskId={selectedTaskId} onClose={() => setSelectedTaskId(null)} onOpen={setSelectedTaskId} />}

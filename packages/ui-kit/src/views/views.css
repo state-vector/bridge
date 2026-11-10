@@ -538,6 +538,27 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .train-queue-card { cursor: pointer; }
 .train-queue-card:hover { filter: brightness(1.15); }
 .train-all-idle { margin: 2px 0 0 2px; }
+/* BR#4849 stop-the-line banner — a red main is the loudest thing on the panel:
+   red-ruled strip above the lane table, two accountability lines (broke it /
+   fixing it), UNOWNED chip when nobody has claimed the episode task. */
+.train-stopline {
+  border: 1px solid var(--red); border-radius: 8px;
+  background: color-mix(in srgb, var(--red) 12%, var(--bg-raised));
+  padding: 7px 10px; margin-bottom: 6px;
+  display: flex; flex-direction: column; gap: 3px; min-width: 0;
+}
+.train-stopline-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.train-stopline-flag { color: var(--red); font-weight: 700; font-size: 12.5px; letter-spacing: 0.02em; white-space: nowrap; }
+.train-stopline-line { font-weight: 600; font-size: 12.5px; }
+.train-stopline-why {
+  font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.train-stopline-who { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; }
+.train-stopline-cell { display: inline-flex; align-items: center; gap: 4px; min-width: 0; flex-wrap: wrap; }
+.train-stopline-who-link { color: var(--accent); cursor: pointer; font-weight: 600; }
+.train-stopline-who-link:hover { text-decoration: underline; }
+.train-stopline-unowned { cursor: help; }
 .train-row { border-radius: 6px; }
 .train-row.train-row-idle { opacity: 0.75; }
 .trainc-dot { display: flex; align-items: center; justify-content: center; }
@@ -585,6 +606,7 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
    "cars transparent/empty"). Markup is the contract — style what it
    emits. */
 .tb-ready { background: var(--green, #3fb26a); }
+.tb-reviewed { background: var(--accent, #6ea8fe); }
 .tb-waiting { background: var(--amber, #d29a4b); }
 .tb-conflict { background: var(--red, #d9534f); }
 .tb-needs-review { background: var(--text-faint, #8b94a7); }
@@ -607,15 +629,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
       merge batches (Batch 1 | Batch 2 | …), separated by .train-block-gap.
    3. Block colour strictly denotes verification state (no red on awaiting per
       BR#5476, no diagonal stripes):
-      - green solid (.tb-ready)     = ready (verified, mergeable)
+      - green solid (.tb-ready)     = eligible for the current batch
+      - blue solid (.tb-reviewed)   = reviewed and conflict-free, held
       - orange pulsing (.tb-verifying) = being verified right now
       - orange solid (.tb-wait)     = waiting to be verified */
 .train-block-group { display: inline-flex; align-items: center; gap: 3px; }
 .tb-verifying { background: var(--amber, #d29a4b); animation: tb-pulse 1.6s ease-in-out infinite; }
 .tb-wait { background: var(--amber, #d29a4b); }
 @keyframes tb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-.train-stats { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; max-width: 100%; overflow: hidden; font-size: 11.5px; }
-.train-stat { font-weight: 600; }
+.train-stats { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; max-width: 100%; font-size: 11.5px; }
+.train-stat { font-weight: 600; white-space: nowrap; }
 .train-stat.ts-ip { color: var(--text-faint, #8b94a7); }
 .train-stat.ts-verifying { color: var(--amber, #d29a4b); }
 .train-stat.ts-ready { color: var(--green, #3fb26a); }

@@ -34,7 +34,9 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
   it("a completed unblock round cannot suppress an already-satisfied execution prerequisite forever", async () => {
     const dependency = await task("Delivered prerequisite", {}, ["analysis"]);
     await call("transition", { id: dependency, to: "in_progress", actor: "dependency", session: "dependency" });
-    await call("transition", { id: dependency, to: "done", actor: "dependency", session: "dependency", note: "Analysis delivered" });
+    const dependencyDone = await call("transition", { id: dependency, to: "done", actor: "dependency", session: "dependency",
+      execution_result: { outcome: "Prerequisite analysis delivered", receipts: [dependency] }, note: "Analysis delivered" });
+    expect(dependencyDone.status, JSON.stringify(dependencyDone.body)).toBe(200);
     const parent = await task("Actual execution still required", { completion: { kind: "execution", outcome: "Run the post-delivery action" } });
     const parked = await call("transition", { id: parent, to: "blocked", actor: "author", note: "Waiting on prerequisite",
       await_event: { event: "br_done", id: dependency } });
@@ -45,6 +47,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(duty).toBeTruthy();
     await call("transition", { id: duty.id, to: "in_progress", actor: "unblocker", session: "unblocker" });
     const finished = await call("transition", { id: duty.id, to: "done", actor: "unblocker", session: "unblocker",
+      execution_result: { outcome: "Prerequisite verified; parent execution remains outstanding", receipts: [dependency] },
       note: `Unblocked prerequisite verified at https://hub.fleetbridge.run/card/${dependency.replace("#", "-")}; actual parent execution still required.` });
     expect(finished.status, JSON.stringify(finished.body)).toBe(200);
     await call("admin.unblock_proxy_sweep", { now: now + 60 * 60_000 });
@@ -66,7 +69,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
       question: "Can the executor keep its changes scoped to the assigned task?", options: ["Executor keeps assigned scope", "Executor reports overlap"], actor: "peer" });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     await call("transition", { id: subject, to: "in_progress", actor: "recipient", session: "recipient" });
-    const done = await call("transition", { id: subject, to: "done", actor: "recipient", session: "recipient", note: "Analysis completed" });
+    const done = await call("transition", { id: subject, to: "done", actor: "recipient", session: "recipient", execution_result: { outcome: "Analysis completed", receipts: [subject] }, note: "Analysis completed" });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     const resolved = await get(ask.body.id);
     expect(resolved.status).toBe("done");
@@ -75,14 +78,18 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
   });
 
   it("replays a human's exact per-card retirement instead of asking again, including an unclaimed operator gate", async () => {
-    const target = await task("Obsolete operator purge", { operator_gated: "Ray go before execution" });
+    const target = await task("Obsolete operator purge", { operator_gated: "Ray go before execution", execution_requirements: { tier: "large", environment: ["retired-host"] } });
     const answer = `Close the overtaken issue — retire ${target}`;
-    const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the obsolete purge whose target no longer exists?",
+    const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Retire the obsolete purge whose target no longer exists?",
       reason: "The operator must choose whether this obsolete operation is retired.", details: `The purge target is gone; retire ${target}.`,
       options: [answer, "KEEP the operation"], actor: "author" });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     const answered = await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
     expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    const gated = await get(target);
+    expect(gated.status).toBe("todo");
+    expect(gated.meta.operator_gated).toBe("Ray go before execution");
+    expect(gated.meta.blocked?.await_event).toBeUndefined();
     const applied = await call("transition", { id: target, to: "superseded", batch_auth: { ask: ask.body.id }, actor: "executor", session: "cleanup" });
     expect(applied.status, JSON.stringify(applied.body)).toBe(200);
     const retired = await get(target);
@@ -100,7 +107,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     for (const prefix of ["KEEP — do not retire", "NO — retire", "Do not retire"]) {
       const target = await task(`Protected decision ${prefix}`);
       const answer = `${prefix} ${target}`;
-      const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Should this operation remain available?",
+      const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Should this operation remain available?",
         reason: "Only the operator chooses whether to retain this operation.", details: `Current operation ${target} remains valid.`,
         options: [answer, `SUPERSEDE ${target}`], actor: "author" });
       expect(ask.status, JSON.stringify(ask.body)).toBe(200);
@@ -115,7 +122,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     const target = await task("Obsolete duplicate");
     const successor = await task("Real delivery owner");
     const answer = `SUPERSEDE — ${target} superseded by ${successor}`;
-    const ask = await call("ask.create", { to: "human", artefact_id: target, question: "Retire the duplicate in favor of its existing delivery owner?",
+    const ask = await call("ask.create", { to: "legacy-peer", artefact_id: target, question: "Retire the duplicate in favor of its existing delivery owner?",
       reason: "Only the operator chooses which obligation is retired.", details: `${target} duplicates ${successor}.`, options: [answer, "KEEP both"], actor: "author" });
     await call("ask.answer", { id: ask.body.id, answer, actor: "web:rayh" });
     const current = await get(target);
@@ -140,5 +147,102 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     await call("admin.unblock_proxy_sweep", { now: Date.now() + 120 * 60_000 });
     expect((await get(parent)).status).toBe("blocked");
     expect((await get(parent)).meta.operator_gated).toBe("Explicit operator choice");
+  });
+
+  it("replaces a historical churn timer with a single diagnostic prerequisite", async () => {
+    const parent = await task("Diagnose prior failures before any retry");
+    const parked = await call("transition", { id: parent, to: "blocked", actor: "author", note: "churn guard: same gate repeatedly refused",
+      await_event: { event: "time", until_ts: Date.now() - 1 } });
+    expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+    const now = Date.now() + 4 * 60 * 60_000;
+    await call("admin.unblock_proxy_sweep", { now });
+    const repaired = await get(parent);
+    const duty = repaired.meta.recovery?.task_id;
+    expect(duty).toBeTruthy();
+    expect(repaired.status).toBe("blocked");
+    expect(repaired.meta.blocked.await_event).toEqual({ event: "br_done", id: duty });
+    await call("admin.unblock_proxy_sweep", { now: now + 60 * 60_000 });
+    expect((await children(parent)).filter(c => c.status !== "superseded").map(c => c.id)).toEqual([duty]);
+    const boardResponse = await stub.fetch("https://kb/board");
+    expect(boardResponse.status).toBe(200);
+    const board = await boardResponse.json() as any;
+    expect(board.tasks.find((t: any) => t.id === parent).work_waits).toContainEqual({
+      kind: "execution_recovery", exit: { event: "reviewed_execution_repair", task_id: parent, duty_id: duty },
+    });
+
+    const replacement = await task("Apply the change that repairs the repeated failure", {}, ["analysis"]);
+    await call("transition", { id: duty, to: "in_progress", actor: "repair", session: "repair" });
+    const receipt = `https://hub.fleetbridge.run/card/${replacement.replace("#", "-")}`;
+    const unsupported = await call("transition", { id: duty, to: "in_review", actor: "repair", session: "repair",
+      note: "Looked at the failure", execution_result: { outcome: "Completed diagnosis", receipts: [receipt] } });
+    expect(unsupported.status).toBe(400);
+    const submitted = await call("transition", { id: duty, to: "in_review", actor: "repair", session: "repair",
+      note: "Recorded the observable replacement condition and its evidence.",
+      execution_result: { outcome: "Diagnosed the failure and established the replacement prerequisite", receipts: [receipt] },
+      unblock_result: { kind: "reblocked", parent_id: parent, reason: "The reviewed repair must finish",
+        next: "Wait for the repair receipt", await_event: { event: "br_done", id: replacement } } });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    await call("admin.unblock_proxy_sweep", { now: now + 2 * 60 * 60_000 });
+    expect((await get(parent)).meta.blocked.await_event).toEqual({ event: "br_done", id: duty });
+    const review = (await children(duty)).find(c => c.roles.includes("review"));
+    expect(review).toBeTruthy();
+    const claimed = await call("transition", { id: review.id, to: "in_progress", actor: "independent", session: "independent" });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    const subject = (await get(review.id)).meta.review_subject;
+    expect(subject).toBeTruthy();
+    const accepted = await call("transition", { id: review.id, to: "done", actor: "independent", session: "independent",
+      review_result: { kind: "accepted_execution", task_id: duty, subject_revision: subject.revision, receipts: [receipt] } });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    await call("admin.unblock_proxy_sweep", { now: now + 3 * 60 * 60_000 });
+    const reparked = await get(parent);
+    expect(reparked.status).toBe("blocked");
+    expect(reparked.meta.blocked.await_event).toEqual({ event: "br_done", id: replacement });
+  });
+
+
+  it("lists the same blocked tasks as the census through authenticated stats", async () => {
+    const id = await task("Audit a live typed park");
+    const until = Date.now() + 60_000;
+    const blocked = await call("transition", { id, to: "blocked", actor: "author", note: "Wait for the scheduled check",
+      await_event: { event: "time", until_ts: until } });
+    expect(blocked.status).toBe(200);
+    const runnable = await task("Ready work is outside the park census");
+    expect((await call("stats")).body.park_inventory).toBeUndefined();
+    const report = (await call("stats", { park_inventory: true })).body;
+    const count = report.counts.find((entry: any) => entry.type === "task" && entry.status === "blocked").n;
+    expect(report.park_inventory.next).toBeNull();
+    expect(report.park_inventory.items).toHaveLength(count);
+    expect(report.park_inventory.items).toContainEqual(expect.objectContaining({ id, await_event: { event: "time", until_ts: until } }));
+    expect(report.park_inventory.items.map((entry: { id: string }) => entry.id)).not.toContain(runnable);
+    const continuation = (await call("stats", { park_inventory: true, after_park: id })).body.park_inventory;
+    expect(continuation.items.every((entry: { id: string }) => entry.id > id)).toBe(true);
+  });
+
+  it("keeps older open human asks on the board when recent work fills the window", async () => {
+    const subject = await task("Pilot archive policy");
+    const human = await call("ask.create", {
+      actor: "author", route: { kind: "human_decision" }, question: "Should the archive be retained after the pilot?",
+      decision: {
+        kind: "preference", task_id: subject, context: "The pilot is complete.",
+        why_human: "The owner sets the archive policy.",
+        choices: [
+          { label: "Keep the archive", executor: "bridge", consequence: "Bridge retains the records.", action: "hold" },
+          { label: "Discard the archive", executor: "bridge", consequence: "Bridge implements the new retention policy.", action: "resume" },
+        ],
+      },
+    });
+    expect(human.status, JSON.stringify(human.body)).toBe(200);
+    const peer = await call("ask.create", {
+      actor: "author", to: "any", route: { kind: "agent_coordination" },
+      question: "Can someone review the pilot logs?",
+      options: ["I can review the logs", "Leave the logs for the next reviewer"],
+    });
+    expect(peer.status).toBe(200);
+    for (let i = 0; i < 260; i++) await task(`Recent work ${i}`);
+
+    const board = await (await stub.fetch("https://kb/board")).json();
+    const ids = board.tasks.map((row: { id: string }) => row.id);
+    expect(ids).toContain(human.body.id);
+    expect(ids).not.toContain(peer.body.id);
   });
 });

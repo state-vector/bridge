@@ -72,8 +72,9 @@ export function AskOptions({ options: raw, onPick, busy, choices }: {
   options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean; choices?: import("@bridge/contracts").HumanDecision["choices"];
 }) {
   if (choices) return <div className="ask-opt-list">{choices.map((choice) => <div key={choice.label} className="ask-choice">
+    <p className="ask-opt-text"><b>Action owner: {choice.executor === "human" ? "You" : "Bridge"}.</b> {choice.consequence}</p>
+    {choice.executor === "human" && <p className="ask-opt-text">You perform the action described above. This button only sends your answer; it does not perform the action or give Bridge your permissions.</p>}
     <Btn disabled={busy} onClick={() => onPick(choice.label)}>{choice.label}</Btn>
-    <p className="ask-opt-text"><b>{choice.executor === "human" ? "You" : "Bridge"}:</b> {choice.consequence}</p>
   </div>)}</div>;
   const options = raw
     .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))

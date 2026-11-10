@@ -2,7 +2,24 @@ import { RunnerManifestSchema as ManifestSchema, RunnerPublishSchema as PublishS
 import { boundedWakeStream } from "./kb/sse.ts";
 export { ManifestSchema };
 const repo = "state-vector/bridge";
-class PublicationUnavailable extends Error {}
+/** Bounded, fixed publication stages. A transient publication failure must
+ * expose which stage failed and when the provider says to retry — never a
+ * bare error body that masks a quota exhaustion behind blind polling. */
+const PUBLICATION_STAGES = ["github_verification", "manifest_fetch"] as const;
+type PublicationStage = (typeof PUBLICATION_STAGES)[number];
+const TIMING_EXPOSURE_CAP_SECS = 3600;
+
+class PublicationUnavailable extends Error {
+  constructor(readonly stage: PublicationStage, message: string, readonly retryAfterSecs?: number) { super(message); }
+}
+
+/** Only bounded integer second timings are honored; HTTP-date forms and
+ * out-of-range values are ignored so exposure stays fixed and finite. */
+function boundedRetrySeconds(response: Response): number | undefined {
+  const seconds = Number(response.headers.get("retry-after"));
+  if (!Number.isSafeInteger(seconds) || seconds < 1) return undefined;
+  return Math.min(seconds, TIMING_EXPOSURE_CAP_SECS);
+}
 
 /** Public build metadata only. Publication accepts hints, never caller-supplied
  * manifests or URLs. GitHub independently proves every gate and source SHA. */
@@ -18,12 +35,18 @@ export class RunnerUpdates {
     // this fixed GitHub repository API. The supplied facts still prove nothing:
     // every run/commit/workflow is independently checked below.
     const token = jobToken || this.env.GITHUB_TOKEN;
-    const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, { headers: {
-      "user-agent": "bridge-runner-updates", accept: "application/vnd.github+json",
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    }, signal: AbortSignal.timeout(15000) });
+    let response: Response;
+    try {
+      response = await fetch(`https://api.github.com/repos/${repo}/${path}`, { headers: {
+        "user-agent": "bridge-runner-updates", accept: "application/vnd.github+json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      }, signal: AbortSignal.timeout(15000) });
+    } catch (error) {
+      if (error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError")) throw new PublicationUnavailable("github_verification", `GitHub verification unreachable (${error.name})`);
+      throw error;
+    }
     if (!response.ok) {
-      if (response.status >= 500 || response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) throw new PublicationUnavailable(`GitHub verification temporarily unavailable (${response.status})`);
+      if (response.status >= 500 || response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) throw new PublicationUnavailable("github_verification", `GitHub verification temporarily unavailable (${response.status})`, boundedRetrySeconds(response));
       throw new Error(`GitHub verification ${response.status}`);
     }
     return GithubRunSchema.parse(await response.json());
@@ -79,8 +102,14 @@ export class RunnerUpdates {
         if (!eligibleRun(release, input.commit, "release.yml", true)) throw new Error("unverified stable release");
       }
       const download = `https://github.com/${repo}/releases/download/runner-${input.commit}/manifest.json`;
-      const response = await fetch(download, { headers: { "user-agent": "bridge-runner-updates" }, signal: AbortSignal.timeout(15000) });
-      if (!response.ok) throw new PublicationUnavailable(`verified build manifest not available (${response.status})`);
+      let response: Response;
+      try {
+        response = await fetch(download, { headers: { "user-agent": "bridge-runner-updates" }, signal: AbortSignal.timeout(15000) });
+      } catch (error) {
+        if (error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError")) throw new PublicationUnavailable("manifest_fetch", `verified build manifest unreachable (${error.name})`);
+        throw error;
+      }
+      if (!response.ok) throw new PublicationUnavailable("manifest_fetch", `verified build manifest not available (${response.status})`, boundedRetrySeconds(response));
       const manifest = ManifestSchema.parse(await response.json());
       if (manifest.commit !== input.commit) throw new Error("manifest commit mismatch");
       for (const [target, artifact] of Object.entries(manifest.artifacts)) {
@@ -94,7 +123,14 @@ export class RunnerUpdates {
       });
       this.send(`data: ${JSON.stringify({ type: "runner.update.available", channel: input.channel, commit: input.commit })}\n\n`);
       return Response.json({ published: input.channel, commit: input.commit });
-    } catch (error) { return Response.json({ error: String(error) }, { status: error instanceof PublicationUnavailable || error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError") ? 503 : 400 }); }
+    } catch (error) {
+      if (error instanceof PublicationUnavailable) {
+        const timing = error.retryAfterSecs === undefined ? {} : { retry_after_secs: error.retryAfterSecs };
+        return Response.json({ error: String(error), stage: error.stage, ...timing },
+          { status: 503, headers: error.retryAfterSecs === undefined ? undefined : { "retry-after": String(error.retryAfterSecs) } });
+      }
+      return Response.json({ error: String(error) }, { status: 400 });
+    }
   }
 }
 

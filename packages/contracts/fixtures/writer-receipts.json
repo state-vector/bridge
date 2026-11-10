@@ -1,0 +1,8 @@
+[
+  { "kind": "writer_receipt_missing" },
+  { "kind": "writer_receipt_held", "reason": "An outside action is still unresolved" },
+  {
+    "kind": "writer_receipt_found", "task_id": "old-task", "command_id": "physical-proof", "source": "quiesce",
+    "proof": { "host": "original-host", "session": "old-session", "generation": 1, "attempt_id": "old-attempt", "phase": "quiesced", "writers": "process_group_empty" }
+  }
+]

@@ -1,7 +1,10 @@
 import { Miniflare } from "miniflare";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readyGateway, executorRequest } from "./executor-fixture";
+import { decisionFixture } from "./ask-fixture";
 
 /**
  * DO integration tests — the tier that would have caught today's production
@@ -19,7 +22,13 @@ import { readyGateway, executorRequest } from "./executor-fixture";
 let mf: Miniflare;
 let kb: (path: string, init?: RequestInit) => Promise<Response>;
 
-beforeAll(async () => {
+/**
+ * Boot a fresh workerd runtime hosting the bundled hub, and return a fetcher
+ * bound to the KnowledgeHub DO's "global" instance. `persist` points storage
+ * at a directory so a SECOND boot over the SAME directory is the warm-isolate
+ * shape: a brand-new isolate (the prod deploy shape) over an existing database.
+ */
+async function bootKb(persist?: string) {
   // miniflare 3 API (direct devDep; the v4 bundled with wrangler changed
   // its options schema). scriptPath MUST be absolute — it resolves against
   // the process cwd, not the config.
@@ -34,7 +43,11 @@ beforeAll(async () => {
   if (!existsSync(bundle)) {
     throw new Error("bundle missing — run: npx wrangler deploy --dry-run --outdir ../../.kb-bundle (the npm test script does this before vitest)");
   }
-  mf = new Miniflare({
+  const instance = new Miniflare({
+    // Miniflare 3's DO storage persistence is the SHARED `durableObjectsPersist`
+    // option (a bare `persist` key is silently ignored) — a directory gives a
+    // second boot over the same dir the exact existing-database warm shape.
+    durableObjectsPersist: persist,
     workers: [{
       name: "main",
       scriptPath: bundle,
@@ -46,9 +59,16 @@ beforeAll(async () => {
         KB: { className: "KnowledgeHub", useSQLite: true },
       },
     }],
-  });  const ns = await mf.getDurableObjectNamespace("KB");
+  });
+  const ns = await instance.getDurableObjectNamespace("KB");
   const stub = await ns.get(ns.idFromName("global"));
-  kb = (path, init) => stub.fetch(`https://kb${path}`, init);
+  return { instance, kb: (path: string, init?: RequestInit) => stub.fetch(`https://kb${path}`, init) };
+}
+
+beforeAll(async () => {
+  const booted = await bootKb();
+  mf = booted.instance;
+  kb = booted.kb;
   // warm + cold ensureSchema paths both exercised
   await kb("/orient", { actor: "test" });
   await kb("/orient", { actor: "test" });
@@ -128,6 +148,70 @@ describe("auth token SQL paths (real storage)", () => {
     expect(second.status).toBeLessThan(500);
     expect(second.body.secret).toBeTruthy();
     expect(second.body.id).toBe(first.body.id);
+  });
+});
+
+// ---------- BR#2841: the warm-isolate class ----------
+// A frozen migration or a non-idempotent ensureSchema only breaks on an
+// EXISTING database — the shared beforeAll isolate never presents one (every
+// test above runs on a single cold boot). This spins TWO sequential workerd
+// runtimes over ONE persisted SQLite directory: the cold boot creates the
+// schema, then a brand-new isolate (the deploy/restart shape) must re-run
+// ensureSchema over the live database and keep every feature working.
+describe("warm isolate over an existing database (BR#2841 — frozen-migration class)", () => {
+  const post = async (
+    call: (path: string, init?: RequestInit) => Promise<Response>,
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; body: any }> => {
+    const r = await call(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-kb-admin": "1" },
+      body: JSON.stringify(executorRequest(body)),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+
+  it("ensureSchema runs cold then warm — a new isolate over the persisted DB re-applies it idempotently and features still work", async () => {
+    const dir = mkdtempSync(join(realpathSync(tmpdir()), "br2841-warm-"));
+    try {
+      // COLD isolate: empty storage — ensureSchema creates every table, then
+      // mint and session touch work on the fresh schema.
+      const cold = await bootKb(dir);
+      const first = await post(cold.kb, "/admin.mint", { label: "br2841-warm-isolate", tags: [] });
+      expect(first.status).toBeLessThan(500);
+      expect(first.body.error).toBeUndefined();
+      expect(first.body.secret).toBeTruthy();
+      await cold.instance.dispose();
+
+      // WARM isolate: a NEW isolate boots over the SAME storage — exactly what
+      // a prod deploy does. ensureSchema re-runs against an existing database
+      // (idempotent DDL + migrations), then every feature still works.
+      const warm = await bootKb(dir);
+      // INSERT on the warm schema — a frozen migration would leave a column
+      // missing and 500 here (the session.kind class)
+      const second = await post(warm.kb, "/admin.mint", { label: "br2841-warm-second", tags: [] });
+      expect(second.status).toBeLessThan(500);
+      expect(second.body.error).toBeUndefined();
+      expect(second.body.secret).toBeTruthy();
+      // REPLACE on the warm database (the binding-count branch that shipped a
+      // production failure once): re-minting the COLD isolate's label must find
+      // and rotate the EXISTING row — same id. A different id would mean the
+      // warm isolate is looking at a fresh database, not the persisted one.
+      const re = await post(warm.kb, "/admin.mint", { label: "br2841-warm-isolate", tags: [] });
+      expect(re.status).toBeLessThan(500);
+      expect(re.body.error).toBeUndefined();
+      expect(re.body.secret).toBeTruthy();
+      expect(re.body.id).toBe(first.body.id);
+      // the migration that never ran in prod: session touch writes the kind
+      // column, exercised on the warm isolate's schema
+      const touch = await post(warm.kb, "/session.touch", { token_id: re.body.id ?? second.body.id, session: "warm-isolate-s" });
+      expect(touch.status).toBeLessThan(500);
+      expect(touch.body.session).toBeTruthy();
+      await warm.instance.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -225,12 +309,14 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
   });
 
   it("asks create type=question nodes (no question tag), answerable to done", async () => {
+    const subject = (await kbJson("/create", { type: "task", title: "Roles column publication policy" })).body.id;
     const ask = await kbJson("/ask.create", {
       question: "integration: merge the roles column PR?",
       options: ["GO — merge", "NO-GO — hold"],
       reason: "integration test coverage",
       details: "Adds a roles column to tasks so review-gated cards dispatch only to review-role agents. PR is green; this ask covers the go/no-go on merging it.",
       to: "human",
+      decision: decisionFixture(subject, ["GO — merge", "NO-GO — hold"]),
     });
     expect(ask.status).toBe(200);
     // human-directed asks require the plain-reading brief (details) — bare
@@ -242,7 +328,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       to: "human",
     });
     expect(bare.status).toBe(400);
-    expect(String(bare.body.error)).toContain("details");
+    expect(String(bare.body.error)).toContain("decision");
     const node = await kbJson("/get", { id: ask.body.id });
     expect(node.body.type).toBe("question");
     expect(node.body.tags).toEqual([]);
@@ -263,7 +349,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Keep the executor lease or release the card?",
       options: ["KEEP — stay parked", "RELEASE — back to the pool"],
       reason: "BR#3822 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       artefact_id: t.id,
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
 
@@ -330,7 +416,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Should the verifier park this card?",
       options: ["PARK", "GO"],
       reason: "BR#3822 failure-path fixture",
-      to: "human",
+      to: "legacy-peer",
       artefact_id: t.id,
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
 
@@ -359,7 +445,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Rework loop on the card — drop it?",
       options: ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"],
       reason: "churn guard rework loop",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -390,7 +476,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Execute the recorded retire-GO: drop this card?",
       options: ["(Recommended) SUPERSEDE — drop it now", "KEEP — stay parked", "RE-SCOPE — I'll rewrite it myself"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -411,7 +497,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Keep parked while the base is red?",
       options: ["(Recommended) KEEP — stay parked", "RELEASE — back to the pool"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -431,7 +517,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
       question: "Proceed with the ordinary plan?",
       options: ["(Recommended) Yes — proceed", "No — rethink"],
       reason: "BR#5570 regression fixture",
-      to: "human",
+      to: "legacy-peer",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
     });
     expect(ask.status).toBe(200);
@@ -711,17 +797,9 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
    *  demands review evidence (a done review-role child first), the lifecycle
    *  demands a claim before done, and the close cites its investigation. */
   const closeBreachCard = async (cardId: string) => {
-    const { body: child } = await kbJson("/create", { type: "task", title: `verify ${cardId}`, roles: ["review"] });
-    const linked = await kbJson("/link", { src: child.id, relation: "child_of", dst: cardId });
-    expect(linked.status).toBe(200);
-    const claim = await kbJson("/transition", { id: child.id, to: "in_progress", note: "claim verify duty", actor: "verifier-opencode" });
-    expect(claim.status).toBe(200);
-    const done = await kbJson("/transition", { id: child.id, to: "done", note: "verified PR https://github.com/state-vector/bridge/pull/0 — no-refold control", actor: "verifier-opencode" });
-    expect(done.status).toBe(200);
     const take = await kbJson("/transition", { id: cardId, to: "in_progress", note: "claim breach investigation", actor: "investigator-opencode" });
     expect(take.status).toBe(200);
-    const close = await kbJson("/transition", { id: cardId, to: "done", note: "investigated and adjudicated", actor: "investigator-opencode" });
-    expect(close.status).toBe(200);
+    await completeExecutionReview(kbJson, cardId, { outcome: "Audit evidence investigated and adjudicated; the closed fold high-water covers these events.", receipts: [cardId] });
   };
 
   const rejectOnce = async (id: string) => {
@@ -799,7 +877,7 @@ describe("typed answers dispatch like the option click (BR#3912 type-your-own)",
     // rule-6 parking: askCreate flips an IN_PROGRESS subject to blocked-on-ask
     await kbJson("/transition", { id: subject.id, to: "in_progress", note: "claim" });
     const { body: ask } = await kbJson("/ask.create", {
-      to: "ray",
+      to: "legacy-peer",
       question: `Rework loop on ${subject.id} "${title}" — the release→claim→stall cycle is now invalid (it failed 20 times). What do you want to do with it?`,
       reason: "20 dispatch attempts without completion — re-running repeats the claim→stall cycle",
       details: "drill brief: fixture ask exercising the ask lifecycle end-to-end — no live decision rides on it.",
@@ -884,7 +962,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
     const wrong = await kbJson("/question.claim", { id: t.id, actor: "web:rayh" });
     expect(wrong.status).toBe(400);
     expect(String(wrong.body.error)).toContain("only on question");
-    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for the human-claim hold lifecycle.", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "already answered drill?", to: "legacy-peer", reason: "drill", details: "drill brief: fixture ask for the human-claim hold lifecycle.", options: ["GO", "NO-GO"] });
     expect(ask.status).toBe(200);
     await kbJson("/ask.answer", { id: ask.body.id, answer: "GO" });
     const ans = await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
@@ -914,7 +992,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
   });
 
   it("an answer resolves the hold — the timer is cancelled and the stamp clears", async () => {
-    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "human", reason: "drill", details: "drill brief: fixture ask for answer-resolves-hold behavior.", options: ["GO", "NO-GO"] });
+    const ask = await kbJson("/ask.create", { question: "answer resolves the hold drill?", to: "legacy-peer", reason: "drill", details: "drill brief: fixture ask for answer-resolves-hold behavior.", options: ["GO", "NO-GO"] });
     await kbJson("/question.claim", { id: ask.body.id, actor: "web:rayh" });
     const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO", actor: "web:rayh" });
     expect(ans.status).toBe(200);
@@ -987,7 +1065,7 @@ describe("question human-claim hold (BR#3911, real storage)", () => {
 });
 
 describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clobber class)", () => {
-  const laneConfig = {
+  let laneConfig = {
     lane: {
       repo: "state-vector/bridge", base: "main",
       required_workflows: ["Test", "CLI build (packages/cli)"],
@@ -1000,8 +1078,13 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
   };
   const seedLaneCard = async (title: string) => {
     const { body: t } = await kbJson("/create", { type: "task", title });
+    // Each test is a distinct live lane. Canonical authority must not rebind
+    // the same repo/base from another still-active fixture card.
+    const repo = `state-vector/meta-lane-${String(t.id).slice(3)}`;
+    laneConfig = { ...laneConfig, lane: { ...laneConfig.lane, repo, key: `${repo}@main` } };
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
-    await kbJson("/update", { id: t.id, meta: laneConfig, actor: "gw-1" });
+    const configured = await kbJson("/update", { id: t.id, meta: laneConfig, actor: "gw-1" });
+    expect(configured.status, JSON.stringify(configured.body)).toBe(200);
     return t.id;
   };
 
@@ -1018,7 +1101,7 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
     const m = after.body.meta;
     // lane config intact — every infrastructure key the old replace semantics amputated
     expect(m.lane).toEqual(laneConfig.lane);
-    expect(m.lane.key).toBe("state-vector/bridge@main");
+    expect(m.lane.key).toBe(laneConfig.lane.key);
     expect(m.lane.required_workflows).toEqual(laneConfig.lane.required_workflows);
     expect(m.lease).toEqual(laneConfig.lease);
     expect(m.currently).toEqual(laneConfig.currently);
@@ -1031,7 +1114,7 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
 
   it("a present top-level key replaces WHOLESALE — nested objects are never Frankenstein-merged", async () => {
     const id = await seedLaneCard("BR#5807 wholesale-replace regression lane");
-    const newLane = { repo: "state-vector/bridge", base: "main", key: "state-vector/bridge@main", ci_typical_minutes: 12 };
+    const newLane = { repo: laneConfig.lane.repo, base: "main", key: laneConfig.lane.key, ci_typical_minutes: 12 };
     const r = await kbJson("/update", { id, actor: "gw-1", meta: { lane: newLane } });
     expect(r.status).toBe(200);
     const m = (await kbJson("/get", { id })).body.meta;
@@ -1129,6 +1212,30 @@ describe("update_artefact meta merge semantics (BR#5807 — the BR#5733 lane-clo
     expect(line).toBeTruthy();
     expect(line.summary).toContain("set: blocked");
     expect(line.summary).toContain("deleted: session");
+  });
+
+  it("a UI-style task edit (title/body/tags, meta omitted) is lossless — every meta key survives untouched (BR#1108 edit flow)", async () => {
+    // The detail-panel edit form saves human-owned fields only and carries NO
+    // meta key. Per-key merge (BR#5807) must preserve every pre-existing meta
+    // key — the "lossless metadata round-trip" the edit flow promises: editing
+    // a task amputates nothing, alters nothing it did not touch.
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#1108 lossless edit round-trip", body_md: "original body", tags: ["alpha"] });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    // infrastructure-shaped meta a real card carries (non-lane card: plain keys)
+    const seeded = await kbJson("/update", { id: t.id, actor: "gw-1", meta: { currently: { phase: "editing" }, session: "keep-me" } });
+    expect(seeded.status).toBe(200);
+    const r = await kbJson("/update", { id: t.id, actor: "some-agent", title: "edited title", body_md: "edited body", tags: ["beta", "edited-by-ui"] });
+    expect(r.status).toBe(200);
+    expect(r.body.error).toBeUndefined();
+    const after = await kbJson("/get", { id: t.id });
+    // the edited fields landed
+    expect(after.body.title).toBe("edited title");
+    expect(after.body.body_md).toBe("edited body");
+    expect(after.body.tags).toEqual(["beta", "edited-by-ui"]);
+    // meta: NO key amputated, NO key altered by the meta-less edit
+    const m = metaOf(after.body);
+    expect(m.currently).toEqual({ phase: "editing" });
+    expect(m.session).toBe("keep-me");
   });
 });
 
@@ -1461,3 +1568,4 @@ describe("interactive claim takeover (BR#6135)", () => {
     expect(door.body.taken_over).toBe(true);
   });
 });
+import { completeExecutionReview } from "./completion-fixture";

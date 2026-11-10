@@ -29,12 +29,18 @@ routes = [
 # Install what the build needs, then invoke vite by path. Typechecking stays
 # in CI's full-install job.
 [build]
-command = "printf '{\"commit\":\"%s\",\"built_at\":\"%s\"}' \"$(git rev-parse HEAD 2>/dev/null || echo unknown)\" \"$(date -u +%FT%TZ)\" > src/__version.json && cd ../webapp && npm install --no-save --silent && ../../node_modules/.bin/vite build"
+command = """
+revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+printf '{"commit":"%s","built_at":"%s"}' "$revision" "$(date -u +%FT%TZ)" > src/__version.json &&
+cd ../webapp && npm install --no-save --silent &&
+VITE_BRIDGE_COMMIT="$revision" ../../node_modules/.bin/vite build
+"""
 
 
 # Workers AI: re-enable by adding [ai] binding = "AI" once the deploy env has
 # CLOUDFLARE_API_TOKEN (local dev fails without it). Until then search = FTS + trigram fuzzy.
 [durable_objects]
+code_update_strategy = { mode = "deferred", max_delay = 60 }
 bindings = [
   { name = "HUB", class_name = "FlowsHub" },
   { name = "KB", class_name = "KnowledgeHub" },

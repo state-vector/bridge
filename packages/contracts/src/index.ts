@@ -17,8 +17,10 @@ export * from "./delivery.ts";
 export * from "./work.ts";
 export * from "./config.ts";
 export * from "./train.ts";
+export * from "./executor-readiness.ts";
 export * from "./train-checks.ts";
 export * from "./train-line.ts";
+export * from "./train-scan.ts";
 export * from "./train-recovery.ts";
 export * from "./execution.ts";
 export * from "./scheduling.ts";
@@ -27,4 +29,7 @@ export * from "./execution-availability.ts";
 export * from "./runner-update.ts";
 export * from "./model-policy.ts";
 export * from "./execution-observability.ts";
+export * from "./hub-diagnostics.ts";
 export { WorkerStatusSchema, currentWorkerStatus, WorkerSlotSchema, WorkerOccupancySchema, currentWorkerOccupancy, type WorkerStatus, type WorkerSlot, type WorkerOccupancy } from "./worker-status.ts";
+
+export type { AwaitEvent, WorkWait } from "./work-wait.ts";

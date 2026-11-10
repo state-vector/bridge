@@ -202,18 +202,19 @@ describe("BR#6384 Leg 1 — observed-merge close (real DO)", () => {
     expect(rep.status).toBe(200);
     expect(rep.body.ok).toBe(true);
     expect(rep.body.accounting.observed_merged).toBe(1);
-    expect(rep.body.line).toContain("1 observed-merged closed");
-    expect(rep.body.spawned).toHaveLength(0); // no ruling duty, no tracking card
+    expect(rep.body.line).toContain("1 awaiting delivery verification");
+    expect(rep.body.spawned).toHaveLength(1); // one actual delivery review
     const cur = await taskById(id);
-    expect(cur.status).toBe("done");
+    expect(cur.status).toBe("in_review");
     const hist = (await kbJson("/get_history", { id })).body;
-    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("observed MERGED"));
+    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("Observed MERGED"));
     expect(close, "the close note must cite the observation").toBeTruthy();
-    expect(String(close.summary)).toContain(SHA.slice(0, 9));
-    expect(String(close.summary)).toContain("BR#6384");
-    // the close spawned nothing itself: the only duty child is the card's
-    // own block-time round (main's park law, present before the report)
+    expect(String(close.data.note)).toContain(SHA);
+    expect(String(close.data.note)).toContain("decisive required CI");
+    // Existing unblock duties do not multiply. The separately reported new
+    // child is an actual delivery review, not another unblock round.
     expect(await dutyChildrenOf(id)).toHaveLength(beforeChildren.length);
+    expect((await taskById(rep.body.spawned[0].card)).roles).toContain("review");
   });
 });
 
@@ -236,11 +237,11 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect(ev.body.error ?? "").toBe("");
     await alarm();
     const cur = await taskById(id);
-    expect(cur.status).toBe("done");
+    expect(cur.status).toBe("in_review");
     const hist = (await kbJson("/get_history", { id })).body;
-    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("strand disposition (BR#6384)"));
+    const close = (hist.versions ?? []).find((v: any) => String(v.summary ?? "").includes("Observed MERGED"));
     expect(close, "the close must ride the strand-disposition receipt").toBeTruthy();
-    expect(String(close.summary)).toContain("provenance");
+    expect(String(close.data.note)).toContain("decisive required CI");
     expect(String(close.summary)).toContain("e".repeat(40).slice(0, 9));
   });
 
@@ -319,6 +320,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     expect((await kbJson("/transition", { id: duty, to: "in_progress", actor: "rig", note: "ruling the round" })).status).toBeLessThan(400);
     expect((await kbJson("/transition", {
       id: duty, to: "done", actor: "rig",
+      review_result: { kind: "findings", summary: "PR remains open and advancing; no delivery accepted." },
       note: "re-verified first-hand: PR still OPEN and advancing — re-queued the car (https://github.com/x/pull/6112)",
     })).status).toBeLessThan(400);
     // pass 4: rounds 1 >= cap 1 — the ladder exhausts, superseded with findings
@@ -417,13 +419,12 @@ describe("BR#6384 Leg 3 — pr_merged proxy probes (real DO)", () => {
     expect((await dutyChildrenOf(id)).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("a conclusive negative (closed unmerged) stamps an honest false — the park stands, no duty", async () => {
+  it("a closed-unmerged upstream prerequisite is replaced by a repair duty", async () => {
     const id = await parkedCard(
       "BR#6384 L3c: closed-unmerged must not flip",
       { event: "pr_merged", repo: "state-vector/br6384-l3", n: 6132 },
       "PR state-vector/br6384-l3#6132 merged (mergeCommit non-null)",
     );
-    const before = await dutyChildrenOf(id);
     await sweep();
     const rep = await kbJson("/proxy.verify", {
       key: "merged:state-vector/br6384-l3#6132",
@@ -434,9 +435,9 @@ describe("BR#6384 Leg 3 — pr_merged proxy probes (real DO)", () => {
     });
     expect(rep.body.verdict).toBe("negative");
     await sweep();
-    const check = await proxyCheck(id);
-    expect(check.verdict).toBe("false"); // the gate has NOT fired — never a flip
-    expect(await dutyChildrenOf(id)).toHaveLength(before.length);
-    expect((await taskById(id)).status).toBe("blocked");
+    const card = await taskById(id);
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.reason).toContain("CLOSED");
+    expect(card.meta.blocked.await_event).toEqual({ event: "br_done", id: card.meta.recovery.task_id });
   });
 });

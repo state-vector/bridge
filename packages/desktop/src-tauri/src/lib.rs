@@ -310,6 +310,11 @@ fn cli_u64(name: &str) -> Option<u64> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().nth(1).as_deref() == Some("internal-worker") {
+        let code = std::env::args().nth(2).ok_or("worker manifest required".to_string()).and_then(|path| dispatch::worker_entry(std::path::Path::new(&path)));
+        if let Err(error) = code { eprintln!("independent worker: {error}"); std::process::exit(1); }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())

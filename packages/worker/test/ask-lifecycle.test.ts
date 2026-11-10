@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { askLifecycle, askRoute, isHumanDecisionAsk, planTaskRecovery, mergeCompletesTask } from "@bridge/contracts";
 import { exitClassOf } from "../../ui-kit/src/server/views";
+import { decisionFixture } from "./ask-fixture";
 
 let mf: Miniflare;
 let stub: any;
@@ -101,7 +102,7 @@ describe("request audience and lifecycle", () => {
     const ask = await call("ask.create", { to: "peer", question: "Can you arrange the independent check?", options: ["Arrange review", "Wait"], artefact_id: task.id });
     expect(ask.status, JSON.stringify(ask.body)).toBe(200);
     await call("transition", { id: task.review, to: "in_progress", actor: "reviewer", session: "reviewer" });
-    const done = await call("transition", { id: task.review, to: "done", actor: "reviewer", session: "reviewer", review_result: { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }, note: `Verified https://github.com/state-vector/bridge/commit/${sha} ${ci}` });
+    const done = await call("transition", { id: task.review, to: "done", actor: "reviewer", session: "reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), task.review, { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }), note: `Verified https://github.com/state-vector/bridge/commit/${sha} ${ci}` });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     const parent = (await call("get", { id: task.id })).body;
     expect(parent.status, JSON.stringify((await call("events?since=0&limit=500")).body)).toBe("done");
@@ -122,9 +123,9 @@ describe("request audience and lifecycle", () => {
 
   it("replays an interrupted accepted review after a real human decision resolves, without asking for a second review", async () => {
     const task = await submit("Recover interrupted acceptance", true);
-    const ask = await call("ask.create", { to: "human", question: "Should Bridge retain the historical records?", reason: "Only you can choose the retention policy.", details: "The implementation is delivered. The retention policy still needs your decision.", options: ["Retain records", "Delete records"], artefact_id: task.id });
+    const ask = await call("ask.create", { to: "human", question: "Should Bridge retain the historical records?", decision: decisionFixture(task.id, ["Retain records", "Delete records"]), artefact_id: task.id });
     await call("transition", { id: task.review, to: "in_progress", actor: "healing-reviewer", session: "healing-reviewer" });
-    const done = await call("transition", { id: task.review, to: "done", actor: "healing-reviewer", session: "healing-reviewer", review_result: { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }, note: `Verified commit ${sha} ${ci}` });
+    const done = await call("transition", { id: task.review, to: "done", actor: "healing-reviewer", session: "healing-reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), task.review, { kind: "accepted_direct_main", repo: "state-vector/bridge", commit: sha, ci_run_url: ci }), note: `Verified commit ${sha} ${ci}` });
     expect(done.status, JSON.stringify(done.body)).toBe(200);
     expect((await call("get", { id: task.id })).body.status).toBe("in_review");
     expect((await call("get", { id: ask.body.id })).body.status).toBe("todo");
@@ -163,7 +164,7 @@ describe("request audience and lifecycle", () => {
     await call("progress.log", { id: task, actor: "repair-owner", session: "repair-session", note: "Repairing failing tests" });
     const sink = (await call("create", { type: "task", title: "Alarm sink", meta: { infra_anchor: true } })).body.id;
     await call("admin.settings_set", { settings: { train_alarm_sink_id: sink } });
-    const obsolete = await call("ask.create", { to: "human", actor: "system:train", question: `${task} sits out of the merge queue on a train-only wait (pr_merged) while state-vector/bridge kept merging — need a human leg?`, reason: "Old diagnostic", details: "Old queue diagnostic", options: ["Investigate", "Release"], artefact_id: sink });
+    const obsolete = await call("ask.create", { to: "any", actor: "system:train", question: `${task} sits out of the merge queue on a train-only wait (pr_merged) while state-vector/bridge kept merging — need a human leg?`, reason: "Old diagnostic", details: "Old queue diagnostic", options: ["Investigate", "Release"], artefact_id: sink });
     expect(obsolete.status, JSON.stringify(obsolete.body)).toBe(200);
     await call("admin.alarm_sweep");
     const parent = (await call("get", { id: task })).body;
@@ -198,7 +199,7 @@ describe("request audience and lifecycle", () => {
     expect(duty.body_md).toContain("actual execution_result");
     expect(duty.body_md).not.toContain("gh pr view");
     await call("transition", { id: verify, to: "in_progress", actor: "outcome-reviewer", session: "outcome-reviewer" });
-    const accepted = await call("transition", { id: verify, to: "done", actor: "outcome-reviewer", session: "outcome-reviewer", review_result: { kind: "accepted_execution", task_id: execution, receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] }, note: "Verified every applied target; passed execution outcome checks." });
+    const accepted = await call("transition", { id: verify, to: "done", actor: "outcome-reviewer", session: "outcome-reviewer", review_result: await reviewOutcome((path, body) => call(path.slice(1), body), verify, { kind: "accepted_execution", task_id: execution, receipts: [`https://hub.fleetbridge.run/card/${execution.replace("#", "-")}`] }), note: "Verified every applied target; passed execution outcome checks." });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     expect((await call("get", { id: execution })).body.status).toBe("done");
   });
@@ -221,9 +222,10 @@ describe("request audience and lifecycle", () => {
     const lane = await call("train.lane", { repo: "state-vector/retired-diagnostic" });
     const laneId = lane.body.card ?? lane.body.id;
     const snapshot = (await call("get", { id: laneId })).body;
-    const ask = await call("ask.create", { to: "human", question: "Should someone investigate this queue?", reason: "Legacy diagnostic", details: "An old queue monitor asked for investigation.", options: ["Investigate", "Wait"] });
+    const ask = await call("ask.create", { to: "any", question: "Should someone investigate this queue?", reason: "Legacy diagnostic", details: "An old queue monitor asked for investigation.", options: ["Investigate", "Wait"] });
     await call("update", { id: laneId, meta: { lane: { ...snapshot.meta.lane, starvation: { ask_id: ask.body.id, since: Date.now(), fired_at: Date.now() } } } });
     await call("admin.alarm_sweep");
     expect((await call("get", { id: ask.body.id })).body.meta.ask.resolution.kind).toBe("cancelled");
   });
 });
+import { reviewOutcome } from "./completion-fixture";
