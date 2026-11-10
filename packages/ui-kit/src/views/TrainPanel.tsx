@@ -284,6 +284,8 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
       const repo = l.lane.split("@")[0];
       const stats = l.pr_stats ?? { in_progress: 0, verifying: 0, ready: 0 };
       const cars = l.batches?.flat() ?? [];
+      const verifying = stats.waiting == null ? cars.filter(q => q.state === "verifying").length : stats.verifying;
+      const waiting = stats.waiting ?? cars.filter(q => q.state === "waiting").length;
       const eligible = cars.filter(q => q.eligibility === "eligible").length;
       const reviewed = cars.filter(q => q.eligibility != null).length;
       const progress = l.currently?.phase === "bursting"
@@ -304,7 +306,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         </span>
         <span className="trainc-rate top-num">{l.activity?.merged_1h ?? 0}/h · {l.activity?.merged_24h ?? 0}/24h</span>
         <span className="trainc-backlog"><span className="train-stats">
-          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> <span className="train-stat ts-verifying">{stats.verifying} verifying</span> <span className="train-stat" title="Reviewed and conflict-free, including eligible PRs">{reviewed} reviewed &amp; clean</span> <span className="train-stat ts-ready" title="Eligible to merge now: selected by the executor for the current batch">{eligible} eligible</span>
+          <span className="train-stat ts-ip">{stats.in_progress} in progress</span> <span className="train-stat ts-verifying">{verifying} verifying</span> <span className="train-stat" title="Waiting for a reviewer to start">{waiting} waiting for review</span> <span className="train-stat" title="Reviewed and conflict-free, including eligible PRs">{reviewed} reviewed &amp; clean</span> <span className="train-stat ts-ready" title="Eligible to merge now: selected by the executor for the current batch">{eligible} eligible</span>
         </span><span className="train-blocks">{(l.batches ?? []).map((batch, bi) => <span key={bi} className="train-block-group">
           {bi > 0 && <span className="train-block-gap" />}
           {batch.map((q, qi) => <span key={`${q.id}-${q.pr ?? qi}`} className={`train-block ${q.eligibility === "eligible" ? "tb-ready" : q.eligibility === "reviewed" ? "tb-reviewed" : q.state === "ready" ? "tb-unknown" : q.state === "verifying" ? "tb-verifying" : "tb-wait"}${bi === 0 && qi === 0 ? " tb-head" : ""}${q.over_budget ? " tb-over-budget" : ""}`}

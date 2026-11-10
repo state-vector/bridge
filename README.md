@@ -1458,11 +1458,9 @@ in-progress, verifying and ready… the backlog train just shows the batches of
 verifying/ready PRs based on how they can be merged in batches… colours should
 denote verification — green if ready, orange pulsing if being verified, orange
 solid if waiting to be"):
-1. **3-bucket lane PR stats (`N in progress · M verifying · K ready`)**:
-   `in_progress` counts open PRs on the lane in active implementation (or bounced
-   back to `in_progress` / conflicted); `verifying` counts all PRs in the
-   verification stage across `in_review` (both `Verify:` todo and `Verify:` in
-   progress), `awaiting` review parks, and `reconcile` verify duties; `ready`
+1. **Lane PR stats** show implementation, active review, waiting review, and ready.
+   Implementation includes open PRs returned for conflict repair. Active review
+   and waiting review use the same states as the PR blocks. Ready
    counts **verified (`ACCEPT`), base-conflict-free PRs**. The count is derived
    from the same car states as the colours: `K ready` means exactly K green
    blocks. A verified queued PR stays green through a stopped line, red or

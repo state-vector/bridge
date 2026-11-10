@@ -16460,8 +16460,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // laneSyncReason's baseBlock (<15m — the executor refreshes every
       // tick): a dead daemon's stale stamp never pins a banner, and the
       // block disappears by itself the moment base_state goes green.
-      // BR#5658 (Ray 2026-11-03, v2): true 3-bucket per-lane PR stats
-      // (`in_progress · verifying · ready`) covering ALL open PRs on the lane
+      // BR#5658 (Ray 2026-11-03, v2): per-lane PR stats
+      // (`in_progress · verifying · waiting · ready`) covering ALL open PRs on the lane
       // (`lane.queue`, `in_review` cards + their `Verify:` children, `awaiting`
       // review parks, `in_progress` cards, and `reconcile_seen` / `reconcile_duties`
       // open PRs), plus sequential merge `batches` partitioned via iterative
@@ -16485,6 +16485,13 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         );
         for (const observed of this.state.storage.sql.exec(`SELECT pr FROM proxy_probes
           WHERE repo=? AND kind='pr_merged' AND state='verified' AND ok=1`, lane.repo).toArray()) mergedPrs.add(Number(observed.pr));
+        // The reconciler already persists explicit GitHub outcomes. Delivery
+        // verification can remain open after a merge, but that PR can no
+        // longer be a candidate for a future batch.
+        const terminalPrs = new Set(mergedPrs);
+        for (const observed of this.state.storage.sql.exec(
+          `SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND state IN ('MERGED','CLOSED')`, lane.repo,
+        ).toArray()) terminalPrs.add(Number(observed.pr));
         const ignoredPrs = new Set<number>(
           (this.state.storage.sql.exec(`SELECT pr FROM reconcile_ignores WHERE repo = ?`, lane.repo).toArray() as any[])
             .map((r) => Number(r.pr ?? 0))
@@ -16497,20 +16504,20 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
         const cardLegsForLane = (cm: any, title: string, bodyMd: string, extraText: string = ""): { pr?: number }[] => {
           const rem = trainLegsRemaining(cm, lane.repo, lane.base);
-          if (rem.length > 0) return rem.map((leg) => ({ pr: Number(leg.number) || undefined }));
+          if (rem.length > 0) return rem.filter(leg => !terminalPrs.has(Number(leg.number))).map((leg) => ({ pr: Number(leg.number) || undefined }));
           if (trainLegs(cm).length > 0) return [];
           if (
             cm?.review_pr?.repo === lane.repo &&
             Number(cm?.review_pr?.number) > 0 &&
             String(cm?.review_pr?.base ?? "main") === lane.base &&
-            !mergedPrs.has(Number(cm.review_pr.number))
+            !terminalPrs.has(Number(cm.review_pr.number))
           ) {
             return [{ pr: Number(cm.review_pr.number) }];
           }
           if (lane.base === "main") {
             const parsed = trainParseNoteLegs(
               [String(cm?.review_note ?? ""), String(cm?.pr_context ?? ""), String(cm?.last_progress?.note ?? ""), extraText, bodyMd, title].join("\n"),
-            ).filter((leg) => leg.repo === lane.repo && !mergedPrs.has(leg.number));
+            ).filter((leg) => leg.repo === lane.repo && !terminalPrs.has(leg.number));
             if (parsed.length > 0) return parsed.map((leg) => ({ pr: leg.number }));
           }
           return [];
@@ -16533,7 +16540,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           const qLegState = q.pr ? String(qCardMeta?.merge_train?.legs?.[String(q.pr)]?.state ?? "") : "";
           // Already merged in the current batch and settling on main — not waiting in the backlog
           if (
-            (q.pr && mergedPrs.has(Number(q.pr))) ||
+            (q.pr && terminalPrs.has(Number(q.pr))) ||
             (meta.currently?.task_id && q.id === String(meta.currently.task_id)) ||
             (q.pr && Number(meta.currently?.pr) === Number(q.pr)) ||
             String(qCardMeta?.merge_train?.state ?? "") === "awaiting-ci" ||
@@ -16620,7 +16627,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
         // 3. Awaiting review parks on this lane
         for (const a of awaitingRows) {
-          if (seenCards.has(a.task) || (a.pr && seenPrs.has(a.pr))) continue;
+          if (seenCards.has(a.task) || (a.pr && (seenPrs.has(a.pr) || terminalPrs.has(a.pr)))) continue;
           seenCards.add(a.task);
           if (a.pr) seenPrs.add(a.pr);
           const state = a.in_flight ? "verifying" : "waiting";
@@ -16669,7 +16676,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             lane.repo,
           ).toArray() as any[]) {
             const prNum = Number(rs.pr ?? 0);
-            if (!prNum || seenPrs.has(prNum) || mergedPrs.has(prNum) || ignoredPrs.has(prNum)) continue;
+            if (!prNum || seenPrs.has(prNum) || terminalPrs.has(prNum) || ignoredPrs.has(prNum)) continue;
             seenPrs.add(prNum);
             const boundCardId = String(rs.card ?? "").trim();
             const vDuty = this.one(
@@ -16712,8 +16719,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // Count the same car states that drive colour and ready-first order.
         // A separate queued-card tally can disagree with the visible blocks.
         const ready = batchCandidates.filter(car => car.state === "ready").length;
+        const verifying = batchCandidates.filter(car => car.state === "verifying").length;
         return {
-          prStats: { in_progress: inProgress, verifying: batchCandidates.length - ready, ready },
+          prStats: { in_progress: inProgress, verifying, waiting: batchCandidates.length - ready - verifying, ready },
           batches: partitionMergeBatches(batchCandidates, conflictPairs, lane.burst_max),
         };
       })();

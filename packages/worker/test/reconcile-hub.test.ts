@@ -168,6 +168,23 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await kbJson("/get", { id: parent })).body.meta.pr.head_sha_at_acceptance).toBe(repairedHead);
   });
 
+  it("keeps merged delivery reviews out of the next-batch review count", async () => {
+    const repo = "state-vector/terminal-review-drill";
+    const number = 2472;
+    expect((await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "train" })).status).toBe(200);
+    const parent = (await kbJson("/create", { actor: "author", type: "task", title: "Deliver and verify", qualified: true,
+      meta: { pr: { repo, number } } })).body.id;
+    const transition = (to: string, fields: object = {}) => kbJson("/transition", { id: parent, to, actor: "author", session: "author", ...fields });
+    expect((await transition("in_progress")).status).toBe(200);
+    expect((await transition("in_review", { note: `PR https://github.com/${repo}/pull/${number}` })).status).toBe(200);
+    const lane = async () => (await kbJson("/train.status", { repo })).body.lanes.find((l: { lane: string }) => l.lane === repo + "@main");
+    await report(repo, [prRow(number)]);
+    expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 1 });
+    await report(repo, [prRow(number, { state: "MERGED", mergeCommit: { oid: "b".repeat(40) } })]);
+    expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 0 });
+    expect((await kbJson("/get", { id: parent })).body.status).toBe("in_review");
+  });
+
   it("destination-blocked binds WITHOUT a verify duty; a later CLEAN cycle spawns the verify on the SAME card", async () => {
     const repo = "state-vector/reconcile-drill-b";
     const r1 = await report(repo, [prRow(2402, { mergeStateStatus: "BLOCKED" })]);

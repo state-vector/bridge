@@ -133,12 +133,13 @@ describe("BR#8075 one PR readiness definition", () => {
     const assertReadiness = async () => {
       const lane = await laneSnap(repo);
       const cars = lane.batches.flat();
-      expect(lane.pr_stats).toEqual({ in_progress: 2, verifying: 1, ready: 3 });
+      expect(lane.pr_stats).toEqual({ in_progress: 2, verifying: 0, waiting: 1, ready: 3 });
       expect(cars.map((car: any) => [car.pr, car.state])).toEqual([
         [1, "ready"], [2, "ready"], [6, "ready"], [5, "waiting"],
       ]);
       expect(lane.pr_stats.ready).toBe(cars.filter((car: any) => car.state === "ready").length);
-      expect(lane.pr_stats.verifying).toBe(cars.filter((car: any) => car.state !== "ready").length);
+      expect(lane.pr_stats.verifying).toBe(cars.filter((car: any) => car.state === "verifying").length);
+      expect(lane.pr_stats.waiting).toBe(cars.filter((car: any) => car.state === "waiting").length);
     };
     expect((await kbJson("/train.queue_facts", { repo, actor, entries })).status).toBe(200);
     await assertReadiness();
@@ -172,7 +173,7 @@ describe("BR#8075 one PR readiness definition", () => {
       for (const facts of [legFacts, [...legFacts].reverse()]) {
         expect((await kbJson("/train.queue_facts", { repo, actor, entries: facts })).status).toBe(200);
         const lane = await laneSnap(repo);
-        expect(lane.pr_stats).toEqual({ in_progress: currentReady ? 0 : 1, verifying: 0, ready: currentReady ? 1 : 0 });
+        expect(lane.pr_stats).toEqual({ in_progress: currentReady ? 0 : 1, verifying: 0, waiting: 0, ready: currentReady ? 1 : 0 });
         expect(lane.batches.flat().map((car: any) => [car.pr, car.state])).toEqual(currentReady ? [[1, "ready"]] : []);
       }
     }
@@ -4370,7 +4371,8 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(laneSnap).toBeTruthy();
     expect(laneSnap.pr_stats).toEqual({
       in_progress: 1, // PR 501
-      verifying: 2,   // PR 502 (waiting) + PR 503 (actively verifying)
+      verifying: 1,   // PR 503 actively verifying
+      waiting: 1,     // PR 502 awaiting a reviewer
       ready: 1,       // PR 504 (ready)
     });
     // Ready PR504 leads even without a current executor/main observation.
