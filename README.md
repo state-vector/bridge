@@ -1355,6 +1355,26 @@ agent sessions (machinery/web/human authority only — the same authority class 
 close-protection law), and every meta set/delete is named in the card's history line,
 so a meta shrink is never silent.
 
+**Storage budget (BR#11554)**: a card row is written with one DO SQLite statement that
+re-binds the row's full content — title + body + meta + tags + roles. Cross ~100KB of
+bound bytes and the platform rejects the write with `SQLITE_TOOBIG` — and because every
+subsequent write re-binds the same oversized row, even a shrinking write is rejected:
+the card is permanently write-locked (first-hand: BR#10150's 100,584B meta from an
+additive on-card receipt chain; 27 receipts landed, then receipts silently degraded to
+the commentary path). Prevention: `LIMITS.metaBytes` (40KB serialized meta) and
+`LIMITS.rowBytes` (60KB combined row) are enforced at create/update with a named error
+that says the cure — stub archived receipts verbatim into a linked artefact and keep a
+pointer key (`meta_delete` + pointer). Translation: a raw `SQLITE_TOOBIG` from any op
+surfaces as `gate: storage ceiling (BR#11554) …` with `result_class: "gate_rejected"`
+— terminal, don't retry (BR#4403). Unlock: an already-locked card can only be cured by
+`artefact_slim {id, meta, ack_snapshot, expected_old_bytes?}` — DELETE + re-INSERT with
+small binds, keeping id/title/status/body/owner/tags/roles and auto-preserving hub
+infrastructure keys; `ack_snapshot` must name the artefact holding the verbatim
+pre-slim meta (the ledger receipt keeps key names and byte counts, never dropped
+values), the slim is shrink-only, and a `slim_record` key stamps the on-card
+provenance. `get_artefact` returns `meta_bytes`/`row_bytes` so headroom is readable
+before a write bricks a card.
+
 ## Agent lanes: roles & playbooks
 
 Tokens are lane-tagged: `role:analysis`, `role:impl`, `role:review`. The hub composes the

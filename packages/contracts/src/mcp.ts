@@ -64,6 +64,7 @@ export const TOOL_NAMES = [
   "train_recovery_event",
   "transition",
   "update_artefact",
+  "artefact_slim",
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -126,6 +127,21 @@ export const TOOL_ARG_SCHEMAS = {
     meta_delete: z.array(z.string()).optional(),
     tags: z.array(z.string()).optional(),
     roles: z.array(z.string()).optional(),
+  }),
+  /** BR#11554 — unlock a card whose row crossed the DO SQLite write budget:
+   *  every in-place write re-binds the full row so even shrinking updates are
+   *  rejected SQLITE_TOOBIG; this op DELETE + re-INSERTs the row with the
+   *  caller's stubbed meta (small binds only). Shrink-only, infra keys
+   *  preserved, snapshot artefact required. */
+  artefact_slim: z.looseObject({
+    id: z.string(),
+    /** The COMPLETE replacement meta (stub pointers, not verbatim receipts). */
+    meta: z.record(z.string(), z.unknown()).optional(),
+    /** Artefact id(s) holding the verbatim pre-slim meta — required; the
+     *  ledger receipt keeps only key names and byte counts. */
+    ack_snapshot: z.string().optional(),
+    /** Fence: reject when the live meta byte size differs from the caller's read. */
+    expected_old_bytes: z.number().int().optional(),
   }),
   transition: z.looseObject({
     subject_revision: z.string().min(1).optional().describe("Compatibility transport for the explicit captured review revision. Must agree with review_result.subject_revision when both are supplied; never inferred by the hub."),

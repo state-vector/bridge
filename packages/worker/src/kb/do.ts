@@ -43,6 +43,8 @@ import {
   ASK_OPEN,
   assertHumanLabel,
   checkLimits,
+  checkStorageBudget,
+  utf8Bytes,
   ftsQuery,
   formatId,
   FEEDBACK_TITLE_PREFIX,
@@ -4088,6 +4090,11 @@ export class KnowledgeHub {
           if (body.meta?.machine_duty?.by === "recovery-review") throw new Error("gate: recovery review priority is assigned by Bridge");
           return this.json(await this.update(body, actor));
         }
+        // BR#11554 — the unlock path for rows already over the DO SQLite write
+        // budget (every in-place write re-binds the row's full content, so even
+        // a shrinking update is rejected; DELETE + re-INSERT binds only small
+        // values). See artefactSlim for the guard set.
+        case "slim": return this.json(await this.artefactSlim(body, actor));
         case "transition": return this.json(await this.transition(body, actor, "client"));
         case "claim.takeover": return this.json(await this.claimTakeover(body, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
@@ -4312,6 +4319,21 @@ export class KnowledgeHub {
       // layer's fallback classified it as infra. A 400-classified op
       // rejection is the hub REFUSING, never the hub being down.
       const rc = (e as any)?.result_class;
+      // BR#11554: a raw SQLITE_TOOBIG here means a row involved in the op
+      // crosses the DO SQLite write budget (~100KB incl. bound values) — and
+      // because every row write re-binds the row's full content, even a
+      // shrinking write to that row is rejected. Callers used to read it as a
+      // retryable infra fault and burned recovery cycles retrying an
+      // atomically-rolled-back write. Translate ONCE, here, into a named
+      // terminal error with the cure, so recovery duties branch instead of
+      // retry (BR#4403: semantic gate rejections are terminal).
+      const rawMsg = String((e as Error).message ?? e);
+      if (!rc && /SQLITE_TOOBIG|string or blob too big/i.test(rawMsg)) {
+        return this.json({
+          error: `gate: storage ceiling (BR#11554): ${rawMsg} — a row involved in this op exceeds the DO SQLite write budget (~100KB incl. bound values). Every write to that row re-binds its full content, so even shrinking writes are rejected: the card is agent-side write-locked and retries cannot succeed. Cure: hub-side slim op artefact_slim (verbatim snapshot artefact first), prevention via LIMITS.metaBytes/rowBytes budget checks.`,
+          result_class: "gate_rejected",
+        }, 400);
+      }
       return this.json({ error: String((e as Error).message ?? e), ...(rc ? { result_class: rc } : {}) }, 400);
     }
   }
@@ -4496,6 +4518,14 @@ export class KnowledgeHub {
       }
       bodyMd = `${verifyVerdictStatement(createMeta)}\n\n${bodyMd.trim()}`.trim();
     }
+    // BR#11554 storage budget: the create binds the whole row in one DO SQLite
+    // statement — enforce the budget BEFORE the write, with the named error,
+    // so oversized cards are refused instead of created one step from bricking.
+    const createBudget = checkStorageBudget(
+      title, bodyMd, JSON.stringify({ ...createMeta, session }),
+      tags ? JSON.stringify(tags) : null, roles.length ? JSON.stringify(roles) : null,
+    );
+    if (createBudget) throw new Error(createBudget);
     this.state.storage.sql.exec(
       `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, roles, status_ts, project, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -4717,6 +4747,11 @@ export class KnowledgeHub {
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
     if (!row) throw new Error(`no such artefact: ${id}`);
     const shaped = this.shape(row);
+    // BR#11554: write-budget visibility — additive receipt chains brick a card
+    // silently; make the headroom readable at read time so agents can stub
+    // before the next write fails.
+    shaped.meta_bytes = utf8Bytes(String((row as any).meta ?? "{}"));
+    shaped.row_bytes = shaped.meta_bytes + utf8Bytes(String((row as any).title ?? "")) + utf8Bytes(String((row as any).body_md ?? ""));
     if (row.type === "task") {
       shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
       shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
@@ -4946,6 +4981,12 @@ export class KnowledgeHub {
     }
     const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
     if (limitErr) throw new Error(limitErr);
+    // BR#11554 storage budget: every row write re-binds the full title+body+
+    // meta+tags+roles — the resulting row must stay well under the DO SQLite
+    // statement budget or the NEXT write to this card bricks it (shrinks
+    // included). Named error so agents can stub-and-shrink deterministically.
+    const budgetErr = checkStorageBudget(title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null);
+    if (budgetErr) throw new Error(budgetErr);
     // update does not touch status — transitions are the only status path
     this.atomicLaneMutation(() => {
       this.state.storage.sql.exec(
@@ -4978,6 +5019,82 @@ export class KnowledgeHub {
     if (body.body_md !== undefined || body.meta?.repo !== undefined || body.meta?.execution_requirements !== undefined || body.meta?.qualification !== undefined) this.reconcileStartupWaits(Date.now());
     this.executionWork().sweep();
     return { id };
+  }
+
+  /**
+   * BR#11554 — the unlock path for a card whose artefact row already crossed
+   * the DO SQLite write budget. Every in-place write (update, transition, even
+   * a shrinking meta_delete) re-binds the row's FULL stored content, so once a
+   * row reaches the ~100KB statement budget every agent-side write fails
+   * SQLITE_TOOBIG — first-hand on BR#10150 (100,584B meta; 38KB-bound shrink
+   * writes rejected, 2026-11-10). DELETE binds only the id (the FTS delete
+   * trigger binds old.title/old.body_md — small) and the re-INSERT binds the
+   * caller's stubbed meta, so both statements stay in budget. The artefact
+   * keeps its id, type, title, status, body_md, owner, tags, roles, project,
+   * created_ts/created_by; meta is REPLACED by the caller's stub (per-key
+   * merge is physically impossible here — the old values can't be bound);
+   * hub-owned infrastructure keys (lane/lease/currently/stop and a parked
+   * card's blocked) are carried over verbatim automatically. Relations,
+   * ledger, admissions and provenance key on id strings and are untouched.
+   * Guards: shrink-only (new meta strictly smaller and ≤ LIMITS.metaBytes),
+   * row budget applies, lane cards refuse (canonical persistence owns their
+   * meta), `ack_snapshot` must name the artefact(s) holding the verbatim
+   * pre-slim meta (the ledger keeps key NAMES and byte counts, never the
+   * dropped values), and `expected_old_bytes` optionally fences against a
+   * stale read. A `slim_record` provenance key is stamped on-card.
+   */
+  private async artefactSlim(body: any, actor: string) {
+    const id = String(body.id ?? "");
+    const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (this.laneStore().isCanonicalCard(String(row.id)))
+      throw new Error("gate: lane cards keep meta in canonical persistence — artefact_slim does not apply");
+    const ackSnapshot = String(body.ack_snapshot ?? "").trim();
+    if (!ackSnapshot)
+      throw new Error("gate: artefact_slim requires ack_snapshot — the artefact id(s) holding the verbatim pre-slim meta (create that snapshot FIRST; this op's ledger receipt keeps only key names and byte counts, never the dropped values)");
+    const oldMetaStr = String(row.meta ?? "{}");
+    const oldMeta = JSON.parse(oldMetaStr) as Record<string, unknown>;
+    const oldBytes = utf8Bytes(oldMetaStr);
+    if (typeof body.meta !== "object" || body.meta === null || Array.isArray(body.meta))
+      throw new Error("gate: artefact_slim replaces meta wholesale — pass the complete stubbed meta object");
+    const stub: Record<string, unknown> = JSON.parse(JSON.stringify(body.meta));
+    const infraPreserved: string[] = [];
+    for (const k of ["lane", "lease", "currently", "stop", "blocked"]) {
+      if (oldMeta[k] !== undefined && stub[k] === undefined) { stub[k] = oldMeta[k]; infraPreserved.push(k); }
+    }
+    for (const k of ["review_result", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"]) {
+      if (oldMeta[k] !== undefined) stub[k] = oldMeta[k]; // lifecycle-owned keys ride verbatim
+    }
+    const newBytes = utf8Bytes(JSON.stringify(stub));
+    if (newBytes >= oldBytes)
+      throw new Error(`gate: artefact_slim must shrink meta (stub ${newBytes}B >= live ${oldBytes}B) — use update_artefact for additive edits`);
+    if (Object.keys(stub).length > LIMITS.metaKeys)
+      throw new Error(`storage budget: meta exceeds ${LIMITS.metaKeys} keys`);
+    const budgetErr = checkStorageBudget(String(row.title ?? ""), String(row.body_md ?? ""), JSON.stringify(stub),
+      row.tags ? String(row.tags) : null, row.roles ? String(row.roles) : null);
+    if (budgetErr) throw new Error(budgetErr);
+    if (body.expected_old_bytes !== undefined && Number(body.expected_old_bytes) !== oldBytes)
+      throw new Error(`gate: expected_old_bytes fence mismatch — live meta is ${oldBytes}B, caller fenced ${Number(body.expected_old_bytes)}B; re-read the card before slimming`);
+    const dropped = Object.keys(oldMeta).filter((k) => stub[k] === undefined);
+    stub.slim_record = {
+      by: actor, ts: Date.now(), root_fix: "BR#11554",
+      old_meta_bytes: oldBytes, new_meta_bytes: newBytes,
+      dropped_keys: dropped, infra_preserved: infraPreserved,
+      snapshot: ackSnapshot,
+    };
+    const newMeta = JSON.stringify(stub);
+    const ts = Date.now();
+    const cols = Object.keys(row as Record<string, unknown>).filter((c) => c !== "meta");
+    const insert = `INSERT INTO artefacts (${[...cols, "meta"].join(", ")}) VALUES (${[...cols, "meta"].map(() => "?").join(", ")})`;
+    this.atomicLaneMutation(() => {
+      this.state.storage.sql.exec(`DELETE FROM artefacts WHERE id = ?`, id);
+      this.state.storage.sql.exec(insert, ...cols.map((c) => (c === "updated_ts" ? ts : (row as any)[c])), newMeta);
+    });
+    // receipts name keys and byte counts — never the dropped values
+    this.audit(actor, "slim", id, { dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, snapshot: ackSnapshot });
+    this.version(id, actor, "slim", `slimmed meta ${oldBytes}B → ${newBytes}B (dropped: ${dropped.join(", ") || "—"}; verbatim archive: ${ackSnapshot}; BR#11554 unlock path — in-place writes on this row were rejected SQLITE_TOOBIG)`, { dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, snapshot: ackSnapshot });
+    await this.embedArtefact(id, String(row.title ?? ""), String(row.body_md ?? ""));
+    return { id, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, dropped_keys: dropped, infra_preserved: infraPreserved, snapshot: ackSnapshot };
   }
 
   /** Pure evidence for a qualification kind: a done analysis/review child, or an accepted

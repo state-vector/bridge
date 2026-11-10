@@ -657,6 +657,25 @@ export const LIMITS = {
   body: 100_000,
   metaKeys: 20,
   relationsPerArtefact: 100,
+  /**
+   * BR#11554 — meta VALUE bytes (the serialized meta JSON). The old limits
+   * capped body chars and meta KEY COUNT but never meta VALUE size, so
+   * additive on-card receipt chains (refire_archive + per-duty receipt keys)
+   * grew rows until they crossed the DO SQLite write budget and the card
+   * became permanently write-locked — every write to a ≥~100KB row re-binds
+   * the full row content and fails SQLITE_TOOBIG, shrinks included, so no
+   * agent-side write can recover it (first-hand: BR#10150, 2026-11-10).
+   * 40KB leaves ~2.5x headroom under the empirical ~98KB safe bound.
+   */
+  metaBytes: 40_000,
+  /**
+   * BR#11554 — combined per-row write budget (title + body + meta + tags +
+   * roles serialized bytes) with headroom under the DO SQLite statement
+   * budget. A row that lands near the budget bricks the card on its NEXT
+   * write, so the budget must be enforced against the RESULTING row, not the
+   * delta.
+   */
+  rowBytes: 60_000,
 };
 
 export function checkLimits(title: string, body: string, meta?: unknown): string | null {
@@ -667,6 +686,47 @@ export function checkLimits(title: string, body: string, meta?: unknown): string
     return "meta must be an object";
   if (meta && Object.keys(meta as object).length > LIMITS.metaKeys)
     return `meta exceeds ${LIMITS.metaKeys} keys`;
+  return null;
+}
+
+/** UTF-8 byte length (the DO SQLite budget is a byte budget; String.length
+ *  undercounts multi-byte content). TextEncoder exists in Workers and Node;
+ *  the char-count fallback keeps pure-function callers safe. */
+export function utf8Bytes(s: string): number {
+  try {
+    return new TextEncoder().encode(s).length;
+  } catch {
+    return s.length;
+  }
+}
+
+function kb(n: number): string {
+  return (Math.round(n / 100) / 10).toFixed(1);
+}
+
+/**
+ * BR#11554 — the storage write budget, enforced BEFORE any artefact row
+ * statement. `parts` are the exact values about to be bound into the row
+ * write (tags/roles as their serialized JSON strings, or undefined). Returns
+ * a named, actionable error — agents must be able to branch on it (stub
+ * receipts into a linked artefact, shrink body/meta) instead of burning
+ * retries on a raw SQLITE_TOOBIG. Null when the write is in budget.
+ */
+export function checkStorageBudget(
+  title: string,
+  bodyMd: string,
+  metaJson: string,
+  tagsJson?: string | null,
+  rolesJson?: string | null,
+): string | null {
+  const metaBytes = utf8Bytes(metaJson);
+  if (metaBytes > LIMITS.metaBytes)
+    return `storage budget: meta is ${kb(metaBytes)}KB > ${kb(LIMITS.metaBytes)}KB (LIMITS.metaBytes, BR#11554) — this row would brick near the DO SQLite write budget: stub archived receipts verbatim into a linked artefact, keep only a pointer key (meta_delete the verbatim keys), then retry`;
+  const rowBytes =
+    utf8Bytes(title) + utf8Bytes(bodyMd) + metaBytes +
+    (tagsJson ? utf8Bytes(tagsJson) : 0) + (rolesJson ? utf8Bytes(rolesJson) : 0);
+  if (rowBytes > LIMITS.rowBytes)
+    return `storage budget: row is ${kb(rowBytes)}KB > ${kb(LIMITS.rowBytes)}KB (title+body+meta+tags+roles, LIMITS.rowBytes, BR#11554) — shrink body or meta first; a row that lands near the DO SQLite statement budget (~100KB) becomes permanently write-locked on its next write`;
   return null;
 }
 

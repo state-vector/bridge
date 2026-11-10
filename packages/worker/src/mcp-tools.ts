@@ -204,6 +204,11 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     schema: TOOL_ARG_SCHEMAS.update_artefact,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("update", args))),
   },
+  artefact_slim: {
+    description: "BR#11554 unlock for a row already over the DO SQLite write budget (~100KB incl. bound values): EVERY in-place write re-binds the row's full stored content, so even a shrinking update_artefact/meta_delete on such a card fails SQLITE_TOOBIG forever (first-hand BR#10150). This op DELETE + re-INSERTs the row with your stubbed meta — small binds only — keeping id/type/title/status/body/owner/tags/roles/timestamps and auto-preserving hub infra keys (lane/lease/currently/stop/blocked). FIRST create a snapshot artefact holding the verbatim pre-slim meta and pass its id as ack_snapshot (the ledger keeps key names + byte counts, never dropped values). meta is REPLACED wholesale by your stub — shrink-only (strictly smaller than live, ≤ LIMITS.metaBytes); expected_old_bytes fences stale reads. After a slim, ordinary writes work again.",
+    schema: TOOL_ARG_SCHEMAS.artefact_slim,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("slim", args))),
+  },
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
