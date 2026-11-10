@@ -2704,11 +2704,14 @@ export function verdictCoversHeadLeg(leg: TrainLeg | undefined, headSha: string)
 /** Append a carry link to ONE leg's chain (pure; the caller persists meta).
  *  The matching meta.prs entry AND meta.pr (when it is the same PR — legacy
  *  readers read meta.pr) both move, so no reader sees a half-carry. */
-export function carryAppendLeg(meta: any, number: number, rec: CarryRecord): any {
+export function carryAppendLeg(meta: any, target: Pick<TrainLeg, "repo" | "base" | "number">, rec: CarryRecord): any {
   const m = meta && typeof meta === "object" ? { ...meta } : {};
-  const withCarry = (leg: any) => ({ ...leg, carry: [...(Array.isArray(leg.carry) ? leg.carry : []), rec] });
-  if (Array.isArray(m.prs)) m.prs = m.prs.map((l: any) => (Number(l?.number) === number ? withCarry(l) : l));
-  if (Number(m.pr?.number) === number) m.pr = withCarry(m.pr);
+  const append = (leg: any) =>
+    Number(leg?.number) === target.number && String(leg?.repo ?? m.pr?.repo ?? "") === target.repo
+      && String(leg?.base ?? "main") === (target.base ?? "main")
+      ? { ...leg, carry: [...(Array.isArray(leg.carry) ? leg.carry : []), rec] } : leg;
+  if (Array.isArray(m.prs)) m.prs = m.prs.map(append);
+  if (m.pr) m.pr = append(m.pr);
   return m;
 }
 

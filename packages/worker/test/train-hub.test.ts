@@ -485,6 +485,8 @@ describe("BR#6776 durable check recovery", () => {
   it("holds an exact branch update across a lease handoff and allows another candidate", async () => {
     const repo = "state-vector/branch-update-fence", actor = "gw-preparing", next = "gw-preparing-next";
     const head = "c".repeat(40);
+    await queueViaAccept({ repo, pr: 3, head });
+    await queueViaAccept({ repo, pr: 4, head });
     await acquire(repo, actor);
     const request = (pr: number, holder: string) => kbJson("/train.lease", { repo, actor: holder, action: "renew",
       progress: { progress: "Preparing", progress_age_ms: 0, holder, preparation: { pr, head_sha: head, phase: "updating" } } });
@@ -494,6 +496,70 @@ describe("BR#6776 durable check recovery", () => {
     expect((await request(3, next)).body.error).toMatch(/still awaiting readback/);
     expect((await request(4, next)).status).toBe(200);
     expect((await laneSnap(repo)).branch_updates).toMatchObject({ "3": { head_sha: head }, "4": { head_sha: head } });
+  });
+
+  it("keeps a handed-off PR outside the train and rejects stale preparation and recovery", async () => {
+    const repo = "state-vector/train-handoff", actor = "gw-handoff";
+    const pr = 24, head = "a".repeat(40);
+    const task = await queueViaAccept({ repo, pr, head });
+    await acquire(repo, actor);
+    expect((await laneSnap(repo)).queue.map((car: { id: string }) => car.id)).toContain(task);
+    const handedOff = await kbJson("/handoff.control", {
+      id: task, actor: "web:test", kind: "request_local", reason: "User will apply an environment change", action: "Run local repair",
+    });
+    expect(handedOff.body.kind).toBe("requested");
+    expect((await laneSnap(repo)).queue.map((car: { id: string }) => car.id)).not.toContain(task);
+
+    const renewal = await kbJson("/train.lease", { repo, actor, action: "renew",
+      progress: { progress: "Preparing", progress_age_ms: 0, holder: actor, preparation: { pr, head_sha: head, phase: "updating" } } });
+    expect(renewal.body.error).toMatch(/lacks one train-owned reviewed leg/);
+    for (const event of [
+      { kind: "carried", head_sha: "b".repeat(40), from_head: head },
+      { kind: "updated", head_sha: "b".repeat(40), from_head: head },
+      { kind: "bounced", head_sha: head, bounce_kind: "conflict", conflict_files: ["file.ts"] },
+    ]) {
+      const stale = await kbJson("/train.event", { repo, actor, pr, task_id: task, ...event });
+      expect(stale.body.error).toMatch(/execution owns this PR/);
+    }
+    const legacy = await kbJson("/train.carry", { repo, actor, pr, from_head: head, to_head: "b".repeat(40) });
+    expect(legacy.body.error).toMatch(/no unambiguous train-owned card/);
+    const before = (await kbJson("/get", { id: task })).body;
+    expect(before.meta.blocked.await_event.event).toBe("local_handoff");
+
+    const merge = "c".repeat(40);
+    const observed = await kbJson("/train.event", { repo, actor, pr, task_id: task, kind: "merged",
+      head_sha: head, merge_sha: merge, merged_at: Date.now() - 10 * 60_000 });
+    expect(observed.status).toBe(200);
+    expect((await laneSnap(repo)).currently).toMatchObject({ task_id: null, merge_sha: merge });
+    expect((await kbJson("/get", { id: task })).body.meta.blocked).toEqual(before.meta.blocked);
+  });
+
+  it.each(["success", "failure"] as const)("settles %s CI when a local handoff begins after the merge receipt", async (conclusion) => {
+    const repo = "state-vector/train-settle-handoff", actor = "gw-settle-handoff";
+    const pr = 25, head = "a".repeat(40), merge = "c".repeat(40);
+    const task = await queueViaAccept({ repo, pr, head });
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const observed = await kbJson("/train.event", { repo, actor, pr, task_id: task, kind: "merged",
+      head_sha: head, merge_sha: merge, merged_at: Date.now() - 10 * 60_000 });
+    expect(observed.status).toBe(200);
+    const handedOff = await kbJson("/handoff.control", {
+      id: task, actor: "web:test", kind: "request_local", reason: "An independent operation needs local execution", action: "Run local repair",
+    });
+    expect(handedOff.body.kind).toBe("requested");
+    const before = (await kbJson("/get", { id: task })).body;
+    const result = await kbJson("/train.ci", { repo, actor, sha: merge, checks: [check(1, "Test", conclusion)] });
+    const lane = await laneSnap(repo);
+    if (conclusion === "success") {
+      expect(result.body.decided).toBe("landed");
+      expect(lane.currently).toBeNull();
+    } else {
+      expect(result.status).toBe(200);
+      expect(lane.stop).toMatchObject({ sha: merge, culprit_task: task });
+    }
+    const after = (await kbJson("/get", { id: task })).body;
+    expect(after.status).toBe("blocked");
+    expect(after.meta.blocked).toEqual(before.meta.blocked);
+    expect(after.meta.recovery).toEqual(before.meta.recovery);
   });
 
   it("gives an ownerless queued red head exactly one repair duty and projects its actual startup blocker", async () => {

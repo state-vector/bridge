@@ -1465,17 +1465,19 @@ describe("verdictCoversHeadLeg / carryAppendLeg (per-leg carry — BR#3659)", ()
       prs: [
         { repo: "o/r", number: 1, head_sha_at_acceptance: "a".repeat(9) },
         { repo: "o/r", number: 2, head_sha_at_acceptance: "b".repeat(40) },
+        { repo: "other/repo", number: 1, head_sha_at_acceptance: "c".repeat(40) },
       ],
     };
     const rec = { from_head: "a".repeat(9), to_head: "e".repeat(40), prior_verdict_id: "v2", carried_ts: 2, via: "update-branch" as const };
-    const next = carryAppendLeg(meta, 1, rec);
+    const next = carryAppendLeg(meta, { repo: "o/r", number: 1 }, rec);
     expect(next).not.toBe(meta);
     expect(meta.prs[0].carry).toBeUndefined(); // the caller's meta is never mutated
     expect(next.prs[0].carry).toEqual([rec]);
     expect(next.prs[1].carry).toBeUndefined();
+    expect(next.prs[2].carry).toBeUndefined();
     expect(next.pr.carry).toEqual([rec]); // legacy mirror — meta.pr IS leg 1
     // a leg that is NOT meta.pr never leaks its carry onto meta.pr
-    const next2 = carryAppendLeg(meta, 2, rec);
+    const next2 = carryAppendLeg(meta, { repo: "o/r", number: 2 }, rec);
     expect(next2.prs[1].carry).toEqual([rec]);
     expect(next2.pr.carry).toBeUndefined();
   });

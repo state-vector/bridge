@@ -6580,7 +6580,7 @@ export class KnowledgeHub {
       for (const leg of trainLegs(next).filter((l) => !trainLegLanded(next, l))) {
         const stamped = String(leg.head_sha_at_acceptance ?? "").toLowerCase();
         if (stamped && parkedHead && stamped !== parkedHead.toLowerCase()) {
-          next = carryAppendLeg(next, leg.number, { from_head: stamped, to_head: parkedHead, prior_verdict_id: verdictId ?? null, carried_ts: now, via: "force-review" as const });
+          next = carryAppendLeg(next, leg, { from_head: stamped, to_head: parkedHead, prior_verdict_id: verdictId ?? null, carried_ts: now, via: "force-review" as const });
           carried.push(`${leg.repo || "?"}#${leg.number} ${stamped.slice(0, 9)}→${String(parkedHead).slice(0, 9)}`);
         }
       }
@@ -11873,8 +11873,8 @@ export class KnowledgeHub {
     // expires, so the next gateway's acquire wins within one tick. A missing
     // proof (legacy `{}` renewals) is UNKNOWN — allowed + loud audit while
     // the deprecation window runs (BR#4104 retires those senders). ----
+    const queue = action === "renew" ? this.laneQueue(repo, base) : [];
     if (action === "renew") {
-      const queue = this.laneQueue(repo, base);
       const progress = renewProgressDecide(body.progress ?? null, holder, queue.length);
       if (progress.ok === false) {
         const proofNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
@@ -11911,18 +11911,26 @@ export class KnowledgeHub {
     // line — WHAT the holder is doing this minute (the trains panel renders
     // it; a stale one ages out client-side against the 5-min lease TTL).
     const progNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
-    if (action === "renew" && progNote) {
-      const preparation = TrainBranchPreparationSchema.safeParse(body.progress?.preparation);
-      if (preparation.success && preparation.data.phase === "updating") {
-        const { pr, head_sha } = preparation.data;
+    if (action === "renew") {
+      const preparation = body.progress?.preparation == null ? null : TrainBranchPreparationSchema.parse(body.progress.preparation);
+      if (preparation?.phase === "updating") {
+        if (!progNote) throw new Error("gate: branch preparation requires a progress note");
+        const { pr, head_sha } = preparation;
+        const binding = this.uniqueTrainPrBinding(repo, base, pr);
+        const stamp = binding?.meta.merge_train;
+        const legState = stamp?.legs?.[String(pr)]?.state ?? (Number(stamp?.pr) === pr ? stamp?.state : undefined);
+        const terminal = this.one(`SELECT pr FROM provenance WHERE repo=? AND pr=?
+          UNION SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND pr=? AND state IN ('MERGED','CLOSED')`, repo, pr, repo, pr);
+        if (!binding || !queue.some(entry => entry.id === binding.id) || legState === "awaiting-ci"
+          || terminal || !verdictCoversHeadLeg(binding.leg, head_sha))
+          throw new Error(`gate: PR #${pr} lacks one train-owned reviewed leg for branch preparation`);
         const stored = TrainBranchUpdateFenceSchema.safeParse(meta.lane.branch_updates ?? {});
         const fences = Object.fromEntries(Object.entries(stored.success ? stored.data : {}).filter(([, fence]) => fence.expires_at > now));
         if (fences[pr]?.head_sha === head_sha) throw new Error(`Branch update for PR #${pr} is still awaiting readback`);
         fences[pr] = { head_sha, expires_at: now + 120_000 };
         meta.lane.branch_updates = fences;
       }
-      meta.lane.now_action = { note: progNote, holder, at: now,
-        ...(preparation.success ? { preparation: preparation.data } : {}) };
+      if (progNote) meta.lane.now_action = { note: progNote, holder, at: now, ...(preparation ? { preparation } : {}) };
     }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
@@ -12197,7 +12205,8 @@ export class KnowledgeHub {
         if (!card || card.status !== "blocked") throw new Error("train:updated requires a queued card");
         if (card) {
           const cm = JSON.parse(card.meta ?? "{}");
-          const leg = trainLegs(cm).find((l) => l.number === Number(pr) && l.repo === repo && (l.base ?? "main") === base);
+          if (this.protectedExecution(chain.task_id, cm)) throw new Error("gate: execution owns this PR; the train cannot apply a stale updated event");
+          const leg = trainLegsRemaining(cm, repo, base).find(l => l.number === pr);
           if (!leg || mergePhaseOf(cm) !== "queued") throw new Error("train:updated PR must belong to this queued task and lane");
           const stamped = String(leg.head_sha_at_acceptance ?? "").toLowerCase();
           if (!stamped)
@@ -12213,7 +12222,7 @@ export class KnowledgeHub {
           } else if (from === to) {
             throw new Error("train:updated head_sha equals the stamp — nothing moved; do not fabricate a carry");
           } else {
-            const next = carryAppendLeg(cm, Number(pr), { from_head: from, to_head: to, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+            const next = carryAppendLeg(cm, leg, { from_head: from, to_head: to, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
             this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(next), chain.task_id);
             this.version(chain.task_id, actor, "train_carry", `verdict carried across machine update-branch ${stamped.slice(0, 9)}→${to.slice(0, 9)} (worker-authored branch, prior verdict ${chain.verdict_id ?? "unrecorded"} cited; BR#4687)`, {});
           }
@@ -12256,7 +12265,8 @@ export class KnowledgeHub {
         if (chainTask && priorEv?.base === base && headSha && headSha === priorEv.head_sha) {
           const card = row(chainTask);
           const cm = JSON.parse(card?.meta ?? "{}");
-          if (card?.status === "blocked" && cm.merge_train?.state === "queued" && mergeCompletesTask(cm)
+          if (card?.status === "blocked" && cm.merge_train?.state === "queued" && !this.protectedExecution(chainTask, cm)
+            && mergeCompletesTask(cm)
             && trainLegsRemaining(cm, repo, base).some(leg => leg.number === pr && leg.head_sha_at_acceptance === headSha)) {
             const review = this.currentTaskReview(chainTask);
             if (review.phase === "accepted" && review.subject.task_id === chainTask && review.subject.revision === (cm.work_revision ?? "legacy")
@@ -12320,22 +12330,27 @@ export class KnowledgeHub {
       // the verdict CARRIES (BR#3516 §5) — appended on the impl card. ONE
       // meta write: carry + awaiting-ci stamp + provenance + (blocked)
       // reason, so no leg clobbers another.
+      let settleTask = chain.task_id;
       if (chain.task_id) {
         const card = row(chain.task_id);
-        if (card) {
-          const cm = JSON.parse(card.meta ?? "{}");
+        const cm = JSON.parse(card?.meta ?? "{}");
+        if (card && this.protectedExecution(chain.task_id, cm)) {
+          // Record the external merge on the lane without consuming the
+          // independent execution-owned wait on the task.
+          settleTask = null;
+        } else if (card) {
           // THIS leg's stamp (multi-PR cards ride meta.prs; single-PR cards
           // fall back to the legacy meta.pr stamp — same leg, two shapes)
-          const leg = trainLegs(cm).find((l) => l.number === Number(pr));
-          const stamped = String(leg?.head_sha_at_acceptance ?? cm.pr?.head_sha_at_acceptance ?? "");
+          const leg = trainLegsRemaining(cm, repo, base).find(l => l.number === pr);
+          const stamped = String(leg?.head_sha_at_acceptance ?? "");
           let next = cm;
           // BR#4687: an `updated` event may already carry stamp→headSha (the
           // executor stamps the machine update-branch the moment it lands) —
           // appending again would double the chain leg. Dedupe on to_head.
-          const priorCarry = [...(Array.isArray(leg?.carry) ? leg.carry : []), ...(Array.isArray(cm.pr?.carry) ? cm.pr.carry : [])];
+          const priorCarry = leg?.carry ?? [];
           const alreadyCarried = priorCarry.some((c) => String(c?.to_head ?? "").toLowerCase() === (headSha ?? "").toLowerCase());
-          if (stamped && headSha && stamped.toLowerCase() !== headSha.toLowerCase() && !alreadyCarried) {
-            next = carryAppendLeg(cm, Number(pr), { from_head: stamped, to_head: headSha, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+          if (leg && stamped && headSha && stamped.toLowerCase() !== headSha.toLowerCase() && !alreadyCarried) {
+            next = carryAppendLeg(cm, leg, { from_head: stamped, to_head: headSha, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
             this.version(chain.task_id, actor, "train_carry", `verdict carried across clean update ${stamped.slice(0, 9)}→${headSha.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
           }
           // per-leg awaiting-ci stamp — a multi-PR card is mid-flight leg by
@@ -12376,7 +12391,7 @@ export class KnowledgeHub {
         // "bursting" drain phase (no settle wait between merges); the final
         // merge — or any legacy merge — enters the awaiting-ci settle.
         phase: burstMerged != null && !burstSettling ? "bursting" : "awaiting-ci",
-        task_id: chain.task_id,
+        task_id: settleTask,
         ...burstFields,
       };
       // BR#4981: a landing clears the lane's bypass-wait for that PR — the
@@ -12430,10 +12445,12 @@ export class KnowledgeHub {
       if (!card) throw new Error(`train:carried could not resolve the impl card (task_id ${taskId ?? "none"})`);
       if (card.status !== "blocked") throw new Error(`train:carried expects the card queued on the train (blocked) — ${taskId} is ${card.status}`);
       const cm = JSON.parse(card.meta ?? "{}");
+      if (this.protectedExecution(String(taskId), cm)) throw new Error("gate: execution owns this PR; the train cannot apply a stale carried event");
       const chain = this.trainChain(taskId);
-      const leg = trainLegs(cm).find((l) => l.number === Number(pr));
-      const stamp = String(leg?.head_sha_at_acceptance ?? cm.pr?.head_sha_at_acceptance ?? "");
-      const carrySrc = leg?.carry ?? cm.pr?.carry;
+      const leg = trainLegsRemaining(cm, repo, base).find(l => l.number === pr);
+      if (!leg) throw new Error("train:carried PR must belong to this task and lane");
+      const stamp = String(leg.head_sha_at_acceptance ?? "");
+      const carrySrc = leg.carry;
       // CONTIGUITY, re-proved server-side: from_head must be the leg's exact
       // chain tip. Carry is the default path, not a bypass — a leg that skips
       // a link (or a broken chain) can never be extended, only re-verified.
@@ -12441,7 +12458,7 @@ export class KnowledgeHub {
       if (tip === null || tip !== fromHead)
         throw new Error(`train:carried refused: from_head ${fromHead.slice(0, 9)} is not the leg's chain tip (${tip ? tip.slice(0, 9) : "none — stamp missing or chain broken"}) — the chain must stay contiguous`);
       const evidence = String(body.evidence ?? "").slice(0, 300);
-      const next = carryAppendLeg(cm, Number(pr), { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "rebase" as const });
+      const next = carryAppendLeg(cm, leg, { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "rebase" as const });
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, taskId);
       this.version(taskId, actor, "train_carry", `verdict carried across mechanical head move ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} (same patch-ids; prior verdict ${chain.verdict_id ?? "unrecorded"} cited)${evidence ? ` — ${evidence}` : ""}`, {});
       ev({ task: taskId, verdict: chain.verdict_id, session: chain.session, carry: true, from_head: fromHead, to_head: toHead, evidence }, taskId);
@@ -12466,6 +12483,7 @@ export class KnowledgeHub {
       const card = taskId ? row(taskId) : null;
       if (!card) throw new Error(`train:bounced could not resolve the impl card (task_id ${taskId ?? "none"})`);
       const cm = JSON.parse(card.meta ?? "{}");
+      if (this.protectedExecution(String(taskId), cm)) throw new Error("gate: execution owns this PR; the train cannot apply a stale bounced event");
       const writer = this.executionState(String(taskId))?.attempt;
       if (card.status === "in_progress" && ((writer && writer.phase !== "quiesced") || cm.interactive_execution)) {
         throw new Error("train:bounced repair handoff cannot release a live execution claim — reconcile the writer before rescheduling");
@@ -12959,26 +12977,33 @@ export class KnowledgeHub {
       // failing runs; red at admission ⇒ no merge happened, nothing bounces.
       if (culprit && meta.currently) {
         const card = row(culprit);
-        if (card && card.status === "blocked") {
+        if (card && card.status === "blocked" && !this.protectedExecution(culprit, JSON.parse(card.meta ?? "{}"))) {
           const lines = [
             `Merge-train STOP THE LINE: your PR #${pr} landed as ${sha.slice(0, 9)} and broke main — required workflows RED.`,
             ...failing.map((f) => `- ${f.name}: ${f.conclusion ?? "failed"}${f.url ? ` (${f.url})` : ""}`),
             ``,
             `Fix forward or revert, then re-enter review. The lane is stopped until main is green again (BR#3516 §6 — v1 stops the line; no auto-revert).`,
           ];
-          await this.transition(
-            {
-              id: culprit,
-              to: "in_progress",
-              session: "", // anonymous — hub-side machine action (see bounce)
-              note: `merge-train stop-the-line — main RED at ${sha.slice(0, 9)}: ${failing.map((f) => f.name).join(", ") || why}`,
-              body_md: `${String(card.body_md ?? "")}\n\n---\n\n${lines.join("\n")}`,
-            },
-            actor,
-          );
-          const cm2 = JSON.parse(card.meta ?? "{}");
-          cm2.merge_train = { ...(cm2.merge_train ?? {}), state: "stopped", pr, sha, at: now };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm2), culprit);
+          try {
+            await this.transition(
+              {
+                id: culprit,
+                to: "in_progress",
+                session: "", // anonymous — hub-side machine action (see bounce)
+                note: `merge-train stop-the-line — main RED at ${sha.slice(0, 9)}: ${failing.map((f) => f.name).join(", ") || why}`,
+                body_md: `${String(card.body_md ?? "")}\n\n---\n\n${lines.join("\n")}`,
+              },
+              actor,
+            );
+          } catch (error) {
+            const current = JSON.parse(row(culprit)?.meta ?? "{}");
+            if (!this.protectedExecution(culprit, current)) throw error;
+          }
+          const current = JSON.parse(row(culprit)?.meta ?? "{}");
+          if (!this.protectedExecution(culprit, current)) {
+            current.merge_train = { ...(current.merge_train ?? {}), state: "stopped", pr, sha, at: now };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(current), culprit);
+          }
         }
       }
       meta.currently = meta.currently ? { ...meta.currently, phase: "stopped" } : null;
@@ -13158,7 +13183,7 @@ export class KnowledgeHub {
       if (row.id === cur.task_id) continue; // the final card — landedFlow owns it
       try {
         const cm = JSON.parse(row.meta ?? "{}");
-        if (!mergeCompletesTask(cm)) continue;
+        if (this.protectedExecution(String(row.id), cm) || !mergeCompletesTask(cm)) continue;
         const legs = trainLegs(cm);
         const leg = legs.find((l) => (l.repo === laneSpec.repo || !l.repo) && String(cm.merge_train?.legs?.[String(l.number)]?.state ?? "") === "awaiting-ci");
         if (!leg) continue;
@@ -13381,11 +13406,14 @@ export class KnowledgeHub {
   private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null; receiptTaskId?: string }): Promise<any> {
     const now = Date.now();
     const laneSpec = laneOfMeta(meta)!;
-    const taskId: string | null = p.receiptTaskId ?? meta.currently?.task_id ?? null;
+    let taskId: string | null = p.receiptTaskId ?? meta.currently?.task_id ?? null;
     if (taskId) {
       const card = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, taskId);
-      if (card && card.status !== "done" && card.status !== "superseded") {
-        const cm = JSON.parse(card.meta ?? "{}");
+      const cm = JSON.parse(card?.meta ?? "{}");
+      if (card && this.protectedExecution(taskId, cm)) {
+        if (p.receiptTaskId) return;
+        taskId = null;
+      } else if (card && card.status !== "done" && card.status !== "superseded") {
         if (!mergeCompletesTask(cm)) {
           await this.resumePrerequisite(taskId, laneSpec.repo, p.pr, p.mergeSha);
           meta.currently = null;
@@ -13460,6 +13488,7 @@ export class KnowledgeHub {
     if (card) {
       const now2 = Date.now();
       const cm = JSON.parse(card.meta ?? "{}");
+      if (this.protectedExecution(taskId, cm)) return;
       const nextMeta = {
         ...cm,
         // starvation law shape (BR#4068): a merged-green card one gate
@@ -14353,29 +14382,23 @@ export class KnowledgeHub {
     const lane = await this.laneEnsure(repo, base, actor);
     const meta = JSON.parse(lane.meta ?? "{}");
     const lease: TrainLease | null = meta.lease ?? null;
-    if (!lease || lease.holder !== actor) throw new Error(`train.carry requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
-    const cards = this.state.storage.sql.exec(
-      `SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
-       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
-    ).toArray() as any[];
-    for (const row of cards) {
-      const cm = JSON.parse(row.meta ?? "{}");
-      const leg = trainLegs(cm).find((l) => l.number === pr && (l.repo === repo || !l.repo));
-      if (!leg) continue;
-      // contiguity at append time (BR#3516 §5): the carry may only extend
-      // the walked chain end — a gap would silently unverify the head.
-      const end = trainCarryChainEnd(leg);
-      if (fromHead !== end)
-        throw new Error(`train.carry: from_head ${fromHead.slice(0, 9)} is not the verdict chain's end (${end.slice(0, 9)}) — carries append contiguously (BR#3516 §5)`);
-      const chain = this.trainChain(row.id);
-      const now = Date.now();
-      const next = carryAppendLeg(cm, pr, { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, row.id);
-      this.version(row.id, actor, "train_carry", `verdict carried across the settle-window machine update ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
-      this.audit(actor, "train:carry", lane.id, { lane: laneKey(repo, base), pr, task: row.id, from_head: fromHead, to_head: toHead });
-      return { ok: true, kind: "carry", lane: laneKey(repo, base), task: row.id, pr, from_head: fromHead, to_head: toHead };
-    }
-    throw new Error(`train.carry: no queued card on ${repo}@${base} rides PR #${pr} — carries feed only the lane's queued heads`);
+    if (!lease || lease.holder !== actor || lease.expires_ts <= Date.now()) throw new Error(`train.carry requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
+    const binding = this.uniqueTrainPrBinding(repo, base, pr);
+    if (!binding || this.protectedExecution(binding.id, binding.meta))
+      throw new Error(`train.carry: no unambiguous train-owned card on ${repo}@${base} rides PR #${pr}`);
+    const { id, meta: cm, leg } = binding;
+    // contiguity at append time (BR#3516 §5): the carry may only extend
+    // the walked chain end — a gap would silently unverify the head.
+    const end = trainCarryChainEnd(leg);
+    if (fromHead !== end)
+      throw new Error(`train.carry: from_head ${fromHead.slice(0, 9)} is not the verdict chain's end (${end.slice(0, 9)}) — carries append contiguously (BR#3516 §5)`);
+    const chain = this.trainChain(id);
+    const now = Date.now();
+    const next = carryAppendLeg(cm, leg, { from_head: fromHead, to_head: toHead, prior_verdict_id: chain.verdict_id, carried_ts: now, via: "update-branch" as const });
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(next), now, id);
+    this.version(id, actor, "train_carry", `verdict carried across the settle-window machine update ${fromHead.slice(0, 9)}→${toHead.slice(0, 9)} (prior verdict ${chain.verdict_id ?? "unrecorded"} cited)`, {});
+    this.audit(actor, "train:carry", lane.id, { lane: laneKey(repo, base), pr, task: id, from_head: fromHead, to_head: toHead });
+    return { ok: true, kind: "carry", lane: laneKey(repo, base), task: id, pr, from_head: fromHead, to_head: toHead };
   }
 
    /** Apply only the current typed, exact-revision acceptance. PR delivery uses
@@ -14619,6 +14642,16 @@ export class KnowledgeHub {
     this.version(parentId, actor, "train_queued", `queued on the merge train — ${withStampHeads.map((l) => `${l.repo}#${l.number}@${String(l.head_sha_at_acceptance).slice(0, 9)}`).join(", ")}${alreadyQueued ? ` (re-queued${refreshed ? ", stamp refreshed" : ""})` : ""}`, { prs: withStampHeads.map((l) => l.number) });
   }
 
+  private uniqueTrainPrBinding(repo: string, base: string, pr: number) {
+    const matches = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type='task' AND status='blocked'
+      AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER)>0`).toArray().flatMap(row => {
+      const meta = JSON.parse(String(row.meta));
+      return trainLegsRemaining(meta, repo, base).filter(leg => leg.number === pr)
+        .map(leg => ({ id: String(row.id), meta, leg }));
+    });
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   /** The lane's derived queue — COMPUTED (mergeTrainQueue over blocked,
    *  merge-train-stamped cards), never stored (BR#3516 §7). Shared by the
    *  status snapshot and the renew-arm zombie check (BR#4129). BR#4977: the
@@ -14663,7 +14696,9 @@ export class KnowledgeHub {
       // whole repo queue
       // A merge can leave an unrelated dependency or delivery review open.
       // Keep the task and its wait, while removing its stale train slot.
-      return !!cm && trainLegsRemaining(metaById.get(c.id), repo, base).some(leg => !observedMerges.has(leg.number));
+      const task = metaById.get(c.id);
+      return !!cm && !this.protectedExecution(c.id, task)
+        && trainLegsRemaining(task, repo, base).some(leg => !observedMerges.has(leg.number));
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
