@@ -8737,8 +8737,18 @@ export class KnowledgeHub {
     const recent = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM (
       SELECT review_id,record FROM delivery_admissions ORDER BY rowid DESC LIMIT 32
     ) WHERE json_extract(record,'$.state.phase')='pending' LIMIT 4`).toArray();
+    // A repaired typed merge wait can be ready now even when its admission
+    // was held in a previous pass. Prioritize it over historical held rows.
+    const mergeWaits = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor, a.review_id
+      FROM artefacts t JOIN delivery_admissions a ON json_extract(a.record,'$.task_id')=t.id
+      WHERE t.status='blocked' AND json_extract(t.meta,'$.blocked.await_event.event')='pr_merged'
+        AND json_extract(a.record,'$.state.phase')='held'
+        AND EXISTS (SELECT 1 FROM json_each(a.record,'$.legs') leg
+          WHERE json_extract(leg.value,'$.repo')=json_extract(t.meta,'$.blocked.await_event.repo')
+            AND json_extract(leg.value,'$.number')=json_extract(t.meta,'$.blocked.await_event.n'))
+      ORDER BY a.rowid DESC LIMIT 4`).toArray();
     const attempted = new Set<string>();
-    for (const row of [...recent, ...rows]) {
+    for (const row of [...recent, ...mergeWaits, ...rows]) {
       const id = String(row.review_id);
       const advance = () => {
         if (row.cursor != null) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
@@ -13326,7 +13336,7 @@ export class KnowledgeHub {
     if (isStandingCard(meta, parseTags(row.tags)) || this.staleReviewHasExecutionHold(id, meta) || meta.interactive_execution)
       return { kind: "retained", reason: "An existing subsystem or executor owns this exit." };
     let beforeWrite: (() => void) | undefined;
-    if (meta.merge_train?.close_bounce === true && meta.merge_train.breach_class === "gate:done-unreviewed"
+    if (meta.merge_train?.state === "bounced" && meta.merge_train.close_bounce === true && meta.merge_train.breach_class === "gate:done-unreviewed"
       && trainLegs(meta).length === 1) {
       const current = JSON.stringify(this.currentTaskReview(id));
       const refusal = () => this.landedCloseReviewHold(id, repo, pr, mergeSha);

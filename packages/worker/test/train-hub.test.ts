@@ -2474,7 +2474,7 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
 // { landed, landed_retry, bounce_gate, bounce_bound } and the queue advances.
 
 describe("BR#4753 landed-close recovery (real bundled worker)", () => {
-  it.each(["pending", "findings"] as const)("reconciles an exact landed close bounce with a %s review without a GitHub feed", async (reviewState) => {
+  it.each(["pending", "findings", "accepted-pr"] as const)("reconciles an exact landed close bounce with a %s review without a GitHub feed", async (reviewState) => {
     const repo = "state-vector/close-recovery";
     const pr = 2808;
     const head = "a".repeat(40);
@@ -2536,10 +2536,18 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     const accepted = await kbJson("/transition", {
       id: fresh, to: "done", actor: "fresh-reviewer", note: "Verified delivery and green CI",
       review_result: await reviewOutcome(kbJson, fresh, {
-        kind: "accepted_direct_main", repo, commit: merge, ci_run_url: `https://github.com/${repo}/actions/runs/123`,
+        ...(reviewState === "accepted-pr"
+          ? { kind: "accepted_pr" as const, task_id: task, legs: [{ repo, number: pr, head_sha_at_acceptance: head }] }
+          : { kind: "accepted_direct_main" as const, repo, commit: merge, ci_run_url: `https://github.com/${repo}/actions/runs/123` }),
       }),
     });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    if (reviewState === "accepted-pr") {
+      expect((await kbJson("/get", { id: task })).body).toMatchObject({
+        status: "blocked", meta: { merge_train: { state: "queued", close_bounce: true, landed_merge_sha: merge } },
+      });
+      expect((await kbJson("/admin.alarm_sweep")).status).toBe(200);
+    }
     expect((await kbJson("/get", { id: task })).body.status).toBe("done");
   });
 
