@@ -723,6 +723,46 @@ describe("eligibility-first scheduling on real SQLite", () => {
 });
 
 describe("priority line recovery capacity", () => {
+  it("dispatches the original implementation after current PR findings on an accepted recovery", async () => {
+    const project = "review-to-repair", g = await gateway(project);
+    const repo = "state-vector/review-to-repair", pr = 45;
+    const parent = await task(project, { pr: { repo, number: pr, head_sha_at_acceptance: "a".repeat(40) },
+      merge_train: { state: "bounced", repo, pr } });
+    const report = (mergeable: string, mergeStateStatus: string) => post("reconcile.report", {
+      repo, actor: "system:reconcile", prs: [{ number: pr, title: "PR recovery fixture", mergeable, mergeStateStatus,
+        headRefOid: "b".repeat(40), updatedAt: new Date(Date.now() - 90 * 3_600_000).toISOString() }],
+    });
+    const transition = (id: string, to: string, actor: string, fields: object = {}) =>
+      post("transition", { id, to, actor, session: actor, ...fields });
+    const repair = (await report("CONFLICTING", "DIRTY")).spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(repair).toBeTruthy();
+    expect((await transition(repair, "in_progress", "repairer")).error).toBeUndefined();
+    const submitted = await transition(repair, "in_review", "repairer", {
+      execution_result: { outcome: "Restored mergeability", receipts: ["GitHub branch readback"] },
+    });
+    const repairClaim = await transition(submitted.verify_task, "in_progress", "repair-reviewer");
+    expect((await transition(submitted.verify_task, "done", "repair-reviewer", { review_result: {
+      kind: "accepted_execution", task_id: repair, subject_revision: repairClaim.review_subject.revision,
+      receipts: ["Verified recovery evidence"],
+    } })).error).toBeUndefined();
+    const review = (await report("MERGEABLE", "UNSTABLE")).spawned.find((x: { action: string }) => x.action === "verify")?.duty;
+    expect(review).toBeTruthy();
+    expect((await post("get", { id: review })).project).toBe(project);
+    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0].held.independent_wait).toContain(parent);
+    expect((await transition(review, "in_progress", "pr-reviewer")).error).toBeUndefined();
+    expect((await transition(review, "done", "pr-reviewer", { review_result: {
+      kind: "findings", summary: "The feature still needs a regression repair",
+    } })).error).toBeUndefined();
+    const next = await report("MERGEABLE", "UNSTABLE");
+    expect(next.spawned).toEqual([]);
+    expect(next.accounting.repairing).toBe(1);
+    const claim = await reserve(g);
+    expect(claim).toMatchObject({ kind: "reserved", task_id: parent, task: { meta: { merge_train: { state: "unbound" } } } });
+    if (claim.kind !== "reserved") throw new Error("implementation was not reserved");
+    expect(claim.task.body_md).toContain("The feature still needs a regression repair");
+    expect((await post("get", { id: parent })).meta.recovery.task_id).toBe(repair);
+  });
+
   it("keeps independent review of an urgent concrete repair ahead of unrelated repair backlog", async () => {
     const project = "critical-repair-review", g = await gateway(project, 3);
     const older = await task(project, { machine_duty: { kind: "task-recovery", reason: "queue_binding" } });

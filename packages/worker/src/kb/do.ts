@@ -305,6 +305,12 @@ const TRAIN_READY_MS = 15 * 60_000;
 /** A failed probe re-arms after this backoff (the executor re-polls pending
  *  probes each tick; the sweep re-enqueues failed rows past the backoff). */
 const PROBE_RETRY_MS = 10 * 60_000;
+
+type RecoveredPrMeta = Record<string, unknown> & {
+  merge_train?: { state?: unknown; repo?: unknown; pr?: unknown };
+  recovery?: { task_id?: unknown };
+  blocked?: { await_event?: unknown };
+};
 /** Transient gh failures before the probe gives up and the park goes back to
  *  a loud unresolvable (never a silent infinite retry loop). */
 const PROBE_ATTEMPT_CAP = 12;
@@ -5214,6 +5220,28 @@ export class KnowledgeHub {
     this.audit("system:executor", "startup_recovery_error", id, { reason });
   }
 
+  private recoveredPrFindings(id: string, meta: RecoveredPrMeta): { id: string; summary: string } | null {
+    const stamp = meta.merge_train;
+    if (!stamp || (stamp.state !== "bounced" && stamp.state !== "unbound") ||
+      !meta.recovery?.task_id || meta.blocked?.await_event) return null;
+    const review = this.currentTaskReview(id);
+    if (review.phase !== "rejected" || review.result.kind !== "findings") return null;
+    const duty = this.one(`SELECT json_extract(meta,'$.review_subject') AS subject,
+      json_extract(meta,'$.machine_duty.pr') AS pr FROM artefacts WHERE id=?`, review.id);
+    const subject = ReviewSubjectSchema.safeParse(JSON.parse(String(duty?.subject ?? "null")));
+    if (!subject.success || subject.data.task_id !== id || subject.data.revision !== (meta.work_revision ?? "legacy") ||
+      duty?.pr !== `${stamp.repo}#${stamp.pr}`) return null;
+    const priorBounce = { ...meta, merge_train: { ...stamp, state: "bounced" } };
+    return this.acceptedQueueRepair({ id, status: "todo", meta: JSON.stringify(priorBounce) }, String(stamp.repo ?? ""), Number(stamp.pr))
+      ? { id: review.id, summary: review.result.summary } : null;
+  }
+
+  private todoLifecycleHold(id: string, meta: RecoveredPrMeta): string | null {
+    const hold = todoDispatchHold(meta);
+    if (!hold || !this.recoveredPrFindings(id, meta)) return hold;
+    return todoDispatchHold({ ...meta, recovery: undefined });
+  }
+
   private startupHasAsk(id: string): boolean {
     return !!this.one(`SELECT id FROM asks WHERE artefact_id = ? AND status = 'open'`, id)
       || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL`, id);
@@ -5267,7 +5295,7 @@ export class KnowledgeHub {
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
       else if (this.unmetBars(row).length) reason = "qualification";
-      else if (this.protectedExecution(id, meta) || todoDispatchHold(meta) || this.startupHasAsk(id)) reason = "independent_wait";
+      else if (this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta) || this.startupHasAsk(id)) reason = "independent_wait";
       else {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state ?? undefined, revision);
@@ -5817,7 +5845,7 @@ export class KnowledgeHub {
         if (Number(granted?.n ?? 0) >= 4) throw new Error("gate: this proxy receipt has already granted four recovery trials");
       }
       const a = current.attempt, terminal = current.terminal;
-      if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || todoDispatchHold(meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
+      if (row.status !== "todo" || row.owner || this.protectedExecution(req.id,meta) || this.todoLifecycleHold(req.id, meta) || meta.operator_gated || this.startupHasAsk(req.id)) throw new Error("gate: independent lifecycle hold owns provider recovery");
       if (!a || a.phase !== "quiesced" || !terminal || terminal.generation !== a.generation || terminal.attempt_id !== a.attempt_id) throw new Error("gate: provider recovery requires the exact quiesced terminal attempt");
       if (current.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) throw new Error("gate: unresolved external effects prohibit provider recovery");
       if (JSON.stringify(command.terminal) !== JSON.stringify(terminal)) throw new Error("gate: provider recovery terminal evidence changed");
@@ -7320,7 +7348,7 @@ export class KnowledgeHub {
     // body_md rides the transition too when the caller supplies it (the train's
     // bounce/stop briefs append to the card body on the same write) — absent a
     // supplied body, the existing body is preserved.
-    const nextBodyMd = typeof body.body_md === "string" && body.body_md.trim()
+    let nextBodyMd = typeof body.body_md === "string" && body.body_md.trim()
       ? body.body_md
       : String(row.body_md ?? "");
     const terminalStartup = ["done", "superseded"].includes(verdict.status);
@@ -7382,7 +7410,20 @@ export class KnowledgeHub {
         // The lifecycle awaits evidence/session lookups. Re-evaluate execution
         // prerequisites at the write boundary, not just at HTTP ingress.
         this.executionMutationGuard("transition", body);
+        const currentMeta: RecoveredPrMeta = JSON.parse(String(current.meta ?? "{}"));
         const credential = this.one(`SELECT label,tags FROM auth_tokens WHERE id=? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
+        if (row.status === "todo" && credential && tagsSayGateway(parseTags(credential.tags)) && this.todoLifecycleHold(id, currentMeta)) {
+          throw new Error("gate: an independent wait still owns this task");
+        }
+        if (row.status === "todo" && currentMeta.merge_train?.state === "bounced") {
+          const findings = this.recoveredPrFindings(id, currentMeta);
+          if (findings) {
+            meta.merge_train = { ...meta.merge_train, state: "unbound" };
+            nextBodyMd = `${nextBodyMd}\n\n### Independent review ${findings.id}\n\n${findings.summary}`;
+            this.version(id, "system:recovery", "review_repair_dispatched",
+              "Current independent review returned the recovered PR to implementation", { review: findings.id });
+          }
+        }
         if (credential && tagsSayGateway(parseTags(credential.tags))) {
           const observation = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id=?`, String(body.token_id));
           const capacity = gatewayCapacity(ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)));
@@ -15320,7 +15361,7 @@ export class KnowledgeHub {
           || (meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis.hold === hold)
           || (hold === "retry_budget" && recoveryPermitCoversAttempt(state, Date.now()))
           || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
-          || this.protectedExecution(id, meta) || todoDispatchHold(meta)) continue;
+          || this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta)) continue;
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
         const fresh = this.executionState(id);
         if (fresh?.generation !== state.generation || executionAdmissionHold(fresh, String(meta.work_revision ?? "legacy")) !== hold
@@ -17420,7 +17461,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
   private async reconcileSpawnVerify(repo: string, pr: number, parentId: string, actor: string, now: number): Promise<string | null> {
     if (!this.reconcileClaimDuty(repo, pr, "verify", now)) return null;
-    const parent = this.one(`SELECT id, title, meta, tags FROM artefacts WHERE id = ?`, parentId) as any;
+    const parent = this.one(`SELECT id, title, meta, tags, project FROM artefacts WHERE id = ?`, parentId) as any;
     if (!parent) return null;
     const pm = JSON.parse(parent.meta ?? "{}");
     const rootTitle = String(parent.title ?? `PR #${pr}`).replace(/^(?:Verify:\s*)+/, "");
@@ -17443,6 +17484,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // review acceptance).
         meta: { machine_duty: { by: "reconcile", kind: "verify", subject: parentId, pr: `${repo}#${pr}` } },
         roles: ["review"],
+        project: parent.project,
       },
       actor,
     );
@@ -17567,9 +17609,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const recoveryLive = recovery && !rm.execution_blockers?.length && (recovery.status === "in_progress" ? this.strandOwnerLive(recovery.owner, rm, 10) : ["todo", "in_review"].includes(String(recovery.status)) && now - Number(recovery.updated_ts) < cfg.disposition_age_h * 3_600_000);
         const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
         const held = hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > now;
+        const needsImplementation = row.status === "todo" && !verifying && !recoveryLive &&
+          meta.merge_train?.repo === repo && Number(meta.merge_train?.pr) === leg.number && !!this.recoveredPrFindings(String(row.id), meta);
         bindings.push({
-          repairAccepted: !queued && !verifying && !recoveryLive && this.acceptedQueueRepair(row, repo, leg.number),
-          progress: queued ? "queued" : verifying ? "verifying" : recoveryLive || (row.status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10)) ? "repairing" : held ? "held" : "stranded",
+          repairAccepted: !queued && !verifying && !recoveryLive && !needsImplementation && this.acceptedQueueRepair(row, repo, leg.number),
+          progress: queued ? "queued" : verifying ? "verifying" : needsImplementation || recoveryLive || (row.status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10)) ? "repairing" : held ? "held" : "stranded",
           card: String(row.id),
           status: String(row.status),
           pr: leg.number,
