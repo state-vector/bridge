@@ -245,7 +245,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
-import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta } from "./recovery-capacity.ts";
+import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta, trainReviewParentJoin } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
@@ -3402,6 +3402,7 @@ export class KnowledgeHub {
         detail TEXT -- JSON: reason, carry record, verdict citations
       );
       CREATE INDEX IF NOT EXISTS idx_train_events_lane ON train_events (repo, base, seq);
+      CREATE INDEX IF NOT EXISTS idx_train_events_task_pr ON train_events (task_id, repo, pr, kind);
       -- BR#6012 canonical lane operational state machine table: one row per
       -- (repo, base) lane, updated atomically on every lease/event/CI/queue_facts
       -- mutation so lane state is never split-brained across partial JSON writes.
@@ -5269,9 +5270,10 @@ export class KnowledgeHub {
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
     const rows = this.state.storage.sql.exec(
       `SELECT a.id,a.title,a.body_md,a.project,a.meta,a.roles,a.tags,a.updated_ts,a.created_ts,
-        MAX(COALESCE(repair.created_ts, a.created_ts), COALESCE(repair_turn.last_reserved_at, 0),
+        MAX(COALESCE(repair.created_ts, delivery.created_ts, a.created_ts), COALESCE(repair_turn.last_reserved_at, 0),
             COALESCE(q.last_reserved_at, 0)) AS queue_ts,
-        COALESCE(repair.id, a.id) AS queue_id,
+        COALESCE(repair.id, delivery.id, a.id) AS queue_id,
+        delivery.id IS NOT NULL AS train_review, delivery.meta AS train_parent_meta,
         q.task_id IS NOT NULL AS reserved_before
         FROM artefacts a LEFT JOIN dispatch_queue_turns q ON q.task_id=a.id
         LEFT JOIN artefacts repair ON repair.id=json_extract(a.meta,'$.execution_review_of')
@@ -5281,7 +5283,8 @@ export class KnowledgeHub {
           AND a.roles='["review"]'
           AND (json_extract(repair.meta,'$.verify_round.duty')=a.id OR EXISTS (
             SELECT 1 FROM relations WHERE src_id=a.id AND dst_id=repair.id AND relation='child_of'))
-        LEFT JOIN dispatch_queue_turns repair_turn ON repair_turn.task_id=repair.id
+        ${trainReviewParentJoin}
+        LEFT JOIN dispatch_queue_turns repair_turn ON repair_turn.task_id=COALESCE(repair.id, delivery.id)
         WHERE a.type='task' AND a.status='todo' AND a.owner=''` + filter,
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
@@ -5338,8 +5341,10 @@ export class KnowledgeHub {
       return true;
     }));
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
+    const boost = (row: (typeof rows)[number]) => Math.max(schedulingBoost(JSON.parse(String(row.meta ?? "{}"))),
+      row.reserved_before ? 0 : schedulingBoost(JSON.parse(String(row.train_parent_meta ?? "{}"))));
     eligible.sort((a, b) => rank(a) - rank(b)
-      || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
+      || boost(b) - boost(a)
       // Independent recovery review continues the repair's queue position.
       // A failed reservation moves the review itself to the back of its class.
       || Number(a.queue_ts) - Number(b.queue_ts) || Number(a.reserved_before) - Number(b.reserved_before)
@@ -7682,6 +7687,7 @@ export class KnowledgeHub {
     }
     // ---- execute the effects the executor decided (do.ts never decides) ----
     let verifyTaskId: string | undefined;
+    let registerReview = false;
     for (const fx of verdict.effects) {
       switch (fx.kind) {
         case "spawn_verify": {
@@ -7740,6 +7746,7 @@ export class KnowledgeHub {
             actor,
           );
           verifyTaskId = created.id;
+          registerReview = true;
           if (fx.detached) {
             // BR#6518: depth-capped subject — the duty rides DETACHED: no
             // child_of edge (this insert would otherwise be the BR#532 cap's
@@ -7760,6 +7767,8 @@ export class KnowledgeHub {
         }
         case "reuse_verify": {
           verifyTaskId = fx.verify;
+          registerReview = !!this.one(`SELECT 1 FROM ledger WHERE artefact_id=? AND kind='mutation'
+            AND action='review_registered' AND json_extract(data,'$.task_id')=? LIMIT 1`, fx.verify, id);
           this.audit("system:separation", "verify_reused", id, { verify: fx.verify });
           break;
         }
@@ -7918,6 +7927,9 @@ export class KnowledgeHub {
       }
     }
     // replay consistency: fold the version log forward and compare with the
+    if (verifyTaskId && registerReview) this.version(verifyTaskId, "system:review", "review_registered", "Independent review registered for this submission", {
+      task_id: id, subject_revision: String(meta.work_revision ?? "legacy"),
+    });
     // stored state — fold(events) != stored_state is itself a breach
     // (BR#2419 item 6).
     try { await this.replayCheck(id); } catch { /* fail-soft: the log fold never blocks a legal write */ }
@@ -12893,7 +12905,7 @@ export class KnowledgeHub {
             actor,
           );
         }
-        ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, escalated: true, ...(escAskId ? { ask_id: escAskId } : {}) }, taskId);
+        ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, bounced_at: now2, escalated: true, ...(escAskId ? { ask_id: escAskId } : {}) }, taskId);
         const escReason = this.laneSyncReason(lane.id, meta, now);
         this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (${bounceKind}) #${bounceNo} — BOUNCE BUDGET EXCEEDED: de-queued, escalation ask ${escAskId ?? "(deduped)"}; the train stops re-serving until an owner acts (BR#4688, disposition per BR#3312)`, { reason: escReason });
         return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: bounceKind, conflict_files: conflictFiles, reason: defect, escalated: true, bounce_no: bounceNo, ask: escAskId };
@@ -12907,7 +12919,7 @@ export class KnowledgeHub {
       const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
       meta.currently = inFlightBounced ? null : meta.currently;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo }, taskId);
+      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, bounced_at: now2 }, taskId);
       const laneNote =
         baseRedNames
           ? `PR #${pr} bounced (gate, base-red) — MAIN is red; the PR is fine and held until it clears (the fix rides the base-red card/ask), then re-queue at the back`

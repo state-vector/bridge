@@ -802,6 +802,46 @@ describe("priority line recovery capacity", () => {
     expect(failed.kind).toBe("released");
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: later });
   });
+  it.each(["registered", "caller-linked"] as const)("uses train priority only for a %s review", async (source) => {
+    const project = "train-review-dispatch";
+    const repo = "state-vector/bridge", pr = 6997, head = "b".repeat(40);
+    const train = "train-review-gateway";
+    expect((await post("train.lease", { repo, actor: train, action: "acquire" })).error).toBeUndefined();
+    const g = await gateway(project, 3);
+    const parent = await task(project, {
+      pr: { repo, number: pr, head_sha_at_acceptance: head },
+      merge_train: { state: "unbound", repo, pr, bounced_at: Date.now() },
+    });
+    expect((await post("train.event", { repo, actor: train, kind: "bounced", pr, task_id: parent,
+      head_sha: head, bounce_kind: "gate", reason: "Candidate tests required a repair" })).error).toBeUndefined();
+    expect((await post("transition", { id: parent, to: "in_progress", actor: "train-repairer", session: "train-repairer" })).error).toBeUndefined();
+    const later = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const linkUnrelated = async () => {
+      const review = await post("create", { type: "task", title: "Standalone review", project, roles: ["review"], meta: { execution_review_of: parent } });
+      expect((await post("link", { src: review.id, relation: "child_of", dst: parent })).error).toBeUndefined();
+      return review.id;
+    };
+    const callerLinked = source === "caller-linked" ? await linkUnrelated() : null;
+    const submitted = await post("transition", { id: parent, to: "in_review", actor: "train-repairer", session: "train-repairer",
+      note: `PR https://github.com/${repo}/pull/${pr} — repaired at ${head}` });
+    expect(submitted.error).toBeUndefined();
+    expect(submitted.verify_task).toBeTruthy();
+    if (callerLinked) {
+      expect(submitted.verify_task).toBe(callerLinked);
+      expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: later });
+      return;
+    }
+    const unrelated = await linkUnrelated();
+    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].candidates.slice(0, 3)).toEqual([submitted.verify_task, later, unrelated]);
+    const review = await reserve(g);
+    if (review.kind !== "reserved") throw new Error("train review was not reserved");
+    expect(review.task_id).toBe(submitted.verify_task);
+    expect((await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true },
+      "train-review-cancelled", review.task_id, review.session)).kind).toBe("released");
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: later });
+  });
+
   it("does not accept caller-assigned recovery review priority", async () => {
     const project = "repair-review-authority";
     const ordinary = await task(project);

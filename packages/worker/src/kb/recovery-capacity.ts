@@ -1,8 +1,39 @@
 import { ExecutionStateSchema, RecoveryPreemptionSchema, reduceExecution, type RecoveryPreemption } from "@bridge/contracts";
 import { isRootFixCard, parseTags } from "./core";
 
-interface Task { id: string; meta: string; tags: string; roles: string }
-export const priorityTask = (row: Record<string, unknown>): Task => ({ id: String(row.id), meta: String(row.meta ?? "{}"), tags: String(row.tags ?? "[]"), roles: String(row.roles ?? "[]") });
+interface Task { id: string; meta: string; tags: string; roles: string; trainReview: boolean }
+export const priorityTask = (row: Record<string, unknown>): Task => ({
+  id: String(row.id), meta: String(row.meta ?? "{}"), tags: String(row.tags ?? "[]"),
+  roles: String(row.roles ?? "[]"), trainReview: row.train_review === 1,
+});
+
+// An exact server-bound review of a recovered train delivery continues its
+// parent's work. Use the same authority join for selection and preemption.
+export const trainReviewParentJoin = `LEFT JOIN artefacts delivery ON delivery.id=json_extract(a.meta,'$.execution_review_of')
+  AND delivery.type='task' AND delivery.status='in_review' AND a.roles='["review"]'
+  AND json_extract(delivery.meta,'$.merge_train.state') IN ('bounced','unbound')
+  AND json_extract(delivery.meta,'$.merge_train.bounced_at')>0
+  AND CAST(json_extract(delivery.meta,'$.merge_train.pr') AS INTEGER)>0
+  AND (json_type(a.meta,'$.review_subject') IS NULL OR (
+    json_extract(a.meta,'$.review_subject.task_id')=delivery.id
+    AND json_extract(a.meta,'$.review_subject.revision')=COALESCE(json_extract(delivery.meta,'$.work_revision'),'legacy')))
+  AND EXISTS (SELECT 1 FROM train_events tr WHERE tr.task_id=delivery.id
+    AND tr.repo=json_extract(delivery.meta,'$.merge_train.repo') AND tr.pr=json_extract(delivery.meta,'$.merge_train.pr')
+    AND ((tr.kind='bounced' AND json_extract(tr.detail,'$.bounced_at')=json_extract(delivery.meta,'$.merge_train.bounced_at'))
+      OR (tr.kind='landed' AND json_extract(tr.detail,'$.close_bounced')=1
+        AND tr.merge_sha=json_extract(delivery.meta,'$.merge_train.landed_merge_sha')))
+    AND (EXISTS (SELECT 1 FROM ledger WHERE artefact_id=a.id AND kind='mutation' AND action='review_registered'
+      AND json_extract(data,'$.task_id')=delivery.id
+      AND json_extract(data,'$.subject_revision')=COALESCE(json_extract(delivery.meta,'$.work_revision'),'legacy'))
+      OR (tr.kind='landed' AND EXISTS (SELECT 1 FROM ledger WHERE artefact_id=delivery.id AND kind='signal'
+        AND action='observed_merge_review_submitted' AND ts>=delivery.status_ts
+        AND json_extract(data,'$.review')=a.id AND json_extract(data,'$.repo')=tr.repo
+        AND json_extract(data,'$.pr')=tr.pr AND json_extract(data,'$.merge_sha')=tr.merge_sha)))
+    AND (EXISTS (SELECT 1 FROM json_each(delivery.meta,'$.prs') AS leg
+      WHERE CASE WHEN leg.type='object' THEN json_extract(leg.value,'$.repo')=tr.repo
+        AND json_extract(leg.value,'$.number')=tr.pr AND COALESCE(json_extract(leg.value,'$.base'),'main')=tr.base ELSE 0 END)
+      OR (json_extract(delivery.meta,'$.pr.repo')=tr.repo AND json_extract(delivery.meta,'$.pr.number')=tr.pr
+        AND COALESCE(json_extract(delivery.meta,'$.pr.base'),'main')=tr.base)))`;
 type Meta = Record<string, unknown>;
 const object = (v: unknown): Meta => typeof v === "object" && v !== null && !Array.isArray(v) ? v as Meta : {};
 
@@ -16,7 +47,7 @@ export function schedulingRank(meta: Meta, tags: string[], roles: string[]): num
   if (meta.boosted) return 3;
   return roles.includes("review") || roles.includes("unblock") ? 4 : 5;
 }
-export const taskSchedulingRank = (task: Task) => schedulingRank(JSON.parse(task.meta || "{}"), parseTags(task.tags), parseTags(task.roles));
+export const taskSchedulingRank = (task: Task) => task.trainReview ? 0 : schedulingRank(JSON.parse(task.meta || "{}"), parseTags(task.tags), parseTags(task.roles));
 
 /** Human urgency breaks ties WITHIN a class, never displacing concrete repair
  * with routine verification. Otherwise a freshly diagnosed line fix sits
@@ -77,12 +108,14 @@ export class RecoveryCapacity {
     if (prior) return prior;
     if (taskSchedulingRank(recovery) > 1) return null;
     const now = Date.now();
-    const victims = this.sql.exec(`SELECT a.id,a.meta,a.tags,a.roles,e.state FROM artefacts a JOIN execution_state e ON e.task_id=a.id
+    const victims = this.sql.exec(`SELECT a.id,a.meta,a.tags,a.roles,e.state,delivery.id IS NOT NULL AS train_review
+      FROM artefacts a JOIN execution_state e ON e.task_id=a.id
+      ${trainReviewParentJoin}
       WHERE a.type='task' AND a.status='in_progress' AND json_extract(e.state,'$.attempt.host')=?
       AND json_extract(e.state,'$.attempt.phase')='running' ORDER BY a.updated_ts DESC`, host).toArray();
     for (const row of victims) {
       const id = String(row.id), meta: Meta = JSON.parse(String(row.meta));
-      if (!parseTags(row.roles).includes("review") || schedulingRank(meta, parseTags(row.tags), parseTags(row.roles)) <= 1
+      if (!parseTags(row.roles).includes("review") || taskSchedulingRank(priorityTask(row)) <= 1
         || meta.interactive_execution || meta.operator_gated || this.protectedTask(id, meta)) continue;
       const parents = this.sql.exec(`SELECT p.meta,p.tags,p.roles FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=? AND r.relation='child_of'`, id).toArray();
       if (typeof meta.execution_review_of === "string") parents.push(...this.sql.exec(`SELECT meta,tags,roles FROM artefacts WHERE id=?`, meta.execution_review_of).toArray());
