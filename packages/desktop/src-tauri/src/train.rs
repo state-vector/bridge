@@ -60,6 +60,7 @@ const SESSION: &str = "merge-train-executor";
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const SCAN_BUDGET: Duration = Duration::from_secs(30);
 const CARD_READ_BUDGET: Duration = Duration::from_secs(10);
+const FINAL_CARD_READ_BUDGET: Duration = Duration::from_secs(30);
 const CARD_FIRST_ATTEMPT: Duration = Duration::from_secs(4);
 const SCAN_MAX_ENTRIES: usize = 32;
 
@@ -226,6 +227,12 @@ struct PrCommit {
     sha: String,
     verified: bool,
     login: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum McpRead {
+    Normal,
+    FinalCandidate,
 }
 
 struct Ctx {
@@ -460,6 +467,10 @@ impl Ctx {
 
     /// MCP over the hub's /mcp — the same JSON-RPC surface the agents use.
     fn mcp(&mut self, name: &str, args_body: Value) -> Result<Value, String> {
+        self.mcp_request(name, args_body, McpRead::Normal)
+    }
+
+    fn mcp_request(&mut self, name: &str, args_body: Value, read: McpRead) -> Result<Value, String> {
         self.rpc_id += 1;
         let mut arguments = args_body;
         if let Value::Object(map) = &mut arguments {
@@ -469,14 +480,19 @@ impl Ctx {
             if name == "get_artefact" { map.insert("view".into(), json!("execution")); }
         }
         let card_read = name == "get_artefact";
-        let timeout = self.operation_budget(if card_read { CARD_READ_BUDGET } else { RPC_TIMEOUT })?;
+        let maximum = match read {
+            McpRead::FinalCandidate => FINAL_CARD_READ_BUDGET,
+            McpRead::Normal if card_read => CARD_READ_BUDGET,
+            McpRead::Normal => RPC_TIMEOUT,
+        };
+        let timeout = self.operation_budget(maximum)?;
         let deadline = Instant::now() + timeout;
         let request = self.http
             .post(format!("{}/mcp", self.hub))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.token))
             .json(&json!({ "jsonrpc": "2.0", "id": self.rpc_id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }));
-        let result = if card_read && timeout > CARD_FIRST_ATTEMPT {
+        let result = if read == McpRead::Normal && card_read && timeout > CARD_FIRST_ATTEMPT {
             // The canonical card read has no effects. Retry one transport
             // failure within the original deadline, using the same request.
             let first = request.try_clone().expect("JSON request body is replayable")
@@ -2094,7 +2110,9 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
     use crate::train_gate::{classify_candidate_gate_phase, classify_head_checks, CandidateGatePhase};
     use BatchCandidateReadiness::{Deferred, Ready, Recomputing};
 
-    let card = ctx.mcp("get_artefact", json!({ "id": cand.head_id }))?;
+    // The short queue scan can defer an individual card. At the write
+    // boundary, allow one complete fresh read within the member deadline.
+    let card = ctx.mcp_request("get_artefact", json!({ "id": cand.head_id }), McpRead::FinalCandidate)?;
     let meta = card.get("meta").cloned().unwrap_or(json!({}));
     let legs = train_legs(&meta);
     let Some((index, _)) = legs.iter().enumerate().find(|(_, leg)| leg.repo == repo
@@ -6843,6 +6861,21 @@ mod tests {
         let mut ctx = test_ctx(&hub);
         assert_eq!(ctx.mcp("get_artefact", json!({ "id": "BR#1" })).unwrap(), expected);
         assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn final_candidate_read_does_not_restart_a_slow_success() {
+        let card = card_without_lane_legs();
+        let expected = card.clone();
+        let (hub, calls) = mock_hub_with(move |_| {
+            std::thread::sleep(CARD_FIRST_ATTEMPT + Duration::from_millis(100));
+            ok(card.clone())
+        });
+        let mut ctx = test_ctx(&hub);
+        assert_eq!(ctx.mcp_request("get_artefact", json!({ "id": "BR#1" }), McpRead::FinalCandidate).unwrap(), expected);
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(call_args(&recorded[0])["view"], "execution");
     }
 
     #[test]

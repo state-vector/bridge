@@ -3397,6 +3397,7 @@ export class KnowledgeHub {
         review_id TEXT PRIMARY KEY,
         record TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_delivery_admissions_task ON delivery_admissions (json_extract(record,'$.task_id'));
       CREATE TABLE IF NOT EXISTS delivery_review_backfill (
         review_id TEXT PRIMARY KEY, status_ts INTEGER NOT NULL
       );
