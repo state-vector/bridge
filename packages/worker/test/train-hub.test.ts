@@ -4172,6 +4172,12 @@ describe("BR#5151: train:merged dedupe — a PR merges exactly once", () => {
     });
     expect((await kbJson("/train.event", { ...event, task_id: needsRepair })).body).toMatchObject({ deduped: true });
     expect((await laneSnap(repo)).currently).toEqual(before);
+    const automatic = await queueViaAccept({ repo, pr: 428, head });
+    expect((await kbJson("/admin.alarm_sweep")).status).toBe(200);
+    expect((await kbJson("/get", { id: automatic })).body).toMatchObject({
+      status: "done", meta: { merge_train: { state: "landed", merge_sha: merge } },
+    });
+    expect((await laneSnap(repo)).currently).toEqual(before);
     const history = (await kbJson("/train.history", { repo })).body.events;
     expect(history.filter((e: any) => e.pr === 428 && e.kind === "merged")).toHaveLength(1);
     expect(history.filter((e: any) => e.pr === 428 && e.kind === "landed")).toHaveLength(1);

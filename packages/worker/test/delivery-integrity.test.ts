@@ -185,6 +185,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
 
   it("admits a fresh verdict immediately past held historical acceptances", async () => {
     const held: string[] = [];
+    let typedWait = "";
     let fresh = "";
     for (let i = 0; i < 14; i++) {
       const number = 1000 + i;
@@ -192,7 +193,10 @@ describe("delivery responsibility (real SQLite hub)", () => {
       await call("transition", { id, to: "in_progress", actor: "bulk-impl", session: `impl-${number}` });
       const submitted = await call("transition", { id, to: "in_review", actor: "bulk-impl", session: `impl-${number}`, note: `PR https://github.com/${repo}/pull/${number}` });
       expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
-      if (i < 13) {
+      if (i === 12) {
+        typedWait = id;
+        await call("transition", { id, to: "blocked", actor: "bulk-impl", session: `impl-${number}`, note: "Recovery handed delivery back to the train", await_event: { event: "pr_merged", repo, n: number } });
+      } else if (i < 13) {
         held.push(id);
         await call("transition", { id, to: "blocked", actor: "bulk-impl", session: `impl-${number}`, note: "Independent dependency hold", await_event: { event: "time", until_ts: Date.now() + 86_400_000 } });
       } else {
@@ -204,6 +208,7 @@ describe("delivery responsibility (real SQLite hub)", () => {
       const accepted = await call("transition", { id: review, to: "done", actor: "bulk-reviewer", session: `review-${number}`, note: `Verified https://github.com/${repo}/pull/${number} head ${head}`, review_result: await resultFor(review, { kind: "accepted_pr", task_id: id, legs: [{ repo, number, head_sha_at_acceptance: head }] }) });
       expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     }
+    expect((await get(typedWait)).meta.merge_train?.state).toBe("queued");
     const admitted = await get(fresh);
     expect(admitted.meta.merge_train.state).toBe("queued");
     expect(admitted.delivery_admissions).toEqual(expect.arrayContaining([expect.objectContaining({ state: expect.objectContaining({ phase: "admitted" }) })]));
