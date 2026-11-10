@@ -1898,6 +1898,10 @@ export class KnowledgeHub {
         `UPDATE proxy_probes SET state = 'verified', ok = 1, receipt = ?, head_sha = ?, conclusion = ?, error = NULL, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
         receipt.slice(0, 500), headSha || null, conclusion || null, now, key,
       );
+      if (probe.kind === "pr_merged" && conclusion === "MERGED" && /^[0-9a-f]{40}$/.test(headSha)
+        && receipt === `https://github.com/${probe.repo}/pull/${probe.pr}`) {
+        this.recordDeliveryPrOutcome(String(probe.repo), Number(probe.pr), "MERGED", null, now);
+      }
       const note = `proxy_verified: ${probe.kind} SATISFIED — ${receipt}${headSha ? ` (head ${headSha.slice(0, 9)})` : ""} (worker-executor ${actor}, BR#4658)`;
       this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 1, receipt: receipt.slice(0, 300), head_sha: headSha || null });
       this.audit("hub:proxy-watch", "proxy_probe_verified", key, { card: probe.card_id, receipt: receipt.slice(0, 300), head_sha: headSha || null });
@@ -14491,6 +14495,12 @@ export class KnowledgeHub {
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
     const metaById = new Map<string, any>(cards.map((c) => [c.id, JSON.parse(c.meta ?? "{}")]));
+    const observedMerges = new Set(this.state.storage.sql.exec(
+      `SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND state='MERGED'
+       UNION SELECT pr FROM proxy_probes WHERE repo=? AND kind='pr_merged' AND state='verified' AND ok=1
+         AND conclusion='MERGED' AND length(head_sha)=40 AND head_sha NOT GLOB '*[^0-9a-f]*'
+         AND receipt='https://github.com/' || repo || '/pull/' || pr`, repo, repo,
+    ).toArray().map(row => Number(row.pr)));
     const entries = mergeTrainQueue(
       cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}"), tags: parseTags(c.tags) })),
     ).filter((c) => {
@@ -14501,7 +14511,9 @@ export class KnowledgeHub {
       // card matched every lane); BR#4977 adds the base half — repo alone
       // let a second base's lane (e.g. a retired drill base) inherit the
       // whole repo queue
-      return cm && trainCardMatchesLane(JSON.parse(cm.meta ?? "{}"), repo, base);
+      // A merge can leave an unrelated dependency or delivery review open.
+      // Keep the task and its wait, while removing its stale train slot.
+      return !!cm && trainLegsRemaining(metaById.get(c.id), repo, base).some(leg => !observedMerges.has(leg.number));
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
@@ -17416,6 +17428,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     );
   }
 
+  private recordDeliveryPrOutcome(repo: string, pr: number, state: "OPEN" | "CLOSED" | "MERGED", head: string | null, now: number): void {
+    this.state.storage.sql.exec(`
+      INSERT INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(repo,pr) DO UPDATE SET state=excluded.state, head=coalesce(excluded.head, delivery_pr_outcomes.head),
+        receipt=excluded.receipt, observed_at=excluded.observed_at
+      WHERE delivery_pr_outcomes.state <> 'MERGED' OR excluded.state = 'MERGED'`,
+      repo, pr, state, head, `https://github.com/${repo}/pull/${pr}`, now);
+  }
+
   /** reconcile.report — one daemon observation cycle for one repo. Runs the
    *  pure join (reconcile.ts), APPLIES every judgement (spawns, clock
    *  updates, provenance closes, alarm), records the accounting line, and
@@ -17429,8 +17450,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const cfg = this.reconcileSettings();
     for (const p of prs) {
       const state = String(p.state ?? "OPEN").toUpperCase();
-      if (!["OPEN", "CLOSED", "MERGED"].includes(state)) continue;
-      this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at) VALUES(?,?,?,?,?,?)`, repo, p.number, state, p.headRefOid, `https://github.com/${repo}/pull/${p.number}`, now);
+      if (state !== "OPEN" && state !== "CLOSED" && state !== "MERGED") continue;
+      if (state === "MERGED" && !/^[0-9a-f]{40}$/i.test(p.mergeCommit ?? "")) continue;
+      this.recordDeliveryPrOutcome(repo, p.number, state, p.headRefOid, now);
     }
     // Comments/head updates cannot renew review/draft grace forever. The
     // hub's own first-observation clock bounds even malformed timestamps.
@@ -17504,6 +17526,18 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           lane: isStandingCard(meta, parseTags(row.tags)),
         });
       }
+    }
+
+    // The bounded merged feed can miss old PR numbers. Absence only
+    // schedules an exact GitHub read in the existing gateway probe loop.
+    const alreadyTerminal = new Set(this.state.storage.sql.exec(
+      `SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND state IN ('MERGED','CLOSED')`, repo,
+    ).toArray().map(row => Number(row.pr)));
+    for (const binding of bindings) {
+      if (!binding.missing || binding.lane || binding.provenance || alreadyTerminal.has(binding.pr)) continue;
+      alreadyTerminal.add(binding.pr);
+      const atom = awaitEventToAtom({ event: "pr_merged", repo, n: binding.pr });
+      if (atom) this.enqueueProxyProbe(atom, binding.card, now);
     }
 
     // ---- duty ledger, with each duty card's LIVE status ----

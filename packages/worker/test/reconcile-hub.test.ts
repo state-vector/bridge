@@ -180,7 +180,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     const lane = async () => (await kbJson("/train.status", { repo })).body.lanes.find((l: { lane: string }) => l.lane === repo + "@main");
     await report(repo, [prRow(number)]);
     expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 1 });
-    await report(repo, [prRow(number, { state: "MERGED", mergeCommit: { oid: "b".repeat(40) } })]);
+    await report(repo, [prRow(number, { state: "MERGED", mergeCommit: "b".repeat(40) })]);
     expect((await lane()).pr_stats).toMatchObject({ verifying: 0, waiting: 0 });
     expect((await kbJson("/get", { id: parent })).body.status).toBe("in_review");
   });

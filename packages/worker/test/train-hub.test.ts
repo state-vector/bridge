@@ -415,6 +415,30 @@ describe("BR#6776 durable check recovery", () => {
     expect(recovery.meta.machine_duty).toMatchObject({ kind: "line_recovery", subject: snap.card });
     expect(recovery.tags).toContain("p0");
   });
+  it("drops a confirmed merged leg from the train while retaining its independent wait", async () => {
+    const repo = "state-vector/terminal-train-slot", actor = "gw-terminal", head = "a".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 1, head });
+    await acquire(repo, actor);
+    const dependency = (await kbJson("/create", { type: "task", title: "Independent follow-up" })).body.id;
+    const original = (await kbJson("/get", { id })).body;
+    const wait = { event: "br_done", id: dependency };
+    const parked = await kbJson("/update", { id, meta: { blocked: { ...original.meta.blocked, await_event: wait } } });
+    expect(parked.body.error).toBeUndefined();
+    expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).toContain(1);
+    await kbJson("/reconcile.report", { repo, actor, prs: [{ number: 1, state: "MERGED" }] });
+    expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).toContain(1);
+    await kbJson("/reconcile.report", { repo, actor, prs: [] });
+    expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).toContain(1);
+    const probe = (await kbJson("/proxy.probes", { limit: 25 })).body.probes
+      .find((p: { repo: string; pr: number }) => p.repo === repo && p.pr === 1);
+    expect(probe).toBeTruthy();
+    expect((await kbJson("/proxy.verify", { actor, key: probe.key, ok: true, conclusion: "MERGED",
+      head_sha: "b".repeat(40), receipt: `https://github.com/${repo}/pull/1` })).body.ok).toBe(true);
+    await kbJson("/reconcile.report", { repo, actor, prs: [{ number: 1, state: "OPEN", headRefOid: head }] });
+    expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).not.toContain(1);
+    expect((await kbJson("/get", { id })).body.meta.blocked.await_event).toEqual(wait);
+  });
+
   it("reserves one retry per head/obligation across lease takeover, including unknown effects", async () => {
     const repo = "state-vector/retry-6776", actor = "gw-retry6776", head = "a".repeat(40);
     const id = await queueViaAccept({ repo, pr: 1, head });

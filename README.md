@@ -1468,7 +1468,7 @@ solid if waiting to be"):
    those are lane holds, not loss of PR readiness. An explicit `needs-review`
    (invalidated acceptance) is orange solid; `conflict`/`blocked` and a queued
    car skipped after a bounce-free walk count as in progress. Per-PR facts
-   classify each leg separately when a task carries multiple PRs.
+   classify each leg separately when a task carries multiple PRs. Confirmed GitHub merges leave the queue even when delivery review or another task dependency remains open. The reconciler schedules exact GitHub probes for older tracked PRs missing from its inventory.
 2. **Sequential merge batches (`Batch 1 | Batch 2 | …`)**: `partitionMergeBatches`
    orders candidates by readiness state first (`ready` → `verifying` → `waiting` —
    the train is NOT FIFO: ready PRs merge immediately in Batch 1 without waiting on
