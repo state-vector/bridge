@@ -234,7 +234,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -11817,7 +11817,17 @@ export class KnowledgeHub {
     // it; a stale one ages out client-side against the 5-min lease TTL).
     const progNote = typeof (body.progress ?? {})?.progress === "string" ? String(body.progress.progress).slice(0, 200) : "";
     if (action === "renew" && progNote) {
-      meta.lane = { ...meta.lane, now_action: { note: progNote, holder, at: now } };
+      const preparation = TrainBranchPreparationSchema.safeParse(body.progress?.preparation);
+      if (preparation.success && preparation.data.phase === "updating") {
+        const { pr, head_sha } = preparation.data;
+        const stored = TrainBranchUpdateFenceSchema.safeParse(meta.lane.branch_updates ?? {});
+        const fences = Object.fromEntries(Object.entries(stored.success ? stored.data : {}).filter(([, fence]) => fence.expires_at > now));
+        if (fences[pr]?.head_sha === head_sha) throw new Error(`Branch update for PR #${pr} is still awaiting readback`);
+        fences[pr] = { head_sha, expires_at: now + 120_000 };
+        meta.lane.branch_updates = fences;
+      }
+      meta.lane.now_action = { note: progNote, holder, at: now,
+        ...(preparation.success ? { preparation: preparation.data } : {}) };
     }
     // acquisition carries the executor's lane config (required workflows —
     // config, never hardcoded); release clears the stop when the line is green again.
@@ -13946,7 +13956,15 @@ export class KnowledgeHub {
       const subject = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=? AND type='task'`, String(entry.id));
       if (!subject || ["done", "superseded", "in_review"].includes(String(subject.status))) continue;
       const sm = JSON.parse(String(subject.meta ?? "{}"));
-      if (mergePhaseOf(sm) !== "queued" || this.enrichFixCardRow(String(entry.id))?.active_agent) continue;
+      const phase = mergePhaseOf(sm);
+      const readiness = TrainCarReadinessSchema.safeParse(entry.readiness);
+      const leg = trainLegs(sm).find(candidate => candidate.repo === repo && candidate.number === Number(entry.pr)
+        && (candidate.base ?? "main") === base);
+      const resolvedConflict = phase === "conflicting" && readiness.success && !!leg
+        && readiness.data.base_sha === (baseState ?? preservedQf.base_state)?.tip_sha
+        && readiness.data.head_sha === evidence.data.head_sha
+        && trainCarryChainEnd(leg) === evidence.data.head_sha;
+      if ((phase !== "queued" && !resolvedConflict) || this.enrichFixCardRow(String(entry.id))?.active_agent) continue;
       if (!prTargetsOf({ meta: sm }).some(p => p.repo === repo && p.number === Number(entry.pr))) continue;
       const duty = checkRecovery.candidateDuty(String(entry.id), evidence.data.head_sha)
         ?? await this.ensureTaskRecovery(String(entry.id), "head_checks");
@@ -16599,7 +16617,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           const vKids = this.state.storage.sql.exec(
             `SELECT a.id AS id, a.status AS status, a.body_md AS body_md, a.meta AS meta, a.updated_ts AS updated_ts
              FROM relations rel JOIN artefacts a ON a.id = rel.src_id
-             WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task'
+             WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task' AND a.roles LIKE '%"review"%'
              ORDER BY a.created_ts DESC`,
             cid,
           ).toArray() as any[];
@@ -17091,6 +17109,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // executor is doing right now, verbatim from its own tick log; the
         // panel renders it as the NOW line and ages it out at the lease TTL
         now_action: meta.lane?.now_action ?? null,
+        branch_updates: meta.lane?.branch_updates ?? {},
         // 2026-11-02 + BR#5679: the answer-derived authorization stamps (askAnswer
         // writes them; the executor consumes + acks them). Omit when unset so
         // pre-BR#5679 Rust executors (`lane.get("rerun_failed").map(|_| true)`)

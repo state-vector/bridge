@@ -47,7 +47,7 @@ use crate::train_gate::{
     TRAIN_CI_BOUND_MULTIPLIER, TRAIN_CI_TYPICAL_MINUTES,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
@@ -222,9 +222,16 @@ impl CheckRunRead {
     }
 }
 
+struct PrCommit {
+    sha: String,
+    verified: bool,
+    login: String,
+}
+
 struct Ctx {
     /// Local time budget only; progress and merge authority live on the hub.
     operation_deadline: Option<Instant>,
+    preparation_scan: HashMap<String, QueueScan>,
     http: reqwest::blocking::Client,
     hub: String,
     token: String,
@@ -411,6 +418,7 @@ impl Ctx {
         let workdir_env = std::env::var("MERGE_TRAIN_WORKDIR").ok().filter(|s| !s.is_empty());
         Ok(Ctx {
             operation_deadline: None,
+            preparation_scan: HashMap::new(),
             http: reqwest::blocking::Client::builder().timeout(RPC_TIMEOUT).build().map_err(|e| e.to_string())?,
             hub: hub.trim_end_matches('/').to_string(),
             token,
@@ -712,7 +720,7 @@ impl Ctx {
             "--repo",
             repo,
             "--json",
-            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,mergedAt,baseRefName",
+            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,mergedAt,baseRefName,isDraft",
         ])?;
         let norm_mergeable = normalize_gh_mergeable(raw.get("mergeable").unwrap_or(&Value::Null));
         let norm_state = normalize_gh_merge_state(raw.get("mergeStateStatus").unwrap_or(&Value::Null));
@@ -854,38 +862,32 @@ impl Ctx {
         combined
     }
 
-    fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
-        // Slurp all REST pages atomically. Any failed or malformed page leaves
-        // no proof, so a partial response cannot certify a long PR.
+    fn pr_commit_rows(&self, repo: &str, n: i64) -> Vec<PrCommit> {
+        // Slurp all pages atomically. A malformed or partial reply cannot
+        // establish signatures or branch ownership.
         let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--paginate", "--slurp"]);
         let Ok(Value::Array(pages)) = out else { return vec![]; };
         let mut commits = Vec::new();
         for page in pages {
             let Value::Array(rows) = page else { return vec![]; };
             for row in rows {
-                let Some(sha) = row.get("sha").and_then(Value::as_str).filter(|sha| !sha.is_empty()) else { return vec![]; };
-                commits.push((sha.to_string(), row.pointer("/commit/verification/verified").and_then(Value::as_bool).unwrap_or(false)));
+                let Some(sha) = vstr(&row, "sha").filter(|sha| !sha.is_empty()) else { return vec![]; };
+                commits.push(PrCommit {
+                    sha: sha.into(),
+                    verified: row.pointer("/commit/verification/verified").and_then(Value::as_bool).unwrap_or(false),
+                    login: row.pointer("/author/login").and_then(Value::as_str).unwrap_or("").into(),
+                });
             }
         }
         commits
     }
 
-    /// BR#4687 (L1.2): branch provenance — the GitHub author LOGIN of every
-    /// commit on the PR head. The pulls API resolves the commit email to the
-    /// owning account (`author.login`; null when the email maps to no
-    /// account). Worker-authored = every commit's login on the worker
-    /// allowlist; anything else (a human's login, an unlinked email) fails
-    /// closed to human-owned — the train never machine-updates a branch it
-    /// cannot prove is its own fleet's.
+    fn pr_commits(&self, repo: &str, n: i64) -> Vec<(String, bool)> {
+        self.pr_commit_rows(repo, n).into_iter().map(|c| (c.sha, c.verified)).collect()
+    }
+
     fn pr_commit_logins(&self, repo: &str, n: i64) -> Vec<String> {
-        let out = self.gh_json(&["api", &format!("repos/{repo}/pulls/{n}/commits"), "--jq", "[.[] | {login: (.author.login // \"\")}]"]);
-        match out {
-            Ok(Value::Array(a)) => a
-                .iter()
-                .map(|c| c.get("login").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
-                .collect(),
-            _ => vec![],
-        }
+        self.pr_commit_rows(repo, n).into_iter().map(|c| c.login).collect()
     }
 
     /// Trial merge (plumbing, no worktree): {clean, files} for the bounce
@@ -902,32 +904,29 @@ impl Ctx {
     /// in the parsed files and ride the bounce brief as fake filenames.
     fn trial_merge(&self, base: &str, head_sha: &str) -> Result<(bool, Vec<String>), String> {
         self.sh("git", &["fetch", "--quiet", "origin", base])?;
-        for obj in [format!("origin/{base}"), head_sha.to_string()] {
-            let known = Command::new("git")
-                .args(["cat-file", "-e", &format!("{obj}^{{commit}}")])
-                .current_dir(&self.workdir)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !known {
+        self.trial_merge_at(&format!("origin/{base}"), head_sha)
+    }
+
+    fn trial_merge_at(&self, base_ref: &str, head_sha: &str) -> Result<(bool, Vec<String>), String> {
+        for obj in [base_ref, head_sha] {
+            if self.sh("git", &["cat-file", "-e", &format!("{obj}^{{commit}}")]).is_err() {
                 return Err(format!(
                     "trial merge aborted: {obj} is not a commit object in {} — fetch it explicitly first (BR#3935: merge-tree cannot be trusted to say so)",
                     self.workdir
                 ));
             }
         }
-        let out = Command::new("git")
-            .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", &format!("origin/{base}"), head_sha])
-            .current_dir(&self.workdir)
-            .output()
-            .map_err(|e| e.to_string())?;
+        let mut command = Command::new("git");
+        command.args(["merge-tree", "--write-tree", "--name-only", "--no-messages", base_ref, head_sha])
+            .current_dir(&self.workdir);
+        let out = train_command_output(command, self.operation_budget(SCAN_BUDGET)?)?;
         if out.status.success() {
             return Ok((true, vec![]));
         }
         if out.status.code() != Some(1) {
             return Err(format!(
                 "git merge-tree {} {} failed ({}) — not a conflict verdict, fail-closed: {}",
-                format!("origin/{base}"),
+                base_ref,
                 head_sha,
                 out.status,
                 trunc(String::from_utf8_lossy(&out.stderr).trim(), 300)
@@ -1037,7 +1036,28 @@ impl Ctx {
                 ));
             }
         }
-        // phase 3 — prove: run the range-diff, let the pure parser answer.
+        // range-diff omits merge commits. Prove the actual integration tree
+        // before carrying a review across a GitHub-generated branch update.
+        let parents = self.sh("git", &["show", "-s", "--format=%P", new_head])?;
+        let parents: Vec<_> = parents.split_whitespace().collect();
+        if let [first, second] = parents.as_slice() {
+            let base_parent = if *first == old_head { second } else if *second == old_head { first }
+                else { return Err("Updated merge does not include the reviewed head as a parent".into()); };
+            if !self.is_ancestor(base_parent, &base_sha)? {
+                return Err("Updated branch does not merge the reviewed head with the lane base".into());
+            }
+            let merged = self.sh("git", &["merge-tree", "--write-tree", old_head, base_parent])?;
+            let new_tree = self.sh("git", &["rev-parse", &format!("{new_head}^{{tree}}")])?;
+            if merged.lines().next().map(str::trim) != Some(new_tree.trim()) {
+                return Err("Updated branch tree differs from the clean trial merge".into());
+            }
+            return Ok(format!("clean merge tree for {old_head} and {base_parent} against {base_sha}"));
+        }
+        let merges = self.sh("git", &["rev-list", "--merges", old_head, new_head, "--not", &base_sha])?;
+        if parents.len() > 1 || !merges.trim().is_empty() {
+            return Err("Updated branch includes merges outside the proven integration".into());
+        }
+        // Linear rebase: each patch must survive unchanged and in order.
         let out = Command::new("git")
             .args([
                 "range-diff",
@@ -1394,11 +1414,30 @@ fn self_heal_stall_fact(reds: usize, dispatched: usize, last_error: Option<&str>
 /// this holder took and its age. The hub ignores the payload today — consuming
 /// it (deny renewal on stale progress while the queue is non-empty) is the
 /// filed hub-eviction follow-up. The seam is on the wire either way.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BranchPreparationPhase {
+    Updating,
+    Observing,
+}
+
+#[derive(serde::Serialize)]
+struct BranchPreparation {
+    pr: i64,
+    head_sha: String,
+    phase: BranchPreparationPhase,
+}
+
 fn renew_lease(ctx: &mut Ctx, repo: &str, base: &str) -> bool {
+    renew_lease_with_preparation(ctx, repo, base, None)
+}
+
+fn renew_lease_with_preparation(ctx: &mut Ctx, repo: &str, base: &str, preparation: Option<BranchPreparation>) -> bool {
     let progress = json!({
         "progress": ctx.last_action,
         "progress_age_ms": now_ms().saturating_sub(ctx.last_action_ms),
         "holder": ctx.holder,
+        "preparation": preparation,
     });
     ctx.train_lease(repo, base, "renew", json!({ "progress": progress, "merge_capable": true })).is_ok()
 }
@@ -1955,25 +1994,60 @@ enum StrictBranchRepair {
     RepairDispatched,
 }
 
+enum BranchUpdate {
+    Requested,
+    Unconfirmed(String),
+    NotWorkerOwned,
+}
+
+/// Update the exact worker-owned branch under the lane lease. GitHub may
+/// complete the request asynchronously; callers must observe the new head.
+fn request_branch_update(ctx: &mut Ctx, repo: &str, base: &str, pr: i64, head: &str) -> Result<BranchUpdate, String> {
+    let commits = ctx.pr_commit_rows(repo, pr);
+    if !commits.last().is_some_and(|commit| commit.sha.eq_ignore_ascii_case(head))
+        || !commits.iter().all(|commit| commit.verified) {
+        return Err(format!("Cannot verify the exact signed head of PR #{pr}"));
+    }
+    let logins = commits.into_iter().map(|commit| commit.login).collect::<Vec<_>>();
+    if !branch_is_worker_authored(&logins, &ctx.worker_identities) {
+        return Ok(BranchUpdate::NotWorkerOwned);
+    }
+    let live = ctx.pr_facts(repo, pr)?;
+    if vstr(&live, "state") != Some("OPEN") || vstr(&live, "baseRefName") != Some(base)
+        || vstr(&live, "headRefOid") != Some(head) || live["isDraft"].as_bool() == Some(true) {
+        return Err(format!("PR #{pr} changed before branch preparation"));
+    }
+    ctx.note(&format!("Preparing PR #{pr} for the next batch — updating against {base}"));
+    if !renew_lease_with_preparation(ctx, repo, base, Some(BranchPreparation { pr, head_sha: head.into(), phase: BranchPreparationPhase::Updating })) {
+        return Err("Cannot renew permission to update this branch".into());
+    }
+    Ok(match ctx.sh("gh", &["api", &format!("repos/{repo}/pulls/{pr}/update-branch"), "-X", "PUT",
+        "-f", &format!("expected_head_sha={head}")]) {
+        Ok(_) => BranchUpdate::Requested,
+        Err(error) => BranchUpdate::Unconfirmed(error),
+    })
+}
+
 /// Repair a worker branch only after a native up-to-date refusal and a
 /// clean trial merge confirm this exact head is behind.
 fn integrate_after_strict_refusal(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCandidate,
     base_sha: String) -> Result<StrictBranchRepair, String> {
     let pr = cand.pr;
     let head = cand.head_sha.as_str();
-    if !renew_lease(ctx, repo, base) {
-        return Err("Cannot renew permission to update this branch".into());
-    }
-    if !branch_is_worker_authored(&ctx.pr_commit_logins(repo, pr), &ctx.worker_identities) {
+    match request_branch_update(ctx, repo, base, pr, head)? {
+        BranchUpdate::Requested => {}
+        BranchUpdate::Unconfirmed(error) => return Err(error),
+        BranchUpdate::NotWorkerOwned => {
         ctx.mcp("train_event", json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr,
             "task_id": cand.head_id, "head_sha": head, "bounce_kind": "gate",
             "reason": "GitHub requires an up-to-date head. This branch is not worker-authored; its owner must update it and run CI." }))?;
         return Ok(StrictBranchRepair::RepairDispatched);
+        }
     }
-    ctx.sh("gh", &["api", &format!("repos/{repo}/pulls/{pr}/update-branch"), "-X", "PUT", "-f", &format!("expected_head_sha={head}")])?;
     let updated = ctx.pr_facts(repo, pr)?;
     let to_head = vstr(&updated, "headRefOid").ok_or("Updated branch has no readable head")?;
     if to_head == head { return Err("Branch update accepted but new head not yet observable; hold for fresh CI".into()); }
+    ctx.mechanical_rebase(base, head, to_head)?;
     ctx.mcp("train_carry", json!({ "repo": repo, "base": base, "pr": pr, "from_head": head, "to_head": to_head }))?;
     Ok(StrictBranchRepair::AwaitingCi { base_sha, head_sha: to_head.into() })
 }
@@ -2806,7 +2880,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 };
                 let live_base_state = reconcile_base_deploy(ctx, lane, key, repo, base, &base_sha, base_age_secs, &mut effective_v, &required, 0)?;
                 let _ = ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base, "base_state": live_base_state }));
-                let _ = settle_window_rebase(ctx, key, repo, base, lane);
+                let _ = settle_window_rebase(ctx, key, repo, base, lane, PreparationMode::ProbeConflicts);
             }
             let reds = v.red.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ");
             let hold_msg = format!("main still {}{} — holding", v.verdict.as_str(), if reds.is_empty() { String::new() } else { format!(" (red: {reds})") });
@@ -2929,14 +3003,12 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             if (burst_cap == 0 || cur_merged < burst_cap) && has_other_queued {
                 log(Some(key), &format!("awaiting-ci with batch slot open ({cur_merged}/{}) — checking remaining queued PRs to merge into this batch before settling CI", if burst_cap == 0 { "∞".to_string() } else { burst_cap.to_string() }));
             } else {
-                settle_window_rebase(ctx, key, repo, base, lane)?;
+                settle_window_rebase(ctx, key, repo, base, lane, PreparationMode::Prepare)?;
                 return Ok(());
             }
         } else {
-            // BR#4934 §6: the settle wait is the rebase window — ONE machine-clean
-            // update-branch per tick on the first behind+covered queued head, so
-            // conflicts surface during the wait, not at the drain.
-            settle_window_rebase(ctx, key, repo, base, lane)?;
+            // Prepare reviewed heads and dispatch conflicts while this batch settles.
+            settle_window_rebase(ctx, key, repo, base, lane, PreparationMode::Prepare)?;
             return Ok(());
         }
     }
@@ -4207,7 +4279,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     // Otherwise the lane is honestly idle.
     if pass_merged > 0 && !tip_sha.is_empty() {
         if from_awaiting_ci && pass_merged == initial_pass_merged {
-            settle_window_rebase(ctx, key, repo, base, lane)?;
+            settle_window_rebase(ctx, key, repo, base, lane, PreparationMode::Prepare)?;
             return Ok(());
         }
         burst_settle_feed(ctx, key, repo, base, &tip_sha, pass_merged)?;
@@ -4271,16 +4343,40 @@ fn settle_ancestors(ctx: &mut Ctx, repo: &str, base: &str, tip_sha: &str) -> Res
     Ok(out)
 }
 
-/// Probe queued heads during the settle wait so confirmed conflicts can go
-/// to repair while deployment runs. Clean heads stay ready for direct merge.
-fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparationMode {
+    ProbeConflicts,
+    Prepare,
+}
+
+/// Prepare the next batch during settlement. Dispatch confirmed conflicts
+/// and integrate one clean, reviewed worker branch per pass so its new checks
+/// can run alongside the current deployment.
+fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value, mode: PreparationMode) -> Result<(), String> {
+    let previous_deadline = ctx.operation_deadline.replace(Instant::now() + SCAN_BUDGET);
+    let result = prepare_next_batch(ctx, key, repo, base, lane, mode);
+    ctx.operation_deadline = previous_deadline;
+    result
+}
+
+fn prepare_next_batch(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value, mode: PreparationMode) -> Result<(), String> {
     let queue = lane.get("queue").and_then(|q| q.as_array()).cloned().unwrap_or_default();
-    for (qi, head) in queue.iter().enumerate() {
-        let head_id = vstr(head, "id").unwrap_or("").to_string();
+    let mut update_attempted = false;
+    if queue.is_empty() { return Ok(()); }
+    ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
+    let base_sha = ctx.sh("git", &["rev-parse", "--verify", &format!("origin/{base}^{{commit}}")])?;
+    let order = queue_scan_order(&queue, ctx.preparation_scan.get(key).unwrap_or(&QueueScan::Complete));
+    for qi in order.into_iter().take(SCAN_MAX_ENTRIES) {
+        if ctx.operation_budget(SCAN_BUDGET).is_err() { break; }
+        let head_id = vstr(&queue[qi], "id").unwrap_or("").to_string();
         if head_id.is_empty() {
             continue;
         }
-        let card = ctx.mcp("get_artefact", json!({ "id": head_id }))?;
+        ctx.preparation_scan.insert(key.into(), QueueScan::Checking { after_id: head_id.clone() });
+        let Ok(card) = ctx.mcp("get_artefact", json!({ "id": head_id })) else {
+            log(Some(key), &format!("Could not inspect {head_id} while preparing the next batch"));
+            continue;
+        };
         if card.get("status").and_then(|v| v.as_str()) != Some("blocked") {
             continue;
         }
@@ -4289,7 +4385,7 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
         let leg = legs
             .iter()
             .enumerate()
-            .find(|(_, l)| l.repo == repo && !train_leg_landed(&card_meta, l) && train_leg_state(&card_meta, l) != Some("awaiting-ci"))
+            .find(|(_, l)| l.repo == repo && l.base.as_deref().unwrap_or("main") == base && !train_leg_landed(&card_meta, l) && train_leg_state(&card_meta, l) != Some("awaiting-ci"))
             .map(|(i, l)| (i + 1, l.clone()));
         let (leg_number, leg) = match leg {
             Some(x) => x,
@@ -4299,8 +4395,12 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
         if pr == 0 {
             continue;
         }
-        let facts = ctx.pr_facts(repo, pr)?;
-        if vstr(&facts, "state") != Some("OPEN") {
+        let Ok(facts) = ctx.pr_facts(repo, pr) else {
+            log(Some(key), &format!("Could not read PR #{pr} while preparing the next batch"));
+            continue;
+        };
+        if vstr(&facts, "state") != Some("OPEN") || vstr(&facts, "baseRefName") != Some(base)
+            || facts["isDraft"].as_bool() == Some(true) {
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_lowercase();
@@ -4308,9 +4408,11 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
             continue;
         }
         // behind: base tip is NOT an ancestor of the head
-        ctx.sh("git", &["fetch", "--quiet", "origin", base])?;
-        ctx.fetch_pr_head(pr)?;
-        if ctx.is_ancestor(&format!("origin/{base}"), &head_sha).unwrap_or(true) {
+        if let Err(error) = ctx.fetch_pr_head(pr) {
+            log(Some(key), &format!("Could not fetch PR #{pr}: {}", trunc(&error, 120)));
+            continue;
+        }
+        if ctx.is_ancestor(&base_sha, &head_sha).unwrap_or(true) {
             continue;
         }
         // coverage extends, never created: the verdict must cover the head
@@ -4319,7 +4421,10 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
             log(Some(key), &format!("settle-window probe: queue[{qi}] {head_id} leg {leg_number} uncovered at head — verify owns it, skipping"));
             continue;
         }
-        let (clean, files) = ctx.trial_merge(base, &head_sha)?;
+        let Ok((clean, files)) = ctx.trial_merge_at(&base_sha, &head_sha) else {
+            log(Some(key), &format!("Could not trial-merge PR #{pr} while preparing the next batch"));
+            continue;
+        };
         if !clean {
             // BR#5252: the same decision law as the merge-refusal arm — a
             // file-less not-clean read is structurally impossible for a real
@@ -4338,16 +4443,41 @@ fn settle_window_rebase(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: 
             if event_kind == "conflict" {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
-            ctx.mcp("train_event", ev)?;
-            log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced to impl agent to resolve", files.len()));
-            return Ok(());
+            match ctx.mcp("train_event", ev) {
+                Ok(_) => log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced to impl agent to resolve", files.len())),
+                Err(error) => log(Some(key), &format!("Could not dispatch conflict repair for PR #{pr}: {}", trunc(&error, 120))),
+            }
+            continue;
         }
-        // Ray 2026-10-30: "if it's still mergeable, go — we only need a
-        // rebase if there are conflicts." Clean ⇒ NO proactive update-branch
-        // (no machine push, no PR-branch CI churn): the drain merges this
-        // head directly. The probe's only job now is surfacing conflicts
-        // during the settle wait so impl work pipelines.
-        log(Some(key), &format!("settle-window probe: PR #{pr} merges cleanly against base — the drain merges it directly (no rebase)"));
+        if update_attempted || mode == PreparationMode::ProbeConflicts {
+            continue;
+        }
+        let pending = &lane["branch_updates"][pr.to_string()];
+        if pending["head_sha"].as_str() == Some(&head_sha) && pending["expires_at"].as_u64().is_some_and(|expires| expires > now_ms()) {
+            continue;
+        }
+        // GitHub checks the exact accepted head at the write boundary. The
+        // update can finish asynchronously; the regular gate proves any
+        // changed head mechanically and checks its own CI before admission.
+        match request_branch_update(ctx, repo, base, pr, &head_sha) {
+            Ok(BranchUpdate::NotWorkerOwned) => continue,
+            Ok(BranchUpdate::Requested) => {
+                let note = format!("PR #{pr} branch update requested — waiting for the new head and checks");
+                ctx.note(&note);
+                log(Some(key), &note);
+            }
+            Ok(BranchUpdate::Unconfirmed(error)) => {
+                let note = format!("PR #{pr} branch update needs a fresh read — {}", trunc(&error, 120));
+                ctx.note(&note);
+                log(Some(key), &note);
+            }
+            Err(error) => {
+                log(Some(key), &format!("Could not prepare PR #{pr}: {}", trunc(&error, 120)));
+                continue;
+            }
+        }
+        update_attempted = true;
+        renew_lease_with_preparation(ctx, repo, base, Some(BranchPreparation { pr, head_sha, phase: BranchPreparationPhase::Observing }));
     }
     Ok(())
 }
@@ -5191,6 +5321,7 @@ fn ctx_for_daemon(cfg: &DaemonTrainConfig) -> Result<Ctx, String> {
     }
     Ok(Ctx {
         operation_deadline: None,
+            preparation_scan: HashMap::new(),
         http: reqwest::blocking::Client::builder().timeout(RPC_TIMEOUT).build().map_err(|e| e.to_string())?,
         hub: hub.trim_end_matches('/').to_string(),
         token,
@@ -6592,7 +6723,7 @@ mod tests {
     fn signature_fixture(args: &[&str], rows: Value) -> String {
         if args.contains(&"--slurp") {
             let page: Vec<Value> = rows.as_array().unwrap().iter().map(|row| json!({
-                "sha": row["sha"], "commit": { "verification": { "verified": row["verified"] } }
+                "sha": row["sha"], "author": { "login": row["login"] }, "commit": { "verification": { "verified": row["verified"] } }
             })).collect();
             json!([page]).to_string()
         } else { rows.to_string() }
@@ -6601,6 +6732,7 @@ mod tests {
     fn test_ctx(hub: &str) -> Ctx {
         Ctx {
             operation_deadline: None,
+            preparation_scan: HashMap::new(),
             http: reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
             hub: hub.to_string(),
             token: "test-token".into(),
@@ -7153,6 +7285,7 @@ mod tests {
         fn ctx(&self) -> Ctx {
             Ctx {
                 operation_deadline: None,
+            preparation_scan: HashMap::new(),
                 http: reqwest::blocking::Client::new(),
                 hub: String::new(),
                 token: String::new(),
@@ -7571,6 +7704,62 @@ mod tests {
     }
 
     #[test]
+    fn settlement_prepares_a_reviewed_worker_head_and_dispatches_all_conflicts() {
+        let repo = Repo::new("prepare-next-batch");
+        let conflict_one = repo.side_commit("conflict-one", "first conflict");
+        let conflict_two = repo.side_commit("conflict-two", "second conflict");
+        repo.git(&["checkout", "-qb", "worker", "main"]);
+        std::fs::write(repo.dir.join("worker.txt"), "worker change\n").unwrap();
+        repo.git(&["add", "worker.txt"]);
+        repo.git(&["commit", "-qm", "worker change"]);
+        let clean = repo.git(&["rev-parse", "HEAD"]);
+        for (pr, head) in [(1, &conflict_one), (2, &clean), (3, &conflict_two)] {
+            repo.git(&["push", "-q", "origin", &format!("{head}:refs/pull/{pr}/head")]);
+        }
+        repo.advance_main("base now conflicts");
+        let heads = [conflict_one, clean, conflict_two];
+        let cards = heads.clone();
+        let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+            "get_artefact" => {
+                let id = call_args(params)["id"].as_str().unwrap();
+                if id == "BR#4" { return Err("lookup unavailable".into()); }
+                let pr = id.strip_prefix("BR#").unwrap().parse::<usize>().unwrap();
+                Ok(json!({ "status": "blocked", "meta": {
+                    "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": cards[pr - 1] }],
+                    "merge_train": { "state": "queued", "pr": pr }
+                } }))
+            }
+            "train_lease" | "train_event" => Ok(json!({})),
+            other => panic!("unexpected hub command {other}"),
+        });
+        let mut ctx = test_ctx(&hub);
+        ctx.workdir = repo.dir.to_string_lossy().to_string();
+        let updated = std::sync::Arc::new(AtomicBool::new(false));
+        let updated_in_mock = updated.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            if cmd != "gh" { return None; }
+            if args[0] == "pr" {
+                let pr = args[2].parse::<usize>().unwrap();
+                return Some(Ok(json!({"state":"OPEN", "baseRefName":"main", "headRefOid": heads[pr - 1]}).to_string()));
+            }
+            if args[1].ends_with("/commits") {
+                return Some(Ok(signature_fixture(args, json!([{ "sha": heads[1], "verified": true, "login": "detached-cody" }]))));
+            }
+            assert!(args[1].ends_with("/pulls/2/update-branch"));
+            assert!(args.contains(&format!("expected_head_sha={}", heads[1]).as_str()));
+            assert!(!updated_in_mock.swap(true, Ordering::SeqCst));
+            Some(Ok("{}".into()))
+        }));
+        settle_window_rebase(&mut ctx, "o/r@main", "o/r", "main",
+            &json!({"queue":[{"id":"BR#1"},{"id":"BR#4"},{"id":"BR#2"},{"id":"BR#3"}]}), PreparationMode::Prepare).unwrap();
+        assert!(updated.load(Ordering::SeqCst));
+        let calls = calls.lock().unwrap();
+        let conflicts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_event")
+            .map(|c| call_args(c)["pr"].as_i64().unwrap()).collect();
+        assert_eq!(conflicts, [1, 3]);
+    }
+
+    #[test]
     fn strict_refusal_repair_never_blocks_an_independent_candidate() {
         for worker_owned in [true, false] {
             let repo = Repo::new(if worker_owned { "batch-ci" } else { "batch-repair" });
@@ -7627,7 +7816,7 @@ mod tests {
                     }
                     let head = if pr == "2" { &current } else if updated_c.load(Ordering::SeqCst) { &integrated } else { &stale };
                     let done = pr == "2" && merged_c.load(Ordering::SeqCst);
-                    return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head,
+                    return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" }, "headRefOid": head, "baseRefName": "main",
                         "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "mergeCommit": if done { json!({ "oid": current }) } else { Value::Null }
                     }).to_string()));
                 }
@@ -7742,11 +7931,18 @@ mod tests {
         ctx.workdir = repo.dir.to_string_lossy().to_string();
         ctx.worker_identities = vec!["worker".into()];
         let new_head = integrated.clone();
+        let prior_head = old.clone();
+        let branch_updated = std::sync::Arc::new(AtomicBool::new(false));
         ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
             if cmd != "gh" { return None; }
-            if args.get(1) == Some(&"repos/o/r/pulls/7/commits") { return Some(Ok(json!([{"login":"worker"}]).to_string())); }
-            if args.get(1) == Some(&"repos/o/r/pulls/7/update-branch") { return Some(Ok("{}".into())); }
-            if args.first() == Some(&"pr") { return Some(Ok(json!({"headRefOid":new_head,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}).to_string())); }
+            if args.get(1) == Some(&"repos/o/r/pulls/7/commits") {
+                return Some(Ok(signature_fixture(args, json!([{"sha":prior_head,"verified":true,"login":"worker"}]))));
+            }
+            if args.get(1) == Some(&"repos/o/r/pulls/7/update-branch") {
+                branch_updated.store(true, Ordering::SeqCst);
+                return Some(Ok("{}".into()));
+            }
+            if args.first() == Some(&"pr") { return Some(Ok(json!({"state":"OPEN","baseRefName":"main","headRefOid":if branch_updated.load(Ordering::SeqCst) { &new_head } else { &prior_head },"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}).to_string())); }
             panic!("unexpected command {args:?}");
         }));
         let candidate = BatchCandidate { qi: 0, head_id: "BR#7".into(), pr: 7, head_sha: old.clone(), root_fix: false };
@@ -8241,6 +8437,9 @@ mod tests {
         let merged = repo.git(&["rev-parse", "HEAD"]);
         ctx.mechanical_rebase("main", &old_head, &merged)
             .expect("machine-only merge update must carry without a local main branch");
+        let old_tree = repo.git(&["rev-parse", &format!("{old_head}^{{tree}}")]);
+        let changed_merge = repo.git(&["commit-tree", &old_tree, "-p", &old_head, "-p", &remote_base, "-m", "merge with an altered tree"]);
+        assert!(ctx.mechanical_rebase("main", &old_head, &changed_merge).is_err());
 
         std::fs::write(repo.dir.join("feature.txt"), "authored change\n").unwrap();
         repo.git(&["commit", "-q", "-am", "change feature"]);

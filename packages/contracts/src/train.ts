@@ -10,6 +10,18 @@ import { RecoveryCauseSchema } from "./train-recovery.ts";
 import { ExecutionBlockerSchema } from "./execution.ts";
 import { RecoveryPreemptionSchema } from "./scheduling.ts";
 
+export const TrainBranchPreparationSchema = z.object({
+  pr: z.number().int().positive(),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  phase: z.enum(["updating", "observing"]),
+});
+export type TrainBranchPreparation = z.infer<typeof TrainBranchPreparationSchema>;
+
+export const TrainBranchUpdateFenceSchema = z.record(z.string(), z.object({
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  expires_at: z.number().int().positive(),
+}));
+
 export const TrainEntryClassSchema = z.enum([
   "ready",
   "waiting",

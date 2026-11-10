@@ -1,5 +1,5 @@
 import { getKbHubConfig } from "./config";
-import type { ExecutionModelView, GatewayDispatch, LaneOperationalState, WorkWait } from "@bridge/contracts";
+import type { ExecutionModelView, GatewayDispatch, LaneOperationalState, TrainBranchPreparation, WorkWait } from "@bridge/contracts";
 import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
@@ -316,7 +316,7 @@ export interface KbTrainLane {
    *  (Ray 2026-10-29): ready=true inside the 15-min window, so an idle lane
    *  still names WHO is driving it and that merges will start when work lands. */
   capable?: { holder: string; at: number; age_ms: number; ready: boolean } | null;
-  now_action?: { note: string; holder: string; at: number } | null;
+  now_action?: { note: string; holder: string; at: number; preparation?: TrainBranchPreparation } | null;
   /** 2026-11-02: the answer-derived authorization stamps — a BYPASS answer on
    *  the base-red alarm ask / root-fix fast-lane ask stamps bypass_merge
    *  (the executor merges that PR out of turn), a RETRY answer stamps

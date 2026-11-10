@@ -2683,13 +2683,17 @@ included) as "unmergeable — CONFLICTING".
   fire on sight. The per-member merge leg law is unchanged: the pass's
   FIRST landing still gates on the real base verdict (BR#3009), the burst
   cap and the mid-drain tip RED check re-run before EACH member (GH#2261),
-  a strict branch update awaits fresh checks on its new head, and every merged
+  a branch update awaits fresh checks on its new head, and every merged
   event carries `batch_members` — the batch composition in landing order,
   sanitized into the provenance ledger (positive ints, deduped, order
   kept; absent payload keeps legacy rows byte-identical). A merge refused
   mid-batch soft-breaks: the landed prefix settles, the refused member
   waits for the next pass (a fresh pass keeps the loud tick error); the
   pass still runs exactly ONE settle wait, on the FINAL merge commit.
+  During that wait the gateway trial-merges queued heads, sends confirmed
+  conflicts to implementation, and requests one clean exact-head update per
+  pass on a reviewed worker branch. Mechanical proof preserves acceptance and
+  CI still runs on the new head. Top links to the PR being prepared.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the

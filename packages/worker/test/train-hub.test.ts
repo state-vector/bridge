@@ -436,6 +436,42 @@ describe("BR#6776 durable check recovery", () => {
     expect((await command(reserve)).body.error).toMatch(/lease/);
     await kbJson("/train.lease", { repo, action: "release", actor: "gw-replacement6776" });
   });
+  it("routes a conflict-parked PR to head-check repair only after exact clean mergeability evidence", async () => {
+    const repo = "state-vector/next-repair-after-conflict", actor = "gw-next-repair", head = "c".repeat(40), base = "d".repeat(40);
+    const id = await queueViaAccept({ repo, pr: 2, head });
+    await acquire(repo, actor);
+    const bounce = await kbJson("/train.event", { repo, actor, kind: "bounced", pr: 2, task_id: id,
+      head_sha: head, bounce_kind: "conflict", conflict_files: ["src/a.ts"], reason: "Confirmed merge conflict" });
+    expect(bounce.body.conflicting_park).toBe(true);
+    const stamp = (observedHead: string) => kbJson("/train.queue_facts", { repo, actor,
+      base_state: { verdict: "green", tip_sha: base, red: [], unsettled: [] }, entries: [{
+      id, pr: 2, cls: "blocked",
+      readiness: { phase: "reviewed", head_sha: observedHead, base_sha: base, observed_at: Date.now() },
+      repair: { kind: "head_checks", head_sha: head, checks: [{ name: "Test", url: "https://github.com/run/failure" }] },
+    }] });
+    await stamp("a".repeat(40));
+    expect((await laneSnap(repo)).queue_facts.entries[0].repair_task).toBeUndefined();
+    await stamp(head);
+    const duty = (await laneSnap(repo)).queue_facts.entries[0].repair_task;
+    expect((await kbJson("/get", { id: duty })).body.meta.machine_duty).toMatchObject({ subject: id, reason: "head_checks" });
+    await stamp(head);
+    expect((await laneSnap(repo)).queue_facts.entries[0].repair_task).toBe(duty);
+  });
+
+  it("holds an exact branch update across a lease handoff and allows another candidate", async () => {
+    const repo = "state-vector/branch-update-fence", actor = "gw-preparing", next = "gw-preparing-next";
+    const head = "c".repeat(40);
+    await acquire(repo, actor);
+    const request = (pr: number, holder: string) => kbJson("/train.lease", { repo, actor: holder, action: "renew",
+      progress: { progress: "Preparing", progress_age_ms: 0, holder, preparation: { pr, head_sha: head, phase: "updating" } } });
+    expect((await request(3, actor)).status).toBe(200);
+    await kbJson("/train.lease", { repo, actor, action: "release" });
+    await acquire(repo, next);
+    expect((await request(3, next)).body.error).toMatch(/still awaiting readback/);
+    expect((await request(4, next)).status).toBe(200);
+    expect((await laneSnap(repo)).branch_updates).toMatchObject({ "3": { head_sha: head }, "4": { head_sha: head } });
+  });
+
   it("gives an ownerless queued red head exactly one repair duty and projects its actual startup blocker", async () => {
     const repo = "state-vector/candidate-6776", actor = "gw-candidate6776", head = "c".repeat(40);
     const id = await queueViaAccept({ repo, pr: 2, head });

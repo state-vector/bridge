@@ -108,11 +108,16 @@ export function TrainMachineRows({ lanes, now, openTask }: {
   lanes: KbTrainLane[]; now: number; openTask?: (id: string) => void;
 }) {
   return lanes.filter(isActiveTrainLane).map(lane => {
-    const task = lane.currently?.task_id ?? lane.attempt?.card ?? lane.card;
-    const pr = lane.currently?.pr ?? lane.queue?.find(candidate => candidate.id === task)?.pr;
+    const action = lane.now_action;
+    const preparation = action && lane.lease && action.holder === lane.lease.holder
+      && lane.lease.expires_ts > now && now - action.at < 60_000 ? action.preparation : undefined;
+    const preparingTask = preparation && lane.queue?.find(candidate => candidate.pr === preparation.pr);
+    const task = preparingTask?.id ?? lane.currently?.task_id ?? lane.attempt?.card ?? lane.card;
+    const pr = preparation?.pr ?? lane.currently?.pr ?? lane.queue?.find(candidate => candidate.id === task)?.pr;
     const repo = lane.lane.split("@")[0];
     const holder = lane.lease?.holder ?? "Merge train";
-    const reason = lane.line.remediation?.text ?? lane.line.reason;
+    const reason = preparation && action ? action.note : lane.line.remediation?.text ?? lane.line.reason;
+    const label = preparation ? (preparation.phase === "updating" ? "Preparing next batch" : "Waiting for updated head") : lane.line.label;
     const signal = lane.now_action?.at ?? lane.line.observed_at;
     return <div key={lane.lane} className="ktable-row top-row top-click" onClick={() => openTask?.(task)}>
       <span className="topc-task"><span className="task-id top-task-id">{task}</span></span>
@@ -124,7 +129,7 @@ export function TrainMachineRows({ lanes, now, openTask }: {
         {pr && <a className="topc-prov" href={`https://github.com/${repo}/pull/${pr}`} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()}><Chip tone="scope">PR #{pr}</Chip></a>}
         <span className="top-will">{reason}</span>
       </span>
-      <span className="topc-status"><Chip tone={trainLineTones[lane.line.phase]} pill>{lane.line.label}</Chip></span>
+      <span className="topc-status"><Chip tone={trainLineTones[lane.line.phase]} pill>{label}</Chip></span>
       <span className="topc-score" />
       <span className="topc-gauge top-num">—</span>
       <span className="topc-gauge top-num">—</span>
