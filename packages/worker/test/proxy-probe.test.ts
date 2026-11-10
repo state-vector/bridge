@@ -216,6 +216,33 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
     expect(await dutyChildrenOf(id)).toHaveLength(before.length);
   });
 
+  it("rechecks a failed PR head and releases the wait only on fresh green evidence", async () => {
+    const repo = "state-vector/bridge", pr = 323;
+    const key = `checks:${repo}#${pr}`, receipt = `https://github.com/${repo}/pull/${pr}`;
+    const id = await parkedCard("repair leaves the old PR head red", { event: "pr_checks_green", repo, n: pr },
+      `all checks green on PR ${repo}#${pr}`);
+    await sweep();
+    const before = await dutyChildrenOf(id);
+    expect((await kbJson("/proxy.verify", { key, receipt, head_sha: "a".repeat(40), ok: false,
+      conclusive: true, error: "checks failing: Test=FAILURE" })).body.verdict).toBe("negative");
+    await sweep();
+    expect((await taskById(id)).meta.blocked.await_event).toEqual({ event: "pr_checks_green", repo, n: pr });
+    expect((await proxyCheck(id)).verdict).toBe("false");
+    expect(await dutyChildrenOf(id)).toEqual(before);
+    const reopened = (await kbJson("/proxy.probes", {})).body.probes.find((p: { key: string }) => p.key.startsWith(`${key}@`));
+    expect(reopened).toBeDefined();
+    expect((await kbJson("/proxy.verify", { key, receipt, head_sha: "a".repeat(40), ok: true })).body.error).toContain("previous probe");
+    const current = { key: reopened.key, receipt, ok: true };
+    expect((await kbJson("/proxy.verify", current)).body.error).toContain("exact GitHub head SHA");
+    expect((await kbJson("/proxy.verify", { ...current, receipt: `${receipt}1`, head_sha: "b".repeat(40) })).body.error).toContain("PR URL");
+    expect((await kbJson("/proxy.verify", { ...current, head_sha: "b".repeat(40) })).body.verdict).toBe("satisfied");
+    await sweep();
+    const check = await proxyCheck(id);
+    expect(check.verdict).toBe("true");
+    expect(before).toContain(check.spawned);
+    expect(await dutyChildrenOf(id)).toEqual(before);
+  });
+
   it("transient gh failures are bounded and exhausted probes schedule a reassessment", async () => {
     const id = await parkedCard(
       "probe rig E: gh keeps failing",

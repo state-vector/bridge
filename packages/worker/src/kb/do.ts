@@ -1635,7 +1635,7 @@ export class KnowledgeHub {
   private async evalProxyAtom(
     atom: ProxyAtom,
     io: { defaultRepo: string },
-  ): Promise<{ ok: boolean; receipt: string; probeState?: "unprobed" | "pending" | "exhausted" | "negative" }> {
+  ): Promise<{ ok: boolean; receipt: string; probeState?: "unprobed" | "pending" | "exhausted" | "negative" | "refresh" }> {
     const unresolvable = { ok: false, receipt: "unresolvable (no repo in the condition text)" };
     switch (atom.kind) {
       case "lane_health": {
@@ -1750,10 +1750,15 @@ export class KnowledgeHub {
       case "pr_checks_green": {
         if (!atom.repo) return unresolvable;
         const v = this.one(
-          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts FROM proxy_probes WHERE key = ?`,
+          `SELECT ok, receipt, head_sha, conclusion, error, state, attempts, updated_ts FROM proxy_probes WHERE key = ?`,
           proxyProbeKey(atom),
         ) as any;
         if (v?.state === "verified" && v.ok === 1) {
+          const newer = this.one(`SELECT head FROM delivery_pr_outcomes
+            WHERE repo=? AND pr=? AND state='OPEN' AND observed_at>?`, atom.repo, Number(atom.number), Number(v.updated_ts));
+          if (!/^[0-9a-f]{40}$/.test(String(v.head_sha)) || newer?.head && newer.head !== v.head_sha) {
+            return { ok: false, receipt: "PR check evidence needs a fresh current-head observation", probeState: "refresh" };
+          }
           return { ok: true, receipt: `executor-verified (BR#4658): ${v.receipt}` };
         }
         if (v?.state === "verified" && v.ok === 0) {
@@ -1828,8 +1833,18 @@ export class KnowledgeHub {
   private enqueueProxyProbe(atom: ProxyAtom, cardId: string, now: number): void {
     const key = proxyProbeKey(atom);
     if (!key) return;
-    const existing = this.one(`SELECT state, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key) as any;
+    const existing = this.one(`SELECT state, ok, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key);
     if (existing) {
+      if (existing.state === "verified" && atom.kind === "pr_checks_green") {
+        // This gate follows a PR's current head. A failed head may be repaired
+        // or rerun. Keep its evidence until a paced, read-only probe replaces it.
+        if (now - Number(existing.updated_ts) < PROBE_RETRY_MS) return;
+        this.state.storage.sql.exec(
+          `UPDATE proxy_probes SET state='pending', attempts=0, card_id=?, updated_ts=? WHERE key=?`,
+          cardId, now, key,
+        );
+        return;
+      }
       if (existing.state === "pending" || existing.state === "verified") return; // in flight / done
       // failed: retry on backoff until the cap
       if (Number(existing.attempts ?? 0) >= PROBE_ATTEMPT_CAP) return; // exhausted — loud unresolvable
@@ -1860,7 +1875,8 @@ export class KnowledgeHub {
   private proxyProbes(body: any): any {
     const limit = Math.max(1, Math.min(Number(body?.limit ?? 10) || 10, 25));
     const rows = this.state.storage.sql.exec(
-      `SELECT key, repo, kind, run_id, newer_than, pr, expected_head, card_id, attempts FROM proxy_probes
+      `SELECT CASE WHEN kind='pr_checks_green' AND ok IS NOT NULL THEN key || '@' || updated_ts ELSE key END AS key,
+         repo, kind, run_id, newer_than, pr, expected_head, card_id, attempts FROM proxy_probes
        WHERE state = 'pending' ORDER BY updated_ts ASC LIMIT ?`,
       limit,
     ).toArray();
@@ -1875,9 +1891,14 @@ export class KnowledgeHub {
    *  are stamped negative and NEVER flip (BR#3409 fail-closed); transient
    *  gh errors bump attempts (backoff, cap → loud unresolvable again). */
   private proxyVerify(body: any, actor: string): any {
-    const key = String(body?.key ?? "").trim();
+    const presentedKey = String(body?.key ?? "").trim();
+    const key = presentedKey.startsWith("checks:") ? presentedKey.split("@", 1)[0] : presentedKey;
     const probe = this.one(`SELECT * FROM proxy_probes WHERE key = ?`, key) as any;
     if (!probe) return { ok: false, error: `no such probe: ${key}` };
+    if (probe.kind === "pr_checks_green" && probe.ok !== null &&
+      (probe.state !== "pending" || presentedKey !== `${key}@${probe.updated_ts}`)) {
+      return { ok: false, error: "PR check observation belongs to a previous probe" };
+    }
     if (probe.state === "verified") return { ok: false, error: `probe ${key} already verified — verdict of record stands` };
     const now = Date.now();
     const headSha = typeof body?.head_sha === "string" ? body.head_sha.toLowerCase() : "";
@@ -1891,6 +1912,10 @@ export class KnowledgeHub {
     const headMismatch = !!(expected && headSha && !headMatches(headSha, expected));
 
     if (body?.ok === true && !headMismatch) {
+      if (probe.kind === "pr_checks_green" &&
+        (!/^[0-9a-f]{40}$/.test(headSha) || receipt !== `https://github.com/${probe.repo}/pull/${probe.pr}`)) {
+        return { ok: false, error: "current PR checks require the exact GitHub head SHA and PR URL" };
+      }
       if (!/https:\/\/github\.com\//.test(receipt)) {
         return { ok: false, error: "receipt must carry the GitHub URL(s) of the evidence (BR#4658 contract)" };
       }
@@ -2086,10 +2111,15 @@ export class KnowledgeHub {
         }
         const results: { atom: ProxyAtom; ok: boolean; receipt: string; probeState?: string }[] = [];
         for (const atom of atoms) results.push({ atom, ...(await this.evalProxyAtom(atom, { defaultRepo })) });
-        if (aw && results.some(x => x.probeState === "negative" || x.probeState === "exhausted")) {
-          const failed = results.find(x => x.probeState === "negative" || x.probeState === "exhausted");
-          if (await this.repairBlockedWait(String(r.id), aw, bmeta.ts, `Bridge must reassess the failed prerequisite. ${failed?.receipt}`)) continue;
+        for (const result of results) {
+          if (result.atom.kind === "pr_checks_green" && (result.probeState === "negative" || result.probeState === "refresh")) {
+            this.enqueueProxyProbe(result.atom, r.id, now);
+          }
         }
+        const failed = results.find(x => x.probeState === "exhausted" ||
+          (x.probeState === "negative" && x.atom.kind !== "pr_checks_green"));
+        if (aw && failed && await this.repairBlockedWait(String(r.id), aw, bmeta.ts,
+          `Bridge must reassess the failed prerequisite. ${failed.receipt}`)) continue;
         const unresolvable = results.some((x) => !x.ok && x.receipt.startsWith("unresolvable"));
         if (unparseable || unresolvable) {
           // cannot FULLY read the condition — never auto-flip (conservatism law)
@@ -2106,7 +2136,7 @@ export class KnowledgeHub {
         // verdict re-enters the standard path: every-atom-true flips below
         // (BR#4282 owned done-close / unblock spawn); a conclusive negative
         // or an exhausted probe stamps honestly and never flips.
-        const probeStates = results.filter((x) => x.probeState && x.probeState !== "negative");
+        const probeStates = results.filter((x) => x.probeState && x.probeState !== "negative" && x.probeState !== "refresh");
         if (probeStates.length) {
           for (const x of probeStates) this.enqueueProxyProbe(x.atom, r.id, now);
           const exhausted = probeStates.some((x) => x.probeState === "exhausted");
