@@ -15774,12 +15774,19 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const hasReady = entries.some(raw => raw && typeof raw === "object" && "cls" in raw && raw.cls === "ready");
       for (const raw of hasReady ? [] : entries) {
         if (!raw || typeof raw !== "object" || !("repair_task" in raw) || typeof raw.repair_task !== "string") continue;
-        const candidateRepair = this.enrichFixCardRow(raw.repair_task, now);
+        const pr = "pr" in raw && typeof raw.pr === "number" && Number.isSafeInteger(raw.pr) && raw.pr > 0 ? raw.pr : undefined;
+        const candidateRepair = this.enrichFixCardRow(raw.repair_task, now,
+          pr ? { pr, pr_url: `https://github.com/${cfg.repo}/pull/${pr}` } : undefined);
         if (!candidateRepair) continue;
+        const evidence = CandidateRepairSchema.safeParse("repair" in raw ? raw.repair : undefined);
+        const cause = pr && evidence.success
+          ? `PR #${pr} fails ${evidence.data.checks.map(check => check.name).join(", ")}. `
+          : "";
         if (["done", "superseded"].includes(candidateRepair.status)) return { ...line, remediation: {
-          kind: "blocked", task: candidateRepair, text: "The candidate repair duty ended, but the same head still fails. Its outcome requires investigation; no unchanged retry will be dispatched.",
+          kind: "blocked", task: candidateRepair, text: `${cause}The repair duty ended and the same head still fails. Bridge must investigate its outcome before retrying.`,
         } };
-        return { ...line, remediation: taskRemediation(candidateRepair) };
+        const remediation = taskRemediation(candidateRepair);
+        return { ...line, remediation: { ...remediation, text: cause + remediation.text } };
       }
     }
     const current = line.blocker === "merge_failed" ? null : this.trainOpenRootFix(cfg.repo, undefined, undefined, cfg.base).card;

@@ -2693,7 +2693,7 @@ included) as "unmergeable — CONFLICTING".
   During that wait the gateway trial-merges queued heads, sends confirmed
   conflicts to implementation, and requests one clean exact-head update per
   pass on a reviewed worker branch. Mechanical proof preserves acceptance and
-  CI still runs on the new head. Top links to the PR being prepared.
+  CI still runs on the new head. Top links to the PR being prepared. When a candidate needs check repair, the train banner shows the PR, failing checks, and repair owner as soon as Bridge has them.
 - **The landed close is guarded — a green verdict can never wedge the lane
   (BR#4753)**: when the all-green verdict fires the landed close and the close itself
   is refused (a gate rejection — e.g. done-open-children — or a storage fault), the

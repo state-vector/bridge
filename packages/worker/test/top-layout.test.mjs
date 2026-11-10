@@ -34,6 +34,20 @@ it("the alert is inside the affected lane group after its row, never above an un
   expect(failedGroup).toContain(recovery.task.last_progress.will);
 });
 
+it("shows the affected PR, check failure and repair owner before expanding details", () => {
+  const prUrl = "https://github.com/state-vector/superpositional/pull/2479";
+  const line = { ...stopped.line, phase: "error", blocker: "no_progress", label: "Merge machinery stalled",
+    remediation: { ...recovery, text: "PR #2479 fails ci / Chat Integration. Repair is running.",
+      task: { ...recovery.task, pr: 2479, pr_url: prUrl } } };
+  const html = render(h(TrainPanelView, { lanes: [{ ...stopped, line }], now, error: null }));
+  const banner = html.slice(html.indexOf('role="alert"'));
+  const details = banner.indexOf("<details");
+  expect(details).toBeGreaterThan(0);
+  expect(banner.slice(0, details)).toContain(prUrl);
+  expect(banner.slice(0, details)).toContain("ci / Chat Integration");
+  expect(banner.slice(0, details)).toContain("test-agent");
+});
+
 it("routine deployment waits stay compact while stopped and unknown lines retain their alerts", () => {
   const waiting = { ...ready, line: { ...ready.line, phase: "waiting", label: "Build and deployment running", blocker: "checks_running", held: 2, remediation: { kind: "machine", text: "Watching deployment.", url: null } } };
   const html = render(h(TrainPanelView, { lanes: [waiting], now, error: null }));

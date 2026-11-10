@@ -507,7 +507,10 @@ describe("BR#6776 durable check recovery", () => {
     expect((await stamp()).body.error).toBeUndefined();
     const lane = await laneSnap(repo), duty = lane.queue_facts.entries[0].repair_task;
     expect(duty).toMatch(/^BR#/);
-    expect(lane.line.remediation).toMatchObject({ task: { id: duty } });
+    expect(lane.line.remediation).toMatchObject({
+      task: { id: duty, pr: 2, pr_url: `https://github.com/${repo}/pull/2` },
+      text: expect.stringContaining("PR #2 fails Test."),
+    });
     await stamp();
     expect((await laneSnap(repo)).queue_facts.entries[0].repair_task).toBe(duty);
     const repair = (await kbJson("/get", { id: duty })).body;

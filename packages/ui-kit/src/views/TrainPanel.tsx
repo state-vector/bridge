@@ -58,6 +58,11 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
       const task = action.task;
       return <>
         <span className="train-banner-line">{action.text}</span>
+        {task.pr && task.pr_url && <span className="train-banner-line">
+          <a href={task.pr_url} target="_blank" rel="noreferrer">PR #{task.pr}</a>
+          {" · "}<TaskLink id={task.id} url={task.url} openTask={openTask}>Repair {task.id}</TaskLink>
+          {task.owner && ` · ${task.owner}`}
+        </span>}
         <details className="train-banner-line">
           <summary>Repair details · {task.id}</summary>
           <TaskLink id={task.id} url={task.url} openTask={openTask}>{task.title}</TaskLink>
