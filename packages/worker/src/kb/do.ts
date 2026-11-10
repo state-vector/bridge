@@ -12174,6 +12174,19 @@ export class KnowledgeHub {
     return created.id;
   }
 
+  /** BR#4694 train canary: is this impl card the canary fixture? The fixture
+   *  stamps meta.canary=true (the CLI spawns it qualified + tagged
+   *  train-canary); the executor also sends body.canary=true belt-and-braces.
+   *  Canary events carry detail.canary=true in the ledger — the throughput
+   *  metrics (BR#4363 panel) exclude them — and canary bounces never file a
+   *  human review ask (mechanics, not judgment). */
+  private canaryOf(taskId: string | null | undefined, bodyCanary: unknown): boolean {
+    if (bodyCanary === true) return true;
+    if (!taskId) return false;
+    const r = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId) as any;
+    try { return JSON.parse(r?.meta ?? "{}")?.canary === true; } catch { return false; }
+  }
+
   /** train.event — kind merged | bounced | stopped | landed | stalled |
    *  updated. The acting gateway (actor) must hold the lease; every event is
    *  audited with the gateway for attribution and written to the train_events
@@ -12361,8 +12374,10 @@ export class KnowledgeHub {
       const batchMembers = sanitizeBatchMembers(body.batch_members);
       const chain = this.trainChain(String(body.task_id ?? "") || null);
       const burstFields = burstMerged != null ? { burst_merged: burstMerged, burst_cap: burstCap } : {};
+      const canary = this.canaryOf(chain.task_id, body.canary);
       const receipt = { task: chain.task_id, verdict: chain.verdict_id, session: chain.session, carry: !!(headSha && String(body.carry_from ?? "")),
         ...burstFields, burst_settling: burstSettling || undefined, ...(batchMembers ? { batch_members: batchMembers } : {}),
+        ...(canary ? { canary: true } : {}),
         ...(midWalk ? { mid_walk_receipt: { lost_via: midWalk.action, lost_at: new Date(midWalk.ts).toISOString() } } : {}) };
       this.trainStampProvenance({ repo, pr, merge_sha: mergeSha, head_sha: headSha, ...chain, signer: String(body.signer ?? "worker-executor"), merged_at: mergedAt });
       // carry-record: a clean machine update moved the verified head X→Y and
@@ -12438,19 +12453,19 @@ export class KnowledgeHub {
       // executor's walk stamps the merged event from live state when it next
       // sees the PR MERGED, train.rs:848).
       if (meta.bypass_wait && Number(meta.bypass_wait.pr) === pr) delete meta.bypass_wait;
-      // BR#5674 P4: ANY merge on the lane clears the starvation episode
-      // (meta.lane.starvation + meta.starvation + meta.lane.starved_since)
-      // and records the latest merge timestamp.
-      const prevStarv = meta.lane?.starvation ?? meta.starvation ?? null;
-      meta.lane = {
-        ...(meta.lane ?? {}),
-        last_merge_ts: Math.max(Number(meta.lane?.last_merge_ts ?? 0) || 0, mergedAt),
-        starvation: null,
-        starved_since: null,
-      };
-      delete meta.starvation;
-      if (prevStarv) {
-        this.audit(actor, "train:starvation_cleared", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha.slice(0, 9), prev_since: prevStarv.since ?? null, ask_id: prevStarv.ask_id ?? null, duty_id: prevStarv.duty_id ?? null });
+      // A synthetic merge cannot clear a real delivery stall.
+      if (!canary) {
+        const prevStarv = meta.lane?.starvation ?? meta.starvation ?? null;
+        meta.lane = {
+          ...(meta.lane ?? {}),
+          last_merge_ts: Math.max(Number(meta.lane?.last_merge_ts ?? 0) || 0, mergedAt),
+          starvation: null,
+          starved_since: null,
+        };
+        delete meta.starvation;
+        if (prevStarv) {
+          this.audit(actor, "train:starvation_cleared", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha.slice(0, 9), prev_since: prevStarv.since ?? null, ask_id: prevStarv.ask_id ?? null, duty_id: prevStarv.duty_id ?? null });
+        }
       }
       const reason = this.laneSyncReason(lane.id, meta, now);
       this.saveLaneState(lane.id, meta, now);
@@ -12634,7 +12649,10 @@ export class KnowledgeHub {
         const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
         meta.currently = inFlightBounced ? null : meta.currently;
         const reason = this.laneSyncReason(lane.id, meta, now);
-        ev({ task: taskId, bounce_kind: "coverage", merge_state_status: mergeStateStatus, reason: defect, awaiting_park: true }, taskId);
+        // BR#4694: canary bounce events are ledger-stamped — throughput
+        // metrics exclude them (the fixture tests mechanics, not pace).
+        const canary = this.canaryOf(taskId, body.canary) || cm.canary === true;
+        ev({ task: taskId, bounce_kind: "coverage", merge_state_status: mergeStateStatus, reason: defect, awaiting_park: true, ...(canary ? { canary: true } : {}) }, taskId);
         this.version(lane.id, actor, `train:${kind}`, `PR #${pr} bounced (coverage) — human leg, the card parks Awaiting review (zero asks, BR#4960); force-review from the backlog re-queues or bounces it`, { reason });
         return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, bounce_kind: "coverage", awaiting_park: true, reason };
         }
@@ -12748,6 +12766,10 @@ export class KnowledgeHub {
       // self-clear in the merged flow), clears it.
       if (!bounceBudgetBreached && bounceKind === "gate" && mergeStateStatus === "blocked") meta.bypass_wait = { pr, task_id: taskId, at: now };
       else if (meta.bypass_wait?.pr === pr) delete meta.bypass_wait;
+      // BR#4694: the canary's bounces are mechanical, not judgment — the
+      // event is ledger-stamped canary (throughput metrics exclude it); the
+      // bounce itself (brief, boost, re-entry) proceeds unchanged.
+      const canary = this.canaryOf(taskId, body.canary) || cm.canary === true;
       // Stamp the bounce FACTS on meta (kind, defect, files) + BOOST (BR#4068:
       // a bounced merge-ready card is the board's highest-value work — one
       // mechanical/human leg from landing — and must not re-enter at default
@@ -12919,7 +12941,7 @@ export class KnowledgeHub {
       const inFlightBounced = !!meta.currently && String(meta.currently.task_id ?? "") === String(taskId);
       meta.currently = inFlightBounced ? null : meta.currently;
       const reason = this.laneSyncReason(lane.id, meta, now);
-      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, bounced_at: now2 }, taskId);
+      ev({ task: taskId, conflict_files: conflictFiles, bounce_kind: bounceKind, merge_state_status: mergeStateStatus, reason: defect, bounce_no: bounceNo, bounced_at: now2, ...(canary ? { canary: true } : {}) }, taskId);
       const laneNote =
         baseRedNames
           ? `PR #${pr} bounced (gate, base-red) — MAIN is red; the PR is fine and held until it clears (the fix rides the base-red card/ask), then re-queue at the back`
@@ -13066,6 +13088,9 @@ export class KnowledgeHub {
       // its PR (or opens the human fast-lane ask for the circular
       // deploy-health class). Best-effort: a spawn failure must never eat the
       // stop event itself — the ledger entry below still fires.
+      // BR#4694: canary stops stamp their ledger event canary=true — the
+      // metrics exclude them and the fixture's own watcher owns the alarm.
+      const canary = this.canaryOf(culprit, body.canary);
       try {
         const rootFixId = await this.ensureRootFixCard({
           repo,
@@ -13115,7 +13140,7 @@ export class KnowledgeHub {
           this.audit(actor, "train_red_ding_error", lane.id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
         }
       }
-      ev({ reason: why, failing, culprit }, culprit);
+      ev({ reason: why, failing, culprit, ...(canary ? { canary: true } : {}) }, culprit);
       this.version(lane.id, actor, `train:${kind}`, `line stopped — ${why}`, { stop: meta.stop, reason });
       // Rapid bypass escalation: if a cure PR is already bound (or the root-fix
       // card is already exhausted) at the moment the stop is recorded, file/refresh
@@ -13193,7 +13218,8 @@ export class KnowledgeHub {
       : [];
     const classified = classifyRequiredRuns(checks, laneSpec.required_workflows, { merged_at: Number(meta.currently.merged_at ?? now), now, typical_ms: (laneSpec.ci_typical_minutes ?? TRAIN_CI_TYPICAL_MINUTES) * 60_000, phantom_required: phantomRequired });
     if (classified.verdict !== "green") throw new Error(`train:landed rejected — required runs classify ${classified.verdict} (failing: ${classified.failing.map((f) => f.name).join(", ") || "none"}; pending: ${classified.pending.join(", ") || "none"}); post train.ci instead and let the hub decide`);
-    return this.landedFlowGuarded(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null) });
+    const landedCanary = this.canaryOf(meta.currently?.task_id ?? null, body.canary);
+    return this.landedFlowGuarded(lane, meta, actor, { pr: Number(pr), mergeSha: mergeSha!, greenRunUrl: classified.failing.length ? null : (checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null), canary: landedCanary });
   }
 
   /** BR#4934 burst parks: on a GREEN settle of a burst pass, every parked
@@ -13234,7 +13260,7 @@ export class KnowledgeHub {
         const remaining = trainLegsRemaining(cm);
         this.state.storage.sql.exec(
           `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
-          now, laneSpec.repo, laneSpec.base, actor, leg.number, row.id, String(legRec.merge_sha), JSON.stringify({ burst: true, evidence_sha: settledSha, pass_merged: Number(cur.burst_merged) }),
+          now, laneSpec.repo, laneSpec.base, actor, leg.number, row.id, String(legRec.merge_sha), JSON.stringify({ burst: true, evidence_sha: settledSha, pass_merged: Number(cur.burst_merged), ...(cm.canary === true ? { canary: true } : {}) }),
         );
         if (remaining.length) {
           // legs remain on other lanes/repos — stay queued, honestly named
@@ -13442,7 +13468,7 @@ export class KnowledgeHub {
    *  when its LAST leg lands — after a partial landing it stays queued with
    *  an honest reason naming the legs still out, and the train picks the
    *  next leg on a later tick. */
-  private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null; receiptTaskId?: string }): Promise<any> {
+  private async landedFlow(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null; receiptTaskId?: string; canary?: boolean }): Promise<any> {
     const now = Date.now();
     const laneSpec = laneOfMeta(meta)!;
     let taskId: string | null = p.receiptTaskId ?? meta.currently?.task_id ?? null;
@@ -13480,7 +13506,7 @@ export class KnowledgeHub {
           const reason = this.laneSyncReason(lane.id, meta, now);
           this.state.storage.sql.exec(
             `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
-            now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ leg: true, run: p.greenRunUrl ?? null, remaining: remaining.map((l) => l.number) }),
+            now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ leg: true, run: p.greenRunUrl ?? null, remaining: remaining.map((l) => l.number), ...(p.canary ? { canary: true } : {}) }),
           );
           this.audit(actor, "train:leg_landed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, merge_sha: p.mergeSha, remaining: remaining.map((l) => l.number) });
           this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed green — card ${taskId} stays queued (${remaining.length} leg(s) remain: ${remaining.map((l) => `${l.repo}#${l.number}`).join(", ")})`, { reason });
@@ -13512,7 +13538,7 @@ export class KnowledgeHub {
     const reason = this.laneSyncReason(lane.id, meta, now);
     this.state.storage.sql.exec(
       `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
-      now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ run: p.greenRunUrl ?? null }),
+      now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ run: p.greenRunUrl ?? null, ...(p.canary ? { canary: true } : {}) }),
     );
     this.audit(actor, "train:landed", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, merge_sha: p.mergeSha });
     this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed — ${p.mergeSha.slice(0, 9)} green on main; card ${taskId ?? "n/a"} closed`, { reason });
@@ -13603,7 +13629,7 @@ export class KnowledgeHub {
    *  bound, whichever first — bounces fail-closed with ONE alarm-sink ask
    *  per episode. awaiting-ci always resolves to
    *  { landed, red-stop, bound-stop, bounce }; never a raw throw. */
-  private async landedFlowGuarded(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null }): Promise<any> {
+  private async landedFlowGuarded(lane: any, meta: any, actor: string, p: { pr: number; mergeSha: string; greenRunUrl?: string | null; canary?: boolean }): Promise<any> {
     const laneSpec = laneOfMeta(meta)!;
     try {
       const out = await this.landedFlow(lane, meta, actor, p);
@@ -13659,7 +13685,7 @@ export class KnowledgeHub {
       const reason2 = this.laneSyncReason(lane.id, meta, Date.now());
       this.state.storage.sql.exec(
         `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
-        Date.now(), laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ close_bounced: true, breach_class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) }),
+        Date.now(), laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ close_bounced: true, breach_class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300), ...(p.canary ? { canary: true } : {}) }),
       );
       this.audit(actor, "train:landed_close_bounced", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, class: klass, bound_fired: boundFired, failures, error: error.slice(0, 300) });
       this.version(lane.id, actor, "train:landed", `PR #${p.pr} merged green but the card close failed ${failures}× (${klass}${boundFired ? ", bound fired" : ""}) — card close-bounced with the repair brief; lane idled, queue advances (BR#4753)`, { reason: reason2 });
@@ -13765,7 +13791,8 @@ export class KnowledgeHub {
       // { landed, landed_retry, bounce_gate, bounce_bound } and the bound
       // fires here too after repeated close failures (it used to be
       // reachable only from the pending branch).
-      return this.landedFlowGuarded(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null });
+      const canary = this.canaryOf(meta.currently?.task_id ?? null, body.canary);
+      return this.landedFlowGuarded(lane, meta, actor, { pr, mergeSha, greenRunUrl: checks.find((c) => laneSpec.required_workflows.includes(c.name ?? ""))?.html_url ?? body.run_url ?? null, canary });
     }
     if (v.verdict === "red") {
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, failing: v.failing }, actor);
@@ -15113,7 +15140,7 @@ export class KnowledgeHub {
     const dbLast = tpLastMergeTs !== undefined
       ? (Number(tpLastMergeTs ?? 0) || 0)
       : (Number((this.state.storage.sql.exec(
-          `SELECT MAX(ts) AS last_merge_ts FROM train_events WHERE kind = 'merged' AND repo = ? AND base = ?`,
+          `SELECT MAX(ts) AS last_merge_ts FROM train_events WHERE kind = 'merged' AND repo = ? AND base = ? AND COALESCE(json_extract(detail, '$.canary'), 0) = 0`,
           repo, base,
         ).toArray()[0] as any)?.last_merge_ts ?? 0) || 0);
     const metaLast = Number(meta.lane?.last_merge_ts ?? 0) || 0;
@@ -15145,7 +15172,7 @@ export class KnowledgeHub {
     const awaiting = awaitingArg ?? this.laneAwaitingRows(lane.repo, now0, undefined, lane.base);
     const lastMergeTs = this.laneLastMergeTs(lane.repo, lane.base, meta, tpLastMergeTs);
     const oldestCarAt = [...queue, ...awaiting].reduce((oldest, car) =>
-      Number.isFinite(car.at) && car.at > 0 ? Math.min(oldest, car.at) : oldest, now0);
+      Number.isFinite(car.at) && car.at > 0 && !this.canaryOf(car.id ?? car.task, false) ? Math.min(oldest, car.at) : oldest, now0);
     // An idle lane can go days without a merge. Only time with a car
     // waiting on this lane counts toward a machinery stall.
     const mergeRefTs = Math.max(oldestCarAt, lastMergeTs ?? 0);
@@ -16680,11 +16707,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         continue;
       }
       const queue = this.laneQueue(lane.repo, lane.base);
+      // BR#4694: canary merges ride the real ledger but never the throughput
+      // metrics — a synthetic daily doc-touch must not flatter (or mask) the
+      // lane's merges/h, nor refresh last_merge_ts over a stalled lane.
       const tp = this.state.storage.sql.exec(
         `SELECT SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h1,
                 SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END) AS h24,
                 MAX(ts) AS last_merge_ts
-         FROM train_events WHERE kind = 'merged' AND repo = ? AND base = ?`,
+         FROM train_events WHERE kind = 'merged' AND repo = ? AND base = ?
+           AND COALESCE(json_extract(detail, '$.canary'), 0) = 0`,
         now0 - 3_600_000, now0 - 86_400_000, lane.repo, lane.base,
       ).toArray()[0] ?? {};
       const lastEvent = this.state.storage.sql.exec(

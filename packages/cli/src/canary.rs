@@ -114,7 +114,8 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 /// UTC ISO-8601 without a chrono dependency (civil-from-days, same as train.rs).
-fn iso(ts_ms: u64) -> String {
+/// pub(crate): the train canary (BR#4694) reuses the exact format.
+pub(crate) fn iso(ts_ms: u64) -> String {
     let secs = (ts_ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -135,7 +136,7 @@ fn iso(ts_ms: u64) -> String {
 }
 
 /// Compact run id: UTC date + hour-minute (unique per run, safe in titles).
-fn run_stamp(ts_ms: u64) -> String {
+pub(crate) fn run_stamp(ts_ms: u64) -> String {
     iso(ts_ms).replace(['-', ':'], "").replace('T', "-")[..15].to_string()
 }
 
