@@ -5743,43 +5743,39 @@ fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
     ProbeVerdict::Transient { error: format!("no successful run newer than {newer_than} yet") }
 }
 
-/// pr_checks_green: gh's statusCheckRollup reflects the PR's CURRENT head
-/// (head-consistency by construction). SUCCESS/NEUTRAL/SKIPPED don't block;
-/// the terminal-failure classes are conclusive; everything else is pending.
-/// BR#6568: failing checks whose NAME matches MERGE_EXEMPT_CHECK_PATTERNS
-/// (BR#2267 mechanism, BR#6001 list — the same law the head gate applies via
-/// classify_head_checks) route into a NON-BLOCKING external bucket: the
-/// verdict still names the exempt external in its conclusion (the receipt
-/// stays the GitHub checks URL per the BR#4658 evidence contract), but it
-/// SATISFIES the probe — a degraded Superpositional flow runner must not
-/// park a typed pr_checks_green await (live: PR state-vector/bridge#323,
-/// BR#4694). A REQUIRED (non-exempt) check failing still stamps negative,
-/// and any pending check still stays transient (fail-closed, BR#3409).
+/// GitHub's PR rollup reports checks on the current head. Apply the same
+/// external-check exemptions as the train and require at least one observed
+/// non-exempt check before accepting the recovery prerequisite.
 fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict {
-    if rollup.is_empty() {
-        return ProbeVerdict::Transient { error: "no checks reported on the PR yet".into() };
-    }
     let mut failed: Vec<String> = Vec::new();
     let mut external: Vec<String> = Vec::new();
     let mut pending = 0usize;
+    let mut applicable = 0usize;
     for e in rollup {
-        let state = e
-            .get("conclusion")
-            .and_then(|v| v.as_str())
-            .or_else(|| e.get("state").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        let name = e.get("name").and_then(|v| v.as_str()).or_else(|| e.get("context").and_then(|v| v.as_str())).unwrap_or("?");
-        match state.to_ascii_uppercase().as_str() {
+        let state = ["conclusion", "state", "status"]
+            .iter()
+            .filter_map(|field| vstr(e, field))
+            .find(|state| !state.is_empty())
+            .unwrap_or("unknown")
+            .to_ascii_uppercase();
+        let name = vstr(e, "name").or_else(|| vstr(e, "context")).unwrap_or("?");
+        if crate::train_gate::is_exempt_check_name(name) {
+            if !matches!(state.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+                external.push(format!("{name}={state}"));
+            }
+            continue;
+        }
+        applicable += 1;
+        match state.as_str() {
             "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
             "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => {
-                if crate::train_gate::is_exempt_check_name(name) {
-                    external.push(format!("{name}={state}"));
-                } else {
-                    failed.push(format!("{name}={state}"));
-                }
+                failed.push(format!("{name}={state}"));
             }
             _ => pending += 1,
         }
+    }
+    if applicable == 0 {
+        return ProbeVerdict::Transient { error: "no non-exempt checks reported on the PR yet".into() };
     }
     if let Some(first) = failed.first() {
         let more = if failed.len() > 1 { format!(" (+{} more)", failed.len() - 1) } else { String::new() };
@@ -5790,7 +5786,7 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
         };
     }
     if pending > 0 {
-        return ProbeVerdict::Transient { error: format!("checks pending ({pending} of {} not concluded)", rollup.len()) };
+        return ProbeVerdict::Transient { error: format!("checks pending ({pending} of {applicable} not concluded)") };
     }
     if let Some(first) = external.first() {
         // green-modulo-externals: satisfied, and the verdict NAMES what was
@@ -8276,6 +8272,21 @@ mod tests {
             }
             other => panic!("expected conclusive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rollup_pending_external_does_not_hold_settled_non_exempt_checks() {
+        let rollup = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "CLI build (packages/cli)", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "conclusion": "", "status": "IN_PROGRESS" }
+        ]);
+        let checks = rollup.as_array().unwrap();
+        match classify_rollup(checks, "https://github.com/o/r/pull/9", "deadbeef") {
+            ProbeVerdict::Satisfied { conclusion, .. } => assert!(conclusion.contains("Superpositional=IN_PROGRESS")),
+            other => panic!("pending external must not hold settled checks: {other:?}"),
+        }
+        assert!(matches!(classify_rollup(&checks[2..], "u", ""), ProbeVerdict::Transient { .. }));
     }
 
     #[test]
