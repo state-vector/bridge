@@ -52,3 +52,17 @@ it("uses the current typed line despite historical red-main records", () => {
   expect(render()).toContain("Status unavailable");
   expect(render()).not.toContain("main RED");
 });
+
+
+it("shows an execution-owned PR alongside the idle train", () => {
+  const lane: KbTrainLane = { card: "BR#1", lane: "test/repo@main", lease: null, currently: null, stop: null, queue: [],
+    line: { phase: "idle", label: "idle", reason: "No queued changes.", blocker: null, remediation: null, held: 0, observed_at: 0, evidence: [] },
+    execution_holds: [{ kind: "local_handoff", task_id: "BR#3", task_url: "https://hub.fleetbridge.run/card/BR-3", pr: 2479, reason: "Wait for exact IAM grant" }],
+  };
+  const html = renderToStaticMarkup(<TrainPanelView lanes={[lane]} error={null} now={1_800_000_000_000} />);
+  expect(html).toContain("PR #2479 waiting for local handoff");
+  expect(html).toContain('title="Wait for exact IAM grant"');
+  expect(html).toContain('href="https://hub.fleetbridge.run/card/BR-3"');
+  expect(html).toContain("0 changes queued");
+  expect(html).not.toContain("Merge machinery stalled");
+});

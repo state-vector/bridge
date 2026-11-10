@@ -10,6 +10,15 @@ import { RecoveryCauseSchema } from "./train-recovery.ts";
 import { ExecutionBlockerSchema } from "./execution.ts";
 import { RecoveryPreemptionSchema } from "./scheduling.ts";
 
+export const TrainExecutionHoldSchema = z.object({
+  kind: z.enum(["local_handoff", "executor_capability"]),
+  task_id: z.string(),
+  task_url: z.string(),
+  pr: z.number().int().positive(),
+  reason: z.string(),
+});
+export type TrainExecutionHold = z.infer<typeof TrainExecutionHoldSchema>;
+
 export const TrainBranchPreparationSchema = z.object({
   pr: z.number().int().positive(),
   head_sha: z.string().regex(/^[0-9a-f]{40}$/),

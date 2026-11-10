@@ -1,5 +1,5 @@
 import { getKbHubConfig } from "./config";
-import type { ExecutionModelView, GatewayDispatch, LaneOperationalState, TrainBranchPreparation, WorkWait } from "@bridge/contracts";
+import type { ExecutionModelView, GatewayDispatch, LaneOperationalState, TrainBranchPreparation, TrainExecutionHold, WorkWait } from "@bridge/contracts";
 import { HubDiagnosticsSchema } from "@bridge/contracts";
 
 /** Knowledge-layer REST + realtime client.
@@ -289,6 +289,7 @@ export interface KbBaseRedResolution {
 export interface KbTrainLane {
   lane_state?: LaneOperationalState;
   line?: import("@bridge/contracts").TrainLineProjection;
+  execution_holds?: TrainExecutionHold[];
   lane: string;
   card: string;
   lease: KbTrainLease | null;

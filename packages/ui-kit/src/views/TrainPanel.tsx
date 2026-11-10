@@ -306,6 +306,11 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
         </span>
         <span className="trainc-prog top-num">{progress}</span>
         <span className="trainc-msg">{line.remediation?.text ?? line.reason}
+          {(l.execution_holds ?? []).map(hold => <span key={`${hold.task_id}-${hold.pr}`} title={hold.reason}>
+            <TaskLink id={hold.task_id} url={hold.task_url} openTask={openTask}>
+              PR #{hold.pr} {hold.kind === "local_handoff" ? "waiting for local handoff" : "waiting for executor capability"}
+            </TaskLink>
+          </span>)}
           {(l.escalations ?? []).map((e) => <Chip key={`${e.task_id}-${e.pr}`} pill tone={e.expired ? "err" : "warn"}
             title={`bounce budget (BR#4688): ${e.task_id} PR #${e.pr} breached at ${e.bounce_no}× ${e.bounce_kind ?? "?"} bounces — de-queued, escalation ask ${e.ask_id ?? "?"}; owner clock ${e.expired ? `expired ${age(e.grace_until, now)} ago (executor closes the PR)` : `${age(e.grace_until, now)} left`}`}>⏳ {e.pr ? `#${e.pr}` : e.task_id} ×{e.bounce_no}</Chip>)}
         </span>

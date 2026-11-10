@@ -234,7 +234,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -15060,6 +15060,24 @@ export class KnowledgeHub {
     this.saveLaneState(lane.id, meta, Date.now());
   }
 
+  private laneExecutionHolds(repo: string, base: string) {
+    const tasks = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type='task' AND status='blocked'
+      AND json_extract(meta,'$.blocked.await_event.event') IN ('local_handoff','executor_capability')`).toArray();
+    return tasks.flatMap(task => {
+      const meta = JSON.parse(String(task.meta));
+      const wait = validateAwaitEvent(meta.blocked?.await_event);
+      if (wait?.event !== "local_handoff" && wait?.event !== "executor_capability") return [];
+      return trainLegsRemaining(meta, repo, base).flatMap(leg => {
+        if (!Number.isInteger(leg.number) || leg.number <= 0 || this.one(`SELECT pr FROM provenance WHERE repo=? AND pr=?
+          UNION SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND pr=? AND state IN ('MERGED','CLOSED')`, repo, leg.number, repo, leg.number)) return [];
+        const id = String(task.id);
+        return [TrainExecutionHoldSchema.parse({
+          kind: wait.event, task_id: id, task_url: this.cardUrl(id), pr: leg.number, reason: String(meta.blocked?.reason ?? ""),
+        })];
+      });
+    });
+  }
+
   private laneAwaitingRows(repo: string, now0: number, ttlMs?: number, base?: string) {
     const resolvedTtlMs = ttlMs ?? clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     return (this.state.storage.sql.exec(
@@ -17386,6 +17404,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         starvation: meta.lane?.starvation ?? meta.starvation ?? null,
         queue,
         awaiting: awaitingRows,
+        execution_holds: this.laneExecutionHolds(lane.repo, lane.base),
         pr_stats: prStats,
         batches,
         red_main: recordedRepair

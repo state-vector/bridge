@@ -509,6 +509,7 @@ describe("BR#6776 durable check recovery", () => {
     });
     expect(handedOff.body.kind).toBe("requested");
     expect((await laneSnap(repo)).queue.map((car: { id: string }) => car.id)).not.toContain(task);
+    expect((await laneSnap(repo)).execution_holds).toMatchObject([{ kind: "local_handoff", task_id: task, pr }]);
 
     const renewal = await kbJson("/train.lease", { repo, actor, action: "renew",
       progress: { progress: "Preparing", progress_age_ms: 0, holder: actor, preparation: { pr, head_sha: head, phase: "updating" } } });
@@ -531,6 +532,7 @@ describe("BR#6776 durable check recovery", () => {
       head_sha: head, merge_sha: merge, merged_at: Date.now() - 10 * 60_000 });
     expect(observed.status).toBe(200);
     expect((await laneSnap(repo)).currently).toMatchObject({ task_id: null, merge_sha: merge });
+    expect((await laneSnap(repo)).execution_holds).toEqual([]);
     expect((await kbJson("/get", { id: task })).body.meta.blocked).toEqual(before.meta.blocked);
   });
 
