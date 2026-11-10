@@ -29,6 +29,8 @@ mod attempt_journal;
 mod gateway_pipeline;
 #[path = "worker_session.rs"]
 mod worker_session;
+#[path = "writer_scan.rs"]
+mod writer_scan;
 #[path = "workspace.rs"]
 mod workspace;
 #[path = "recovery.rs"]
@@ -3643,6 +3645,15 @@ fn spawn_opencode(
         }
     }
     let expected_attempt = format!("{}-{}", std::process::id(), now_ms());
+    // Write-ahead identity (BR#9843): fsync the client attempt id + worktree
+    // BEFORE the hub begin call. A crash between begin and the post-begin
+    // launch journal then still leaves durable identity — recovery upgrades
+    // the reservation mint to an honest unproven record with the original
+    // worktree instead of a faceless UnknownWriter charge.
+    if let Err(error) = gateway_pipeline::persist_begin_intent(cfg, tid, &bridge_session, &expected_attempt, worktree.clone()) {
+        failed_start(cfg, tid, StartStage::Inspect, &format!("begin identity could not be persisted: {error}"), None, worktree.as_deref());
+        return;
+    }
     let begin_requested_at = Instant::now();
     let begin = begin_with_fresh_readiness(readiness_observed, update_request().is_some(), || {
         // The tick already advertised this exact worker/config inventory. Do
@@ -3675,6 +3686,10 @@ fn spawn_opencode(
         Ok(control) => control,
         Err(error) => { dlog(tid, &format!("launch intent could not be persisted; no writer launched: {error}")); return; },
     };
+    // The full-fence launch journal is durable: the pre-begin intent's job is
+    // done. Left in place on any earlier failure so recovery can identify the
+    // attempt this daemon began.
+    let _ = gateway_pipeline::remove_begin_intent(cfg, tid, &bridge_session);
     if matches!(remote.state, RemoteAttemptState::Restoring) {
         dlog(tid, "Hub requested a retired checkpoint restore; no writer launched");
         return;

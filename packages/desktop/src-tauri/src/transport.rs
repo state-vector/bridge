@@ -33,7 +33,9 @@ impl ProcessIdentity { pub fn group(&self) -> u32 { match self { Self::Linux { g
 pub enum GroupState { Empty, ZombiesOnly, Live, Unobservable }
 impl GroupState { pub fn quiescent(self) -> bool { matches!(self, Self::Empty | Self::ZombiesOnly) } }
 
-#[cfg(target_os = "linux")]
+// Test-visible so the fence-scoped census (writer_scan.rs, BR#9843) can be
+// exercised against fixture /proc trees on every platform.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn proc_stat(raw: &str) -> Option<(char, u32, u64)> {
     let fields: Vec<_> = raw.get(raw.rfind(") ")? + 2..)?.split_whitespace().collect();
     Some((fields.first()?.chars().next()?, fields.get(2)?.parse().ok()?, fields.get(19)?.parse().ok()?))

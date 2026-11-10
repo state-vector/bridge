@@ -109,6 +109,42 @@ impl Launch {
     }
 }
 
+/// Write-ahead begin identity (BR#9843). Persisted and fsynced BEFORE the hub
+/// begin call: the client-chosen attempt id (echoed verbatim by the hub) and
+/// the worktree are then durable across a crash between begin and the
+/// post-begin launch journal. Recovery upgrades such a reservation to an
+/// honest unproven record with the original worktree instead of a faceless
+/// UnknownWriter charge, and the fence-scoped scan discharges it with kernel
+/// proof. Nothing but the exact-fence evidence ever releases capacity.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct BeginIntent {
+    ticket: Ticket, host: String, url: String,
+    expected_attempt: String,
+    #[serde(default)]
+    worktree: Option<PathBuf>,
+    at: u64,
+}
+fn begin_intent_path(cfg: &DispatchConfig, ticket: &Ticket) -> Result<PathBuf, String> {
+    Ok(root(cfg)?.join("begin-intents").join(format!("{}.json", journal::stable_key(&[&ticket.task_id, &ticket.session]))))
+}
+pub(super) fn persist_begin_intent(cfg: &DispatchConfig, task: &str, session: &str, expected_attempt: &str, worktree: Option<PathBuf>) -> Result<(), String> {
+    let intent = BeginIntent { ticket: Ticket { task_id: task.into(), session: session.into() },
+        host: cfg.label.clone().ok_or("gateway host missing")?, url: cfg.url.trim_end_matches('/').into(),
+        expected_attempt: expected_attempt.into(), worktree, at: now_ms() };
+    journal::write_file(&begin_intent_path(cfg, &intent.ticket)?, &serde_json::to_vec(&intent).map_err(|e| e.to_string())?)
+}
+fn begin_intent(cfg: &DispatchConfig, ticket: &Ticket) -> Result<Option<BeginIntent>, String> {
+    match std::fs::read(begin_intent_path(cfg, ticket)?) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| format!("gate: begin intent unreadable; preserve ownership: {e}"))?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+pub(super) fn remove_begin_intent(cfg: &DispatchConfig, task: &str, session: &str) -> Result<(), String> {
+    let ticket = Ticket { task_id: task.into(), session: session.into() };
+    std::fs::remove_file(begin_intent_path(cfg, &ticket)?).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())
+}
+
 pub(super) fn cross_launch_boundary(cfg: &DispatchConfig, task: &str, generation: u64, attempt_id: &str) -> Result<(), String> {
     let ticket = Ticket { task_id: task.into(), session: claim_session(cfg, task) };
     let host = cfg.label.clone().ok_or("gateway host missing")?;
@@ -359,6 +395,8 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                             workspace::Owner::open(&cfg)?.release(&Released::from_hub(&record.owner, &reply)?)?;
                             remove_reservation(&cfg, record.ticket())?;
                             remove_launch(&cfg, &record)?;
+                            let ticket = record.ticket();
+                            let _ = remove_begin_intent(&cfg, &ticket.task_id, &ticket.session)?;
                             worker_session::retire(&cfg, &record)?;
                             journal::remove(&root, &record)?;
                             return Ok(());
@@ -449,6 +487,8 @@ fn retire_proved_writer(cfg: &DispatchConfig, record: &Record, receipt: &WriterR
     if path.exists() && std::fs::read(&path).map_err(|e| e.to_string())? != raw { return Err("Saved result changed during recovery; preserve it".into()); }
     worker_session::retire(cfg, &saved)?; // an actual live worker lock still prevents retirement
     remove_launch(cfg, &saved)?;
+    let ticket = saved.ticket();
+    let _ = remove_begin_intent(cfg, &ticket.task_id, &ticket.session)?;
     journal::remove(&terminal, &saved)?; // keeps the complete original record in archive
     // Reservations are keyed only by task/session, not generation. Do not
     // remove one here: a newer attempt may use the same session. Its existing
@@ -515,9 +555,13 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
     // A vanished transport result is not success. Capture that exact truth,
     // with kernel proof and the original worktree, into the NORMAL stopped →
     // stopped → finalize path. No synthesized finalize ACK or lease inference.
-    let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("Original attempt required".into()); };
+    let Ownership::Attempt { generation, attempt_id, .. } = &record.owner else { return Err("Original attempt required".into()) };
     if !root(cfg)?.join("workers").join(record.name().trim_end_matches(".json")).join("request.json").exists() {
-        return Err("Original stopped receipt or worker manifest is required".into());
+        // BR#9843: neither a hub writer receipt nor a worker manifest exists —
+        // the originating daemon crashed before its stop receipt and before/
+        // without a manifest. Discharge on kernel fence proof or hold; never
+        // an error wall the observe loop retries into forever.
+        return self_heal_release(cfg, record, apply);
     }
     let state = execution_request(cfg, &record.ticket().task_id, &record.ticket().session,
         &record.command_id("reconcile-inspect"), json!({"kind":"inspect"}))?;
@@ -550,6 +594,92 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
         }
         Ok(None)
     })
+}
+
+/// BR#9843 self-heal: the charged attempt has neither a hub writer receipt nor
+/// a worker manifest. The only lawful local discharges are kernel facts from a
+/// fence-scoped same-UID /proc census (writer_scan): a live exact-fence match
+/// is fenced-stopped through the normal transport path; a complete readable
+/// census with no match proves the writer absent and delivers an honest
+/// ResultUnavailable through the normal stopped→finalize path. Any visibility
+/// gap holds. Never infer from lease expiry, time or titles; never touch a
+/// newer attempt; no hub protocol change, no privilege.
+fn self_heal_release(cfg: &DispatchConfig, record: &Record, apply: bool) -> Result<Option<Released>, String> {
+    let Ownership::Attempt { generation, attempt_id, ticket, .. } = &record.owner else { return Err("Original attempt required".into()) };
+    let state = execution_request(cfg, &ticket.task_id, &ticket.session,
+        &record.command_id("reconcile-inspect"), json!({"kind":"inspect"}))?;
+    let attempt = &state["attempt"];
+    if attempt["host"] != record.host || attempt["session"] != ticket.session || attempt["generation"] != *generation
+        || attempt["attempt_id"] != *attempt_id
+        || !matches!(attempt["phase"].as_str(), Some("running" | "restoring" | "stopping"))
+        || state["handoff"]["phase"] != "none"
+        || state["operations"].as_array().is_none_or(|ops| ops.iter().any(|op| matches!(op["state"].as_str(), Some("prepared" | "outcome_unknown")))) {
+        return Err("Original live fence, retained-work authority or outside-action proof is missing".into());
+    }
+    let target = writer_scan::ScanTarget::new(&record.owner, record.name().trim_end_matches(".json"))?;
+    let first = writer_scan::scan_live(cfg, &target);
+    let verdict = match first {
+        live @ writer_scan::FenceScan::Live(_) => live,
+        absent @ writer_scan::FenceScan::Absent { .. } => {
+            // Two clean passes spaced past fork/exec of a just-queued worker
+            // unit before kernel absence is trusted.
+            std::thread::sleep(writer_scan::rescan_spacing());
+            match writer_scan::scan_live(cfg, &target) {
+                writer_scan::FenceScan::Absent { .. } => absent,
+                other => other,
+            }
+        },
+        hold @ writer_scan::FenceScan::Hold(_) => hold,
+    };
+    let (writers, evidence) = match verdict {
+        writer_scan::FenceScan::Hold(reason) => return Err(format!("gate: fence-scoped writer scan cannot prove identity: {reason}")),
+        writer_scan::FenceScan::Live(matches) => {
+            if !apply { return Ok(None); }
+            let (writers, stopped) = writer_scan::stop_matches(&matches)?;
+            (writers, json!({"result":"live","stopped":stopped["stopped"],"at":now_ms()}))
+        },
+        writer_scan::FenceScan::Absent { scanned } => {
+            if !apply { return Ok(None); }
+            (WriterProof::NoLiveGroupMembers, json!({"result":"absent","scanned":scanned,"at":now_ms()}))
+        },
+    };
+    let outcome = if evidence["result"] == "live" {
+        Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
+            stderr_tail: "Fenced stop of an orphaned live writer matched by the exact execution fence; its uncaptured result is unavailable; original work retained".into(), cause: None }
+    } else {
+        Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
+            stderr_tail: format!("Daemon restart left no manifest or receipt; a complete same-UID /proc census ({} entries) found no process matching the exact execution fence; the writer is kernel-proved absent; original work retained", evidence["scanned"]), cause: None }
+    };
+    let terminal = terminal_root(cfg)?;
+    let launch_path = root(cfg)?.join("launches").join(record.name());
+    let launch_record = match std::fs::read_to_string(&launch_path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let saved = match std::fs::read(terminal.join(record.name())) {
+        Ok(original) => {
+            let saved: Record = serde_json::from_slice(&original).map_err(|e| e.to_string())?;
+            if !writer_observable(&saved) || saved.owner != record.owner { return Err("A real result arrived; preserve normal delivery".into()); }
+            saved
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => record.clone(),
+        Err(e) => return Err(e.to_string()),
+    };
+    // Archive the scan evidence exactly like the receipt apply path — before
+    // the journal is mutated, and never over existing proof.
+    let archive = root(cfg)?.join("reconciled-writer-proofs").join(record.name());
+    if !archive.exists() { journal::write_file(&archive, &serde_json::to_vec(&json!({"record":saved,"launch_record":launch_record,"scan":evidence})).map_err(|e| e.to_string())?)?; }
+    // Preserve any saved unproven outcome/worktree; never synthesize a result.
+    let outcome = match &saved.work { Work::Unproven { outcome, .. } => outcome.clone(), _ => outcome };
+    let worktree = match &saved.work {
+        Work::Unproven { worktree: Some(path), .. } => Some(path.clone()),
+        _ => begin_intent(cfg, record.ticket()).ok().flatten().and_then(|intent| intent.worktree),
+    };
+    journal::save(&terminal, &Record { work: Work::Stopped { outcome, writers, worktree, step: Step::Stop }, disposition: Disposition::Pending, ..saved })?;
+    let ticket = record.ticket();
+    let _ = remove_begin_intent(cfg, &ticket.task_id, &ticket.session);
+    Ok(None)
 }
 
 pub(super) fn reconcile(cfg: &DispatchConfig, apply: bool, task: Option<&str>) -> Result<serde_json::Value, String> {
@@ -690,9 +820,21 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
             let a = &state["attempt"];
             let record = if a["session"] == input.ticket.session && a["phase"] != "quiesced" && !a.is_null() {
                 let generation = a["generation"].as_u64().ok_or("gate: recovered attempt generation missing")?;
-                let attempt_id = a["attempt_id"].as_str().ok_or("gate: recovered attempt id missing")?;
-                Record { owner: Ownership::Attempt { ticket: input.ticket, host: host.into(), generation, attempt_id: attempt_id.into() }, host: host.into(), url: cfg.url.clone(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
-                    work: Work::UnknownWriter { reason: "Daemon restarted without a terminal process-group-empty receipt; retain writer ownership for kernel reconciliation".into() } }
+                let attempt_id = a["attempt_id"].as_str().ok_or("gate: recovered attempt id missing")?.to_string();
+                // Write-ahead begin identity (BR#9843): this daemon issued this
+                // begin (the durable pre-begin intent names the exact echoed
+                // attempt id) but the launch journal was never written — no
+                // writer can have crossed the launch boundary. Retain the
+                // worktree and an honest unproven result for the fence-scoped
+                // kernel discharge instead of a faceless UnknownWriter.
+                let identified = begin_intent(&cfg, &input.ticket).ok().flatten()
+                    .filter(|intent| intent.host == host && intent.url == cfg.url.trim_end_matches('/') && intent.expected_attempt == attempt_id);
+                Record { owner: Ownership::Attempt { ticket: input.ticket, host: host.into(), generation, attempt_id }, host: host.into(), url: cfg.url.clone(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
+                    work: if let Some(intent) = identified {
+                        Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted after begin before the launch journal existed; no writer crossed the launch boundary; original work retained".into(), cause: None }, worktree: intent.worktree }
+                    } else {
+                        Work::UnknownWriter { reason: "Daemon restarted without a terminal process-group-empty receipt; retain writer ownership for kernel reconciliation".into() }
+                    } }
             } else {
                 Record { owner: Ownership::Reservation { ticket: input.ticket }, host: host.into(), url: cfg.url.clone(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
                     work: Work::Unstarted { reason: "Recovered a persisted reservation with no active owned attempt; reconcile before scheduling".into() } }
@@ -1084,6 +1226,9 @@ pub(crate) mod tests {
         let proof = Arc::new(Mutex::new(json!({"kind":"writer_receipt_missing"}))); let response = proof.clone();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let seen = reads.clone();
         let hub = Hub::new(move |request| {
+            // BR#9843: a missing receipt now probes the live fence before the
+            // kernel scan; an unconfirmable fence keeps the charge held.
+            if request["params"]["arguments"]["command"]["kind"] == "inspect" { return Some(json!({})); }
             assert_eq!(request["params"]["arguments"]["command"]["kind"],"writer_receipt","recovery may only observe canonical stop proof");
             seen.fetch_add(1,Ordering::SeqCst); Some(response.lock().unwrap().clone())
         });
@@ -1126,6 +1271,9 @@ pub(crate) mod tests {
         let owner=Arc::new(Mutex::new(None::<Ownership>));let expected=owner.clone();
         let hub=Hub::new(move |request| {
             let c=&request["params"]["arguments"]["command"];
+            // BR#9843: a missing receipt now probes the live fence before the
+            // kernel scan; an unconfirmable fence keeps the record waiting.
+            if c["kind"]=="inspect" { return Some(json!({})); }
             assert_eq!(c["kind"],"writer_receipt","offline recovery cannot replay a mutation");
             Some(match c["generation"].as_u64().unwrap() {
                 1=>writer_proof_reply(expected.lock().unwrap().as_ref().unwrap()),
@@ -1492,5 +1640,287 @@ pub(crate) mod tests {
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
         assert_eq!(std::fs::read_to_string(work.join("keep")).unwrap(), "newer generation's work");
         drop(controller); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // ---- BR#9843: fence-scoped writer self-heal ---------------------------
+
+    fn fake_proc(cfg: &DispatchConfig) -> PathBuf {
+        let root = root(cfg).unwrap().join("fake-proc");
+        std::fs::create_dir_all(root.join("sys/kernel/random")).unwrap();
+        std::fs::write(root.join("sys/kernel/random/boot_id"), "fixture-boot-id\n").unwrap();
+        root
+    }
+    fn fake_uid() -> u32 { unsafe { libc::getuid() } }
+    /// One /proc-shaped census entry. `environ_dir` makes environ unreadable
+    /// (a directory read fails on every platform, root included).
+    fn fake_entry(root: &Path, pid: u32, uid: u32, env: Option<&str>, cmdline: &str, unit: Option<&str>, environ_dir: bool) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), format!("{pid} (fixture) S 1 {pid} {pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 77 0 0")).unwrap();
+        std::fs::write(dir.join("status"), format!("Name:\tfixture\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")).unwrap();
+        std::fs::write(dir.join("cmdline"), cmdline.replace(' ', "\0")).unwrap();
+        let unit_path = unit.map(|unit| format!("/user.slice/user-{uid}.slice/user@{uid}.service/{unit}")).unwrap_or_else(|| "/user.slice".into());
+        std::fs::write(dir.join("cgroup"), format!("0::{unit_path}\n")).unwrap();
+        if environ_dir { std::fs::create_dir_all(dir.join("environ")).unwrap(); }
+        else { std::fs::write(dir.join("environ"), format!("{}\0", env.unwrap_or(""))).unwrap(); }
+    }
+    fn fence_env(owner: &Ownership) -> String {
+        format!("BRIDGE_TASK_ID={}\0BRIDGE_EXECUTOR_SESSION={}\0BRIDGE_EXECUTION_FENCE={}",
+            owner.ticket().task_id, owner.ticket().session, serde_json::to_string(owner).unwrap())
+    }
+    fn unclaimed_record(cfg: &DispatchConfig, task: &str, generation: u64) -> Record {
+        Record { owner: Ownership::Attempt { ticket: Ticket { task_id: task.into(), session: "original".into() }, host: cfg.label.clone().unwrap(), generation, attempt_id: format!("attempt-{generation}") },
+            host: cfg.label.clone().unwrap(), url: cfg.url.clone(), observed_at: 1, process: None,
+            disposition: Disposition::Rejected { reason: "crashed before stop receipt".into() },
+            work: Work::UnknownWriter { reason: "Daemon restarted without a terminal process-group-empty receipt".into() } }
+    }
+    fn inspect_state(owner: &Ownership, phase: &str) -> serde_json::Value {
+        let Ownership::Attempt { ticket, host, generation, attempt_id } = owner else { panic!("attempt required") };
+        json!({"attempt":{"phase":phase,"host":host,"session":ticket.session,"generation":generation,"attempt_id":attempt_id},"handoff":{"phase":"none"},"operations":[]})
+    }
+    fn fence_reply(owner: &Ownership, phase: &str, writers: &serde_json::Value) -> serde_json::Value {
+        let Ownership::Attempt { ticket, host, generation, attempt_id } = owner else { panic!("attempt required") };
+        json!({"attempt":{"phase":phase,"host":host,"session":ticket.session,"generation":generation,"attempt_id":attempt_id,"writers":writers}})
+    }
+
+    // 1. Crashed-runner record + live exact-fence process -> fenced stop,
+    //    stopped→finalize delivered, reservation/journal retired.
+    #[test]
+    fn fence_scan_live_orphan_is_fenced_stopped_then_finalized() {
+        let owner = Arc::new(Mutex::new(None::<Ownership>));
+        let calls = Arc::new(Mutex::new(Vec::<String>::new())); let observed = calls.clone();
+        let bound = owner.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "schedule" => Some(json!({"kind":"no_eligible_work"})),
+                "writer_receipt" => Some(json!({"kind":"writer_receipt_missing"})),
+                "inspect" => Some(inspect_state(bound.lock().unwrap().as_ref().unwrap(), "running")),
+                "stopped" | "finalize" => {
+                    observed.lock().unwrap().push(command["kind"].as_str().unwrap().into());
+                    Some(fence_reply(&bound.lock().unwrap().clone().unwrap(), if command["kind"] == "stopped" { "finalizing" } else { "quiesced" }, &command["writers"]))
+                },
+                "receipt" => Some(json!({"kind":"receipt_missing"})),
+                other => panic!("self-heal must not repeat effects, got {other}"),
+            }
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        let record = unclaimed_record(&cfg, "orphan-live", 1);
+        *owner.lock().unwrap() = Some(record.owner.clone());
+        let proc = fake_proc(&cfg);
+        fake_entry(&proc, 3900001, fake_uid(), Some(&fence_env(&record.owner)), "/usr/bin/bridge internal-worker fixture", None, false);
+        let ticket = record.ticket().clone();
+        let terminal = terminal_root(&cfg).unwrap();
+        journal::insert(&terminal, record.clone()).unwrap();
+        let reservation = reservation_path(&cfg, &ticket).unwrap();
+        journal::write_file(&reservation, b"persisted reservation").unwrap();
+        let mut controller = Controller::new(&cfg, &ready, &snap);
+        controller.registry.restore_finalization(record.owner.clone(), FinalWork::Journal(record.clone())).ok().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !controller.registry.is_idle() { controller.registry.poll(|_| None); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(controller.registry.counts().charged, 0, "the fence-scoped stop must release the immortal charge");
+        assert_eq!(*calls.lock().unwrap(), vec!["stopped".to_string(), "finalize".to_string()], "delivery rides the normal stopped→finalize path");
+        assert!(journal::pending(&terminal, cfg.label.as_deref().unwrap(), &cfg.url).unwrap().is_empty());
+        let archived: Record = serde_json::from_slice(&std::fs::read(terminal.join("archive").join(record.name())).unwrap()).unwrap();
+        assert_eq!(archived.owner, record.owner, "the delivered record is archived, not discarded");
+        let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(root(&cfg).unwrap().join("reconciled-writer-proofs").join(record.name())).unwrap()).unwrap();
+        assert_eq!(evidence["record"]["work"]["kind"], "unknown_writer", "the original crashed-runner record is preserved as scan evidence");
+        assert_eq!(evidence["scan"]["stopped"][0]["pid"], 3900001);
+        assert_eq!(evidence["scan"]["stopped"][0]["via"], "environ");
+        assert!(!reservation.exists(), "finalization retires the persisted reservation");
+        drop(controller); drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // 2. Complete readable census with no match -> NoLiveGroupMembers proof,
+    //    honest ResultUnavailable, saved outcome/worktree preserved.
+    #[test]
+    fn complete_census_absence_discharges_and_preserves_captured_work() {
+        let owner = Arc::new(Mutex::new(None::<Ownership>));
+        let stopped = Arc::new(Mutex::new(Vec::<serde_json::Value>::new())); let seen = stopped.clone();
+        let bound = owner.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "schedule" => Some(json!({"kind":"no_eligible_work"})),
+                "writer_receipt" => Some(json!({"kind":"writer_receipt_missing"})),
+                "inspect" => Some(inspect_state(bound.lock().unwrap().as_ref().unwrap(), "stopping")),
+                "stopped" => { seen.lock().unwrap().push(command.clone()); Some(fence_reply(&bound.lock().unwrap().clone().unwrap(), "finalizing", &command["writers"])) },
+                "finalize" => Some(fence_reply(&bound.lock().unwrap().clone().unwrap(), "quiesced", &command["writers"])),
+                "receipt" => Some(json!({"kind":"receipt_missing"})),
+                other => panic!("unexpected effect {other}"),
+            }
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        let mut record = unclaimed_record(&cfg, "orphan-absent", 4);
+        record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: "original captured tail".into(), stderr_tail: "original transport loss".into(), cause: None },
+            worktree: Some(root(&cfg).unwrap().join("retained-work")) };
+        *owner.lock().unwrap() = Some(record.owner.clone());
+        let wip = root(&cfg).unwrap().join("retained-work"); journal::write_file(&wip, b"unpublished work").unwrap();
+        let proc = fake_proc(&cfg);
+        fake_entry(&proc, 3900011, fake_uid().wrapping_add(4242), Some("PATH=/bin"), "compiler --job", None, false); // foreign owner: provably not ours
+        fake_entry(&proc, 3900012, fake_uid(), None, "/bin/sleep 60", None, false); // same uid, unrelated, readable
+        let other_task = Ownership::Attempt { ticket: Ticket { task_id: "another-task".into(), session: "another-session".into() }, host: "h".into(), generation: 9, attempt_id: "nine".into() };
+        fake_entry(&proc, 3900013, fake_uid(), Some(&fence_env(&other_task)), "bridge internal-worker other", None, false); // another fence's worker
+        let terminal = terminal_root(&cfg).unwrap();
+        journal::insert(&terminal, record.clone()).unwrap();
+        let mut controller = Controller::new(&cfg, &ready, &snap);
+        controller.registry.restore_finalization(record.owner.clone(), FinalWork::Journal(record.clone())).ok().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !controller.registry.is_idle() { controller.registry.poll(|_| None); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
+        assert_eq!(controller.registry.counts().charged, 0, "kernel-proved absence must release the charge");
+        let stopped = stopped.lock().unwrap();
+        assert_eq!(stopped[0]["writers"], "no_live_group_members");
+        assert_eq!(stopped[0]["outcome"]["stdout_tail"], "original captured tail", "the saved unproven outcome is preserved, never synthesized");
+        drop(stopped);
+        assert_eq!(std::fs::read(&wip).unwrap(), b"unpublished work");
+        let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(root(&cfg).unwrap().join("reconciled-writer-proofs").join(record.name())).unwrap()).unwrap();
+        assert_eq!(evidence["scan"]["result"], "absent");
+        assert_eq!(evidence["scan"]["scanned"], 2, "every readable same-uid entry backs the proof (foreign-owner entries are provably not ours)");
+        drop(controller); drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // 3. An unreadable same-UID entry holds (fail closed); an env-blind entry
+    //    kernel-provably inside ANOTHER fence's unit never blocks the proof.
+    #[test]
+    fn unreadable_same_uid_census_holds_fail_closed() {
+        let owner = Arc::new(Mutex::new(None::<Ownership>));
+        let bound = owner.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "writer_receipt" => Some(json!({"kind":"writer_receipt_missing"})),
+                "inspect" => Some(inspect_state(bound.lock().unwrap().as_ref().unwrap(), "running")),
+                other => panic!("a hold must not stop or finalize anything, got {other}"),
+            }
+        });
+        let (cfg, ready, _) = fixture(&hub);
+        let record = unclaimed_record(&cfg, "orphan-hold", 2);
+        *owner.lock().unwrap() = Some(record.owner.clone());
+        let proc = fake_proc(&cfg);
+        fake_entry(&proc, 3900021, fake_uid(), None, "/bin/sleep 60", None, true); // environ unreadable, no bridge markers
+        let terminal = terminal_root(&cfg).unwrap();
+        journal::insert(&terminal, record.clone()).unwrap();
+        let before = std::fs::read(terminal.join(record.name())).unwrap();
+        let lock = root(&cfg).unwrap().join("test.lock");
+        let held = reconcile_locked(&cfg, true, None, &lock).unwrap();
+        assert!(held["waiting"].as_array().unwrap().iter().any(|v| v["reason"].as_str().is_some_and(|s| s.contains("cannot be proved outside this fence"))), "unreadable same-uid evidence must hold");
+        assert_eq!(std::fs::read(terminal.join(record.name())).unwrap(), before, "a hold writes nothing");
+        assert!(!root(&cfg).unwrap().join("reconciled-writer-proofs").exists());
+        // The same env-blind entry, kernel-cgroup-provable as another fence's
+        // worker, is provably not ours — the census may then discharge.
+        let entry = proc.join("3900021");
+        std::fs::remove_dir_all(entry.join("environ")).unwrap();
+        std::fs::write(entry.join("cgroup"), "0::/user.slice/bridge-worker-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service\n").unwrap();
+        let applied = reconcile_locked(&cfg, true, None, &lock).unwrap();
+        assert_eq!(applied["eligible"].as_array().unwrap().len(), 1);
+        let saved: Record = serde_json::from_slice(&std::fs::read(terminal.join(record.name())).unwrap()).unwrap();
+        assert!(matches!(saved.work, Work::Stopped { writers: WriterProof::NoLiveGroupMembers, .. }));
+        drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // 4. A sibling writer marker (our task/session, different fence) never
+    //    matches and never releases.
+    #[test]
+    fn sibling_fence_marker_never_matches_or_releases() {
+        let owner = Arc::new(Mutex::new(None::<Ownership>));
+        let bound = owner.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "writer_receipt" => Some(json!({"kind":"writer_receipt_missing"})),
+                "inspect" => Some(inspect_state(bound.lock().unwrap().as_ref().unwrap(), "running")),
+                other => panic!("a sibling fence must not be touched, got {other}"),
+            }
+        });
+        let (cfg, ready, _) = fixture(&hub);
+        let record = unclaimed_record(&cfg, "orphan-sibling", 1);
+        *owner.lock().unwrap() = Some(record.owner.clone());
+        let mut sibling = record.owner.clone();
+        if let Ownership::Attempt { generation, .. } = &mut sibling { *generation = 2; }
+        let proc = fake_proc(&cfg);
+        fake_entry(&proc, 3900031, fake_uid(), Some(&fence_env(&sibling)), "bridge internal-worker sibling", None, false);
+        let terminal = terminal_root(&cfg).unwrap();
+        journal::insert(&terminal, record.clone()).unwrap();
+        let before = std::fs::read(terminal.join(record.name())).unwrap();
+        let result = reconcile_locked(&cfg, true, None, &root(&cfg).unwrap().join("test.lock")).unwrap();
+        assert!(result["waiting"].as_array().unwrap().iter().any(|v| v["reason"].as_str().is_some_and(|s| s.contains("different fence"))));
+        assert_eq!(std::fs::read(terminal.join(record.name())).unwrap(), before);
+        drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // 5. The hub's current attempt is newer — an old fence never discharges
+    //    against it.
+    #[test]
+    fn newer_hub_attempt_is_untouched_by_an_old_fence_discharge() {
+        let current = Arc::new(Mutex::new(None::<Ownership>));
+        let bound = current.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str().unwrap() {
+                "writer_receipt" => Some(json!({"kind":"writer_receipt_missing"})),
+                "inspect" => Some(inspect_state(bound.lock().unwrap().as_ref().unwrap(), "running")),
+                other => panic!("an old fence must not stop or finalize a newer attempt, got {other}"),
+            }
+        });
+        let (cfg, ready, _) = fixture(&hub);
+        let record = unclaimed_record(&cfg, "orphan-old", 1);
+        let mut newer = record.owner.clone();
+        if let Ownership::Attempt { generation, attempt_id, .. } = &mut newer { *generation = 2; attempt_id.clear(); attempt_id.push_str("attempt-2"); }
+        *current.lock().unwrap() = Some(newer);
+        let terminal = terminal_root(&cfg).unwrap();
+        journal::insert(&terminal, record.clone()).unwrap();
+        let before = std::fs::read(terminal.join(record.name())).unwrap();
+        let result = reconcile_locked(&cfg, true, None, &root(&cfg).unwrap().join("test.lock")).unwrap();
+        assert!(result["waiting"].as_array().unwrap().iter().any(|v| v["reason"].as_str().is_some_and(|s| s.contains("fence"))));
+        assert_eq!(std::fs::read(terminal.join(record.name())).unwrap(), before);
+        assert!(!root(&cfg).unwrap().join("reconciled-writer-proofs").exists());
+        drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // 6. Write-ahead identity: every crash window around begin leaves the
+    //    daemon able to self-identify the attempt.
+    #[test]
+    fn write_ahead_begin_intent_covers_every_crash_window() {
+        let live: Arc<Mutex<std::collections::BTreeMap<String, serde_json::Value>>> = Arc::new(Mutex::new(Default::default()));
+        let observed = live.clone();
+        let hub = Hub::new(move |request| {
+            let args = &request["params"]["arguments"];
+            assert_eq!(args["command"]["kind"], "inspect", "recovery may only observe");
+            Some(observed.lock().unwrap().get(args["id"].as_str().unwrap()).cloned().unwrap_or(json!({"attempt":null})))
+        });
+        let (cfg, ready, _) = fixture(&hub);
+        let ticket = |task: &str| Ticket { task_id: task.into(), session: "original".into() };
+        // (a) crash between the intent write and begin: no live attempt at all.
+        persist_begin_intent(&cfg, "before-begin", "original", "attempt-before", None).unwrap();
+        journal::write_file(&reservation_path(&cfg, &ticket("before-begin")).unwrap(), &serde_json::to_vec(&Input { ticket: ticket("before-begin"), task: None }).unwrap()).unwrap();
+        // (b) crash between begin and the launch journal: intent matches the
+        // live echoed attempt and carries the worktree.
+        let worktree = root(&cfg).unwrap().join("intent-work");
+        persist_begin_intent(&cfg, "after-begin", "original", "attempt-after", Some(worktree.clone())).unwrap();
+        journal::write_file(&reservation_path(&cfg, &ticket("after-begin")).unwrap(), &serde_json::to_vec(&Input { ticket: ticket("after-begin"), task: None }).unwrap()).unwrap();
+        live.lock().unwrap().insert("after-begin".into(), json!({"attempt":{"session":"original","phase":"running","generation":7,"attempt_id":"attempt-after"}}));
+        // (c) a live attempt this daemon never began: stays fail-closed.
+        persist_begin_intent(&cfg, "foreign-begin", "original", "attempt-mismatch", None).unwrap();
+        journal::write_file(&reservation_path(&cfg, &ticket("foreign-begin")).unwrap(), &serde_json::to_vec(&Input { ticket: ticket("foreign-begin"), task: None }).unwrap()).unwrap();
+        live.lock().unwrap().insert("foreign-begin".into(), json!({"attempt":{"session":"original","phase":"running","generation":2,"attempt_id":"attempt-live"}}));
+        let recovered = recover(&ready.data, Vec::new()).unwrap();
+        let record_for = |task: &str| recovered.iter().find_map(|item| match item {
+            Recovered::Final(_, FinalWork::Journal(record)) if record.ticket().task_id == task => Some(record.clone()),
+            _ => None,
+        }).unwrap_or_else(|| panic!("recovery must journal {task}"));
+        assert!(matches!(record_for("before-begin").work, Work::Unstarted { .. }), "no begin -> the reservation reconciliation path");
+        let identified = record_for("after-begin");
+        match &identified.work {
+            Work::Unproven { outcome, worktree: Some(path) } => {
+                assert_eq!(*path, worktree, "the intent's worktree is preserved for the kernel discharge");
+                assert!(matches!(outcome.kind, OutcomeKind::ResultUnavailable));
+                assert!(outcome.stderr_tail.contains("launch boundary"), "the outcome is honest about what is and is not known");
+            },
+            _ => panic!("an identified begin must retain an honest unproven result"),
+        }
+        let Ownership::Attempt { generation, .. } = &identified.owner else { panic!("fence required") };
+        assert_eq!(*generation, 7);
+        assert!(matches!(record_for("foreign-begin").work, Work::UnknownWriter { .. }), "an attempt this daemon never began stays fail-closed");
+        drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
 }

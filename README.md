@@ -278,6 +278,16 @@ it is not an independently verified OS process count. Old/expired or claimless
 attempts are **unconfirmed**, with expandable task, generation, session and reason.
 They still hold capacity until the gateway confirms their process groups stopped.
 Card release, heartbeat expiry and daemon restart alone never free those slots.
+A daemon that crashed before delivering its stop receipt (and before writing a
+worker manifest) used to leave such a charge forever. The gateway now persists
+a write-ahead begin identity before every hub begin, and when neither a stop
+receipt nor a manifest exists it runs a fence-scoped same-UID /proc census:
+a live process matching the exact execution fence (task/session/generation/
+attempt env markers, or its fence-named systemd unit) is fenced-stopped through
+the normal transport path; a complete readable census with no match is kernel
+proof the writer is absent and releases the slot with an honest
+result-unavailable outcome. Any unreadable or ambiguous entry keeps the hold —
+lease expiry, time and titles are never quiescence evidence.
 Releasing a live managed claim atomically marks its attempt stopping and queues
 an interrupt; the runner must stop and preserve work instead of renewing a
 released worker indefinitely. Only its quiescence confirmation frees the slot.

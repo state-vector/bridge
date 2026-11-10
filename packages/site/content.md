@@ -307,6 +307,14 @@ claim session and fenced begin are required before launching the worker.
 Capacity includes pre-launch reservations and every unquiesced writer—even one
 whose lease expired. A never-launched reservation can recover after five minutes
 without spending task retries, while unpublished work stays on its original host.
+A gateway whose daemon crashed before delivering a stop receipt (and before
+writing a worker manifest) self-heals such charges: it persists a write-ahead
+begin identity before every begin, then runs a fence-scoped same-UID /proc
+census for receipt-less, manifest-less attempts. An exact-fence live match is
+fenced-stopped through the normal transport path; a complete readable census
+with no match proves the writer absent and releases the slot with an honest
+result-unavailable outcome; any unreadable or ambiguous entry keeps the hold.
+Lease expiry, time and titles are never quiescence evidence.
 
 Use `bridge execution schedule-status [hostname]` to see occupied slots,
 reservations, capacity, eligible work, exclusion reasons and the last scheduling
