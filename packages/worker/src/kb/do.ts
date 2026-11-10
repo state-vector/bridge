@@ -6134,13 +6134,13 @@ export class KnowledgeHub {
     return response;
   }
 
-  private async transition(body: any, actor: string, origin: "client" | "machine" = "machine") {
+  private async transition(body: any, actor: string, origin: "client" | "machine" = "machine", beforeWrite?: () => void) {
     if (body.to === "in_progress" || body.to === "todo") {
       const wait = this.startupWait(String(body.id ?? ""));
       if (wait && !(body.to === "in_progress" && this.executionWork().isInteractive(String(body.token_id ?? "")))) throw new Error(`gate: ${startupWaitReason(wait)}`);
     }
     try {
-      return await this.doTransition(body, actor, origin);
+      return await this.doTransition(body, actor, origin, beforeWrite);
     } catch (e) {
       const id = String(body?.id ?? "");
       const to = String(body?.to ?? "");
@@ -6961,7 +6961,7 @@ export class KnowledgeHub {
     return { id, status: "superseded", batch_auth: { ask: askId, answered_by: answeredBy, authorized_scope: authorized.length } };
   }
 
-  private async doTransition(body: any, actor: string, origin: "client" | "machine") {
+  private async doTransition(body: any, actor: string, origin: "client" | "machine", beforeWrite?: () => void) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
@@ -7391,6 +7391,7 @@ export class KnowledgeHub {
     }
     if (terminalStartup) delete meta.startup_wait;
     this.atomicLaneMutation(() => {
+      beforeWrite?.();
       if (rebound) {
         this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(rebound.meta), ts, rebound.id);
         if (laneOfMeta(rebound.meta)) this.saveLaneState(rebound.id, rebound.meta, ts);
@@ -13250,8 +13251,21 @@ export class KnowledgeHub {
       await this.resumePrerequisite(id, repo, pr, mergeSha);
       return { kind: "retained", reason: "Prerequisite observed; the actual execution outcome remains outstanding." };
     }
-    if (isStandingCard(meta, parseTags(row.tags)) || this.protectedExecution(id, meta) || meta.interactive_execution)
+    if (isStandingCard(meta, parseTags(row.tags)) || this.staleReviewHasExecutionHold(id, meta) || meta.interactive_execution)
       return { kind: "retained", reason: "An existing subsystem or executor owns this exit." };
+    let beforeWrite: (() => void) | undefined;
+    if (meta.merge_train?.close_bounce === true && meta.merge_train.breach_class === "gate:done-unreviewed"
+      && trainLegs(meta).length === 1) {
+      const current = JSON.stringify(this.currentTaskReview(id));
+      const refusal = () => this.landedCloseReviewHold(id, repo, pr, mergeSha);
+      const initial = refusal();
+      if (initial) return { kind: "retained", reason: initial };
+      beforeWrite = () => {
+        const reason = refusal();
+        if (reason || JSON.stringify(this.currentTaskReview(id)) !== current)
+          throw new Error(reason ?? "Independent review changed before the landed delivery could be submitted.");
+      };
+    }
     const laneOwner = this.one(`SELECT lane_key FROM lane_state WHERE repo=? AND phase IN ('draining_batch','settling_ci') AND lease_expires_ts>? AND json_extract(state_json,'$.task_id')=? LIMIT 1`, repo, Date.now(), id);
     if (laneOwner) return { kind: "retained", reason: "The live canonical merge lane already owns decisive CI verification." };
     if (row.status === "in_review") return { kind: "retained", reason: "Independent review already owns this delivery." };
@@ -13259,20 +13273,58 @@ export class KnowledgeHub {
     if (row.status === "blocked" && wait && !(wait.event === "pr_merged" && wait.repo === repo && wait.n === pr)
       && !String(meta.blocked?.reason ?? "").startsWith(MERGE_TRAIN_REASON_PREFIX)) return { kind: "retained", reason: "An independent wait owns this exit." };
     const note = `Observed MERGED ${repo}#${pr}: https://github.com/${repo}/commit/${mergeSha}. Verify actual main ancestry, signature, decisive required CI and every task outcome. A merge observation is not delivery acceptance.`;
-    if (row.status !== "in_progress") await this.transition({ id, to: "in_progress", session: "", note, merge_train: true }, actor);
-    const submitted = await this.transition({ id, to: "in_review", session: "", note }, actor);
+    if (row.status !== "in_progress") await this.transition({ id, to: "in_progress", session: "", note, merge_train: true }, actor, "machine", beforeWrite);
+    const submitted = await this.transition({ id, to: "in_review", session: "", note }, actor, "machine", beforeWrite);
     if (!("verify_task" in submitted) || typeof submitted.verify_task !== "string") return { kind: "retained", reason: "Delivery was submitted but no new review duty was returned; existing lifecycle owns its continuation." };
     this.audit(actor, "observed_merge_review_submitted", id, { repo, pr, merge_sha: mergeSha, review: submitted.verify_task });
     return { kind: "submitted", review_id: String(submitted.verify_task) };
+  }
+
+  private landedCloseReviewHold(id: string, repo: string, pr: number, mergeSha: string): string | null {
+    const row = this.one(`SELECT meta,owner,status FROM artefacts WHERE id=?`, id);
+    const meta = JSON.parse(String(row?.meta ?? "{}"));
+    const stamp = meta.merge_train;
+    const legs = trainLegs(meta);
+    const leg = legs[0];
+    if (!row || !["todo", "in_progress"].includes(String(row.status)) || stamp?.state !== "bounced" || stamp.close_bounce !== true
+      || stamp.breach_class !== "gate:done-unreviewed" || stamp.repo !== repo || stamp.pr !== pr
+      || stamp.landed_merge_sha !== mergeSha || legs.length !== 1 || leg.repo !== repo || leg.number !== pr
+      || !trainLegLanded(meta, leg)
+      || !this.one(`SELECT 1 FROM train_events WHERE repo=? AND base=? AND pr=? AND merge_sha=? AND task_id=?
+        AND kind='landed' AND json_extract(detail,'$.close_bounced')=1 LIMIT 1`, repo, leg.base ?? "main", pr, mergeSha, id))
+      return "A landed close bounce needs the exact train receipt and a complete single-leg delivery.";
+    const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
+    if (this.staleReviewHasExecutionHold(id, meta) || meta.interactive_execution || this.strandOwnerLive(row.owner, meta, 10)
+      || meta.awaiting_ask || hold?.kind === "replace" || (hold?.kind === "abandon" && hold.closure.phase === "pending")
+      || (hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > Date.now()))
+      return "An existing executor or independent decision owns this exit.";
+    const review = this.currentTaskReview(id);
+    if (review.phase !== "rejected" && review.phase !== "pending") return null;
+    const duty = this.one(`SELECT meta,owner,status FROM artefacts WHERE id=?`, review.id);
+    const dm = JSON.parse(String(duty?.meta ?? "{}"));
+    if (review.phase === "rejected") {
+      const subject = ReviewSubjectSchema.safeParse(dm.review_subject);
+      return !subject.success || subject.data.revision === (meta.work_revision ?? "legacy")
+        ? "Independent findings still require a disposition." : null;
+    }
+    const attempt = this.executionState(review.id)?.attempt;
+    if (attempt && attempt.phase !== "quiesced" || dm.interactive_execution
+      || (duty?.status === "in_progress" && this.strandOwnerLive(duty.owner, dm, 10))
+      || this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=? AND expires_at>?`, review.id, Date.now()))
+      return "The existing independent review has an executor.";
+    return null;
   }
 
   private async sweepMergedParks(_now0: number): Promise<number> {
     await this.resumeMergedPrerequisites();
     const rows = this.state.storage.sql.exec(
       `SELECT id, meta FROM artefacts
-       WHERE type = 'task' AND status = 'blocked'
-         AND (json_extract(meta, '$.merge_train.state') = 'queued'
-              OR json_extract(meta, '$.merge_train.state') = 'awaiting-ci')`,
+       WHERE type = 'task' AND (
+         (status = 'blocked' AND json_extract(meta, '$.merge_train.state') IN ('queued', 'awaiting-ci'))
+         OR (status IN ('todo', 'in_progress') AND json_extract(meta, '$.merge_train.state') = 'bounced'
+             AND json_extract(meta, '$.merge_train.close_bounce') = 1
+             AND json_extract(meta, '$.merge_train.breach_class') = 'gate:done-unreviewed')
+       )`,
     ).toArray() as any[];
     if (!rows.length) return 0;
     const prov = new Map<string, { merge_sha: string; merged_at: number }>();
@@ -13288,9 +13340,17 @@ export class KnowledgeHub {
         if (!mergeCompletesTask(meta)) continue;
         const legs = trainLegs(meta);
         const repoDefault = String((meta as any).merge_train?.repo ?? (meta as any).pr?.repo ?? "");
-        const mergedLeg = legs.find((l) => {
-          const repo = String(l.repo ?? repoDefault);
-          return repo && prov.has(`${repo}#${Number(l.number) || 0}`);
+        const stamp = meta.merge_train;
+        const closeBounce = stamp?.close_bounce === true && stamp.state === "bounced";
+        if (closeBounce && legs.length !== 1) continue;
+        const mergedLeg = legs.find((leg) => {
+          const repo = String(leg.repo ?? repoDefault);
+          const receipt = prov.get(`${repo}#${leg.number}`);
+          if (!receipt) return false;
+          // A close bounce names the final delivered leg. Use the exact
+          // train receipt even when the bounded GitHub feed omits this PR.
+          return !closeBounce || (stamp.repo === repo && stamp.pr === leg.number
+            && stamp.landed_merge_sha === receipt.merge_sha);
         });
         if (!mergedLeg) continue;
         const legRepo = String(mergedLeg.repo ?? repoDefault);

@@ -2341,6 +2341,75 @@ describe("BR#4489 starvation — capability-aware lane health", () => {
 // { landed, landed_retry, bounce_gate, bounce_bound } and the queue advances.
 
 describe("BR#4753 landed-close recovery (real bundled worker)", () => {
+  it.each(["pending", "findings"] as const)("reconciles an exact landed close bounce with a %s review without a GitHub feed", async (reviewState) => {
+    const repo = "state-vector/close-recovery";
+    const pr = 2808;
+    const head = "a".repeat(40);
+    const merge = "c".repeat(40);
+    const task = await queueViaAccept({ repo, pr, head });
+    const pending = await kbJson("/create", {
+      type: "task", title: "Independent review at the updated head", roles: ["review"], session: "",
+      meta: { machine_duty: { kind: "task-recovery", by: "recovery", subject: task, reason: "queue_binding" } },
+    });
+    const review = String(pending.body.id);
+    await kbJson("/link", { src: review, relation: "child_of", dst: task });
+    const captured = await kbJson("/transition", { id: review, to: "in_progress", actor: "second-reviewer", note: "Review started" });
+    expect(captured.status).toBe(200);
+
+    const actor = "close-recovery-gateway";
+    await acquire(repo, actor, { required_workflows: ["Test"] });
+    const merged = await kbJson("/train.event", {
+      repo, base: "main", actor, kind: "merged", pr, task_id: task, merge_sha: merge, head_sha: head,
+      merged_at: Date.now() - 10 * 60_000,
+    });
+    expect(merged.body.error).toBeUndefined();
+    const settled = await kbJson("/train.ci", {
+      repo, base: "main", actor, sha: merge, checks: [check(1, "Test", "success")],
+    });
+    expect(settled.body.breach_class).toBe("gate:done-unreviewed");
+    expect((await laneSnap(repo)).currently).toBeNull();
+    if (reviewState === "findings") {
+      const rejected = await kbJson("/transition", {
+        id: review, to: "done", actor: "second-reviewer", note: "The delivered behavior fails the contract",
+        review_result: await reviewOutcome(kbJson, review, { kind: "findings", summary: "The delivered behavior fails the contract" }),
+      });
+      expect(rejected.status, JSON.stringify(rejected.body)).toBe(200);
+    }
+
+    expect((await kbJson("/admin.alarm_sweep")).status).toBe(200);
+    const after = (await kbJson("/get", { id: task })).body;
+    const submitted = (await kbJson("/events?limit=100")).body.events
+      .filter((event: { op: string }) => event.op === "observed_merge_review_submitted");
+    if (reviewState === "findings") {
+      expect(after.meta.work_revision).toBe(captured.body.review_subject.revision);
+      expect(submitted).toHaveLength(0);
+      return;
+    }
+    expect(after.status).toBe("in_review");
+    expect(captured.body.review_subject?.revision).toBeTruthy();
+    expect(after.meta.work_revision).not.toBe(captured.body.review_subject.revision);
+    expect((await kbJson("/get", { id: review })).body.status).toBe("in_progress");
+    expect(submitted).toHaveLength(1);
+    const fresh = submitted[0].detail.review;
+    expect(fresh).toMatch(/^BR#\d+$/);
+    expect(fresh).not.toBe(review);
+    expect(submitted[0].detail.merge_sha).toBe(merge);
+    expect((await kbJson("/admin.alarm_sweep")).status).toBe(200);
+    const repeated = (await kbJson("/get", { id: task })).body;
+    expect(repeated.meta.work_revision).toBe(after.meta.work_revision);
+
+    const claimed = await kbJson("/transition", { id: fresh, to: "in_progress", actor: "fresh-reviewer", note: "Verifying the landed delivery" });
+    expect(claimed.body.review_subject).toMatchObject({ task_id: task, revision: after.meta.work_revision });
+    const accepted = await kbJson("/transition", {
+      id: fresh, to: "done", actor: "fresh-reviewer", note: "Verified delivery and green CI",
+      review_result: await reviewOutcome(kbJson, fresh, {
+        kind: "accepted_direct_main", repo, commit: merge, ci_run_url: `https://github.com/${repo}/actions/runs/123`,
+      }),
+    });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect((await kbJson("/get", { id: task })).body.status).toBe("done");
+  });
+
   it("a gate-rejected landed close CLOSE-BOUNCES the culprit card, advances the lane and schedules agent recovery without asking the human", async () => {
     const repo = "state-vector/lane-closebounce";
     // a reachable alarm sink for this episode (the setting overrides BR#3124)
