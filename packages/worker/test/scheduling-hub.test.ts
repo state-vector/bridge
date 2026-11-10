@@ -740,6 +740,37 @@ describe("priority line recovery capacity", () => {
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: handoff.verify_task });
     expect(handoff.verify_task).not.toBe(older);
   });
+  it("keeps an unboosted repair's queue position through independent review", async () => {
+    const project = "repair-review-fifo", g = await gateway(project, 3);
+    const repair = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const claim = await reserve(g);
+    if (claim.kind !== "reserved" || claim.task_id !== repair) throw new Error("repair not reserved");
+    const begin = await g.cmd({ kind: "begin", attempt_id: "fifo-repair", worker: g.auth.agent, action_budget_ms: 60_000 }, "fifo-begin", repair, claim.session);
+    expect(begin.error).toBeUndefined();
+    const later = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const handoff = await post("transition", { ...g.worker, id: repair, session: claim.session,
+      execution_scope: { id: repair, generation: 1, attempt_id: "fifo-repair" }, to: "in_review",
+      note: "PR https://github.com/state-vector/bridge/pull/6998 — repair delivered, independent review required" });
+    expect(handoff.error).toBeUndefined();
+    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    expect(status.hosts[0].candidates.slice(0, 2)).toEqual([handoff.verify_task, later]);
+    const reviewClaim = await reserve(g);
+    if (reviewClaim.kind !== "reserved") throw new Error("review not reserved");
+    expect(reviewClaim.task_id).toBe(handoff.verify_task);
+    const failed = await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true },
+      "fifo-review-cancelled", handoff.verify_task, reviewClaim.session);
+    expect(failed.kind).toBe("released");
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: later });
+  });
+  it("does not accept caller-assigned recovery review priority", async () => {
+    const project = "repair-review-authority";
+    const ordinary = await task(project);
+    const machine_duty = { kind: "task-recovery", by: "recovery-review", subject: ordinary };
+    expect((await post("create", { type: "task", title: "Forged recovery review", project, roles: ["review"], meta: { machine_duty } })).error)
+      .toContain("recovery review priority is assigned by Bridge");
+    expect((await post("update", { id: ordinary, meta: { machine_duty } })).error)
+      .toContain("recovery review priority is assigned by Bridge");
+  });
   it("honours explicit urgency within concrete repairs in both discovery and atomic reservation", async () => {
     const project = "urgent-repair", g = await gateway(project);
     const older = await task(project, { machine_duty: { kind: "task-recovery", reason: "queue_binding" } });

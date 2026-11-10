@@ -4030,14 +4030,20 @@ export class KnowledgeHub {
           this.executionWork().sweep(Number(body.now) || Date.now());
           return this.json({ ok: true });
         }
-        case "create": return this.json(await this.create(body, actor));
+        case "create": {
+          if (body.meta?.machine_duty?.by === "recovery-review") throw new Error("gate: recovery review priority is assigned by Bridge");
+          return this.json(await this.create(body, actor));
+        }
         case "boost": return this.json(await this.boost(body, actor));
         case "get": return this.json(await this.get(String(body.id)));
         case "list": return this.json(await this.list(body));
         case "search": return this.json(await this.search(body));
         case "provenance": { const rec = await this.provenanceBySha(parseProvenanceSha(new URLSearchParams({ sha: String((body as any)?.sha ?? "") }))); return rec ? this.json(rec) : this.json({ error: "no bridge provenance for this sha", sha: String((body as any)?.sha ?? "") }, 404); }
         case "related": return this.json(await this.related(String(body.id), Number(body.limit ?? 10)));
-        case "update": return this.json(await this.update(body, actor));
+        case "update": {
+          if (body.meta?.machine_duty?.by === "recovery-review") throw new Error("gate: recovery review priority is assigned by Bridge");
+          return this.json(await this.update(body, actor));
+        }
         case "transition": return this.json(await this.transition(body, actor, "client"));
         case "claim.takeover": return this.json(await this.claimTakeover(body, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
@@ -5198,8 +5204,19 @@ export class KnowledgeHub {
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
     const rows = this.state.storage.sql.exec(
       `SELECT a.id,a.title,a.body_md,a.project,a.meta,a.roles,a.tags,a.updated_ts,a.created_ts,
-        MAX(a.created_ts, COALESCE(q.last_reserved_at, 0)) AS queue_ts, q.task_id IS NOT NULL AS reserved_before
+        MAX(COALESCE(repair.created_ts, a.created_ts), COALESCE(repair_turn.last_reserved_at, 0),
+            COALESCE(q.last_reserved_at, 0)) AS queue_ts,
+        COALESCE(repair.id, a.id) AS queue_id,
+        q.task_id IS NOT NULL AS reserved_before
         FROM artefacts a LEFT JOIN dispatch_queue_turns q ON q.task_id=a.id
+        LEFT JOIN artefacts repair ON repair.id=json_extract(a.meta,'$.execution_review_of')
+          AND repair.status='in_review'
+          AND json_extract(a.meta,'$.machine_duty.by')='recovery-review'
+          AND json_extract(a.meta,'$.machine_duty.subject')=repair.id
+          AND a.roles='["review"]'
+          AND (json_extract(repair.meta,'$.verify_round.duty')=a.id OR EXISTS (
+            SELECT 1 FROM relations WHERE src_id=a.id AND dst_id=repair.id AND relation='child_of'))
+        LEFT JOIN dispatch_queue_turns repair_turn ON repair_turn.task_id=repair.id
         WHERE a.type='task' AND a.status='todo' AND a.owner=''` + filter,
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
@@ -5258,9 +5275,10 @@ export class KnowledgeHub {
     const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
     eligible.sort((a, b) => rank(a) - rank(b)
       || schedulingBoost(JSON.parse(String(b.meta ?? "{}"))) - schedulingBoost(JSON.parse(String(a.meta ?? "{}")))
-      // A failed or cancelled reservation takes one turn within its priority
-      // class. Generic card updates never change FIFO position.
+      // Independent recovery review continues the repair's queue position.
+      // A failed reservation moves the review itself to the back of its class.
       || Number(a.queue_ts) - Number(b.queue_ts) || Number(a.reserved_before) - Number(b.reserved_before)
+      || Number(String(a.queue_id).slice(3)) - Number(String(b.queue_id).slice(3))
       || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
     return { eligible, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id) };
