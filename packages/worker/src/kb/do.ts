@@ -178,6 +178,10 @@ import {
   trainLandedCloseEdge,
   trainCloseBounceBrief,
   TRAIN_LANDED_CLOSE_MAX_RETRIES,
+  admissionMergedTerminal,
+  admissionLandedCloseNote,
+  type MergedLegReceipt,
+  type AdmissionLegCoverage,
   releaseHold,
   todoDispatchHold,
   trainProxyEvent,
@@ -8975,6 +8979,11 @@ export class KnowledgeHub {
         const qm = JSON.parse(queued?.meta ?? "{}");
         if (queued?.status === "blocked" && qm.merge_train?.state === "queued" && a.legs.every(l => trainLegs(qm).some(q => q.repo === l.repo && q.number === l.number && q.head_sha_at_acceptance === l.head_sha_at_acceptance))) {
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
+        } else if (queued?.status === "done" && trainLegs(qm).length > 0 && trainLegs(qm).every(l => trainLegLanded(qm, l))) {
+          // BR#9510: the admission took the merged-provenance terminal close
+          // — the acceptance is applied (card done, legs landed), never a
+          // pending row the replay churns on.
+          a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
         }
       } catch (e) {
         // Keep the pending row on errors. Audit is diagnostic, NOT the retry queue.
@@ -9010,7 +9019,10 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
     await this.replayDeliveryAdmissions();
-    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type='task' AND status='in_review'`).toArray();
+    // BR#9510 additive leg: the scan also covers todo-position parents — an
+    // exact-subject accepted_direct_main round whose close stranded because
+    // the parent had been watchdog-released back to todo (BR#7642).
+    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type='task' AND status IN ('in_review','todo')`).toArray();
     for (const row of rows) {
       const current = this.currentTaskReview(String(row.id));
       if (current.phase !== "accepted") continue;
@@ -13481,12 +13493,16 @@ export class KnowledgeHub {
    *  red cycle or an out-of-band push — the 2026-11-05 evidence: nine cards
    *  for merged PRs still sitting in the "awaiting merge" class). The
    *  provenance table is the hub's own merge record (BR#3287, stamped at
-   *  train merges) — a receipt close needs zero GitHub calls. Multi-leg
-   *  cards re-queue to their next unlanded leg (closeBurstParks mechanics)
-   *  instead of closing. Runs on the alarm cadence (the strand-sweep
-   *  family); one bad card audits and skips, never throws. */
+   *  train merges) — a receipt close needs zero GitHub calls. BR#9510: an
+   *  existing DONE admission for the same task+leg is retained-and-carried
+   *  (terminal merged-provenance close) instead of spawning a fresh verify
+   *  round — respawning discarded prior acceptances of the same head and
+   *  livelocked the delivery pipeline (the BR#9032 33-admission class).
+   *  Multi-leg cards re-queue to their next unlanded leg (closeBurstParks
+   *  mechanics) instead of closing. Runs on the alarm cadence (the
+   *  strand-sweep family); one bad card audits and skips, never throws. */
   private async reviewObservedMerge(id: string, repo: string, pr: number, mergeSha: string, actor: string): Promise<
-    { kind: "submitted"; review_id: string } | { kind: "settled" } | { kind: "retained"; reason: string }
+    { kind: "submitted"; review_id: string } | { kind: "settled" } | { kind: "retained"; reason: string } | { kind: "carried"; review_id: string }
   > {
     if (!isValidGitHubRepo(repo) || !/^[0-9a-f]{40}$/i.test(mergeSha)) return { kind: "retained", reason: "An exact repository and full merge SHA are required." };
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
@@ -13513,6 +13529,15 @@ export class KnowledgeHub {
     }
     const laneOwner = this.one(`SELECT lane_key FROM lane_state WHERE repo=? AND phase IN ('draining_batch','settling_ci') AND lease_expires_ts>? AND json_extract(state_json,'$.task_id')=? LIMIT 1`, repo, Date.now(), id);
     if (laneOwner) return { kind: "retained", reason: "The live canonical merge lane already owns decisive CI verification." };
+    // BR#9510 retain-and-carry: a DONE admission for this exact task whose
+    // legs all carry merge receipts outranks a fresh review round. Spawning
+    // one anyway discarded prior acceptances of the same head and fed the
+    // verify-respawn livelock (BR#9032: every heal spawned a fresh duty that
+    // re-accepted the same merged head ~every 6 min). Carrying an admission
+    // is idempotent acceptance application, not a new verdict — the
+    // admission IS an independent review's acceptance of this exact head.
+    const carried = await this.carryMergedAdmission(id, repo, pr, meta, actor);
+    if (carried) return { kind: "carried", review_id: carried };
     if (row.status === "in_review") return { kind: "retained", reason: "Independent review already owns this delivery." };
     const wait = validateAwaitEvent(meta.blocked?.await_event);
     if (row.status === "blocked" && wait && !(wait.event === "pr_merged" && wait.repo === repo && wait.n === pr)
@@ -13538,6 +13563,48 @@ export class KnowledgeHub {
     if (!("verify_task" in submitted) || typeof submitted.verify_task !== "string") return { kind: "retained", reason: "Delivery was submitted but no new review duty was returned; existing lifecycle owns its continuation." };
     this.audit(actor, "observed_merge_review_submitted", id, { repo, pr, merge_sha: mergeSha, review: submitted.verify_task });
     return { kind: "submitted", review_id: String(submitted.verify_task) };
+  }
+
+  /** BR#9510 — find a DONE admission for this task that covers the observed
+   *  leg (repo+pr, acceptance head intact for the current subject revision)
+   *  and whose legs are ALL merge-receipted, then carry it: close the card
+   *  on the merged-provenance terminal path instead of spawning a fresh
+   *  verify round. A pending/rejected CURRENT review round that is not the
+   *  admission's own duty is NOT overridden (fresh findings own the exit);
+   *  a pending round with a live executor is left to close on its own (its
+   *  acceptance takes the same terminal path via the admission replay). */
+  private async carryMergedAdmission(id: string, repo: string, pr: number, meta: any, actor: string): Promise<string | null> {
+    if (meta?.awaiting_ask) return null; // an open human leg owns the exit
+    const rows = this.state.storage.sql.exec(
+      `SELECT a.review_id AS review_id, a.record AS record FROM delivery_admissions a
+       JOIN artefacts c ON c.id = a.review_id
+       WHERE json_extract(a.record,'$.task_id')=? AND json_extract(a.record,'$.state.phase') IN ('pending','held','admitted')
+         AND c.status='done' AND json_extract(c.meta,'$.review_result.kind')='accepted_pr'
+         AND json_extract(c.meta,'$.review_result.task_id')=json_extract(a.record,'$.task_id')
+       ORDER BY CAST(json_extract(a.record,'$.accepted_at') AS INTEGER) DESC LIMIT 5`,
+      id,
+    ).toArray() as any[];
+    for (const r of rows) {
+      const a = JSON.parse(String(r.record)) as DeliveryAdmission;
+      if ((a.subject_revision ?? "legacy") !== (meta.work_revision ?? "legacy")) continue;
+      const leg = (a.legs ?? []).find((l) => l.repo === repo && Number(l.number) === pr);
+      if (!leg) continue;
+      const cardLegs = trainLegs(meta).map((l) => {
+        const al = (a.legs ?? []).find((x) => x.repo === l.repo && Number(x.number) === l.number);
+        return al ? { ...l, head_sha_at_acceptance: al.head_sha_at_acceptance } : l;
+      });
+      const merged = this.admissionMergedReceipts(meta, cardLegs, a.legs);
+      if (!merged) continue; // some leg is still out — not terminal, the fresh round owns it
+      const current = this.currentTaskReview(id);
+      if (!(current.phase === "none" || current.phase === "accepted" || current.phase === "historical" || current.id === String(a.review_id))) continue;
+      const closed = await this.closeAdmittedMergedCard(id, merged, cardLegs, actor, "observed-merge-carry", String(a.review_id));
+      if (!closed) return null; // gate-refused: loud audit already written; never spawn past it
+      a.state = { phase: "admitted", task_id: id, subject_revision: meta.work_revision ?? "legacy" };
+      this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
+      this.audit(actor, "merged_admission_carried", id, { admission: a.review_id, repo, pr, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      return String(a.review_id);
+    }
+    return null;
   }
 
   private landedCloseReviewHold(id: string, repo: string, pr: number, mergeSha: string): string | null {
@@ -13669,7 +13736,7 @@ export class KnowledgeHub {
         const legN = Number(mergedLeg.number) || 0;
         const rec = prov.get(`${legRepo}#${legN}`)!;
         const reviewed = await this.reviewObservedMerge(String(r.id), legRepo, legN, rec.merge_sha, "system:train");
-        if (reviewed.kind === "settled") closed += 1;
+        if (reviewed.kind === "settled" || reviewed.kind === "carried") closed += 1;
         if (reviewed.kind !== "submitted") continue;
         this.audit("system:train", "merged_park_review_submitted", r.id, { lane: `${legRepo}@${String(mergedLeg.base ?? "main")}`, pr: legN, merge_sha: rec.merge_sha, review: reviewed.review_id });
         this.version(r.id, "system:train", "merge_observed", `Merged PR #${legN} now has an independent delivery review; decisive CI and completion remain unproven.`, {});
@@ -14717,7 +14784,26 @@ export class KnowledgeHub {
       this.audit("system:completion", "prerequisite_not_delivery", parentId, { completion: completionContract(meta) });
       return;
     }
-    if (parent.status === "in_review" && result.kind === "accepted_direct_main") {
+    if ((parent.status === "in_review" || parent.status === "todo") && result.kind === "accepted_direct_main") {
+      if (parent.status === "todo") {
+        // BR#9510 additive leg (BR#7642/BR#7644/BR#9655): the exact-subject
+        // direct-main acceptance landed while the parent sat in todo (its
+        // review round had been watchdog-released) — the close had no
+        // in_review→done edge, so the VERIFIED delivered work stranded in
+        // the pool. Ladder through in_progress (machine, anonymous) and
+        // close on the acceptance. Only this exact-subject accepted verdict
+        // reaches here; a card a fresh executor legitimately claimed is
+        // in_progress and stays untouched.
+        await this.transition(
+          {
+            id: parentId,
+            to: "in_progress",
+            session: "",
+            note: `Verified direct-to-main commit ${result.commit} — exact-subject acceptance restored from the todo position (BR#9510)`,
+          },
+          actor,
+        );
+      }
       await this.transition({ id: parentId, to: "done", session: "", execution_result: meta.execution_result,
         note: `Verified direct-to-main commit ${result.commit}; ${result.ci_run_url}` }, actor);
       // Read the completed row again: terminal-transition cleanup owns its
@@ -14733,6 +14819,126 @@ export class KnowledgeHub {
       this.audit("system:coordination", "direct_main_closed_on_accept", parentId, { sha: result.commit });
       return;
     }
+  }
+
+  /** BR#9510 — fetch the hub merge receipts for an admission's legs and run
+   *  the pure terminal test (core.ts admissionMergedTerminal). The card's
+   *  own leg stamps and the provenance index are both the hub's internal
+   *  record of THE TRAIN's own merges — zero GitHub calls. Returns the
+   *  per-leg receipts when EVERY leg is merged, else null. */
+  private admissionMergedReceipts(
+    meta: any,
+    legs: { repo: string; number: number; head_sha_at_acceptance?: string; carry?: any[] }[],
+    acceptedLegs?: AcceptedPrLeg[],
+  ): MergedLegReceipt[] | null {
+    const stampLegs: Record<string, { merge_sha?: string | null }> = {};
+    for (const [n, rec] of Object.entries(meta?.merge_train?.legs ?? {})) {
+      stampLegs[String(n)] = { merge_sha: (rec as any)?.merge_sha ?? null };
+    }
+    const provenance = new Map<string, { merge_sha?: string | null; head_sha?: string | null }>();
+    for (const l of legs) {
+      const key = `${l.repo}#${l.number}`;
+      if (provenance.has(key)) continue;
+      const row = this.one(`SELECT merge_sha, head_sha FROM provenance WHERE repo = ? AND pr = ?`, l.repo, l.number) as any;
+      if (row) provenance.set(key, { merge_sha: row.merge_sha, head_sha: row.head_sha });
+    }
+    const coverage: AdmissionLegCoverage[] = legs.map((l) => ({
+      repo: l.repo,
+      number: l.number,
+      stamped_head: l.head_sha_at_acceptance,
+      carry: Array.isArray(l.carry) ? l.carry : undefined,
+      accepted_head: acceptedLegs?.find((a) => a.repo === l.repo && Number(a.number) === l.number)?.head_sha_at_acceptance,
+    }));
+    return admissionMergedTerminal(coverage, provenance, stampLegs);
+  }
+
+  /** BR#9510 — the merged-provenance terminal close (machine proxy,
+   *  landed/burst-settle mechanics): stamps every leg landed citing its
+   *  merge receipt, ladders to done through lifecycle-legal edges
+   *  (blocked/todo → in_progress → done, in_review → done) and marks the
+   *  card's merge_train landed. Idempotent: a done/superseded parent is an
+   *  immediate success. A gate-rejected close keeps the (honest) landed
+   *  stamp, audits loud and returns false — the next admission replay or
+   *  merged-park sweep retries the carry; it never spawns a fresh verify
+   *  duty, so a refused close cannot resurrect the respawn livelock. */
+  private async closeAdmittedMergedCard(
+    parentId: string,
+    merged: MergedLegReceipt[],
+    legs: { repo: string; number: number; head_sha_at_acceptance?: string; base?: string }[],
+    actor: string,
+    via: "admission-replay" | "observed-merge-carry",
+    reviewId?: string,
+  ): Promise<boolean> {
+    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, parentId);
+    if (!row || ["done", "superseded"].includes(String(row.status))) return true;
+    const now = Date.now();
+    const meta = JSON.parse(row.meta ?? "{}");
+    // Same law as landedFlow/closeBurstParks: an explicit execution wait or
+    // live writer owns the exit — the admission stays pending and the next
+    // pass retries once the execution machinery quiesces.
+    if (this.protectedExecution(parentId, meta)) {
+      this.audit(actor, "merged_admission_close_held", parentId, { via, reason: "an explicit execution wait or live writer owns this exit" });
+      return false;
+    }
+    // stamp the legs the acceptance names (same shape as the queue path —
+    // trainLegs() readers and the acceptance-qualify gate read meta.prs/
+    // meta.pr; without them an in_review-position close looks unlanded)
+    const known = new Map(trainLegs(meta).map((l) => [`${l.repo}#${l.number}`, l]));
+    for (const l of legs) if (!known.has(`${l.repo}#${l.number}`)) known.set(`${l.repo}#${l.number}`, l);
+    const allLegs = [...known.values()];
+    meta.prs = allLegs;
+    meta.pr = { ...(meta.pr ?? {}), repo: allLegs[0].repo, number: allLegs[0].number, head_sha_at_acceptance: allLegs[0].head_sha_at_acceptance, ...(allLegs[0].base ? { base: allLegs[0].base } : {}) };
+    const legsMap: Record<string, any> = { ...(meta.merge_train?.legs ?? {}) };
+    for (const r of merged) {
+      const prior = legsMap[String(r.number)] ?? {};
+      legsMap[String(r.number)] = { ...prior, state: "landed", merge_sha: r.mergeSha, landed_at: now, via: "merged-provenance" };
+    }
+    meta.merge_train = { ...(meta.merge_train ?? {}), legs: legsMap };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+    const note = admissionLandedCloseNote({
+      gateway: actor,
+      reviewId: reviewId ?? "the carried admission",
+      legs: merged.map((m) => ({ repo: m.repo, number: m.number, head: m.head || m.mergeSha, mergeSha: m.mergeSha })),
+    });
+    const first = merged[0];
+    try {
+      if (row.status === "blocked" || row.status === "todo") {
+        await this.transition(
+          {
+            id: parentId,
+            to: "in_progress",
+            // anonymous: the hub acts as the machine carrying an independent
+            // acceptance — it must not stamp a session onto the card.
+            session: "",
+            note: `merge-train: landed — closing on the merged-provenance receipt (every accepted leg of ${first.repo}#${first.number} carries a hub merge sha, ${merged.map((m) => m.mergeSha.slice(0, 9)).join(", ")})`,
+            merge_train: true,
+          },
+          actor,
+        );
+      }
+      await this.transition({ id: parentId, to: "done", session: "", note }, actor);
+    } catch (e) {
+      // The landed stamp is honest (the legs ARE merged — hub receipts prove
+      // it) and it is exactly what the acceptance-qualify gate reads, so the
+      // stamp STAYS; the refusal is a loud audit the next pass retries.
+      this.audit(actor, "merged_admission_close_refused", parentId, { error: String((e as Error)?.message ?? e).slice(0, 300), via, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      this.version(parentId, actor, "merged_admission_close_refused", `terminal admission close refused — ${String((e as Error)?.message ?? e).slice(0, 180)}; the landed legs stamp stands and the next replay/sweep retries the carry (BR#9510)`, {});
+      return false;
+    }
+    const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, parentId).meta ?? "{}");
+    completed.merge_train = { ...(meta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(completed), now, parentId);
+    this.state.storage.sql.exec(
+      `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail)
+       SELECT ?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?
+       WHERE NOT EXISTS (SELECT 1 FROM train_events WHERE repo = ? AND kind = 'landed' AND pr = ? AND merge_sha = ?)`,
+      now, first.repo, String(meta.pr?.base ?? "main"), actor, first.number, parentId, first.mergeSha,
+      JSON.stringify({ via, admission: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`) }),
+      first.repo, first.number, first.mergeSha,
+    );
+    this.audit(actor, "merged_admission_closed", parentId, { via, legs: merged.map((m) => ({ repo: m.repo, pr: m.number, merge_sha: m.mergeSha })), ...(reviewId ? { admission: reviewId } : {}) });
+    this.version(parentId, actor, "merged_admission_closed", `merged-provenance terminal close — ${merged.map((m) => `${m.repo}#${m.number} merged as ${m.mergeSha.slice(0, 9)}`).join(", ")}; the independent acceptance is carried, not re-queued (BR#9510)`, {});
+    return true;
   }
 
   /** Only the durable, revision-checked admission outbox calls this actuator.
@@ -14777,6 +14983,23 @@ export class KnowledgeHub {
       meta.merge_train = { ...(meta.merge_train ?? {}), state: "unbound", pr: withStampHeads[0].number, at: Date.now(), unbound: unbound.map((l) => l.number) };
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
       this.audit("system:merge-train", "queue_unbound", parentId, { reason: `close cited PR(s) ${unbound.map((l) => `#${l.number}`).join(", ")} without a paired \`head <sha>\` — every cited PR needs its head before the train can gate it (BR#3659)` });
+      return;
+    }
+    // ---- BR#9510 merged-provenance terminal: an admission whose EVERY leg
+    // already carries a hub merge receipt (the leg's own train stamp or a
+    // provenance row whose recorded head the acceptance covers) is TERMINAL.
+    // Re-stamping queued on a fully-merged delivery re-queues a merge that
+    // already happened; the merged-park heal then re-converts the park and
+    // spawns a fresh verify duty, whose acceptance re-queues again — the
+    // BR#9032 livelock (33 identical accepted_pr admissions of bridge#439,
+    // ~35 verify respawns, one small-tier executor burned every ~6 min per
+    // chain). Close on the machine proxy (landed/burst-settle mechanics)
+    // instead; a second admission of the same task+head is then a no-op
+    // carry (the done/superseded early-return above + the replay done-branch
+    // mark it admitted without touching the card). ----
+    const mergedReceipts = this.admissionMergedReceipts(meta, withStampHeads, acceptedLegs);
+    if (mergedReceipts) {
+      await this.closeAdmittedMergedCard(parentId, mergedReceipts, withStampHeads, actor, "admission-replay");
       return;
     }
     // ---- bounce budget (BR#4688): an ACTIVE escalation stops re-serving —

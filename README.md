@@ -3124,15 +3124,43 @@ conflict on train", with every Backlog section and row explicitly labelling
 who or what unblocks it: `You`, `Agent`, or `System`, BR#6395).
 A card cannot enter the merge class by text or by an upstream `pr_merged` wait. The count in Backlog equals the
 trains queue by construction because stranded state self-heals:
-`sweepMergedParks` (alarm cadence, the strand-sweep family) closes any
+`sweepMergedParks` (alarm cadence, the strand-sweep family) heals any
 blocked queued/awaiting-ci card whose PR leg carries a **provenance merge
 receipt** — the hub's own merge record (BR#3287), zero GitHub calls — via the
 lifecycle-legal blocked→in_progress→done citing the merge sha; multi-leg
 cards stamp the leg landed and re-queue to the next unlanded leg (the
-closeBurstParks mechanics). This kills the 2026-11-05 shape: nine cards for
+closeBurstParks mechanics). When an admitted acceptance already covers the
+merged leg the heal **carries** it (the BR#9510 terminal close below)
+instead of spawning a fresh verify round. This kills the 2026-11-05 shape: nine cards for
 already-merged PRs sitting in the merge class because the settle-close owed
 them rode a pass interrupted by red cycles / out-of-band pushes.
 Pinned in `packages/worker/test/br6330-merge-class.test.ts`.
+
+### A fully-merged acceptance is terminal — never re-queued (BR#9510)
+
+An `accepted_pr` admission whose EVERY leg already carries a hub merge
+receipt (the leg's own train stamp `merge_sha`, or a provenance row whose
+recorded head the acceptance or its carry chain covers — the BR#3516 §5
+head law, so a force-pushed-then-merged PR still needs a fresh verify) is
+**terminal**: `queueAcceptedPrLegs` closes the parent on the machine proxy
+(stamps every leg landed citing the merge sha, then the lifecycle-legal
+ladder to `done`) instead of re-stamping `merge_train.state=queued`, and
+`reviewObservedMerge` retains-and-carries an existing DONE admission for
+the same task+leg instead of spawning a fresh verify duty. A second
+admission of the same task+head is a no-op carry. Without this, every
+acceptance of an already-merged PR re-queued a merge that had happened,
+the heal re-converted the park into a fresh verify round, and the cycle
+repeated forever — the BR#9032 live incident (33 identical `accepted_pr`
+admissions of merged PR bridge#439, ~35 verify respawns, a small-tier
+executor burned every ~6 minutes per chain; the same class on the BR#3785
+sibling). One unmerged leg keeps the admission on the queue (fail-closed,
+BR#3659); the BR#4688 bounce budget and BR#4648 stamp honesty are
+unchanged, and an escalated card whose leg IS merge-receipted closes — a
+merged PR is beyond the bounce clock. The same repair closes the
+`accepted_direct_main` strand: an exact-subject acceptance now also closes
+a parent parked in `todo` (the BR#7642 shape — the close previously
+required `in_review` and stranded verified delivered work in the pool).
+Pinned in `packages/worker/test/br9510-admission-livelock.test.ts`.
 
 ### Duplicate citations bind once; the stale re-queue fails closed (BR#6349)
 

@@ -2543,8 +2543,13 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     });
     expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
     if (reviewState === "accepted-pr") {
+      // BR#9510: the fresh acceptance IS the review the close-bounce
+      // demanded — and the leg is provenance merge-receipted, so the
+      // admission is TERMINAL: the parent closes done directly on the
+      // machine proxy instead of re-queueing for a sweep re-close (the
+      // queued detour was the superseded decision path).
       expect((await kbJson("/get", { id: task })).body).toMatchObject({
-        status: "blocked", meta: { merge_train: { state: "queued", close_bounce: true, landed_merge_sha: merge } },
+        status: "done", meta: { merge_train: { state: "landed", landed_merge_sha: merge } },
       });
       expect((await kbJson("/admin.alarm_sweep")).status).toBe(200);
     }

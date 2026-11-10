@@ -2788,6 +2788,94 @@ export function trainQueueRemainingReason(meta: any): string {
   return `merge-train: queued — waiting on ${remaining.length} leg(s): ${remaining.map((l) => `${l.repo || "?"}#${l.number}`).join(", ")}`;
 }
 
+// ---- merged-provenance terminal admissions (BR#9510) ----
+
+/** One leg's hub merge receipt a terminal admission can cite. `via
+ *  "provenance"` — the hub's own train-merge record (BR#3287), head-checked
+ *  when it recorded the merged head; `via "leg-stamp"` — the train's
+ *  per-leg stamp on THIS card (meta.merge_train.legs.<n>.merge_sha, written
+ *  only by the train's own merge observation of the card's leg, head
+ *  coverage enforced walk-side at merge time). */
+export type MergedLegReceipt = {
+  repo: string;
+  number: number;
+  head: string;
+  mergeSha: string;
+  via: "provenance" | "leg-stamp";
+};
+
+/** The coverage facts one admitted leg brings to the terminal test. */
+export type AdmissionLegCoverage = {
+  repo: string;
+  number: number;
+  /** the card's current leg stamp head (+ carry chain) */
+  stamped_head?: string;
+  carry?: CarryRecord[];
+  /** the acceptance's own head, when this admission cites one */
+  accepted_head?: string;
+};
+
+const SHA40 = (v: unknown): string => {
+  const s = String(v ?? "").toLowerCase();
+  return /^[0-9a-f]{40}$/.test(s) ? s : "";
+};
+
+/** BR#9510 — the merged-provenance terminal test for an accepted admission.
+ *  EVERY accepted leg must already carry a hub merge receipt before a
+ *  (re-)admission may be treated as terminal: a provenance row for
+ *  (repo, pr) whose recorded head is covered by the acceptance or the
+ *  card's carry-chained stamp (BR#3516 §5 head law — an acceptance never
+ *  covers a head it does not name, so a force-pushed-then-merged PR stays
+ *  a fresh-verify matter), OR the train's own leg stamp. All legs or null:
+ *  a single unmerged leg keeps the card on the queue (BR#3659). */
+export function admissionMergedTerminal(
+  legs: AdmissionLegCoverage[],
+  provenance: Map<string, { merge_sha?: string | null; head_sha?: string | null } | undefined>,
+  legStamps: Record<string, { merge_sha?: string | null } | undefined>,
+): MergedLegReceipt[] | null {
+  if (!legs.length) return null;
+  const merged: MergedLegReceipt[] = [];
+  for (const leg of legs) {
+    const prov = provenance.get(`${leg.repo}#${leg.number}`);
+    const stamp = legStamps[String(leg.number)];
+    const provSha = SHA40(prov?.merge_sha);
+    const provHead = String(prov?.head_sha ?? "").toLowerCase();
+    const covered =
+      !provHead ||
+      headCoveredBy(String(leg.accepted_head ?? "").toLowerCase(), undefined, provHead) ||
+      headCoveredBy(String(leg.stamped_head ?? "").toLowerCase(), leg.carry, provHead);
+    if (provSha && covered) {
+      merged.push({ repo: leg.repo, number: leg.number, head: String(leg.accepted_head ?? leg.stamped_head ?? ""), mergeSha: provSha, via: "provenance" });
+      continue;
+    }
+    const stampSha = SHA40(stamp?.merge_sha);
+    if (stampSha) {
+      merged.push({ repo: leg.repo, number: leg.number, head: String(leg.accepted_head ?? leg.stamped_head ?? ""), mergeSha: stampSha, via: "leg-stamp" });
+      continue;
+    }
+    return null; // an unmerged leg: the admission is not terminal — fail-closed
+  }
+  return merged;
+}
+
+/** The machine-proxy close note for a terminal merged admission —
+ *  burst-settle honesty (BR#4934): it cites the receipts it actually holds
+ *  (the independent acceptance + every leg's merge sha) and never claims a
+ *  hub-observed main-green the hub did not observe (BR#4648 stamp
+ *  honesty). */
+export function admissionLandedCloseNote(input: { gateway: string; reviewId: string; legs: { repo: string; number: number; head: string; mergeSha: string }[] }): string {
+  const legList = input.legs.filter((l) => l.number > 0);
+  const merged =
+    legList.length > 1
+      ? `all ${legList.length} queued PRs merged — ${legList.map((l) => `[#${l.number}](https://github.com/${l.repo}/pull/${l.number}) head ${l.head.slice(0, 9)} as ${l.mergeSha.slice(0, 9)}`).join(", ")}`
+      : `PR [#${legList[0].number}](https://github.com/${legList[0].repo}/pull/${legList[0].number}) head ${legList[0].head.slice(0, 9)} merged as ${legList[0].mergeSha.slice(0, 9)}`;
+  return [
+    `merged-provenance terminal admission (BR#9510) — ${merged}; the independent acceptance ${input.reviewId} already covers this exact head, and every leg carries a hub merge receipt.`,
+    `merge commits: ${legList.map((l) => `https://github.com/${l.repo}/commit/${l.mergeSha}`).join(", ")}`,
+    `carried by ${input.gateway}; re-queueing a fully-merged delivery is the 33-admission respawn livelock — this admission is terminal, never a re-queue.`,
+  ].join("\n");
+}
+
 // ---- awaiting-CI phase (BR#3516 §2) ----
 
 /** The unknown-past bound: ~3× typical CI wall-clock ⇒ fail-closed stop

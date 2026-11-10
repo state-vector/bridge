@@ -24,11 +24,14 @@ import { trainStrandClass } from "../src/kb/core";
  *      absent (source assertions below).
  *   2. The canonical closed phase + predicate live in @bridge/contracts
  *      (unit-pinned below; ui-kit mirrors it with a MUST-STAY-IN-SYNC note).
- *   3. sweepMergedParks (alarm cadence) closes a blocked queued/awaiting-ci
+ *   3. sweepMergedParks (alarm cadence) heals a blocked queued/awaiting-ci
  *      card whose PR leg carries a provenance merge receipt — the hub's own
- *      merge record, zero GitHub calls. Multi-leg cards re-queue to the
- *      next unlanded leg instead of closing. Cards without a receipt are
- *      untouched (live queue slots are never guess-closed).
+ *      merge record, zero GitHub calls. BR#9510: when an admitted acceptance
+ *      already covers the merged leg, the heal CARRIES it (terminal close,
+ *      no fresh duty); otherwise it submits one independent delivery
+ *      review. Multi-leg cards re-queue to the next unlanded leg instead of
+ *      closing. Cards without a receipt are untouched (live queue slots are
+ *      never guess-closed).
  */
 
 const HOUR = 3_600_000;
@@ -176,24 +179,21 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect(current.meta.lane.key).toBe(`${repo}@main`);
     expect((await kbJson("/train.lane", { repo, base: "main" })).body.id).toBe(lane.id);
   });
-  it("gives a merged queued car one delivery review without inventing decisive CI", async () => {
-    const REPO = "state-vector/br6330-heal";
-    const N = 6330;
-    const HEAD = "1".repeat(40);
-    const SHA = "2".repeat(40);
-    await stampProvenance(REPO, N, SHA, HEAD, "gw-br6330-a");
-    const id = await task("BR#6330 merged-park heal specimen");
-    await parkQueuedCar(id, REPO, N, "drill-owner-a", HEAD);
+  it("BR#9510 — a merged queued car WITH an admitted acceptance is carried to done, never respawned into a fresh review", async () => {
+    const REPO = "state-vector/br6330-carry";
+    const N = 6334;
+    const HEAD = "9".repeat(40);
+    const SHA = "8".repeat(40);
+    const id = await task("BR#6330/BR#9510 admitted merged-park specimen");
+    await parkQueuedCar(id, REPO, N, "drill-owner-d", HEAD);
+    await stampProvenance(REPO, N, SHA, HEAD, "gw-br6330-d");
+    const before = (await kbJson("/relations", { id })).body.relations.length;
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
     const cur = (await kbJson("/get", { id })).body;
-    expect(cur.status).toBe("in_review");
-    expect(cur.meta?.merge_train?.state).not.toBe("landed");
-    const hist = (await kbJson(`/history?id=${encodeURIComponent(id)}`)).body;
-    const notes = (hist?.versions ?? []).map((v: any) => `${v?.summary ?? ""}\n${v?.action ?? ""}`).join("\n");
-    expect(notes).toContain("independent delivery review");
-    const before = (await kbJson("/relations", { id })).body.relations.length;
-    await kbJson("/admin.alarm_sweep");
+    expect(cur.status).toBe("done");
+    expect(cur.meta?.merge_train?.state).toBe("landed");
+    // NO fresh verify duty: the existing acceptance was carried, not respawned
     expect((await kbJson("/relations", { id })).body.relations).toHaveLength(before);
   });
 
