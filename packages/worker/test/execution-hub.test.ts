@@ -7,6 +7,7 @@ import { executorRequest } from "./executor-fixture";
 
 let mf: Miniflare;
 let stub: { fetch: (url: string, init: RequestInit) => Promise<Response> };
+let hub: (name: string) => Promise<typeof stub>;
 async function post<T = Record<string, unknown>>(op: string, body: object): Promise<{ status: number; data: T & { error?: string } }> {
   const r = await stub.fetch(`https://kb/${op}`, { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(executorRequest(body)) });
   return { status: r.status, data: await r.json() as T & { error?: string } };
@@ -17,8 +18,11 @@ beforeAll(async () => {
   const ns = await mf.getDurableObjectNamespace("KB");
   // Miniflare's RPC proxy type and workers-types' fetch graph do not meet.
   // Narrow only this harness boundary; protocol payloads validate below.
-  const durable = await ns.get(ns.idFromName("global")) as unknown as typeof stub;
-  stub = { fetch: (url, init) => durable.fetch(url, init) };
+  hub = async name => {
+    const durable = await ns.get(ns.idFromName(name)) as unknown as typeof stub;
+    return { fetch: (url, init) => durable.fetch(url, init) };
+  };
+  stub = await hub("global");
 });
 
 let serial = 0;
@@ -77,6 +81,46 @@ describe("historical stopped-writer receipts", () => {
     expect((await command("begin-old", { kind: "begin", attempt_id: "old", worker: `${host}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
     return { id, auth, worker, command };
   }
+
+  it.each(["before", "after"] as const)("continues an answered coordination ask when the writer stops %s the answer", async (quiescence) => {
+    const shared = stub;
+    stub = await hub(`coordination-${quiescence}`);
+    try {
+      const r = await setup(), fence = { generation: 1, attempt_id: "old" };
+      const peer = await setup();
+      const ask = await post<{ id: string }>("ask.create", {
+        ...r.auth, artefact_id: r.id, route: { kind: "executor_coordination", task_id: peer.id },
+        question: "Are the signed branch receipts available?", options: ["Receipts attached", "Still gathering receipts"],
+      });
+      expect(ask.status, JSON.stringify(ask.data)).toBe(200);
+      const quiet = async () => expect((await r.command("coordination-stop", {
+        kind: "quiesce", ...fence, writers: "process_group_empty",
+      })).data.error).toBeUndefined();
+      if (quiescence === "before") await quiet();
+      const answered = await post("ask.answer", { ...peer.auth, id: ask.data.id, answer: "Receipts attached" });
+      expect(answered.data.error).toBeUndefined();
+      if (quiescence === "after") {
+        expect((await post("get", { id: r.id })).data).toMatchObject({
+          status: "blocked", meta: { blocked: { await_event: { event: "ask", ask_id: ask.data.id } } },
+        });
+        await quiet();
+        expect((await post("admin.unblock_proxy_sweep", { now: Date.now() + 60_000 })).status).toBe(200);
+      }
+      expect((await post("get", { id: r.id })).data).toMatchObject({
+        status: "todo", owner: "", meta: { proxy_check: { verdict: "true", receipts: [expect.stringContaining("Receipts attached")] } },
+      });
+      const reserved = await post<{ session: string }>("execution", {
+        ...r.auth, id: "gateway", command_id: "reserve-continuation", command: { kind: "schedule", mode: "reserve" },
+      });
+      expect(reserved.data).toMatchObject({ kind: "reserved", task_id: r.id });
+      const resumed = await r.command("begin-continuation", {
+        kind: "begin", attempt_id: "new", worker: `${r.auth.actor}/worker`, action_budget_ms: 60_000,
+      }, { session: reserved.data.session });
+      expect(resumed.data).toMatchObject({ attempt: { generation: 2, attempt_id: "new", phase: "running" } });
+    } finally {
+      stub = shared;
+    }
+  });
 
   it("reads the original immutable proof without releasing a newer active attempt", async () => {
     const r = await setup(), fence = { generation: 1, attempt_id: "old" };

@@ -2319,12 +2319,19 @@ export class KnowledgeHub {
     }
     // narrowed: the ask leg — an OPEN ask waits; answered/superseded/vanished fires
     if (aw.event !== "ask") return; // machine-event legs never route here (guarded by the callers)
-    const a = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
+    const a = this.one(`SELECT status,meta FROM artefacts WHERE id = ?`, aw.ask_id);
     if (a && a.status !== "done" && a.status !== "superseded") {
       this.stampProxyCheck(r.id, meta, now, "waiting", `awaiting ask ${aw.ask_id}`, prev);
       return;
     }
-    await this.spawnProxyDuty(r, meta, now, prev, cond, [`${describeAwaitEvent(aw)} → ask ${aw.ask_id} answered/closed`]);
+    const receipts = [`${describeAwaitEvent(aw)} → ask ${aw.ask_id} answered/closed`];
+    const coordination = a?.status === "done"
+      ? this.managedCoordinationReceipt(String(r.id), meta.blocked, aw.ask_id, JSON.parse(String(a.meta ?? "{}")).ask) : null;
+    if (coordination) {
+      this.continueSatisfiedWait(String(r.id), meta, [coordination]);
+      return;
+    }
+    await this.spawnProxyDuty(r, meta, now, prev, cond, receipts);
   }
 
   // ---------- prose-card disposition ladder (BR#4416) ----------
@@ -9450,6 +9457,19 @@ export class KnowledgeHub {
     };
   }
 
+  private managedCoordinationReceipt(
+    id: string,
+    blocked: { await_event?: unknown; await_migration_ask?: unknown } | undefined,
+    askId: string,
+    ask: { route?: unknown; decision?: unknown; answer?: unknown; artefact_id?: unknown } | undefined,
+  ): string | null {
+    const wait = validateAwaitEvent(blocked?.await_event);
+    if (wait?.event !== "ask" || wait.ask_id !== askId || blocked?.await_migration_ask === askId
+      || ask?.artefact_id !== id || typeof ask.answer !== "string" || !ask.answer.trim() || ask.decision
+      || askRoute(ask).kind !== "executor_coordination" || !this.executionState(id)?.attempt) return null;
+    return `Coordination ask ${askId} answered: ${ask.answer.slice(0, 1000)}`;
+  }
+
   private async askAnswer(body: any, actor: string) {
     const id = String(body.id ?? "");
     const answer = String(body.answer ?? "").trim();
@@ -9491,6 +9511,7 @@ export class KnowledgeHub {
       if (subject) {
         const sm = JSON.parse(subject.meta ?? "{}");
         const answeredLocalExit = sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id;
+        const managedContinuation = this.managedCoordinationReceipt(String(subject.id), sm.blocked, id, m.ask);
         // BR#5902: the standing alarm sink (train_alarm_sink_id) is exempt
         // from ask-answer dispatch entirely — every dispatch leg ends in a
         // transition and every transition on the sink is refused by its
@@ -9512,7 +9533,7 @@ export class KnowledgeHub {
         // BR#4067: the paired typed await points at THIS ask — answered means
         // SATISFIED. Leaving it stamped would make every later machine release
         // path hold the card forever on a wait that already resolved.
-        if (sm.blocked?.await_event?.event === "ask" && sm.blocked.await_event.ask_id === id) {
+        if (answeredLocalExit && !managedContinuation) {
           delete sm.blocked.await_event;
           cleared = true;
         }
@@ -9525,7 +9546,13 @@ export class KnowledgeHub {
           taskStatus = "blocked";
         }
         if (answeredLocalExit && (localMode?.phase === "accepted" || localMode?.phase === "returned")) this.executionWork().resumeAfterAnswer(String(subject.id));
-        if (subject.status === "blocked" && !sinkAnchored && !isExecutionWait(sm) && localMode?.phase !== "accepted" && decisionAction !== "local_handoff") {
+        const canDispatch = subject.status === "blocked" && !sinkAnchored && !isExecutionWait(sm)
+          && localMode?.phase !== "accepted" && decisionAction !== "local_handoff";
+        if (canDispatch && managedContinuation) {
+          // An answer satisfies the prerequisite. If the previous writer is
+          // still stopping, the proxy sweep will consume the same typed wait.
+          taskStatus = this.continueSatisfiedWait(String(subject.id), sm, [managedContinuation]) ? "todo" : "blocked";
+        } else if (canDispatch) {
           // BR#3578 answer dispatch: when the ask IS the exit path (a
           // migration ask, or an option that names the action), the ANSWER
           // actions the card — SUPERSEDE drops it, RELEASE/CANCEL releases
