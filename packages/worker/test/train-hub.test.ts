@@ -242,6 +242,7 @@ describe("BR#6776 durable check recovery", () => {
     const liveMergedAt = Date.now() - 1_000;
     const oldMergedAt = liveMergedAt - 16 * 86_400_000;
     const oldCard = await queueViaAccept({ repo, pr: 2266, head: oldHead });
+    const duplicate = await queueViaAccept({ repo, pr: 2266, head: oldHead });
     const liveCard = await queueViaAccept({ repo, pr: 2973, head: liveHead });
     await acquire(repo, actor, { required_workflows: ["Test"] });
     const latest = await kbJson("/train.event", {
@@ -257,6 +258,8 @@ describe("BR#6776 durable check recovery", () => {
     expect(historical.status).toBe(200);
     const after = await laneSnap(repo);
     expect(after.currently).toEqual(before.currently);
+    expect(after.queue.map((entry: { id: string }) => entry.id)).not.toContain(duplicate);
+    expect((await kbJson("/get", { id: duplicate })).body.status).toBe("blocked");
     expect(after.lane_state).toMatchObject({ phase: "settling_ci", pr: 2973, merge_sha: liveMerge, merged_at: liveMergedAt });
     expect(after.last_merge).toEqual(before.last_merge);
     expect(after.stop).toBeNull();

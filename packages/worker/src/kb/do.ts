@@ -15202,6 +15202,9 @@ export class KnowledgeHub {
          AND conclusion='MERGED' AND length(head_sha)=40 AND head_sha NOT GLOB '*[^0-9a-f]*'
          AND receipt='https://github.com/' || repo || '/pull/' || pr`, repo, repo,
     ).toArray().map(row => Number(row.pr)));
+    const recordedOwners = new Map(this.state.storage.sql.exec(
+      `SELECT pr, task_id FROM provenance WHERE repo=? AND task_id IS NOT NULL`, repo,
+    ).toArray().map(row => [Number(row.pr), String(row.task_id)]));
     const entries = mergeTrainQueue(
       cards.map((c) => ({ id: c.id, status_ts: c.status_ts, meta: JSON.parse(c.meta ?? "{}"), tags: parseTags(c.tags) })),
     ).filter((c) => {
@@ -15215,8 +15218,12 @@ export class KnowledgeHub {
       // A merge can leave an unrelated dependency or delivery review open.
       // Keep the task and its wait, while removing its stale train slot.
       const task = metaById.get(c.id);
-      return !!cm && !this.protectedExecution(c.id, task)
-        && trainLegsRemaining(task, repo, base).some(leg => !observedMerges.has(leg.number));
+      if (!cm || this.protectedExecution(c.id, task)) return false;
+      const legs = trainLegsRemaining(task, repo, base);
+      // A duplicate single-leg slot cannot drive a merge already recorded
+      // against another card. Leave the original binding to settlement.
+      const recordedOwner = legs.length === 1 ? recordedOwners.get(legs[0].number) : undefined;
+      return (!recordedOwner || recordedOwner === c.id) && legs.some(leg => !observedMerges.has(leg.number));
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
