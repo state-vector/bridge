@@ -38,6 +38,7 @@ import {
   isValidGitHubRepo,
   parseDirectCommitReceipt,
   replayBounceBudget,
+  requiredWorkflowsGuard,
   trainBounceBrief,
   resolveTrainBounceKind,
   trainCardMatchesLane,
@@ -2550,5 +2551,23 @@ describe("replayBounceBudget over the LIVE 2026-10-28 storm ledger (BR#4688 acce
     const merged281 = fixture.events.find((e: any) => e.kind === "merged" && e.pr === 281);
     expect(merged281.ts).toBe(1793239458292);
     expect(merged281.ts - 1793205611590).toBeGreaterThan(9 * 3_600_000);
+  });
+});
+
+describe("requiredWorkflowsGuard (BR#4691 — an empty lane config is a hole, not a choice)", () => {
+  const refusal = (required: string[], allowEmpty: boolean) => requiredWorkflowsGuard(required, allowEmpty);
+
+  it("a configured lane is always legal; the override only matters for the empty set", () => {
+    expect(refusal(["Test", "CLI build (packages/cli)", "main-green gate"], false)).toBeNull();
+    expect(refusal(["Test"], true)).toBeNull();
+    expect(refusal([], true)).toBeNull();
+  });
+
+  it("the empty set refuses and the reason names BOTH fixes (configure / explicit override)", () => {
+    const r = refusal([], false)!;
+    expect(r).toContain("lane config refused");
+    expect(r).toContain("required_workflows is empty");
+    expect(r).toContain("allow_empty_workflows=true");
+    expect(r).toContain("BR#4691");
   });
 });

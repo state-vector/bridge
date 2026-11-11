@@ -121,6 +121,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
 
   it("returns an independently verified repair to the train without a GitHub approval label", async () => {
     const repo = "state-vector/recovered-pr";
+    expect((await kbJson("/train.lane", { repo, spec: { required_workflows: ["Test"] } })).status).toBe(200);
     const number = 2471;
     const initialHead = "a".repeat(40);
     const repairedHead = "b".repeat(40);
@@ -171,7 +172,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
   it("keeps merged delivery reviews out of the next-batch review count", async () => {
     const repo = "state-vector/terminal-review-drill";
     const number = 2472;
-    expect((await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "train" })).status).toBe(200);
+    expect((await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "train", required_workflows: ["Test"] })).status).toBe(200);
     const parent = (await kbJson("/create", { actor: "author", type: "task", title: "Deliver and verify", qualified: true,
       meta: { pr: { repo, number } } })).body.id;
     const transition = (to: string, fields: object = {}) => kbJson("/transition", { id: parent, to, actor: "author", session: "author", ...fields });
@@ -274,7 +275,7 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
       meta: { pr: { repo: repoE, number: 2405 } },
     });
     const bindingId = String(binding.body.id);
-    await kbJson("/train.lane", { repo: repoE, base: "main", actor: "drill-executor" });
+    await kbJson("/train.lane", { repo: repoE, base: "main", actor: "drill-executor", spec: { required_workflows: ["Test"] } });
     const lease = await kbJson("/train.lease", { repo: repoE, base: "main", action: "acquire", actor: "drill-executor" });
     expect(lease.body.error ?? "").toBe("");
     const ev = await kbJson("/train.event", {
@@ -327,7 +328,7 @@ describe("BR#5151 lane survival (real bundled worker)", () => {
   it("a lane card with a stamped provenance row and a vanished bootstrap PR is never closed, never dutied — lease intact", async () => {
     const repo = "state-vector/lane-survival";
     // the standing lane card + a live lease: the state under protection
-    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     expect(lane.body.error ?? "").toBe("");
     const laneId = String(lane.body.id);
     await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: "gw-keep", required_workflows: ["Test"] });
@@ -363,7 +364,7 @@ describe("BR#5151 lane survival (real bundled worker)", () => {
 
   it("a lane card bound to an OPEN actionable PR is accounted bound — reconcile never spawns a verify duty at it", async () => {
     const repo = "state-vector/lane-forward";
-    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill" });
+    const lane = await kbJson("/train.lane", { repo, base: "main", actor: "drill", spec: { required_workflows: ["Test"] } });
     const laneId = String(lane.body.id);
     const cur = (await kbJson("/get", { id: laneId })).body;
     const upd = await kbJson("/update", { id: laneId, meta: { ...cur.meta, pr: { repo, number: 5154 } }, actor: "drill" });
