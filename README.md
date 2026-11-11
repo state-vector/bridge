@@ -1368,12 +1368,25 @@ pointer key (`meta_delete` + pointer). Translation: a raw `SQLITE_TOOBIG` from a
 surfaces as `gate: storage ceiling (BR#11554) …` with `result_class: "gate_rejected"`
 — terminal, don't retry (BR#4403). Unlock: an already-locked card can only be cured by
 `artefact_slim {id, meta, ack_snapshot, expected_old_bytes?}` — DELETE + re-INSERT with
-small binds, keeping id/title/status/body/owner/tags/roles and auto-preserving hub
+small binds, keeping id/title/status/body/owner and auto-preserving hub
 infrastructure keys; `ack_snapshot` must name the artefact holding the verbatim
 pre-slim meta (the ledger receipt keeps key names and byte counts, never dropped
 values), the slim is shrink-only, and a `slim_record` key stamps the on-card
 provenance. `get_artefact` returns `meta_bytes`/`row_bytes` so headroom is readable
 before a write bricks a card.
+
+The row budget counts the tags and roles columns too (BR#11637): a meta-only
+`update_artefact` used to re-bind the raw tags column string through
+`JSON.stringify` — one JSON encoding layer per write, escaping roughly doubling each
+time, until BR#10150's tags column reached ~4.19MB while `row_bytes` (which then
+counted only meta+title+body) reported a healthy ~102KB. The update passthrough now
+normalizes omitted tags/roles through the same defensive parser every read surface
+uses, so a meta-only write stops the accretion AND heals the column to canonical JSON;
+the budget gate's error names the per-component bytes
+(`title=…B body=…B meta=…B tags=…B roles=…B`) so an oversized row is actionable in one
+read; and `artefact_slim` normalizes tags+roles before its re-INSERT and budgets the
+normalized row — slim unlocks rows bloated outside meta as well, with old→new tag/role
+byte counts stamped in the slim_record.
 
 ## Agent lanes: roles & playbooks
 

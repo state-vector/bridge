@@ -4751,7 +4751,12 @@ export class KnowledgeHub {
     // silently; make the headroom readable at read time so agents can stub
     // before the next write fails.
     shaped.meta_bytes = utf8Bytes(String((row as any).meta ?? "{}"));
-    shaped.row_bytes = shaped.meta_bytes + utf8Bytes(String((row as any).title ?? "")) + utf8Bytes(String((row as any).body_md ?? ""));
+    // BR#11637: row_bytes must match the write-budget gate's own definition —
+    // the tags/roles column bytes count too, or a read shows "plenty of
+    // headroom" while the true bind payload is 40× larger (BR#10150: reported
+    // 102144B while the accreted tags column alone was ~4.19MB).
+    shaped.row_bytes = shaped.meta_bytes + utf8Bytes(String((row as any).title ?? "")) + utf8Bytes(String((row as any).body_md ?? ""))
+      + utf8Bytes(String((row as any).tags ?? "")) + utf8Bytes(String((row as any).roles ?? ""));
     if (row.type === "task") {
       shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
       shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
@@ -4971,7 +4976,15 @@ export class KnowledgeHub {
     const publicMeta = { ...metaObj }; delete publicMeta[LANE_REVISION];
     const meta = JSON.stringify(publicMeta);
     if (row.type === "progress") await this.progressHeartbeat(metaObj, title, actor);
-    const tags = body.tags !== undefined ? sanitizeTags(body.tags) : row.tags;
+    // BR#11637: normalize the passthrough — row.tags is the RAW column string,
+    // and binding `JSON.stringify(row.tags)` re-encoded the already-encoded
+    // JSON one layer per write (every meta-only update did this), roughly
+    // doubling the escaping each time: exponential column accretion
+    // (BR#10150's tags column reached ~4.19MB). parseTags is the canonical
+    // reader on every surface, so omitting tags now re-binds canonical JSON —
+    // accretion stops AND the column heals on the next write. Mirrors the
+    // roles line below.
+    const tags = body.tags !== undefined ? sanitizeTags(body.tags) : parseTags(row.tags);
     // roles replacement semantics, same as tags (explicit array = replace)
     let roles: string[] | null = parseTags(row.roles);
     if (body.roles !== undefined) {
@@ -4985,13 +4998,13 @@ export class KnowledgeHub {
     // meta+tags+roles — the resulting row must stay well under the DO SQLite
     // statement budget or the NEXT write to this card bricks it (shrinks
     // included). Named error so agents can stub-and-shrink deterministically.
-    const budgetErr = checkStorageBudget(title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null);
+    const budgetErr = checkStorageBudget(title, bodyMd, meta, tags && tags.length ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null);
     if (budgetErr) throw new Error(budgetErr);
     // update does not touch status — transitions are the only status path
     this.atomicLaneMutation(() => {
       this.state.storage.sql.exec(
         `UPDATE artefacts SET title = ?, body_md = ?, meta = ?, tags = ?, roles = ?, updated_ts = ? WHERE id = ?`,
-        title, bodyMd, meta, tags ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
+        title, bodyMd, meta, tags && tags.length ? JSON.stringify(tags) : null, roles && roles.length ? JSON.stringify(roles) : null, Date.now(), id,
       );
       if (preMeta.lane || metaObj.lane) {
         if (!laneOfMeta(metaObj)) throw new Error("gate: preserve lane identity; retire the lane through its lifecycle");
@@ -5070,8 +5083,23 @@ export class KnowledgeHub {
       throw new Error(`gate: artefact_slim must shrink meta (stub ${newBytes}B >= live ${oldBytes}B) — use update_artefact for additive edits`);
     if (Object.keys(stub).length > LIMITS.metaKeys)
       throw new Error(`storage budget: meta exceeds ${LIMITS.metaKeys} keys`);
+    // BR#11637: slim heals the tags/roles columns too — they may hold
+    // exponentially accreted JSON-on-JSON strings (the meta-only
+    // update_artefact passthrough bug; BR#10150's tags column reached ~4.19MB
+    // while every read path rendered []). parseTags is the canonical reader on
+    // every surface and is information-preserving, so normalize both columns
+    // and budget-check the NORMALIZED row: slim is the unlock op for bloat
+    // that lives outside meta as well.
+    const tagsNorm = parseTags(row.tags);
+    const rolesNorm = parseTags(row.roles);
+    const oldTagsBytes = utf8Bytes(String(row.tags ?? ""));
+    const newTags = tagsNorm.length ? JSON.stringify(tagsNorm) : null;
+    const newTagsBytes = newTags ? utf8Bytes(newTags) : 0;
+    const oldRolesBytes = utf8Bytes(String(row.roles ?? ""));
+    const newRoles = rolesNorm.length ? JSON.stringify(rolesNorm) : null;
+    const newRolesBytes = newRoles ? utf8Bytes(newRoles) : 0;
     const budgetErr = checkStorageBudget(String(row.title ?? ""), String(row.body_md ?? ""), JSON.stringify(stub),
-      row.tags ? String(row.tags) : null, row.roles ? String(row.roles) : null);
+      newTags, newRoles);
     if (budgetErr) throw new Error(budgetErr);
     if (body.expected_old_bytes !== undefined && Number(body.expected_old_bytes) !== oldBytes)
       throw new Error(`gate: expected_old_bytes fence mismatch — live meta is ${oldBytes}B, caller fenced ${Number(body.expected_old_bytes)}B; re-read the card before slimming`);
@@ -5079,6 +5107,10 @@ export class KnowledgeHub {
     stub.slim_record = {
       by: actor, ts: Date.now(), root_fix: "BR#11554",
       old_meta_bytes: oldBytes, new_meta_bytes: newBytes,
+      // BR#11637: tag/role column heal receipts — bytes only (per slim
+      // privacy rule: key names and byte counts, never the dropped values)
+      old_tags_bytes: oldTagsBytes, new_tags_bytes: newTagsBytes,
+      old_roles_bytes: oldRolesBytes, new_roles_bytes: newRolesBytes,
       dropped_keys: dropped, infra_preserved: infraPreserved,
       snapshot: ackSnapshot,
     };
@@ -5088,13 +5120,27 @@ export class KnowledgeHub {
     const insert = `INSERT INTO artefacts (${[...cols, "meta"].join(", ")}) VALUES (${[...cols, "meta"].map(() => "?").join(", ")})`;
     this.atomicLaneMutation(() => {
       this.state.storage.sql.exec(`DELETE FROM artefacts WHERE id = ?`, id);
-      this.state.storage.sql.exec(insert, ...cols.map((c) => (c === "updated_ts" ? ts : (row as any)[c])), newMeta);
+      // BR#11637: the re-INSERT binds the NORMALIZED tags/roles (the raw
+      // columns are exactly what may be bloated — copying them verbatim made
+      // slim unable to heal its own lockout)
+      this.state.storage.sql.exec(insert, ...cols.map((c) =>
+        c === "updated_ts" ? ts : c === "tags" ? newTags : c === "roles" ? newRoles : (row as any)[c]), newMeta);
     });
     // receipts name keys and byte counts — never the dropped values
-    this.audit(actor, "slim", id, { dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, snapshot: ackSnapshot });
-    this.version(id, actor, "slim", `slimmed meta ${oldBytes}B → ${newBytes}B (dropped: ${dropped.join(", ") || "—"}; verbatim archive: ${ackSnapshot}; BR#11554 unlock path — in-place writes on this row were rejected SQLITE_TOOBIG)`, { dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, snapshot: ackSnapshot });
+    this.audit(actor, "slim", id, {
+      dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes,
+      old_tags_bytes: oldTagsBytes, new_tags_bytes: newTagsBytes,
+      old_roles_bytes: oldRolesBytes, new_roles_bytes: newRolesBytes,
+      snapshot: ackSnapshot,
+    });
+    this.version(id, actor, "slim", `slimmed meta ${oldBytes}B → ${newBytes}B (dropped: ${dropped.join(", ") || "—"}; verbatim archive: ${ackSnapshot}; tags ${oldTagsBytes}B → ${newTagsBytes}B, roles ${oldRolesBytes}B → ${newRolesBytes}B; BR#11554 unlock path — in-place writes on this row were rejected SQLITE_TOOBIG)`, {
+      dropped_keys: dropped, old_meta_bytes: oldBytes, new_meta_bytes: newBytes,
+      old_tags_bytes: oldTagsBytes, new_tags_bytes: newTagsBytes,
+      old_roles_bytes: oldRolesBytes, new_roles_bytes: newRolesBytes,
+      snapshot: ackSnapshot,
+    });
     await this.embedArtefact(id, String(row.title ?? ""), String(row.body_md ?? ""));
-    return { id, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, dropped_keys: dropped, infra_preserved: infraPreserved, snapshot: ackSnapshot };
+    return { id, old_meta_bytes: oldBytes, new_meta_bytes: newBytes, dropped_keys: dropped, infra_preserved: infraPreserved, snapshot: ackSnapshot, old_tags_bytes: oldTagsBytes, new_tags_bytes: newTagsBytes, old_roles_bytes: oldRolesBytes, new_roles_bytes: newRolesBytes };
   }
 
   /** Pure evidence for a qualification kind: a done analysis/review child, or an accepted

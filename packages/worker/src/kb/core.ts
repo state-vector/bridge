@@ -722,11 +722,16 @@ export function checkStorageBudget(
   const metaBytes = utf8Bytes(metaJson);
   if (metaBytes > LIMITS.metaBytes)
     return `storage budget: meta is ${kb(metaBytes)}KB > ${kb(LIMITS.metaBytes)}KB (LIMITS.metaBytes, BR#11554) — this row would brick near the DO SQLite write budget: stub archived receipts verbatim into a linked artefact, keep only a pointer key (meta_delete the verbatim keys), then retry`;
-  const rowBytes =
-    utf8Bytes(title) + utf8Bytes(bodyMd) + metaBytes +
-    (tagsJson ? utf8Bytes(tagsJson) : 0) + (rolesJson ? utf8Bytes(rolesJson) : 0);
+  // BR#11637: name the per-component bytes — an oversized row is ambiguous
+  // from its total alone, and the calibration dance (three probes to find
+  // WHICH component blew the budget) collapses to one readable error.
+  const titleBytes = utf8Bytes(title);
+  const bodyBytes = utf8Bytes(bodyMd);
+  const tagsBytes = tagsJson ? utf8Bytes(tagsJson) : 0;
+  const rolesBytes = rolesJson ? utf8Bytes(rolesJson) : 0;
+  const rowBytes = titleBytes + bodyBytes + metaBytes + tagsBytes + rolesBytes;
   if (rowBytes > LIMITS.rowBytes)
-    return `storage budget: row is ${kb(rowBytes)}KB > ${kb(LIMITS.rowBytes)}KB (title+body+meta+tags+roles, LIMITS.rowBytes, BR#11554) — shrink body or meta first; a row that lands near the DO SQLite statement budget (~100KB) becomes permanently write-locked on its next write`;
+    return `storage budget: row is ${kb(rowBytes)}KB > ${kb(LIMITS.rowBytes)}KB (title=${titleBytes}B body=${bodyBytes}B meta=${metaBytes}B tags=${tagsBytes}B roles=${rolesBytes}B — LIMITS.rowBytes, BR#11554) — shrink the largest named component; a tags/roles-bloated row unlocks via artefact_slim (normalizes the columns); a row that lands near the DO SQLite statement budget (~100KB) becomes permanently write-locked on its next write`;
   return null;
 }
 
