@@ -1077,6 +1077,22 @@ impl Ctx {
         }
         let merges = self.sh("git", &["rev-list", "--merges", old_head, new_head, "--not", &base_sha])?;
         if parents.len() > 1 || !merges.trim().is_empty() {
+            // A branch repair can flatten the gateway's integration merge.
+            // Accept that rewrite only on the same lane base commit and
+            // only when the complete reviewed and rewritten trees match.
+            if let [new_base] = parents.as_slice() {
+                let old_parents = self.sh("git", &["show", "-s", "--format=%P", old_head])?;
+                let old_parents: Vec<_> = old_parents.split_whitespace().collect();
+                if let [_, old_base] = old_parents.as_slice() {
+                    if old_base == new_base && self.is_ancestor(new_base, &base_sha)? {
+                        let old_tree = self.sh("git", &["rev-parse", &format!("{old_head}^{{tree}}")])?;
+                        let new_tree = self.sh("git", &["rev-parse", &format!("{new_head}^{{tree}}")])?;
+                        if old_tree == new_tree {
+                            return Ok(format!("identical Git tree {new_tree} at reviewed {old_head} and rewritten {new_head}, both integrated with lane base {new_base}"));
+                        }
+                    }
+                }
+            }
             return Err("Updated branch includes merges outside the proven integration".into());
         }
         // Linear rebase: each patch must survive unchanged and in order.
@@ -8895,6 +8911,12 @@ mod tests {
         let old_tree = repo.git(&["rev-parse", &format!("{old_head}^{{tree}}")]);
         let changed_merge = repo.git(&["commit-tree", &old_tree, "-p", &old_head, "-p", &remote_base, "-m", "merge with an altered tree"]);
         assert!(ctx.mechanical_rebase("main", &old_head, &changed_merge).is_err());
+        let flattened = ctx.mechanical_rebase("main", &merged, &rebased)
+            .expect("flattening the exact same integrated tree should carry");
+        assert!(flattened.contains("identical Git tree"));
+        let changed_flatten = repo.git(&["commit-tree", &old_tree, "-p", &remote_base, "-m", "flattened with a different tree"]);
+        assert!(ctx.mechanical_rebase("main", &merged, &changed_flatten).is_err());
+
 
         std::fs::write(repo.dir.join("feature.txt"), "authored change\n").unwrap();
         repo.git(&["commit", "-q", "-am", "change feature"]);
