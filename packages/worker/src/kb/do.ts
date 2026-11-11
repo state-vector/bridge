@@ -3441,7 +3441,9 @@ export class KnowledgeHub {
         repo TEXT NOT NULL,
         accounting TEXT NOT NULL, -- JSON ReconcileAccounting
         line TEXT NOT NULL,       -- accountingLine(...) — the canary line
-        ok INTEGER NOT NULL
+        ok INTEGER NOT NULL,
+        open_prs INTEGER          -- BR#5106: open PRs the pass listed (the
+                                  -- panel's honest open-N beside queue depth)
       );
       CREATE INDEX IF NOT EXISTS idx_reconcile_reports_repo ON reconcile_reports (repo, seq);
       CREATE TABLE IF NOT EXISTS delivery_admissions (
@@ -3559,6 +3561,7 @@ export class KnowledgeHub {
       `ALTER TABLE ws_tokens ADD COLUMN principal TEXT`, // BR#3787: principal→ws for the agent-plane repair route
       `ALTER TABLE sessions ADD COLUMN kind TEXT`,
       `ALTER TABLE sessions ADD COLUMN worktree TEXT`, // BR#3204: where the session's tree lives — board collision visibility
+      `ALTER TABLE reconcile_reports ADD COLUMN open_prs INTEGER`, // BR#5106: the panel's `open N` source
       `ALTER TABLE lane_state ADD COLUMN lane_id TEXT`,
       `ALTER TABLE lane_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
@@ -15312,6 +15315,10 @@ export class KnowledgeHub {
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
+      // BR#5106: the same leg number feeds the executor's label sync, which
+      // derives "merge-ready" PRs from train_status alone (its only hub
+      // source; a blind stamp would lie), and readers can name the head PR
+      // without a card fetch.
       const row = cards.find((x) => x.id === c.id)!;
       const cm = metaById.get(c.id);
       const leg = trainLegsRemaining(cm, repo, base)[0];
@@ -17251,6 +17258,18 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         continue;
       }
       const queue = this.laneQueue(lane.repo, lane.base);
+      // BR#5106 depth-counter honesty: the open-PR count from the repo's
+      // LAST reconcile report — the queue is the actionable subset; `open`
+      // is everything the executor listed. Null until the first report
+      // (pre-migration rows have no count) — the panel then shows the queue
+      // alone instead of a made-up zero.
+      const lastReport = this.one(
+        `SELECT ts, open_prs FROM reconcile_reports WHERE repo = ? ORDER BY seq DESC LIMIT 1`,
+        lane.repo,
+      ) as any;
+      const openPrs = lastReport && lastReport.open_prs != null
+        ? { count: Number(lastReport.open_prs), ts: Number(lastReport.ts) }
+        : null;
       // BR#4694: canary merges ride the real ledger but never the throughput
       // metrics — a synthetic daily doc-touch must not flatter (or mask) the
       // lane's merges/h, nor refresh last_merge_ts over a stalled lane.
@@ -17980,6 +17999,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         starvation: meta.lane?.starvation ?? meta.starvation ?? null,
         queue,
         awaiting: awaitingRows,
+        open_prs: openPrs,
         execution_holds: this.laneExecutionHolds(lane.repo, lane.base),
         pr_stats: prStats,
         batches,
@@ -18565,11 +18585,24 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
     }
 
+    // ---- executor-applied PR label transitions (BR#5106) — audited here so
+    // every from→to carries the reporter's identity; the hub never touches
+    // GitHub itself (BR#3516), it only records what its executor stamped ----
+    const labelEvents = Array.isArray(body?.labels) ? body.labels : [];
+    let labelsSynced = 0;
+    for (const ev of labelEvents) {
+      const pr = Number(ev?.pr ?? 0);
+      const to = String(ev?.to ?? "").trim();
+      if (!Number.isInteger(pr) || pr <= 0 || !to.startsWith("bridge:")) continue;
+      this.audit(actor, "pr_label_synced", null, { repo, pr, from: ev?.from ?? null, to });
+      labelsSynced += 1;
+    }
+
     // ---- record the run ----
     const line = accountingLine(accounting);
     this.state.storage.sql.exec(
-      `INSERT INTO reconcile_reports (ts, actor, repo, accounting, line, ok) VALUES (?, ?, ?, ?, ?, ?)`,
-      now, actor, repo, JSON.stringify(accounting), line, accounting.ok ? 1 : 0,
+      `INSERT INTO reconcile_reports (ts, actor, repo, accounting, line, ok, open_prs) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      now, actor, repo, JSON.stringify(accounting), line, accounting.ok ? 1 : 0, accounting.open_total,
     );
 
     // Accounting is agent work. Dispatch a durable, deduplicated repair rather
@@ -18590,13 +18623,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         this.audit(actor, "reconcile:alarm_deduped", null, { repo, error: String((e as Error).message ?? e).slice(0, 160) });
       }
     }
-    this.audit(actor, "reconcile_report", null, { repo, line, ok: accounting.ok, spawned: spawned.length });
+    this.audit(actor, "reconcile_report", null, { repo, line, ok: accounting.ok, spawned: spawned.length, labels_synced: labelsSynced });
 
     return {
       ok: accounting.ok,
       line,
       accounting,
       spawned,
+      labels_synced: labelsSynced,
       unaccounted: unaccounted.map((j) => ({ pr: j.pr, why: (j.decision as { why: string }).why })),
     };
   }
