@@ -114,7 +114,7 @@ async function strandDutiesOf(id: string): Promise<string[]> {
 /** A lane card for the repo + a LIVE lease + one merged event NOW — the
  *  healthy-lane proof (the train moved after any backdated park). */
 async function healthyLane(repo: string, gw: string): Promise<void> {
-  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "rig" });
+  const lane = await kbJson("/train.lane", { repo, base: "main", actor: "rig", spec: { required_workflows: ["Test"] } });
   expect(lane.body.error ?? "").toBe("");
   const a = await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: gw });
   expect(a.body.error ?? "").toBe("");
@@ -338,7 +338,7 @@ describe("BR#6384 Leg 2 — the disposition ladder (real DO)", () => {
     // stalled lane: live lane, but it never merged after the park — the
     // starvation law owns that lane, not the ladder.
     const STALL = "state-vector/br6384-l2-stalled";
-    const lane = await kbJson("/train.lane", { repo: STALL, base: "main", actor: "rig" });
+    const lane = await kbJson("/train.lane", { repo: STALL, base: "main", actor: "rig", spec: { required_workflows: ["Test"] } });
     expect(lane.body.error ?? "").toBe("");
     const stalledId = await strandedCard(
       "BR#6384 guard: stalled-lane car",

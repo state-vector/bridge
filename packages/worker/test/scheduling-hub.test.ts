@@ -806,7 +806,7 @@ describe("priority line recovery capacity", () => {
     const project = "train-review-dispatch";
     const repo = "state-vector/bridge", pr = 6997, head = "b".repeat(40);
     const train = "train-review-gateway";
-    expect((await post("train.lease", { repo, actor: train, action: "acquire" })).error).toBeUndefined();
+    expect((await post("train.lease", { repo, actor: train, action: "acquire", required_workflows: ["Test"] })).error).toBeUndefined();
     const g = await gateway(project, 3);
     const parent = await task(project, {
       pr: { repo, number: pr, head_sha_at_acceptance: head },
