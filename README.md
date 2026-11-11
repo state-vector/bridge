@@ -3160,7 +3160,16 @@ merged PR is beyond the bounce clock. The same repair closes the
 `accepted_direct_main` strand: an exact-subject acceptance now also closes
 a parent parked in `todo` (the BR#7642 shape — the close previously
 required `in_review` and stranded verified delivered work in the pool).
-Pinned in `packages/worker/test/br9510-admission-livelock.test.ts`.
+The strand sweep shares the law: a stranded car (stale `queued` stamp on
+a card the sweep sees un-admitted — resumed `blocked→in_progress` by an
+answered ask, or an un-admitted park) whose every leg already carries a
+merge receipt is terminally closed instead of re-boarding or dispatching
+another `queue_binding` recovery duty — the pre-cure stamps never replay
+an acceptance, so without this the sweep re-dispatched recovery forever
+(the BR#11981 live incident: PR merged, acceptance admitted, four+
+identical recovery duties, one small-tier executor per strand pass). A
+car with no merge receipt still re-boards / dispatches exactly as before
+(fail-closed). Pinned in `packages/worker/test/br9510-admission-livelock.test.ts`.
 
 ### Duplicate citations bind once; the stale re-queue fails closed (BR#6349)
 

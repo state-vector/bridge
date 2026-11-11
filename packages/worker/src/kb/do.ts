@@ -15878,9 +15878,31 @@ export class KnowledgeHub {
         if (ageMs < strandHours * 3_600_000) continue;
         const event = meta.blocked?.await_event;
         const plan = planTaskRecovery({ status: String(r.status), phase: String(meta.merge_train?.state ?? ""), live_executor: this.strandOwnerLive(r.owner, meta, staleMin), queue_admitted: admitted, is_delivery: mergeCompletesTask(meta), has_other_wait: !!event && !["pr_merged", "pr_checks_green"].includes(event.event) });
+        // ---- BR#9510 strand-surface carry: a stranded car whose EVERY leg
+        // already carries a hub merge receipt is TERMINAL — close it on the
+        // machine proxy instead of re-boarding or dispatching another
+        // queue_binding duty. The acceptance-path cure (queueAcceptedPrLegs)
+        // only fires on a NEW acceptance replay; a car stranded by a pre-cure
+        // stamp whose acceptance never replays — resumed blocked→in_progress
+        // by an answered ask, or an un-admitted park — re-fired recovery on
+        // every sweep pass forever (BR#11981: PR merged at 1794381140294,
+        // acceptance admitted 1794381817748, four+ identical recovery duties,
+        // one small-tier executor burned per strand pass). The terminal close
+        // is idempotent and gate-refusals keep the honest landed stamp for
+        // the next pass — a refused close never spawns a verify duty. ----
+        const strandLegs = trainLegs(meta).filter((l) => isValidGitHubRepo(l.repo));
+        const mergedTerminal = (plan.kind === "restore_queue" || plan.kind === "dispatch") && strandLegs.length
+          ? this.admissionMergedReceipts(meta, strandLegs)
+          : null;
         switch (plan.kind) {
           case "none": case "owned": break;
-          case "restore_queue": if (cls) await this.strandAct(String(r.id), String(r.status), cls, awaitEv); break;
+          case "restore_queue":
+            if (mergedTerminal) {
+              await this.closeAdmittedMergedCard(String(r.id), mergedTerminal, strandLegs, "system:train", "observed-merge-carry");
+              break;
+            }
+            if (cls) await this.strandAct(String(r.id), String(r.status), cls, awaitEv);
+            break;
           case "dispatch": {
             // GitHub reconciliation owns the next step for a completed
             // repair. The alarm has no fresh head evidence to reopen it.
@@ -15888,6 +15910,10 @@ export class KnowledgeHub {
               && (this.acceptedRecoveryForBounce(String(r.id), meta.recovery?.task_id, meta.merge_train.bounced_at)
                 || this.openVerifyChildren(String(r.id)) > 0
                 || this.currentTaskReview(String(r.id)).phase === "pending")) break;
+            if (mergedTerminal) {
+              await this.closeAdmittedMergedCard(String(r.id), mergedTerminal, strandLegs, "system:train", "observed-merge-carry");
+              break;
+            }
             await this.ensureTaskRecovery(String(r.id), plan.reason);
             break;
           }
