@@ -3333,7 +3333,7 @@ runs on the merge commit) · `train.lane` (ensure / configure) · `train.history
 // operator/executor refreshes it in place via train.lane afterwards
 "train_lane": {
   "state-vector/bridge@main": {
-    "required_workflows": ["Test", "CLI build (packages/cli)", "main-green gate"],
+    "required_workflows": ["Test", "CLI build (packages/cli)"],
     "ci_typical_minutes": 10
   }
 },
