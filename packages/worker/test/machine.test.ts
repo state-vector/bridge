@@ -2095,6 +2095,55 @@ describe("breachClass: release:held-execution-wait (BR#6740)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#9534 — the done-close-legs receipts gate (machine.ts done-close-legs
+// rule, BR#3361) refuses a done whose Done-when/note derives terminal GH
+// close legs with neither a closure receipt nor a closed close-duty child:
+// "terminal close leg(s) not receipted: #3089 — a done card claiming a GH
+// close must carry the closure receipt (state=closed + closing-comment id
+// (or the comment URL) + guard run id (or n/a)) in the done note, or own
+// the leg with a closed close-duty child. Retrying this done auto-derives
+// the close-duty child (BR#3361)." The refusal IS the receipts contract
+// working — the message prescribes its own cure and the retry auto-derives
+// the child (do.ts spawnCloseLegDuty), so one compliant close flow emits
+// 2-3 events (attempt → refusal → auto-derive → clarified done → child
+// superseded). The trailing " [rule: done-close-legs]" tag does NOT survive
+// the 300-char audit slice (the message runs ~341 chars — the BR#4562
+// tag-cut case), so the ladder owns the class via the stem that OPENS the
+// message. Specimen: 3 events on BR#9497, 2026-11-09 10:10:36–10:13:07Z
+// (the verify done for GH#3089 derived a leg the merge train owned; the
+// train closed the issue at merge a0794a3c — zero orphan legs, fully
+// compliant), folded "unclassified" and raised breach card BR#9534. The
+// class is named so the Log says WHAT fenced; priced never-a-breach so a
+// compliant close can never arm a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: close_leg_fence (BR#9534)", () => {
+  // the exact audited reason shape (machine.ts done-close-legs rule) with
+  // the leg list interpolated and do.ts's rule tag appended — then cut
+  const FENCE =
+    "terminal close leg(s) not receipted: #3089 — a done card claiming a GH close must carry the closure receipt (state=closed + closing-comment id (or the comment URL) + guard run id (or n/a)) in the done note, or own the leg with a closed close-duty child. Retrying this done auto-derives the close-duty child (BR#3361). [rule: done-close-legs]";
+
+  it("the receipts-fence refusal classifies close_leg_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("close_leg_fence");
+    // the audited reason is sliced to 300 chars and the trailing [rule:
+    // done-close-legs] tag is cut (the message runs 341 chars) — the stem
+    // OPENS the message, so classification survives the cut
+    expect(FENCE.slice(0, 300)).not.toContain("[rule:"); // the tag-cut case this stem exists for
+    expect(breachClass(FENCE.slice(0, 300))).toBe("close_leg_fence");
+  });
+
+  it("a receipts-fence storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#9497", ts: 1000 + i * 60_000, reason: FENCE.slice(0, 300),
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["close_leg_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,

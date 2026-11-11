@@ -1232,6 +1232,20 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // 23:30:41–58Z, folded "unclassified" (default threshold 3) and raised
   // breach card BR#6740. The class is named so the Log says WHAT held.
   "release:held-execution-wait": Number.POSITIVE_INFINITY,
+  // BR#9534 — the done-close-legs receipts fence (machine.ts done-close-legs
+  // rule, BR#3361): a done whose text derives terminal GH close legs with
+  // neither a closure receipt nor a closed close-duty child is refused, and
+  // the retry auto-derives the close-duty child — the refusal IS the
+  // receipts contract working (zero orphan legs; a receipt that lies about a
+  // closure is the closure audit's beat, not this gate's), so it joins the
+  // BR#4562/BR#6654/BR#7008/BR#7684 never-a-breach pricing family. One
+  // compliant close flow emits 2-3 of these events, so the default threshold
+  // of 3 re-arms breach cards on exactly the enforcement the message
+  // prescribes (specimen BR#9497: 3 events 2026-11-09 10:10:36–10:13:07Z on
+  // the GH#3089 verify done — the train closed the issue at merge a0794a3c,
+  // zero orphan legs — folded "unclassified" and raised BR#9534). Named so
+  // the Log says WHAT fenced.
+  close_leg_fence: Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1394,6 +1408,23 @@ export function breachClass(reason: string): string {
   // inside the 300-char audit slice, so the classification survives any tail.
   // Specimen: BR#6642, 3 events 2026-11-05 23:30:41–58Z (breach card BR#6740).
   if (r.includes("typed local/capability wait owns this exit")) return "release:held-execution-wait";
+  // BR#9534: the done-close-legs receipts gate (machine.ts done-close-legs
+  // rule, BR#3361) refusing a done whose Done-when/note derives terminal GH
+  // close legs with neither a closure receipt nor a closed close-duty child.
+  // The refusal IS the receipts contract working — the message prescribes
+  // its own cure (carry the receipt, or the retry auto-derives the
+  // close-duty child, do.ts spawnCloseLegDuty), so one compliant close flow
+  // emits 2-3 of these events (attempt → refusal → auto-derive → clarified
+  // done → child superseded). Match the structural fragment "terminal close
+  // leg(s) not receipted" — it OPENS the message, far inside the 300-char
+  // audit slice; the trailing " [rule: done-close-legs]" tag does NOT
+  // survive it (the message runs ~340 chars — the BR#4562 tag-cut case), so
+  // the rule-tag table can't own this class. Specimen: 3 events on BR#9497,
+  // 2026-11-09 10:10:36–10:13:07Z (the verify done for GH#3089 derived a leg
+  // the merge train owned; the train closed the issue at merge a0794a3c —
+  // zero orphan legs, fully compliant), folded "unclassified" and raised
+  // breach card BR#9534. The class is named so the Log says WHAT fenced.
+  if (r.includes("terminal close leg(s) not receipted")) return "close_leg_fence";
   return "unclassified";
 }
 
