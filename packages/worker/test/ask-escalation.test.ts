@@ -62,9 +62,10 @@ afterAll(async () => {
 });
 
 /** an in_progress task bound to a fresh ask addressed to `to` */
-async function askOnInProgressTask(to: string, question: string): Promise<{ askId: string; taskId: string }> {
+async function askOnInProgressTask(to: string, question: string, recovery = false): Promise<{ askId: string; taskId: string }> {
   const task = await kbJson("/create", {
     type: "task", title: `escalation drill carrier — ${to}`, body_md: "drill", actor: "escal-driller",
+    ...(recovery ? { meta: { machine_duty: { by: "recovery", kind: "task-recovery", subject: "BR#100000", reason: "queue_binding" } } } : {}),
   });
   expect(task.status, JSON.stringify(task.body)).toBe(200);
   const taskId = String(task.body.id);
@@ -79,6 +80,37 @@ async function askOnInProgressTask(to: string, question: string): Promise<{ askI
 }
 
 describe("ask TTL escalation (real DO)", () => {
+  it("returns the same recovery duty to dispatch after its exclusive coordination request expires", async () => {
+    const recovery = await askOnInProgressTask("any", "Can a gateway restore the verified delivery?", true);
+    const ordinary = await askOnInProgressTask("any", "Can an agent clarify this work?");
+    const now = Date.now();
+    expect((await kbJson("/admin.ask_escalation_sweep", { now: now + 60 * 60_000 })).status).toBe(200);
+    expect((await kbJson("/get", { id: recovery.taskId })).body.status).toBe("blocked");
+
+    const sweep = await kbJson("/admin.ask_escalation_sweep", { now: now + 25 * 60 * 60_000 });
+    expect(sweep.status, JSON.stringify(sweep.body)).toBe(200);
+    const task = (await kbJson("/get", { id: recovery.taskId })).body;
+    expect(task).toMatchObject({ status: "todo", owner: "", meta: { machine_duty: { kind: "task-recovery" } } });
+    expect(task.meta.blocked).toBeUndefined();
+    expect(task.meta.proxy_check).toBeUndefined();
+    const ask = (await kbJson("/get", { id: recovery.askId })).body;
+    expect(ask).toMatchObject({ status: "done", meta: { ask: { resolution: { kind: "cancelled" } } } });
+    expect(ask.meta.ask.answer).toBeUndefined();
+    expect((await kbJson("/get", { id: ordinary.taskId })).body.status).toBe("blocked");
+  });
+
+  it("preserves a recovery request another task still references", async () => {
+    const recovery = await askOnInProgressTask("any", "Can a gateway reconcile shared delivery?", true);
+    const dependent = (await kbJson("/create", { type: "task", title: "Shared recovery answer consumer", actor: "consumer" })).body.id;
+    expect((await kbJson("/transition", { id: dependent, to: "in_progress", actor: "consumer" })).status).toBe(200);
+    expect((await kbJson("/transition", { id: dependent, to: "blocked", actor: "consumer",
+      note: "Wait for the same request", await_event: { event: "br_answered", id: recovery.askId },
+    })).status).toBe(200);
+    expect((await kbJson("/admin.ask_escalation_sweep", { now: Date.now() + 25 * 60 * 60_000 })).status).toBe(200);
+    expect((await kbJson("/get", { id: recovery.taskId })).body.status).toBe("blocked");
+    expect((await kbJson("/get", { id: recovery.askId })).body.status).toBe("todo");
+  });
+
   it("escalates an ask to a never-seen agent identity past the default TTL — same node, options intact, human-visible on the board", async () => {
     const { askId, taskId } = await askOnInProgressTask(
       "escal-ghost-agent", // never connected: no auth token, no gateway edge

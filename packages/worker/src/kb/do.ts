@@ -2335,7 +2335,7 @@ export class KnowledgeHub {
     const coordination = a?.status === "done"
       ? this.managedCoordinationReceipt(String(r.id), meta.blocked, aw.ask_id, JSON.parse(String(a.meta ?? "{}")).ask) : null;
     if (coordination) {
-      this.continueSatisfiedWait(String(r.id), meta, [coordination]);
+      this.continueBlockedWork(String(r.id), meta, { kind: "satisfied", receipts: [coordination] });
       return;
     }
     await this.spawnProxyDuty(r, meta, now, prev, cond, receipts);
@@ -2573,7 +2573,7 @@ export class KnowledgeHub {
     // A completed verification round is not a continuation. Consume a verified
     // prerequisite before flood/dedup checks, which must never strand it.
     if (!openChild && lastChild && ["done", "superseded"].includes(String(lastChild.status))
-      && this.continueSatisfiedWait(String(r.id), meta, receiptLines)) return;
+      && this.continueBlockedWork(String(r.id), meta, { kind: "satisfied", receipts: receiptLines })) return;
     // same flood law as the machine's own spawn (machine.ts): only the
     // SAME exit condition within the window floods — a block-time round
     // with this exact condition is already on the case; a later flip
@@ -2640,33 +2640,36 @@ export class KnowledgeHub {
     this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE — unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
   }
 
-  /** The authoritative continuation of a verified typed wait. Like executor
-   * readiness recovery, this is an atomic blocked→todo edge, not a claim and
-   * not task completion. Protected execution and human/train holds retain
-   * their own exits. All evidence comes from this pass's complete evaluation. */
-  private continueSatisfiedWait(id: string, evaluated: any, receipts: string[]): boolean {
+  /** Return the same task to dispatch when its typed prerequisite was
+   * verified or its own obsolete recovery request was cancelled. */
+  private continueBlockedWork(id: string, evaluated: any, continuation:
+    | { kind: "satisfied"; receipts: string[] }
+    | { kind: "expired_coordination"; ask_id: string }): boolean {
+    const expiredAsk = continuation.kind === "expired_coordination" ? continuation.ask_id : undefined;
     const expected = validateAwaitEvent(evaluated.blocked?.await_event);
-    if (!expected || !receipts.length) return false;
+    if (!expected || (continuation.kind === "satisfied" && !continuation.receipts.length)
+      || (expiredAsk && (expected.event !== "ask" || expected.ask_id !== expiredAsk))) return false;
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
     if (!row || row.status !== "blocked") return false;
     const meta = JSON.parse(String(row.meta ?? "{}"));
     if (JSON.stringify(validateAwaitEvent(meta.blocked?.await_event)) !== JSON.stringify(expected)
       || meta.blocked?.ts !== evaluated.blocked?.ts) return false;
     if (this.isUnclaimableAnchor(row, meta) || meta.lane || meta.operator_gated || meta.delivery_disposition
-      || meta.interactive_execution || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id)) return false;
+      || meta.interactive_execution || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id, expiredAsk)) return false;
     if (["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))) return false;
     const execution = this.executionState(id);
     if (execution?.attempt && execution.attempt.phase !== "quiesced"
       || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
       || this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, id)) return false;
-    if (meta.awaiting_ask?.ask_id) {
+    if (meta.awaiting_ask?.ask_id && meta.awaiting_ask.ask_id !== expiredAsk) {
       const ask = this.one(`SELECT status FROM artefacts WHERE id=?`, meta.awaiting_ask.ask_id);
       if (!ask || !["done", "superseded"].includes(String(ask.status))) return false;
     }
     const now = Date.now();
     const predicate = meta.blocked;
     delete meta.blocked; delete meta.awaiting_ask; delete meta.last_unblock_spawn;
-    meta.proxy_check = { at: now, verdict: "true", receipts };
+    if (continuation.kind === "satisfied") meta.proxy_check = { at: now, verdict: "true", receipts: continuation.receipts };
+    else delete meta.proxy_check;
     delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
     // A historical bounce is repair work, not an active train slot. Keeping
     // its releaseHold after consuming the prerequisite would strand todo too.
@@ -2675,10 +2678,17 @@ export class KnowledgeHub {
     this.state.storage.transactionSync(() => {
       const current = this.one(`SELECT status,meta,owner FROM artefacts WHERE id=?`, id);
       if (current.status !== row.status || current.meta !== row.meta || current.owner !== row.owner) throw new Error("wait continuation changed before commit");
+      if (expiredAsk) this.cancelRequest(expiredAsk, "The recovery coordination request expired. Bridge will retry the same recovery duty.", "system:coordination");
       this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
-      this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
-      this.version(id, "system:proxy-watch", "wait_continued", "Satisfied prerequisite recorded; continuation returned to the executable pool", { await_event: expected, receipts });
-      this.audit("system:proxy-watch", "wait_continued", id, { await_event: expected, receipts });
+      if (continuation.kind === "expired_coordination") {
+        this.version(id, "system:coordination", "transition", "blocked → todo — retrying recovery after its coordination request expired", { from: "blocked", to: "todo", ask_id: continuation.ask_id });
+        this.audit("system:coordination", "recovery_coordination_expired", id, { ask_id: continuation.ask_id });
+      } else {
+        const { receipts } = continuation;
+        this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
+        this.version(id, "system:proxy-watch", "wait_continued", "Satisfied prerequisite recorded; continuation returned to the executable pool", { await_event: expected, receipts });
+        this.audit("system:proxy-watch", "wait_continued", id, { await_event: expected, receipts });
+      }
     });
     return true;
   }
@@ -5421,9 +5431,9 @@ export class KnowledgeHub {
     return todoDispatchHold({ ...meta, recovery: undefined });
   }
 
-  private startupHasAsk(id: string): boolean {
-    return !!this.one(`SELECT id FROM asks WHERE artefact_id = ? AND status = 'open'`, id)
-      || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL`, id);
+  private startupHasAsk(id: string, except = ""): boolean {
+    return !!this.one(`SELECT id FROM asks WHERE artefact_id = ? AND status = 'open' AND id != ?`, id, except)
+      || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL AND c.id != ?`, id, except);
   }
 
   private proxyTrialConsumed(id: string, revision: string): boolean {
@@ -8801,6 +8811,7 @@ export class KnowledgeHub {
   private async escalateStaleAsks(now: number): Promise<string[]> {
     await this.reconcileCompletedReviews();
     this.retireCompletedCoordination(now);
+    this.retryExpiredRecoveryCoordination(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
     const ttlMs = ttlMin * 60_000;
@@ -8839,6 +8850,37 @@ export class KnowledgeHub {
       escalated.push(r.id);
     }
     return escalated;
+  }
+
+  private retryExpiredRecoveryCoordination(now: number): void {
+    const cutoff = now - 24 * 60 * 60_000;
+    const rows = this.state.storage.sql.exec(`SELECT t.id, t.meta, q.id AS ask_id, q.status AS ask_status, q.meta AS ask_meta
+      FROM artefacts t JOIN artefacts q ON q.id=json_extract(t.meta,'$.blocked.await_event.ask_id')
+      WHERE t.type='task' AND t.status='blocked' AND q.type='question' AND q.status='todo'
+        AND json_extract(t.meta,'$.machine_duty.kind')='task-recovery'
+        AND json_extract(t.meta,'$.blocked.await_event.event')='ask'
+        AND json_extract(q.meta,'$.ask.artefact_id')=t.id
+        AND q.created_ts<? AND json_extract(t.meta,'$.blocked.ts')<?
+        AND coalesce(CAST(json_extract(q.meta,'$.human_claimed.expires_ts') AS INTEGER),0)<=?
+      ORDER BY q.created_ts`, cutoff, cutoff, now).toArray();
+    let resumed = 0;
+    for (const row of rows) {
+      const meta = JSON.parse(String(row.meta ?? "{}"));
+      const askMeta = JSON.parse(String(row.ask_meta ?? "{}"));
+      const ask = askMeta.ask;
+      if (!ask || isHumanDecisionAsk(ask) || askLifecycle({ status: String(row.ask_status), meta: askMeta }).state !== "open") continue;
+      const route = askRoute(ask);
+      if (route.kind !== "agent_coordination" && route.kind !== "executor_coordination") continue;
+      // A single request shared with another blocked card has another owner.
+      const askId = String(row.ask_id);
+      if (this.one(`SELECT id FROM artefacts WHERE type='task' AND status NOT IN ('done','superseded') AND id!=? AND (
+        json_extract(meta,'$.awaiting_ask.ask_id')=?
+        OR (json_extract(meta,'$.blocked.await_event.event')='ask' AND json_extract(meta,'$.blocked.await_event.ask_id')=?)
+        OR (json_extract(meta,'$.blocked.await_event.event') IN ('br_answered','br_done') AND json_extract(meta,'$.blocked.await_event.id')=?)
+        OR id IN (SELECT dst_id FROM relations WHERE src_id=? AND relation='child_of')
+      ) LIMIT 1`, row.id, askId, askId, askId, askId)) continue;
+      if (this.continueBlockedWork(String(row.id), meta, { kind: "expired_coordination", ask_id: askId }) && ++resumed >= 12) break;
+    }
   }
 
   /** Terminal work retires its coordination obligations, not human decisions.
@@ -9762,7 +9804,7 @@ export class KnowledgeHub {
         if (canDispatch && managedContinuation) {
           // An answer satisfies the prerequisite. If the previous writer is
           // still stopping, the proxy sweep will consume the same typed wait.
-          taskStatus = this.continueSatisfiedWait(String(subject.id), sm, [managedContinuation]) ? "todo" : "blocked";
+          taskStatus = this.continueBlockedWork(String(subject.id), sm, { kind: "satisfied", receipts: [managedContinuation] }) ? "todo" : "blocked";
         } else if (canDispatch) {
           // BR#3578 answer dispatch: when the ask IS the exit path (a
           // migration ask, or an option that names the action), the ANSWER
@@ -16428,7 +16470,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             : `executor-verified satisfied: ${String(verifiedOk!.receipt ?? "")}`;
           const continuation = pv
             ? await this.reviewObservedMerge(carId, awaitEv.repo, awaitEv.n, String(pv.merge_sha), "system:train")
-            : { kind: this.continueSatisfiedWait(carId, meta, [receipt]) ? "resumed" : "retained" };
+            : { kind: this.continueBlockedWork(carId, meta, { kind: "satisfied", receipts: [receipt] }) ? "resumed" : "retained" };
           this.audit("system:train", "strand_disposition_continued", carId, { class: cls, via: pv ? "provenance" : "probe", continuation });
           continue;
         }
