@@ -350,3 +350,63 @@ describe("BR#9510 leg 5 — accepted_direct_main closes a todo-position parent (
     expect(cur.meta?.delivery).toMatchObject({ kind: "direct_main", sha: COMMIT, repo: REPO });
   });
 });
+
+describe("BR#14071 leg — an analysis-role parent closes via a derived execution_result (no refused-close storm)", () => {
+  // The live defect (2026-11-12, breach card BR#14071, specimen BR#6074):
+  // the merged-provenance terminal close (BR#9510) passed a bare done body,
+  // the analysis-done-needs-outcome gate refused EVERY attempt ("requires
+  // execution_result {outcome,receipts}"), and the next admission replay /
+  // merged-park sweep retried — an unbounded merged_admission_close_refused
+  // storm folding "unclassified" into the breach door. Modern analysis
+  // cards are execution-contract cards (do.ts stamps completion at create)
+  // and close via accepted_execution without a train leg; the storm shape
+  // is the LEGACY one: an analysis-role card with delivery-contract meta
+  // riding the train (BR#6074: created before the auto-stamp, accepted_pr
+  // admissions, merged legs). The emitter now derives the execution_result
+  // from the receipts it already holds (the merged legs + the carried
+  // independent acceptance), so the close lands first try.
+  it("an accepted merged admission on a legacy analysis parent lands done with a derived execution_result, first try", async () => {
+    const REPO = "state-vector/br14071-analysis";
+    const N = 14071;
+    const HEAD = "a".repeat(40);
+    const SHA = "b".repeat(40);
+    await stampProvenance(REPO, N, SHA, HEAD, "gw-br14071-a");
+    const created = await kbJson("/create", {
+      type: "task", title: "BR#14071 analysis admission specimen", roles: ["analysis"],
+      // the BR#6074 legacy shape: analysis role, delivery-contract meta.
+      // Must be CREATE-TIME meta: a top-level field is ignored, and an
+      // analysis card created without an explicit contract gets the modern
+      // execution auto-stamp (do.ts:4446) — the wrong specimen entirely.
+      meta: { completion: { kind: "delivery" } },
+    });
+    expect(created.status, JSON.stringify(created.body)).toBe(200);
+    const id = String(created.body.id);
+    expect((await kbJson("/transition", { id, to: "in_progress", actor: "drill-analyst", note: "analysis" })).status).toBe(200);
+    // the analysis contract requires the outcome receipts at SUBMISSION time
+    // (execution-submission-needs-outcome) — the analyst's honest filing
+    const submitted = await kbJson("/transition", {
+      id, to: "in_review", actor: "drill-analyst",
+      note: `PR https://github.com/${REPO}/pull/${N} head ${HEAD}`,
+      execution_result: { outcome: "provisional baseline frozen (drill run rrp-specimen)", receipts: [`drill run rrp-specimen manifest`] },
+    });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    const duty = String(submitted.body.verify_task);
+    expect(duty).toBeTruthy();
+    await acceptSpawnedReview(duty, id, [{ repo: REPO, number: N, head_sha_at_acceptance: HEAD }]);
+    const cur = await get(id);
+    expect(cur.status).toBe("done");
+    expect(cur.meta?.merge_train?.state).toBe("landed");
+    expect(cur.meta?.merge_train?.legs?.[String(N)]).toMatchObject({ state: "landed", merge_sha: SHA });
+    // the DERIVED execution_result describes the delivery with receipts and
+    // replaces the submission's at the terminal close (the done gate reads
+    // the close body only, so the derivation is what lands the card)
+    expect(String(cur.meta?.execution_result?.outcome ?? "")).toContain(`merged as ${SHA}`);
+    expect(Array.isArray(cur.meta?.execution_result?.receipts)).toBe(true);
+    expect(cur.meta.execution_result.receipts.length).toBeGreaterThan(0);
+    expect(cur.meta.execution_result.receipts.join("\n")).toContain(`https://github.com/${REPO}/pull/${N}`);
+    // no refusal ever audited: the close landed on the first attempt
+    const text = await historyText(id);
+    expect(text).toContain("merged-provenance");
+    expect(text).not.toContain("terminal admission close refused");
+  });
+});
