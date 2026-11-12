@@ -190,7 +190,7 @@ describe("one line status and recovery contract", () => {
     const state = { verdict: "green", tip_sha: tip, red: [], unsettled: [], deploy_coverage: {
       phase: "covered", tip_sha: tip, tip_age_secs: 50, covered_by_sha: tip, covered_by_run_id: 122,
     } };
-    expect(applyDeployObservation(state, observation, required, now)?.verdict).toBe("unsettled");
+    expect(applyDeployObservation(state, observation, required, now)?.verdict).toBe("settling"); // BR#14088: in-flight deploy = settling (amber)
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_id: 123 } }, observation, required, now)?.verdict).toBe("green");
   });
   it.each(["failure", null] as const)("older same-run success cannot override a newer rerun (%s)", conclusion => {
@@ -201,7 +201,7 @@ describe("one line status and recovery contract", () => {
     const state = { verdict: "green", tip_sha: tip, red: [], unsettled: [], check_observed_at: 100,
       deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 50, covered_by_sha: tip,
         covered_by_run_id: 500, covered_by_run_attempt: 1 } };
-    const expected = conclusion ? "red" : "unsettled";
+    const expected = conclusion ? "red" : "settling"; // BR#14088: an in-flight rerun settles amber, never green
     expect(applyDeployObservation(state, observation, required)?.verdict).toBe(expected);
     expect(applyDeployObservation(state, observation, required, 300)?.verdict).toBe(expected);
     expect(applyDeployObservation({ ...state, deploy_coverage: { ...state.deploy_coverage, covered_by_run_attempt: undefined } }, observation, required, 300)?.verdict).toBe(expected);
@@ -221,7 +221,8 @@ describe("one line status and recovery contract", () => {
     const second = { ...first, run_attempt: 2, status: "in_progress" as const, conclusion: null };
     const observation = { tip_sha: tip, observed_at: now, runs: [first, second] };
     const effective = applyDeployObservation(base, observation, required);
-    expect(effective).toMatchObject({ verdict: "unsettled", red: [],
+    // BR#14088: the exact active retry holds the lane SETTLING (amber, never green)
+    expect(effective).toMatchObject({ verdict: "settling", red: [],
       deploy_coverage: { phase: "settling", tip_sha: tip, active_run_id: runId, active_run_url: runUrl } });
     const line = projectTrainLine(facts({ queue: [{ id: "BR#1" }], queue_facts: { at: now, base_state: effective } }), now);
     expect(line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine", url: runUrl } });
@@ -244,9 +245,28 @@ describe("one line status and recovery contract", () => {
     const base_state = { verdict: "empty", red: [], unsettled: [], deploy_coverage: {
       phase: "settling", tip_sha: "20b508b3", tip_age_secs: 147, active_run_id: 41911085476, active_run_url: "https://github.com/run/41911085476",
     } };
-    expect(normalizeBaseStateWithCoverage(base_state).verdict).toBe("unsettled");
+    expect(normalizeBaseStateWithCoverage(base_state).verdict).toBe("settling"); // BR#14088: empty + active deploy = settling, never "deployment-missing" and never green
     const line = projectTrainLine(facts({ queue_facts: { at: now, base_state } }), now);
     expect(line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine", url: "https://github.com/run/41911085476" } });
+  });
+  it("BR#14088: a settling tip (green deploy + in-flight smoke) renders amber waiting and never a green lane state", () => {
+    // The lane's published base_state for the live shape: the deploy job settled
+    // green, the post-admission smoke is still in flight — verdict SETTLING.
+    const base_state = { verdict: "settling", red: [], green: 3,
+      settling: ["post-deploy / Cortex Quality Smoke"],
+      unsettled: ["post-deploy / Cortex Quality Smoke"] };
+    const line = projectTrainLine(facts({ queue: [{ id: "BR#14088" }], queue_facts: { at: now, base_state },
+      lease: { holder: "runner", heartbeat_ts: now } }), now);
+    // amber wait class — never idle/ready/green, and the reason names the in-flight checks
+    expect(line).toMatchObject({ phase: "waiting", blocker: "checks_running" });
+    expect(line.reason).toContain("post-deploy / Cortex Quality Smoke");
+    expect(line.reason).toContain("no green until every required check settles");
+    // a settled-green tip (every required check completed-success) leaves the wait class:
+    // with a green base_state the projection no longer renders "Required checks are running"
+    const greenLine = projectTrainLine(facts({ queue: [{ id: "BR#14088" }], queue_facts: { at: now, base_state: { verdict: "green", red: [], settling: [], unsettled: [], green: 4 } },
+      lease: { holder: "runner", heartbeat_ts: now } }), now);
+    expect(greenLine.blocker).not.toBe("checks_running");
+    expect(greenLine.reason).not.toContain("Required checks are running");
   });
 
   it("failed main remains loud with ZERO queued changes and carries actual agent progress", () => {

@@ -124,10 +124,11 @@ describe("classifyHeadChecks (the head half of the 5c gate)", () => {
     expect(v.external).toEqual([]);
   });
 
-  it("null conclusion on a substance check is unsettled — checks still running never vouch", () => {
+  it("null conclusion on a substance check is settling — an in-flight check never vouches (BR#14088)", () => {
     const v = classifyHeadChecks([run(1, "Test", null)]);
-    expect(v.verdict).toBe("unsettled");
-    expect(v.unsettled).toEqual(["Test"]);
+    expect(v.verdict).toBe("settling");
+    expect(v.settling).toEqual(["Test"]);
+    expect(v.unsettled).toEqual(["Test"]); // fold: list consumers keep naming the check
   });
 
   it("null conclusion on an exempt external is silent (it says nothing either way)", () => {

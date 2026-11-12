@@ -1979,10 +1979,10 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(v.gate).toBeTruthy();
     expect(v.gate?.verdict).toBe("red");
     expect(v.gate?.red.map((r) => r.name)).toEqual(["Deploy drift alarm"]);
-    // in-flight non-required check → the gate refuses unsettled too
+    // in-flight non-required check → the gate refuses it too (BR#14088: the gate verdict reads SETTLING, never green)
     const unsettled = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy health (merge gate)", null)], ["Test", "main-green gate"]);
-    expect(unsettled.verdict).toBe("green");
-    expect(unsettled.gate?.verdict).toBe("unsettled");
+    expect(unsettled.verdict).toBe("green"); // not in the required set: the required-scoped verdict still certifies
+    expect(unsettled.gate?.verdict).toBe("settling");
     // fully green tip → no qualifier
     const allGreen = classifyBaseCheckRuns([run(1, "Test"), run(2, "Deploy drift alarm")], ["Test", "main-green gate"]);
     expect(allGreen.verdict).toBe("green");
@@ -1991,6 +1991,24 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     const scopedRed = classifyBaseCheckRuns([run(1, "Test", "failure")], ["Test", "main-green gate"]);
     expect(scopedRed.verdict).toBe("red");
     expect(scopedRed.gate).toBeUndefined();
+  });
+
+  it("BR#14088 required-completeness: a required name with no run yet is settling '(awaiting first run)', never green; red is never downgraded", () => {
+    // the smoke starts LAST (~40-60 min after push): before its first check-run
+    // exists the old law certified green with green < required.len()
+    const required = ["deploy / Deploy to dev", "post-deploy / Cortex Quality Smoke"];
+    const v = classifyBaseCheckRuns([run(1, "deploy / Deploy to dev", "success")], required);
+    expect(v.verdict).toBe("settling");
+    expect(v.settling).toEqual(["post-deploy / Cortex Quality Smoke (awaiting first run)"]);
+    expect(v.unsettled).toContain("post-deploy / Cortex Quality Smoke (awaiting first run)");
+    // the BR#5847 vacuity class stays exempt: a structurally-absent merge-gate name never blocks certification
+    const bridgeRequired = ["Test", "main-green gate"];
+    const vacuous = classifyBaseCheckRuns([run(1, "Test", "success")], bridgeRequired);
+    expect(vacuous.verdict).toBe("green");
+    // red is never downgraded to settling
+    const red = classifyBaseCheckRuns([run(1, "deploy / Deploy to dev", "failure"), run(2, "post-deploy / Cortex Quality Smoke", null)], ["deploy / Deploy to dev"]);
+    expect(red.verdict).toBe("red");
+    expect(red.red).toHaveLength(1);
   });
 
   it("P4 trainStarvationAskTitle + details + duty builders hold the ask contract and carry full diagnosis", () => {

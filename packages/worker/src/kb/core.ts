@@ -4259,9 +4259,10 @@ export function trainStarvationDutyBody(i: TrainStarvationDiagnosisInput): strin
     ``,
     `## What to check (agent checklist)`,
     `1. **\`per_page\` / pagination and naming of \`required_workflows\`**: run \`gh api "repos/${i.lane.repo}/commits/${i.lane.base}/check-runs?per_page=100"\` and compare actual check-run names against \`required_workflows\`. Did required runs fall past page 1 or change workflow/job names?`,
-    `2. **Base runs count on tip**: verify total check-runs count on \`${i.lane.base}\` tip vs matched required runs (\`base_state.alarm\`). If a required check failed transiently, re-run it (\`gh run rerun\`) or open/bind the root-fix cure PR.`,
-    `3. **Verify pool depth**: check \`queue_awaiting_review\` and open \`Verify:\` tasks — are verify duties backed up or bouncing in a coverage loop?`,
-    `4. **Park exits (\`awaiting\` / \`blocked\` cards)**: inspect every card in \`awaiting\` and \`queue\` — confirm each has a valid \`head_sha_at_acceptance\` covering its live PR head and a live machine exit (\`awaiting_sweep\` / \`pr_merged\` proxy).`,
+    `2. **The in-flight trap (BR#14088 — "0 failing ≠ green")**: an in-flight check run (GitHub \`status\` \`queued\`/\`in_progress\`) carries \`conclusion: null\` — a query that counts only \`conclusion == "failure"\` reports ZERO failing while the verdict is UNKNOWN. Count the settling runs too: the tip is green ONLY when EVERY required check is \`status: completed\` + \`conclusion: success\`; any in-flight required check means SETTLING (amber, never green).`,
+    `3. **Base runs count on tip**: verify total check-runs count on \`${i.lane.base}\` tip vs matched required runs (\`base_state.alarm\`). If a required check failed transiently, re-run it (\`gh run rerun\`) or open/bind the root-fix cure PR.`,
+    `4. **Verify pool depth**: check \`queue_awaiting_review\` and open \`Verify:\` tasks — are verify duties backed up or bouncing in a coverage loop?`,
+    `5. **Park exits (\`awaiting\` / \`blocked\` cards)**: inspect every card in \`awaiting\` and \`queue\` — confirm each has a valid \`head_sha_at_acceptance\` covering its live PR head and a live machine exit (\`awaiting_sweep\` / \`pr_merged\` proxy).`,
   ].join("\n");
 }
 
