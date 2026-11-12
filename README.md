@@ -346,7 +346,16 @@ Per-task execution-attention cards are not shown on Top.
 
 **Recovery owns execution priority (BR#6835).** Concrete task-repair duties and
 main-red fixes rank above line recovery, generic diagnostics, boosts, verification
-and ordinary implementation in both discovery and reservation. When a compatible
+and ordinary implementation in both discovery and reservation. A card ranks in the
+top root-fix tier only in its recognized shape — a root-side marker (`root_blocker`
+tag or the meta `root_blocker` / `root_blocker_for_lane` markers) plus a main-red
+tag (`main-red`, `main_red`, `stop-the-line`, or the BR#14075 synonyms `deploy-red` /
+`deploy_red`) plus a bound failing main-HEAD run (`meta.root_fix` repo+head_sha).
+Tags and meta markers never qualify alone — the binding does, so a non-red card
+cannot rank up by wearing the words. Wherever the hub spawns or binds root-fix work
+from a required-workflow red on a tracked base (deploy observation, train
+stop-the-line, the recovery bind), it stamps that exact shape onto the card
+regardless of the authoring session's own vocabulary (BR#14075). When a compatible
 gateway is full, the scheduler can checkpoint-preempt one ordinary managed verifier
 on that host. A durable interrupt requests checkpoint, stopped-process proof and
 yield; the verifier returns to todo with its checkpoint preserved. Its slot stays
@@ -2218,7 +2227,12 @@ stamped on the binding). Three paths, never a duplicate: the culprit card is
 still open and qualified → it is re-bound in place; another open card in the
 same repo qualifies → the binding moves to it; nothing qualifies → a fresh card
 spawns. The red and the repair share one identity: the card the train was
-stopped for IS the ticket that fixes it.
+stopped for IS the ticket that fixes it. Re-binding a repair card from the
+current scope also stamps the recognized marker tags (`root_blocker` +
+`main-red`) onto it — the bind is the qualification, never left to whatever
+vocabulary the authoring session used (BR#14075; recognition additionally
+tolerates the documented main-red synonyms `deploy-red` / `deploy_red`,
+always subject to the failing-run binding).
 
 The queue sorts in four absolute tiers — `root_fix` > `boosted` > `critical` >
 `normal` — root-fix beats even a human ▲ boost (the old `boosted` meta label

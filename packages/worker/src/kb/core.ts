@@ -2235,13 +2235,15 @@ export function mainRedBinding(meta: any, base?: string): RootFixBinding | null 
 
 /** The qualification (Rust is_root_fix_card mirror): tags root_blocker (or
  *  root-blocker / root-fix / base-fix) + main-red (or main_red /
- *  stop-the-line) AND a bound failing main-HEAD run. Tags alone never
- *  qualify — the binding does. BR#6390: a field-minted BASE-FIX card can
- *  carry NO root-side tag at all — the marker then lives in meta
- *  (`root_blocker_for_lane` "<repo>@<base>" or a `root_blocker` id string —
- *  the BR#6378 exemplar), so a meta marker qualifies as the root-side half.
- *  Neither tags nor meta markers qualify ALONE: the failing-run binding below
- *  is still required. */
+ *  stop-the-line / deploy-red / deploy_red — the BR#14075 documented
+ *  synonyms: the red is the deploy leg of the required-workflow set) AND a
+ *  bound failing main-HEAD run. Tags alone never qualify — the binding does.
+ *  BR#6390: a field-minted BASE-FIX card can carry NO root-side tag at all —
+ *  the marker then lives in meta (`root_blocker_for_lane` "<repo>@<base>" or
+ *  a `root_blocker` id string — the BR#6378 exemplar), so a meta marker
+ *  qualifies as the root-side half. Neither tags nor meta markers qualify
+ *  ALONE: the failing-run binding below is still required, so a non-red card
+ *  cannot rank up by wearing the words (BR#14075 no-gaming law). */
 export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
   const tags = Array.isArray(card?.tags) ? card.tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase()) : [];
   const hasRoot =
@@ -2254,7 +2256,11 @@ export function isRootFixCard(card: { tags?: unknown; meta?: any }): boolean {
     // field used).
     (typeof card?.meta?.root_blocker_for_lane === "string" && card.meta.root_blocker_for_lane.includes("@")) ||
     typeof card?.meta?.root_blocker === "string";
-  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red") || tags.includes("stop-the-line");
+  // BR#14075: the documented main-red synonyms qualify too — an authoring
+  // session's own vocabulary (deploy-red names the deploy leg of the
+  // required-workflow red) must not hide a bound main breakage from the
+  // scheduler. The binding below stays mandatory either way.
+  const hasMainRed = tags.includes(MAIN_RED_TAG) || tags.includes("main_red") || tags.includes("stop-the-line") || tags.includes("deploy-red") || tags.includes("deploy_red");
   if (!hasRoot || !hasMainRed) return false;
   return mainRedBinding(card?.meta) !== null;
 }
