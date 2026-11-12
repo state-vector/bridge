@@ -2557,6 +2557,16 @@ export class KnowledgeHub {
     r: any, meta: any, now: number, prev: any, cond: string, receiptLines: string[],
   ): Promise<void> {
     if (this.protectedExecution(String(r.id), meta)) return;
+    const wait = validateAwaitEvent(meta.blocked?.await_event) ?? trainProxyEvent(meta);
+    if (meta.merge_train?.state === "awaiting-ci" && mergeCompletesTask(meta) && wait?.event === "pr_merged") {
+      const receipt = trainMergeReceipt(meta, wait.repo, wait.n);
+      // The train's closeout sweep owns delivery once it can join the card
+      // receipt to provenance. A standalone card receipt still uses the proxy.
+      if (receipt && this.one(
+        `SELECT 1 FROM provenance WHERE repo = ? AND pr = ? AND merge_sha = ?`,
+        wait.repo, wait.n, receipt.merge_sha,
+      )) return;
+    }
     const predicate = JSON.stringify({ event: validateAwaitEvent(meta.blocked?.await_event), condition: cond,
       revision: meta.blocked?.ts, heads: trainLegs(meta).map(l => [l.repo, l.number, l.head_sha_at_acceptance]) });
     const openChild = this.one(
@@ -13669,6 +13679,8 @@ export class KnowledgeHub {
     const carried = await this.carryMergedAdmission(id, repo, pr, meta, actor);
     if (carried) return { kind: "carried", review_id: carried };
     if (row.status === "in_review") return { kind: "retained", reason: "Independent review already owns this delivery." };
+    if (row.status === "in_progress" && meta.merge_train?.state === "awaiting-ci")
+      return { kind: "retained", reason: "The train owns this merge; closeout requires the existing admission." };
     const wait = validateAwaitEvent(meta.blocked?.await_event);
     if (row.status === "blocked" && wait && !(wait.event === "pr_merged" && wait.repo === repo && wait.n === pr)
       && !String(meta.blocked?.reason ?? "").startsWith(MERGE_TRAIN_REASON_PREFIX)) return { kind: "retained", reason: "An independent wait owns this exit." };
@@ -13827,9 +13839,10 @@ export class KnowledgeHub {
   private async sweepMergedParks(_now0: number): Promise<number> {
     await this.resumeMergedPrerequisites();
     const rows = this.state.storage.sql.exec(
-      `SELECT id, meta FROM artefacts
+      `SELECT id, status, meta FROM artefacts
        WHERE type = 'task' AND (
          (status = 'blocked' AND json_extract(meta, '$.merge_train.state') IN ('queued', 'awaiting-ci'))
+         OR (status = 'in_progress' AND json_extract(meta, '$.merge_train.state') = 'awaiting-ci')
          OR (status IN ('todo', 'in_progress') AND json_extract(meta, '$.merge_train.state') = 'bounced'
              AND json_extract(meta, '$.merge_train.close_bounce') = 1
              AND json_extract(meta, '$.merge_train.breach_class') = 'gate:done-unreviewed')
@@ -13847,6 +13860,11 @@ export class KnowledgeHub {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
         if (!mergeCompletesTask(meta)) continue;
+        if (r.status === "in_progress") {
+          const attempt = this.executionState(String(r.id))?.attempt;
+          if (attempt && attempt.phase !== "quiesced") continue;
+          if (meta.awaiting_ask || meta.delivery_disposition) continue;
+        }
         const legs = trainLegs(meta);
         const repoDefault = String((meta as any).merge_train?.repo ?? (meta as any).pr?.repo ?? "");
         const stamp = meta.merge_train;

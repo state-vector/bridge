@@ -179,14 +179,24 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect(current.meta.lane.key).toBe(`${repo}@main`);
     expect((await kbJson("/train.lane", { repo, base: "main" })).body.id).toBe(lane.id);
   });
-  it("BR#9510 — a merged queued car WITH an admitted acceptance is carried to done, never respawned into a fresh review", async () => {
-    const REPO = "state-vector/br6330-carry";
+  it.each(["queued", "resumed awaiting-ci"] as const)("closes a merged %s car from its existing acceptance", async (position) => {
+    const REPO = position === "queued" ? "state-vector/br6330-carry" : "state-vector/br6330-resumed";
     const N = 6334;
     const HEAD = "9".repeat(40);
     const SHA = "8".repeat(40);
     const id = await task("BR#6330/BR#9510 admitted merged-park specimen");
     await parkQueuedCar(id, REPO, N, "drill-owner-d", HEAD);
     await stampProvenance(REPO, N, SHA, HEAD, "gw-br6330-d");
+    if (position === "resumed awaiting-ci") {
+      const resume = await kbJson("/transition", { id, to: "in_progress", actor: "drill-owner-d",
+        note: "Merge predicate is satisfied; resume closeout." });
+      expect(resume.status, JSON.stringify(resume.body)).toBe(200);
+      const card = (await kbJson("/get", { id })).body;
+      expect((await kbJson("/update", { id, meta: { merge_train: {
+        ...card.meta.merge_train, state: "awaiting-ci", repo: REPO, pr: N,
+        legs: { [N]: { state: "awaiting-ci", merge_sha: SHA } },
+      } } })).status).toBe(200);
+    }
     const before = (await kbJson("/relations", { id })).body.relations.length;
     const sweep = await kbJson("/admin.alarm_sweep");
     expect(sweep.body.error ?? "").toBe("");
