@@ -2144,6 +2144,64 @@ describe("breachClass: close_leg_fence (BR#9534)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#14071 — the analysis-done receipts gate (machine.ts
+// analysis-done-needs-outcome rule) refusing a done whose body carries no
+// execution_result {outcome,receipts}: "analysis BR#6074 requires
+// execution_result {outcome,receipts} describing its actual findings. A
+// process exit or a completed diagnostic does not prove the incident
+// recovered. [rule: analysis-done-needs-outcome]". The refusal IS the
+// analysis receipts contract working — and unlike the auto-curing fences
+// above, the BR#9510 merged-provenance close used to retry the identical
+// refusal forever (its emitter passes no execution_result and it is the
+// card's only writer; the do.ts fix derives one for analysis parents), so
+// the family is priced FINITE (default 3): a compliant machine close now
+// emits zero refusals, an agent's bare attempt is one-shot under the retry
+// law, and three events mean a genuinely stubborn loop. The reason is 209
+// chars, so its tag survives the 300-char audit slice — the live gap was
+// simply NO entry for this rule anywhere (the breach card's 200-char
+// sample display cuts the tag mid-way, but classification reads the full
+// reason). The stem additionally owns wrapper forms, where text follows
+// the tag and the anchored match fails. Specimen: 3 events on BR#6074,
+// 2026-11-12 21:04:26–21:06:40Z, folded "unclassified", raised BR#14071.
+// ---------------------------------------------------------------------------
+describe("breachClass: gate:analysis-outcome (BR#14071)", () => {
+  const GATE =
+    "analysis BR#6074 requires execution_result {outcome,receipts} describing its actual findings. A process exit or a completed diagnostic does not prove the incident recovered. [rule: analysis-done-needs-outcome]";
+
+  it("the analysis-outcome refusal classifies gate:analysis-outcome from its rule tag", () => {
+    expect(breachClass(GATE)).toBe("gate:analysis-outcome");
+    // the reason is short enough that the tag survives the audited 300-char
+    // slice intact — the anchored form is the live storm's folded shape
+    expect(GATE.length).toBeLessThan(300);
+    expect(breachClass(GATE.slice(0, 300))).toBe("gate:analysis-outcome");
+  });
+
+  it("wrapper forms (text after the tag) defeat the anchored match — the message stem owns them", () => {
+    // the BR#9510 emitter wraps the guard message and appends its own
+    // suffix after the tag
+    const emitterForm = `terminal admission close refused — ${GATE}; the landed legs stamp stands and the next replay/sweep retries the carry (BR#9510)`;
+    expect(emitterForm.includes("[rule: analysis-done-needs-outcome]")).toBe(true);
+    expect(breachClass(emitterForm)).toBe("gate:analysis-outcome");
+    // the breach card's 200-char sample display cuts the tag mid-way
+    const sample = GATE.slice(0, 200);
+    expect(sample.endsWith("[rule: analysis-done-needs")).toBe(true);
+    expect(breachClass(sample)).toBe("gate:analysis-outcome");
+  });
+
+  it("other 'supply execution_result' wording (the verdict gate) does NOT fold into this class", () => {
+    expect(breachClass("unblock BR#1 cannot complete without a typed outcome: supply execution_result {outcome,receipts} or unblock_result {kind:reblocked,parent_id,reason,next,await_event}. Notes, exit zero and transcripts are not outcome receipts. [rule: verdict-done-needs-receipts]")).toBe("gate:verdict-receipts");
+  });
+
+  it("a storm on the tagged form still raises at the default threshold (finite pricing)", () => {
+    const events = Array.from({ length: 3 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#6074", ts: 1000 + i * 60_000, reason: GATE.slice(0, 300),
+    }));
+    expect(detectBreaches(events as any, new Set())).toHaveLength(1);
+    expect(BREACH_THRESHOLDS["gate:analysis-outcome"]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,

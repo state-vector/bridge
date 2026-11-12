@@ -15027,7 +15027,7 @@ export class KnowledgeHub {
     via: "admission-replay" | "observed-merge-carry",
     reviewId?: string,
   ): Promise<boolean> {
-    const row = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, parentId);
+    const row = this.one(`SELECT id, status, meta, roles FROM artefacts WHERE id = ?`, parentId);
     if (!row || ["done", "superseded"].includes(String(row.status))) return true;
     const now = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
@@ -15074,7 +15074,30 @@ export class KnowledgeHub {
           actor,
         );
       }
-      await this.transition({ id: parentId, to: "done", session: "", note }, actor);
+      // BR#14071: an analysis-role parent cannot land via a bare done — the
+      // analysis-done-needs-outcome gate refuses every attempt, this close
+      // is the only writer of the card, and the next admission replay /
+      // merged-park sweep retries the identical refusal forever (the
+      // merged_admission_close_refused storm that raised breach card
+      // BR#14071; specimen BR#6074: 4+ events 2026-11-12 21:04–21:08Z).
+      // The machine close is the terminal delivery leg, so derive the
+      // execution_result from the receipts this path already holds — the
+      // merged legs and the carried independent acceptance. The accepted
+      // artifact IS the analysis findings, so the derived outcome is
+      // honest; the close lands first try, lifecycle-legal, with full
+      // bookkeeping instead of storming the breach door.
+      const parentRoles = parseTags(String((row as any).roles ?? ""));
+      const closeBody: Record<string, unknown> = { id: parentId, to: "done", session: "", note };
+      if (parentRoles.includes("analysis")) {
+        closeBody.execution_result = {
+          outcome: `analysis delivered via ${merged.map((m) => `${m.repo}#${m.number} merged as ${m.mergeSha}`).join(", ")}; merged-provenance terminal close (BR#9510) carrying the independent acceptance${reviewId ? ` ${reviewId}` : ""} — the accepted artifact is the findings`,
+          receipts: [
+            ...merged.map((m) => `https://github.com/${m.repo}/pull/${m.number} merged as ${m.mergeSha}`),
+            ...(reviewId ? [`independent acceptance ${reviewId} carried, not re-queued (BR#9510)`] : []),
+          ],
+        };
+      }
+      await this.transition(closeBody, actor);
     } catch (e) {
       // The landed stamp is honest (the legs ARE merged — hub receipts prove
       // it) and it is exactly what the acceptance-qualify gate reads, so the

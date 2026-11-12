@@ -1293,6 +1293,15 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   "recovery-priority": "release_held",
   "takeover-verdict-duty": "gate:separation",
   "takeover-stale-holder": "claim_race",
+  // BR#14071: the analysis-done receipts gate (analysis-done-needs-outcome)
+  // refusing a done that carries no execution_result {outcome,receipts} —
+  // the lifecycle receipts contract for analysis cards, same family as
+  // verdict-done-needs-receipts. The gate's reason is short enough that its
+  // tag survives the 300-char audit slice intact (209 chars), so this entry
+  // alone classifies the live storm's folded reasons; the ladder stem below
+  // owns the wrapper forms (the BR#9510 emitter appends its own suffix
+  // AFTER the message+tag, which defeats the anchored tag match).
+  "analysis-done-needs-outcome": "gate:analysis-outcome",
 };
 
 export function breachClass(reason: string): string {
@@ -1425,6 +1434,25 @@ export function breachClass(reason: string): string {
   // zero orphan legs, fully compliant), folded "unclassified" and raised
   // breach card BR#9534. The class is named so the Log says WHAT fenced.
   if (r.includes("terminal close leg(s) not receipted")) return "close_leg_fence";
+  // BR#14071: the analysis-done gate (machine.ts analysis-done-needs-outcome
+  // rule) refusing a done whose body carries no execution_result
+  // {outcome,receipts} — "analysis <id> requires execution_result
+  // {outcome,receipts} describing its actual findings. …". The refusal IS
+  // the analysis receipts contract working. Match the structural fragment
+  // "requires execution_result" — it sits ~18 chars in, far inside any
+  // slice, so the classification survives every tail (the BR#3611/BR#3612
+  // wording-drift lesson). The tag table owns the anchored form (the live
+  // storm's folded reasons — the gap was simply no entry anywhere); this
+  // stem owns the wrapper forms, where text follows the tag and the
+  // anchored tag match fails (the BR#9510 merged-provenance close's own
+  // summary appends "; the landed legs stamp stands …" after the
+  // message+tag). Specimen: 3+ events on BR#6074, 2026-11-12
+  // 21:04–21:08Z, folded "unclassified", raised breach card BR#14071. The
+  // emitter now derives the execution_result for analysis parents (do.ts
+  // closeAdmittedMergedCard), so a compliant machine close emits ZERO of
+  // these refusals — the default threshold 3 prices only genuinely
+  // stubborn loops; no BREACH_THRESHOLDS entry.
+  if (r.includes("requires execution_result")) return "gate:analysis-outcome";
   return "unclassified";
 }
 
