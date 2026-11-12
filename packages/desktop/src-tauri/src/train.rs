@@ -2026,6 +2026,12 @@ fn root_fix_head_under_stop(lane: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn root_fix_matches_base(card: &Value, base_sha: &str) -> bool {
+    !base_sha.is_empty()
+        && is_root_fix_card(card)
+        && card.pointer("/meta/root_fix/head_sha").and_then(Value::as_str) == Some(base_sha)
+}
+
 /// BR#4996: one gate-clean queue head, classified in phase A of the drain
 /// walk, eligible for phase B's batch selection and phase C's back-to-back
 /// landing. Landing order is queue order (oldest-first).
@@ -2205,7 +2211,7 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         base_verdict, mergeable: facts.get("mergeable").and_then(Value::as_bool),
         merge_state_status: vstr(&facts, "mergeStateStatus").map(String::from),
         commits: &commits, head_checks: &checks, leg_number: Some(index + 1),
-        mechanical_move: None, root_fix: cand.root_fix && is_root_fix_card(&card), base_red_names,
+        mechanical_move: None, root_fix: cand.root_fix && root_fix_matches_base(&card, base_sha), base_red_names,
         train_owned_branch: false,
     };
     if let CandidateGatePhase::MergeabilityComputing { reason } = classify_candidate_gate_phase(&input) {
@@ -3450,8 +3456,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // mirror of the hub's isRootFixCard. The WHOLE card rides (tags live
         // on the card row, the binding under meta.root_fix).
         let root_fix = head.get("root_fix").and_then(Value::as_bool) == Some(true)
-            && is_root_fix_card(&card)
-            && card_meta.pointer("/root_fix/head_sha").and_then(Value::as_str) == Some(tip_sha.as_str());
+            && root_fix_matches_base(&card, &probed_base_sha);
         // BR#5880 (live incident, tick 2026-11-03T21:23:47Z): every gate
         // DECISION reads the LIVE check-runs for THIS head sha — the
         // paginated ctx.check_runs() fetch above, this tick — never a
@@ -3748,7 +3753,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 // Persist exact reviewed-head evidence before the shared hub
                 // resolver files the one durable owner request and UI action.
                 qfacts.last_mut().unwrap()["bypass"] = json!({ "kind": "bypass_required",
-                    "base_sha": tip_sha, "head_sha": head_sha });
+                    "base_sha": probed_base_sha, "head_sha": head_sha });
                 renew_lease(ctx, repo, base);
                 ctx.mcp("train_queue_facts", json!({ "repo": repo, "base": base,
                     "entries": qfacts, "base_state": base_state }))?;
@@ -7803,15 +7808,23 @@ mod tests {
 
     #[test]
     fn batch_progress_and_write_guards_survive_failures_br7736() {
-        for scenario in ["lookup", "repair", "revoked", "main-red", "lost-reply", "unknown-reply", "restart", "historical"] {
+        for scenario in ["lookup", "repair", "revoked", "main-red", "lost-reply", "unknown-reply", "restart", "historical", "stopped-root-fix", "stopped-stale-root-fix"] {
             let repo = Repo::new(scenario);
             let head = repo.side_commit("ready", "reviewed change");
             repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
             let base = repo.git(&["rev-parse", "main"]);
-            let card = json!({ "id": "BR#2", "status": "blocked", "meta": {
+            let stopped = matches!(scenario, "stopped-root-fix" | "stopped-stale-root-fix");
+            let mut card = json!({ "id": "BR#2", "status": "blocked", "meta": {
                 "prs": [{ "repo": "o/r", "number": 2, "head_sha_at_acceptance": head }],
                 "merge_train": { "state": "queued", "pr": 2 }
             } });
+            if stopped {
+                card["tags"] = json!(["root-fix", "main-red"]);
+                card["meta"]["root_fix"] = json!({
+                    "repo": "o/r",
+                    "head_sha": if scenario == "stopped-root-fix" { base.as_str() } else { BOGUS_SHA },
+                });
+            }
             let card_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let reads = card_reads.clone();
             let (hub, calls) = mock_hub_with(move |params| {
@@ -7870,7 +7883,8 @@ mod tests {
                     return Some(Ok(json!({"sha":base,"committed_at":crate::logging::iso(now_ms())}).to_string()));
                 }
                 if endpoint.contains("/check-runs?") {
-                    let red = scenario == "main-red" && endpoint.contains(&base) && base_reads.load(Ordering::SeqCst) > 1;
+                    let red = endpoint.contains(&base)
+                        && (stopped || (scenario == "main-red" && base_reads.load(Ordering::SeqCst) > 1));
                     return Some(Ok(json!([{"id":1,"name":"Test","status":"completed","conclusion":if red {"failure"} else {"success"}}]).to_string()));
                 }
                 if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
@@ -7883,6 +7897,11 @@ mod tests {
                 queue.push(json!({"id":"BR#2"}));
             }
             let mut lane = json!({"queue":queue,"required_workflows":["Test"]});
+            if stopped {
+                lane["queue"][1]["root_fix"] = json!(true);
+                lane["stop"] = json!({"kind":"base_red","sha":repo.git(&["rev-parse", "main"])});
+                lane["currently"] = json!({"phase":"stopped","pr":1});
+            }
             let mut result = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10);
             if scenario == "restart" {
                 assert!(result.is_ok());
@@ -7902,7 +7921,7 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 1, "unknown write must never be repeated");
             } else {
                 assert!(result.is_ok(), "{scenario}: {result:?}");
-                let should_merge = !matches!(scenario, "revoked" | "main-red" | "historical");
+                let should_merge = !matches!(scenario, "revoked" | "main-red" | "historical" | "stopped-stale-root-fix");
                 assert_eq!(writes.load(Ordering::SeqCst), usize::from(should_merge), "{scenario}");
                 let calls = calls.lock().unwrap();
                 assert_eq!(calls.iter().any(|p| call_name(p) == "train_ci"), should_merge, "successful work still owes deployment checks");
