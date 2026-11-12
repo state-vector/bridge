@@ -207,6 +207,42 @@ describe("BR#6330 leg 3 — sweepMergedParks heals stranded merged parks on the 
     expect((await kbJson("/relations", { id })).body.relations).toHaveLength(before);
   });
 
+  it("keeps a current interactive claim and recovers a superseded claim on the exact train receipt", async () => {
+    const repo = "state-vector/br6330-interactive";
+    const pr = 6335;
+    const head = "a".repeat(40);
+    const mergeSha = "b".repeat(40);
+    const gateway = "gw-br6330-interactive";
+    const created = await kbJson("/create", { type: "task", title: "Interactive merged closeout", qualified: true });
+    expect(created.status).toBe(200);
+    const id = String(created.body.id);
+    await parkQueuedCar(id, repo, pr, "drill-owner-interactive", head);
+    const { body: token } = await kbJson("/admin.mint", { label: "drill-interactive", tags: [] });
+    const { body: identity } = await kbJson("/auth.identify", { bearer: token.secret });
+    const session = "drill-interactive-claim";
+    const claim = await kbJson("/transition", { id, to: "in_progress", actor: "drill-interactive",
+      token_id: identity.token_id, session, note: "Claimed for the closeout drill." });
+    expect(claim.status, JSON.stringify(claim.body)).toBe(200);
+    await kbJson("/train.lane", { repo, base: "main", actor: gateway, spec: { required_workflows: ["Test"] } });
+    await kbJson("/train.lease", { repo, base: "main", action: "acquire", actor: gateway });
+    const merge = await kbJson("/train.event", { repo, base: "main", kind: "merged", actor: gateway, pr,
+      task_id: id, merge_sha: mergeSha, head_sha: head });
+    expect(merge.body.error).toBeUndefined();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: gateway });
+    await kbJson("/admin.alarm_sweep");
+    expect((await kbJson("/get", { id })).body).toMatchObject({
+      status: "in_progress", meta: { session, interactive_execution: { session }, merge_train: { state: "awaiting-ci" } },
+    });
+
+    // Reproduce a historical row whose proxy replaced the session but
+    // retained the interactive marker.
+    expect((await kbJson("/update", { id, meta: { session: "drill-proxy-resume" } })).status).toBe(200);
+    await kbJson("/admin.alarm_sweep");
+    const closed = (await kbJson("/get", { id })).body;
+    expect(closed).toMatchObject({ status: "done", meta: { merge_train: { state: "landed", merge_sha: mergeSha } } });
+    expect(closed.meta.interactive_execution).toBeUndefined();
+  });
+
   it("multi-leg merge observation retains both obligations and cannot stamp a leg landed without CI", async () => {
     const REPO = "state-vector/br6330-multi";
     const N1 = 6331, N2 = 6332;

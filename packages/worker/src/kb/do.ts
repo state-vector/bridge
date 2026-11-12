@@ -7473,6 +7473,7 @@ export class KnowledgeHub {
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta.session = String(sess).slice(0, 120);
         }
+        if (freshClaim && meta.interactive_execution?.session !== meta.session) delete meta.interactive_execution;
       }
     }
     // (release ownership, churn escalate/redirect and the attempt stamp are
@@ -13652,7 +13653,16 @@ export class KnowledgeHub {
       await this.resumePrerequisite(id, repo, pr, mergeSha);
       return { kind: "retained", reason: "Prerequisite observed; the actual execution outcome remains outstanding." };
     }
-    if (isStandingCard(meta, parseTags(row.tags)) || this.staleReviewHasExecutionHold(id, meta) || meta.interactive_execution)
+    // Older proxy resumes could change the claim session while retaining
+    // the old interactive marker. Only recover that shape on the card's own
+    // train receipt; active claims and all other execution fences still hold.
+    const staleTrainClaim = row.status === "in_progress" && meta.merge_train?.state === "awaiting-ci"
+      && typeof meta.session === "string" && typeof meta.interactive_execution?.session === "string"
+      && meta.interactive_execution.session !== meta.session
+      && trainMergeReceipt(meta, repo, pr)?.merge_sha === mergeSha
+      && !!this.one(`SELECT 1 FROM provenance WHERE repo=? AND pr=? AND merge_sha=? AND task_id=?`, repo, pr, mergeSha, id);
+    if (isStandingCard(meta, parseTags(row.tags)) || this.staleReviewHasExecutionHold(id, meta)
+      || (meta.interactive_execution && !staleTrainClaim))
       return { kind: "retained", reason: "An existing subsystem or executor owns this exit." };
     let beforeWrite: (() => void) | undefined;
     if (meta.merge_train?.state === "bounced" && meta.merge_train.close_bounce === true && meta.merge_train.breach_class === "gate:done-unreviewed"
