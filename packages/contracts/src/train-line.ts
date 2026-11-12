@@ -201,7 +201,7 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       kind: "attention", text: `Diagnostic ${task.id} ended without restoring merges. Bridge must investigate the failed recovery and assign executable repair work; task completion is not line recovery.`,
     };
     if (task?.execution_blockers?.length) return taskRemediation(task);
-    if (task?.active_agent) return taskRemediation(task);
+    if (task?.active_agent || (mainFailed && task?.status === "blocked" && f.queue.some(entry => entry.id === task.id))) return taskRemediation(task);
     if (task && (task.status === "todo" || task.status === "in_review")) return {
       kind: "queued", text: task.status === "todo" ? "Repair queued; no executor has started it yet." : "The repair is awaiting independent verification.", task,
     };

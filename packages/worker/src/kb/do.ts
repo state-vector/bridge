@@ -15366,7 +15366,7 @@ export class KnowledgeHub {
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
       const root_fix = c.root_fix && scope.kind === "current" &&
-        (scope.task_ids.length ? scope.task_ids.includes(c.id) : mainRedBinding(cm, base)?.head_sha === scope.head_sha);
+        mainRedBinding(cm, base)?.head_sha === scope.head_sha;
       return { ...c, priority: root_fix ? "root_fix" : c.priority === "root_fix" ? "normal" : c.priority, root_fix, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
     entries.sort((a, b) => Number(b.root_fix) - Number(a.root_fix));
@@ -16880,8 +16880,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     state: BaseRedEpisodeState;
   } {
     const scope = this.trainRepairScope(repo, base);
-    const inScope = (id: string, meta: unknown): boolean => scope.kind === "unobserved" ||
-      (scope.task_ids.length ? scope.task_ids.includes(id) : mainRedBinding(meta, base)?.head_sha === scope.head_sha);
+    const inScope = (meta: unknown): boolean => {
+      if (scope.kind === "unobserved") return true;
+      const binding = mainRedBinding(meta, base);
+      return binding?.repo === repo && binding.head_sha === scope.head_sha;
+    };
     const bypassHead = (id: string, meta: unknown, pr: number): string | null => {
       const evidence = RecoveryMergeGateSchema.safeParse(entries?.find(e => e.id === id && e.pr === pr)?.bypass);
       if (!evidence.success || evidence.data.kind !== "bypass_required" || scope.kind !== "current" || evidence.data.base_sha !== scope.head_sha) return null;
@@ -16941,7 +16944,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
         // (agent-filed stop-the-line shape — BR#6378) heads the episode.
         if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
-        if (binding?.repo !== repo || !inScope(String(r.id), m)) continue;
+        if (binding?.repo !== repo || !inScope(m)) continue;
         const unlandedLegs = trainLegs(m)
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
@@ -17005,7 +17008,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ) as any;
         if (!row) continue;
         const m = JSON.parse(row.meta ?? "{}");
-        if (!inScope(id, m)) continue;
+        if (!inScope(m)) continue;
         if (isCardPrConflicting(m, pr)) continue;
         const unlanded = trainLegs(m).filter((l) => !trainLegLanded(m, l));
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);
@@ -17919,7 +17922,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const assignedLine = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
-      let line = withRecoveryEpisodes(assignedLine, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), repairScope);
+      // A continued episode may still name the task for the previous tip.
+      // Retain the journal, but only use exact-bound tasks as current repairs.
+      const projectionScope = assignedLine.phase === "base_red" && repairScope.kind === "current"
+        ? { ...repairScope, task_ids: repairScope.task_ids.filter(id => {
+          const task = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
+          const binding = mainRedBinding(JSON.parse(task?.meta ?? "{}"), lane.base);
+          return binding?.repo === lane.repo && binding.head_sha === repairScope.head_sha;
+        }) }
+        : repairScope;
+      let line = withRecoveryEpisodes(assignedLine, recoveries.map((episode) => ({ episode, task: this.enrichFixCardRow(episode.stage.task_id, now0) })), projectionScope);
       if (repairScope.kind === "current" && line.phase === "base_red"
         && assignedLine.phase === "base_red") {
         const assigned = assignedLine.remediation;

@@ -218,6 +218,8 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
                 <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
               ) : remediation?.kind === "queued" ? (
                 <Chip tone="warn" title={remediation.text}>Recovery queued</Chip>
+              ) : remediation?.kind === "blocked" ? (
+                <Chip tone="warn" title={remediation.text}>Recovery blocked</Chip>
               ) : (
                 <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
                   ⚠ UNOWNED — nobody is fixing it

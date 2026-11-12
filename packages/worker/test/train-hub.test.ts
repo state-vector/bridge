@@ -4750,11 +4750,13 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     await kbJson("/update", { id: staleQueued, tags: ["root_blocker", "main-red"], meta: {
       root_fix: { repo, base: "main", head_sha: oldBase } } });
     const current = await queueViaAccept({ repo, pr: 84681, head, title: "Cause-specific recovery without a magic title" });
+    await kbJson("/update", { id: current, tags: ["root_blocker", "main-red"], meta: {
+      root_fix: { repo, base: "main", head_sha: base, failing: ["Deploy Dev"] } } });
     const cause = { kind: "check_failure", check: "Deploy Dev" };
     const observed = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
       tip_sha: base, observed_at: Date.now(), runs: [{ id: 8468, name: "Deploy Dev", head_sha: base,
         run_attempt: 1, status: "completed", conclusion: "failure", html_url: `https://github.com/${repo}/actions/runs/8468` }],
-      failures: [{ run_id: 8468, name: "Deploy Dev", url: `https://github.com/${repo}/actions/runs/8468/job/1`, cause, repair_task_id: current }],
+      failures: [{ run_id: 8468, name: "Deploy Dev", url: `https://github.com/${repo}/actions/runs/8468/job/1`, cause, repair_task_id: old }],
     } });
     expect(observed.status, JSON.stringify(observed.body)).toBe(200);
     const stamp = (bypass?: object) => kbJson("/train.queue_facts", { repo, actor: gateway,
@@ -4763,6 +4765,8 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect((await stamp()).status).toBe(200);
     let snap = await laneSnap(repo);
     expect(snap.base_red_resolution.fix_card.id).toBe(current);
+    expect(snap.line.remediation.task.id).toBe(current);
+    expect(snap.line.recoveries).toEqual(expect.arrayContaining([expect.objectContaining({ task: expect.objectContaining({ id: old }) })]));
     expect(snap.queue.find((q: any) => q.id === staleQueued).root_fix).toBe(false);
     expect(snap.queue.find((q: any) => q.id === current).root_fix).toBe(true);
     expect(snap.queue[0].id).toBe(current);
