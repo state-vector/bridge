@@ -80,13 +80,33 @@ export function normalizePr(raw: unknown): ReconcilePr | null {
   const number = r.number;
   if (typeof number !== "number" || !Number.isFinite(number) || number <= 0) return null;
   const s = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
+  const headRefOid = s(r.headRefOid);
+  const aggregateDecision = s(r.reviewDecision);
+  let exactHeadApproved = false;
+  if (!aggregateDecision && headRefOid && /^[0-9a-f]{40}$/.test(headRefOid) && Array.isArray(r.reviews)) {
+    // GitHub can leave the aggregate blank when the app's review is the
+    // only approval. Use its latest exact-head decision to request the
+    // normal independent review. Comments don't replace review decisions.
+    const currentDecisions = new Map<string, { state: string; submittedAt: string }>();
+    for (const review of r.reviews) {
+      const login = s(review?.author?.login);
+      const state = s(review?.state);
+      const submittedAt = s(review?.submittedAt);
+      if (review?.commit?.oid !== headRefOid || !login || !submittedAt ||
+          (state !== "APPROVED" && state !== "CHANGES_REQUESTED" && state !== "DISMISSED")) continue;
+      const previous = currentDecisions.get(login);
+      if (!previous || previous.submittedAt <= submittedAt) currentDecisions.set(login, { state, submittedAt });
+    }
+    exactHeadApproved = currentDecisions.get("superpositional-sync")?.state === "APPROVED"
+      && ![...currentDecisions.values()].some(review => review.state === "CHANGES_REQUESTED");
+  }
   return {
     number,
     title: s(r.title),
-    reviewDecision: s(r.reviewDecision),
+    reviewDecision: aggregateDecision ?? (exactHeadApproved ? "APPROVED" : null),
     mergeable: s(r.mergeable),
     mergeStateStatus: s(r.mergeStateStatus),
-    headRefOid: s(r.headRefOid),
+    headRefOid,
     headRefName: s(r.headRefName),
     updatedAt: s(r.updatedAt),
     isDraft: r.isDraft === true,
@@ -371,7 +391,9 @@ export function reconcileJoin(args: {
         }
         continue;
       }
-      if (b.progress === "stranded" && age > cfg.disposition_age_ms && !b.lane) {
+      const canVerify = verifyEligible && !p.isDraft && age > cfg.verify_age_ms
+        && b.open_verify_children === 0 && !hasDuty(dutiesByPr, p.number, "verify");
+      if (b.progress === "stranded" && age > cfg.disposition_age_ms && !b.lane && !canVerify) {
         acc.unaccounted++;
         judgements.push({ pr: p.number, decision: { action: "repair_binding", card: b.card, reason: conflicting ? "conflict" : "queue_binding" }, reason: "binding has no live owner/action or bounded hold — existing recovery must restore executable delivery" });
         continue;
@@ -392,7 +414,7 @@ export function reconcileJoin(args: {
         acc.inflight++;
         acc.accounted++;
         judgements.push({ pr: p.number, decision: { action: "inflight", duty_id: b.card, via: "verify-children" }, reason: "bound; a verify duty is open on the bound card (normal flow)" });
-      } else if (verifyEligible && age > cfg.verify_age_ms && !hasDuty(dutiesByPr, p.number, "verify")) {
+      } else if (canVerify) {
         acc.spawned++;
         acc.accounted++;
         judgements.push({ pr: p.number, decision: { action: "spawn_verify", card: b.card }, reason: `bound but never verified — approved+mergeable ${Math.round(age / 3_600_000)}h; spawning the standard verify duty on ${b.card}` });

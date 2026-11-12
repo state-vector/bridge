@@ -89,6 +89,27 @@ const join = (args: {
   });
 
 describe("all-open delivery progress", () => {
+  it("starts independent verification for a stranded PR with an exact-head bot approval and no aggregate decision", () => {
+    const candidate = pr(3152, { reviewDecision: null, updatedAt: iso(50) });
+    const approval = { author: { login: "superpositional-sync" }, state: "APPROVED",
+      commit: { oid: candidate.headRefOid }, submittedAt: iso(5) };
+    const bind = binding(candidate.number, { status: "blocked", progress: "stranded" });
+    const observed = normalizePr({ ...candidate, reviews: [approval] })!;
+    expect(join({ prs: [observed], bindings: [bind] }).judgements[0].decision)
+      .toEqual({ action: "spawn_verify", card: bind.card });
+
+    const rejected = [
+      { ...candidate, reviews: [{ ...approval, commit: { oid: "b".repeat(40) } }] },
+      { ...candidate, reviews: [approval, { ...approval, state: "DISMISSED", submittedAt: iso(4) }] },
+      { ...candidate, reviews: [approval, { ...approval, author: { login: "reviewer" }, state: "CHANGES_REQUESTED" }] },
+      { ...candidate, reviewDecision: "CHANGES_REQUESTED", reviews: [approval] },
+      { ...candidate, isDraft: true, reviews: [approval] },
+    ];
+    for (const row of rejected) {
+      expect(join({ prs: [normalizePr(row)!], bindings: [bind] }).judgements[0].decision.action).not.toBe("spawn_verify");
+    }
+  });
+
   it("bounds undecided and draft grace, including dead duties", () => {
     for (const extra of [{ reviewDecision: null }, { isDraft: true, reviewDecision: null }]) {
       const aged = join({ prs: [pr(99, { ...extra, updatedAt: iso(50) })] });

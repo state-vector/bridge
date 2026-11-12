@@ -5670,15 +5670,19 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
         // gateway holds no board authority and the hub holds no VCS
         // credentials); the ONLY write this leg may make is the BR#5106
         // label family, identity-gated below.
+        // Reconcile needs decision metadata, never review body text.
+        let review_facts = "map(.reviews |= map({author: {login: .author.login}, state, commit: {oid: .commit.oid}, submittedAt}))";
         let rows = match ctx.gh_json(&[
             "pr", "list", "--repo", &repo, "--state", "open", "--limit", "200",
-            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft,state,labels",
+            "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft,state,labels,reviews",
+            "--jq", review_facts,
         ]) {
             Ok(r) => r,
             Err(e) if e.contains("502") || e.contains("504") || e.contains("Bad Gateway") || e.contains("timeout") => {
                 ctx.gh_json(&[
                     "pr", "list", "--repo", &repo, "--state", "open", "--limit", "100",
-                    "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft,state,labels",
+                    "--json", "number,title,reviewDecision,mergeable,mergeStateStatus,headRefOid,headRefName,updatedAt,isDraft,state,labels,reviews",
+                    "--jq", review_facts,
                 ])?
             }
             Err(e) => return Err(e),
