@@ -66,7 +66,7 @@ async function interactive(label: string) {
 }
 
 describe("historical stopped-writer receipts", () => {
-  async function setup() {
+  async function setup(meta: Record<string, unknown> = {}) {
     const host = `writer-proof-host-${++serial}`;
     const gateway = (await post<{ secret: string }>("admin.mint", { label: host, tags: ["gateway"] })).data;
     const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gateway.secret })).data;
@@ -75,12 +75,32 @@ describe("historical stopped-writer receipts", () => {
     expect((await post("execution", { ...auth, id: "gateway", command_id: "ready", command: { kind: "advertise", capabilities: {
       ...localCapabilities, backend: "opencode", capacity: 4, worker: { kind: "provisioned", label: `${host}/worker` },
     } } })).data.error).toBeUndefined();
-    const id = (await post<{ id: string }>("create", { type: "task", title: `Writer proof ${serial}`, project: "bridge", roles: ["impl"], qualified: true })).data.id;
+    const id = (await post<{ id: string }>("create", { type: "task", title: `Writer proof ${serial}`, project: "bridge", roles: ["impl"], qualified: true, meta })).data.id;
     expect((await post("transition", { ...auth, id, to: "in_progress" })).data.error).toBeUndefined();
     const command = (command_id: string, command: object, extra: object = {}) => post("execution", { ...auth, id, command_id, command, ...extra });
     expect((await command("begin-old", { kind: "begin", attempt_id: "old", worker: `${host}/worker`, action_budget_ms: 60_000 })).data.error).toBeUndefined();
     return { id, auth, worker, command };
   }
+
+  it("uses only live gateway output from the current recovery claim as liveness", async () => {
+    const r = await setup({ recovery_links: [{ repo: "state-vector/bridge", base: "main", head_sha: "a".repeat(40),
+      cause: { kind: "check_failure", check: "Test" } }] });
+    const card = () => post<{ meta: { session_alive_ts?: number; last_progress?: unknown } }>("get", { id: r.id });
+    const before = (await card()).data.meta;
+    const relayed = { ...r.auth, id: r.id, note: "runner: agent output — testing the repair" };
+    expect((await post("progress.log", { ...relayed, session: "previous-claim" })).data.kind).toBe("commentary");
+    expect((await card()).data.meta.session_alive_ts).toBe(before.session_alive_ts);
+    expect((await post("progress.log", relayed)).data.kind).toBe("commentary");
+    const live = (await card()).data.meta;
+    expect(live.session_alive_ts).toEqual(expect.any(Number));
+    expect(live.last_progress).toEqual(before.last_progress);
+
+    expect((await r.command("recovery-stop", {
+      kind: "quiesce", generation: 1, attempt_id: "old", writers: "process_group_empty",
+    })).data.error).toBeUndefined();
+    expect((await post("progress.log", relayed)).data.kind).toBe("commentary");
+    expect((await card()).data.meta.session_alive_ts).toBe(live.session_alive_ts);
+  });
 
   it.each(["before", "after"] as const)("continues an answered coordination ask when the writer stops %s the answer", async (quiescence) => {
     const shared = stub;

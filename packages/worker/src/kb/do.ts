@@ -8448,8 +8448,18 @@ export class KnowledgeHub {
       const principal = body.token_id ? this.one(`SELECT principal FROM auth_tokens WHERE id = ?`, String(body.token_id))?.principal : null;
       const owns = row.owner === actor || (principal && row.owner === principal);
       if (!owns || row.status === "todo") {
-        // Recovery comments must not implicitly claim released work, refresh
-        // executor liveness, or overwrite its authoritative progress/next.
+        const attempt = execution?.attempt;
+        const now = Date.now();
+        if (row.status === "in_progress" && body.gateway === true && this.isGatewayActor(actor)
+          && attempt?.phase === "running" && attempt.lease_until > now && attempt.host === actor
+          && body.session === attempt.session && meta.session === attempt.session
+          && attempt.executor.worker.kind === "provisioned"
+          && body.agent === attempt.executor.worker.label && row.owner === body.agent) {
+          // Output relayed by the current gateway refreshes claim liveness.
+          meta.session_alive_ts = now;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+        }
+        // Recovery commentary preserves claim ownership and executor progress.
         this.audit(actor, "progress_comment", id, { note, will: will || undefined });
         this.version(id, actor, "comment", note, { note, will: will || undefined, kind: "commentary" });
         return { id, kind: "commentary", note, will: will || undefined, instructions,
