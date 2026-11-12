@@ -2139,6 +2139,29 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
         meta: { repo: "state-vector/superpositional", tip_sha: "2c2a6ae5e217adc0fdc73de3774b46e7aa938879" },
       }),
     ).toBe(false); // names no root_blocker/root_blocker_for_lane — binding is mandatory
+    // 3c. BR#14075: the documented main-red synonyms qualify — deploy-red /
+    // deploy_red (the deploy leg of the required-workflow red) with a meta
+    // root-side marker and a bound run ranks exactly like main-red…
+    expect(
+      isRootFixCard({
+        tags: ["deploy-red"],
+        meta: { root_fix: { repo: "state-vector/superpositional", head_sha: "16462d866abd", base: "main" }, root_blocker_for_lane: "state-vector/superpositional@main" },
+      }),
+    ).toBe(true);
+    expect(
+      isRootFixCard({
+        tags: ["deploy_red"],
+        meta: { root_fix: { repo: "state-vector/superpositional", head_sha: "16462d866abd", base: "main" }, root_blocker: "BR#13684" },
+      }),
+    ).toBe(true);
+    // …and the BR#14075 no-gaming law: a non-red card wearing every
+    // recognized tag but binding NO failing run stays a non-root card.
+    expect(
+      isRootFixCard({
+        tags: ["root_blocker", "main-red", "deploy-red"],
+        meta: {},
+      }),
+    ).toBe(false); // tags alone never qualify — the binding does
     expect(
       isLaneBaseFixCard(
         {

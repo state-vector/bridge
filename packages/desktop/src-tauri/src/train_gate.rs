@@ -769,12 +769,13 @@ pub fn root_fix_fast_lane_title(repo: &str, pr: impl std::fmt::Display) -> Strin
 /// The main-breakage qualification (BR#5189 §1): the card is THE root fix iff
 /// it is tagged `root_blocker` (also root-blocker / root-fix / base-fix) +
 /// `main-red` (also main_red / stop-the-line, BR#6390 — the BASE-FIX /
-/// stop-the-line spellings the field stamps, BR#6378 class) AND bound to a
-/// failing main-HEAD run (meta.root_fix repo+head_sha; fallback sha sources
-/// main_tip / tip_sha / red_since; fallback repo sources root_fix.repo /
-/// repo / pr.repo / prs[0].repo / merge_train.repo / root_blocker_for_lane
-/// "<repo>@<base>"). BR#6390: a field-minted BASE-FIX card can carry NO
-/// root-side tag at all — the marker then lives in meta
+/// stop-the-line spellings the field stamps, BR#6378 class; also
+/// deploy-red / deploy_red, BR#14075 — the documented main-red synonyms) AND
+/// bound to a failing main-HEAD run (meta.root_fix repo+head_sha; fallback
+/// sha sources main_tip / tip_sha / red_since; fallback repo sources
+/// root_fix.repo / repo / pr.repo / prs[0].repo / merge_train.repo /
+/// root_blocker_for_lane "<repo>@<base>"). BR#6390: a field-minted BASE-FIX
+/// card can carry NO root-side tag at all — the marker then lives in meta
 /// (`root_blocker_for_lane` "<repo>@<base>" or a `root_blocker` id string,
 /// the BR#6378 exemplar) — so a meta marker qualifies as the root-side half.
 /// Meta markers never qualify ALONE: the binding (a named failing run) is
@@ -800,7 +801,7 @@ pub fn is_root_fix_card(card: &Value) -> bool {
             .map(|s| s.contains('@'))
             .unwrap_or(false)
         || meta_ref.and_then(|m| m.get("root_blocker")).and_then(|v| v.as_str()).is_some();
-    let has_main_red = tags.iter().any(|t| t == "main-red" || t == "main_red" || t == "stop-the-line");
+    let has_main_red = tags.iter().any(|t| t == "main-red" || t == "main_red" || t == "stop-the-line" || t == "deploy-red" || t == "deploy_red");
     if !has_root || !has_main_red {
         return false;
     }
@@ -3640,6 +3641,12 @@ mod tests {
         assert!(!is_root_fix_card(&serde_json::json!({ "tags": ["root_blocker", "main-red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "" } } })));
         // tag match is case-insensitive (the executor sees gh/board casing)
         assert!(is_root_fix_card(&serde_json::json!({ "tags": ["ROOT_BLOCKER", "Main-Red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "d" } } })));
+        // BR#14075: the documented main-red synonyms qualify — deploy-red /
+        // deploy_red with a meta root-side marker and a bound run
+        assert!(is_root_fix_card(&serde_json::json!({ "tags": ["deploy-red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "d" }, "root_blocker_for_lane": "o/r@main" } })));
+        assert!(is_root_fix_card(&serde_json::json!({ "tags": ["deploy_red"], "meta": { "root_fix": { "repo": "o/r", "head_sha": "d" }, "root_blocker": "BR#1234" } })));
+        // BR#14075 no-gaming: fake tags without a binding never rank up
+        assert!(!is_root_fix_card(&serde_json::json!({ "tags": ["root_blocker", "main-red", "deploy-red"], "meta": {} })));
     }
 
     #[test]

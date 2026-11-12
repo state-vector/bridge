@@ -12431,11 +12431,18 @@ export class KnowledgeHub {
     };
     const scope = this.trainRepairScope(a.repo, a.base, a.sha);
     if (scope.kind === "current") for (const id of scope.task_ids) {
-      const repair = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, id);
+      const repair = this.one(`SELECT id,status,meta,tags FROM artefacts WHERE id=?`, id);
       if (!repair || ["done", "superseded"].includes(repair.status)) continue;
       const rm = JSON.parse(repair.meta ?? "{}");
       if (mainRedBinding(rm) && !isExact(rm)) continue;
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(bind(rm)), id);
+      // BR#14075: the bind must stamp the RECOGNIZED markers, not only the
+      // meta binding — the repair card may have been authored with foreign
+      // vocabulary (a worker session's own tag set), and a bound repair the
+      // scheduler cannot recognize never ranks in the root-fix tier (the
+      // BR#13684 lesson: ad-hoc tags sat unpicked while the pool owned the
+      // fix). Idempotent: set-union, so re-binding never duplicates tags.
+      const tags = [...new Set([...parseTags(repair.tags), ROOT_FIX_TAG, MAIN_RED_TAG])];
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta=?, tags=?, updated_ts=? WHERE id=?`, JSON.stringify(bind(rm)), JSON.stringify(tags), a.now, id);
       return id;
     }
     // (1) culprit-qualified-in-place

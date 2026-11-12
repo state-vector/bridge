@@ -466,6 +466,13 @@ then may the gateway acknowledge idle. A failed train join never authorises rest
 
 Recovery has execution priority, not just a prominent card: concrete repairs and
 main-red fixes outrank line diagnostics, ordinary verification and implementation.
+The root-fix tier reads one recognized card shape only — a root-side marker
+(`root_blocker` tag or the meta `root_blocker` / `root_blocker_for_lane` markers)
+plus a main-red tag (`main-red`, `main_red`, `stop-the-line`, or the BR#14075
+synonyms `deploy-red` / `deploy_red`) plus a bound failing main-HEAD run. Card
+authors need no special vocabulary: wherever the hub spawns or binds root-fix work
+from a required-workflow red it stamps that exact shape itself, and the binding
+stays mandatory so a non-red card can never wear its way into the tier.
 If an eligible gateway is full, one safe checkpointed managed verification can
 yield its slot through a durable stop/checkpoint/quiescence handoff. The slot stays
 charged until stopped-writer proof; recovery dispatches before that verification
