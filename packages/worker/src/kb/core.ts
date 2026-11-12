@@ -1052,10 +1052,18 @@ function checkObligations(runs: MainCheckRun[]): MainCheckRun[][] {
 export type MainRedCheck = { name: string; conclusion: string; url: string };
 
 export type MainCheckVerdict = {
-  /** green: every check settled green · red: ≥1 failure · unsettled: running/inconclusive · empty: no check runs at all */
-  verdict: "green" | "red" | "unsettled" | "empty";
+  /** green: every check settled green · settling: ≥1 check in flight (BR#14088,
+   *  rendered amber, never green) · red: ≥1 failure · unsettled: inconclusive
+   *  (cancelled-only, unknown conclusion) · empty: no check runs at all */
+  verdict: "green" | "settling" | "red" | "unsettled" | "empty";
   /** failures on main's HEAD (verdict red) */
   red: MainRedCheck[];
+  /** BR#14088: checks IN FLIGHT (queued/in_progress — GitHub files a check
+   *  run's conclusion only at completion, so null conclusion = in flight) or
+   *  required names with no run yet ("(awaiting first run)"). Rendered amber
+   *  ("settling"), never green. Names ALSO fold into `unsettled` so list
+   *  consumers keep naming the checks while the verdict carries the truth. */
+  settling: string[];
   /** checks that did not vouch: still running, inconclusive, or unknown conclusion */
   unsettled: string[];
   /** settled-green check count (receipt line) */
@@ -1083,8 +1091,9 @@ export const MAIN_RED_CONCLUSIONS = new Set([
 ]);
 
 export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
-  if (!runs.length) return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
+  if (!runs.length) return { verdict: "empty", red: [], settling: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
   const red: MainRedCheck[] = [];
+  const settling: string[] = [];
   const unsettled: string[] = [];
   let green = 0;
   for (const list of checkObligations(runs)) {
@@ -1092,7 +1101,12 @@ export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
     // the newest non-cancelled run judges; cancelled runs say nothing
     const judge = [...list].sort((a, b) => (b.id ?? 0) - (a.id ?? 0)).find((r) => r.conclusion !== "cancelled");
     if (!judge || judge.conclusion == null) {
-      unsettled.push(judge ? name : `${name} (only cancelled runs)`);
+      // BR#14088: an in-flight judge (queued/in_progress — GitHub files a
+      // conclusion only at completion) is SETTLING, never green; the name
+      // folds into `unsettled` for list consumers.
+      const entry = judge ? name : `${name} (only cancelled runs)`;
+      if (judge) settling.push(name);
+      unsettled.push(entry);
       continue;
     }
     if (MAIN_RED_CONCLUSIONS.has(judge.conclusion)) {
@@ -1103,16 +1117,18 @@ export function classifyMainCheckRuns(runs: MainCheckRun[]): MainCheckVerdict {
       unsettled.push(`${name} (unknown conclusion: ${judge.conclusion})`);
     }
   }
-  if (red.length) return { verdict: "red", red, unsettled, green };
-  if (unsettled.length) return { verdict: "unsettled", red, unsettled, green };
-  return { verdict: "green", red, unsettled, green };
+  // BR#14088 precedence: red > settling > unsettled > green.
+  if (red.length) return { verdict: "red", red, settling, unsettled, green };
+  if (settling.length) return { verdict: "settling", red, settling, unsettled, green };
+  if (unsettled.length) return { verdict: "unsettled", red, settling, unsettled, green };
+  return { verdict: "green", red, settling, unsettled, green };
 }
 
 /** BR#5265 Fix B + BR#5674 P1 (empty-is-loud) + BR#5883 (gate-consumed
  *  qualifier): TypeScript mirror of train_gate.rs classify_base_check_runs. */
 export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]): MainCheckVerdict {
   if (!runs.length) {
-    return { verdict: "empty", red: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
+    return { verdict: "empty", red: [], settling: [], unsettled: [], green: 0, alarm: "tip carries no check runs at all" };
   }
   if (!required.length) {
     return classifyMainCheckRuns(runs);
@@ -1141,6 +1157,7 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
     return {
       verdict: "empty",
       red: [],
+      settling: [],
       unsettled: [],
       green: 0,
       alarm: `${runs.length} runs read, none matched required set — check names/pagination`,
@@ -1156,6 +1173,28 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
       verdict: "red",
       red: [...res.red, ...gateVerdict.red],
     };
+  }
+  // BR#14088 required-completeness: green certification requires EVERY
+  // required check (incl. the post-admission smoke) settled green at the
+  // observed tip. A required name with NO run yet — the smoke job starts
+  // last, ~40-60 min after push, so between admission and its first
+  // check-run the obligation is invisible — is IN FLIGHT, not absent: it
+  // yields SETTLING "(awaiting first run)" and green is forbidden. The
+  // documented exception is the `main-green gate` vacuity class (BR#5847:
+  // structurally absent on merge-commit tips — the BR#5883 qualifier owns
+  // that read). Mirror of train_gate.rs.
+  const missingRequired: string[] = [];
+  for (const name of required) {
+    if (scoped.some((r) => r.name === name) || startupFailedNames.has(name)) continue;
+    if (name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) continue; // BR#5847: structurally vacuous on some tip classes
+    missingRequired.push(name);
+  }
+  if (missingRequired.length && res.verdict !== "red") {
+    // a red verdict is never downgraded to settling
+    res.verdict = "settling";
+    const entries = missingRequired.map((name) => `${name} (awaiting first run)`);
+    res.settling.push(...entries);
+    res.unsettled.push(...entries); // fold: list consumers keep naming the check
   }
   // BR#5883: a required-set GREEN no longer certifies a plain green when the
   // repo's own merge gate would judge the same tip non-green (the 2026-11-03
@@ -1219,8 +1258,11 @@ export function isExemptCheckName(name: string): boolean {
 }
 
 export type HeadCheckVerdict = {
-  verdict: "green" | "red" | "unsettled";
+  verdict: "green" | "settling" | "red" | "unsettled";
   red: MainRedCheck[];
+  /** BR#14088: in-flight (queued/in_progress, conclusion null) check names —
+   *  amber, never green; names also fold into `unsettled`. */
+  settling: string[];
   unsettled: string[];
   /** externals that failed but are exempt — human-leg, never gating */
   external: MainRedCheck[];
@@ -1232,10 +1274,11 @@ export type HeadCheckVerdict = {
  *  highest id — so a re-run that succeeded supersedes an earlier failure of
  *  the same check), with exempt-external failures (BR#2267) pulled OUT of red
  *  and recorded as `external` — they are collected into the class ask, never
- *  bounce a PR. */
+ *  bounce a PR. BR#14088: an in-flight non-exempt check reads SETTLING. */
 export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
-  if (!runs.length) return { verdict: "unsettled", red: [], unsettled: ["head checks have not started or could not be read"], external: [], green: 0 };
+  if (!runs.length) return { verdict: "unsettled", red: [], settling: [], unsettled: ["head checks have not started or could not be read"], external: [], green: 0 };
   const red: MainRedCheck[] = [];
+  const settling: string[] = [];
   const unsettled: string[] = [];
   const external: MainRedCheck[] = [];
   let green = 0;
@@ -1248,6 +1291,9 @@ export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
     }
     if (judge.conclusion == null) {
       if (isExemptCheckName(name)) continue; // exempt externals in flight say nothing
+      // BR#14088: an in-flight check (conclusion null) is SETTLING — amber,
+      // never green; the name folds into `unsettled` for list consumers.
+      settling.push(name);
       unsettled.push(name);
       continue;
     }
@@ -1260,9 +1306,11 @@ export function classifyHeadChecks(runs: MainCheckRun[]): HeadCheckVerdict {
     else if (judge.conclusion === "success" || judge.conclusion === "skipped" || judge.conclusion === "neutral") green += 1;
     else unsettled.push(name);
   }
-  if (red.length) return { verdict: "red", red, unsettled, external, green };
-  if (unsettled.length) return { verdict: "unsettled", red, unsettled, external, green };
-  return { verdict: "green", red, unsettled, external, green };
+  // BR#14088 precedence: red > settling > unsettled > green.
+  if (red.length) return { verdict: "red", red, settling, unsettled, external, green };
+  if (settling.length) return { verdict: "settling", red, settling, unsettled, external, green };
+  if (unsettled.length) return { verdict: "unsettled", red, settling, unsettled, external, green };
+  return { verdict: "green", red, settling, unsettled, external, green };
 }
 
 export type MergeCandidateInput = {
@@ -1271,7 +1319,7 @@ export type MergeCandidateInput = {
   /** full 40-hex head sha (the merge gate pins the verify lineage to it) */
   headSha: string;
   /** classifyMainCheckRuns verdict on the BASE (main) HEAD */
-  baseVerdict: "green" | "red" | "unsettled" | "empty";
+  baseVerdict: "green" | "settling" | "red" | "unsettled" | "empty";
   /** GitHub pull API mergeable; null while GitHub computes it */
   mergeable: boolean | null;
   /** GitHub pull API mergeStateStatus */
@@ -1354,7 +1402,7 @@ export function decideMergeAction(i: MergeCandidateInput): MergeAction {
       ? { kind: "bounce", defect: `PR #${i.prNumber} head check RED: ${names}. Fix or bounce to impl`, bounceKind: "gate" }
       : { kind: "note", reason: `PR #${i.prNumber} head check RED: ${names} — card not in_review, no bounce; the linked session owns it` };
   }
-  if (head.verdict === "unsettled") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) — not yet, skip this tick` };
+  if (head.verdict === "unsettled" || head.verdict === "settling") return { kind: "skip", reason: `head checks unsettled (${head.unsettled.join(", ")}) — not yet, skip this tick` };
   // (5) verify lineage: an ACCEPTED verify verdict must cover THIS head.
   //     Head moved past an accepted verdict → coverage BOUNCE — for ANY card
   //     status (BR#5114 round 2, Ray ruling 2026-10-30: "if it can't merge,
@@ -3017,7 +3065,7 @@ export type TrainGateInput = {
   cardMeta: any;
   cardStatus: string | null;
   /** classifyMainCheckRuns verdict on the BASE (main) HEAD */
-  baseVerdict: "green" | "red" | "unsettled" | "empty";
+  baseVerdict: "green" | "settling" | "red" | "unsettled" | "empty";
   /** GitHub pull API mergeable; null while GitHub computes — wait this tick */
   mergeable: boolean | null;
   mergeStateStatus: string | null;
@@ -3163,7 +3211,7 @@ export function classifyCandidateGatePhase(i: TrainGateInput): CandidateGatePhas
   let headState: CandidateHeadCheckState;
   if (head.verdict === "green") {
     headState = { kind: "green" };
-  } else if (head.verdict === "unsettled") {
+  } else if (head.verdict === "unsettled" || head.verdict === "settling") {
     headState = { kind: "pending", unsettled: head.unsettled };
   } else {
     const names = head.red.map((r) => r.name);
@@ -4049,7 +4097,7 @@ export function resolveLaneOperationalState(input: {
   const tip = baseState?.tip_sha;
   const gateFailed = baseState?.gate_blocked && (!!baseState.gate_red?.length || !baseState.gate_unsettled?.length);
   if (input.stop?.sha && tip && /^[0-9a-f]{40}$/.test(tip) && tip !== input.stop.sha && observedAfterStop && !gateFailed
-    && baseState?.deploy_coverage?.phase !== "failed" && (verdict === "unsettled" || verdict === "green")) {
+    && baseState?.deploy_coverage?.phase !== "failed" && (verdict === "unsettled" || verdict === "settling" || verdict === "green")) {
     return { phase: "verifying_base", tip_sha: tip, verdict, updated_ts: now };
   }
   const redTip = verdict === "red" && tip;
@@ -4478,7 +4526,7 @@ export function reconcileDeployCoverage(input: {
     };
   }
 
-  if (input.baseVerdict.verdict === "unsettled" || tipActive) {
+  if (input.baseVerdict.verdict === "unsettled" || input.baseVerdict.verdict === "settling" || tipActive) {
     return {
       coverage: {
         phase: "settling",
@@ -4597,8 +4645,9 @@ export function formatDeployCoverageSummary(cov: DeployCoverageState): string {
  *  - When `baseVerdict.verdict === "empty"` because a multi-stage deploy
  *    workflow (e.g. `Deploy Dev` in `Prepare deploy to dev (build on spot)`)
  *    has not created downstream `required_workflows` check-runs yet, but
- *    `coverage.phase === "settling"`, the effective verdict is `"unsettled"`
- *    (with `alarm` cleared), NEVER `"empty"` ("dark tip").
+ *    `coverage.phase === "settling"`, the effective verdict is `"settling"`
+ *    (with `alarm` cleared), NEVER `"empty"` ("dark tip") — BR#14088: an
+ *    in-flight deploy reads settling (amber), never green.
  *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "failed"`,
  *    the effective verdict is `"red"` naming `Deploy Dev`.
  *  - When `baseVerdict.verdict === "empty"` and `coverage.phase === "covered"`,
@@ -4617,10 +4666,14 @@ export function reconcileBaseVerdictWithDeployCoverage(
       ? `Deploy Dev (run #${coverage.active_run_id} in flight)`
       : "Deploy Dev (in flight)";
     const { alarm: _alarm, ...rest } = baseVerdict;
+    // BR#14088: the deploy is IN FLIGHT — the verdict is unknown, so the
+    // rollup reads SETTLING (amber), never green/unsettled; the name folds
+    // into `unsettled` so list consumers keep naming the check.
     return {
       ...rest,
-      verdict: "unsettled",
+      verdict: "settling",
       red: [],
+      settling: baseVerdict.settling.length > 0 ? baseVerdict.settling : [label],
       unsettled: baseVerdict.unsettled.length > 0 ? baseVerdict.unsettled : [label],
     };
   }
@@ -4675,12 +4728,14 @@ export function normalizeBaseStateWithCoverage(
   const parsed = DeployCoverageStateSchema.safeParse(baseState.deploy_coverage);
   if (!parsed.success || (baseState.tip_sha && baseState.tip_sha !== parsed.data.tip_sha)) return baseState;
   const effective = reconcileBaseVerdictWithDeployCoverage({
-    verdict: baseState.verdict === "green" ? "green" : baseState.verdict === "red" ? "red" : baseState.verdict === "unsettled" ? "unsettled" : "empty",
+    verdict: baseState.verdict === "green" ? "green" : baseState.verdict === "settling" ? "settling" : baseState.verdict === "red" ? "red" : baseState.verdict === "unsettled" ? "unsettled" : "empty",
     red: Array.isArray(baseState.red) ? baseState.red : [], green: Number(baseState.green ?? 0),
+    settling: Array.isArray(baseState.settling) ? baseState.settling.map(String) : [],
     unsettled: Array.isArray(baseState.unsettled) ? baseState.unsettled.map(String) : [],
   }, parsed.data, required);
   if (effective.verdict === "empty") return baseState;
   const next: Record<string, unknown> = { ...baseState, verdict: effective.verdict, unsettled: effective.unsettled };
+  if (effective.settling.length || "settling" in baseState) next.settling = effective.settling;
   if (effective.red.length || "red" in baseState) next.red = effective.red;
   delete next.alarm;
   return next;
@@ -4714,8 +4769,10 @@ export function applyDeployObservation(
     }
   }
   const verdict: MainCheckVerdict = {
-    verdict: raw.verdict === "green" ? "green" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",
-    red: Array.isArray(raw.red) ? raw.red : [], unsettled: Array.isArray(raw.unsettled) ? raw.unsettled.map(String) : [], green: Number(raw.green ?? 0),
+    verdict: raw.verdict === "green" ? "green" : raw.verdict === "settling" ? "settling" : raw.verdict === "red" ? "red" : raw.verdict === "unsettled" ? "unsettled" : "empty",
+    red: Array.isArray(raw.red) ? raw.red : [], green: Number(raw.green ?? 0),
+    settling: Array.isArray(raw.settling) ? raw.settling.map(String) : [],
+    unsettled: Array.isArray(raw.unsettled) ? raw.unsettled.map(String) : [],
   };
   const plan = reconcileDeployCoverage({ tipSha: observation.tip_sha, tipAgeSecs: Number(raw.tip_age_secs ?? 0),
     baseVerdict: verdict, required, workflowRuns: observation.runs });

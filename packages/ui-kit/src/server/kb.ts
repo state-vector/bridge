@@ -277,7 +277,7 @@ export type KbDeployCoverageState =
     };
 
 export interface KbBaseRedResolution {
-  verdict: "red" | "unsettled" | "empty";
+  verdict: "red" | "settling" | "unsettled" | "empty";
   phase?: KbBaseRedPhase;
   whats_broken: { name: string; url?: string }[];
   held: number;
@@ -386,7 +386,7 @@ export interface KbTrainLane {
     }[];
     conflict_pairs?: [number, number][];
     base_state?: {
-      verdict: "green" | "red" | "unsettled" | "empty";
+      verdict: "green" | "settling" | "red" | "unsettled" | "empty";
       scoped_to_required?: boolean;
       red?: { name: string; url?: string }[];
       unsettled?: string[];

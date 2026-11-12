@@ -177,7 +177,7 @@ export const DeployObservationSchema = z.object({
 export type DeployObservation = z.infer<typeof DeployObservationSchema>;
 
 export const BaseRedResolutionSchema = z.object({
-  verdict: z.enum(["red", "unsettled", "empty"]),
+  verdict: z.enum(["red", "settling", "unsettled", "empty"]),
   phase: BaseRedPhaseSchema,
   whats_broken: z.array(
     z.object({
@@ -220,7 +220,7 @@ export const LaneOperationalStateSchema = z.discriminatedUnion("phase", [
   z.object({
     phase: z.literal("verifying_base"),
     tip_sha: z.string().min(1),
-    verdict: z.enum(["unsettled", "green"]),
+    verdict: z.enum(["unsettled", "settling", "green"]),
     updated_ts: z.number(),
   }),
   z.object({

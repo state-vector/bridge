@@ -109,6 +109,12 @@ pub struct MainRedCheck {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainVerdict {
     Green,
+    /// BR#14088: a required check that is queued/in_progress (GitHub files a
+    /// check run's conclusion only at completion) has NO verdict yet — the
+    /// rollup reads SETTLING: rendered amber, never green. The lane may only
+    /// enter a green state when every required check is completed-success at
+    /// the observed tip. MUST stay behaviour-identical to core.ts.
+    Settling,
     Red,
     Unsettled,
     Empty,
@@ -118,6 +124,7 @@ impl MainVerdict {
     pub fn as_str(&self) -> &'static str {
         match self {
             MainVerdict::Green => "green",
+            MainVerdict::Settling => "settling",
             MainVerdict::Red => "red",
             MainVerdict::Unsettled => "unsettled",
             MainVerdict::Empty => "empty",
@@ -129,6 +136,13 @@ impl MainVerdict {
 pub struct CheckVerdict {
     pub verdict: MainVerdict,
     pub red: Vec<MainRedCheck>,
+    /// BR#14088: checks that are IN FLIGHT (queued/in_progress — conclusion
+    /// null) or required names with no run yet ("(awaiting first run)").
+    /// Rendered amber ("settling"), never green. Names ALSO fold into
+    /// `unsettled` so every list-consuming surface (banner, gate rows,
+    /// laneSyncReason vocabulary) keeps naming the checks while the VERDICT
+    /// carries the truth. MUST stay behaviour-identical to core.ts.
+    pub settling: Vec<String>,
     pub unsettled: Vec<String>,
     pub external: Vec<MainRedCheck>,
     pub green: usize,
@@ -204,12 +218,18 @@ fn same_check_obligation(a: &CheckSource, b: &CheckSource) -> bool {
 }
 
 /// core.ts classifyMainCheckRuns (764): newest non-cancelled run per name
-/// judges; red beats unsettled beats green; no runs at all = "empty".
+/// judges; red beats settling beats unsettled beats green; no runs at all =
+/// "empty". BR#14088: an in-flight judge (conclusion null — GitHub files a
+/// conclusion only at completion, so null = queued/in_progress) yields
+/// SETTLING, never green: the name is pushed to `settling` AND folded into
+/// `unsettled` so list consumers keep naming the check while the verdict
+/// carries the truth.
 pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
     if runs.is_empty() {
         return CheckVerdict {
             verdict: MainVerdict::Empty,
             red: vec![],
+            settling: vec![],
             unsettled: vec![],
             external: vec![],
             green: 0,
@@ -218,6 +238,7 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
         };
     }
     let mut red = Vec::new();
+    let mut settling = Vec::new();
     let mut unsettled = Vec::new();
     let mut green = 0usize;
     for (name, list) in parse_runs(runs) {
@@ -227,7 +248,10 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
         match judge {
             None => unsettled.push(format!("{} (only cancelled runs)", name)),
             Some(j) => match j.conclusion.as_deref() {
-                None => unsettled.push(name),
+                None => {
+                    settling.push(name.clone());
+                    unsettled.push(name);
+                }
                 Some(c) if is_red_conclusion(c) => red.push(MainRedCheck {
                     name: name.clone(),
                     conclusion: c.to_string(),
@@ -238,7 +262,7 @@ pub fn classify_main_check_runs(runs: &[MainCheckRun]) -> CheckVerdict {
             },
         }
     }
-    finish_verdict(red, unsettled, vec![], green)
+    finish_verdict(red, settling, unsettled, vec![], green)
 }
 
 /// BR#5265 Fix B + BR#5674 P1 (empty-is-loud): the base-green gate classifies
@@ -254,6 +278,7 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
         return CheckVerdict {
             verdict: MainVerdict::Empty,
             red: vec![],
+            settling: vec![],
             unsettled: vec![],
             external: vec![],
             green: 0,
@@ -306,6 +331,7 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
         return CheckVerdict {
             verdict: MainVerdict::Empty,
             red: vec![],
+            settling: vec![],
             unsettled: vec![],
             external: vec![],
             green: 0,
@@ -324,6 +350,36 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
         if gv.verdict == MainVerdict::Red && !(res.verdict == MainVerdict::Green && res.green >= required.len()) {
             res.verdict = MainVerdict::Red;
             res.red.extend(gv.red);
+        }
+    }
+    // BR#14088 required-completeness: green certification requires EVERY
+    // required check (incl. the post-admission smoke) settled green at the
+    // observed tip. A required name with NO run yet — the smoke job starts
+    // last, ~40-60 min after push, so between admission and its first
+    // check-run the obligation is invisible — is IN FLIGHT, not absent: it
+    // yields SETTLING "(awaiting first run)" and green is forbidden. The
+    // documented exception is the `main-green gate` vacuity class (BR#5847:
+    // structurally absent on merge-commit tips — the BR#5883 qualifier owns
+    // that read), so a vacuous gate never blocks certification.
+    let mut missing_required: Vec<String> = Vec::new();
+    for name in required {
+        if scoped.iter().any(|r| &r.name == name) || startup_failed_names.iter().any(|n| n == name) {
+            continue;
+        }
+        if name.to_lowercase().contains(MAIN_GREEN_GATE_PATTERN) {
+            continue; // BR#5847: structurally vacuous on some tip classes
+        }
+        missing_required.push(name.clone());
+    }
+    if !missing_required.is_empty() {
+        missing_required.sort();
+        for name in &missing_required {
+            let entry = format!("{} (awaiting first run)", name);
+            res.settling.push(entry.clone());
+            res.unsettled.push(entry); // fold: list consumers keep naming the check
+        }
+        if res.verdict != MainVerdict::Red {
+            res.verdict = MainVerdict::Settling;
         }
     }
     // BR#5883 (gate-consumed qualifier): a required-set GREEN no longer
@@ -364,9 +420,10 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
 /// (human-leg class ask, never gating).
 pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
     if runs.is_empty() {
-        return finish_verdict(vec![], vec!["head checks have not started or could not be read".into()], vec![], 0);
+        return finish_verdict(vec![], vec![], vec!["head checks have not started or could not be read".into()], vec![], 0);
     }
     let mut red = Vec::new();
+    let mut settling = Vec::new();
     let mut unsettled = Vec::new();
     let mut external = Vec::new();
     let mut green = 0usize;
@@ -382,7 +439,12 @@ pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
             }
             Some(r) => match r.conclusion.as_deref() {
                 None => {
+                    // BR#14088: an in-flight (queued/in_progress) check has no
+                    // verdict yet — SETTLING, never green; fold into unsettled
+                    // for list consumers. An EXEMPT in-flight check still says
+                    // nothing (the BR#6568 law is untouched).
                     if !is_exempt_check_name(&name) {
+                        settling.push(name.clone());
                         unsettled.push(name);
                     }
                 }
@@ -403,18 +465,23 @@ pub fn classify_head_checks(runs: &[MainCheckRun]) -> CheckVerdict {
             },
         }
     }
-    finish_verdict(red, unsettled, external, green)
+    finish_verdict(red, settling, unsettled, external, green)
 }
 
-fn finish_verdict(red: Vec<MainRedCheck>, unsettled: Vec<String>, external: Vec<MainRedCheck>, green: usize) -> CheckVerdict {
+fn finish_verdict(red: Vec<MainRedCheck>, settling: Vec<String>, unsettled: Vec<String>, external: Vec<MainRedCheck>, green: usize) -> CheckVerdict {
+    // BR#14088 precedence: red > settling > unsettled > green. A red check
+    // stops the line; an in-flight check is settling (amber, never green);
+    // only when every check settled green is the verdict green.
     let verdict = if !red.is_empty() {
         MainVerdict::Red
+    } else if !settling.is_empty() {
+        MainVerdict::Settling
     } else if !unsettled.is_empty() {
         MainVerdict::Unsettled
     } else {
         MainVerdict::Green
     };
-    CheckVerdict { verdict, red, unsettled, external, green, alarm: None, gate: None }
+    CheckVerdict { verdict, red, settling, unsettled, external, green, alarm: None, gate: None }
 }
 
 /// BR#5880 (live incident, tick 2026-11-03T21:23:47Z on PR #2707): the
@@ -1115,7 +1182,9 @@ pub fn classify_candidate_gate_phase(i: &TrainGateInput) -> CandidateGatePhase {
     let head = classify_head_checks(i.head_checks);
     let head_state = match head.verdict {
         MainVerdict::Green | MainVerdict::Empty => CandidateHeadCheckState::Green,
-        MainVerdict::Unsettled => CandidateHeadCheckState::Pending { unsettled: head.unsettled },
+        // BR#14088: a settling head (queued/in_progress checks) is pending —
+        // never admission, same wait class as an unsettled read.
+        MainVerdict::Settling | MainVerdict::Unsettled => CandidateHeadCheckState::Pending { unsettled: head.unsettled },
         MainVerdict::Red => {
             let names: Vec<String> = head.red.iter().map(|r| r.name.clone()).collect();
             let all_base_health = !names.is_empty() && names.iter().all(|n| is_base_health_gate_name(n));
@@ -1962,7 +2031,12 @@ pub fn reconcile_deploy_coverage(
         };
     }
 
-    if base_verdict.verdict == MainVerdict::Unsettled || tip_active.is_some() {
+    // BR#14088: a SETTLING base (required checks in flight) is the same
+    // wait class as an unsettled read — the tip's verdict is not known yet.
+    if base_verdict.verdict == MainVerdict::Unsettled
+        || base_verdict.verdict == MainVerdict::Settling
+        || tip_active.is_some()
+    {
         return DeployReconcilePlan {
             coverage: DeployCoverageState::Settling {
                 tip_sha,
@@ -2128,15 +2202,21 @@ pub fn reconcile_base_verdict_with_deploy_coverage(
     match coverage {
         DeployCoverageState::Settling { active_run_id, .. } => {
             let mut v = base_verdict.clone();
-            v.verdict = MainVerdict::Unsettled;
+            // BR#14088: the deploy is IN FLIGHT — the verdict is unknown, so
+            // the rollup reads SETTLING (amber), never green/unsettled: the
+            // in-flight class is distinguishable from an inconclusive read.
+            v.verdict = MainVerdict::Settling;
             v.red.clear();
             v.alarm = None;
+            let label = match active_run_id {
+                Some(id) => format!("Deploy Dev (run #{id} in flight)"),
+                None => "Deploy Dev (in flight)".to_string(),
+            };
+            if v.settling.is_empty() {
+                v.settling.push(label.clone());
+            }
             if v.unsettled.is_empty() {
-                let label = match active_run_id {
-                    Some(id) => format!("Deploy Dev (run #{id} in flight)"),
-                    None => "Deploy Dev (in flight)".to_string(),
-                };
-                v.unsettled.push(label);
+                v.unsettled.push(label); // fold: list consumers keep naming the check
             }
             v
         }
@@ -2423,7 +2503,9 @@ mod tests {
         let plan = reconcile_deploy_coverage(tip, 1350, 300, &scoped, &required, &[first.clone(), second.clone()], None);
         assert!(matches!(plan.coverage, DeployCoverageState::Settling { active_run_id: Some(id), .. } if id == run_id));
         let effective = reconcile_base_verdict_with_deploy_coverage(&scoped, &plan.coverage, &required);
-        assert_eq!(effective.verdict, MainVerdict::Unsettled);
+        // BR#14088: the in-flight deploy attempt reads SETTLING (amber, never
+        // green); the derived-gate red stays superseded (red empty).
+        assert_eq!(effective.verdict, MainVerdict::Settling);
         assert!(effective.red.is_empty());
 
         let mut native_gate = gate.clone();
@@ -2591,7 +2673,12 @@ mod tests {
         let v = classify_head_checks(&[run(1, "Cloudflare Workers", None)]);
         assert!(matches!(v.verdict, MainVerdict::Green)); // exempt in-flight says nothing
         let v = classify_head_checks(&[run(1, "ci", None)]);
-        assert!(matches!(v.verdict, MainVerdict::Unsettled));
+        // BR#14088: an in-flight (conclusion null) check is SETTLING — amber,
+        // never green, and never the inconclusive "unsettled" class. The name
+        // still folds into `unsettled` for list consumers.
+        assert!(matches!(v.verdict, MainVerdict::Settling));
+        assert_eq!(v.settling, vec!["ci"]);
+        assert_eq!(v.unsettled, vec!["ci"]);
     }
 
     // ---------- BR#6001: the Superpositional external check is never gating
@@ -2694,12 +2781,25 @@ mod tests {
         assert!(matches!(required_red.verdict, MainVerdict::Red));
         assert_eq!(required_red.red.len(), 1);
         assert_eq!(required_red.red[0].name, "deploy / Deploy to dev");
-        // newest non-cancelled per name still judges inside the scope
+        // newest non-cancelled per name still judges inside the scope: the
+        // rerun's success heals the earlier failure. Every required name must
+        // be present-and-green for GREEN — the second required workflow is
+        // added below so the healed read certifies green (BR#14088
+        // required-completeness), and the missing-post-deploy variant reads
+        // SETTLING "(awaiting first run)", never green.
         let healed = classify_base_check_runs(
-            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success"))],
+            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success")), run(3, "post-deploy / Lodestar Storage Health", Some("success"))],
             &required,
         );
         assert!(matches!(healed.verdict, MainVerdict::Green));
+        let missing_post_deploy = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success"))],
+            &required,
+        );
+        // BR#14088: the post-admission smoke starts LAST (~40-60 min after
+        // push) — until its first check-run the rollup is settling, never green.
+        assert!(matches!(missing_post_deploy.verdict, MainVerdict::Settling), "got {:?}", missing_post_deploy.verdict);
+        assert!(missing_post_deploy.settling.iter().any(|s| s.contains("post-deploy / Lodestar Storage Health") && s.contains("(awaiting first run)")));
         // required set matching NOTHING on the tip → Empty (a lane-config
         // defect, rendered loud by the Fix A BLOCKED line — never green)
         // BR#5674 P1 (empty-is-loud): distinguishes some-runs-none-matched vs zero-total-runs
@@ -2754,15 +2854,17 @@ mod tests {
     #[test]
     fn gate_qualifier_covers_unsettled_and_stays_silent_when_honest_br5883() {
         let required: Vec<String> = vec!["Test".into(), "main-green gate".into()];
-        // gate verdict UNSETTLED: a tip check still in flight fails the gate
-        // script too ("an in-flight main does not vouch for main")
+        // gate verdict SETTLING (BR#14088): a tip check still in flight fails the
+        // gate script too ("an in-flight main does not vouch for main") — the
+        // in-flight class now reads Settling, never green; the qualifier still
+        // fires (verdict != Green) and the name stays in the unsettled list.
         let v = classify_base_check_runs(
             &[run(1, "Test", Some("success")), run(2, "Deploy health (merge gate)", None)],
             &required,
         );
         assert!(matches!(v.verdict, MainVerdict::Green));
         let gate = v.gate.expect("in-flight non-required check fails the gate: qualifier must fire");
-        assert!(matches!(gate.verdict, MainVerdict::Unsettled));
+        assert!(matches!(gate.verdict, MainVerdict::Settling));
         assert_eq!(gate.unsettled, vec!["Deploy health (merge gate)"]);
         // fully green tip → NO qualifier (silence is the point)
         let v = classify_base_check_runs(
@@ -2782,6 +2884,76 @@ mod tests {
         let v = classify_base_check_runs(&[run(1, "ci", Some("failure"))], &[]);
         assert!(matches!(v.verdict, MainVerdict::Red));
         assert!(v.gate.is_none());
+    }
+
+    // ---------- BR#14088: no green until settled — the post-admission smoke
+    // window (settling state + required-completeness). The live shape:
+    // superpositional main tip edfb114682 pushed 20:17Z; the Cortex Quality
+    // Smoke job (INSIDE the required Deploy Dev workflow) settles LAST
+    // (~50-60 min after admission) and its check-run carries conclusion=null
+    // while in flight; every surface that read "0 failing checks" reported
+    // green while the verdict was UNKNOWN. ----------
+
+    /// BR#14088 helper: an IN-FLIGHT check run — queued/in_progress, no
+    /// conclusion yet (GitHub files a conclusion only at completion).
+    fn in_flight(id: i64, name: &str) -> MainCheckRun {
+        MainCheckRun { id, source: CheckSource::Unknown, name: name.into(), status: Some("in_progress".into()), conclusion: None, html_url: None }
+    }
+
+    #[test]
+    fn br14088_green_deploy_plus_in_flight_smoke_is_settling_never_green() {
+        // THE evidence scenario: the deploy job settled green, the post-deploy
+        // smoke inside the same workflow is still in flight. The rollup is
+        // SETTLING — rendered amber, never green.
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into()];
+        let v = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("success")), in_flight(2, "deploy / Deploy to dev")],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Settling), "got {:?}", v.verdict);
+        assert!(v.settling.contains(&"deploy / Deploy to dev".to_string()));
+        assert!(v.unsettled.contains(&"deploy / Deploy to dev".to_string()), "fold: list consumers keep naming the in-flight check");
+        // same shape at the whole-tip level
+        let m = classify_main_check_runs(&[run(1, "deploy / Deploy to dev", Some("success")), in_flight(2, "deploy / Deploy to dev")]);
+        assert!(matches!(m.verdict, MainVerdict::Settling));
+    }
+
+    #[test]
+    fn br14088_all_completed_green_certifies_green() {
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into()];
+        let v = classify_base_check_runs(
+            &[run(2, "deploy / Deploy to dev", Some("success")), run(1, "deploy / Deploy to dev", Some("failure"))],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Green), "newest attempt settled green: got {:?}", v.verdict);
+    }
+
+    #[test]
+    fn br14088_missing_required_run_is_settling_not_green() {
+        // The smoke starts LAST (~40-60 min after push): before its first
+        // check-run exists the obligation is INVISIBLE to the old law — green
+        // was certified with green < required.len(). Now: SETTLING.
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into(), "post-deploy / Cortex Quality Smoke".into()];
+        let v = classify_base_check_runs(&[run(1, "deploy / Deploy to dev", Some("success"))], &required);
+        assert!(matches!(v.verdict, MainVerdict::Settling), "got {:?}", v.verdict);
+        assert!(v.settling.iter().any(|s| s.contains("post-deploy / Cortex Quality Smoke") && s.contains("(awaiting first run)")));
+        // the vacuity class stays exempt (BR#5847): a structurally-absent
+        // `main-green gate` on a merge-commit tip never blocks certification
+        let bridge_required: Vec<String> = vec!["Test".into(), "main-green gate".into()];
+        let v = classify_base_check_runs(&[run(1, "Test", Some("success"))], &bridge_required);
+        assert!(matches!(v.verdict, MainVerdict::Green), "BR#5847 vacuous gate must not block green: got {:?}", v.verdict);
+    }
+
+    #[test]
+    fn br14088_red_wins_over_settling() {
+        let required: Vec<String> = vec!["deploy / Deploy to dev".into()];
+        let v = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("failure")), in_flight(2, "post-deploy / Cortex Quality Smoke")],
+            &required,
+        );
+        assert!(matches!(v.verdict, MainVerdict::Red), "red stops the line even while other checks settle: got {:?}", v.verdict);
+        assert_eq!(v.red.len(), 1);
+        assert!(v.red[0].name.contains("Deploy to dev"));
     }
 
     #[test]
@@ -4339,8 +4511,11 @@ mod tests {
             DeployCoverageState::Settling { active_run_id: Some(41911085476), .. }
         ));
         let reconciled_spot = reconcile_base_verdict_with_deploy_coverage(&spot_build_verdict, &plan_spot.coverage, &required);
-        assert_eq!(reconciled_spot.verdict, MainVerdict::Unsettled);
+        // BR#14088: in-flight deploy = SETTLING (amber, never green); the name
+        // still folds into `unsettled` so list consumers keep naming it.
+        assert_eq!(reconciled_spot.verdict, MainVerdict::Settling);
         assert!(reconciled_spot.alarm.is_none());
+        assert_eq!(reconciled_spot.settling, vec!["Deploy Dev (run #41911085476 in flight)"]);
         assert_eq!(reconciled_spot.unsettled, vec!["Deploy Dev (run #41911085476 in flight)"]);
 
         // 5c. Stage-1 failed build (0 required check-runs created because Spot build failed):

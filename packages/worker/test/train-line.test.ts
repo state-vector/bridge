@@ -148,7 +148,7 @@ describe("one line status and recovery contract", () => {
     expect(repairProgressText(task)).toBe("Reading the failed deployment log");
   });
   const required = ["deploy / Deploy to dev", "post-deploy / Post-Deploy Smoke", "post-deploy / DNS chain (front doors)", "post-deploy / Lodestar Operational Health"];
-  const scopedGreen: MainCheckVerdict = { verdict: "green", red: [], unsettled: [], green: 4 };
+  const scopedGreen: MainCheckVerdict = { verdict: "green", red: [], settling: [], unsettled: [], green: 4 };
   const workflow = (id: number, head_sha: string, conclusion: string): DeployWorkflowRun => ({
     id, head_sha, name: "Deploy Dev", path: ".github/workflows/deploy-dev.yml", status: "completed", conclusion, html_url: `https://github.com/actions/runs/${id}`,
   });

@@ -129,7 +129,7 @@ export const TrainLineFactsSchema = z.object({
   queue: z.array(z.object({ id: z.string() })).default([]),
   currently: z.object({ phase: z.string().optional(), pr: z.number().nullable().optional() }).nullable().optional(),
   stop: z.object({ kind: z.enum(["base_red", "checks_unconfirmed"]).optional(), reason: z.string().optional(), failing: z.array(EvidenceSchema).optional() }).nullable().optional(),
-  verifying_base: z.object({ tip_sha: z.string().min(1), verdict: z.enum(["unsettled", "green"]) }).nullable().optional(),
+  verifying_base: z.object({ tip_sha: z.string().min(1), verdict: z.enum(["unsettled", "settling", "green"]) }).nullable().optional(),
   lease: z.object({ holder: z.string(), heartbeat_ts: z.number() }).nullable().optional(),
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
@@ -137,8 +137,12 @@ export const TrainLineFactsSchema = z.object({
     entries: z.array(z.object({ id: z.string(), cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]) })).optional(),
     base_observed_at: z.number().optional(),
     base_state: z.object({
-      verdict: z.enum(["green", "red", "unsettled", "empty"]),
-      red: z.array(EvidenceSchema).optional(), unsettled: z.array(z.string()).optional(),
+      verdict: z.enum(["green", "settling", "red", "unsettled", "empty"]),
+      red: z.array(EvidenceSchema).optional(),
+      /** BR#14088: required checks in flight (queued/in_progress) or required
+       *  names with no run yet — amber, never green. */
+      settling: z.array(z.string()).optional(),
+      unsettled: z.array(z.string()).optional(),
       gate_blocked: z.boolean().optional(), gate_red: z.array(EvidenceSchema).optional(), gate_unsettled: z.array(z.string()).optional(),
       deploy_coverage: DeployCoverageStateSchema.nullable().optional(),
     }).optional(),
@@ -279,9 +283,19 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     return f.currently.phase === "bursting" ? make("working", "Merging changes", reason, null, [], action)
       : make("waiting", "Waiting for checks and deployment", reason, "checks_running", [], action);
   }
-  if (fresh && bs?.verdict === "unsettled") return make("waiting", "Required checks are running",
-    (bs.unsettled ?? []).join(", ") || "Waiting for main's required checks.", "checks_running", [],
-    { kind: "machine", text: "Watching required checks; changes resume automatically when they pass.", url: null });
+  // BR#14088: a SETTLING tip (required checks queued/in_progress, or a
+  // required check with no run yet) is the amber wait class — it renders as
+  // "waiting / Required checks are running", never green, and is
+  // distinguishable from an inconclusive (unsettled) read in the reason.
+  if (fresh && (bs?.verdict === "unsettled" || bs?.verdict === "settling")) {
+    const names = [...(bs.settling ?? []), ...(bs.unsettled ?? [])];
+    const waiting = bs?.verdict === "settling";
+    return make("waiting", "Required checks are running",
+      waiting ? `${names.join(", ") || "Main's required checks are still in flight"} — no green until every required check settles.`
+        : (bs.unsettled ?? []).join(", ") || "Waiting for main's required checks.",
+      "checks_running", [],
+      { kind: "machine", text: "Watching required checks; changes resume automatically when they pass.", url: null });
+  }
   const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000) || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
   if (!f.queue.length) return make("idle", "idle", "No queued changes.", null, [], null);
   if (!executorLive) return error("no_executor",
