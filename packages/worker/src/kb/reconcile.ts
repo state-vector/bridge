@@ -285,6 +285,16 @@ export function accountingLine(a: ReconcileAccounting): string {
   return base + alarm + info + reverse + observed + ` [all-open: ${a.open_total}; progress: ${a.queued} queued, ${a.repairing} repairing, ${a.verifying} verifying, ${a.held} held, ${a.stranded} stranded]`;
 }
 
+function openBindingPriority(binding: ReconcileBinding): number {
+  if (binding.lane) return 0;
+  if (binding.queued || binding.progress === "queued") return 6;
+  if (binding.open_verify_children > 0 || binding.progress === "verifying") return 5;
+  if (binding.progress === "repairing") return 4;
+  if (binding.progress === "held") return 3;
+  if (binding.repairAccepted) return 2;
+  return 1;
+}
+
 /** Join one repo's observed open PRs against the board projection and emit
  *  one judgement per PR plus the accounting report. The order of checks IS
  *  the precedence: binding > review-gate (BR#5677: a bound card accounts the
@@ -335,6 +345,15 @@ export function reconcileJoin(args: {
   // observed-merge loop below; judging them as live PRs would mis-account
   // every merged PR on the repo as board state.
   const openRows = prs.filter(prRowIsOpen);
+  const openBindings = new Map<number, ReconcileBinding>();
+  // Multiple cards can retain the same PR after a recovery handoff.
+  // Prefer the live delivery owner so a stale binding cannot spawn work.
+  for (const binding of args.bindings) {
+    const current = openBindings.get(binding.pr);
+    if (!current || openBindingPriority(binding) >= openBindingPriority(current)) {
+      openBindings.set(binding.pr, binding);
+    }
+  }
   const reviewed = openRows;
   for (const p of reviewed) {
     acc.open_total++;
@@ -365,7 +384,7 @@ export function reconcileJoin(args: {
     //    decision, approved/verifyEligible are false by construction, so
     //    an unreviewed bound card can never spawn a verify duty — it
     //    accounts as bound (queued/lane/in-flight per its stamps).
-    const b = bindings.get(p.number);
+    const b = openBindings.get(p.number);
     if (b) {
       if (b.progress) acc[b.progress]++;
       // A verified recovery owes the bound PR a fresh review at its live head.

@@ -16190,19 +16190,31 @@ export class KnowledgeHub {
     }
   }
 
-  private async ensureTaskRecovery(taskId: string, reason: RecoveryReason, waitEpisode?: string): Promise<string> {
+  private async ensureTaskRecovery(
+    taskId: string, reason: RecoveryReason, waitEpisode?: string, conflict?: { repo: string; pr: number },
+  ): Promise<string> {
     const key = waitEpisode ? JSON.stringify([taskId, reason, waitEpisode]) : taskId;
     const pending = this.taskRecoveries.get(key);
     if (pending) return pending;
-    const run = this.createTaskRecovery(taskId, reason, waitEpisode);
+    const run = this.createTaskRecovery(taskId, reason, waitEpisode, conflict);
     this.taskRecoveries.set(key, run);
     try { return await run; } finally { this.taskRecoveries.delete(key); }
   }
 
-  private async createTaskRecovery(taskId: string, reason: RecoveryReason, waitEpisode?: string): Promise<string> {
+  private async createTaskRecovery(
+    taskId: string, reason: RecoveryReason, waitEpisode?: string, conflict?: { repo: string; pr: number },
+  ): Promise<string> {
+    // A tracking duty parked on the eventual merge cannot repair a new
+    // conflict on that same PR. Preserve its wait and dedupe the new repair
+    // against every other active duty, including earlier conflict repairs.
     const active = this.one(`SELECT id FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded') AND (json_extract(meta, '$.machine_duty.kind') = 'task-recovery' OR (? = 'execution_environment' AND json_extract(meta, '$.machine_duty.kind') IN ('diagnostic','line_recovery'))) AND json_extract(meta, '$.machine_duty.subject') = ?
       AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
-      ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "");
+      AND NOT coalesce(? = 'conflict' AND status = 'blocked'
+        AND json_extract(meta, '$.machine_duty.reason') = 'queue_binding'
+        AND json_extract(meta, '$.blocked.await_event.event') = 'pr_merged'
+        AND json_extract(meta, '$.blocked.await_event.repo') = ?
+        AND json_extract(meta, '$.blocked.await_event.n') = ?, 0)
+      ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "", reason, conflict?.repo ?? null, conflict?.pr ?? null);
     if (active) return String(active.id);
     const parent = this.one(`SELECT title, project FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
@@ -18540,7 +18552,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             if (parent.status === "todo" && stamp?.state === "bounced" && stamp.repo === repo && Number(stamp.pr) === j.pr
               && this.acceptedRecoveryForBounce(a.card, meta.recovery?.task_id, stamp.bounced_at)) break;
           }
-          const duty = await this.ensureTaskRecovery(a.card, a.reason);
+          const duty = await this.ensureTaskRecovery(a.card, a.reason, undefined,
+            a.reason === "conflict" ? { repo, pr: j.pr } : undefined);
           spawned.push({ pr: j.pr, action: "repair", card: a.card, duty });
           break;
         }

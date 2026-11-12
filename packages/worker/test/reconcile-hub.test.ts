@@ -119,6 +119,34 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await dutiesOf(repo)).length).toBe(1);
   });
 
+  it("dispatches one conflict repair when the old tracking duty waits for that PR to merge", async () => {
+    const repo = "state-vector/conflict-after-tracking";
+    const number = 3066;
+    const parent = (await kbJson("/create", {
+      actor: "author", type: "task", title: "Tracked PR became conflicting", qualified: true,
+      meta: { pr: { repo, number } },
+    })).body.id;
+    const clean = prRow(number, { reviewDecision: null, updatedAt: iso(90) });
+    const tracked = await report(repo, [clean]);
+    const tracking = tracked.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(tracking).toBeTruthy();
+    expect((await kbJson("/transition", { id: tracking, to: "in_progress", actor: "tracker" })).status).toBe(200);
+    expect((await kbJson("/transition", { id: tracking, to: "blocked", actor: "tracker",
+      note: "Wait for the tracked PR to merge", await_event: { event: "pr_merged", repo, n: number },
+    })).status).toBe(200);
+
+    const conflicted = { ...clean, mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" };
+    const observed = await report(repo, [conflicted]);
+    const repair = observed.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(repair).toBeTruthy();
+    expect(repair).not.toBe(tracking);
+    expect((await kbJson("/get", { id: repair })).body).toMatchObject({
+      status: "todo", meta: { machine_duty: { subject: parent, reason: "conflict" } },
+    });
+    expect((await kbJson("/get", { id: tracking })).body.status).toBe("blocked");
+    expect((await report(repo, [conflicted])).body.spawned).toHaveLength(0);
+  });
+
   it("returns an independently verified repair to the train without a GitHub approval label", async () => {
     const repo = "state-vector/recovered-pr";
     expect((await kbJson("/train.lane", { repo, spec: { required_workflows: ["Test"] } })).status).toBe(200);

@@ -136,6 +136,17 @@ describe("all-open delivery progress", () => {
     expect(join({ prs: [observed], bindings: [{ ...repaired, open_verify_children: 1 }] }).judgements[0].decision.action).not.toBe("verify_repaired");
   });
 
+  it("keeps a live review ahead of a stranded duplicate in either binding order", () => {
+    const observed = pr(3057, { reviewDecision: null, updatedAt: iso(50) });
+    const current = binding(3057, { card: "BR#14047", status: "in_review", progress: "verifying", open_verify_children: 1 });
+    const stale = binding(3057, { card: "BR#10150", status: "todo", progress: "stranded" });
+    for (const bindings of [[current, stale], [stale, current]]) {
+      const result = join({ prs: [observed], bindings });
+      expect(result.judgements[0].decision).toEqual({ action: "inflight", duty_id: current.card, via: "verify-children" });
+      expect(result.accounting).toMatchObject({ verifying: 1, stranded: 0, unaccounted: 0 });
+    }
+  });
+
   it("an existing card with no executable action is stranded, not accounted", () => {
     const r = join({ prs: [pr(99, { updatedAt: iso(50), mergeable: "CONFLICTING" })], bindings: [binding(99, { progress: "stranded" })] });
     expect(r.accounting.stranded).toBe(1);
