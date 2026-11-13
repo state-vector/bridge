@@ -2191,6 +2191,49 @@ describe("breachClass: rebind_fence (BR#9703)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#14512 — the wait-recovery close fence (do.ts:7754, the doTransition
+// in_review path): a task-recovery duty carrying a wait_episode that closes
+// in_review with NO unblock_result while its subject is still blocked with
+// the blocked.repairing binding on THIS duty + episode is refused with
+// "gate: this wait recovery must submit an observable replacement or record
+// an authorized disposition before review". The gate refusing a bare close
+// IS the system working (the BR#4562/BR#6654/BR#7008/BR#7684 pricing
+// family): zero state destroyed, the parent's typed wait stays intact, and
+// the duty's legal paths — a genuinely different observable via
+// unblock_result {kind:"reblocked"}, or a receipt-backed disposition while
+// the coordinated parent release dissolves the binding — stay open.
+// Specimen: BR#13588 (task-recovery repeated_failure duty on BR#42), 3
+// terminal gate rejections 2026-11-13 12:04:24–12:19:32Z across two
+// executor generations; gen-2 answered the fence by recording the
+// receipt-backed disposition (BR#14504) and gen-3 reconciled it before any
+// repeat. The 3 events folded "unclassified" (default threshold 3) and
+// raised breach card BR#14512. The class is named so the Log says WHAT
+// fenced, and priced never-a-breach so compliance can never arm a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: wait_close_fence (BR#14512)", () => {
+  // the exact audited reason shape (do.ts:7754, thrown message, no [rule:] tag)
+  const FENCE = "gate: this wait recovery must submit an observable replacement or record an authorized disposition before review";
+
+  it("the bare-close refusal classifies wait_close_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("wait_close_fence");
+    // the stem sits ~40 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("wait_close_fence");
+  });
+
+  it("a bare-close refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#13588", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["wait_close_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
