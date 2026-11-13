@@ -3,6 +3,7 @@ import {
   accountingLine,
   isActionableDutyCard,
   normalizePr,
+  originTaskId,
   prAgeMs,
   prRowIsOpen,
   reconcileJoin,
@@ -811,5 +812,96 @@ describe("reconcileJoin — BR#6384 observed-merge close", () => {
     });
     expect(r.judgements[0]?.decision).toEqual({ action: "observed_merge_verify", card: "BR#90021", merge_sha: "e".repeat(40) });
     expect(r.accounting.observed_merged).toBe(1);
+  });
+});
+
+// ---------- BR#14364: origin-bind — the dead-runner rescue ----------
+
+describe("BR#14364 origin-bind law", () => {
+  // The specimen: PR #3191 sat OPEN+MERGEABLE with reviewDecision="" beside
+  // a todo card for 4h because the runner died before its in_review
+  // transition — the PR was UNBOUND, so the unreviewed grace swallowed it.
+  const stranded = (number: number, over: Partial<ReconcilePr> = {}): ReconcilePr =>
+    pr(number, { reviewDecision: null, title: `feat: t1 foundation (BR#${number})`, ...over });
+
+  it("originTaskId: title marker wins, branch fallback, ambiguity binds nothing, zeros normalize", () => {
+    expect(originTaskId("feat: t1 (BR#43125)", "feature/x")).toBe("BR#43125");
+    expect(originTaskId("PR title without marker", "fix/br14125-chat-scope-t1-foundation")).toBe("BR#14125");
+    expect(originTaskId("PR title without marker", "br/14125")).toBe("BR#14125");
+    expect(originTaskId("PR title without marker", "br-14125")).toBe("BR#14125");
+    expect(originTaskId("two in the title: BR#10 and BR#20", "feature/plain")).toBeNull();
+    expect(originTaskId("one here BR#10", "fix/br-20-other")).toBe("BR#10"); // title is authoritative
+    expect(originTaskId("PR title without marker", "feature/br-10-and-br-20")).toBeNull(); // branch ambiguity
+    expect(originTaskId("zero-pad BR#0042", null)).toBe("BR#42");
+    expect(originTaskId("zero BR#0 and BR#000", null)).toBeNull();
+    expect(originTaskId("not a marker: brevity, libra, club", "fix/browser-upgrade")).toBeNull();
+    expect(originTaskId(null, null)).toBeNull();
+    expect(originTaskId("caps BR#77 stated twice BR#77", null)).toBe("BR#77"); // duplicates collapse; one DISTINCT id per source
+    expect(originTaskId("case-insensitive BR#77 vs br#78", null)).toBeNull(); // still two distinct ids
+  });
+
+  it("an unbound marker PR past the verify grace emits bind_origin — never the grace swallow", () => {
+    const r = join({ prs: [stranded(3191, { updatedAt: iso(4) })] });
+    expect(r.judgements[0].decision).toEqual({ action: "bind_origin", card: "BR#3191" });
+    expect(r.accounting.spawned).toBe(1);
+    expect(r.accounting.accounted).toBe(1);
+    expect(r.accounting.unreviewed).toBe(0);
+    expect(r.accounting.ok).toBe(true);
+  });
+
+  it("a young marker PR keeps the grace — the rescue never fires inside the verify window", () => {
+    const r = join({ prs: [stranded(3200, { updatedAt: iso(1) })] });
+    expect(r.judgements[0].decision.action).toBe("grace");
+    expect(r.accounting.spawned).toBe(0);
+  });
+
+  it("an ignored marker PR is never origin-bound — an explicit ruling outranks the inference", () => {
+    // young + unreviewed lands in the pre-existing grace swallow (before the
+    // ignored check) — either way bind_origin must not fire:
+    const young = join({ prs: [stranded(3210)], ignores: [{ pr: 3210, reason: "docs-only" }] });
+    expect(young.judgements[0].decision.action).not.toBe("bind_origin");
+    // aged past the disposition grace reaches the ignored branch:
+    const aged = join({ prs: [stranded(3210, { updatedAt: iso(50) })], ignores: [{ pr: 3210, reason: "docs-only" }] });
+    expect(aged.judgements[0].decision.action).toBe("ignored");
+  });
+
+  it("drafts are never origin-bound", () => {
+    const r = join({ prs: [stranded(3211, { isDraft: true })] });
+    expect(r.judgements[0].decision.action).toBe("grace");
+  });
+
+  it("a conflicting/unmergeable marker PR falls through — greenish is the fence", () => {
+    const young = join({ prs: [stranded(3212, { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(5) })] });
+    expect(young.judgements[0].decision.action).toBe("grace");
+    const aged = join({ prs: [stranded(3212, { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(50) })] });
+    expect(aged.judgements[0].decision.action).toBe("spawn_disposition");
+  });
+
+  it("the bulk feed's UNKNOWN/UNKNOWN counts as greenish (needsProbe) — the verifier reads the exact head", () => {
+    const r = join({ prs: [stranded(3213, { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" })] });
+    expect(r.judgements[0].decision).toEqual({ action: "bind_origin", card: "BR#3213" });
+    const unstable = join({ prs: [stranded(3214, { mergeStateStatus: "UNSTABLE" })] });
+    expect(unstable.judgements[0].decision).toEqual({ action: "bind_origin", card: "BR#3214" });
+  });
+
+  it("a branch-only marker binds too — titled-but-unmarked runner PRs are the same class", () => {
+    const r = join({ prs: [pr(14125, { reviewDecision: null, title: "feat: t1 foundation", headRefName: "fix/br14125-chat-scope-t1-foundation" })] });
+    expect(r.judgements[0].decision).toEqual({ action: "bind_origin", card: "BR#14125" });
+  });
+
+  it("an ambiguous marker binds nothing — a wrong auto-bind advances the wrong card", () => {
+    const r = join({ prs: [pr(3300, { reviewDecision: null, title: "Fix BR#10 and BR#20", headRefName: "feature/plain" })] });
+    expect(r.judgements[0].decision.action).toBe("grace");
+  });
+
+  it("a bound PR never emits bind_origin — the binding branch owns it whatever the marker says", () => {
+    const r = join({ prs: [stranded(3400)], bindings: [binding(3400)] });
+    expect(r.judgements[0].decision.action).toBe("bound");
+  });
+
+  it("a dead duty on a marker PR is repaired by the bind, not alarmed", () => {
+    const r = join({ prs: [stranded(3410)], duties: [duty(3410, { card_status: "done" })] });
+    expect(r.judgements[0].decision.action).toBe("bind_origin");
+    expect(r.accounting.ok).toBe(true);
   });
 });
