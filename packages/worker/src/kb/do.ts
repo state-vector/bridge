@@ -18386,6 +18386,105 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     );
   }
 
+  /** BR#14364 apply leg: a `bind_origin` judgement — an unbound, green,
+   *  marker-bearing PR whose origin card is named. The join's snapshot is
+   *  stale the moment it is taken, so this re-reads the card LIVE and
+   *  resolves one of three actions:
+   *  - "advance" — todo / dead-strand in_progress delivery card: stamp
+   *    meta.pr FIRST (the in_review verify effect resolves the PR link from
+   *    the note, and the next cycle accounts the PR as bound even when a
+   *    gate refuses), then walk the machine's OWN two-step todo →
+   *    in_progress → in_review as the machine actor — never a bypass. The
+   *    in_review effect spawns the standard (unmarked) verify duty; a gate
+   *    refusal stands the binding and is audited, never retried in-cycle
+   *    (the next cycle sees the PR bound).
+   *  - "bind" — in_review / blocked (their own lifecycle continues with the
+   *    PR now visible), or a soft-guard failure on an open card (bound ask,
+   *    live verify child, pending review round, live dispatch reservation,
+   *    live strand owner, non-delivery completion contract): stamp + audit +
+   *    version note only.
+   *  - "tracking" — missing/done/superseded card, standing/lane card,
+   *    machine-duty or verdict-role card, a card bound to a DIFFERENT PR,
+   *    or a merge-train-stamped card: the standard orphan path (tracking
+   *    card + verify duty), identical to the card-less spawn. */
+  private async reconcileBindOrigin(card: string, repo: string, pr: number, title: string | null, prUrl: string, actor: string, now: number): Promise<{ action: "advance" | "bind" | "tracking"; duty?: string | null; card?: string }> {
+    const fallback = async (why: string): Promise<{ action: "tracking"; duty?: string | null; card: string }> => {
+      this.audit(actor, "reconcile_bind_origin_fallback", card, { pr: `${repo}#${pr}`, why });
+      const tracking = await this.reconcileTrackingCard(repo, pr, title, `unbound PR names ineligible origin card ${card} (BR#14364) — projected as a tracking card instead`, actor, now);
+      const duty = await this.reconcileSpawnVerify(repo, pr, tracking, actor, now);
+      return { action: "tracking", duty, card: tracking };
+    };
+    const row = this.one(`SELECT id, type, status, meta, tags, roles, owner FROM artefacts WHERE id = ?`, card) as any;
+    if (!row || String(row.type) !== "task") return fallback(`origin card ${card} missing or not a task`);
+    const meta = JSON.parse(String(row.meta ?? "{}"));
+    const tags = parseTags(String(row.tags ?? ""));
+    const roles = parseTags(String(row.roles ?? ""));
+    if (isStandingCard(meta, tags)) return fallback(`${card} is a standing/lane card — reconcile never advances it (BR#5151)`);
+    if (meta.machine_duty) return fallback(`${card} is a machine duty card, not a delivery owner`);
+    if (roles.includes("review") || roles.includes("unblock")) return fallback(`${card} is a verdict-duty card (${roles.join(", ")}) — separation of duties keeps deliveries out of verdict cards`);
+    // A merge-train stamp makes the card the train's business — whatever
+    // the marker says, the queue owns that delivery; a tracking projection
+    // keeps THIS pr visible without touching the train's card.
+    const mt = (meta.merge_train ?? {}) as Record<string, any>;
+    if (String(mt.repo ?? "") === repo && Number(mt.pr ?? 0) > 0) return fallback(`${card} is merge-train stamped (${repo}#${Number(mt.pr)}) — the train owns it`);
+    // PR legs (meta.pr + meta.prs, the join's extraction): already bound to
+    // THIS pr → a binder raced the join — nothing to do; bound to a
+    // DIFFERENT pr → this card must not silently carry two deliveries.
+    const legs = [
+      { repo: String((meta.pr ?? {}).repo ?? ""), number: Number((meta.pr ?? {}).number ?? 0) },
+      ...(Array.isArray(meta.prs) ? meta.prs : []).map((l: any) => ({ repo: String(l?.repo ?? ""), number: Number(l?.number ?? 0) })),
+    ];
+    const boundHere = legs.some((l) => l.repo === repo && l.number === pr);
+    const boundElsewhere = legs.some((l) => l.number > 0 && !(l.repo === repo && l.number === pr));
+    if (boundElsewhere) return fallback(`${card} already carries a different PR leg`);
+    const status = String(row.status);
+    if (!["todo", "in_progress", "in_review", "blocked"].includes(status)) return fallback(`${card} is ${status} — no live delivery to advance`);
+    const stamp = (why: string) => {
+      meta.pr = { repo, number: pr };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), card);
+      this.version(card, actor, "reconcile_bind_origin", `reconcile bound origin PR ${repo}#${pr} (BR#14364): ${why}`, { pr: `${repo}#${pr}`, url: prUrl });
+      this.audit(actor, "reconcile_bind_origin", card, { pr: `${repo}#${pr}`, url: prUrl, note: why });
+    };
+    if (boundHere) {
+      this.audit(actor, "reconcile_bind_origin_already_bound", card, { pr: `${repo}#${pr}`, note: "card bound this PR between the join snapshot and the apply — nothing to do" });
+      return { action: "bind" };
+    }
+    if (status === "in_review" || status === "blocked") {
+      stamp(`card is ${status} — binding stands, its own lifecycle continues`);
+      return { action: "bind" };
+    }
+    // ---- advance guards: a soft failure degrades to bind-only ----
+    const soft = [
+      mergeCompletesTask(meta) ? null : "non-delivery completion contract — in_review would demand an execution_result reconcile cannot author",
+      meta.awaiting_ask ? "a bound ask is open" : null,
+      this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=? AND expires_at>?`, card, now) ? "a live dispatch reservation holds it" : null,
+      this.openVerifyChildren(card) > 0 ? "a verify child is open" : null,
+      this.currentTaskReview(card).phase === "pending" ? "a review round is pending" : null,
+      status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10) ? "the strand owner is alive" : null,
+    ].find(Boolean) as string | null;
+    if (soft) {
+      stamp(`${soft} — binding stands, lifecycle untouched`);
+      return { action: "bind" };
+    }
+    // ---- ADVANCE: stamp first, then the machine's own two-step walk ----
+    stamp(`dead-strand rescue — advancing through the standard gates`);
+    const note = `Reconcile auto-submission (BR#14364): the dispatched runner died before its in_review transition; origin PR ${prUrl} is mergeable and now bound — independent verification rides the standard flow.`;
+    try {
+      if (status === "todo") await this.transition({ id: card, to: "in_progress", session: "", note: `reconcile (BR#14364): dead-strand delivery rescue — origin PR ${prUrl} bound` }, actor);
+      const res = (await this.transition({ id: card, to: "in_review", session: "", note }, actor)) as any;
+      const duty = res?.verify_task ?? null;
+      this.audit(actor, "reconcile_bind_origin_advanced", card, { pr: `${repo}#${pr}`, verify_task: duty });
+      return { action: "advance", duty };
+    } catch (e) {
+      // A semantic gate rejection is TERMINAL for this attempt (retry law) —
+      // never retried in-cycle. The binding stands; the next cycle accounts
+      // the PR as bound and the card's own lifecycle (an owner, or repair at
+      // the disposition age) takes over from here.
+      this.audit(actor, "reconcile_bind_origin_gate_refused", card, { pr: `${repo}#${pr}`, error: String((e as Error)?.message ?? e).slice(0, 300) });
+      return { action: "bind" };
+    }
+  }
+
   private recordDeliveryPrOutcome(repo: string, pr: number, state: "OPEN" | "CLOSED" | "MERGED", head: string | null, now: number): void {
     this.state.storage.sql.exec(`
       INSERT INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at) VALUES(?,?,?,?,?,?)
@@ -18627,6 +18726,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           this.reconcileSettleDuty(repo, j.pr, "disposition", card);
           const duty = await this.ensureTaskRecovery(card, prs.find(p => p.number === j.pr)?.mergeable === "CONFLICTING" ? "conflict" : "queue_binding");
           spawned.push({ pr: j.pr, action: "disposition", card, duty });
+          break;
+        }
+        case "bind_origin": {
+          // BR#14364: the dead-runner rescue. The named origin card is
+          // resolved LIVE (advance through the standard gates / bind-only /
+          // tracking fallback) — reconcileBindOrigin owns every guard.
+          const out = await this.reconcileBindOrigin(a.card, repo, j.pr, titleByPr.get(j.pr) ?? null, `https://github.com/${repo}/pull/${j.pr}`, actor, now);
+          // the receipt names the card that now carries the delivery: the
+          // origin for advance/bind, the projection for the tracking fallback
+          spawned.push({ pr: j.pr, action: out.action, card: out.card ?? a.card, ...(out.duty ? { duty: out.duty } : {}) });
           break;
         }
         case "spawn_reverse": {

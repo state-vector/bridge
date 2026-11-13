@@ -3560,6 +3560,21 @@ daemon never writes the board; the hub never touches GitHub. A report per repo p
   only; it never queues, stamps, or merges.
 - **destination-blocked** (BLOCKED/BEHIND) binds WITHOUT a verify duty — a verify would
   bounce on mergeability by construction; the duty comes when a later cycle sees CLEAN.
+- **dead-runner rescue (BR#14364)**: an UNBOUND mergeable PR past the verify grace whose
+  title carries exactly one `BR#N` marker (the branch segment `brN`/`br-N` is the fallback;
+  two distinct ids in one source bind NOTHING) names its origin card — the dispatched
+  runner that opened the PR died before its in_review transition (specimen BR#14125/#3191:
+  the card sat `todo` ~4h with a fully green PR while typed br_done waits froze behind it).
+  The hub binds the PR to that card and ADVANCES it through the machine's own
+  todo → in_progress → in_review walk (`meta.pr` stamped first, the standard verify duty
+  riding the normal in_review flow) — the delivery is observable, so the handoff no longer
+  depends on the delivering session surviving. Cards whose lifecycle must not be touched
+  (in_review/blocked, an open bound ask, a live verify child, a pending review round, a
+  live strand owner, a non-delivery completion contract, standing/lane/machine-duty/
+  verdict-role cards, merge-train stamps, a card bound to a different PR) get bind-only —
+  the PR becomes visible, the card's own lifecycle continues; a named card that cannot
+  legally carry the delivery degrades to the tracking projection; a gate refusal mid-walk
+  stands the binding audited, never retried in-cycle.
 - **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
   repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
   silently respawning over the corpse.

@@ -13,8 +13,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * PR fails the run AND alarms the sink, an ignore-with-reason accounts a PR,
  * and reverse reconcile closes the zombie binding via provenance (two
  * consecutive misses) or spawns a ruling duty (no provenance — never a
- * silent close). The daemon leg feeding these endpoints is pinned in
- * train.rs (packages/desktop).
+ * silent close). BR#14364 adds the dead-runner rescue: an unbound green PR
+ * whose title/branch names its origin card binds + ADVANCES that card
+ * through the standard gates (specimen BR#14125/#3191). The daemon leg
+ * feeding these endpoints is pinned in train.rs (packages/desktop).
  */
 
 let mf: Miniflare;
@@ -466,5 +468,130 @@ describe("BR#5677 binding-before-review-gate + merge_train stamp legs (real bund
     const r2 = await report(repo2, [prRow(2443, { reviewDecision: null })]);
     expect(r2.body.accounting.bound).toBe(0);
     expect(r2.body.accounting.unreviewed).toBe(1);
+  });
+});
+
+// ---------- BR#14364: bind_origin — the dead-runner rescue ----------
+// The specimen (BR#14125/#3191, 2026-11-13): a dispatched runner opened its
+// green PR and died BEFORE the in_review transition. The card sat `todo`,
+// unbound, for ~4h — the watchdog owes no heartbeat on a todo card and the
+// unreviewed grace swallowed the PR for a full disposition day while typed
+// br_done waits froze downstream. Tier 1 pins the join law (marker
+// extraction + the fence order); this file proves the APPLICATION: the DO
+// binds the named origin card and ADVANCES the stranded delivery through the
+// machine's own two-step walk (never a bypass), degrades to bind-only for
+// cards whose lifecycle must not be touched (blocked / non-delivery
+// contract), and falls back to the standard tracking projection when the
+// named origin cannot legally carry the delivery.
+
+describe("BR#14364 bind_origin DO drills (real bundled worker)", () => {
+  const markerPr = (number: number, cardId: string, over: Record<string, unknown> = {}) =>
+    prRow(number, {
+      reviewDecision: null, // the BR#5677 repo-wide phenomenon — unreviewed
+      title: `feat: dead-runner specimen (BR#${String(cardId).replace(/\D/g, "")})`,
+      ...over,
+    });
+
+  it("the specimen: a todo card whose runner died after opening its green PR is bound + advanced to in_review with the standard verify duty; the next cycle accounts it in-flight", async () => {
+    const repo = "state-vector/reconcile-drill-14364-advance";
+    const card = String((await kbJson("/create", {
+      type: "task", title: "IMPL: 14364 dead-runner advance drill", qualified: true, session: "",
+    })).body.id);
+    const number = 3201;
+    const r1 = await report(repo, [markerPr(number, card)]);
+    expect(r1.status).toBe(200);
+    expect(r1.body.ok, JSON.stringify(r1.body)).toBe(true);
+    expect(r1.body.accounting.spawned).toBe(1);
+    expect(r1.body.spawned).toHaveLength(1);
+    expect(r1.body.spawned[0]).toMatchObject({ pr: number, action: "advance", card });
+    const dutyId: string = r1.body.spawned[0].duty;
+    expect(dutyId).toBeTruthy();
+
+    // the card: advanced through the machine's own gates, the PR bound FIRST
+    // (the in_review verify effect resolves the PR link from the note)
+    const advanced = (await kbJson("/get", { id: card })).body;
+    expect(advanced.status).toBe("in_review");
+    expect(advanced.meta?.pr).toEqual({ repo, number });
+
+    // the duty: the SHARED 5c template — never a marked machine duty
+    const duty = (await kbJson("/get", { id: dutyId })).body;
+    expect(duty.title).toContain("Verify:");
+    expect(duty.roles).toContain("review");
+    expect(String(duty.body_md)).toContain("VERIFY GATE");
+    expect(String(duty.body_md)).toContain(`pull/${number}`);
+    expect(String(duty.body_md)).toContain(card);
+    expect(duty.meta?.machine_duty).toBeUndefined();
+
+    // second cycle: the PR is bound, its verify duty open — in-flight
+    const r2 = await report(repo, [markerPr(number, card)]);
+    expect(r2.body.ok).toBe(true);
+    expect(r2.body.accounting.inflight).toBe(1);
+    expect(r2.body.accounting.spawned).toBe(0);
+    expect(r2.body.spawned).toHaveLength(0);
+  });
+
+  it("a marker naming a nonexistent card degrades to the tracking projection — reconcile never mints the origin", async () => {
+    const repo = "state-vector/reconcile-drill-14364-tracking";
+    const number = 3202;
+    const r = await report(repo, [prRow(number, { reviewDecision: null, title: "feat: t9 (BR#9999999)" })]);
+    expect(r.status).toBe(200);
+    expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
+    expect(r.body.spawned[0].action).toBe("tracking");
+    const trackingId: string = r.body.spawned[0].card;
+    expect(trackingId).not.toBe("BR#9999999");
+    expect(r.body.spawned[0].duty).toBeTruthy();
+    const tracking = (await kbJson("/get", { id: trackingId })).body;
+    expect(tracking.meta?.pr).toEqual({ repo, number });
+    // the named origin does not exist and reconcile did not fabricate it
+    const origin = await kbJson("/get", { id: "BR#9999999" });
+    expect(origin.status).toBeGreaterThanOrEqual(400);
+  });
+
+  it("a blocked origin card binds bind-only — its own lifecycle (the typed wait) continues untouched", async () => {
+    const repo = "state-vector/reconcile-drill-14364-blocked";
+    const card = String((await kbJson("/create", {
+      type: "task", title: "IMPL: 14364 blocked origin drill", qualified: true, session: "",
+    })).body.id);
+    const number = 3203;
+    expect((await kbJson("/transition", { id: card, to: "in_progress", actor: "drain" })).status).toBe(200);
+    expect((await kbJson("/transition", {
+      id: card, to: "blocked", actor: "drain",
+      note: "Waiting for the prerequisite PR to merge",
+      await_event: { event: "pr_merged", repo, n: 99999 },
+    })).status).toBe(200);
+
+    const r1 = await report(repo, [markerPr(number, card)]);
+    expect(r1.status).toBe(200);
+    expect(r1.body.ok, JSON.stringify(r1.body)).toBe(true);
+    expect(r1.body.spawned[0]).toMatchObject({ pr: number, action: "bind", card });
+    expect(r1.body.spawned[0].duty).toBeUndefined(); // bind-only: no verify child
+    const bound = (await kbJson("/get", { id: card })).body;
+    expect(bound.status).toBe("blocked");
+    expect(bound.meta?.pr).toEqual({ repo, number });
+
+    // second cycle: the PR is bound — accounted, not re-judged
+    const r2 = await report(repo, [markerPr(number, card)]);
+    expect(r2.body.ok).toBe(true);
+    expect(r2.body.accounting.bound).toBe(1);
+    expect(r2.body.accounting.spawned).toBe(0);
+    expect((await dutiesOf(repo)).length).toBe(0);
+  });
+
+  it("an execution-contract origin refuses the advance (reconcile never authors an execution_result) — bind-only", async () => {
+    const repo = "state-vector/reconcile-drill-14364-exec";
+    const card = String((await kbJson("/create", {
+      type: "task", title: "IMPL: 14364 execution-contract drill", qualified: true, session: "",
+      meta: { completion: { kind: "execution", outcome: "Execute the work after its prerequisites are satisfied." } },
+    })).body.id);
+    const number = 3204;
+    const r1 = await report(repo, [markerPr(number, card)]);
+    expect(r1.status).toBe(200);
+    expect(r1.body.ok, JSON.stringify(r1.body)).toBe(true);
+    expect(r1.body.spawned[0]).toMatchObject({ pr: number, action: "bind", card });
+    expect(r1.body.spawned[0].duty).toBeUndefined();
+    const after = (await kbJson("/get", { id: card })).body;
+    expect(after.status).toBe("todo"); // never advanced
+    expect(after.meta?.pr).toEqual({ repo, number }); // the binding stands
+    expect((await dutiesOf(repo)).length).toBe(0);
   });
 });
