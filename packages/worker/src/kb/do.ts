@@ -240,7 +240,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
+import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
@@ -354,6 +354,33 @@ export function headMatches(observed: string, expected: string): boolean {
 }
 
 
+/** BR#14366 (ADR BR#14118): the parent's meta.acceptance, safe-parsed for duty
+ * rendering — absent/malformed acceptance renders the generic template
+ * (fail-open to today's behavior; acceptance VALIDATION is fail-closed on the
+ * write path, this read path never blocks a spawn). Returns the FULL parsed
+ * acceptance (criteria + authored_by + basis) so the spawn snapshot carries
+ * provenance and re-parses as AcceptanceCriteriaSchema at claim time. */
+function parentAcceptanceCriteria(meta: unknown): AcceptanceCriteria | null {
+  const acceptance = (meta as { acceptance?: unknown } | null | undefined)?.acceptance;
+  const parsed = AcceptanceCriteriaSchema.safeParse(acceptance);
+  return parsed.success ? parsed.data : null;
+}
+
+/** BR#14366: the criteria section spliced into a verify/outcome-review duty —
+ * each criterion becomes a checkable line the verifier MUST disposition in
+ * review_result.criteria. Empty string when the parent carries no criteria, so
+ * the generic templates stay byte-identical (the golden tests hold). */
+function renderCriteriaBlock(parentId: string, criteria: AcceptanceCriterion[]): string {
+  if (!criteria.length) return "";
+  const lines = criteria.map((c) => {
+    const check = c.check ? ` — machine probe: ${c.check.event === "run_success" ? `run_success ${c.check.repo}${c.check.run_id ? `/${c.check.run_id}` : ` newer than ${c.check.newer_than ?? "<latest>"}`}${c.check.head ? ` at head ${c.check.head}` : ""}` : `${c.check.event} ${c.check.repo}#${c.check.n}`}` : "";
+    return `- ${c.id} [${c.kind}] ${c.statement}${check}`;
+  });
+  return `\n\nACCEPTANCE CRITERIA (BR#14118) — ${parentId} carries meta.acceptance; disposition EVERY criterion below:
+${lines.join("\n")}
+Record per-criterion verdicts on your review_result: criteria:[{id,verdict:"met"|"unmet"|"na",receipt}] — receipt doubles as the na justification. Acceptance requires EVERY criterion met or na; an unmet, undispositioned or extra criterion gate-rejects acceptance naming the id(s). Findings (bounce) must NAME the unmet criterion id(s). These criteria were frozen at this duty's spawn — criteria added to the parent afterwards never bind this round.`;
+}
+
 /** The standard verify-duty body — the ONE 5c-gated template. The normal
  *  in_review spawn (verdict effects) and the reconcile spawn (BR#4170) both
  *  render through here, so the two spawn sites can never drift apart.
@@ -363,12 +390,16 @@ export function headMatches(observed: string, expected: string): boolean {
  *  only as a conjunction ("mergeCommit non-null AND main green"); duties
  *  imitated the prose, the text parsed to 2 atoms, the multi-atom gate
  *  refused, and (pre-#288) the refusal rode as a retryable 503 — three
- *  blind retries, three transition_rejected events, a breach card. */
-export function verifyDutyBody(parentId: string, rootTitle: string, prLink: string, leg?: { repo: string; n: number }, rootFix?: { repo: string; pr: number }): string {
+ *  blind retries, three transition_rejected events, a breach card.
+ *  BR#14366: `criteria` (the parent's spawn-frozen meta.acceptance) splices
+ *  a per-criterion disposition section between the substance check and the
+ *  ACCEPT steps; absent criteria leave the template byte-identical. */
+export function verifyDutyBody(parentId: string, rootTitle: string, prLink: string, leg?: { repo: string; n: number }, rootFix?: { repo: string; pr: number }, criteria?: AcceptanceCriterion[]): string {
   const direct = !leg ? parseDirectCommitReceipt(prLink) : null;
+  const criteriaBlock = renderCriteriaBlock(parentId, criteria ?? []);
   if (direct?.repo) return `Independent review of ${parentId} — "${rootTitle}".
 
-Commit receipt: ${prLink}. A commit URL does not prove main ancestry. Check it in a fresh session; do not ask the human to arrange a reviewer.
+Commit receipt: ${prLink}. A commit URL does not prove main ancestry. Check it in a fresh session; do not ask the human to arrange a reviewer.${criteriaBlock}
 
 1. Establish the actual delivery phase from the parent and GitHub. For a published prelanding candidate, check the signature and substance and record a prelanding recommendation; do not assert it is on main or return accepted_direct_main. After landing, confirm this commit is an ancestor of current main, its GitHub signature is valid, and CI succeeded for this commit.
 2. Check that the delivered behaviour meets the parent task, including current deployed behaviour where applicable. Cite the evidence and tests you actually checked.
@@ -392,7 +423,7 @@ VERIFY GATE — mergeability is a precondition, NOT a finding:
 2. Conflicts, unsigned commits or failing mechanical gates: stop substance checks and bounce ${parentId} to in_progress with the exact repair. Do not ask the human to waive a mechanical defect.
 3. A broken signing environment warrants ONE environment-level ask.
 
-Then check the actual task and receipts (PR: ${prLink}), not process output or a prerequisite merge.${fastLane}
+Then check the actual task and receipts (PR: ${prLink}), not process output or a prerequisite merge.${fastLane}${criteriaBlock}
 
 ACCEPT only after substance AND mergeability hold:
 1. Read the live full-40-hex head for EVERY accepted PR.
@@ -402,8 +433,13 @@ ACCEPT only after substance AND mergeability hold:
 Problems or cannot proceed: bounce the parent with concrete findings, then close THIS duty done with review_result {kind:"findings",summary:"<specific missing evidence or defect>"}. Findings are not acceptance. A stronger-implementation verdict must name this exact parent. A repaired or changed head needs fresh head-specific verification.`;
 }
 
-function executionDutyBody(id: string, title: string): string {
-  return `Independent outcome review for ${id}: ${title}.\n\nVerify the actual execution_result and every action receipt on the parent, not whether a prerequisite PR merged. Acceptance requires that the stated outcome was executed. Read this duty's captured review_subject from its claim response or metadata, then re-read that exact parent submission. Close this duty done with review_result {kind:"accepted_execution",task_id:"${id}",subject_revision:"<captured review_subject.revision>",receipts:["<verified outcome evidence>"]}. Changed work needs a fresh review round; do not copy a newer parent revision onto an old verdict. Missing actions or unverifiable receipts are findings: bounce the parent and close with review_result {kind:"findings",summary:"<specific missing outcome>"}. A prerequisite arriving is not acceptance.`;
+/** BR#14366: `criteria` splices the per-criterion disposition section into the
+ *  outcome-review duty; absent criteria leave the template byte-identical. */
+function executionDutyBody(id: string, title: string, criteria?: AcceptanceCriterion[]): string {
+  const criteriaBlock = renderCriteriaBlock(id, criteria ?? []);
+  return `Independent outcome review for ${id}: ${title}.${criteriaBlock}
+
+Verify the actual execution_result and every action receipt on the parent, not whether a prerequisite PR merged. Acceptance requires that the stated outcome was executed. Read this duty's captured review_subject from its claim response or metadata, then re-read that exact parent submission. Close this duty done with review_result {kind:"accepted_execution",task_id:"${id}",subject_revision:"<captured review_subject.revision>",receipts:["<verified outcome evidence>"]}. Changed work needs a fresh review round; do not copy a newer parent revision onto an old verdict. Missing actions or unverifiable receipts are findings: bounce the parent and close with review_result {kind:"findings",summary:"<specific missing outcome>"}. A prerequisite arriving is not acceptance.`;
 }
 
 /** Body for a reconcile-spawned binding card (BR#4170): the card's whole job
@@ -4411,6 +4447,9 @@ export class KnowledgeHub {
     // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
     if (["review_result", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
+    // BR#14366 (ADR BR#14118): acceptance criteria are validated on write —
+    // unknown kinds, duplicate ids and empty statements are malformed bars.
+    if (createMeta.acceptance !== undefined) createMeta.acceptance = AcceptanceCriteriaSchema.parse(createMeta.acceptance);
     if (createMeta.delivery_disposition !== undefined) throw new Error("gate: delivery disposition cannot be forged through create metadata");
     if (createMeta.batch_auth !== undefined) throw new Error("gate: disposition authority cannot be forged through create metadata");
     if (createMeta.disposition_request !== undefined) createMeta.disposition_request = DispositionRequestSchema.parse(createMeta.disposition_request);
@@ -4950,6 +4989,26 @@ export class KnowledgeHub {
       if (metaDel.includes("completion") && preMeta.completion !== undefined) throw new Error("gate: a completion contract cannot be deleted; preserve the task's outcome obligation");
       if (completionContract(preMeta).kind === "execution" && body.meta?.completion !== undefined
           && CompletionContractSchema.parse(body.meta.completion).kind !== "execution") throw new Error("gate: an execution outcome cannot be weakened to incidental code delivery");
+    }
+    // BR#14366 (ADR BR#14118): meta.acceptance is validated on every write —
+    // unknown kinds, duplicate ids and empty statements are malformed bars,
+    // not prose. Steering-law fence: the impl-role session measured by the
+    // criteria may attach per-criterion evidence but can never add, drop or
+    // relax them — a wrong criterion is flagged via an ask, not an edit.
+    // analysis/human authoring and the web plane (exempt actors) keep full
+    // authority over the bar.
+    if (row.type === "task" && (Object.hasOwn(body.meta ?? {}, "acceptance") || metaDel.includes("acceptance"))) {
+      const acceptanceSet = body.meta && Object.hasOwn(body.meta, "acceptance");
+      const next = acceptanceSet ? AcceptanceCriteriaSchema.safeParse(body.meta.acceptance) : null;
+      if (next && !next.success)
+        throw new Error(`gate: malformed meta.acceptance — ${next.error.issues.map(i => `${i.path.join(".") || "acceptance"}: ${i.message}`).join("; ")}`);
+      const prev = AcceptanceCriteriaSchema.safeParse(preMeta.acceptance);
+      if (prev.success && effectiveRole(parseTags(row.roles)) === "impl" && !OWNER_RELEASE_EXEMPT.test(actor)) {
+        const identity = (a: { criteria: { id: string; statement: string; kind: string; check?: unknown }[] }) =>
+          JSON.stringify(a.criteria.map(c => [c.id, c.statement, c.kind, c.check ?? null]));
+        if (metaDel.includes("acceptance") || !next || identity(prev.data) !== identity(next.data))
+          throw new Error("gate: acceptance criteria are authored by analysis/human — an impl-role session may attach evidence per criterion but cannot add, drop or relax them; flag a wrong criterion via an ask instead");
+      }
     }
     if (["delivery_disposition", "closure_authority", "batch_auth"].some(k => metaDel.includes(k) || (body.meta && Object.hasOwn(body.meta, k)))) throw new Error("gate: delivery dispositions and closure authority are owned by the authenticated disposition lifecycle");
     if (metaDel.includes("startup_wait") || (body.meta && Object.hasOwn(body.meta, "startup_wait"))) throw new Error("gate: startup waits are owned by executor readiness reconciliation");
@@ -7260,7 +7319,19 @@ export class KnowledgeHub {
       if (subjects.size === 1) {
         const subjectId = [...subjects][0];
         const subjectRow = this.one(`SELECT meta FROM artefacts WHERE id=? AND type='task'`, subjectId);
-        if (subjectRow) meta.review_subject = ReviewSubjectSchema.parse({ task_id: subjectId, revision: JSON.parse(subjectRow.meta ?? "{}").work_revision ?? "legacy" });
+        if (subjectRow) {
+          // BR#14366: acceptance criteria bind from the SPAWN snapshot only
+          // (acceptance_snapshot, frozen when the duty was created) — the
+          // parent is read here for its work_revision, never re-read for
+          // acceptance, so a criterion added to the parent after spawn never
+          // appears in, and never binds, this review round.
+          const snapshot = AcceptanceCriteriaSchema.safeParse(meta.acceptance_snapshot);
+          meta.review_subject = ReviewSubjectSchema.parse({
+            task_id: subjectId,
+            revision: JSON.parse(subjectRow.meta ?? "{}").work_revision ?? "legacy",
+            ...(snapshot.success ? { criteria: snapshot.data.criteria } : {}),
+          });
+        }
       }
     }
     const explicitDutyOutcome = dutyOutcome(effectiveRole(tRoles), body);
@@ -7284,6 +7355,28 @@ export class KnowledgeHub {
           || captured.data.revision !== (targetMeta.work_revision ?? "legacy")) throw new Error("gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round");
         if (!mergeCompletesTask(targetMeta) && reviewResult.kind !== "accepted_execution") throw new Error("gate: execution outcomes require accepted_execution; prerequisite or code delivery is not outcome acceptance");
         if (reviewResult.kind === "accepted_execution" && (mergeCompletesTask(targetMeta) || !ExecutionResultSchema.safeParse(targetMeta.execution_result).success)) throw new Error("gate: execution acceptance requires an execution contract and the subject's submitted execution_result");
+        // BR#14366 (ADR BR#14118): per-criterion disposition gate. The bar is
+        // this duty's spawn-frozen review_subject.criteria — every criterion
+        // must be dispositioned met or na (na's receipt IS the one-line
+        // justification; the schema enforces a non-empty receipt). Rejection
+        // NAMES the ids, so a bounce is actionable instead of generic
+        // re-review prose. Criteria added to the parent after spawn are not
+        // in the snapshot and therefore never gate this round.
+        {
+          const bound = captured.data.criteria ?? [];
+          if (bound.length) {
+            const verdicts = new Map((reviewResult.criteria ?? []).map(v => [String(v.id), v] as const));
+            const problems: string[] = [];
+            for (const c of bound) {
+              const v = verdicts.get(c.id);
+              if (!v) problems.push(`${c.id}: no verdict`);
+              else if (v.verdict === "unmet") problems.push(`${c.id}: unmet`);
+              else verdicts.delete(c.id);
+            }
+            for (const extra of verdicts.keys()) problems.push(`${extra}: not a bound criterion`);
+            if (problems.length) throw new Error(`gate: acceptance requires every criterion met or na — ${problems.join("; ")}`);
+          }
+        }
       }
       meta.review_result = reviewResult;
       if (reviewResult.kind === "stronger_implementation_required") {
@@ -7918,11 +8011,17 @@ export class KnowledgeHub {
           const parentIsRootFix =
             isRootFixCard({ tags: parseTags(row.tags), meta }) &&
             typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
+          // BR#14366: the parent's acceptance criteria ride the duty — rendered
+          // into the body AND spawn-frozen via acceptance_snapshot (the claim
+          // folds the snapshot into review_subject; later parent edits never
+          // retroactively bind this round).
+          const acc = parentAcceptanceCriteria(meta);
+          const acceptance = acc?.criteria ?? [];
           const created = await this.create(
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: !mergeCompletesTask(meta) ? executionDutyBody(id, rootTitle) : verifyDutyBody(
+              body_md: !mergeCompletesTask(meta) ? executionDutyBody(id, rootTitle, acceptance) : verifyDutyBody(
                 id,
                 rootTitle,
                 prLink,
@@ -7930,9 +8029,10 @@ export class KnowledgeHub {
                   ? { repo: stamp.repo, n: Number(stamp.number) }
                   : undefined,
                 parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
+                acceptance,
               ),
               roles: ["review"],
-              meta: recoveryReviewMeta(id, meta, parseTags(row.tags)),
+              meta: { ...recoveryReviewMeta(id, meta, parseTags(row.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) },
               project: row.project,
             },
             actor,
@@ -9498,7 +9598,11 @@ export class KnowledgeHub {
       return { kind: "independent_review", task_id: taskId, id: current.id, status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
     const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
     const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
-    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link) : executionDutyBody(taskId, parent.title), roles: ["review"], project: parent.project, meta: recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), session: "" }, actor);
+    // BR#14366: criteria render into the duty and spawn-freeze into the snapshot
+    // (claim folds it into review_subject) — same fencing as the in_review spawn.
+    const acc = parentAcceptanceCriteria(meta);
+    const acceptance = acc?.criteria ?? [];
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link, undefined, undefined, acceptance) : executionDutyBody(taskId, parent.title, acceptance), roles: ["review"], project: parent.project, meta: { ...recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) }, session: "" }, actor);
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
@@ -18332,17 +18436,21 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       isRootFixCard({ tags: parseTags(parent.tags), meta: pm }) &&
       typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
     const prLink = `https://github.com/${repo}/pull/${pr}`;
+    // BR#14366: criteria ride the reconcile-spawned duty too — same render +
+    // spawn-freeze as the in_review path so no spawn site can drift.
+    const acc = parentAcceptanceCriteria(pm);
+    const acceptance = acc?.criteria ?? [];
     const created = await this.create(
       {
         type: "task",
         title: `Verify: ${rootTitle.slice(0, 200)}`,
         session: "", // machine spawn: a FRESH session must verify (separation of duties)
-        body_md: verifyDutyBody(parentId, rootTitle, prLink, { repo, n: pr }, parentIsRootFix ? { repo, pr } : undefined),
+        body_md: verifyDutyBody(parentId, rootTitle, prLink, { repo, n: pr }, parentIsRootFix ? { repo, pr } : undefined, acceptance),
         // BR#5370: machine-duty marker — the done-open-children gate ignores
         // it (a duty ABOUT the card must never fence the card's close; the
         // in_review flow's own verify spawn stays UNMARKED — that one IS the
         // review acceptance).
-        meta: { machine_duty: { by: "reconcile", kind: "verify", subject: parentId, pr: `${repo}#${pr}` } },
+        meta: { machine_duty: { by: "reconcile", kind: "verify", subject: parentId, pr: `${repo}#${pr}` }, ...(acc ? { acceptance_snapshot: acc } : {}) },
         roles: ["review"],
         project: parent.project,
       },

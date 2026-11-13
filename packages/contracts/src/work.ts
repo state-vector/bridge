@@ -26,10 +26,48 @@ export const ExecutionResultSchema = z.object({
   receipts: z.array(z.string().min(1)).min(1),
 });
 
+/** BR#14366 (ADR BR#14118): one acceptance criterion — the structured "done
+ * means" an analysis/human author states on a task. `kind:"machine"` reuses
+ * the existing typed-await/probe grammar (pr_merged / pr_checks_green /
+ * run_success) — zero new checker infrastructure. `evidence` is the ONLY
+ * field an impl-role session may change (attach first-hand proof); the
+ * identity fields (id/statement/kind/check) are authored at qualification
+ * time and frozen for the measured session. */
+export const AcceptanceCriterionSchema = z.object({
+  id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/, "criterion id must be a short identifier (e.g. c1)"),
+  statement: z.string().min(1, "a criterion without a statement verifies nothing")
+    .refine((s) => s.trim().length > 0, "a whitespace-only statement verifies nothing"),
+  kind: z.enum(["machine", "receipt", "human"]),
+  check: z.discriminatedUnion("event", [
+    z.object({ event: z.literal("pr_merged"), repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), n: z.number().int().positive() }),
+    z.object({ event: z.literal("pr_checks_green"), repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), n: z.number().int().positive() }),
+    z.object({ event: z.literal("run_success"), repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+      run_id: z.string().min(1).optional(), newer_than: z.string().min(1).optional(), head: z.string().min(1).optional() }),
+  ]).optional(),
+  evidence: z.array(z.string().min(1)).optional(),
+}).strict();
+export type AcceptanceCriterion = z.infer<typeof AcceptanceCriterionSchema>;
+
+/** meta.acceptance on a task: the ordered bar verify dispositions. */
+export const AcceptanceCriteriaSchema = z.object({
+  criteria: z.array(AcceptanceCriterionSchema).min(1,
+    "meta.acceptance without criteria is noise — either state criteria or omit the key")
+    .refine((list) => new Set(list.map((c) => c.id)).size === list.length,
+      { message: "duplicate criterion ids — each criterion needs a distinct dispositionable id" }),
+  authored_by: z.string().min(1),
+  basis: z.string().min(1, "trace criteria to their analysis/human ruling (e.g. BR#<analysis artefact>)"),
+}).strict();
+export type AcceptanceCriteria = z.infer<typeof AcceptanceCriteriaSchema>;
+
 /** Server-captured subject, echoed by the independent reviewer. Definition
- * edits and every new submission change the revision; mailbox/progress do not. */
+ * edits and every new submission change the revision; mailbox/progress do not.
+ * BR#14366 (ADR BR#14118): `criteria` carries the parent's meta.acceptance
+ * criteria SNAPSHOT frozen at duty spawn — the bar this exact review round is
+ * measured against. Criteria added to the parent after spawn never appear
+ * here, so they never retroactively bind an already-spawned round. */
 export const ReviewSubjectSchema = z.object({
   task_id: z.string().regex(/^BR#\d+$/), revision: z.string().min(1),
+  criteria: z.array(AcceptanceCriterionSchema).optional(),
 });
 export type ReviewSubject = z.infer<typeof ReviewSubjectSchema>;
 export type CurrentTaskReview =

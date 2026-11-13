@@ -253,6 +253,47 @@ that same current round rather than duplicating detached or capability-held work
 Existing human force-review approval is captured against its exact revision and
 PR heads; it still cannot merge or skip decisive delivery checks.
 
+### Acceptance criteria as data (BR#14118 / BR#14366)
+
+A task may carry `meta.acceptance` — the structured bar verify disposes instead
+of re-deriving "matches the task" from prose:
+
+    meta.acceptance = {
+      criteria: [
+        { id: "c1", statement: "...", kind: "machine", check: { event: "pr_merged", repo: "o/r", n: 42 } },
+        { id: "c2", statement: "...", kind: "receipt" },
+        { id: "c3", statement: "...", kind: "human" }
+      ],
+      authored_by: "analysis-session | human | dispatcher",
+      basis: "BR#<analysis artefact>"
+    }
+
+`kind:"machine"` reuses the existing typed probe grammar (`pr_merged`,
+`pr_checks_green`, `run_success`) — no new checker infrastructure. Criteria are
+authored at qualification/analysis time and **validated on write**: unknown
+kinds, duplicate ids and empty statements are rejected. The steering-law fence
+holds on the mutation path: an impl-role session may attach `evidence` per
+criterion but can never add, drop or relax criteria — a wrong criterion is
+flagged via an ask, not an edit. Web/human/system actors keep authoring
+authority.
+
+When the parent carries criteria, its verify duty (and outcome-review duty)
+renders each criterion as a checkable line. The verifier records per-criterion
+verdicts on the review result — `review_result.criteria:
+[{id, verdict:"met"|"unmet"|"na", receipt}]` — where the receipt doubles as the
+na justification. Acceptance requires EVERY criterion met or na; an unmet,
+undispositioned or extra criterion gate-rejects acceptance naming the id(s), so
+a bounce ("c2 unmet: checks red") is actionable instead of generic re-review
+prose. A `findings` bounce may also carry the structured `criteria[]`.
+
+Criteria are **frozen at duty spawn**: the spawn snapshots them (alongside the
+subject revision captured at claim) into the duty's
+`review_subject.criteria`, and only that snapshot binds the round. A criterion
+added to the parent after spawn never appears in — and never bounces — an
+already-spawned round. The card view renders the criteria list (collapsed) with
+per-criterion verdicts once a review result carries them. Criteria-less parents
+render the exact generic duty template — adoption is incremental, no migration.
+
 A merge observation or provenance row resumes independent delivery verification;
 it does not itself prove CI or mark a leg landed. A live canonical lane already
 settling that task retains its exit. Reconcile reports `reverse_verifying` and

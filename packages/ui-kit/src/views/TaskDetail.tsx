@@ -210,6 +210,10 @@ interface TaskMeta {
   last_progress?: { note?: string; sentiment?: string; actor?: string; ts?: number; completion_pct?: number; confidence_pct?: number; risk_pct?: number; context_pct?: number };
   attempt?: { by?: string; attempts?: number; last_reason?: string };
   qualification?: { state?: string; how?: string; by?: string; bars?: string[] };
+  /** BR#14366 (ADR BR#14118): structured acceptance criteria authored by analysis/human. */
+  acceptance?: { criteria: { id: string; statement: string; kind: "machine" | "receipt" | "human" }[]; authored_by: string; basis: string };
+  /** Per-criterion verdicts once a verify round carries them (BR#14366). */
+  review_result?: { kind?: string; criteria?: { id: string; verdict: "met" | "unmet" | "na"; receipt: string }[] };
   subprocess?: { reason?: string; budget_minutes?: number; deadline_ts?: number };
   awaiting_ask?: { ask_id?: string };
   kind?: string;
@@ -469,6 +473,37 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       {m.qualification?.state && (
         <div className="progress-note"><b>qualification:</b> {m.qualification.state}{m.qualification.how ? ` (${m.qualification.how})` : ""}{(m.qualification.bars ?? []).length ? ` · bars: ${(m.qualification.bars ?? []).join(", ")}` : ""}</div>
       )}
+      {/* BR#14366 (ADR BR#14118): the task's acceptance criteria — authored by
+          analysis/human, dispositioned per-criterion by the verify duty.
+          Collapsed by default; a review verdict carrying criteria shows each
+          verdict (met/unmet/na + receipt) inline. */}
+      {(m.acceptance?.criteria ?? []).length > 0 && (() => {
+        const criteria = m.acceptance!.criteria;
+        const verdicts = m.review_result?.criteria ?? [];
+        const byId = new Map(verdicts.map((v) => [v.id, v]));
+        return (
+          <details className="progress-note" style={{ marginTop: 4 }}>
+            <summary style={{ cursor: "pointer" }}>
+              <b>acceptance criteria ({criteria.length})</b>
+              {verdicts.length > 0 && (
+                <> · {verdicts.filter((v) => v.verdict === "met").length} met · {verdicts.filter((v) => v.verdict === "unmet").length} unmet · {verdicts.filter((v) => v.verdict === "na").length} na</>
+              )}
+            </summary>
+            <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+              {criteria.map((c) => {
+                const v = byId.get(c.id);
+                return (
+                  <li key={c.id} style={{ marginBottom: 2 }}>
+                    <span className="gw-mono">{c.id}</span> [{c.kind}] {c.statement}
+                    {v && <> — <b>{v.verdict === "met" ? "✓ met" : v.verdict === "unmet" ? "✗ unmet" : "– na"}</b>{v.receipt ? <>: {v.receipt}</> : null}</>}
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="muted-note">authored by {m.acceptance!.authored_by || "?"} · basis {m.acceptance!.basis || "?"} — each verify round dispositions the criteria frozen at its spawn (BR#14118)</div>
+          </details>
+        );
+      })()}
       <dl className="audit task-facts">
         {facts.filter(([, v]) => v !== undefined).map(([k, v]) => (
           <span key={k} className="fact-row"><dt>{k}</dt><dd>{v}</dd></span>

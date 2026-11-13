@@ -1,21 +1,37 @@
 import { z } from "zod";
 
+/** BR#14366 (ADR BR#14118): one dispositioned criterion on a review verdict.
+ * `receipt` doubles as the na justification — a criterion ruled not-applicable
+ * still owes the one-line why. An unmet verdict never accepts; the gate names
+ * the id so a bounce is actionable. */
+export const CriterionVerdictSchema = z.object({
+  id: z.string().min(1),
+  verdict: z.enum(["met", "unmet", "na"]),
+  receipt: z.string().min(1, "every verdict carries a receipt — for na it IS the one-line justification"),
+});
+export type CriterionVerdict = z.infer<typeof CriterionVerdictSchema>;
+
 /** A review completion is not necessarily an acceptance. Typed receipts keep
  * a findings/cannot-proceed close from being mistaken for delivered work. */
 export const ReviewResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("accepted_pr"), task_id: z.string().regex(/^BR#\d+$/),
     subject_revision: z.string().min(1).optional().describe("Echo this duty's meta.review_subject.revision; acceptance is fenced to that exact task submission."),
+    criteria: z.array(CriterionVerdictSchema).optional().describe("Per-criterion disposition of the duty's spawn-frozen review_subject.criteria (BR#14366)."),
     legs: z.array(z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), number: z.number().int().positive(),
       head_sha_at_acceptance: z.string().regex(/^[0-9a-f]{40}$/) })).min(1) }),
-  z.object({ kind: z.literal("accepted_execution"), task_id: z.string().regex(/^BR#\d+$/), subject_revision: z.string().min(1).optional(), receipts: z.array(z.string().min(1)).min(1) }),
+  z.object({ kind: z.literal("accepted_execution"), task_id: z.string().regex(/^BR#\d+$/), subject_revision: z.string().min(1).optional(),
+    criteria: z.array(CriterionVerdictSchema).optional(),
+    receipts: z.array(z.string().min(1)).min(1) }),
   z.object({
     kind: z.literal("accepted_direct_main"),
     subject_revision: z.string().min(1).optional(),
+    criteria: z.array(CriterionVerdictSchema).optional(),
     repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
     commit: z.string().regex(/^[0-9a-f]{40}$/),
     ci_run_url: z.string().regex(/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/actions\/runs\/\d+$/),
   }),
-  z.object({ kind: z.literal("findings"), summary: z.string().min(1) }),
+  z.object({ kind: z.literal("findings"), summary: z.string().min(1),
+    criteria: z.array(CriterionVerdictSchema).optional().describe("Bounces NAME the unmet criterion id(s) — structured findings are actionable (BR#14366).") }),
   z.object({ kind: z.literal("stronger_implementation_required"), summary: z.string().min(1),
     task_id: z.string().regex(/^BR#\d+$/) }),
 ]);
