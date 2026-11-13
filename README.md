@@ -2052,28 +2052,33 @@ every tick. Two laws now hold:
 
 - **Scoped base classification + empty-is-loud (the gate, BR#5265 + BR#5674 P1)**: the base verdict classifies ONLY the
   lane's `required_workflows` when the lane configures them (`classifyBaseCheckRuns`,
-  `train_gate.rs` — newest non-cancelled run per name, red beats unsettled beats
+  `train_gate.rs` — newest non-cancelled run per name, red beats settling beats unsettled beats
   green; an un-configured lane keeps the legacy whole-tip read). A nightly, battery
   or canary red stops its own pipeline and its own cards — never the train. When
   `required_workflows` are configured and the scoped filter yields zero matches on a
   tip that HAS runs, `base_state` carries `alarm: "<N> runs read, none matched required set — check names/pagination"`;
   a tip with zero total runs carries the sibling `alarm: "tip carries no check runs at all"`,
   and the hub's `empty` blocked reason renders the alarm verbatim instead of a silent `config?`.
-- **No green until settled (BR#14088, required-name completeness)**: a required
-  workflow whose check-run does not exist yet on the tip is invisible to a scoped
-  rollup — the post-admission smoke window: `Cortex Quality Smoke` starts only after
-  the deploy job finishes (~40-50 min after admission), so on 2026-11-12 every
-  "0 failing checks" read called main `edfb114682` green for that whole window while
-  the smoke verdict was actually unknown (it settled red at 21:06Z). A missing
-  required name now classifies **unsettled** — `"<name> (awaiting first run)"` — and
-  the line renders **settling** (amber, never green) until every required check at
-  the observed tip completed success. Base-health gate names (`main-green gate`,
-  `Deploy health …`) are exempt: they are vacuous by design on merge-commit tips
-  (BR#5847) and stay judged by the whole-tip BR#5883 gate qualifier. One shared
-  line-health vocabulary renders everywhere — `LineHealth` (green / settling / red /
-  unknown, `lineHealthFromBaseState` in `@bridge/contracts`) — stamped as `health` on
-  every `TrainLineProjection` arm and consumed by the lane banner, the train stop
-  logic and the TrainPanel chip (settling shows the amber `settling` badge).
+- **No green until settled (BR#14088, required-name completeness)**: a required check that is
+  queued/in_progress (GitHub files a check run's `conclusion` only at completion, so an in-flight
+  run reads `conclusion: null`) has NO verdict yet — the rollup reads `settling`, rendered amber,
+  never green; and a required name with no check run at all yet (the post-admission deploy smoke
+  starts LAST, ~40–60 min after push — `Cortex Quality Smoke` starts only after the deploy job
+  finishes) is IN FLIGHT, not absent — it reads `settling "(awaiting first run)"`. The specimen:
+  on 2026-11-12 every "0 failing checks" read called main `edfb114682` green for ~50min while the
+  smoke verdict was actually unknown (it settled red at 21:06Z). The lane may only enter a green
+  state when every required check is completed-success at the observed tip, and a red verdict is
+  never downgraded. In-flight and awaiting names ride `base_state.settling[]` AND fold into
+  `unsettled[]` so every list consumer keeps naming them; the documented exception is the
+  BR#5847 vacuity class (base-health gate names — `main-green gate`, `Deploy health …` — are
+  train-dispatched and structurally absent on merge-commit tips, so they never block
+  certification — the BR#5883 whole-tip qualifier owns that read). One shared line-health
+  vocabulary renders everywhere — `LineHealth` (green / settling / red / unknown,
+  `lineHealthFromBaseState` in `@bridge/contracts`) — stamped as `health` on every
+  `TrainLineProjection` arm and consumed by the lane banner, the train stop logic and the
+  TrainPanel chip (settling shows the amber `settling` badge). The published stamp no longer goes
+  green mid-drain either (BR#4934 admission law untouched — gates keep their own verdict; only
+  the stamp is honest).
   **Reading check state by hand (agent sessions probing with `gh`)?** The same law
   binds you: a check-run with `conclusion: null` is IN FLIGHT, and a required name
   absent from `commits/<sha>/check-runs` has NOT STARTED — "0 failing" is not green;
@@ -2082,7 +2087,7 @@ every tick. Two laws now hold:
   green.
 - **Loud BLOCKED (the lane)**: every walk stamps its base verdict into the lane
   (`train.queue_facts` carries `base_state: {verdict, scoped_to_required, red[],
-  unsettled[]}`, served whole by `train.status`), and a non-green base holding
+  settling[], unsettled[]}`, served whole by `train.status`), and a non-green base holding
   queued cars renders the lane `merge-train: BLOCKED — base main RED: <names> — N
   car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks
   the whole queue` (lane card reason + trains panel status pill, red) — never a
@@ -2202,13 +2207,13 @@ COMPUTED from the tip's runs, never read from the required set. Two laws close t
 - **The qualifier rides the verdict — computed, never read**: when the scoped base verdict
   is Green but the gate predicate — `classify_main_check_runs`, byte-equivalent to
   the retired `scripts/main-green-gate.sh` decision rule (newest non-cancelled run
-  per name, no exemptions, unsettled fails) — judges the tip non-green,
+  per name, no exemptions, unsettled fails — an in-flight run reads settling, BR#14088) — judges the tip non-green,
   `classify_base_check_runs` attaches a
   `GateBlock` qualifier. The verdict itself STAYS Green (BR#5265 law intact: non-required
   reds never park the train). The walk's `base_state` stamps `gate_blocked: true` with
   `gate_verdict` / `gate_red[]` / `gate_unsettled[]` (omitted while clean or mid-burst),
   the lane vocabulary goes loud — `merge-train: GATE-BLOCKED — base main passes the
-  required workflows but the repo merge gate judges it red/unsettled — N car(s) held
+  required workflows but the repo merge gate judges it red/settling/unsettled — N car(s) held
   (every car's main-green gate run fails on these); fix or re-run the named checks to
   unblock` — and the trains panel renders the red `⛔ gate-blocked` pill
   (freshness-guarded <15m like base-red). The hub escalates a fresh gate-blocked stamp at

@@ -2,6 +2,7 @@ import { Miniflare } from "miniflare";
 import { existsSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  classifyBaseCheckRuns,
   classifyMainCheckRuns,
   stopLineAskTitle,
   MAIN_RED_CONCLUSIONS,
@@ -33,9 +34,10 @@ const run = (id: number, name: string, conclusion: string | null, url = `https:/
 });
 
 describe("classifyMainCheckRuns (the stop-the-line decision rule)", () => {
-  it("empty check-run list is empty, never green (vacuity guard)", () => {
+  it("empty check-run list is empty, never green (vacuity guard); an in-flight check is settling (BR#14088)", () => {
     expect(classifyMainCheckRuns([]).verdict).toBe("empty");
-    expect(classifyMainCheckRuns([run(1, "Test", null)]).verdict).toBe("unsettled");
+    // BR#14088: queued/in_progress has no verdict yet — SETTLING (amber), never green
+    expect(classifyMainCheckRuns([run(1, "Test", null)]).verdict).toBe("settling");
   });
 
   it("all settled green is green", () => {
@@ -68,10 +70,35 @@ describe("classifyMainCheckRuns (the stop-the-line decision rule)", () => {
     expect(v.red[0]?.url).toBe("https://example/run/100");
   });
 
-  it("in-flight checks are unsettled (an unsettled main does not vouch)", () => {
+  it("in-flight checks are settling, never green — no green until settled (BR#14088)", () => {
     const v = classifyMainCheckRuns([run(1, "Test", "success"), run(2, "CLI", null)]);
-    expect(v.verdict).toBe("unsettled");
-    expect(v.unsettled).toContain("CLI");
+    expect(v.verdict).toBe("settling");
+    expect(v.settling).toContain("CLI");
+    expect(v.unsettled).toContain("CLI"); // fold: list consumers keep naming the check
+  });
+
+  it("BR#14088 acceptance: completed-green deploy + in-flight smoke is settling, never green; all-completed-green is green", () => {
+    // THE live shape (BR#14088 evidence, 2026-11-12): the deploy job settled green,
+    // the post-admission smoke inside the same workflow is still in flight. The
+    // rollup is SETTLING — rendered amber, never green.
+    const v = classifyMainCheckRuns([run(1, "deploy / Deploy to dev", "success"), run(2, "deploy / Deploy to dev", null)]);
+    expect(v.verdict).toBe("settling");
+    expect(v.settling).toContain("deploy / Deploy to dev");
+    expect(v.green).toBe(0); // grouped by name: the in-flight newest judge means no settled-green obligation yet
+    // the same shape scoped to the lane's required set
+    const scoped = classifyBaseCheckRuns(
+      [run(1, "deploy / Deploy to dev", "success"), run(2, "deploy / Deploy to dev", null)],
+      ["deploy / Deploy to dev"],
+    );
+    expect(scoped.verdict).toBe("settling");
+    expect(scoped.settling).toContain("deploy / Deploy to dev");
+    // a rollup where every check is completed-success enters green
+    const allGreen = classifyBaseCheckRuns(
+      [run(1, "deploy / Deploy to dev", "success"), run(2, "post-deploy / Cortex Quality Smoke", "success")],
+      ["deploy / Deploy to dev", "post-deploy / Cortex Quality Smoke"],
+    );
+    expect(allGreen.verdict).toBe("green");
+    expect(allGreen.green).toBe(2);
   });
 
   it("only-cancelled runs are unsettled, not green", () => {

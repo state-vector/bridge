@@ -2219,7 +2219,9 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
         match head.verdict {
             MainVerdict::Red => return Ok(Deferred(format!("head checks failed: {}",
                 head.red.iter().map(|check| check.name.as_str()).collect::<Vec<_>>().join(", ")))),
-            MainVerdict::Unsettled => return Ok(Deferred(format!("head checks are pending: {}", head.unsettled.join(", ")))),
+            // BR#14088: a settling head (queued/in_progress checks) is pending,
+            // exactly like an unsettled read — never admission.
+            MainVerdict::Settling | MainVerdict::Unsettled => return Ok(Deferred(format!("head checks are pending: {}", head.unsettled.join(", ")))),
             MainVerdict::Green | MainVerdict::Empty => {}
         }
         if !commits.iter().any(|(sha, _)| sha == &cand.head_sha) || commits.iter().any(|(_, verified)| !verified) {
@@ -2427,20 +2429,33 @@ fn extract_actions_run_id(url: &str) -> Option<i64> {
 }
 
 fn build_base_state(base_class: &CheckVerdict, required: &[String], pass_merged: u32) -> Value {
+    // BR#14088 honest stamp: mid-drain (pass_merged > 0) the destination-green
+    // is STILL owned by the pass settle (BR#4934 — admission gates keep their
+    // own verdict; this only stops the PUBLISHED stamp from lying), but a
+    // required check that is queued/in_progress (the post-admission smoke
+    // settles LAST, ~50-60 min after admission) has NO verdict yet — the
+    // stamp reads SETTLING (amber), never green. Only a fully settled-green
+    // read at the observed tip (or a red, which always speaks) publishes.
+    let verdict_str = if pass_merged > 0 {
+        match base_class.verdict {
+            MainVerdict::Green => "green",
+            MainVerdict::Red => "red",
+            _ => "settling", // Settling | Unsettled | Empty mid-drain = in flight / unread, never green
+        }
+    } else {
+        base_class.verdict.as_str()
+    };
     let mut base_state = json!({
-        // mid-drain (pass_merged > 0): destination-green is owned by the
-        // pass settle (BR#4934) — only non-red unsettled/empty reads are
-        // suppressed mid-burst; a RED base is ALWAYS reported as red so the
-        // UI never lies that a red base is green.
-        "verdict": if pass_merged > 0 && base_class.verdict != MainVerdict::Red {
-            "green"
-        } else {
-            base_class.verdict.as_str()
-        },
+        "verdict": verdict_str,
         "scoped_to_required": !required.is_empty(),
         "red": base_class.red.iter().map(|r| json!({ "name": r.name, "url": r.url })).collect::<Vec<_>>(),
         "unsettled": base_class.unsettled,
     });
+    // BR#14088: the settling names ride the stamp so every consumer (banner,
+    // lane vocabulary, TrainPanel) names the checks that are still in flight.
+    if !base_class.settling.is_empty() {
+        base_state.as_object_mut().unwrap().insert("settling".into(), json!(base_class.settling));
+    }
     // BR#5674 P1 (empty-is-loud): annotate base_state with the alarm string
     // when the base verdict is empty (either N runs read with 0 matching
     // required_workflows, or 0 total runs on the tip).
@@ -3186,7 +3201,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         (
             String::new(),
             0u64,
-            CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None },
+            CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], settling: vec![], unsettled: vec!["base read skipped (hermetic)".to_string()], external: vec![], green: 0, alarm: None, gate: None },
         )
     } else {
         match ctx.base_tip_facts(repo, base).map(|(base_sha, age_secs)| {
@@ -3197,7 +3212,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             Err(e) => (
                 String::new(),
                 0u64,
-                CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
+                CheckVerdict { verdict: MainVerdict::Unsettled, red: vec![], settling: vec![], unsettled: vec![format!("base read failed: {}", trunc(&e, 120))], external: vec![], green: 0, alarm: None, gate: None },
             ),
         }
     };
@@ -4090,7 +4105,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 exact_own_prefix = complete && pass_merged > 0 && sha == tip_sha;
                 // The exact tip we just landed can have no required contexts yet.
                 // Only a complete GitHub read can distinguish that from an outage.
-                let own_batch_still_running = exact_own_prefix && matches!(live.verdict, MainVerdict::Unsettled | MainVerdict::Empty);
+                // BR#14088: under the settling law the just-landed prefix's
+                // in-flight required checks read SETTLING — the same
+                // still-running class as Unsettled/Empty (the pass settle
+                // owns destination-green, BR#4934).
+                let own_batch_still_running = exact_own_prefix && matches!(live.verdict, MainVerdict::Settling | MainVerdict::Unsettled | MainVerdict::Empty);
                 if own_batch_still_running && live.verdict == MainVerdict::Empty {
                     log(Some(key), "No required checks on our exact batch tip yet; continuing selected members");
                 }
@@ -8997,9 +9016,12 @@ mod tests {
             bs_unmatched.get("alarm").and_then(|v| v.as_str()),
             Some("2 runs read, none matched required set — check names/pagination")
         );
-        // mid-burst (pass_merged > 0): verdict is forced green and no false alarm rides
+        // mid-burst (pass_merged > 0): BR#14088 — an unmatched/unread required
+        // set is IN FLIGHT mid-drain, so the honest stamp reads SETTLING
+        // (amber), never the old forced green; the empty-is-loud alarm still
+        // does not ride the mid-burst stamp
         let bs_burst = build_base_state(&c_unmatched, &required, 1);
-        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("settling"));
         assert!(bs_burst.get("alarm").is_none());
         // zero total runs on tip → sibling alarm
         let c_zero = classify_base_check_runs(&[], &required);
@@ -9159,7 +9181,11 @@ mod tests {
         let facts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_queue_facts").map(call_args).collect();
         assert_eq!(facts.len(), 5, "every idle tick publishes a new health observation");
         let verdicts: Vec<_> = facts.iter().map(|f| f.pointer("/base_state/verdict").and_then(Value::as_str).unwrap()).collect();
-        assert_eq!(verdicts, ["unsettled", "green", "red", "green", "unsettled"]);
+        // BR#14088: phase 0's required deploy is IN FLIGHT (conclusion null) —
+        // the honest verdict is SETTLING, never the old unsettled fold; the
+        // settling names ride the stamp
+        assert_eq!(verdicts, ["settling", "green", "red", "green", "unsettled"]);
+        assert_eq!(facts[0].pointer("/base_state/settling/0").and_then(Value::as_str), Some("deploy / Deploy to dev"));
         assert!(facts.iter().all(|f| f.get("entries") == Some(&json!([]))));
         assert!(facts[4].pointer("/base_state/unsettled/0").unwrap().as_str().unwrap().contains("GitHub unavailable"));
         assert_eq!(calls.iter().filter(|c| call_name(c) == "train_observe_deploy").count(), 4);
@@ -9446,6 +9472,11 @@ mod tests {
         assert_eq!(qf_calls.len(), 3, "each tick publishes base health before candidate work");
 
         // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
+        // (BR#14088: a DISPATCHED deploy is not yet an OBSERVED in-flight run —
+        // reconcile_base_verdict_with_deploy_coverage deliberately folds
+        // UncoveredDispatched to UNSETTLED "Waiting for a covering deployment
+        // to start"; SETTLING begins only once a run is actually in flight,
+        // which tick 2 covers. Honest either way: never green.)
         let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
         assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
         assert_eq!(bs1.get("covered_by").and_then(|v| v.as_str()), Some(prev_green));
@@ -9453,8 +9484,9 @@ mod tests {
         assert_eq!(bs1.pointer("/deploy_coverage/workflow").and_then(|v| v.as_str()), Some("deploy-dev.yml"));
 
         // Tick 2 base_state: settling + cancelled_redundant_runs = [41798949143]
+        // (BR#14088: the in-flight dispatched run keeps the verdict SETTLING)
         let bs2 = call_args(qf_calls[1]).get("base_state").unwrap();
-        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
+        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("settling"));
         assert_eq!(bs2.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("settling"));
         assert_eq!(bs2.get("cancelled_redundant_runs"), Some(&json!([41798949143_i64])));
 

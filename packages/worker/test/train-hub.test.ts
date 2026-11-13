@@ -788,7 +788,8 @@ describe("merge train DO drill (real bundled worker)", () => {
       deploy_coverage: { phase: "failed", tip_sha: tip, tip_age_secs: 1350, failing_run_id: null } });
     expect(stale.status, JSON.stringify(stale.body)).toBe(200);
     const waiting = await laneSnap(repo);
-    expect(waiting.queue_facts.base_state).toMatchObject({ verdict: "unsettled", red: [],
+    // BR#14088: the active exact retry holds the lane in the SETTLING class (amber, never green)
+    expect(waiting.queue_facts.base_state).toMatchObject({ verdict: "settling", red: [],
       deploy_coverage: { phase: "settling", active_run_id: runId } });
     expect(waiting.line).toMatchObject({ phase: "waiting", blocker: "checks_running", remediation: { kind: "machine", url: runUrl } });
     expect(waiting.line.recoveries ?? []).toHaveLength(0);
@@ -5111,7 +5112,9 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
       deploy_coverage: { phase: "settling", tip_sha: "a".repeat(40), tip_age_secs: 1000, active_run_id: 123, active_run_url: "https://github.com/run/123" },
     } });
     const lane = await laneSnap(repo);
-    expect(lane.queue_facts.base_state.verdict).toBe("unsettled");
+    // BR#14088: an in-flight deploy normalizes to SETTLING (amber) — never "empty", and distinguishable from an inconclusive read
+    expect(lane.queue_facts.base_state.verdict).toBe("settling");
+    expect(lane.queue_facts.base_state.settling).toEqual(["Deploy Dev (run #123 in flight)"]);
     expect(lane.line).toMatchObject({ phase: "waiting", remediation: { kind: "machine", url: "https://github.com/run/123" } });
     await kbJson("/train.lease", { repo, action: "release", actor: "gw-settling6389" });
   });

@@ -9,7 +9,8 @@ describe("GitHub check obligations", () => {
     for (const classify of [classifyHeadChecks, classifyMainCheckRuns]) {
       expect(classify([failed, republished]).verdict).toBe("red");
       expect(classify([failed, republished, { ...failed, id: 127653739994, conclusion: "success" }]).verdict).toBe("green");
-      expect(classify([failed, republished, { ...failed, id: 127653739994, conclusion: null }]).verdict).toBe("unsettled");
+      // BR#14088: an in-flight attempt (conclusion null) reads SETTLING — amber, never green
+      expect(classify([failed, republished, { ...failed, id: 127653739994, conclusion: null }]).verdict).toBe("settling");
     }
   });
 });

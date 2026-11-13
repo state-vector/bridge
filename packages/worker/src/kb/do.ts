@@ -12135,7 +12135,11 @@ export class KnowledgeHub {
       const covSummary = covParsed?.success ? formatDeployCoverageSummary(covParsed.data) : "";
       reason = String(bs.verdict) === "red" && redNames.length
         ? `merge-train: BLOCKED — base main RED: ${redNames.join(", ")} — ${queue.length} car(s) held; clearing the red (fix forward / re-run / bypass-merge a cure) unblocks the whole queue`
-        : `merge-train: BLOCKED — base main ${String(bs.verdict) === "empty" ? `carries none of the lane's required workflow runs (${emptyAlarm || "config?"})${covSummary ? ` · ${covSummary}` : ""}` : `checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"})`} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
+        : String(bs.verdict) === "empty"
+          ? `merge-train: BLOCKED — base main carries none of the lane's required workflow runs (${emptyAlarm || "config?"})${covSummary ? ` · ${covSummary}` : ""} — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`
+          : String(bs.verdict) === "settling"
+            ? `merge-train: BLOCKED — base main is SETTLING: required checks in flight (${(Array.isArray(bs.settling) ? bs.settling : []).join(", ") || (Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"}) — ${queue.length} car(s) held; no green until every required check settles (BR#14088)`
+            : `merge-train: BLOCKED — base main checks unsettled (${(Array.isArray(bs.unsettled) ? bs.unsettled : []).join(", ") || "in flight"}) — ${queue.length} car(s) held; the standing order never merges onto a non-green destination`;
     }
     // BR#5883: gate-blocked is LOUD — the required-scoped verdict reads green
     // so nothing above fires, yet the repo's own merge gate judges the tip
@@ -17959,7 +17963,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
         base_red_resolution = {
           verdict: brGateBlocked
-            ? (String(brGateBlocked.gate_verdict ?? "") === "unsettled" ? "unsettled" : "red")
+            ? (String(brGateBlocked.gate_verdict ?? "") === "unsettled" ? "unsettled"
+              : String(brGateBlocked.gate_verdict ?? "") === "settling" ? "settling" : "red")
             : brBase
               ? String(brBase.verdict ?? "red")
               : mNowUnsettled
