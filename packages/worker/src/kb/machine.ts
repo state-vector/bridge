@@ -1220,6 +1220,25 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // this fix) coalesced the same way while this class awaited its merge.
   // Named so the Log says WHAT fenced; priced never-a-breach.
   review_fence: Number.POSITIVE_INFINITY,
+  // BR#9703 — the recovery review's replacement-binding gate (do.ts:7387,
+  // the doTransition unblock_result path): a task-recovery duty submitting
+  // unblock_result {kind:"reblocked"} whose binding does not match the
+  // parent's fenced repairing binding (this duty, the captured wait episode,
+  // the parent id, the reblocked kind, a genuinely different observable
+  // condition, non-empty reason/next) is refused with "gate: recovery review
+  // requires a different observable condition bound to this blocked task".
+  // The gate refusing an invalid replacement binding IS the system working —
+  // zero state destroyed, the parent's typed wait stays intact, and the
+  // duty's legal path (a valid replacement or a receipt-backed disposition)
+  // stays open — the BR#4562/BR#6654/BR#7008/BR#7684 pricing law again.
+  // The specimen complied: 3 terminal gate rejections on BR#9662 (2026-11-09
+  // 13:21:53–13:26:19Z) after the hub re-fenced the parent's repairing
+  // binding to a successor duty; the duty stopped per the retry law,
+  // documented the reblocked arm structurally infeasible, and closed done on
+  // a receipt-backed disposition. The events folded "unclassified" (default
+  // threshold 3) and raised breach card BR#9703. Named so the Log says WHAT
+  // fenced; priced never-a-breach.
+  rebind_fence: Number.POSITIVE_INFINITY,
   // BR#6740 — the doTransition exit gate for typed execution waits (do.ts,
   // isExecutionWait / local handoff preparing|waiting): ANY ordinary
   // transition/ask/timeout on a card whose exit a durable execution wait owns
@@ -1397,6 +1416,27 @@ export function breachClass(reason: string): string {
   // BR#7684; second specimen BR#7761 (3 events 2026-11-07 16:44–17:09Z,
   // breach card BR#8034) coalesced identically; priced never-a-breach above.
   if (r.includes("stale or missing review subject_revision")) return "review_fence";
+  // BR#9703: the recovery review's replacement-binding gate (do.ts:7387, the
+  // doTransition unblock_result path): a task-recovery duty closing in_review
+  // with unblock_result {kind:"reblocked"} is refused with "gate: recovery
+  // review requires a different observable condition bound to this blocked
+  // task" unless the parent's blocked.repairing binding points at THIS duty
+  // with the matching wait episode and the replacement await_event is a
+  // genuinely different observable condition (isRepairReplacement). The gate
+  // refusing an invalid replacement binding is the system working — zero
+  // state destroyed, the parent's typed wait stays intact, and the duty's
+  // legal path (a valid replacement or a receipt-backed disposition) stays
+  // open — so it joins the BR#4562/BR#6654/BR#7008/BR#7684 never-a-breach
+  // pricing family. Match the structural fragment "different observable
+  // condition", not the whole sentence (BR#3611/BR#3612 wording-drift
+  // lesson); the throw carries no [rule:] tag and the stem sits ~33 chars
+  // in, far inside the 300-char audit slice, so the classification survives
+  // any tail. Specimen: BR#9662, 3 terminal gate rejections 2026-11-09
+  // 13:21:53–13:26:19Z after the hub re-fenced the parent's repairing
+  // binding to a successor duty — the duty stopped per the retry law,
+  // documented the reblocked arm structurally infeasible, and closed done on
+  // a receipt-backed disposition (breach card BR#9703).
+  if (r.includes("different observable condition")) return "rebind_fence";
   // BR#6740: the doTransition exit gate for typed execution waits — an
   // ordinary transition/ask/timeout on a card whose exit a durable execution
   // wait owns (meta.blocked.await_event local_handoff/executor_capability, or

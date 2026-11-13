@@ -2095,6 +2095,7 @@ describe("breachClass: release:held-execution-wait (BR#6740)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // BR#9534 — the done-close-legs receipts gate (machine.ts done-close-legs
 // rule, BR#3361) refuses a done whose Done-when/note derives terminal GH
 // close legs with neither a closure receipt nor a closed close-duty child:
@@ -2140,6 +2141,52 @@ describe("breachClass: close_leg_fence (BR#9534)", () => {
 
   it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
     expect(BREACH_THRESHOLDS["close_leg_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BR#9703 — the recovery review's replacement-binding gate (do.ts:7387, the
+// doTransition unblock_result path): a task-recovery duty closing in_review
+// with unblock_result {kind:"reblocked"} is refused with "gate: recovery
+// review requires a different observable condition bound to this blocked
+// task" unless the parent's blocked.repairing binding points at THIS duty
+// with the matching wait episode and the replacement await_event is a
+// genuinely different observable condition. The gate refusing an invalid
+// replacement binding IS the system working (the BR#4562/BR#6654/BR#7008/
+// BR#7684 pricing family): zero state destroyed, the parent's typed wait
+// stays intact, and the duty's legal path — a valid replacement or a
+// receipt-backed disposition — stays open. Specimen: 3 terminal gate
+// rejections on BR#9662, 2026-11-09 13:21:53–13:26:19Z, after the hub
+// re-fenced the parent's repairing binding to a successor duty (BR#9713) —
+// the duty stopped per the retry law, documented the reblocked arm
+// structurally infeasible, and closed done on a receipt-backed disposition.
+// The 3 events folded "unclassified" (default threshold 3) and raised breach
+// card BR#9703. The class is named so the Log says WHAT fenced, and priced
+// never-a-breach so compliance can never arm a card. Re-landed on the
+// current tip by BR#13516 (fresh specimen: 3 unclassified events on
+// BR#13487, 2026-11-12 09:40:45–09:46:02Z) after the original landing leg
+// was interrupted mid-CI-wait twice.
+// ---------------------------------------------------------------------------
+describe("breachClass: rebind_fence (BR#9703)", () => {
+  // the exact audited reason shape (do.ts:7387, thrown message, no [rule:] tag)
+  const FENCE = "gate: recovery review requires a different observable condition bound to this blocked task";
+
+  it("the rebind refusal classifies rebind_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("rebind_fence");
+    // the stem sits ~33 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("rebind_fence");
+  });
+
+  it("a rebind-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#9662", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["rebind_fence"]).toBe(Number.POSITIVE_INFINITY);
   });
 });
 
