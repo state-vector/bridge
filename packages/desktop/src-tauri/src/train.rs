@@ -9016,9 +9016,12 @@ mod tests {
             bs_unmatched.get("alarm").and_then(|v| v.as_str()),
             Some("2 runs read, none matched required set — check names/pagination")
         );
-        // mid-burst (pass_merged > 0): verdict is forced green and no false alarm rides
+        // mid-burst (pass_merged > 0): BR#14088 — an unmatched/unread required
+        // set is IN FLIGHT mid-drain, so the honest stamp reads SETTLING
+        // (amber), never the old forced green; the empty-is-loud alarm still
+        // does not ride the mid-burst stamp
         let bs_burst = build_base_state(&c_unmatched, &required, 1);
-        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("green"));
+        assert_eq!(bs_burst.get("verdict").and_then(|v| v.as_str()), Some("settling"));
         assert!(bs_burst.get("alarm").is_none());
         // zero total runs on tip → sibling alarm
         let c_zero = classify_base_check_runs(&[], &required);
@@ -9178,7 +9181,11 @@ mod tests {
         let facts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_queue_facts").map(call_args).collect();
         assert_eq!(facts.len(), 5, "every idle tick publishes a new health observation");
         let verdicts: Vec<_> = facts.iter().map(|f| f.pointer("/base_state/verdict").and_then(Value::as_str).unwrap()).collect();
-        assert_eq!(verdicts, ["unsettled", "green", "red", "green", "unsettled"]);
+        // BR#14088: phase 0's required deploy is IN FLIGHT (conclusion null) —
+        // the honest verdict is SETTLING, never the old unsettled fold; the
+        // settling names ride the stamp
+        assert_eq!(verdicts, ["settling", "green", "red", "green", "unsettled"]);
+        assert_eq!(facts[0].pointer("/base_state/settling/0").and_then(Value::as_str), Some("deploy / Deploy to dev"));
         assert!(facts.iter().all(|f| f.get("entries") == Some(&json!([]))));
         assert!(facts[4].pointer("/base_state/unsettled/0").unwrap().as_str().unwrap().contains("GitHub unavailable"));
         assert_eq!(calls.iter().filter(|c| call_name(c) == "train_observe_deploy").count(), 4);
@@ -9465,6 +9472,11 @@ mod tests {
         assert_eq!(qf_calls.len(), 3, "each tick publishes base health before candidate work");
 
         // Tick 1 base_state: uncovered_dispatched, covered_by prev_green
+        // (BR#14088: a DISPATCHED deploy is not yet an OBSERVED in-flight run —
+        // reconcile_base_verdict_with_deploy_coverage deliberately folds
+        // UncoveredDispatched to UNSETTLED "Waiting for a covering deployment
+        // to start"; SETTLING begins only once a run is actually in flight,
+        // which tick 2 covers. Honest either way: never green.)
         let bs1 = call_args(qf_calls[0]).get("base_state").unwrap();
         assert_eq!(bs1.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
         assert_eq!(bs1.get("covered_by").and_then(|v| v.as_str()), Some(prev_green));
@@ -9472,8 +9484,9 @@ mod tests {
         assert_eq!(bs1.pointer("/deploy_coverage/workflow").and_then(|v| v.as_str()), Some("deploy-dev.yml"));
 
         // Tick 2 base_state: settling + cancelled_redundant_runs = [41798949143]
+        // (BR#14088: the in-flight dispatched run keeps the verdict SETTLING)
         let bs2 = call_args(qf_calls[1]).get("base_state").unwrap();
-        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("unsettled"));
+        assert_eq!(bs2.get("verdict").and_then(|v| v.as_str()), Some("settling"));
         assert_eq!(bs2.pointer("/deploy_coverage/phase").and_then(|v| v.as_str()), Some("settling"));
         assert_eq!(bs2.get("cancelled_redundant_runs"), Some(&json!([41798949143_i64])));
 
