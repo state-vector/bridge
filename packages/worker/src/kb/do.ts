@@ -3945,6 +3945,78 @@ export class KnowledgeHub {
       `UPDATE artefacts SET project = ? WHERE project = '' AND type = 'task'`, projectName,
     );
     this.state.storage.sql.exec(`UPDATE artefacts SET owner = '' WHERE type = 'task' AND status = 'todo' AND owner != ''`);
+
+    // ---------- BR#14413 read-path: trigger-maintained content revisions ----------
+    // GET /artefacts is the board's hottest route (30s polls per open tab re-ran
+    // the full list() query + JSON serialize every call on a single-threaded DO).
+    // Conditional GET needs a "did the content change" signal that cannot miss a
+    // write path — artefact writes are scattered across dozens of call sites, so
+    // call-site discipline is not an option. Instead the DATABASE maintains the
+    // counters: one-row scopes in artefact_rev, bumped by triggers on every
+    // table the board read paths project. Two scopes:
+    //   'board' — /artefacts output (rows + relations + lane-card meta overlay +
+    //             consensus (ledger mutation rows) + owner display labels);
+    //   'wide'  — /get additionally projects execution_state + delivery_admissions.
+    // Over-invalidation only costs an occasional extra 200; the trigger set is
+    // deliberately exact for everything these routes render.
+    this.state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS artefact_rev (
+        scope TEXT PRIMARY KEY,
+        rev INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO artefact_rev (scope, rev) VALUES ('board', 0), ('wide', 0);
+      CREATE TRIGGER IF NOT EXISTS artefacts_rev_insert AFTER INSERT ON artefacts BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS artefacts_rev_update AFTER UPDATE ON artefacts BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS artefacts_rev_delete AFTER DELETE ON artefacts BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS relations_rev_insert AFTER INSERT ON relations BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS relations_rev_delete AFTER DELETE ON relations BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      -- consensus enrichment reads the ledger (kind='mutation') directly: a
+      -- progress write that touches no artefact row still changes list output
+      CREATE TRIGGER IF NOT EXISTS ledger_rev_insert AFTER INSERT ON ledger WHEN new.kind = 'mutation' BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      -- lane_cards is a VIEW over lane_state x artefacts — the lane overlay in
+      -- shaped meta moves when lane_state moves
+      CREATE TRIGGER IF NOT EXISTS lane_state_rev_insert AFTER INSERT ON lane_state BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS lane_state_rev_update AFTER UPDATE ON lane_state BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      -- displayOwner resolves principal -> label from auth_tokens; last_seen_ts
+      -- churn is display-irrelevant, so only label-fact columns bump
+      CREATE TRIGGER IF NOT EXISTS auth_tokens_rev_insert AFTER INSERT ON auth_tokens BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS auth_tokens_rev_update AFTER UPDATE OF label, principal, revoked_ts ON auth_tokens BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS auth_tokens_rev_delete AFTER DELETE ON auth_tokens BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'board';
+      END;
+      CREATE TRIGGER IF NOT EXISTS execution_state_rev_insert AFTER INSERT ON execution_state BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
+      END;
+      CREATE TRIGGER IF NOT EXISTS execution_state_rev_update AFTER UPDATE OF state, worker_token_id ON execution_state BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
+      END;
+      CREATE TRIGGER IF NOT EXISTS delivery_admissions_rev_insert AFTER INSERT ON delivery_admissions BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
+      END;
+      CREATE TRIGGER IF NOT EXISTS delivery_admissions_rev_update AFTER UPDATE ON delivery_admissions BEGIN
+        UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
+      END;
+    `);
   }
 
   // ---------- BR#4212: the fetch entry NEVER throws ----------
@@ -4078,8 +4150,31 @@ export class KnowledgeHub {
     if (request.method === "GET") {
       try {
         switch (url.pathname) {
-          case "/artefacts": return this.json(await this.list({ type: url.searchParams.get("type") ?? undefined, status: url.searchParams.get("status") ?? undefined, tag: url.searchParams.get("tag") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
-          case "/artefact": return this.json(await this.getWithRelations(String(url.searchParams.get("id"))));
+          case "/artefacts": {
+            // BR#14413: weak ETag from the trigger-maintained board revision —
+            // an unchanged 30s poll costs one counter read and a 304, not the
+            // full list() query + serialize. The query parameters are folded
+            // into the tag so filters can never cross-match (an etag is only
+            // valid for the exact query that produced it).
+            const type = url.searchParams.get("type") ?? undefined;
+            const status = url.searchParams.get("status") ?? undefined;
+            const tag = url.searchParams.get("tag") ?? undefined;
+            const limit = url.searchParams.get("limit") ?? undefined;
+            const etag = `W/"art${this.contentRev("board")}|t${type ?? ""}|s${status ?? ""}|g${tag ?? ""}|l${limit ?? ""}"`;
+            if (this.ifNoneMatchHit(request.headers.get("if-none-match"), etag)) return this.notModified(etag);
+            return this.json(await this.list({ type, status, tag, limit }), 200, { etag });
+          }
+          case "/artefact": {
+            // BR#14413: same short-circuit for single-card reads. The payload
+            // also projects execution_state + delivery_admissions, so the tag
+            // folds the 'wide' scope; the id is folded so an etag can never be
+            // replayed against a different resource (a false 304 there would
+            // serve card A's bytes for card B).
+            const id = String(url.searchParams.get("id"));
+            const etag = `W/"one${this.contentRev("board")}.${this.contentRev("wide")}|${id}"`;
+            if (this.ifNoneMatchHit(request.headers.get("if-none-match"), etag)) return this.notModified(etag);
+            return this.json(await this.getWithRelations(id), 200, { etag });
+          }
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/events": return this.limited("events", 120, 60_000, request)
             ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
@@ -19066,11 +19161,43 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return { ...row, owner: this.displayOwner(row.owner), meta: this.laneStore().publicMeta(String(row.id), row.meta ?? "{}"), tags: parseTags(row.tags), roles: parseTags(row.roles) };
   }
 
-  private json(obj: unknown, status = 200) {
+  private json(obj: unknown, status = 200, extraHeaders?: Record<string, string>) {
     return new Response(JSON.stringify(obj), {
       status,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
+      headers: { "content-type": "application/json", "cache-control": "no-store", ...(extraHeaders ?? {}) },
     });
+  }
+
+  // ---------- BR#14413 conditional GET (ETag / If-None-Match → 304) ----------
+  // The board's 30s polls re-ran the full list()/getWithRelations() query +
+  // serialize on every call; on a single-threaded DO every poll queues behind
+  // writes. A weak ETag from the trigger-maintained artefact_rev counters
+  // short-circuits the unchanged common case to a body-less 304: one O(1)
+  // counter read instead of the query plan.
+
+  /** Current content revision for a scope ('board' | 'wide'). */
+  private contentRev(scope: string): number {
+    const r = this.one(`SELECT rev FROM artefact_rev WHERE scope = ?`, scope);
+    return Number(r?.rev ?? 0);
+  }
+
+  /** RFC 7232 If-None-Match: comma-separated validator list, `W/` prefixes
+   *  ignored (weak comparison), `*` matches any current representation. */
+  private ifNoneMatchHit(header: string | null, etag: string): boolean {
+    if (!header) return false;
+    const candidate = etag.startsWith("W/") ? etag.slice(2) : etag;
+    for (const raw of header.split(",")) {
+      const t = raw.trim();
+      if (t === "*") return true;
+      const v = t.startsWith("W/") ? t.slice(2) : t;
+      if (v && v === candidate) return true;
+    }
+    return false;
+  }
+
+  /** 304 with no body — ETag echoes back so the client can keep re-validating. */
+  private notModified(etag: string): Response {
+    return new Response(null, { status: 304, headers: { "etag": etag, "cache-control": "no-store" } });
   }
 
   // ---------- BR#4212 channel-health counters ----------

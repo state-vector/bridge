@@ -45,6 +45,8 @@
     // BR#4684: same rig as rotation.test.ts (miniflare + workerd fetch types)
     "test/roster-reap.test.ts",
     // BR#11637: same rig as do.test.ts (miniflare + workerd fetch types)
-    "test/br11637-tags-accretion.test.ts"
+    "test/br11637-tags-accretion.test.ts",
+    // BR#14413: same rig as do.test.ts (miniflare + workerd fetch types)
+    "test/br14413-conditional-get.test.ts"
   ]
 }

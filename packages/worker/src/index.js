@@ -86,7 +86,12 @@ export default {
       if (!bearer) return new Response("unauthorized", { status: 401 });
       const r = await kbAuthenticateBearer(env, bearer);
       if (r instanceof Response) return r;
-      return kbGuard("kb.artefacts", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/artefacts" + new URL(request.url).search, { method: "GET" }));
+      // BR#14413 conditional GET: pass the validator through so bearer pollers
+      // get the DO's 304 short-circuit instead of a full re-list every poll
+      const inm = request.headers.get("if-none-match");
+      return kbGuard("kb.artefacts", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/artefacts" + new URL(request.url).search, {
+        method: "GET", ...(inm ? { headers: { "if-none-match": inm } } : {}),
+      }));
     }
     // Legacy desktop decision action: human authority requires a real session,
     // never a paired gateway bearer. Check the stored target, not caller type.
@@ -726,7 +731,8 @@ function kbCors(r) {
   if (!r || !r.headers) return r;
   const h = new Headers(r.headers);
   h.set("Access-Control-Allow-Origin", "*");
-  h.set("Access-Control-Allow-Headers", "authorization, content-type");
+  h.set("Access-Control-Allow-Headers", "authorization, content-type, if-none-match");
+  h.set("Access-Control-Expose-Headers", "etag");
   h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h, webSocket: r.webSocket });
 }

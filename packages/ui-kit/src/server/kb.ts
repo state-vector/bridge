@@ -473,6 +473,12 @@ export function setKbTransport(t: KbTransport | null) {
   transport = t;
 }
 
+// BR#14413: board polls (30s per open tab) re-fetched identical payloads.
+// Keep the parsed body + ETag per GET path and revalidate: an unchanged poll
+// now returns a body-less 304 and is served from this cache — no transfer,
+// no re-parse, and the DO skips the query entirely (server-side short-circuit).
+const etagCache = new Map<string, { etag: string; body: unknown }>();
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   if (transport) {
     return (await transport(path, {
@@ -482,10 +488,20 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const headers = new Headers(init?.headers);
   if (init?.body) headers.set("content-type", "application/json");
+  const isGet = (init?.method ?? "GET") === "GET";
+  const cached = isGet ? etagCache.get(path) : undefined;
+  if (cached) headers.set("if-none-match", cached.etag);
   const r = await fetch(`${base()}${path}`, { ...(init ?? {}), credentials: "include", headers });
   if (r.status === 401) throw new KbAuthError("unauthorized");
+  if (isGet && r.status === 304 && cached) return cached.body as T;
   if (!r.ok) throw new Error(`${r.status} ${await r.text().then((t) => t.slice(0, 200))}`);
-  return (await r.json()) as T;
+  const parsed = (await r.json()) as T;
+  const etag = r.headers.get("etag");
+  if (isGet && etag) {
+    if (etagCache.size > 500) etagCache.clear();
+    etagCache.set(path, { etag, body: parsed });
+  }
+  return parsed;
 }
 
 export const kbApi = {

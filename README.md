@@ -3480,6 +3480,26 @@ distinguishable from real ones. The DO alarm failure policy: degrade + retry
 schedule entirely); the next fetch entry re-arms via the null-or-stale guard,
 and the sweep rides the 60s alarm retry chain.
 
+## The board's read path revalidates instead of re-listing (BR#14413)
+
+`GET /artefacts` is the hottest route on the hub (30s polls per open tab), and
+on a single-threaded Durable Object every poll used to queue behind writes
+while re-running the full list query + JSON serialize — with
+`cache-control: no-store` and no ETag anywhere. The read path now speaks
+conditional GET: every `200` from `GET /artefacts` and `GET /artefact` carries
+a weak `ETag` derived from trigger-maintained content revision counters
+(`artefact_rev` — the DATABASE bumps the counter on every write to any table
+these routes project, so no write path can forget to invalidate). A client
+that echoes the tag back as `If-None-Match` gets a body-less `304` when
+nothing changed: one O(1) counter read instead of the query plan, and zero
+payload bytes. The tag folds in the query parameters (`/artefacts`) or the
+card id (`/artefact`), so a validator can never cross-match between filters or
+resources. The bearer list mirror (`/api/kb-machine/list`) forwards
+`if-none-match`, CORS exposes `etag` (and allows `if-none-match`), and the
+ui-kit client caches parsed responses per GET path and serves 304s from
+cache — the common 30s poll now moves headers only end to end. Pollers that
+never send `If-None-Match` see exactly the old behaviour.
+
 ## The hub self-canary: daily synthetic lifecycle (BR#4177)
 
 The hub is coordination infrastructure — it gets the same treatment the product gets:
