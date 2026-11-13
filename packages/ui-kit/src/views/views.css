@@ -499,6 +499,13 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
   border-color: color-mix(in srgb, var(--amber) 55%, var(--line));
   background: color-mix(in srgb, var(--amber) 10%, transparent);
 }
+/* BR#14088: the settling badge rides the lane status chip — amber, never green. */
+.train-settling-badge {
+  margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 600;
+  color: var(--amber); border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--line));
+  background: color-mix(in srgb, var(--amber) 10%, transparent); text-transform: uppercase;
+  letter-spacing: 0.04em; cursor: help;
+}
 .train-lane-group { min-width: 0; }
 .train-lane-interrupted > .train-row { border-bottom-color: transparent; }
 .train-banner-cause, .train-banner-recovery { display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere; }

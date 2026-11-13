@@ -2018,6 +2018,27 @@ every tick. Two laws now hold:
   tip that HAS runs, `base_state` carries `alarm: "<N> runs read, none matched required set — check names/pagination"`;
   a tip with zero total runs carries the sibling `alarm: "tip carries no check runs at all"`,
   and the hub's `empty` blocked reason renders the alarm verbatim instead of a silent `config?`.
+- **No green until settled (BR#14088, required-name completeness)**: a required
+  workflow whose check-run does not exist yet on the tip is invisible to a scoped
+  rollup — the post-admission smoke window: `Cortex Quality Smoke` starts only after
+  the deploy job finishes (~40-50 min after admission), so on 2026-11-12 every
+  "0 failing checks" read called main `edfb114682` green for that whole window while
+  the smoke verdict was actually unknown (it settled red at 21:06Z). A missing
+  required name now classifies **unsettled** — `"<name> (awaiting first run)"` — and
+  the line renders **settling** (amber, never green) until every required check at
+  the observed tip completed success. Base-health gate names (`main-green gate`,
+  `Deploy health …`) are exempt: they are vacuous by design on merge-commit tips
+  (BR#5847) and stay judged by the whole-tip BR#5883 gate qualifier. One shared
+  line-health vocabulary renders everywhere — `LineHealth` (green / settling / red /
+  unknown, `lineHealthFromBaseState` in `@bridge/contracts`) — stamped as `health` on
+  every `TrainLineProjection` arm and consumed by the lane banner, the train stop
+  logic and the TrainPanel chip (settling shows the amber `settling` badge).
+  **Reading check state by hand (agent sessions probing with `gh`)?** The same law
+  binds you: a check-run with `conclusion: null` is IN FLIGHT, and a required name
+  absent from `commits/<sha>/check-runs` has NOT STARTED — "0 failing" is not green;
+  green is "every required check completed success at this sha". Filtering a rollup
+  by `conclusion == "failure"` is exactly the query that fabricated the 2026-11-12
+  green.
 - **Loud BLOCKED (the lane)**: every walk stamps its base verdict into the lane
   (`train.queue_facts` carries `base_state: {verdict, scoped_to_required, red[],
   unsettled[]}`, served whole by `train.status`), and a non-green base holding

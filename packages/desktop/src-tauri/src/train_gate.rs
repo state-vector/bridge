@@ -320,6 +320,33 @@ pub fn classify_base_check_runs(runs: &[MainCheckRun], required: &[String]) -> C
     // not itself fully green, a red base-health gate folds in — the verdict
     // speaks red instead of a mid-burst green.
     let mut res = classify_main_check_runs(&scoped);
+    // BR#14088 (no green until settled): required-name completeness. A
+    // required workflow whose check-run does not exist yet on the tip is
+    // invisible to the scoped rollup — the post-admission smoke window (the
+    // smoke job starts only after the deploy job finishes, so "every PRESENT
+    // required check is green" certified green while the smoke verdict was
+    // still unknown: 2026-11-12, main edfb11468 read green ~50min before the
+    // smoke settled red). A missing required name is unsettled ("awaiting
+    // first run"); green requires every required check settled-success at the
+    // observed tip. Base-health gate names (`main-green gate`, `Deploy
+    // health`) are exempt — vacuous by design on merge-commit tips (BR#5847),
+    // judged by the whole-tip BR#5883 gate qualifier instead.
+    let parsed_scoped = parse_runs(&scoped);
+    let present_names: std::collections::HashSet<&str> =
+        parsed_scoped.iter().map(|(n, _)| n.as_str()).collect();
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|n| !present_names.contains(n.as_str()) && !is_base_health_gate_name(n))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        if res.verdict == MainVerdict::Green {
+            res.verdict = MainVerdict::Unsettled;
+        }
+        for n in &missing {
+            res.unsettled.push(format!("{} (awaiting first run)", n));
+        }
+    }
     if let Some(gv) = gate_verdict {
         if gv.verdict == MainVerdict::Red && !(res.verdict == MainVerdict::Green && res.green >= required.len()) {
             res.verdict = MainVerdict::Red;
@@ -2210,6 +2237,62 @@ fn native_run(id: i64, name: &str, conclusion: Option<&str>) -> MainCheckRun {
 mod tests {
     use super::*;
 
+    /// BR#14088 (no green until settled): required-name completeness. The
+    /// post-admission smoke window — a required workflow whose check-run does
+    /// not exist yet must yield Unsettled ("awaiting first run"), never Green;
+    /// Green requires every required check settled-success at the tip.
+    /// Base-health gate names stay exempt (BR#5847 vacuous on merge tips).
+    #[test]
+    fn br14088_required_name_completeness_no_green_until_settled() {
+        let required: Vec<String> =
+            vec!["deploy / Deploy to dev".into(), "Cortex Quality Smoke".into()];
+        // deploy green, the smoke's check-run not created yet → settling
+        let settling = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("success"))],
+            &required,
+        );
+        assert_eq!(settling.verdict, MainVerdict::Unsettled);
+        assert_eq!(settling.green, 1);
+        assert!(settling
+            .unsettled
+            .iter()
+            .any(|u| u == "Cortex Quality Smoke (awaiting first run)"));
+        // the smoke check-run exists but is in flight (conclusion null)
+        let in_flight = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("success")), run(2, "Cortex Quality Smoke", None)],
+            &required,
+        );
+        assert_eq!(in_flight.verdict, MainVerdict::Unsettled);
+        assert!(in_flight.unsettled.iter().any(|u| u == "Cortex Quality Smoke"));
+        // red wins while a required name is missing; the name rides unsettled
+        let red_missing = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("failure"))],
+            &required,
+        );
+        assert_eq!(red_missing.verdict, MainVerdict::Red);
+        assert!(red_missing
+            .unsettled
+            .iter()
+            .any(|u| u == "Cortex Quality Smoke (awaiting first run)"));
+        // every required check present and settled green → green
+        let green = classify_base_check_runs(
+            &[run(1, "deploy / Deploy to dev", Some("success")), run(2, "Cortex Quality Smoke", Some("success"))],
+            &required,
+        );
+        assert_eq!(green.verdict, MainVerdict::Green);
+        assert!(green.unsettled.is_empty());
+        // base-health gate names keep BR#5847 semantics (vacuous on merge
+        // tips: judged by the whole-tip BR#5883 qualifier, not completeness)
+        let gate_required: Vec<String> = vec!["Test".into(), "main-green gate".into()];
+        let vacuous = classify_base_check_runs(
+            &[run(1, "Test", Some("success")), run(2, "Deploy drift alarm", Some("failure"))],
+            &gate_required,
+        );
+        assert_eq!(vacuous.verdict, MainVerdict::Green);
+        assert!(vacuous.unsettled.is_empty());
+        assert!(vacuous.gate.is_some());
+    }
+
     #[test]
     fn same_name_different_suites_remain_independent_obligations() {
         let mut original = run(126988470498, "Deploy health (merge gate)", Some("failure"));
@@ -2695,8 +2778,11 @@ mod tests {
         assert_eq!(required_red.red.len(), 1);
         assert_eq!(required_red.red[0].name, "deploy / Deploy to dev");
         // newest non-cancelled per name still judges inside the scope
+        // (BR#14088: the second required name must be present too — a
+        // required check with no run yet is settling, not green)
         let healed = classify_base_check_runs(
-            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success"))],
+            &[run(1, "deploy / Deploy to dev", Some("failure")), run(2, "deploy / Deploy to dev", Some("success")),
+             run(3, "post-deploy / Lodestar Storage Health", Some("success"))],
             &required,
         );
         assert!(matches!(healed.verdict, MainVerdict::Green));

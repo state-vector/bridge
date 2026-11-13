@@ -1149,7 +1149,26 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   // Never mask a red base_state mid-burst: when the required-set read is not
   // itself fully green, a red base-health gate folds in — the verdict speaks
   // red instead of a mid-burst green.
-  const res = classifyMainCheckRuns(scoped);
+  let res = classifyMainCheckRuns(scoped);
+  // BR#14088 (no green until settled): required-name completeness. A required
+  // workflow whose check-run does not exist yet on the tip is invisible to the
+  // scoped rollup — the post-admission smoke window: the smoke job starts only
+  // after the deploy job finishes, so "every PRESENT required check is green"
+  // certified green while the smoke verdict was still unknown (2026-11-12,
+  // main edfb11468 read green for ~50min before the smoke settled red). A
+  // missing required name is unsettled ("awaiting first run"); green requires
+  // every required check settled-success at the observed tip. Base-health gate
+  // names (`main-green gate`, `Deploy health`) are exempt — they are vacuous
+  // by design on merge-commit tips (BR#5847) and the whole-tip BR#5883 gate
+  // qualifier judges them instead.
+  const presentNames = new Set(checkObligations(scoped).map((list) => list[0].name ?? ""));
+  const missing = required.filter((n) => !presentNames.has(n) && !isBaseHealthGateName(n));
+  if (missing.length) {
+    const awaiting = missing.map((n) => `${n} (awaiting first run)`);
+    res = res.verdict === "green"
+      ? { ...res, verdict: "unsettled", unsettled: [...res.unsettled, ...awaiting] }
+      : { ...res, unsettled: [...res.unsettled, ...awaiting] };
+  }
   if (gateVerdict && gateVerdict.verdict === "red" && !(res.verdict === "green" && res.green >= required.length)) {
     return {
       ...res,

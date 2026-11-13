@@ -1993,6 +1993,49 @@ describe("BR#5674 P1 + P4 — empty-is-loud base classifier + starvation ask/dut
     expect(scopedRed.gate).toBeUndefined();
   });
 
+  it("BR#14088 classifyBaseCheckRuns: required-name completeness — a required check with no check-run yet is unsettled, never green (the post-admission smoke window)", () => {
+    // 2026-11-12 shape: main tip edfb11468 — the deploy job is green, the
+    // Cortex Quality Smoke job's check-run does not exist yet (it starts only
+    // after the deploy finishes, ~40-50min after admission). "0 failing" read
+    // green for the whole window; the smoke settled red at 21:06Z.
+    const required = ["deploy / Deploy to dev", "Cortex Quality Smoke"];
+    const settling = classifyBaseCheckRuns([run(1, "deploy / Deploy to dev", "success")], required);
+    expect(settling.verdict).toBe("unsettled");
+    expect(settling.green).toBe(1);
+    expect(settling.unsettled).toEqual(["Cortex Quality Smoke (awaiting first run)"]);
+    // an in-flight smoke (check-run exists, conclusion null) stays unsettled too
+    const inFlight = classifyBaseCheckRuns(
+      [run(1, "deploy / Deploy to dev", "success"), run(2, "Cortex Quality Smoke", null)],
+      required,
+    );
+    expect(inFlight.verdict).toBe("unsettled");
+    expect(inFlight.unsettled).toEqual(["Cortex Quality Smoke"]);
+    // red still wins while a required name is missing — the missing name rides unsettled
+    const redMissing = classifyBaseCheckRuns([run(1, "deploy / Deploy to dev", "failure")], required);
+    expect(redMissing.verdict).toBe("red");
+    expect(redMissing.unsettled).toEqual(["Cortex Quality Smoke (awaiting first run)"]);
+  });
+
+  it("BR#14088 classifyBaseCheckRuns: every required check present and settled green enters green; missing base-health gate names stay exempt (BR#5847 vacuous on merge tips)", () => {
+    const required = ["deploy / Deploy to dev", "Cortex Quality Smoke"];
+    const green = classifyBaseCheckRuns(
+      [run(1, "deploy / Deploy to dev", "success"), run(2, "Cortex Quality Smoke", "success")],
+      required,
+    );
+    expect(green.verdict).toBe("green");
+    expect(green.unsettled).toEqual([]);
+    expect(green.green).toBe(2);
+    // gate names keep BR#5847 semantics: a vacuous required gate does not
+    // unsettle the tip — the whole-tip BR#5883 qualifier judges it instead
+    const gateVacuous = classifyBaseCheckRuns(
+      [run(1, "Test", "success"), run(2, "Deploy drift alarm", "failure")],
+      ["Test", "main-green gate"],
+    );
+    expect(gateVacuous.verdict).toBe("green");
+    expect(gateVacuous.unsettled).toEqual([]);
+    expect(gateVacuous.gate?.verdict).toBe("red");
+  });
+
   it("P4 trainStarvationAskTitle + details + duty builders hold the ask contract and carry full diagnosis", () => {
     expect(TRAIN_MERGE_STARVE_MS).toBe(60 * MIN);
     const lane = { repo: "state-vector/superpositional", base: "main" };

@@ -334,6 +334,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
           ? `${machine} · last heartbeat ${age(l.lease?.heartbeat_ts ?? l.capable?.at, now)} ago` : "No executor reported"} /></span>
         <span className="trainc-line trainc-open" onClick={() => openTask?.(l.card)} title={l.lane}>{l.lane}</span>
         <span className="trainc-status"><Chip pill tone={trainLineTones[line.phase]} title={line.reason}>{line.label}</Chip>
+          {line.health === "settling" && <span className="train-settling-badge" title="BR#14088: required checks are still settling (queued, in flight, or not started). The line is NOT green until every required check completes — settling renders amber, never green.">settling</span>}
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>

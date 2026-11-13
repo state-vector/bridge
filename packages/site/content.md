@@ -607,6 +607,23 @@ After 15 minutes without a real observation, even an idle previously-green lane
 shows **Status is out of date**. Existing snapshots keep their original time
 until a real observation replaces them.
 
+### No green until settled (BR#14088)
+
+A merge line is **green** only when every required check at the observed main
+tip has *completed* with success. While any required check is queued, in
+flight, or has not started yet (its check-run does not exist), the line is
+**settling** — rendered amber with a `settling` badge, never green. This
+closes the post-admission smoke window: a deploy-then-smoke pipeline reports
+green for its whole deploy phase otherwise, even though the smoke verdict is
+still unknown; on 2026-11-12 that exact window read "0 failing checks" as
+green for ~50 minutes before the smoke settled red. A required check that is
+missing entirely classifies as `unsettled` ("<name> awaiting first run");
+the merge-gate health checks (`main-green gate`, `Deploy health`) remain
+exempt on merge commits where they are vacuous by design. The same rule
+applies when reading check state by hand: a check-run with a null conclusion
+is in flight, a required name with no check-run has not started, and "0
+failing" is not green.
+
 ## Agent integration: one MCP server
 
 **Interactive OAuth connections.** Codex and other OAuth-capable remote MCP
