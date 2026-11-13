@@ -1166,7 +1166,7 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   // Never mask a red base_state mid-burst: when the required-set read is not
   // itself fully green, a red base-health gate folds in — the verdict speaks
   // red instead of a mid-burst green.
-  const res = classifyMainCheckRuns(scoped);
+  let res = classifyMainCheckRuns(scoped);
   if (gateVerdict && gateVerdict.verdict === "red" && !(res.verdict === "green" && res.green >= required.length)) {
     return {
       ...res,
@@ -1179,14 +1179,19 @@ export function classifyBaseCheckRuns(runs: MainCheckRun[], required: string[]):
   // observed tip. A required name with NO run yet — the smoke job starts
   // last, ~40-60 min after push, so between admission and its first
   // check-run the obligation is invisible — is IN FLIGHT, not absent: it
-  // yields SETTLING "(awaiting first run)" and green is forbidden. The
-  // documented exception is the `main-green gate` vacuity class (BR#5847:
-  // structurally absent on merge-commit tips — the BR#5883 qualifier owns
-  // that read). Mirror of train_gate.rs.
+  // yields SETTLING "(awaiting first run)" and green is forbidden (an
+  // in-flight judge — conclusion null — already reads settling via
+  // classifyMainCheckRuns above, with the name folded into `unsettled`).
+  // The documented exception is the base-health gate vacuity class (BR#5847:
+  // `main-green gate` / `Deploy health …` are train-dispatched, structurally
+  // absent on merge-commit tips — the BR#5883 qualifier owns that read).
+  // Mirror of train_gate.rs. Reconciled landing (BR#14403): carries ee95a14's
+  // union gate exemption with the SETTLING vocabulary (red > settling >
+  // unsettled > green; entries ride settling[] AND fold into unsettled[]).
   const missingRequired: string[] = [];
   for (const name of required) {
     if (scoped.some((r) => r.name === name) || startupFailedNames.has(name)) continue;
-    if (name.toLowerCase().includes(MAIN_GREEN_GATE_PATTERN)) continue; // BR#5847: structurally vacuous on some tip classes
+    if (isBaseHealthGateName(name)) continue; // BR#5847: structurally vacuous on merge-commit tips
     missingRequired.push(name);
   }
   if (missingRequired.length && res.verdict !== "red") {

@@ -59,11 +59,33 @@ const lineErrorLabels = {
   no_executor: "No executor is active",
 } as const;
 type LineError = keyof typeof lineErrorLabels;
+
+/** BR#14088 (no green until settled): the ONE line-health vocabulary every
+ * surface renders from — lane base_state verdicts, train stop logic, the lane
+ * banner and TrainPanel. `unsettled` is SETTLING (amber, never green): a
+ * required check that is queued/in_progress — or whose check-run has not been
+ * created yet (the post-admission smoke window) — settles before the line may
+ * report green. `empty` is UNKNOWN, never green. Green means every required
+ * check at the observed tip completed success. */
+export type LineHealth = "green" | "settling" | "red" | "unknown";
+export const LineHealthSchema = z.enum(["green", "settling", "red", "unknown"]);
+export function lineHealthFromBaseState(bs: { verdict?: string | null } | null | undefined): LineHealth {
+  switch (bs?.verdict) {
+    case "green": return "green";
+    case "red": return "red";
+    case "unsettled": return "settling";
+    default: return "unknown";
+  }
+}
+
 const LineFields = z.object({
   reason: z.string(),
   evidence: z.array(EvidenceSchema),
   held: z.number().int().nonnegative(),
   observed_at: z.number(),
+  /** BR#14088: shared line-health classifier stamp — settling/unknown never
+   * render green anywhere. Derived from base_state (or verifying_base). */
+  health: LineHealthSchema.optional(),
   recoveries: z.array(z.object({ episode: RecoveryEpisodeSchema, task: TrainFixCardSchema.nullable() })).optional(),
 });
 /** Closed state machine: healthy/retired cannot carry a blocker, while an
@@ -172,6 +194,7 @@ export function trainBaseObservedAt(q: { at?: number; base_observed_at?: number 
 export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProjection {
   const q = f.queue_facts;
   const bs = q?.base_state;
+  const health = lineHealthFromBaseState(bs);
   const cov = bs?.deploy_coverage;
   const observedAt = trainBaseObservedAt(q);
   const fresh = !!bs && observedAt > 0 && now - observedAt < 15 * 60_000;
@@ -189,7 +212,9 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     ? `PR #${mergeResponse.pr} is merged. Bridge is verifying deployment; a merge receipt is not a green deployment.`
     : `Your merge response for PR #${mergeResponse.pr} is recorded. Bridge is checking GitHub before verifying deployment.` : "";
   const make = (...[phase, label, reason, blocker, evidence, remediation]: LineArgs): TrainLineProjection =>
-    TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: observedAt, remediation });
+    TrainLineProjectionSchema.parse({ phase, label, reason, blocker, evidence, held: f.queue.length, observed_at: observedAt, remediation,
+      // BR#14088: every projection arm carries the shared health stamp.
+      health: f.verifying_base ? lineHealthFromBaseState(f.verifying_base) : health });
   const error = (cause: LineError, reason: string, remediation: LineRemediation) =>
     make("error", lineErrorLabels[cause], reason, cause, [], remediation);
   const repair = (): LineRemediation => {

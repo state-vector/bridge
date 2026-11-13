@@ -292,6 +292,21 @@ describe("one line status and recovery contract", () => {
     expect(recovered).toMatchObject({ phase: "ready", blocker: null, remediation: null });
   });
 
+  it("BR#14088: settling (unsettled) base renders waiting/amber with health=settling — never ready; health stamps green/red/unknown elsewhere", () => {
+    const settling = projectTrainLine(facts({ queue: [{ id: "BR#1" }],
+      queue_facts: { at: now, base_state: { verdict: "unsettled", unsettled: ["Cortex Quality Smoke (awaiting first run)"] } },
+      capable: { ready: true, at: now, holder: "gateway" } }), now);
+    expect(settling).toMatchObject({ phase: "waiting", blocker: "checks_running", health: "settling" });
+    expect(settling.reason).toContain("Cortex Quality Smoke (awaiting first run)");
+    const green = projectTrainLine(facts({ queue: [{ id: "BR#1" }], queue_facts: { at: now, base_state: { verdict: "green" } },
+      capable: { ready: true, at: now, holder: "gateway" } }), now);
+    expect(green).toMatchObject({ phase: "ready", health: "green" });
+    const red = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "red", red: [{ name: "Cortex Quality Smoke" }] } } }), now);
+    expect(red).toMatchObject({ phase: "base_red", health: "red" });
+    const noChecks = projectTrainLine(facts({ queue_facts: { at: now, base_state: { verdict: "empty" } } }), now);
+    expect(noChecks).toMatchObject({ phase: "error", health: "unknown" });
+  });
+
   it("BR#6901: queue activity and executor heartbeats cannot refresh idle main health", () => {
     for (const verdict of ["green", "unsettled", "red"] as const) {
       const line = projectTrainLine(facts({

@@ -2018,17 +2018,32 @@ every tick. Two laws now hold:
   tip that HAS runs, `base_state` carries `alarm: "<N> runs read, none matched required set — check names/pagination"`;
   a tip with zero total runs carries the sibling `alarm: "tip carries no check runs at all"`,
   and the hub's `empty` blocked reason renders the alarm verbatim instead of a silent `config?`.
-- **No green until settled (BR#14088)**: a required check that is queued/in_progress (GitHub files a
-  check run's `conclusion` only at completion, so an in-flight run reads `conclusion: null`) has NO
-  verdict yet — the rollup reads `settling`, rendered amber, never green; and a required name with no
-  check run at all yet (the post-admission deploy smoke starts LAST, ~40–60 min after push) is IN
-  FLIGHT, not absent — it reads `settling "(awaiting first run)"`. The lane may only enter a green
-  state when every required check is completed-success at the observed tip. In-flight names ride
-  `base_state.settling[]` AND fold into `unsettled[]` so every list consumer keeps naming them; the
-  documented exception is the BR#5847 vacuity class (a structurally-absent merge-gate name never
-  blocks certification — the BR#5883 qualifier owns that read). The published stamp no longer goes
-  green mid-drain either (BR#4934 admission law untouched — gates keep their own verdict; only the
-  stamp is honest).
+- **No green until settled (BR#14088, required-name completeness)**: a required check that is
+  queued/in_progress (GitHub files a check run's `conclusion` only at completion, so an in-flight
+  run reads `conclusion: null`) has NO verdict yet — the rollup reads `settling`, rendered amber,
+  never green; and a required name with no check run at all yet (the post-admission deploy smoke
+  starts LAST, ~40–60 min after push — `Cortex Quality Smoke` starts only after the deploy job
+  finishes) is IN FLIGHT, not absent — it reads `settling "(awaiting first run)"`. The specimen:
+  on 2026-11-12 every "0 failing checks" read called main `edfb114682` green for ~50min while the
+  smoke verdict was actually unknown (it settled red at 21:06Z). The lane may only enter a green
+  state when every required check is completed-success at the observed tip, and a red verdict is
+  never downgraded. In-flight and awaiting names ride `base_state.settling[]` AND fold into
+  `unsettled[]` so every list consumer keeps naming them; the documented exception is the
+  BR#5847 vacuity class (base-health gate names — `main-green gate`, `Deploy health …` — are
+  train-dispatched and structurally absent on merge-commit tips, so they never block
+  certification — the BR#5883 whole-tip qualifier owns that read). One shared line-health
+  vocabulary renders everywhere — `LineHealth` (green / settling / red / unknown,
+  `lineHealthFromBaseState` in `@bridge/contracts`) — stamped as `health` on every
+  `TrainLineProjection` arm and consumed by the lane banner, the train stop logic and the
+  TrainPanel chip (settling shows the amber `settling` badge). The published stamp no longer goes
+  green mid-drain either (BR#4934 admission law untouched — gates keep their own verdict; only
+  the stamp is honest).
+  **Reading check state by hand (agent sessions probing with `gh`)?** The same law
+  binds you: a check-run with `conclusion: null` is IN FLIGHT, and a required name
+  absent from `commits/<sha>/check-runs` has NOT STARTED — "0 failing" is not green;
+  green is "every required check completed success at this sha". Filtering a rollup
+  by `conclusion == "failure"` is exactly the query that fabricated the 2026-11-12
+  green.
 - **Loud BLOCKED (the lane)**: every walk stamps its base verdict into the lane
   (`train.queue_facts` carries `base_state: {verdict, scoped_to_required, red[],
   settling[], unsettled[]}`, served whole by `train.status`), and a non-green base holding
@@ -3550,6 +3565,21 @@ daemon never writes the board; the hub never touches GitHub. A report per repo p
   only; it never queues, stamps, or merges.
 - **destination-blocked** (BLOCKED/BEHIND) binds WITHOUT a verify duty — a verify would
   bounce on mergeability by construction; the duty comes when a later cycle sees CLEAN.
+- **dead-runner rescue (BR#14364)**: an UNBOUND mergeable PR past the verify grace whose
+  title carries exactly one `BR#N` marker (the branch segment `brN`/`br-N` is the fallback;
+  two distinct ids in one source bind NOTHING) names its origin card — the dispatched
+  runner that opened the PR died before its in_review transition (specimen BR#14125/#3191:
+  the card sat `todo` ~4h with a fully green PR while typed br_done waits froze behind it).
+  The hub binds the PR to that card and ADVANCES it through the machine's own
+  todo → in_progress → in_review walk (`meta.pr` stamped first, the standard verify duty
+  riding the normal in_review flow) — the delivery is observable, so the handoff no longer
+  depends on the delivering session surviving. Cards whose lifecycle must not be touched
+  (in_review/blocked, an open bound ask, a live verify child, a pending review round, a
+  live strand owner, a non-delivery completion contract, standing/lane/machine-duty/
+  verdict-role cards, merge-train stamps, a card bound to a different PR) get bind-only —
+  the PR becomes visible, the card's own lifecycle continues; a named card that cannot
+  legally carry the delivery degrades to the tracking projection; a gate refusal mid-walk
+  stands the binding audited, never retried in-cycle.
 - **dead duty ⇒ ALARM**: the duty ledger (`reconcile_duties`) holds one row per
   repo+pr+kind EVER, so a duty that ended without binding its PR alarms instead of
   silently respawning over the corpse.

@@ -19,6 +19,21 @@
  *  while the train held 37 cars. `unreviewed` counts only
  *  genuinely-unbound PRs.
  *
+ *  BR#14364: a dispatched runner that opens its PR and then DIES before the
+ *  in_review transition leaves the card open and UNBOUND (the meta.pr stamp
+ *  only lands at verify acceptance / tracking-card creation / train queue)
+ *  while the PR reads unreviewed (reviewDecision="" is the repo-wide
+ *  phenomenon, BR#5677) — the grace bucket below swallows it for a full
+ *  disposition day while the PR sits green. A PR that NAMES its origin card
+ *  (the runner's title carries the `BR#N` marker; the branch segment
+ *  `brN`/`br-N` is the fallback) and is mergeable past the verify grace
+ *  emits `bind_origin`: the DO binds it to that card and advances the
+ *  stranded delivery through the normal gates (or falls back to the
+ *  tracking path when the named card cannot legally carry the delivery).
+ *  Inference is fenced tight: exactly ONE distinct id in one marker source,
+ *  never a draft, never an ignored PR, never before the verify grace — a
+ *  wrong auto-bind would advance the wrong card.
+ *
  *  Division of labour (accepted BR#3507/BR#3499: the hub holds NO VCS
  *  credentials): a gateway daemon runs the read-only `gh pr list` and feeds
  *  observations via reconcile.report; the HUB owns this join, the decisions,
@@ -188,6 +203,11 @@ export type ReconcileDecision =
   /** Destination-blocked approved PR (base red/behind): bind it so it is
    *  visible; the verify duty comes when a later cycle sees it mergeable. */
   | { action: "spawn_tracking" }
+  /** BR#14364: an unbound PR that names its origin card via marker and is
+   *  mergeable past the verify grace — the dispatched runner died before
+   *  its in_review transition. The DO binds it to the named card and
+   *  advances the stranded delivery (or falls back to the tracking path). */
+  | { action: "bind_origin"; card: string }
   /** Young (or unreviewed/draft) — inside the actionable-age grace window. */
   | { action: "grace" }
   /** Reverse reconcile: the PR was seen this cycle — clear any missing marker. */
@@ -271,6 +291,37 @@ export function prAgeMs(updatedAt: string | null, now: number): number {
   const t = Date.parse(updatedAt);
   if (!Number.isFinite(t)) return 0;
   return Math.max(0, now - t);
+}
+
+/** BR#14364: the origin card a PR names via marker, or null. The title
+ *  marker (`BR#N`, the runner's commit-title convention) is authoritative;
+ *  the branch marker (`brN` / `br-N` / `br_N` / `br/N` as a segment-bounded
+ *  token) is the fallback for titled-but-unmarked PRs (e.g.
+ *  `fix/br14125-chat-scope`).
+ *  Ambiguity binds NOTHING — two distinct ids in one source is a coin-flip
+ *  on someone else's card, and a wrong auto-bind advances the wrong card.
+ *  Leading zeros normalize (`BR#0042` → `BR#42`); `0`/`000` is no id.
+ *  Returns the canonical hub id (`BR#<n>`), matching formatId. */
+export function originTaskId(title: string | null | undefined, headRefName: string | null | undefined): string | null {
+  const idsFrom = (text: string, re: RegExp): Set<string> => {
+    const ids = new Set<string>();
+    for (const m of text.matchAll(re)) {
+      const digits = m[1];
+      if (digits.length > 9) continue; // no card seq is 10 digits — noise, not a marker
+      const n = parseInt(digits, 10);
+      if (n > 0) ids.add(String(n));
+    }
+    return ids;
+  };
+  if (title) {
+    const ids = idsFrom(title, /BR#(\d+)/gi);
+    if (ids.size === 1) return `BR#${[...ids][0]}`;
+  }
+  if (headRefName) {
+    const ids = idsFrom(headRefName, /(?:^|[\/_-])br[\/_-]?(\d+)(?:$|[\/_-])/gi);
+    if (ids.size === 1) return `BR#${[...ids][0]}`;
+  }
+  return null;
 }
 
 /** The accounting line — THE canary for the invariant. A run with any
@@ -443,6 +494,26 @@ export function reconcileJoin(args: {
         judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: boundReason(approved, verifyEligible, age, cfg) });
       }
       continue;
+    }
+    // BR#14364: the dead-runner rescue — BEFORE the unreviewed swallow,
+    // because the swallow is exactly the 4-hour hole this closes (an
+    // unbound green PR whose runner died pre-transition reads unreviewed
+    // here and would sit in the grace bucket for a disposition day).
+    // Marker-bound to its origin card; every fence the advance needs is
+    // checked by the DO leg at apply time (the join only sees the feed).
+    if (!p.isDraft && !ignores.has(p.number) && !!p.headRefOid && age > cfg.verify_age_ms) {
+      // "greenish" = could pass the 5c gate today or is merely unprobed:
+      // mergeable+CLEAN/UNSTABLE, or the bulk feed's UNKNOWN/UNKNOWN (the
+      // independent verifier reads the exact head before any acceptance).
+      const greenish = (p.mergeable === "MERGEABLE" && ["CLEAN", "UNSTABLE"].includes(p.mergeStateStatus ?? ""))
+        || ((p.mergeable == null || p.mergeable === "UNKNOWN") && (p.mergeStateStatus == null || p.mergeStateStatus === "UNKNOWN"));
+      const origin = greenish ? originTaskId(p.title, p.headRefName) : null;
+      if (origin) {
+        acc.spawned++;
+        acc.accounted++;
+        judgements.push({ pr: p.number, decision: { action: "bind_origin", card: origin }, reason: `unbound PR names origin card ${origin} and is mergeable past the verify grace — the dispatched runner likely died before its in_review transition (BR#14364); binding + advancing` });
+        continue;
+      }
     }
     // BR#5677: only GENUINELY-unbound PRs reach the unreviewed bucket — a
     // bound PR above is accounted whatever GitHub says about its reviews.

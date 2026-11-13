@@ -66,3 +66,21 @@ it("shows an execution-owned PR alongside the idle train", () => {
   expect(html).toContain("0 changes queued");
   expect(html).not.toContain("Merge machinery stalled");
 });
+
+it("BR#14088: a settling lane renders the amber settling badge, never a green read", () => {
+  const now = 1_800_000_000_000;
+  const lane: KbTrainLane = { card: "BR#1", lane: "test/repo@main", lease: null, currently: null, stop: null, queue: [],
+    line: { phase: "waiting", label: "Required checks are running", reason: "Cortex Quality Smoke (awaiting first run)", blocker: "checks_running",
+      remediation: { kind: "machine", text: "Watching required checks; changes resume automatically when they pass.", url: null },
+      held: 2, observed_at: now, evidence: [], health: "settling" },
+  };
+  const html = renderToStaticMarkup(<TrainPanelView lanes={[lane]} error={null} now={now} />);
+  expect(html).toContain("train-settling-badge");
+  expect(html).toContain(">settling</span>");
+  expect(html).toContain("Required checks are running");
+  expect(html).not.toContain("STOP-THE-LINE");
+  // a green line carries no settling badge
+  const green = { ...lane, line: { ...lane.line!, phase: "ready" as const, label: "ready" as const, blocker: null, remediation: null, health: "green" as const } };
+  const greenHtml = renderToStaticMarkup(<TrainPanelView lanes={[green]} error={null} now={now} />);
+  expect(greenHtml).not.toContain("train-settling-badge");
+});
