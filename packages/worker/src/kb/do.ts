@@ -16731,7 +16731,7 @@ export class KnowledgeHub {
     // tick), so a stable satisfied-but-held park costs one duty total and
     // every later tick cites instead of re-deriving from scratch.
     const waitRow = this.one(
-      `SELECT await_event FROM artefacts WHERE id = ? AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event') IS NOT NULL`,
+      `SELECT json_extract(meta, '$.blocked.await_event') AS await_event FROM artefacts WHERE id = ? AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event') IS NOT NULL`,
       taskId,
     ) as any;
     const awaitEventKey = waitRow?.await_event ? JSON.stringify(validateAwaitEvent(waitRow.await_event) ?? waitRow.await_event) : (waitEpisode ?? "");
