@@ -1265,6 +1265,20 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // zero orphan legs — folded "unclassified" and raised BR#9534). Named so
   // the Log says WHAT fenced.
   close_leg_fence: Number.POSITIVE_INFINITY,
+  // BR#7721 — the execution-acceptance review gate (do.ts:7622, the
+  // doTransition review_result path): a verify duty closing in_review with
+  // review_result {kind:"accepted_execution"} on a card whose completion
+  // contract is not an execution contract, or whose submitted
+  // execution_result is absent, is refused with "gate: execution acceptance
+  // requires an execution contract and the subject's submitted
+  // execution_result". The gate refusing IS the completion-kind enforcement
+  // working — the BR#4562/BR#6654/BR#7008/BR#7684 pricing family again: zero
+  // state destroyed, and the refusal names its own cure (submit the
+  // execution_result the card's declared contract demands). Specimen: 3
+  // gate rejections on BR#7699, 2026-11-07 09:20:32–09:23:47Z, folded
+  // "unclassified" (default threshold 3) and raised breach card BR#7721.
+  // Named so the Log says WHAT fenced; priced never-a-breach.
+  execution_acceptance_fence: Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1465,6 +1479,18 @@ export function breachClass(reason: string): string {
   // zero orphan legs, fully compliant), folded "unclassified" and raised
   // breach card BR#9534. The class is named so the Log says WHAT fenced.
   if (r.includes("terminal close leg(s) not receipted")) return "close_leg_fence";
+  // BR#7721: the execution-acceptance review gate (do.ts:7622) — a verify
+  // duty's accepted_execution verdict on a card with no execution
+  // completion contract or no submitted execution_result is refused with
+  // "gate: execution acceptance requires an execution contract and the
+  // subject's submitted execution_result". The refusal IS the
+  // completion-kind enforcement working — the BR#4562/BR#6654/BR#7008/
+  // BR#7684 pricing family again. Match the structural fragment "execution
+  // acceptance requires", not the whole sentence (BR#3611/BR#3612
+  // wording-drift lesson); it sits ~6 chars in, far inside the 300-char
+  // audit slice, so the classification survives any tail. Specimen:
+  // BR#7699, 3 events 2026-11-07 09:20:32–09:23:47Z (breach card BR#7721).
+  if (r.includes("execution acceptance requires")) return "execution_acceptance_fence";
   return "unclassified";
 }
 

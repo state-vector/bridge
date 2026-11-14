@@ -2191,6 +2191,44 @@ describe("breachClass: rebind_fence (BR#9703)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#7721 — the execution-acceptance review gate (do.ts:7622, the
+// doTransition review_result path): a verify duty closing in_review with
+// review_result {kind:"accepted_execution"} on a card whose completion
+// contract is not an execution contract, or whose submitted
+// execution_result is absent, is refused with "gate: execution acceptance
+// requires an execution contract and the subject's submitted
+// execution_result". The gate refusing IS the completion-kind enforcement
+// working (the BR#4562/BR#6654/BR#7008/BR#7684 pricing family): zero state
+// destroyed, and the refusal names its own cure. Specimen: 3 gate
+// rejections on BR#7699, 2026-11-07 09:20:32–09:23:47Z, folded
+// "unclassified" (default threshold 3) and raised breach card BR#7721.
+// The class is named so the Log says WHAT fenced, and priced never-a-breach
+// so compliance can never arm a card.
+// ---------------------------------------------------------------------------
+describe("breachClass: execution_acceptance_fence (BR#7721)", () => {
+  // the exact audited reason shape (do.ts:7622, thrown message, no [rule:] tag)
+  const FENCE = "gate: execution acceptance requires an execution contract and the subject's submitted execution_result";
+
+  it("the acceptance refusal classifies execution_acceptance_fence from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("execution_acceptance_fence");
+    // the stem sits ~6 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("execution_acceptance_fence");
+  });
+
+  it("an acceptance-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#7699", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["execution_acceptance_fence"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
