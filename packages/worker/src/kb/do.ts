@@ -190,6 +190,10 @@ import {
   decideProseDisposition,
   // consumed-wait auto-resume (BR#14544)
   decideConsumedWaitResume,
+  // mortal asks + duty coalescing (BR#14583)
+  decideAskReap,
+  decideRecoveryCoalesce,
+  ASK_REAP_TTL_HOURS_DEFAULT,
   type ConsumedWaitResumeInput,
   type ConsumedWaitResume,
   PROSE_CLASS_QUIET_MS,
@@ -2758,8 +2762,18 @@ export class KnowledgeHub {
     const otherOpenAsk = meta.awaiting_ask?.ask_id && (!aw || aw.event !== "ask" || aw.ask_id !== meta.awaiting_ask.ask_id)
       ? this.one(`SELECT status FROM artefacts WHERE id = ?`, meta.awaiting_ask.ask_id)
       : null;
+    // BR#14583 live-hold law: an interactive hold (BR#6068) blocks the
+    // mechanical resume only while its holder session is LIVE (the same
+    // holderIsAlive signal the rest of the resume family trusts). A hold
+    // whose session went silent days ago is a zombie hold — the satisfied
+    // park auto-resumes to the dispatch pool, where a FRESH interactive
+    // credential claims it under the unchanged credential gate (the hub
+    // releases nothing a live human/agent still owns).
+    const interactiveHoldLive = meta.interactive_execution
+      ? this.holderIsAlive({ ...meta, session: String(meta.interactive_execution.session ?? meta.session ?? "") }, "")
+      : false;
     const humanBound =
-      !!meta.interactive_execution // interactive hold (the BR#6068 class)
+      !!interactiveHoldLive // interactive hold (the BR#6068 class) — LIVE holds only
       || !!meta.operator_gated // a human clears the gate
       || !!meta.delivery_disposition // conservation-law closure owns the exit
       || !!(askMeta && (isHumanDecisionAsk(askMeta) || askMeta.decision)) // the resolved ask was a human decision
@@ -2820,7 +2834,13 @@ export class KnowledgeHub {
     if (JSON.stringify(validateAwaitEvent(meta.blocked?.await_event)) !== JSON.stringify(expected)
       || meta.blocked?.ts !== evaluated.blocked?.ts) return false;
     if (this.isUnclaimableAnchor(row, meta) || meta.lane || meta.operator_gated || meta.delivery_disposition
-      || meta.interactive_execution || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id, expiredAsk)) return false;
+      // BR#14583 live-hold law: an interactive hold refuses the mechanical
+      // resume only while its holder session is live — a dead hold (silent
+      // past the stale window, the BR#6068 zombie-park class) releases to
+      // the pool; a fresh interactive credential re-claims under the
+      // unchanged gate. The hold is consumed with the wait.
+      || (meta.interactive_execution && this.holderIsAlive({ ...meta, session: String(meta.interactive_execution.session ?? meta.session ?? "") }, ""))
+      || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id, expiredAsk)) return false;
     if (["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))) return false;
     const execution = this.executionState(id);
     if (execution?.attempt && execution.attempt.phase !== "quiesced"
@@ -2834,6 +2854,9 @@ export class KnowledgeHub {
     const predicate = meta.blocked;
     delete meta.blocked; delete meta.awaiting_ask; delete meta.last_unblock_spawn;
     delete meta.consumed_wait_fallback; // BR#14544: the fallback round is consumed with the wait
+    // BR#14583: a consumed interactive hold (dead at the guard above) is
+    // consumed with the wait — the re-claimed card starts hold-free.
+    delete meta.interactive_execution;
     if (continuation.kind === "satisfied" || autoResume) meta.proxy_check = { at: now, verdict: "true", receipts: continuation.receipts };
     else delete meta.proxy_check;
     if (autoResume) {
@@ -9198,6 +9221,11 @@ export class KnowledgeHub {
     await this.reconcileCompletedReviews();
     this.retireCompletedCoordination(now);
     this.retryExpiredRecoveryCoordination(now);
+    // BR#14583 — the ask reaper runs first: a reaped (dead-asker, over-TTL)
+    // ask unbinds its bound card before the reroute loop below could judge
+    // the card on a wait that no longer exists. Reroute and reap are
+    // disjoint (reroute: ONLINE-targeted delivery failure; reap: dead asker).
+    const reaped = this.reapMortalAsks(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
     const ttlMs = ttlMin * 60_000;
@@ -9235,7 +9263,102 @@ export class KnowledgeHub {
       this.audit("system:watchdog", "ask_rerouted", r.id, { to, ttl_min: ttlMin, presence_source: presence.source, artefact_bound: ask.artefact_id ?? null });
       escalated.push(r.id);
     }
+    escalated.push(...reaped);
     return escalated;
+  }
+
+  /** BR#14583 — the ask reaper: mortal asks. A machine ask whose asker
+   *  session died sits open forever (the 50-ask pile-up class): no TTL, no
+   *  dead-asker detection, and every bound card waits on `await ask` with
+   *  the watchdog paused. The reaper expires the ask as system:reaper,
+   *  unbinds each bound card, and releases it to the dispatch pool via the
+   *  proven CAS'd continueBlockedWork resume (full guard set re-checked);
+   *  a guard-tripped card is re-parked on its underlying machine-checkable
+   *  wait (or a fresh time re-arm when none survives) — never left holding a
+   *  dead ask. Human-targeted asks are Ray's alone — never expired. */
+  private reapMortalAsks(now: number): string[] {
+    const ttlHours = Math.max(1, Math.min(24 * 30, parseInt(
+      this.settingValue("ask_reap_ttl_hours", String(ASK_REAP_TTL_HOURS_DEFAULT)).replace(/[^0-9]/g, ""), 10) || ASK_REAP_TTL_HOURS_DEFAULT));
+    const ttlMs = ttlHours * 3_600_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta, created_ts FROM artefacts
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked') AND created_ts < ?`,
+      now - ttlMs,
+    ).toArray() as any[];
+    const reaped: string[] = [];
+    for (const r of rows) {
+      let m: any;
+      try { m = JSON.parse(r.meta ?? "{}"); } catch { continue; }
+      const ask = m.ask;
+      if (!ask || ask.reaper || ask.recovery || isHumanDecisionAsk(ask)) continue;
+      // dead-ASKER detection (the pile-up's cause): the asker (ask.from) is
+      // the session that minted the ask; if it never connected or went
+      // silent past the presence window, nobody can answer-by-asker and the
+      // addressee pool has likely churned past it entirely.
+      const asker = String(ask.from ?? "").trim();
+      if (!asker) continue; // provenance-free legacy ask: not machine-reapable
+      const presence = this.askTargetPresence(asker, now);
+      const disposition = decideAskReap({
+        humanTargeted: isHumanDecisionAsk(ask),
+        askerAlive: presence.online,
+        ageMs: now - Number(r.created_ts ?? 0),
+        ttlMs,
+      });
+      if (disposition.action === "keep") continue;
+      // expire the ask as system:reaper (same write shape as cancelRequest,
+      // no answer verb dispatch — the ask is dead, not answered)
+      const askNow = Date.now();
+      m.ask = { ...m.ask, resolution: { kind: "reaped", reason: disposition.reason, by: "system:reaper", ts: askNow } };
+      delete m.human_claimed;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ? AND status IN ('todo','in_progress','blocked')`,
+        askNow, askNow, JSON.stringify(m), r.id,
+      );
+      this.version(String(r.id), "system:reaper", "transition", `ask reaped: ${disposition.reason}`, { from: "open", to: "done", resolution: m.ask.resolution });
+      this.audit("system:reaper", "ask_reaped", String(r.id), { asker, age_h: Math.round((now - Number(r.created_ts ?? 0)) / 3_600_000), ttl_h: ttlHours, presence_source: presence.source });
+      reaped.push(String(r.id));
+      // unbind + re-park every card this dead ask held
+      const bound = this.state.storage.sql.exec(
+        `SELECT id, meta FROM artefacts
+         WHERE type = 'task' AND status = 'blocked' AND (
+           json_extract(meta, '$.awaiting_ask.ask_id') = ?
+           OR (json_extract(meta, '$.blocked.await_event.event') = 'ask' AND json_extract(meta, '$.blocked.await_event.ask_id') = ?)
+         )`, r.id, r.id,
+      ).toArray() as any[];
+      for (const b of bound) {
+        const id = String(b.id);
+        let bm: any;
+        try { bm = JSON.parse(b.meta ?? "{}"); } catch { continue; }
+        const wait = validateAwaitEvent(bm.blocked?.await_event);
+        // BR#3819-D live-holder guard (mirror of consumedWaitResumeGuards):
+        // a live holder's exit is not the reaper's to take — strip and
+        // re-arm instead of the CAS'd blind resume.
+        const liveHolder = (Boolean(String(bm.session ?? "").trim()) || Boolean(bm.last_progress?.ts))
+          ? this.holderIsAlive(bm, "") : false;
+        // the CAS'd mechanical resume: consume the dead ask wait, release the
+        // card to the dispatch pool (todo) — every protection (live executor,
+        // verdict duty, train, infra anchor, prepared op) re-checked inside.
+        if (!liveHolder && wait?.event === "ask" && wait.ask_id === String(r.id)
+          && this.continueBlockedWork(id, bm, { kind: "expired_coordination", ask_id: String(r.id) })) continue;
+        // guarded (or marker-only) card: strip the dead ask's markers and
+        // re-park on the underlying machine-checkable wait — a fresh time
+        // re-arm when the ask WAS the wait (BR#5916's zombie-park law: never
+        // leave an expired atom in place with no legal leg left).
+        const stripAsk = wait?.event === "ask" && wait.ask_id === String(r.id);
+        const hadMarker = bm.awaiting_ask?.ask_id === String(r.id);
+        if (!stripAsk && !hadMarker) continue;
+        if (hadMarker) delete bm.awaiting_ask;
+        if (stripAsk) {
+          const rearm = now + ANCHOR_REARM_MS;
+          bm.blocked = { ...(bm.blocked ?? {}), reason: `ask ${r.id} reaped by system:reaper (${disposition.reason}) — machine re-armed on a fresh time wait until ${new Date(rearm).toISOString()}`, await_event: { event: "time", until_ts: rearm } };
+          delete bm.proxy_check;
+        }
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(bm), Date.now(), id);
+        this.version(id, "system:reaper", "update", `bound ask ${r.id} reaped — markers stripped${stripAsk ? ", wait re-armed (machine re-park)" : ""}; the dead ask no longer holds this card`, { ask: String(r.id), reaped_wait: stripAsk });
+        this.audit("system:reaper", "ask_unbound", id, { ask: String(r.id), reaped_wait: stripAsk });
+      }
+    }
+    return reaped;
   }
 
   private retryExpiredRecoveryCoordination(now: number): void {
@@ -16570,6 +16693,9 @@ export class KnowledgeHub {
     }
   }
 
+  /** A persisted, already-authorised command survives an executor crash. The
+   * existing gate is the only writer of a drop; semantic refusals terminate
+   * this command and are never retried on the next alarm. */
   private async ensureTaskRecovery(
     taskId: string, reason: RecoveryReason, waitEpisode?: string, conflict?: { repo: string; pr: number },
   ): Promise<string> {
@@ -16595,11 +16721,55 @@ export class KnowledgeHub {
         AND json_extract(meta, '$.blocked.await_event.repo') = ?
         AND json_extract(meta, '$.blocked.await_event.n') = ?, 0)
       ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "", reason, conflict?.repo ?? null, conflict?.pr ?? null);
+    // BR#14583 — duty coalescing, cite-don't-re-derive: recovery spawns key on
+    // (subject, await_event) with a cite-don't-re-derive pointer to the last
+    // disposition. The active-dedup query above keys on (subject, episode);
+    // this second key closes the per-tick re-derivation churn (BR#12180's
+    // contract, machine-enforced): a stable satisfied-but-held park spawns
+    // ZERO new duties per tick — the fresh tick CITES the last disposition
+    // (meta.recovery_coalesce receipt, idempotent — same key never re-stamps)
+    // instead of re-verifying the same state from scratch.
+    const wait = this.one(
+      `SELECT await_event FROM artefacts WHERE id = ? AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event') IS NOT NULL`,
+      taskId,
+    ) as any;
+    const awaitEventKey = wait?.await_event ? JSON.stringify(validateAwaitEvent(wait.await_event) ?? wait.await_event) : (waitEpisode ?? "");
+    const coalesce = decideRecoveryCoalesce({
+      subject: taskId,
+      awaitEventKey,
+      existing: active ? { id: String(active.id) } : null,
+    });
+    if (!active) {
+      const previous = this.one(
+        `SELECT id FROM artefacts WHERE type = 'task' AND status IN ('done','superseded')
+           AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery'
+           AND json_extract(meta, '$.machine_duty.subject') = ?
+           AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
+         ORDER BY updated_ts DESC LIMIT 1`,
+        taskId, awaitEventKey,
+      );
+      if (previous) {
+        // cite-don't-re-derive: stamp the LAST disposition's id on the subject
+        // (idempotent — the content-derived key never re-stamps per tick).
+        const freshRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+        const subjMeta = JSON.parse(String(freshRow?.meta ?? "{}"));
+        const stamp = { key: coalesce.key, cited_duty: String(previous.id), reason, ts: subjMeta.recovery_coalesce?.ts };
+        if (JSON.stringify(stamp) !== JSON.stringify({ ...stamp, ts: subjMeta.recovery_coalesce?.ts }) || subjMeta.recovery_coalesce?.key !== coalesce.key) {
+          subjMeta.recovery_coalesce = { key: coalesce.key, cited_duty: String(previous.id), reason, ts: subjMeta.recovery_coalesce?.ts ?? Date.now() };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(subjMeta), Date.now(), taskId);
+        }
+        this.audit("system:recovery", "duty_coalesced", taskId, { cited_duty: String(previous.id), key: coalesce.key, reason });
+        return String(previous.id);
+      }
+    }
     if (active) return String(active.id);
     const parent = this.one(`SELECT title, project FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
     const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "repeated_failure" ? "Diagnose repeated execution failures" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
-    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), project: parent.project, session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason, ...(waitEpisode && { wait_episode: waitEpisode }) } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
+    // BR#14583: fresh duty carries the coalesce key it was spawned under, so
+    // the next tick's dedup query reads it without re-deriving the episode.
+    const coalesceKey = coalesce.key;
+    const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), project: parent.project, session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason, ...(waitEpisode && { wait_episode: waitEpisode }), ...(coalesceKey && { coalesce_key: coalesceKey }) } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
 

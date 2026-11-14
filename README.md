@@ -3740,6 +3740,29 @@ closes those leaks with four hub mechanisms:
   authority, never by relaxing the gate. A tripped guard falls back to today's duty spawn, with the
   fallback reason (live executor / verdict duty / human-bound / unverified predicate) annotated loud on
   the round so its escalation ask rides `time-sensitive` instead of aging silently.
+- **Mortal asks + machine resume edges + duty coalescing** (BR#14583 — the 50-ask pile-up class): asks are
+  **mortal** (a): the ask reaper (`reapMortalAsks`, riding the alarm sweep's
+  `escalateStaleAsks` cadence) expires a machine ask whose **asker session is dead** once it
+  sits past `ask_reap_ttl_hours` (default 48) — the ask lands `done` with
+  `meta.ask.resolution {kind:"reaped", by:"system:reaper"}`, and every card it bound
+  (`awaiting_ask` marker or a typed `await ask`) is **unbound and released to the dispatch
+  pool** via the same CAS'd `continueBlockedWork` consumption the consumed-wait resume
+  rides (a live holder is never blind-resumed: its markers are stripped and the card
+  re-parked on a fresh machine-checkable time wait — never left holding a dead ask;
+  BR#3819-D). **Human-targeted asks never expire** (`to: human/ray/rayh`, any
+  `human_decision` route) — the human inbox is Ray's alone. **Machine resume edges** (b):
+  the consumed-wait auto-resume law extends to ask-bound parks on non-verdict cards — an
+  answered bound ask (or a satisfied typed predicate) auto-resumes the card as system
+  actor for ALL wait shapes, and the interactive hold (BR#6068) blocks the mechanical
+  resume only while its **holder session is live** (a zombie hold whose session died
+  days ago releases to the pool; a fresh interactive credential re-claims under the
+  unchanged gate). **Recovery-duty coalescing** (c): `createTaskRecovery` keys recovery
+  spawns on `(subject, await_event)` with a cite-don't-re-derive pointer — a repeat tick
+  on the same stable park CITES the last disposition
+  (`meta.recovery_coalesce {key, cited_duty}`, idempotent — the content-derived key
+  never re-stamps) instead of re-deriving identical state, so a stable parked state
+  costs one duty, not one per tick (BR#12180's contract, machine-enforced). Pinned in
+  `packages/worker/test/br14583-mortal-asks.test.ts`.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.

@@ -1795,6 +1795,76 @@ export function decideConsumedWaitResume(i: ConsumedWaitResumeInput): ConsumedWa
 }
 
 // ---------------------------------------------------------------------------
+// BR#14583 — mortal asks + machine resume edges + recovery-duty coalescing
+// (the 50-ask pile-up class). Pure decision tables, pinned in
+// test/br14583-mortal-asks.test.ts; the DO (kb/do.ts) owns the reaper's
+// effects (ask expiry, unbind, re-park) and the coalescing stamp.
+// ---------------------------------------------------------------------------
+
+/** Default ask TTL: 48h. A machine ask whose asker session died and that sat
+ *  past the TTL is reaped by the hub; human-targeted asks never expire
+ *  mechanically (Ray's alone — the non-goal, pinned). */
+export const ASK_REAP_TTL_HOURS_DEFAULT = 48;
+
+export type AskReapDisposition =
+  | { action: "reap"; reason: string }
+  | { action: "keep"; reason: string };
+
+export interface AskReapInput {
+  /** to: human / ray / rayh (or a human_decision route) — never reaped */
+  humanTargeted: boolean;
+  /** the ASKER's session is live (produced a signal inside the presence
+   *  window) — a live asker's ask is still served, whatever its age */
+  askerAlive: boolean;
+  ageMs: number;
+  ttlMs: number;
+}
+
+/** Guard order = the ask's law: human-targeted asks are mortal never (the
+ *  human inbox is Ray's alone); a live asker keeps its ask served; under the
+ *  TTL the ask is young. Exactly one disposition per ask. */
+export function decideAskReap(i: AskReapInput): AskReapDisposition {
+  if (i.humanTargeted)
+    return { action: "keep", reason: "human-targeted ask — never expired mechanically (Ray's alone)" };
+  if (i.askerAlive)
+    return { action: "keep", reason: "asker session is live — the ask is still served" };
+  if (i.ageMs < i.ttlMs)
+    return { action: "keep", reason: `under the ${(i.ttlMs / 3_600_000).toFixed(1)}h reap TTL` };
+  return {
+    action: "reap",
+    reason: `machine ask sat ${Math.round(i.ageMs / 3_600_000)}h (TTL ${(i.ttlMs / 3_600_000).toFixed(1)}h) with a dead asker session — the bound card would wait forever`,
+  };
+}
+
+/** Recovery-duty coalescing: one duty per (subject, await_event) key — a
+ *  stable parked state costs ONE duty, not one per tick. The key is
+ *  content-derived (the canonical await event, not an at-timestamp), so
+ *  repeated ticks produce the identical fingerprint and never re-stamp
+ *  (cite-idempotence). */
+export type RecoveryCoalesceDisposition =
+  | { action: "cite"; duty_id: string; key: string }
+  | { action: "spawn"; key: string };
+
+export interface RecoveryCoalesceInput {
+  subject: string;
+  /** canonical JSON of the typed await_event keying the coalesce ("" when the
+   *  caller has no await event — falls back to the episode) */
+  awaitEventKey: string;
+  /** the latest OPEN (not done/superseded) duty for this key, if any */
+  existing: { id: string } | null;
+}
+
+/** An open duty with the same (subject, await_event) key is CITED —
+ *  cite-don't-re-derive (BR#12180's contract, machine-enforced): the
+ *  disposition receipt rides the subject, no second duty spawns. A closed or
+ *  missing duty spawns exactly one fresh. */
+export function decideRecoveryCoalesce(i: RecoveryCoalesceInput): RecoveryCoalesceDisposition {
+  const key = `${i.subject}|${i.awaitEventKey}`;
+  if (i.existing) return { action: "cite", duty_id: i.existing.id, key };
+  return { action: "spawn", key };
+}
+
+// ---------------------------------------------------------------------------
 // Serialized merge train (decision BR#3516, accepted; impl BR#3517): one merge
 // at a time per (repo, base) lane, leased to an opportunistic edge executor.
 // Division of labour — the hub holds no VCS credentials, ever: the executor
