@@ -31,7 +31,7 @@ beforeAll(async () => {
 afterAll(async () => { await mf?.dispose(); });
 
 describe("backlog continuation and recorded disposition (real SQLite)", () => {
-  it("a completed unblock round cannot suppress an already-satisfied execution prerequisite forever", async () => {
+  it("a satisfied execution prerequisite resumes the parent without waiting on any unblock round (BR#14544)", async () => {
     const dependency = await task("Delivered prerequisite", {}, ["analysis"]);
     await call("transition", { id: dependency, to: "in_progress", actor: "dependency", session: "dependency" });
     const dependencyDone = await call("transition", { id: dependency, to: "done", actor: "dependency", session: "dependency",
@@ -43,14 +43,8 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(parked.status, JSON.stringify(parked.body)).toBe(200);
     const now = Date.now() + 60 * 60_000;
     await call("admin.unblock_proxy_sweep", { now });
-    const duty = (await children(parent)).find(c => c.roles.includes("unblock"));
-    expect(duty).toBeTruthy();
-    await call("transition", { id: duty.id, to: "in_progress", actor: "unblocker", session: "unblocker" });
-    const finished = await call("transition", { id: duty.id, to: "done", actor: "unblocker", session: "unblocker",
-      execution_result: { outcome: "Prerequisite verified; parent execution remains outstanding", receipts: [dependency] },
-      note: `Unblocked prerequisite verified at https://hub.fleetbridge.run/card/${dependency.replace("#", "-")}; actual parent execution still required.` });
-    expect(finished.status, JSON.stringify(finished.body)).toBe(200);
-    await call("admin.unblock_proxy_sweep", { now: now + 60 * 60_000 });
+    // BR#14544: the machine-verified consumed wait resumes the parent
+    // directly — the satisfied prerequisite is never suppressed by a round
     const resumed = await get(parent);
     expect(resumed.status).toBe("todo");
     expect(resumed.owner).toBe("");
@@ -59,8 +53,12 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(resumed.meta.execution_result).toBeUndefined();
     const history = (await call("get_history", { id: parent })).body.versions;
     expect(history.some((v: any) => v.action === "wait_continued")).toBe(true);
+    // the park-time round was superseded by the resume — and no fresh round
+    // spawns for the consumed wait afterward
     await call("admin.unblock_proxy_sweep", { now: now + 120 * 60_000 });
-    expect((await children(parent)).filter(c => c.roles.includes("unblock"))).toHaveLength(1);
+    const rounds = (await children(parent)).filter(c => c.roles.includes("unblock"));
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0].status).toBe("superseded");
   });
 
   it("retires unbound executor coordination when its addressed task is terminal, without inventing an answer", async () => {

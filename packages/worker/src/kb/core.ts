@@ -1738,6 +1738,63 @@ export function proseAlarmAskTitle(cardSummaries: string[]): string {
 }
 
 // ---------------------------------------------------------------------------
+// BR#14544 — consumed-wait auto-resume. When a blocked card's typed wait
+// fires machine-verified (an ask answered, a timer elapsed, a machine atom
+// TRUE) the hub can resume the card ITSELF as system actor instead of
+// spawning an unblock duty whose dispatched credential is then gate-refused
+// on the parent's mechanical resume (the satisfied-park → pool-ask →
+// gate-refused churn class: the hub never re-spawns that loop in the first
+// place). Pure decision table — do.ts supplies the guards from live board
+// state and executes the winning leg; the resume itself stays a lifecycle
+// transition (machine.ts owns legality), the hub never renders verdicts or
+// closes cards through this edge.
+// ---------------------------------------------------------------------------
+
+/** Why the hub must NOT auto-resume a consumed-wait park. Closed — a new
+ *  protection is a new variant here, never an optional-boolean bag. */
+export type ConsumedWaitFallbackReason =
+  | "live_executor" // a live writer/claim/session (or an in-flight duty child) owns the exit
+  | "verdict_duty" // role:review / role:unblock — separation of duties is not transferable
+  | "human_bound" // human decision / interactive hold / unknown external effect owns the exit
+  | "unverified_predicate"; // no machine-verified receipt backs the fire — a duty re-verifies first-hand
+
+/** The consumed-wait resume decision: resume as system actor, or fall back
+ *  to today's unblock-duty path (whose escalation ask then rides loud). */
+export type ConsumedWaitResume =
+  | { kind: "auto_resume"; receipt: string }
+  | { kind: "duty_fallback"; reason: ConsumedWaitFallbackReason; detail: string };
+
+export interface ConsumedWaitResumeInput {
+  cardId: string;
+  /** the fired predicate carries machine verification (receipts of record) */
+  verified: boolean;
+  verificationReceipt: string;
+  /** a live executor/writer/session (or in-flight duty child) holds the exit */
+  liveExecutor: boolean;
+  /** verdict-duty card (role:review / role:unblock) */
+  verdictDuty: boolean;
+  /** human authority owns the exit (human_decision ask, interactive hold,
+   *  unknown external effects, operator gate, delivery disposition) */
+  humanBound: boolean;
+}
+
+/** Guard order = the card's law: the machine-verified fire is the premise;
+ *  a live executor's exit is not the hub's to take; verdict duties are
+ *  never machine-resumed (separation of duties); human-bound exits stay
+ *  held. Exactly one disposition per fire. */
+export function decideConsumedWaitResume(i: ConsumedWaitResumeInput): ConsumedWaitResume {
+  if (!i.verified)
+    return { kind: "duty_fallback", reason: "unverified_predicate", detail: `${i.cardId}: the fired wait carries no machine-verified receipt — a duty re-verifies first-hand` };
+  if (i.liveExecutor)
+    return { kind: "duty_fallback", reason: "live_executor", detail: `${i.cardId}: a live executor/writer/session holds the card — today's unblock-duty path keeps the handoff` };
+  if (i.verdictDuty)
+    return { kind: "duty_fallback", reason: "verdict_duty", detail: `${i.cardId}: verdict-duty card (role:review/role:unblock) — separation of duties is not transferable` };
+  if (i.humanBound)
+    return { kind: "duty_fallback", reason: "human_bound", detail: `${i.cardId}: a human decision / interactive hold / unknown external effect owns the exit — it stays protected` };
+  return { kind: "auto_resume", receipt: i.verificationReceipt };
+}
+
+// ---------------------------------------------------------------------------
 // Serialized merge train (decision BR#3516, accepted; impl BR#3517): one merge
 // at a time per (repo, base) lane, leased to an opportunistic edge executor.
 // Division of labour — the hub holds no VCS credentials, ever: the executor

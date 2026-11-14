@@ -188,6 +188,10 @@ import {
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
   decideProseDisposition,
+  // consumed-wait auto-resume (BR#14544)
+  decideConsumedWaitResume,
+  type ConsumedWaitResumeInput,
+  type ConsumedWaitResume,
   PROSE_CLASS_QUIET_MS,
   type ProseLeg,
   type ProseLegVerdict,
@@ -2023,8 +2027,10 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('unblock_proxy_last_ts', ?)`, String(ts));
     setLast(now); // pace BEFORE the fetch: a hung GitHub call must not tight-loop the tick
     const defaultRepo = this.settingValue("unblock_proxy_default_repo", "state-vector/superpositional");
+    // roles rides the row: the BR#14544 resume guards read verdict-duty roles
+    // (review/unblock) off the SAME row — a second fetch would be a race.
     const rows = this.state.storage.sql.exec(
-      `SELECT id, title, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+      `SELECT id, title, meta, roles FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
     ).toArray() as any[];
     // BR#4416 per-pass prose tally + the class-ask / alarm collectors. The
     // class ask is filed AFTER the loop so ONE ask names every card of the
@@ -2606,7 +2612,7 @@ export class KnowledgeHub {
     const predicate = JSON.stringify({ event: validateAwaitEvent(meta.blocked?.await_event), condition: cond,
       revision: meta.blocked?.ts, heads: trainLegs(meta).map(l => [l.repo, l.number, l.head_sha_at_acceptance]) });
     const openChild = this.one(
-      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
+      `SELECT c.id AS id, c.owner AS owner, c.meta AS cmeta FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked')
          AND c.roles LIKE '%"unblock"%' ORDER BY c.updated_ts DESC LIMIT 1`, r.id,
     );
@@ -2620,6 +2626,41 @@ export class KnowledgeHub {
     // prerequisite before flood/dedup checks, which must never strand it.
     if (!openChild && lastChild && ["done", "superseded"].includes(String(lastChild.status))
       && this.continueBlockedWork(String(r.id), meta, { kind: "satisfied", receipts: receiptLines })) return;
+    // BR#14544 — consumed-wait auto-resume. The HUB is the actor: when the
+    // fired wait is machine-verified and every protection holds, the
+    // mechanical resume (consume the wait, return the card to the dispatch
+    // pool, receipted note, provenance stamp) is hub work — a spawned duty's
+    // dispatched credential can never carry it (the BR#7398 gate-refusal
+    // class, and the satisfied-park → pool-ask → gate-refused churn it
+    // feeds). The resume rides the continueBlockedWork consumption (CAS'd,
+    // same guard set re-checked): the machine's release-holds-typed-await
+    // law (BR#4067) fences any system release that leaves the wait standing,
+    // so consumption IS the resume. Dispatch eligibility is todo (the
+    // dispatchCandidates pool query: status='todo' AND owner='') — never an
+    // ownerless in_progress, which is unclaimable (no in_progress →
+    // in_progress edge) and invisible to the scheduler. The credential gate
+    // itself is untouched: system authority, not a relaxation. A tripped
+    // guard falls back to today's duty path — with the fallback reason
+    // stamped on the standing round (one round per parent — the spawn gate
+    // already issued one at park time) or the new duty, so its escalation
+    // ask rides loud (urgency time-sensitive).
+    const openChildClaimed = openChild
+      ? Boolean(String(openChild.owner ?? "").trim()) || Boolean(String(JSON.parse(String(openChild.cmeta ?? "{}")).session ?? "").trim())
+      : false;
+    let resume: ConsumedWaitResume = decideConsumedWaitResume(
+      this.consumedWaitResumeGuards(r, meta, receiptLines, openChild ? { claimed: openChildClaimed } : null),
+    );
+    if (resume.kind === "auto_resume") {
+      if (this.continueBlockedWork(String(r.id), meta, { kind: "auto_resume", receipts: receiptLines })) return;
+      // the consumption CAS tripped (state moved under the sweep) — today's
+      // duty path re-verifies first-hand instead of resuming blind
+      resume = { kind: "duty_fallback", reason: "live_executor", detail: `${String(r.id)}: the card moved under the sweep (consumption CAS refused) — a duty re-verifies first-hand` };
+    }
+    if (resume.kind === "duty_fallback" && openChild && !JSON.parse(String(openChild.cmeta ?? "{}")).consumed_wait_fallback) {
+      // the standing park-time round gets the WHY + the loud-urgency brief —
+      // a second duty would breach the one-round-per-parent law
+      this.annotateUnblockFallback(String(openChild.id), String(r.id), resume);
+    }
     // same flood law as the machine's own spawn (machine.ts): only the
     // SAME exit condition within the window floods — a block-time round
     // with this exact condition is already on the case; a later flip
@@ -2663,15 +2704,22 @@ export class KnowledgeHub {
     }
     const rootTitle = String(r.title ?? r.id).replace(/^(?:Unblock:\s*)+/, "");
     const atomLines = receiptLines.map((l) => `- ${l}`).join("\n");
+    // BR#14544: a guard-tripped consumed wait falls back to the duty path —
+    // stamp WHY on the duty, and make the escalation ask it files (when its
+    // dispatched credential is gate-refused on the parent's mechanical
+    // resume) ride loud instead of aging silently in the pool.
+    const fallback = resume.kind === "duty_fallback"
+      ? { reason: resume.reason, detail: resume.detail.slice(0, 300), at: ts }
+      : null;
     const created = await this.create(
       {
         type: "task",
         title: `Unblock: ${rootTitle.slice(0, 190)}`,
         session: "", // session-less spawn: the closer stamps it when they claim
-        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (hub proxy-watch).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the predicate TRUE at ${new Date(ts).toISOString()}:\n${atomLines}\n\nRe-verify live state; this sweep is a trigger, not completion authority. If the parent is still blocked on this exact predicate, resume ${r.id} with the resolution. A satisfied prerequisite only resumes the actual work. BR#4282: if the parent is in_progress or in_review, preserve its existing executor/review; never close it merely because the predicate flipped. Close YOURSELF done with execution_result {outcome:"<actual observed findings>",receipts:["<per-action evidence>"]}. If the predicate is false, record that finding using the same typed result. A different current blocker uses unblock_result {kind:"reblocked",parent_id:"${r.id}",reason,next,await_event}. Do not respawn another duty.`,
+        body_md: `Unblock duty for ${r.id} — "${rootTitle}" (hub proxy-watch).\n\nBlocked why: ${String(meta.blocked?.reason ?? "").trim() || "see parent"}.\nExit condition: ${cond}\n\nMACHINE PROXY — the hub evaluated the predicate TRUE at ${new Date(ts).toISOString()}:\n${atomLines}\n\nRe-verify live state; this sweep is a trigger, not completion authority. If the parent is still blocked on this exact predicate, resume ${r.id} with the resolution. A satisfied prerequisite only resumes the actual work. BR#4282: if the parent is in_progress or in_review, preserve its existing executor/review; never close it merely because the predicate flipped. Close YOURSELF done with execution_result {outcome:"<actual observed findings>",receipts:["<per-action evidence>"]}. If the predicate is false, record that finding using the same typed result. A different current blocker uses unblock_result {kind:"reblocked",parent_id:"${r.id}",reason,next,await_event}. Do not respawn another duty.${fallback ? `\n\nBR#14544 consumed-wait fallback (${fallback.reason}): ${fallback.detail} If the parent's mechanical resume is gate-refused on credential grounds, file the pool ask with urgency "time-sensitive" so the stale-sweep surfaces it — never let it age silently.` : ""}`,
         // BR#5370: machine-duty marker — the done-open-children gate ignores
         // it (a duty ABOUT the card must never fence the card's close).
-        meta: { machine_duty: { by: "hub:proxy-watch", kind: "unblock", subject: r.id, predicate } },
+        meta: { machine_duty: { by: "hub:proxy-watch", kind: "unblock", subject: r.id, predicate }, ...(fallback ? { consumed_wait_fallback: fallback } : {}) },
         roles: ["unblock"],
       },
       "hub:proxy-watch",
@@ -2686,14 +2734,85 @@ export class KnowledgeHub {
     this.version(r.id, "hub:proxy-watch", "note", `machine proxy flipped TRUE — unblock duty ${created.id} auto-spawned (BR#3361)`, { spawned: created.id });
   }
 
+  /** BR#14544 — live board guards for the consumed-wait resume decision.
+   *  Mirrors the refusal vocabulary of continueBlockedWork (the proven
+   *  mechanical-resume family) plus holder liveness (the BR#3819-D law:
+   *  never resume onto a finished runner). A CLAIMED unblock round (owner or
+   *  session) is a live executor already on the exit; the session-less
+   *  park-time round the spawn gate auto-issues is NOT — it is the stale
+   *  spawn the resume supersedes (machine.ts: "resumed from blocked —
+   *  unblock confirmed, child superseded"). */
+  private consumedWaitResumeGuards(r: any, meta: any, receiptLines: string[], openDutyChild: { claimed: boolean } | null): ConsumedWaitResumeInput {
+    const id = String(r.id);
+    // some callers (routeSatisfiedProxy's stall rows) carry no roles column —
+    // fetch rather than misread a verdict duty as claimable
+    const roles: string[] = parseTags(r.roles ?? this.one(`SELECT roles FROM artefacts WHERE id = ?`, id)?.roles ?? "[]");
+    const aw = validateAwaitEvent(meta.blocked?.await_event);
+    // The consumed ask's own authority class: a human_decision ask (or any
+    // ask carrying a decision contract) stays human-held even once answered.
+    const askNode = aw?.event === "ask" ? this.one(`SELECT meta FROM artefacts WHERE id = ?`, aw.ask_id) : null;
+    const askMeta = askNode ? JSON.parse(String(askNode.meta ?? "{}")).ask : null;
+    const execution = this.executionState(id);
+    // a DIFFERENT open ask still owns the card's exit (a sibling coordination
+    // round) — the consumed wait is not the only leg
+    const otherOpenAsk = meta.awaiting_ask?.ask_id && (!aw || aw.event !== "ask" || aw.ask_id !== meta.awaiting_ask.ask_id)
+      ? this.one(`SELECT status FROM artefacts WHERE id = ?`, meta.awaiting_ask.ask_id)
+      : null;
+    const humanBound =
+      !!meta.interactive_execution // interactive hold (the BR#6068 class)
+      || !!meta.operator_gated // a human clears the gate
+      || !!meta.delivery_disposition // conservation-law closure owns the exit
+      || !!(askMeta && (isHumanDecisionAsk(askMeta) || askMeta.decision)) // the resolved ask was a human decision
+      || !!(otherOpenAsk && !["done", "superseded"].includes(String(otherOpenAsk.status)));
+    const liveExecutor =
+      !!openDutyChild?.claimed // a claimed duty round is already working the exit
+      || !!(execution?.attempt && execution.attempt.phase !== "quiesced")
+      || !!execution?.operations.some((op: { state: string }) => op.state === "prepared" || op.state === "outcome_unknown")
+      || !!this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, id)
+      || (Boolean(String(meta.session ?? "").trim()) && this.holderIsAlive(meta, "")) // BR#3819-D: never resume onto a live runner's plate blind
+      || !!meta.lane || this.isUnclaimableAnchor({ id }, meta) // standing infrastructure / machinery-owned slots
+      || ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state)); // the train owns the exit
+    return {
+      cardId: id,
+      verified: receiptLines.length > 0,
+      verificationReceipt: receiptLines.join("; ").slice(0, 400),
+      liveExecutor,
+      verdictDuty: roles.includes("review") || roles.includes("unblock"),
+      humanBound,
+    };
+  }
+
+  /** BR#14544 — annotate the standing unblock round with the consumed-wait
+   *  fallback disposition: WHY the hub did not auto-resume, and the
+   *  loud-urgency instruction its escalation ask must carry (the machine
+   *  spawn gate issues one round per parent at park time — the annotation
+   *  rides that round instead of spawning a second one). */
+  private annotateUnblockFallback(childId: string, parentId: string, resume: Extract<ConsumedWaitResume, { kind: "duty_fallback" }>): void {
+    const row = this.one(`SELECT meta, body_md FROM artefacts WHERE id = ?`, childId);
+    if (!row) return;
+    const m = JSON.parse(String(row.meta ?? "{}"));
+    if (m.consumed_wait_fallback) return;
+    m.consumed_wait_fallback = { reason: resume.reason, detail: resume.detail.slice(0, 300), at: Date.now() };
+    const brief = `\n\nBR#14544 consumed-wait fallback (${resume.reason}): ${resume.detail} If the parent's mechanical resume is gate-refused on credential grounds, file the pool ask with urgency "time-sensitive" so the stale-sweep surfaces it — never let it age silently.`;
+    this.state.storage.sql.exec(
+      `UPDATE artefacts SET meta = ?, body_md = ?, updated_ts = ? WHERE id = ?`,
+      JSON.stringify(m), String(row.body_md ?? "") + brief, Date.now(), childId,
+    );
+    this.version(childId, "hub:proxy-watch", "update", `BR#14544 consumed-wait fallback annotated: ${resume.reason} — the parent's fired wait tripped a guard; escalate loud, never let the ask age silently`, { parent: parentId, reason: resume.reason });
+    this.audit("hub:proxy-watch", "consumed_wait_fallback_annotated", parentId, { child: childId, reason: resume.reason });
+  }
+
   /** Return the same task to dispatch when its typed prerequisite was
-   * verified or its own obsolete recovery request was cancelled. */
+   * verified, its own obsolete recovery request was cancelled, or (BR#14544)
+   * the consumed-wait auto-resume won the decision table. */
   private continueBlockedWork(id: string, evaluated: any, continuation:
     | { kind: "satisfied"; receipts: string[] }
-    | { kind: "expired_coordination"; ask_id: string }): boolean {
+    | { kind: "expired_coordination"; ask_id: string }
+    | { kind: "auto_resume"; receipts: string[] }): boolean {
     const expiredAsk = continuation.kind === "expired_coordination" ? continuation.ask_id : undefined;
+    const autoResume = continuation.kind === "auto_resume";
     const expected = validateAwaitEvent(evaluated.blocked?.await_event);
-    if (!expected || (continuation.kind === "satisfied" && !continuation.receipts.length)
+    if (!expected || (continuation.kind !== "expired_coordination" && !continuation.receipts.length)
       || (expiredAsk && (expected.event !== "ask" || expected.ask_id !== expiredAsk))) return false;
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
     if (!row || row.status !== "blocked") return false;
@@ -2714,8 +2833,20 @@ export class KnowledgeHub {
     const now = Date.now();
     const predicate = meta.blocked;
     delete meta.blocked; delete meta.awaiting_ask; delete meta.last_unblock_spawn;
-    if (continuation.kind === "satisfied") meta.proxy_check = { at: now, verdict: "true", receipts: continuation.receipts };
+    delete meta.consumed_wait_fallback; // BR#14544: the fallback round is consumed with the wait
+    if (continuation.kind === "satisfied" || autoResume) meta.proxy_check = { at: now, verdict: "true", receipts: continuation.receipts };
     else delete meta.proxy_check;
+    if (autoResume) {
+      // BR#14544: the provenance stamp RIDES the consumption write — one
+      // transaction, no split-brain: the card lands todo already carrying
+      // the system_auto_resume receipt trail (the BR#6432 batch-auth shape:
+      // the hub verifies server-side, executes as system, stamps
+      // provenance).
+      meta.provenance = {
+        kind: "system_auto_resume", via: "consumed_wait",
+        ask_id: expected.event === "ask" ? expected.ask_id : null, ts: now,
+      };
+    }
     delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
     // A historical bounce is repair work, not an active train slot. Keeping
     // its releaseHold after consuming the prerequisite would strand todo too.
@@ -2726,9 +2857,48 @@ export class KnowledgeHub {
       if (current.status !== row.status || current.meta !== row.meta || current.owner !== row.owner) throw new Error("wait continuation changed before commit");
       if (expiredAsk) this.cancelRequest(expiredAsk, "The recovery coordination request expired. Bridge will retry the same recovery duty.", "system:coordination");
       this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
+      if (autoResume) {
+        // the machine's resume effect, mirrored for this direct-SQL edge
+        // (machine.ts on blocked → in_progress): "resumed from blocked —
+        // unblock confirmed, child superseded" — the stale park-time round
+        // must not outlive the wait it was issued for. conserveDelivery
+        // retains any round with outstanding PR bindings, same as the
+        // transition-path executor.
+        const rounds = this.state.storage.sql.exec(
+          `SELECT c.id AS id, c.status AS status, c.owner AS owner, c.meta AS meta, c.body_md AS body_md, c.title AS title FROM relations r JOIN artefacts c ON c.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND c.roles LIKE '%"unblock"%'`,
+          id,
+        ).toArray() as any[];
+        for (const v of rounds) {
+          try { this.conserveDelivery(v, "", false); } catch {
+            this.audit("system:delivery", "duty_retirement_retained", String(v.id), { reason: "duty has outstanding PR bindings" });
+            continue;
+          }
+          const vm = JSON.parse(String(v.meta ?? "{}"));
+          vm.superseded_reason = `${id} resumed from blocked (BR#14544 consumed-wait auto-resume) — unblock round superseded`;
+          this.state.storage.sql.exec(`UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(vm), now, now, String(v.id));
+          this.audit("system:proxy-watch", "transition", String(v.id), { from: v.status, to: "superseded", note: "consumed-wait auto-resume superseded the round" });
+          this.version(String(v.id), "system:proxy-watch", "transition", `${id} resumed from blocked (BR#14544 consumed-wait auto-resume) — unblock round superseded`, { from: v.status, to: "superseded" });
+        }
+      }
       if (continuation.kind === "expired_coordination") {
         this.version(id, "system:coordination", "transition", "blocked → todo — retrying recovery after its coordination request expired", { from: "blocked", to: "todo", ask_id: continuation.ask_id });
         this.audit("system:coordination", "recovery_coordination_expired", id, { ask_id: continuation.ask_id });
+      } else if (autoResume) {
+        // BR#14544: the hub's mechanical resume edge, as system actor. The
+        // note carries the consumed-wait receipt (ask id + resolution +
+        // verification receipts); the hub never renders verdicts and never
+        // closes cards through this edge — the card re-enters NORMAL
+        // dispatch (todo is the one dispatch-eligible, claimable state:
+        // dispatchCandidates filters status='todo' AND owner=''; in_progress
+        // has no self-edge and would strand ownerless).
+        const { receipts } = continuation;
+        const receiptText = receipts.join("; ").slice(0, 400);
+        this.version(id, "system:proxy-watch", "transition",
+          `BR#14544 consumed-wait auto-resume — blocked → todo (dispatch pool): the hub machine-verified the parked wait fired (receipt: ${receiptText}) and no protection holds (live executor / verdict duty / human decision all clear); the card re-enters normal dispatch`,
+          { from: "blocked", to: "todo", receipts, provenance: meta.provenance });
+        this.version(id, "system:proxy-watch", "wait_continued", "Consumed-wait resume receipt: the fired wait was machine-verified and the card returned to the dispatch pool (BR#14544 system auto-resume)", { await_event: expected, receipts, provenance: meta.provenance });
+        this.audit("system:proxy-watch", "auto_resume", id, { ask_id: (meta.provenance as { ask_id?: string | null }).ask_id, await_event: expected, receipts });
       } else {
         const { receipts } = continuation;
         this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
