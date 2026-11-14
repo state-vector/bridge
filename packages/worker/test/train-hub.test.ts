@@ -3284,6 +3284,32 @@ describe("BR#5061 lane revival (real bundled worker)", () => {
     await kbJson("/train.lease", { repo: repo2, base: "main", action: "release", actor: "gw-st", line_green: true });
   });
 
+  it("keeps a late deployment in settlement after the dwell despite an early green check", async () => {
+    const repo = "state-vector/late-deploy-settle";
+    const gateway = "gw-late-deploy";
+    const head = "c".repeat(40);
+    const mergeSha = "d".repeat(40);
+    await acquire(repo, gateway, { required_workflows: ["Test", "deploy / Deploy to dev"] });
+    const card = await queueViaAccept({ repo, pr: 58292, head, title: "Late deployment settlement" });
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: gateway,
+      pr: 58292, merge_sha: mergeSha, head_sha: head, task_id: card,
+      merged_at: Date.now() - 5 * 60_000,
+    });
+    const early = await kbJson("/train.ci", {
+      repo, base: "main", actor: gateway, sha: mergeSha, checks: [check(1, "Test", "success")],
+    });
+    expect(early.body.decided).toBe("pending");
+    expect(early.body.missing).toEqual(["deploy / Deploy to dev"]);
+    expect((await kbJson("/get", { id: card })).body.status).toBe("blocked");
+    const settled = await kbJson("/train.ci", {
+      repo, base: "main", actor: gateway, sha: mergeSha,
+      checks: [check(1, "Test", "success"), check(2, "deploy / Deploy to dev", "success")],
+    });
+    expect(settled.body.decided).toBe("landed");
+    expect((await kbJson("/get", { id: card })).body.status).toBe("done");
+  });
+
   it("BR#5829: the phantom carve-out fires at the settle DWELL, not the bound — and the stamp makes the next settle green outright", async () => {
     const sink = await kbJson("/create", { type: "task", title: "ALARM SINK drill — phantom dwell", session: "" });
     await kbJson("/admin.settings_set", { settings: { train_alarm_sink_id: String(sink.body.id) } });

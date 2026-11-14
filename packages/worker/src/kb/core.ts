@@ -3053,6 +3053,12 @@ export type RequiredRunsVerdict = {
  *  so slower-triggered workflows (deploys) have registered a check run. */
 export const TRAIN_SETTLE_DWELL_MS = 2 * 60_000;
 
+/** These checks are emitted on PRs only. A missing run is not evidence
+ * that any other required check can be omitted from post-merge settlement. */
+export function isPrOnlyTrainCheck(name: string): boolean {
+  return name === "main-green gate" || name === "Deploy health (merge gate)";
+}
+
 export function classifyRequiredRuns(
   runs: MainCheckRun[],
   required: string[],
@@ -3070,7 +3076,7 @@ export function classifyRequiredRuns(
   // tick instead of holding the full fail-closed bound every merge. Self-
   // heal: if the name DOES carry runs on this commit it is judged normally —
   // the stamp dissolves the moment the workflow starts running on pushes.
-  const phantom = new Set((opts.phantom_required ?? []).map(String));
+  const phantom = new Set((opts.phantom_required ?? []).filter(isPrOnlyTrainCheck));
   // back-pressure default: judge every observed check on the merge commit
   const judgeNames = (required.length ? required : [...byName.keys()]).filter(
     (n) => !(phantom.has(n) && !byName.has(n)),

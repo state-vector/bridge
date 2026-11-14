@@ -543,6 +543,17 @@ describe("classifyRequiredRuns (executor-fed runs vs lane config)", () => {
     expect(typical.bound_exceeded).toBe(true); // 10 min > 3 × 2 min
   });
 
+  it("keeps missing deploy and smoke jobs pending despite a stale phantom stamp", () => {
+    const late = ["deploy / Deploy to dev", "Cortex Quality Smoke"];
+    const v = classifyRequiredRuns(
+      [run(1, "Check Cortex Critical Fixture Needed", "success")],
+      ["Check Cortex Critical Fixture Needed", ...late],
+      { ...base, phantom_required: late },
+    );
+    expect(v.verdict).toBe("pending");
+    expect(v.missing).toEqual(late);
+  });
+
   it("BR#5829: a stamped phantom required name never holds the settle — unless it observes runs (self-heal)", () => {
     // the live BR#5829 shape: Test + CLI build green on the merge commit,
     // main-green gate (pull_request-only) stamped phantom → green NOW

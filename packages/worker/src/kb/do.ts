@@ -128,6 +128,7 @@ import {
   partitionMergeBatches,
   type TrainBatchCar,
   classifyRequiredRuns,
+  isPrOnlyTrainCheck,
   decideTrainGate,
   trainBounceBrief,
   resolveTrainBounceKind,
@@ -14630,28 +14631,8 @@ export class KnowledgeHub {
       const out = await this.trainEvent({ repo, base, kind: "stopped", pr, merge_sha: mergeSha, failing: v.failing }, actor);
       return { ...out, decided: "stopped" };
     }
-    // pending — the bound decides: unknown past ~3× typical ⇒ fail-closed
-    // stop. BR#5061 (Ray 2026-10-30: "if it can't merge, bounce it and move
-    // onto the next one — the train goes regardless"): when EVERY unsettled
-    // required workflow is MISSING (no check run ever existed for it on the
-    // merge commit — e.g. a PR-context-only gate like main-green gate that
-    // only runs on pull_request), waiting cannot change the verdict: the
-    // commit will never grow those runs. Halting the whole line on a
-    // provably-unchangeable classification starves the queue for nothing.
-    // Instead: land on the workflows that exist, drop the phantom names with
-    // a loud audit, and file ONE config-defect ask per episode to the alarm
-    // sink (the halt-class escalation — a human fixes required_workflows).
-    // Genuinely unsettled OBSERVED runs (a check that exists and hasn't
-    // concluded) keep the fail-closed stop, deduped per episode.
-    // BR#5829: the carve-out no longer waits for the bound. The settle dwell
-    // (BR#4804) IS the registration window — a push-triggered workflow that
-    // has not even REGISTERED a check run on the merge commit by then never
-    // will on any later tick — so a merge whose only unsettled required names
-    // are phantoms lands at the dwell instead of holding an already-green
-    // base for the whole ~3×-typical bound (PR #371: tip green 08:06:48Z,
-    // landed only 08:36:34Z — 30 min of pure lag per merge). The dropped
-    // names are stamped into the lane config so the NEXT settle classifies
-    // green outright.
+    // Missing deployment and smoke jobs are pending until they register.
+    // Only documented PR-only names can use the phantom carve-out.
     const dwellSatisfied = now - Number(meta.currently.merged_at ?? now) >= TRAIN_SETTLE_DWELL_MS;
     const observedUnsettled = v.pending.filter((n) => checks.some((c) => (c.name ?? "") === n));
     // positive evidence first: at least one required workflow PROVED green
@@ -14659,7 +14640,8 @@ export class KnowledgeHub {
     // evidence poll (an executor that reports nothing gets the stop, the
     // honest fail-closed posture the bound exists for)
     const greenRequired = checks.filter((c) => laneSpec.required_workflows.includes(c.name ?? "") && c.conclusion === "success");
-    const phantomShaped = !v.failing.length && v.missing.length && !observedUnsettled.length && greenRequired.length;
+    const phantomShaped = !v.failing.length && v.missing.length > 0
+      && v.missing.every(isPrOnlyTrainCheck) && !observedUnsettled.length && greenRequired.length > 0;
     if (v.verdict === "pending" && dwellSatisfied && phantomShaped) {
       return this.landPhantomRequired(lane, meta, actor, {
         repo, base, pr, mergeSha,
