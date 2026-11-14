@@ -16722,52 +16722,58 @@ export class KnowledgeHub {
         AND json_extract(meta, '$.blocked.await_event.n') = ?, 0)
       ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "", reason, conflict?.repo ?? null, conflict?.pr ?? null);
     // BR#14583 — duty coalescing, cite-don't-re-derive: recovery spawns key on
-    // (subject, await_event) with a cite-don't-re-derive pointer to the last
-    // disposition. The active-dedup query above keys on (subject, episode);
-    // this second key closes the per-tick re-derivation churn (BR#12180's
-    // contract, machine-enforced): a stable satisfied-but-held park spawns
-    // ZERO new duties per tick — the fresh tick CITES the last disposition
-    // (meta.recovery_coalesce receipt, idempotent — same key never re-stamps)
-    // instead of re-verifying the same state from scratch.
-    const wait = this.one(
+    // (subject, await_event). An OPEN duty for the key is the dedup (the
+    // active query above — one duty per key, never one per tick). When no
+    // open duty exists, a fresh duty STILL spawns (a closed disposition is
+    // not a live duty; a new episode needs a new owner) — but the subject
+    // carries an idempotent cite pointer to the last disposition
+    // (meta.recovery_coalesce, content-derived key never re-stamps per
+    // tick), so a stable satisfied-but-held park costs one duty total and
+    // every later tick cites instead of re-deriving from scratch.
+    const waitRow = this.one(
       `SELECT await_event FROM artefacts WHERE id = ? AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event') IS NOT NULL`,
       taskId,
     ) as any;
-    const awaitEventKey = wait?.await_event ? JSON.stringify(validateAwaitEvent(wait.await_event) ?? wait.await_event) : (waitEpisode ?? "");
+    const awaitEventKey = waitRow?.await_event ? JSON.stringify(validateAwaitEvent(waitRow.await_event) ?? waitRow.await_event) : (waitEpisode ?? "");
     const coalesce = decideRecoveryCoalesce({
       subject: taskId,
       awaitEventKey,
       existing: active ? { id: String(active.id) } : null,
     });
-    if (!active) {
-      const previous = this.one(
-        `SELECT id FROM artefacts WHERE type = 'task' AND status IN ('done','superseded')
-           AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery'
-           AND json_extract(meta, '$.machine_duty.subject') = ?
-           AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
-         ORDER BY updated_ts DESC LIMIT 1`,
-        taskId, awaitEventKey,
-      );
-      if (previous) {
-        // cite-don't-re-derive: stamp the LAST disposition's id on the subject
-        // (idempotent — the content-derived key never re-stamps per tick).
-        const freshRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
-        const subjMeta = JSON.parse(String(freshRow?.meta ?? "{}"));
-        const stamp = { key: coalesce.key, cited_duty: String(previous.id), reason, ts: subjMeta.recovery_coalesce?.ts };
-        if (JSON.stringify(stamp) !== JSON.stringify({ ...stamp, ts: subjMeta.recovery_coalesce?.ts }) || subjMeta.recovery_coalesce?.key !== coalesce.key) {
-          subjMeta.recovery_coalesce = { key: coalesce.key, cited_duty: String(previous.id), reason, ts: subjMeta.recovery_coalesce?.ts ?? Date.now() };
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(subjMeta), Date.now(), taskId);
-        }
+    if (coalesce.action === "cite") {
+      const freshRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+      const subjMeta = JSON.parse(String(freshRow?.meta ?? "{}"));
+      if (subjMeta.recovery_coalesce?.key !== coalesce.key || subjMeta.recovery_coalesce?.cited_duty !== coalesce.duty_id) {
+        subjMeta.recovery_coalesce = { key: coalesce.key, cited_duty: coalesce.duty_id, reason, ts: subjMeta.recovery_coalesce?.ts ?? Date.now() };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(subjMeta), Date.now(), taskId);
+        this.audit("system:recovery", "duty_coalesced", taskId, { cited_duty: coalesce.duty_id, key: coalesce.key, reason });
+      }
+      return String(active!.id);
+    }
+    const previous = this.one(
+      `SELECT id FROM artefacts WHERE type = 'task' AND status IN ('done','superseded')
+         AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery'
+         AND json_extract(meta, '$.machine_duty.subject') = ?
+         AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
+       ORDER BY updated_ts DESC LIMIT 1`,
+      taskId, awaitEventKey,
+    );
+    if (previous) {
+      // cite-don't-re-derive: the fresh duty's BODY cites the last closed
+      // disposition for the same key (the spawn still happens below).
+      const subjRow = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
+      const subjMeta = JSON.parse(String(subjRow?.meta ?? "{}"));
+      if (subjMeta.recovery_coalesce?.key !== coalesce.key) {
+        subjMeta.recovery_coalesce = { key: coalesce.key, cited_duty: String(previous.id), reason, ts: Date.now() };
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(subjMeta), Date.now(), taskId);
         this.audit("system:recovery", "duty_coalesced", taskId, { cited_duty: String(previous.id), key: coalesce.key, reason });
-        return String(previous.id);
       }
     }
-    if (active) return String(active.id);
     const parent = this.one(`SELECT title, project FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
     const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "repeated_failure" ? "Diagnose repeated execution failures" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
     // BR#14583: fresh duty carries the coalesce key it was spawned under, so
-    // the next tick's dedup query reads it without re-deriving the episode.
+    // the next tick's dedup reads it without re-deriving the episode.
     const coalesceKey = coalesce.key;
     const duty = await this.create({ type: "task", title: `${description}: ${parent.title}`.slice(0, 300), project: parent.project, session: "", qualified: true, roles: ["impl"], meta: { completion: { kind: "execution", outcome: reason === "resume_condition" ? "The affected task has an evidence-backed resume condition and continuation, with its original scope and outcome obligation preserved." : "The affected task has a verified delivery path, or a receipt-backed terminal disposition." }, machine_duty: { by: "recovery", kind: "task-recovery", subject: taskId, reason, ...(waitEpisode && { wait_episode: waitEpisode }), ...(coalesceKey && { coalesce_key: coalesceKey }) } }, body_md: `Restore progress for ${taskId}: ${parent.title}.
 
