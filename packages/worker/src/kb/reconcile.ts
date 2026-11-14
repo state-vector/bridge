@@ -441,7 +441,7 @@ export function reconcileJoin(args: {
       // A verified recovery owes the bound PR a fresh review at its live head.
       // GitHub may have dismissed the old approval when the branch changed.
       if (b.repairAccepted && b.progress === "stranded" && !b.lane && !b.queued && b.open_verify_children === 0
-        && b.status === "todo" && !changesRequested && !conflicting) {
+        && !changesRequested && !conflicting) {
         acc.accounted++;
         // The bulk GitHub feed can return UNKNOWN indefinitely. An
         // independent verifier checks the exact head directly before it

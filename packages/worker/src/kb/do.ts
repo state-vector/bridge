@@ -18668,24 +18668,28 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
    *  null when the ledger already holds this PR's verify (one per PR ever —
    *  a dead one alarms, not respawns). */
   private acceptedQueueRepair(parent: { id: string; status: string; meta: string }, repo: string, pr: number): boolean {
-    if (parent.status !== "todo") return false;
     const meta = JSON.parse(parent.meta ?? "{}");
     const stamp = meta.merge_train;
-    const wait = meta.blocked?.await_event;
+    const wait = validateAwaitEvent(meta.blocked?.await_event);
+    const exactWait = wait?.event === "pr_merged" && wait.repo === repo && Number(wait.n) === pr;
     const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
-    if (!mergeCompletesTask(meta) || stamp?.state !== "bounced" || stamp.repo !== repo || Number(stamp.pr) !== pr
-      || (wait && (wait.event !== "pr_merged" || wait.repo !== repo || Number(wait.n) !== pr))
+    if (!mergeCompletesTask(meta) || (meta.blocked?.await_event && !exactWait)
       || (hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > Date.now())
-      || meta.awaiting_ask || this.staleReviewHasExecutionHold(parent.id, meta)) return false;
-    return this.acceptedRecoveryForBounce(parent.id, meta.recovery?.task_id, stamp.bounced_at);
+      || meta.interactive_execution || meta.awaiting_ask || this.staleReviewHasExecutionHold(parent.id, meta)) return false;
+    if (parent.status === "todo" && stamp?.state === "bounced" && stamp.repo === repo && Number(stamp.pr) === pr)
+      return this.acceptedRecoveryForBounce(parent.id, meta.recovery?.task_id, stamp.bounced_at);
+    if (parent.status === "blocked" && exactWait && meta.recovery?.reason === "conflict")
+      return this.acceptedRecoveryForBounce(parent.id, meta.recovery.task_id, meta.blocked.ts, "conflict");
+    return false;
   }
 
-  private acceptedRecoveryForBounce(parentId: string, dutyId: unknown, bouncedAt: unknown): boolean {
+  private acceptedRecoveryForBounce(parentId: string, dutyId: unknown, bouncedAt: unknown, reason?: "conflict"): boolean {
     if (typeof dutyId !== "string") return false;
     const duty = this.one(`SELECT id,status,meta FROM artefacts WHERE id=?`, dutyId);
     const scheduled = this.one(`SELECT ts FROM artefact_versions WHERE artefact_id=? AND actor='system:recovery'
       AND action='recovery_scheduled' AND json_extract(data,'$.duty')=?
-      AND json_extract(data,'$.reason') IN ('queue_binding','conflict') ORDER BY seq DESC LIMIT 1`, parentId, dutyId);
+      AND json_extract(data,'$.reason') IN ('queue_binding','conflict')
+      AND (? IS NULL OR json_extract(data,'$.reason')=?) ORDER BY seq DESC LIMIT 1`, parentId, dutyId, reason ?? null, reason ?? null);
     if (duty?.status !== "done" || !scheduled || Number(scheduled.ts) < Number(bouncedAt ?? 0)) return false;
     const dm = JSON.parse(String(duty.meta ?? "{}"));
     const review = this.currentTaskReview(String(duty.id));

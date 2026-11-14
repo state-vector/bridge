@@ -149,16 +149,23 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await report(repo, [conflicted])).body.spawned).toHaveLength(0);
   });
 
-  it("returns an independently verified repair to the train without a GitHub approval label", async () => {
-    const repo = "state-vector/recovered-pr";
+  it.each(["bounced", "parked"])("returns an independently verified %s repair to the train without a GitHub approval label", async (position) => {
+    const repo = `state-vector/recovered-${position}`;
     expect((await kbJson("/train.lane", { repo, spec: { required_workflows: ["Test"] } })).status).toBe(200);
     const number = 2471;
     const initialHead = "a".repeat(40);
     const repairedHead = "b".repeat(40);
     const parent = (await kbJson("/create", {
       actor: "author", type: "task", title: "Restore delivery after conflict", qualified: true,
-      meta: { pr: { repo, number, head_sha_at_acceptance: initialHead }, merge_train: { state: "bounced", repo, pr: number } },
+      meta: { pr: { repo, number, head_sha_at_acceptance: initialHead },
+        ...(position === "bounced" ? { merge_train: { state: "bounced", repo, pr: number } } : {}) },
     })).body.id;
+    if (position === "parked") {
+      expect((await kbJson("/transition", { id: parent, to: "in_progress", actor: "author" })).status).toBe(200);
+      expect((await kbJson("/transition", { id: parent, to: "blocked", actor: "author",
+        note: "Waiting on the delivery PR", await_event: { event: "pr_merged", repo, n: number },
+      })).status).toBe(200);
+    }
     const conflicted = await report(repo, [prRow(number, { mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(90) })]);
     const repair = conflicted.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
     expect(repair).toBeTruthy();
