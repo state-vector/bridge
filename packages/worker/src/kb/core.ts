@@ -3837,6 +3837,7 @@ export function trainBaseRedAskBrief(
     card: { id: string; title?: string; status?: string; exhausted?: boolean; blocked_reason?: string } | null;
     curePr: { repo: string; number: number; head_sha?: string } | null;
     culpritPr: number | null;
+    state?: { phase: string } | null;
   },
 ): { details: string; options: string[] } {
   const broken = reds.length
@@ -3895,6 +3896,24 @@ export function trainBaseRedAskBrief(
           ``,
           `If you **DECLINE**: the line holds — nothing merges until main is green again, and agent sessions keep fixing on ${fix.card ? fix.card.id : "the fix card"}. The queue drains by itself the moment main recovers.`,
         ]
+      : fix.state?.phase === "fix_dispatch_starved"
+        ? [
+            ``,
+            `# HUMAN GATE — nothing is fixing your broken main`,
+            `**The root-fix card ${fix.card?.id ?? "(unknown)"} has sat UNCLAIMED in the work queue past the dispatch grace window — no executor picked it up, and nothing automatic will.**`,
+            ``,
+            `Every merge is held while main is red, so this card is the single most expensive piece of idle work on the board. Bridge spawned it at top priority; the dispatch layer never sent an agent.`,
+            ``,
+            `1. Open the card: it names the failing check(s), the red commit, and the recovery journal.`,
+            `2. Either dispatch a session to it (claim it from the queue), or work it yourself — the diagnosis and fix steps are on the card.`,
+            `3. Answering here with what you did lets Bridge close this ask; the queue then drains itself once main is green.`,
+          ]
+    : fix.state?.phase === "fix_dispatch_starved"
+      ? [
+          `Dispatched/worked — I picked the fix card up (reply DONE)`,
+          `Re-arm — re-queue the fix card at top priority`,
+          `Other — manual steps (I'll reply)`,
+        ]
       : fix.card?.exhausted
         ? [
             ``,
@@ -3948,11 +3967,21 @@ export function trainBaseRedAskBrief(
  *  pointless "keep going" click. */
 /** BR#6012 closed state machine for a base-red episode's resolution phase.
  *  Makes illegal states unrepresentable:
- *  - `diagnosing` / `fix_in_progress` / `cure_pr_conflicting` NEVER warrant a
- *    human ask (`warrantAsk: false`) and NEVER carry a `curePr`.
+ *  - `diagnosing` / `fix_in_progress` / `fix_undispatched` / `cure_pr_conflicting`
+ *    NEVER warrant a human ask (`warrantAsk: false`) and NEVER carry a `curePr`.
  *  - `cure_pr_awaiting_force_merge` ALWAYS carries a non-conflicting `curePr`
  *    owned by `card` and the exact `--admin` command.
- *  - `fix_exhausted` warrants a manual-intervention ask with `curePr: null`. */
+ *  - `fix_exhausted` warrants a manual-intervention ask with `curePr: null`.
+ *  - `fix_dispatch_starved` (GH #455) warrants the manual-intervention ask: a
+ *    root-fix card that has sat UNCLAIMED in todo past the grace window is
+ *    not progress — no executor picked it up, nothing else will say so, and
+ *    the ask must surface it instead of suppressing on "the fix work runs
+ *    automatically". */
+
+/** GH #455: how long a spawned root-fix card may sit unclaimed in todo before
+ *  the base-red human ask is warranted. 10 minutes matches the watchdog
+ *  convention — a healthy gateway claims rank -2 work well inside it. */
+export const BASE_RED_UNDISPATCHED_GRACE_MS = 10 * 60_000;
 export type BaseRedEpisodeState =
   | {
       phase: "diagnosing";
@@ -3967,6 +3996,24 @@ export type BaseRedEpisodeState =
       phase: "fix_in_progress";
       warrantAsk: false;
       card: { id: string; title: string; status: string; exhausted: false };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "fix_undispatched";
+      warrantAsk: false;
+      card: { id: string; title: string; status: string; exhausted: false };
+      curePr: null;
+      conflictPr: null;
+      mergedPr: null;
+      culpritPr: number | null;
+    }
+  | {
+      phase: "fix_dispatch_starved";
+      warrantAsk: true;
+      card: { id: string; title: string; status: string; exhausted: boolean };
       curePr: null;
       conflictPr: null;
       mergedPr: null;
@@ -4011,7 +4058,7 @@ export type BaseRedEpisodeState =
     };
 
 export function classifyBaseRedEpisodeState(fix: {
-  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean; active_agent?: boolean; unclaimed_ms?: number } | null;
   curePr?: { repo: string; number: number; head_sha?: string } | null;
   conflictPr?: { repo: string; number: number } | null;
   mergedPr?: { repo: string; number: number; merge_sha: string } | null;
@@ -4086,6 +4133,35 @@ export function classifyBaseRedEpisodeState(fix: {
       culpritPr,
     };
   }
+  // GH #455: a spawned-but-UNCLAIMED todo card is queued work, not progress.
+  // Only callers that carry dispatch liveness classify it this way — a legacy
+  // card shape without liveness fields keeps the old fix_in_progress verdict.
+  if (
+    rawCard.status === "todo" &&
+    fix.card?.active_agent === false &&
+    Number.isFinite(Number(fix.card?.unclaimed_ms))
+  ) {
+    const unclaimedMs = Math.max(0, Number(fix.card!.unclaimed_ms));
+    return unclaimedMs > BASE_RED_UNDISPATCHED_GRACE_MS
+      ? {
+          phase: "fix_dispatch_starved",
+          warrantAsk: true,
+          card: rawCard,
+          curePr: null,
+          conflictPr: null,
+          mergedPr: null,
+          culpritPr,
+        }
+      : {
+          phase: "fix_undispatched",
+          warrantAsk: false,
+          card: { ...rawCard, exhausted: false },
+          curePr: null,
+          conflictPr: null,
+          mergedPr: null,
+          culpritPr,
+        };
+  }
   return {
     phase: "fix_in_progress",
     warrantAsk: false,
@@ -4098,7 +4174,7 @@ export function classifyBaseRedEpisodeState(fix: {
 }
 
 export function trainBaseRedAskWarranted(fix: {
-  card?: { id?: string; title?: string; status?: string; exhausted?: boolean } | null;
+  card?: { id?: string; title?: string; status?: string; exhausted?: boolean; active_agent?: boolean; unclaimed_ms?: number } | null;
   curePr?: unknown;
   conflictPr?: unknown;
   mergedPr?: unknown;
@@ -4118,7 +4194,11 @@ export function trainBaseRedAskWarranted(fix: {
       ? { repo: String((fix.mergedPr as any).repo ?? ""), number: Number((fix.mergedPr as any).number), merge_sha: String((fix.mergedPr as any).merge_sha ?? "") }
       : null;
   const card = fix?.card
-    ? { id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted }
+    ? {
+        id: String(fix.card.id ?? "BR#0"), title: fix.card.title, status: fix.card.status, exhausted: !!fix.card.exhausted,
+        ...(fix.card.active_agent !== undefined ? { active_agent: fix.card.active_agent } : {}),
+        ...(fix.card.unclaimed_ms !== undefined ? { unclaimed_ms: Number(fix.card.unclaimed_ms) } : {}),
+      }
     : null;
   return classifyBaseRedEpisodeState({ card, curePr, conflictPr, mergedPr }).warrantAsk;
 }
