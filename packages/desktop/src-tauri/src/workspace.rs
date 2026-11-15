@@ -12,6 +12,10 @@ mod legacy;
 const GIB: u64 = 1024 * 1024 * 1024;
 pub(super) const INTERVAL: Duration = Duration::from_secs(30);
 const BATCH: usize = 4;
+/// BR#14716 — the pressure drain width (see `reconcile`): a held admission
+/// means the ladder owes the budget bytes; the fair 4-per-30s pass cannot
+/// repay a 684-deep pending pile before the next generation of work arrives.
+const PRESSURE_BATCH: usize = 64;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all="snake_case")]
@@ -69,6 +73,15 @@ pub struct Status {
     pub managed_bytes: u64, pub cache_bytes: u64, pub evidence_bytes: u64, pub reclaimed_bytes: u64,
     pub resources: usize, pub pending: usize, pub retained: usize,
     pub budget_bytes: u64, pub available_bytes: u64, pub admission: Admission,
+    /// BR#14716 — present iff the reclaim ladder is WEDGED: admission held and
+    /// every record errored (zero can advance). The board/alarm must never
+    /// read this state as "idle".
+    pub wedge: Option<()>,
+    /// BR#14716 — the first errored records' actual errors, so the wedge is
+    /// first-hand diagnosable from `workspaces status` without trawling the
+    /// per-record ledger.
+    #[serde(default)]
+    pub error_head: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -270,11 +283,19 @@ impl Owner {
             }
         }
         let mut visited = 0;
+        // BR#14716 — adaptive drain: under a held admission (pressure) the
+        // fair BATCH=4 pass is a starvation generator — 684 pending records
+        // at 4 per 30s pass is 8.5 hours to VISIT once, and any erroring
+        // record re-arms a 30s retry, so a wedged hold never drains while
+        // new ticks keep re-entering the same queue head. Under pressure the
+        // pass widens (local FS ops are cheap; the 30s cadence stays) so the
+        // ladder can actually clear in minutes.
+        let batch = if self.status().is_ok_and(|status| matches!(status.admission, Admission::Held { .. })) { PRESSURE_BATCH } else { BATCH };
         for old in &records {
             if matches!(old.phase, Phase::Removed { .. }) || old.retry_at > now_ms() { continue; }
             let ticket = match &old.phase { Phase::InUse { owner } | Phase::Released { owner } | Phase::Preserving { owner, .. } => Some(owner.ticket()), _ => None };
             if ticket.is_some_and(|t| protected.contains(t)) { continue; }
-            if visited >= BATCH { break; }
+            if visited >= batch { break; }
             let Some(_lock) = self.lock(&old.id)? else { continue; };
             let mut record = self.read(&old.id)?;
             visited += 1;
@@ -495,10 +516,26 @@ impl Owner {
         let admission = if managed_bytes.saturating_add(cache_bytes).saturating_add(evidence_bytes) >= budget_bytes || available_bytes < floor {
             Admission::Held { reason: format!("workspace disk budget: {} bytes owned, {} cache, {} retained evidence, {} budget, {} available; reclamation continues", managed_bytes, cache_bytes, evidence_bytes, budget_bytes, available_bytes) }
         } else { Admission::Ready };
+        // BR#14716 — the silent wedge: `retained == resources` (EVERY record
+        // errored) with a held admission means the reclaim ladder cannot
+        // advance at all — zero bytes can ever free while every pass errors
+        // every record it visits. Observed live on the gateway: 695/695
+        // records errored, pending 684, byte-identical status across hours,
+        // and the ONLY trace was this same INFO reason string in the gateway
+        // log — no per-record error ever surfaced, no alarm fired, the board
+        // read "idle". Surface the head of the actual per-record errors on
+        // the status (so `workspaces status` names WHY, first-hand) and
+        // persist the wedge verdict alongside them.
+        let errors: Vec<(String, String)> = records.iter().filter(|r| r.error.is_some())
+            .map(|r| (r.id.clone(), r.error.clone().unwrap_or_default())).collect();
+        let wedge = matches!(admission, Admission::Held { .. })
+            && !errors.is_empty() && errors.len() == records.len();
         let status = Status { observed_at: now_ms(), last_reconciled_at: now_ms(), managed_bytes, cache_bytes, evidence_bytes,
             reclaimed_bytes,
             resources: records.len(), pending: records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count(),
-            retained: records.iter().filter(|r| r.error.is_some()).count(), budget_bytes, available_bytes, admission };
+            retained: records.iter().filter(|r| r.error.is_some()).count(), budget_bytes, available_bytes, admission,
+            wedge: wedge.then_some(()),
+            error_head: errors.into_iter().take(10).collect() };
         journal::write_file(&self.ledger.join("status.json"), &serde_json::to_vec(&status).map_err(|e| e.to_string())?)?;
         Ok(status)
     }

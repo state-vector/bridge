@@ -321,8 +321,13 @@ fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
 
     owner.reconcile(&[]).unwrap();
     assert!(!root.exists());
+    // BR#14716 — under a held admission the pass is PRESSURE_BATCH wide (the
+    // fair 4-per-30s width starved a 684-deep pending pile), so every legacy
+    // record is visited this pass: each errors on its unpublished input and
+    // is PRESERVED — the invariant this test pins is the released allocation
+    // reclaimed first + no input silently discarded, not the visit width.
     let checked = (0..BATCH).filter(|i| owner.read(&format!("legacy-{i}")).unwrap().checked_at > 0).count();
-    assert_eq!(checked, BATCH - 1);
+    assert_eq!(checked, BATCH);
     for i in 0..BATCH {
         assert_eq!(fs::read_to_string(sandbox.0.join(format!("legacy-{i}/unpublished-input"))).unwrap(), "keep this");
     }

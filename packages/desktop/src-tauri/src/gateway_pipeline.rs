@@ -861,6 +861,8 @@ pub(super) struct Controller { registry: Registry, admission: Admission, shared:
     capacity_probe: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_capacity_probe: Instant,
     workspace_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_workspace: Instant,
     disk_admission: workspace::Admission, disk_observed: Instant,
+    /// BR#14716 — throttle stamp for the wedge class alarm (see the workspace tick).
+    last_wedge_alarm_at: Option<u64>,
     reported_attention:std::collections::HashSet<(String,String)> }
 impl Controller {
     #[cfg(test)]
@@ -880,7 +882,7 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
     }
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
@@ -949,6 +951,27 @@ impl Controller {
                         self.disk_admission = status.admission.clone();
                         self.disk_observed = Instant::now();
                         dlog("workspace", &serde_json::to_string(&status).unwrap_or_default());
+                        // BR#14716 — the wedge alarm: every record errored while
+                        // admission is held means the reclaim ladder cannot
+                        // advance AT ALL (observed live: 695/695 errored, zero
+                        // progress for hours, board read "idle"). This is a
+                        // LOUD class event, not an INFO tick: the dispatch pool
+                        // is fully fenced until it clears, so raise it as a
+                        // fail-loud alarm naming the head errors, once per
+                        // 30m (throttle), so the operator never has to trawl
+                        // gateway logs to find why nothing dispatches.
+                        if status.wedge.is_some() {
+                            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                            if self.last_wedge_alarm_at.map(|t| now_secs.saturating_sub(t) >= 1800).unwrap_or(true) {
+                                self.last_wedge_alarm_at = Some(now_secs);
+                                let head = status.error_head.iter()
+                                    .map(|(id, error)| format!("{id}: {error}"))
+                                    .collect::<Vec<_>>().join(" | ");
+                                dlog("workspace", &format!(
+                                    "ALARM workspace reclaim WEDGED: admission held AND all {} resources errored — zero reclaim progress possible; dispatch fully fenced. First errors: {head}",
+                                    status.resources));
+                            }
+                        }
                         if let Ok(mut snapshot) = snap.lock() { snapshot.workspaces = Some(status); }
                     },
                     Ok(Err(error)) | Err(error) => {
