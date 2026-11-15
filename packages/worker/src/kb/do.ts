@@ -5952,7 +5952,66 @@ export class KnowledgeHub {
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
   }
+  /** GH#455 invariant alarm (Ray ruling 2026-11-15): `red main + unclaimed
+   * root-fix card + ready executor` is a dispatch defect, never a staffing
+   * shortage — while the line is stopped the root-fix card is the board's
+   * highest-precedence work and its cost of delay is the entire lane. The
+   * ordinary dispatch_starved sweep is structurally blind to this state
+   * (eligible=0 or at-capacity rows are silently deleted), so this sweep
+   * alarms the invariant directly: every unclaimed root-fix card that has
+   * rested in todo past the dispatch grace while any live executor is ready
+   * gets a loud, throttled signal naming the per-host reason it was not
+   * claimed (eligibility hold, at-capacity, or eligible-but-not-reserved —
+   * an executor-side admission defect). */
+  private rootFixDispatchStarvationSweep(now: number) {
+    const cards = this.state.storage.sql.exec(
+      `SELECT id, title, status, tags, meta, updated_ts FROM artefacts
+        WHERE type = 'task' AND owner = ''
+          AND (status = 'todo' OR (status = 'blocked' AND json_extract(meta, '$.execution_wait.kind') = 'capability'))`,
+    ).toArray().filter((row: any) => {
+      try { return isRootFixCard({ tags: parseTags(row.tags), meta: JSON.parse(String(row.meta ?? "{}")) }); } catch { return false; }
+    });
+    if (!cards.length) return;
+    const hosts = this.state.storage.sql.exec(
+      `SELECT h.token_id,t.label,h.capabilities FROM execution_hosts h
+        JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL AND h.observed_ts>?`,
+      now - 120_000,
+    ).toArray();
+    for (const card of cards) {
+      const id = String(card.id), updated = Number(card.updated_ts ?? 0);
+      // Grace: the executor's reserve poll normally claims a rank-0 card
+      // within a poll or two of the spawn — only alarm when it demonstrably
+      // has not (BR#14634 sat ~10 minutes; the grace is 2).
+      if (now - updated < 120_000) continue;
+      // Throttle: one alarm per card per 15 minutes — the sweep ticks every
+      // 60s and a repeating signal adds noise, not information.
+      if (this.one(
+        `SELECT seq FROM ledger WHERE kind = 'signal' AND action = 'root_fix_dispatch_starved' AND artefact_id = ? AND ts > ?`,
+        id, now - 900_000,
+      )) continue;
+      const perHost: Record<string, unknown> = {};
+      const parked = String(card.status) === "blocked";
+      let anyReady = false;
+      for (const row of hosts) {
+        const tokenId = String(row.token_id), host = String(row.label);
+        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+        if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
+        anyReady = true;
+        if (parked) { perHost[host] = { claimed: false, reason: "capability_parked" }; continue; }
+        const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
+        const hold = this.dispatchCandidates(tokenId, host, capabilities, [id]).taskHolds.get(id);
+        perHost[host] = hold
+          ? { claimed: false, reason: hold }
+          : { claimed: false, reason: occupancy.active + occupancy.reserved >= gatewayCapacity(capabilities) ? "at_capacity" : "eligible_but_not_reserved", ...occupancy };
+      }
+      if (!anyReady) continue;
+      this.audit("system:scheduler", "root_fix_dispatch_starved", id, { age_ms: now - updated, hosts: perHost });
+      this.version(id, "system:scheduler", "note",
+        `ROOT-FIX DISPATCH STARVED (GH#455 invariant): this p0 root-fix card is unclaimed in todo while a ready executor ticks — ${JSON.stringify(perHost).slice(0, 400)} — a ready executor plus an unclaimed root-fix is a dispatch defect, not a staffing shortage`, {});
+    }
+  }
   private reconcileSchedulingHealth(now: number) {
+    this.rootFixDispatchStarvationSweep(now);
     for (const status of this.schedulingStatus(undefined, now)) {
       if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
         this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
@@ -6010,7 +6069,18 @@ export class KnowledgeHub {
     const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
     if (readiness.kind !== "ready" || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2)) return record({ kind: "gateway_not_ready", ...facts, reason: readiness.kind === "ready" ? "Runner protocol upgrade required" : readiness.reason });
     if (occupancy.active + occupancy.reserved >= facts.capacity) {
-      if (mode !== "inspect" && selection.eligible[0]) facts.preemption = recoveryCapacity.request(tokenId, host, priorityTask(selection.eligible[0])) ?? undefined;
+      if (mode !== "inspect" && selection.eligible[0]) {
+        // GH#455 (Ray ruling 2026-11-15): at capacity the preemption request
+        // names the board's highest-precedence ELIGIBLE work — a root-fix
+        // card for a red main outranks every other duty (routine in-flight
+        // implementation yields to it, recovery-capacity.ts), never merely
+        // the queue's FIFO head. A concrete task-recovery duty keeps its
+        // place ahead of everything else.
+        const rootFixFirst = selection.eligible.find(t => {
+          try { return isRootFixCard({ tags: parseTags(t.tags), meta: JSON.parse(String(t.meta ?? "{}")) }); } catch { return false; }
+        });
+        facts.preemption = recoveryCapacity.request(tokenId, host, priorityTask(rootFixFirst ?? selection.eligible[0])) ?? undefined;
+      }
       return record({ kind: "at_capacity", ...facts });
     }
     if (occupancy.active + occupancy.reserved + occupancy.finalizing >= facts.capacity + Math.min(facts.capacity, 4)) return record({ kind: "finalization_backpressure", ...facts });
@@ -12804,6 +12874,31 @@ export class KnowledgeHub {
       return m;
     };
     const scope = this.trainRepairScope(a.repo, a.base, a.sha);
+    // GH#455: a reused root-fix card carries its history — including dispatch
+    // state stamped by holders that are long gone. A stale
+    // execution_requirements.host pin (the conservative affinity an expired
+    // reservation leaves behind) filters the card out of every OTHER ready
+    // host's eligible set forever (host_affinity), so the absolute-p0 card
+    // rests in todo while ready executors tick — the exact BR#14634 defect.
+    // Rebinding to a live failing head is the one moment the hub owns the
+    // card: clear the dead holder's dispatch pins so the reuse is exactly as
+    // claimable as a fresh spawn. Live claims are never touched — only
+    // unclaimed todo cards with no un-quiesced attempt.
+    const clearDeadHolderDispatchState = (id: string, status: string, owner: string, m: any): boolean => {
+      if (m?.execution_requirements === undefined && m?.dispatch_recovery === undefined) return false;
+      // A dead holder's pin survives on an unclaimed todo card (silent
+      // host_affinity filtering) AND on the capability sweep's
+      // executor_capability park the same pin produces (blocked, awaiting a
+      // host that will never exist). Both are dead state: clear them.
+      const capabilityPark = status === "blocked" && m?.execution_wait?.kind === "capability";
+      if (!((status === "todo" || capabilityPark) && !owner)) return false;
+      const execution = this.executionState(id);
+      if (execution?.attempt && execution.attempt.phase !== "quiesced") return false;
+      delete m.execution_requirements;
+      delete m.dispatch_recovery;
+      this.audit(a.actor, "root_fix_rebind_cleared_stale_dispatch_state", id, { repo: a.repo, sha: a.sha.slice(0, 9), from: status });
+      return true;
+    };
     if (scope.kind === "current") for (const id of scope.task_ids) {
       const repair = this.one(`SELECT id,status,meta,tags FROM artefacts WHERE id=?`, id);
       if (!repair || ["done", "superseded"].includes(repair.status)) continue;
@@ -12821,10 +12916,11 @@ export class KnowledgeHub {
     }
     // (1) culprit-qualified-in-place
     if (a.culpritId) {
-      const c = this.one(`SELECT id, status, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
+      const c = this.one(`SELECT id, status, owner, meta, tags FROM artefacts WHERE id = ?`, a.culpritId) as any;
       if (c && c.status !== "done" && c.status !== "superseded") {
         const cm = JSON.parse(c.meta ?? "{}");
         if (isRootFixCard({ tags: parseTags(c.tags), meta: cm }) && isExact(cm)) {
+          clearDeadHolderDispatchState(String(c.id), String(c.status ?? ""), String(c.owner ?? ""), cm);
           this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(cm)), c.id);
           this.version(c.id, a.actor, "update", `root-fix binding refreshed to the live failing run ${a.sha.slice(0, 9)} — this card IS the line fix (BR#5190)`, {});
           return c.id;
@@ -12834,12 +12930,12 @@ export class KnowledgeHub {
     // (2) reuse an open repair for this exact head. Older incidents retain
     // their task identity, execution state, and progress even after main moves.
     const open = this.state.storage.sql.exec(
-      `SELECT id, meta, tags FROM artefacts
-       WHERE type = 'task' AND status NOT IN ('done', 'superseded')
-        AND (lower(json_extract(meta, '$.root_fix.head_sha')) = ?
-          OR lower(json_extract(meta, '$.main_tip')) = ?
-          OR lower(json_extract(meta, '$.tip_sha')) = ?
-          OR lower(json_extract(meta, '$.red_since')) = ?)
+      `SELECT id, status, owner, meta, tags FROM artefacts
+        WHERE type = 'task' AND status NOT IN ('done', 'superseded')
+         AND (lower(json_extract(meta, '$.root_fix.head_sha')) = ?
+           OR lower(json_extract(meta, '$.main_tip')) = ?
+           OR lower(json_extract(meta, '$.tip_sha')) = ?
+           OR lower(json_extract(meta, '$.red_since')) = ?)
         ORDER BY created_ts DESC`,
       head, head, head, head,
     ).toArray();
@@ -12849,6 +12945,7 @@ export class KnowledgeHub {
       const nextFailing = a.failing.map((f) => f.name);
       const prevFailing = Array.isArray(om.root_fix?.failing) ? om.root_fix.failing.map(String) : [];
       om.boosted = om.boosted ?? a.now;
+      clearDeadHolderDispatchState(String(o.id), String(o.status ?? ""), String(o.owner ?? ""), om);
       this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(bind(om)), o.id);
       if (JSON.stringify(prevFailing) !== JSON.stringify(nextFailing)) {
         this.version(String(o.id), a.actor, "update", `root-fix checks refreshed for ${a.sha.slice(0, 9)} (BR#5190)`, {});

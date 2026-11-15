@@ -480,6 +480,19 @@ resumes. Handoffs are deduplicated across scheduler races and restarts, and the
 line names the yielding verification. Interactive/user holds, recovery verification
 and unknown external effects are protected; capability and review gates still apply.
 
+**Root-fix dispatch takes precedence over everything (GH#455).** A root-fix card
+for a red main is the board's highest-precedence dispatchable work — while the
+line is stopped, its cost of delay is the entire lane. Its preemption scope is
+not limited to verification: a running routine implementation on the full host
+yields the slot the same fenced way. Rebinding a root-fix to a new failing head
+clears a dead holder's stale dispatch pins (a host-affinity
+`execution_requirements` left by an expired reservation) so the reused card is
+exactly as claimable as a fresh spawn. And an unclaimed root-fix resting in todo
+while any live executor reports ready is an invariant violation, not a staffing
+shortage: after a two-minute dispatch grace the scheduler raises one throttled
+`root_fix_dispatch_starved` alarm per card per 15 minutes, naming the per-host
+reason it was not claimed.
+
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
 unavailable and merely busy hosts produce different facts. Queued unsupported

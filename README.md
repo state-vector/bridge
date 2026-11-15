@@ -405,7 +405,18 @@ resume. Concurrent calls/restarts reuse one host handoff, not a cancellation sto
 Interactive sessions, human/control holds, recovery's own verification, pending
 external effects and uncheckpointed writers are protected. Inspect mode never
 preempts. Full runners use `schedule(request_capacity)` to request a safe handoff
-without reserving additional work. The line reports which verification is yielding, rather than merely
+without reserving additional work. A root-fix card for a red main outranks every
+other dispatchable work (GH#455): its preemption scope is not limited to
+verification — a running routine implementation on the full host yields the slot
+the same fenced way, because while the line is stopped the root-fix's cost of
+delay is the entire lane. Rebinding a root-fix to a new failing head clears a
+dead holder's stale dispatch pins (`execution_requirements.host` affinity from
+an expired reservation) so the reuse is exactly as claimable as a fresh spawn,
+and the scheduler treats `red main + unclaimed root-fix + ready executor` as an
+invariant violation: after a two-minute dispatch grace, one throttled
+`root_fix_dispatch_starved` alarm per card per 15 minutes names the per-host
+reason it was not claimed (eligibility hold, at-capacity, or
+eligible-but-not-reserved). The line reports which verification is yielding, rather than merely
 claiming to wait for an eligible executor. Credential/model/host eligibility and
 review separation remain enforced; priority never fabricates capacity.
 

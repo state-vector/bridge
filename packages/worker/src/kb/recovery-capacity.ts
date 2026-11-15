@@ -107,6 +107,12 @@ export class RecoveryCapacity {
     const prior = this.read(token);
     if (prior) return prior;
     if (taskSchedulingRank(recovery) > 1) return null;
+    // GH#455 (Ray ruling 2026-11-15): a root-fix card for a red main takes
+    // precedence over EVERY other dispatchable work — its cost of delay is
+    // the whole stopped lane, so a routine in-flight implementation victim
+    // yields to it, not just a routine verifier. Concrete task-recovery
+    // duties keep the review-only restriction (BR#6835 scope).
+    const rootFix = isRootFixCard({ meta: JSON.parse(recovery.meta || "{}"), tags: parseTags(recovery.tags) });
     const now = Date.now();
     const victims = this.sql.exec(`SELECT a.id,a.meta,a.tags,a.roles,e.state,delivery.id IS NOT NULL AS train_review
       FROM artefacts a JOIN execution_state e ON e.task_id=a.id
@@ -115,7 +121,7 @@ export class RecoveryCapacity {
       AND json_extract(e.state,'$.attempt.phase')='running' ORDER BY a.updated_ts DESC`, host).toArray();
     for (const row of victims) {
       const id = String(row.id), meta: Meta = JSON.parse(String(row.meta));
-      if (!parseTags(row.roles).includes("review") || taskSchedulingRank(priorityTask(row)) <= 1
+      if ((!rootFix && !parseTags(row.roles).includes("review")) || taskSchedulingRank(priorityTask(row)) <= 1
         || meta.interactive_execution || meta.operator_gated || this.protectedTask(id, meta)) continue;
       const parents = this.sql.exec(`SELECT p.meta,p.tags,p.roles FROM relations r JOIN artefacts p ON p.id=r.dst_id WHERE r.src_id=? AND r.relation='child_of'`, id).toArray();
       if (typeof meta.execution_review_of === "string") parents.push(...this.sql.exec(`SELECT meta,tags,roles FROM artefacts WHERE id=?`, meta.execution_review_of).toArray());

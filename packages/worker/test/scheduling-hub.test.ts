@@ -51,6 +51,19 @@ beforeEach(async () => {
             this.executionWork = original;
           }
         }
+        if (path === "/fixture/root-fix-starve") {
+          const { id, age_ms = 180_000 } = await request.json();
+          // Age the card past the dispatch grace so the invariant sweep sees
+          // a root-fix that demonstrably was not claimed by a reserve poll.
+          this.state.storage.sql.exec("UPDATE artefacts SET updated_ts=? WHERE id=?", Date.now() - age_ms, id);
+          const started = Date.now();
+          this.rootFixDispatchStarvationSweep(Date.now());
+          const alarms = this.state.storage.sql.exec(
+            "SELECT artefact_id, action FROM ledger WHERE kind='signal' AND action='root_fix_dispatch_starved' AND ts>=? ORDER BY seq DESC",
+            started,
+          ).toArray();
+          return Response.json({ ok: true, alarms });
+        }
         if (path !== "/fixture/spent-route" && path !== "/fixture/watchdog-release") return super.fetch(request);
         const { id } = await request.json();
         const sql = this.state.storage.sql;
@@ -915,5 +928,98 @@ describe("priority line recovery capacity", () => {
     await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
     expect((await reserve(g)).preemption).toBeUndefined();
     expect((await g.cmd({ kind: "inspect" }, "still-protected", victim, r.session)).messages).toHaveLength(0);
+  });
+
+  it("GH#455: a root-fix card preempts a running routine implementation at capacity, not just verification", async () => {
+    const project = "root-fix-preemption", g = await gateway(project);
+    const victim = await task(project, { pr: { repo: "state-vector/bridge", number: 71, head_sha_at_acceptance: "c".repeat(40) } });
+    const r = await reserve(g); if (r.kind !== "reserved") throw new Error("no routine reservation");
+    await g.cmd({ kind: "begin", attempt_id: "routine", worker: g.auth.agent, action_budget_ms: 60_000 }, "routine-begin", victim, r.session);
+    // a concrete task-recovery duty may not preempt routine implementation
+    await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks", subject: "candidate" } });
+    expect((await reserve(g, "recovery-keeps-review-scope")).preemption).toBeUndefined();
+    // …but a root-fix card for a red main outranks every dispatchable work
+    const rootFix = await post("create", {
+      actor: "system:train", type: "task", project, qualified: true, roles: ["impl"],
+      title: `ROOT-FIX (BR#5189 p0): fix main — state-vector/bridge red at ${"d".repeat(9)} (Test)`,
+      body_md: "Main is RED — stop-the-line.",
+      tags: ["root_blocker", "main-red", "p0"],
+      meta: { root_fix: { repo: "state-vector/bridge", base: "main", head_sha: "d".repeat(40), failing: ["Test"], lane: "state-vector/bridge@main" } },
+    });
+    expect(rootFix.error).toBeUndefined();
+    const probe = await g.cmd({ kind: "schedule", mode: "request_capacity" }, "root-fix-capacity-probe");
+    expect(probe).toMatchObject({ kind: "at_capacity", active: 1,
+      preemption: { phase: "stopping_verification", recovery_id: rootFix.id, victim_id: victim, generation: 1, checkpoint_commit: null } });
+    const stopped = await g.cmd({ kind: "poll", generation: 1, attempt_id: "routine" }, "routine-poll", victim, r.session);
+    expect(stopped.attempt.phase).toBe("stopping");
+    expect(stopped.messages).toHaveLength(1);
+    const message = stopped.messages[0].id;
+    await g.cmd({ kind: "ack", generation: 1, attempt_id: "routine", message_id: message, state: "acknowledged" }, "routine-ack", victim, r.session);
+    await g.cmd({ kind: "ack", generation: 1, attempt_id: "routine", message_id: message, state: "acted" }, "routine-acted", victim, r.session);
+    await g.cmd({ kind: "quiesce", generation: 1, attempt_id: "routine", writers: "process_group_empty" }, "routine-quiet", victim, r.session);
+    await g.cmd({ kind: "yield", generation: 1, attempt_id: "routine" }, "routine-yield", victim, r.session);
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: rootFix.id });
+  });
+
+  it("GH#455: alarms an unclaimed root-fix resting in todo while a ready executor ticks, and throttles the repeat", async () => {
+    const project = "root-fix-starve", g = await gateway(project);
+    const rootFix = await post("create", {
+      actor: "system:train", type: "task", project, qualified: true, roles: ["impl"],
+      title: `ROOT-FIX (BR#5189 p0): fix main — state-vector/bridge red at ${"e".repeat(9)} (Test)`,
+      tags: ["root_blocker", "main-red", "p0"],
+      meta: { root_fix: { repo: "state-vector/bridge", base: "main", head_sha: "e".repeat(40), failing: ["Test"] } },
+    });
+    expect(rootFix.error).toBeUndefined();
+    // young card: inside the dispatch grace — no alarm yet
+    const young = await post("fixture/root-fix-starve", { id: rootFix.id, age_ms: 30_000 });
+    expect(young.alarms).toEqual([]);
+    // past the grace with a ready executor ticking: the invariant alarm fires
+    const starved = await post("fixture/root-fix-starve", { id: rootFix.id, age_ms: 180_000 });
+    expect(starved.alarms).toEqual([{ artefact_id: rootFix.id, action: "root_fix_dispatch_starved" }]);
+    // throttle: the next sweep within 15m is silent, not a repeat
+    const repeat = await post("fixture/root-fix-starve", { id: rootFix.id, age_ms: 300_000 });
+    expect(repeat.alarms).toEqual([]);
+  });
+
+  it("GH#455: rebinding a root-fix clears a dead holder's stale host affinity so every ready executor can claim it", async () => {
+    const project = "root-fix-rebind", repo = "state-vector/rebind", actor = "gw-rebind", head = "f".repeat(40);
+    // the lease is taken BEFORE the gateway advertises — the lane card's
+    // create-sweep must not see an executor inventory (fixture-order note,
+    // not the subject of this test)
+    expect((await post("train.lease", { repo, actor, action: "acquire", required_workflows: ["Test"] })).error).toBeUndefined();
+    const g = await gateway(project);
+    const stale = await post("create", {
+      actor: "system:train", type: "task", project, qualified: true, roles: ["impl"],
+      title: `ROOT-FIX (BR#5189 p0): fix main — ${repo} red at ${head.slice(0, 9)} (Test)`,
+      tags: ["root_blocker", "main-red", "p0"],
+      meta: {
+        root_fix: { repo, base: "main", head_sha: head, failing: ["Test"] },
+        // conservative affinity a dead holder left behind (an expired reservation)
+        execution_requirements: { tier: "small", tools: ["git"], environment: [], host: "dead-holder-host" },
+        dispatch_recovery: { kind: "reservation_expired", at: 1, host: "dead-holder-host" },
+      },
+    });
+    expect(stale.error).toBeUndefined();
+    // the stale pin does not merely filter eligibility — the capability sweep
+    // parks the p0 card BLOCKED awaiting an executor_capability that will
+    // never exist (the pinned host is dead)
+    const parked = await post("get", { id: stale.id });
+    expect(parked.status).toBe("blocked");
+    expect(parked.meta.execution_wait).toMatchObject({ kind: "capability" });
+    expect((await reserve(g)).kind).toBe("no_eligible_work");
+    // a new red episode on the same head rebinds this exact card — the rebind
+    // must clear the dead holder's dispatch pins (GH#455)
+    const stopped = await post("train.event", {
+      repo, actor, kind: "stopped", head_sha: head,
+      failing: [{ name: "Test", url: "https://github.test/test" }], reason: "required workflows RED: Test",
+    });
+    expect(stopped.error).toBeUndefined();
+    const card = await post("get", { id: stale.id });
+    expect(card.meta.root_fix).toMatchObject({ repo, head_sha: head });
+    expect(card.meta.execution_requirements).toBeUndefined();
+    expect(card.meta.dispatch_recovery).toBeUndefined();
+    // …and the card is claimable again: rank-0, first reserve wins it
+    const claim = await reserve(g);
+    expect(claim).toMatchObject({ kind: "reserved", task_id: stale.id });
   });
 });
