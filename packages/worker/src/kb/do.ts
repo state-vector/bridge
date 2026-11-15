@@ -6042,13 +6042,53 @@ export class KnowledgeHub {
   }
   private reconcileSchedulingHealth(now: number) {
     this.rootFixDispatchStarvationSweep(now);
+    // BR#14703 (W2) — stale-stopping attempt reaper: an attempt in `stopping`
+    // past BOTH its lease and action deadline is a zombie slot — it still
+    // counts as active occupancy (gatewayOccupancy counts running/restoring/
+    // stopping) so nothing else dispatches onto it while its writer has been
+    // gone for a full grace window. Observed live: BR#14133 sat in stopping
+    // with a lease from ~24h earlier, the ONLY active slot on the gateway,
+    // while the scheduler starved. Flip it to quiesced (the slot-freeing
+    // terminal-for-occupancy phase — the execution record is preserved) with
+    // a named audit; lease expiry alone never proves writer quiescence, but
+    // lease + action deadline + no subsequent begin/finalize on that attempt
+    // means the slot is unowned by any live writer.
+    const stale = this.state.storage.sql.exec(
+      `SELECT e.task_id, e.state, e.worker_token_id FROM execution_state e
+       WHERE json_extract(e.state,'$.attempt.phase')='stopping'
+         AND CAST(json_extract(e.state,'$.attempt.lease_until') AS INTEGER) < ?
+         AND CAST(json_extract(e.state,'$.attempt.action_deadline') AS INTEGER) < ?`,
+      now, now,
+    ).toArray();
+    for (const row of stale) {
+      const cur = JSON.parse(String(row.state));
+      if (!cur?.attempt || cur.attempt.phase !== "stopping") continue;
+      cur.attempt.phase = "quiesced";
+      this.state.storage.sql.exec(
+        `UPDATE execution_state SET state = ? WHERE task_id = ?`,
+        JSON.stringify(cur), String(row.task_id),
+      );
+      this.audit("system:scheduler", "stale_stopping_reaped", String(row.task_id), {
+        attempt_id: cur.attempt.attempt_id, lease_until: cur.attempt.lease_until,
+        action_deadline: cur.attempt.action_deadline, reaped_at: now,
+      });
+    }
     for (const status of this.schedulingStatus(undefined, now)) {
       if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
         this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
       }
       this.state.storage.sql.exec(`INSERT OR IGNORE INTO dispatch_health(token_id,since) VALUES(?,?)`, status.token_id, now);
       const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, status.token_id);
-      if (now - Number(pending.since) >= 120_000 && !pending.attention_at) {
+      // BR#14703 (W1) — the starvation alarm REPEATS while starved (throttled
+      // to one per 30m per host), not the old one-shot attention_at stamp:
+      // a dispatch loop dead for ~24h fired ONCE and then sat silent — the
+      // operator saw "0/20 idle" with no alarm, ever, because the single
+      // audit event was never re-fired and never surfaced anywhere. Re-arm
+      // attention_at as the throttle stamp so a persistently starved
+      // scheduler alarms persistently (one per class window, stop-the-line
+      // pattern), and stats (W3) carries the starved state so the board
+      // shows it without fetching schedule_status.
+      if (now - Number(pending.since) >= 120_000 && (!pending.attention_at || now - Number(pending.attention_at) >= 1_800_000)) {
         this.state.storage.transactionSync(() => {
           this.state.storage.sql.exec(`UPDATE dispatch_health SET attention_at=? WHERE token_id=?`, now, status.token_id);
           this.audit("system:scheduler", "dispatch_starved", null, { host: status.host, eligible: status.eligible, active: status.active, reserved: status.reserved, capacity: status.capacity, since: pending.since });
@@ -8880,12 +8920,30 @@ export class KnowledgeHub {
         `SELECT COUNT(*) AS n FROM events WHERE op = 'launch_failed' AND ts > ?`, Date.now() - 3600_000,
       ).one() as any)?.n ?? 0);
     } catch { /* events shape varies — best-effort */ }
+    // BR#14703 (W3) — scheduler starvation + hold visibility: the dispatch
+    // loop starving (eligible work, free capacity, zero reservations) and
+    // the hold pile (retry_budget/provider_route/...) fencing the backlog
+    // were BOTH invisible on every operator surface — "0/20 idle" and a
+    // 193-deep todo pool had no explanation without fetching schedule_status
+    // by hand. Surface the per-host scheduler state (starved-since, held
+    // counts by reason) here so the watchdog prose sweep and the operator
+    // both see WHY nothing is dispatching from the stats route alone.
+    let scheduler: { host: string; live: boolean; ready: string; eligible: number; active: number; reserved: number; capacity: number; starved_since: number | null; held: Record<string, number> }[] | undefined;
+    try {
+      scheduler = this.schedulingStatus(undefined, Date.now()).map(s => ({
+        host: s.host, live: s.live, ready: s.readiness?.kind ?? "unknown", eligible: s.eligible ?? 0,
+        active: s.active ?? 0, reserved: s.reserved ?? 0, capacity: s.capacity ?? 0,
+        starved_since: s.health?.kind === "starved" ? Number(s.health.since) : null,
+        held: Object.fromEntries(Object.entries(s.reasons ?? {}).map(([k, v]) => [k, Number(v)])),
+      }));
+    } catch { /* scheduling shape varies — best-effort */ }
     return {
       counts: byType,
       ...(options.park_inventory === true && { park_inventory: this.parkInventory(String(options.after_park ?? "")) }),
       watchdog,
       ...(occupancy?.length ? { occupancy } : {}),
       ...(launch_failed_1h ? { launch_failed_1h } : {}),
+      ...(scheduler?.length ? { scheduler } : {}),
       channel: {
         window_started_ts: this.routeStatsStarted,
         write_ops: { ok: writeOk, err: writeErr },
