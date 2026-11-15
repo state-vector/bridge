@@ -1488,6 +1488,36 @@ export class KnowledgeHub {
           note: "train repair handoff: no recorded executor or live worker signal — returned to the claimable pool; PR binding and repair brief preserved" }, "system:merge-train");
         continue;
       }
+      // BR#14696 (W1) — launch-health fence: a dispatched session that has
+      // NEVER signaled since claim (no alive stamp, no session ping, no
+      // matching progress) is dead-at-launch, not working-quietly — the
+      // BR#10049 gen-1 class ("MCP UNAVAILABLE: bridge tools missing", zero
+      // board effects). Waiting the full stall window per dead session is
+      // what made dispatch look idle at 0/20 while the pool churned: each
+      // launch failure burned a whole 10m watchdog window before the reap,
+      // so the loop's effective throughput was ~zero. Release at the fence
+      // (half the stall window) with a NAMED cause so the release is
+      // distinguishable from a working stall in the log and the score side
+      // can exempt it (result_class) — a false positive (slow boot past the
+      // fence) costs one re-dispatch, never a lost claim: the card releases
+      // claimable either way.
+      const firstSignal = Math.max(
+        meta.session_alive_ts ?? 0,
+        this.sessionPing(meta),
+        meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0,
+      );
+      const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
+      if (firstSignal === 0 && now - claimedAt > staleMs / 2) {
+        await this.audit("system:watchdog", "launch_failed", r.id, {
+          claimed_ago_ms: now - claimedAt, fence_ms: staleMs / 2,
+        });
+        await this.transition({
+          id: r.id, to: "todo",
+          note: `launch_failed — no first signal (alive/progress/ping) since claim ${Math.round((now - claimedAt) / 60000)}m ago; released to the pool by watchdog at the fence (dead-at-launch class, BR#14696), not a working stall`,
+          result_class: "launch_failed",
+        }, "system:watchdog");
+        continue;
+      }
       if (now - lastTs <= staleMs) continue;
       // BR#4067 — typed-proxy preservation: silence must not destroy a machine
       // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
@@ -8828,10 +8858,34 @@ export class KnowledgeHub {
     const flushedRow = this.one(`SELECT value FROM settings WHERE key = 'channel_stats'`);
     let lastFlush: any = null;
     try { lastFlush = flushedRow ? JSON.parse(flushedRow.value) : null; } catch { /* old shape */ }
+    // BR#14696 (W3) — dispatch occupancy: per-host attempt slots from
+    // execution_state (the same attempt.host/attempt.phase facts
+    // gatewayOccupancy reads), so "0/20 busy" has a machine-checkable
+    // explanation on the board instead of operator guesswork — which slots
+    // are leased/running/unconfirmed/starting, per gateway host.
+    let occupancy: { host: string; phase: string; n: number }[] | undefined;
+    try {
+      occupancy = (this.state.storage.sql.exec(
+        `SELECT json_extract(state,'$.attempt.host') AS host, json_extract(state,'$.attempt.phase') AS phase, COUNT(*) AS n
+         FROM execution_state WHERE json_extract(state,'$.attempt.host') IS NOT NULL
+         GROUP BY host, phase ORDER BY host, phase`,
+      ).toArray() as any[]).map((r) => ({ host: String(r.host), phase: String(r.phase), n: Number(r.n) }));
+    } catch { /* execution_state absent on old hubs — occupancy stays absent */ }
+    // BR#14696 (W1 surfacing) — launch-fence recency: the dead-at-launch
+    // release count in the last hour, so a churn storm (the 0/20 class) is
+    // named on the stats surface, not re-derived from per-card notes.
+    let launch_failed_1h = 0;
+    try {
+      launch_failed_1h = Number((this.state.storage.sql.exec(
+        `SELECT COUNT(*) AS n FROM events WHERE op = 'launch_failed' AND ts > ?`, Date.now() - 3600_000,
+      ).one() as any)?.n ?? 0);
+    } catch { /* events shape varies — best-effort */ }
     return {
       counts: byType,
       ...(options.park_inventory === true && { park_inventory: this.parkInventory(String(options.after_park ?? "")) }),
       watchdog,
+      ...(occupancy?.length ? { occupancy } : {}),
+      ...(launch_failed_1h ? { launch_failed_1h } : {}),
       channel: {
         window_started_ts: this.routeStatsStarted,
         write_ops: { ok: writeOk, err: writeErr },
@@ -11984,7 +12038,7 @@ export class KnowledgeHub {
       if (run) for (const [key, episode] of Object.entries(ledger)) {
         const newestFailure = episode.sources.reduce((a, b) => b.run_id > a.run_id || (b.run_id === a.run_id && b.run_attempt > a.run_attempt) ? b : a);
         if (run.id < newestFailure.run_id || (run.id === newestFailure.run_id && (run.run_attempt ?? 1) < newestFailure.run_attempt)) continue;
-        const repair = this.one(`SELECT status FROM artefacts WHERE id = ?`, episode.stage.task_id);
+        const repair = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, episode.stage.task_id);
         // A merge observation is not an ancestry proof for an unrelated tip.
         // Until the accepted lifecycle closes, require deployment of that exact
         // merge rather than inferring containment from run ordering.
@@ -11992,6 +12046,35 @@ export class KnowledgeHub {
         const repairAccepted = repair?.status === "done" || episode.delivery.kind === "train_merge" || episode.delivery.kind === "observed_merge" ||
           (episode.cause.kind === "check_failure" && episode.attempts.some((a) => a.kind === "retry" && a.status === "finished" && a.outcome === "delivered"));
         ledger[key] = verifyRecoveryEpisode(episode, { head_sha: cov.tip_sha, run_id: run.id, run_attempt: run.run_attempt ?? 1, url: run.html_url }, now, repairAccepted);
+        // BR#14696 (W2) — receipts-met acceptance boost: the episode's close is
+        // gated on the REPAIR CARD's lifecycle (its status done = its own review
+        // accepted), but nothing ranked that card on the critical path — an
+        // unclaimed repair card (todo/blocked) with receipts met left the
+        // episode sitting in verifying with the merge line held while the
+        // dispatch pool idled past it (the 0/20 class: receipts 2/1, phase
+        // verifying, no acceptance owner). Boost the repair card once per
+        // receipts-met stall so dispatch ranks it on the recovery critical path
+        // (the BR#6835 law: concrete repair/root-fix work outranks routine
+        // verification). Idempotent: only stamps when `boosted` is absent.
+        if (!repairAccepted) {
+          const updated = ledger[key];
+          if (updated.stage.phase === "verifying" &&
+              updated.verified_receipts.length >= updated.successful_deployments_required &&
+              (repair?.status === "todo" || repair?.status === "blocked")) {
+            const m = JSON.parse(String(repair?.meta ?? "{}"));
+            if (typeof m.boosted !== "number") {
+              m.boosted = now;
+              this.state.storage.sql.exec(
+                `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
+                JSON.stringify(m), now, episode.stage.task_id,
+              );
+              this.audit("system:train", "recovery_acceptance_boost", episode.stage.task_id, {
+                episode: key, receipts: updated.verified_receipts.length,
+                required: updated.successful_deployments_required, repair_status: repair?.status,
+              });
+            }
+          }
+        }
       }
     }
     lane.recovery_episodes = ledger;
