@@ -4923,7 +4923,9 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     };
     expect(await findOpenAsk()).toBeNull();
     const snap1 = await laneSnap(repo);
-    expect(snap1.base_red_resolution.phase).toBe("fix_in_progress");
+    // GH #455: a just-spawned todo root-fix card is UNDISPATCHED queued work
+    // (inside the grace window — no ask yet), not fix_in_progress.
+    expect(snap1.base_red_resolution.phase).toBe("fix_undispatched");
     expect(snap1.base_red_resolution.fix_card.id).toBe(rootFix.body.id);
     expect(snap1.base_red_resolution.fix_card.pr).toBeUndefined();
 

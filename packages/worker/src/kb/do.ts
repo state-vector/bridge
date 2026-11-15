@@ -15970,17 +15970,27 @@ export class KnowledgeHub {
     }
     const brief = trainBaseRedAskBrief({ repo, base }, reds, held, fix);
     const affectedTask = fix.card?.id ?? lane.id;
+    // GH #455: a fix card that sat unclaimed past the dispatch grace window
+    // has its own honest copy — "stalled after repeated attempts" would be a
+    // lie for work no agent ever touched.
+    const starved = !fix.curePr && fix.state?.phase === "fix_dispatch_starved";
     const decision = HumanDecisionSchema.parse({
       kind: fix.curePr ? "authority" : "preference", task_id: affectedTask,
       context: fix.curePr
         ? `Changes in ${repo} are waiting because the main branch is failing. Repair PR #${fix.curePr.number} is ready for the remaining administrator-only merge step.`
-        : `Automatic repair of ${repo} has stalled after repeated attempts. The work remains open; choose whether to provide new direction or keep it paused.`,
+        : starved
+          ? `Main on ${repo} is red and the root-fix card ${affectedTask} has sat UNCLAIMED in the queue past the dispatch grace window — no executor was dispatched to it while every merge is held. Either dispatch/work the card or say how you want it handled.`
+          : `Automatic repair of ${repo} has stalled after repeated attempts. The work remains open; choose whether to provide new direction or keep it paused.`,
       why_human: fix.curePr
         ? "You must merge the repair using your repository-owner account. Bridge cannot bypass this gate; answering this request does not grant it your permissions. Bridge observes the merge and deployment automatically."
-        : "This is a choice about the next repair direction; Bridge cannot invent instructions or treat another unchanged retry as progress.",
+        : starved
+          ? "The dispatch layer has not picked up the highest-priority card on the board; Bridge cannot force a gateway to claim it. A human confirming dispatch (or working the card) is the only lever that moves it."
+          : "This is a choice about the next repair direction; Bridge cannot invent instructions or treat another unchanged retry as progress.",
       choices: brief.options.map((label, i) => ({ label, executor: i === 0 ? "human" : "bridge", consequence: fix.curePr
         ? i === 0 ? "You merge the named repair. Bridge checks the actual GitHub merge and deployment before advancing the queued changes." : "Bridge keeps the changes queued and continues observing the repair; no merge permission or success is inferred."
-        : i === 0 ? "You provide the specific missing information or instructions on the repair task." : i === 1 ? "Bridge re-issues the repair with your new direction; existing execution fences and review requirements remain." : "Bridge keeps the work paused until the existing failure is resolved.", action: "hold" })),
+        : starved
+          ? i === 0 ? "You dispatched or worked the fix card yourself; Bridge records the answer and keeps observing the lane until main is green." : i === 1 ? "Bridge re-queues the fix card at top priority for a fresh dispatch attempt; the card and its fences are unchanged." : "Bridge holds the line and keeps observing; nothing merges until main is green."
+          : i === 0 ? "You provide the specific missing information or instructions on the repair task." : i === 1 ? "Bridge re-issues the repair with your new direction; existing execution fences and review requirements remain." : "Bridge keeps the work paused until the existing failure is resolved.", action: "hold" })),
     });
     const scope = this.trainRepairScope(repo, base);
     const ownerMerge = fix.curePr && fix.card && scope.kind === "current"
@@ -17380,8 +17390,21 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return recoveryRepairScope(String(current), RecoveryLedgerSchema.parse(meta.lane?.recovery_episodes ?? {}));
   }
 
+  /** GH #455: dispatch liveness for a fix-card row — does ANY agent hold the
+   *  work, and if not, how long has it sat unclaimed in todo? Feeds the
+   *  base-red classifier so a spawned-but-undispatched root-fix escalates
+   *  (warrants the human ask) instead of reading as fix_in_progress. */
+  private cardDispatchLiveness(row: { owner?: unknown; status?: unknown; status_ts?: unknown; updated_ts?: unknown }): { active_agent?: boolean; unclaimed_ms?: number } {
+    const status = String(row?.status ?? "");
+    const owner = String(row?.owner ?? "");
+    if (status !== "todo") return { active_agent: true, unclaimed_ms: 0 };
+    if (owner) return { active_agent: true, unclaimed_ms: 0 };
+    const claimedAt = Number(row?.status_ts ?? row?.updated_ts ?? Date.now());
+    return { active_agent: false, unclaimed_ms: Math.max(0, Date.now() - (Number.isFinite(claimedAt) ? claimedAt : Date.now())) };
+  }
+
   private trainOpenRootFix(repo: string, entries?: { id?: string; pr?: number; cls?: string; bypass?: unknown }[], redNames?: string[], base = "main"): {
-    card: { id: string; title: string; status: string; exhausted?: boolean; blocked_reason?: string } | null;
+    card: { id: string; title: string; status: string; exhausted?: boolean; blocked_reason?: string; active_agent?: boolean; unclaimed_ms?: number } | null;
     curePr: { repo: string; number: number; head_sha?: string } | null;
     conflictPr?: { repo: string; number: number } | null;
     mergedPr?: { repo: string; number: number; merge_sha: string } | null;
@@ -17439,7 +17462,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     } = { card: null, curePr: null, conflictPr: null, mergedPr: null, culpritPr: null };
     if (repo) {
       const rows = this.state.storage.sql.exec(
-        `SELECT id, title, status, meta, tags FROM artefacts
+        `SELECT id, title, status, meta, tags, owner, status_ts, updated_ts FROM artefacts
          WHERE type = 'task' AND status NOT IN ('done', 'superseded')
             AND (json_extract(meta, '$.root_fix.repo') = ? OR json_extract(meta, '$.pr.repo') = ? OR json_extract(meta, '$.prs[0].repo') = ? OR json_extract(meta, '$.merge_train.repo') = ? OR json_extract(meta, '$.repo') = ? OR json_extract(meta, '$.root_blocker_for_lane') LIKE ?)
             AND (json_type(meta, '$.root_fix') = 'object' OR json_extract(meta, '$.root_blocker_for_lane') IS NOT NULL
@@ -17487,6 +17510,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             ...(r.status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
               ? { blocked_reason: m.blocked.reason.trim() }
               : {}),
+            // GH #455 dispatch liveness: a spawned-but-unclaimed todo card is
+            // queued work, not progress — the base-red classifier needs to see
+            // the difference so an undispatched root-fix escalates instead of
+            // silently suppressing the human ask.
+            ...this.cardDispatchLiveness(r),
           },
           curePr,
           conflictPr,
@@ -17512,7 +17540,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const id = String(e?.id ?? "");
         if (!id || !Number.isInteger(pr) || pr <= 0) continue;
         const row = this.one(
-          `SELECT id, title, status, meta, tags FROM artefacts WHERE id = ?`,
+          `SELECT id, title, status, meta, tags, owner, status_ts, updated_ts FROM artefacts WHERE id = ?`,
           id,
         ) as any;
         if (!row) continue;
@@ -17544,7 +17572,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         if (mergedSha) {
           if (redNames && redNames.length > 0 && Array.isArray(m?.root_fix?.failing) && m.root_fix.failing.length > 0 && !matchesRedNames(String(row.title ?? ""), m.root_fix.failing)) continue;
           const resolvedMerged = {
-            card: { id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m) },
+            card: {
+              id: String(row.id), title: String(row.title ?? ""), status: String(row.status ?? ""), exhausted: this.rootFixExhausted(m),
+              ...this.cardDispatchLiveness(row),
+            },
             curePr: null,
             conflictPr: null,
             mergedPr: { repo: legRepo, number: pr, merge_sha: String(mergedSha) },
@@ -17565,6 +17596,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             ...(row.status === "blocked" && typeof m?.blocked?.reason === "string" && m.blocked.reason.trim()
               ? { blocked_reason: m.blocked.reason.trim() }
               : {}),
+            ...this.cardDispatchLiveness(row),
           },
           curePr: { repo: legRepo, number: pr, head_sha: head },
           conflictPr: null,
@@ -18277,7 +18309,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             String(askRow.id),
             "system:train",
             "transition",
-            `auto-closed (BR#6012 state machine: phase=${rf.state.phase}, warrantAsk=false) — no human action is warranted while ${rf.state.phase === "cure_pr_merged_awaiting_ci" ? `fix PR #${rf.mergedPr?.number} is already merged and settling post-merge CI` : "the fix work runs automatically"}`,
+            `auto-closed (BR#6012 state machine: phase=${rf.state.phase}, warrantAsk=false) — no human action is warranted while ${rf.state.phase === "cure_pr_merged_awaiting_ci" ? `fix PR #${rf.mergedPr?.number} is already merged and settling post-merge CI` : rf.state.phase === "fix_undispatched" ? `the fix card is queued at top priority and inside the dispatch grace window (GH #455 — it escalates here if no executor picks it up)` : "the fix work runs automatically"}`,
             { from: "todo", to: "done" },
           );
         }

@@ -43,6 +43,8 @@ export type TrainEntryClass = z.infer<typeof TrainEntryClassSchema>;
 export const BaseRedPhaseSchema = z.enum([
   "diagnosing",
   "fix_in_progress",
+  "fix_undispatched",
+  "fix_dispatch_starved",
   "cure_pr_conflicting",
   "cure_pr_merged_awaiting_ci",
   "cure_pr_awaiting_force_merge",
