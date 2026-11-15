@@ -159,6 +159,9 @@ describe("witnessed legacy recovery fences", () => {
   function held() {
     let s = step(started(), {kind:"quiesce",...fence,writers:"process_group_empty"});
     s.budget_exhaustions = 3;
+    // BR#14726 — a budget hold needs RECENT exhaustions: stamp the decay clock
+    // (the predicate holds only within EXECUTION_BUDGET_DECAY_MS of this).
+    s.budget_exhausted_at = Date.now();
     const terminal = {...fence,writers:"process_group_empty" as const,outcome:{kind:"failed" as const,exit_code:1,stdout_tail:"",stderr_tail:"acp session/prompt failed: Authentication required: provider authentication required "}};
     s.terminal = terminal;
     s.recovery_permit = {phase:"available",id:"permit",...fence,task_revision:"revision",checkpoint_commit:null,terminal:structuredClone(terminal),

@@ -6,6 +6,11 @@ import { ExecutorNotReadySchema } from "./executor-readiness.ts";
 export const EXECUTION_POLICY_VERSION = 1;
 export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
 export const EXECUTION_LEASE_MS = 120_000;
+/** BR#14726 — the retry-budget decay window. A budget hold is 3+ exhaustions
+ *  RECENT (within this window), not 3 lifetime: a churn storm arms the budget,
+ *  a quiet period clears it, and the 68-task permanent fence the 2026-11-15
+ *  storm left on the backlog never re-forms. */
+export const EXECUTION_BUDGET_DECAY_MS = 86_400_000;
 const text = z.string().min(1).max(4000);
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/);
 export const ReasoningTierSchema = z.enum(["small", "medium", "large"]);
@@ -308,6 +313,9 @@ export const ExecutionStateSchema = z.object({
   messages: z.array(MessageSchema),
   operations: z.array(OperationSchema),
   budget_exhaustions: z.number().int().nonnegative().default(0),
+  /** BR#14726 — epoch-ms of the LATEST exhaustion (0 = none recorded; legacy
+   *  rows without a timestamp read as aged-out and released). */
+  budget_exhausted_at: z.number().int().nonnegative().default(0),
   failure_charged_generation: z.number().int().nonnegative().nullable().default(null),
   retry_strategy: ExecutionRetryStrategySchema.nullable().default(null),
   recovery_permit: ExecutionRecoveryPermitSchema.nullable().default(null),
@@ -317,7 +325,7 @@ export const ExecutionStateSchema = z.object({
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, failure_charged_generation: 0, retry_strategy: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -611,7 +619,12 @@ export function recoveryPermitMatches(state: ExecutionState, capability: Pick<Ex
  * changed strategy. Time, aliases, sessions and arbitrary edits grant nothing. */
 export function executionAttemptBudgetExhausted(state: ExecutionState, taskRevision = "legacy"): boolean {
   const strategy = state.retry_strategy;
-  if (!strategy) return state.budget_exhaustions >= 3;
+  // BR#14726 — a budget hold is RECENT exhaustions, never a lifetime count: a
+  // lifetime count re-armed permanently on churn-storm residue and fenced 68
+  // backlog tasks from dispatch indefinitely (2026-11-15). 3+ charges within
+  // the decay window hold; a quiet period clears. A missing/zero timestamp is
+  // a pre-decay legacy row — aged out, released.
+  if (!strategy) return state.budget_exhaustions >= 3 && Date.now() - (state.budget_exhausted_at ?? 0) < EXECUTION_BUDGET_DECAY_MS;
   return strategy.task_revision !== taskRevision || strategy.failures >= 3;
 }
 export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTier, reason: string,
@@ -647,6 +660,7 @@ export function chargeExecutionFailure(state: ExecutionState, generation: number
   if (state.failure_charged_generation !== null && state.failure_charged_generation >= generation) return;
   state.failure_charged_generation = generation;
   state.budget_exhaustions += 1;
+  state.budget_exhausted_at = Date.now(); // BR#14726 — the decay clock rides the latest charge
   if (state.retry_strategy && generation >= state.retry_strategy.first_generation) state.retry_strategy.failures += 1;
 }
 
