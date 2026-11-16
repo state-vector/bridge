@@ -350,3 +350,77 @@ describe("BR#9510 leg 5 — accepted_direct_main closes a todo-position parent (
     expect(cur.meta?.delivery).toMatchObject({ kind: "direct_main", sha: COMMIT, repo: REPO });
   });
 });
+
+describe("BR#9510 leg 6 — the strand sweep carries a fully-merged stranded car instead of re-dispatching queue_binding (BR#11981 class)", () => {
+  /** The BR#11981 shape: a queued car whose acceptance ADMITTED (pre-cure
+   *  stamp) is then resumed blocked→in_progress by an answered ask, and the
+   *  PR merges — leaving an in_progress card with a stale queued stamp, an
+   *  admitted acceptance that never replays, and no live writer. */
+  const strandResumedCar = async (repo: string, n: number, actor: string, head: string) => {
+    const id = await task(`BR#9510 strand specimen ${repo}#${n}`);
+    await parkQueuedCar(id, repo, n, actor, head); // queued + admitted (delivery_admissions)
+    const resumed = await kbJson("/transition", { id, to: "in_progress", actor, note: "ask answered — resumed" });
+    expect(resumed.status, `resume failed: ${JSON.stringify(resumed.body)}`).toBe(200);
+    // age the park past the strand horizon (train.strand_hours default 2h)
+    const cur0 = await get(id);
+    const upd = await kbJson("/update", { id, meta: {
+      ...cur0.meta,
+      merge_train: { ...cur0.meta?.merge_train, at: Date.now() - 3 * 3_600_000 },
+      ...(cur0.meta?.blocked ? { blocked: { ...cur0.meta.blocked, ts: Date.now() - 3 * 3_600_000 } } : {}),
+    } });
+    expect(upd.status, `age update failed: ${JSON.stringify(upd.body)}`).toBe(200);
+    return id;
+  };
+
+  const countRecoveryDuties = async (id: string) => {
+    const rel = (await kbJson("/relations", { id })).body.relations ?? [];
+    const out: string[] = [];
+    for (const r of rel) if (r.relation === "child_of" && r.dir === "in") out.push(String(r.artefact_id));
+    let n = 0;
+    for (const c of out) {
+      const child = await get(c);
+      if (String(child?.meta?.machine_duty?.kind ?? "") === "task-recovery") n += 1;
+    }
+    return n;
+  };
+
+  it("a resumed in_progress queued car whose leg carries provenance is terminally closed by the strand sweep — no queue_binding duty dispatched", async () => {
+    const REPO = "state-vector/br9510-strand-carry";
+    const N = 9518;
+    const HEAD = "f".repeat(40);
+    const SHA = "1".repeat(40);
+    const id = await strandResumedCar(REPO, N, "drill-owner-strand-a", HEAD);
+    const before = await get(id);
+    expect(before.status).toBe("in_progress");
+    expect(before.meta?.merge_train?.state).toBe("queued");
+    // the PR merges AFTER the acceptance parked the card (provenance receipt)
+    await stampProvenance(REPO, N, SHA, HEAD, "gw-br9510-strand-a");
+    const recoveriesBefore = await countRecoveryDuties(id);
+    const sweep = await kbJson("/admin.strand_disposition_sweep", {});
+    expect(sweep.body.error, JSON.stringify(sweep.body)).toBeUndefined();
+    const cur = await get(id);
+    expect(cur.status).toBe("done");
+    expect(cur.meta?.merge_train?.state).toBe("landed");
+    expect(cur.meta?.merge_train?.legs?.[String(N)]).toMatchObject({ state: "landed", merge_sha: SHA, via: "merged-provenance" });
+    expect(await countRecoveryDuties(id)).toBe(recoveriesBefore); // NO queue_binding duty
+    expect(await historyText(id)).toContain("merged-provenance");
+    // idempotent: a second strand pass on the done card changes nothing
+    const sweep2 = await kbJson("/admin.strand_disposition_sweep", {});
+    expect(sweep2.body.error, JSON.stringify(sweep2.body)).toBeUndefined();
+    expect((await get(id)).status).toBe("done");
+  });
+
+  it("the SAME stranded car WITHOUT merged provenance still dispatches the recovery duty (fail-closed guard)", async () => {
+    const REPO = "state-vector/br9510-strand-live";
+    const N = 9519;
+    const HEAD = "2".repeat(40);
+    const id = await strandResumedCar(REPO, N, "drill-owner-strand-b", HEAD);
+    const recoveriesBefore = await countRecoveryDuties(id);
+    const sweep = await kbJson("/admin.strand_disposition_sweep", {});
+    expect(sweep.body.error, JSON.stringify(sweep.body)).toBeUndefined();
+    const cur = await get(id);
+    expect(cur.status).not.toBe("done"); // the merge is still owed — the card stays open
+    expect(cur.meta?.merge_train?.state).toBe("queued");
+    expect(await countRecoveryDuties(id)).toBe(recoveriesBefore + 1); // exactly ONE inspection duty
+  });
+});
