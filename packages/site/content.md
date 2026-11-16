@@ -328,7 +328,10 @@ Lease expiry, time and titles are never quiescence evidence.
 Use `bridge execution schedule-status [hostname]` to see occupied slots,
 reservations, capacity, eligible work, exclusion reasons and the last scheduling
 outcome. Within the same priority and boost, the oldest-created eligible task goes first. Idle capacity with eligible work for two minutes produces one
-`dispatch_starved` incident per episode. Repository refusals are task-scoped hub
+`dispatch_starved` incident per episode, re-fired every 30 minutes while the
+starvation persists (BR#14703); stats carries `starved_1h` so a dead dispatch
+loop is visible on the board, and a retry-budget hold pile over 30 tasks raises
+one `retry_budget_pile` class alarm per 30 minutes. Repository refusals are task-scoped hub
 state, re-evaluated when prerequisite inputs change; a stale local give-up cache
 cannot override a released task. Repeated runtime failures use a visible bounded
 cooldown rather than requiring the operator to restart a silent runner.

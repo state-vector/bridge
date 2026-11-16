@@ -631,8 +631,14 @@ command `schedule_status`) reports running/uncertain writers, reservations,
 capacity, eligible work, exclusion counts, readiness, last scheduling result and
 work-conservation health. A ready gateway with free slots and eligible work but
 no new reservations for two minutes raises one `dispatch_starved` audit incident
-per episode. Reservations clear the episode; this is machine diagnosis, not a
-human approval queue.
+per episode, and the alarm RE-FIRES every 30 minutes while the starvation
+persists — a dispatch loop that died hours ago must never look like an empty
+backlog (BR#14703). Stats carries `starved_1h` (live hosts starved for ≥1h) so
+the board shows a dead dispatch loop without fetching schedule_status, and when
+the retry-budget hold pile exceeds 30 tasks the sweep raises one `retry_budget_pile`
+class alarm per 30m naming the storm — per-task cooldowns must not silently
+fence off most of the todo pool. Reservations clear the episodes; this is
+machine diagnosis, not a human approval queue.
 
 To retire a laptop from autonomous execution, an authenticated full agent or
 human uses `execution` with `id:"gateway"` and command

@@ -6234,6 +6234,7 @@ export class KnowledgeHub {
         action_deadline: cur.attempt.action_deadline, observed_at: now,
       });
     }
+    let pileMax = 0, pileReasons: Record<string, number> | null = null;
     for (const status of this.schedulingStatus(undefined, now)) {
       if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
         this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
@@ -6255,6 +6256,23 @@ export class KnowledgeHub {
           this.audit("system:scheduler", "dispatch_starved", null, { host: status.host, eligible: status.eligible, active: status.active, reserved: status.reserved, capacity: status.capacity, since: pending.since });
         });
       }
+      // BR#14703 (W3) — the hold pile is the starvation's other face: 69
+      // retry_budget cooldowns once fenced ~70% of the backlog with no
+      // global view anywhere, each budget ticking down in isolation while
+      // the pool looked full. A pile this large is itself a dispatch
+      // defect: raise ONE throttled class alarm (30m re-fire, the same
+      // cadence as dispatch_starved) naming the storm. The census is
+      // per-host, so the widest host read is the honest pile size.
+      const pile = Number(status.reasons?.["retry_budget"] ?? 0);
+      if (pile > pileMax) { pileMax = pile; pileReasons = { ...status.reasons }; }
+    }
+    if (pileMax > 30 && !this.one(
+      `SELECT seq FROM ledger WHERE kind='signal' AND action='retry_budget_pile' AND ts>? LIMIT 1`,
+      now - 1_800_000,
+    )) {
+      this.audit("system:scheduler", "retry_budget_pile", null, {
+        retry_budget: pileMax, reasons: pileReasons ?? {}, threshold: 30,
+      });
     }
   }
 
@@ -9108,12 +9126,17 @@ export class KnowledgeHub {
         held: Object.fromEntries(Object.entries(s.reasons ?? {}).map(([k, v]) => [k, Number(v)])),
       }));
     } catch { /* scheduling shape varies — best-effort */ }
+    // BR#14703 (W1/W3) — starved_1h: how many live hosts have been starved
+    // for at least an hour (starved_since is per-host; this counter is the
+    // at-a-glance "the dispatch loop has been dead for hours" figure).
+    const starved1h = (scheduler ?? []).filter(s => s.starved_since !== null && Date.now() - (s.starved_since as number) >= 3_600_000).length;
     return {
       counts: byType,
       ...(options.park_inventory === true && { park_inventory: this.parkInventory(String(options.after_park ?? "")) }),
       watchdog,
       ...(occupancy?.length ? { occupancy } : {}),
       ...(launch_failed_1h ? { launch_failed_1h } : {}),
+      ...(starved1h ? { starved_1h: starved1h } : {}),
       ...(scheduler?.length ? { scheduler } : {}),
       channel: {
         window_started_ts: this.routeStatsStarted,

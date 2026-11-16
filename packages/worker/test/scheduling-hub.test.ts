@@ -32,6 +32,45 @@ beforeEach(async () => {
           this.reconcileSchedulingHealth(Date.now());
           return Response.json(this.executionState(id));
         }
+        if (path === "/fixture/scheduling-health") {
+          const body = await request.json().catch(() => ({} as Record<string, unknown>));
+          if (body.starve_age_ms) this.state.storage.sql.exec(`UPDATE dispatch_health SET since=?`, Date.now() - Number(body.starve_age_ms));
+          if (body.attention_age_ms) this.state.storage.sql.exec(`UPDATE dispatch_health SET attention_at=? WHERE attention_at IS NOT NULL`, Date.now() - Number(body.attention_age_ms));
+          const started = Date.now();
+          this.reconcileSchedulingHealth(Date.now());
+          const rows = this.state.storage.sql.exec(
+            `SELECT action, COUNT(*) AS n FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile') AND ts>=? GROUP BY action`, started,
+          ).toArray() as Array<{ action: string; n: number }>;
+          const alarms: Record<string, number> = {};
+          for (const row of rows) alarms[String(row.action)] = Number(row.n);
+          return Response.json({ ok: true, alarms });
+        }
+        if (path === "/fixture/hold-pile") {
+          const { count = 0, starve_age_ms = 0 } = await request.json() as { count?: number; starve_age_ms?: number };
+          const now = Date.now();
+          for (let i = 0; i < count; i++) {
+            const id = `hold-pile-${now}-${i}`;
+            this.state.storage.sql.exec(
+              `INSERT INTO artefacts (id, type, title, status, project, owner, created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)`,
+              id, "task", `Held pile ${i}`, "todo", "", "", now, now,
+            );
+            this.state.storage.sql.exec(
+              `INSERT INTO execution_state (task_id, state) VALUES (?,?)`,
+              id, JSON.stringify({
+                generation: 1,
+                attempt: { generation: 1, attempt_id: `hp-${now}-${i}`, host: "held-host", phase: "quiesced" },
+                operations: [],
+                budget_exhaustions: 3,
+                budget_exhausted_at: now,
+                failure_charged_generation: 1,
+                requirements: { tier: "small", tools: [], environment: [] },
+              }),
+            );
+          }
+          if (starve_age_ms) this.state.storage.sql.exec(`UPDATE dispatch_health SET since=?`, now - starve_age_ms);
+          const stats = await this.stats();
+          return Response.json({ ok: true, starved_1h: (stats as Record<string, unknown>).starved_1h ?? null });
+        }
         if (path === "/fixture/attempt-diagnosis") {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
@@ -653,6 +692,31 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].active).toBe(1);
     expect((await reserve(g)).kind).toBe("at_capacity");
+  });
+  it("re-alarms persistent starvation on the 30m cadence, names a >30 retry-budget pile once per 30m, and carries starved_1h in stats", async () => {
+    const project = "starve-re-fire", g = await gateway(project, 4);
+    await task(project); await task(project); // eligible work, free capacity
+    const tick = async (body: object = {}) => await (await stub.fetch("https://fixture/fixture/scheduling-health", { method: "POST", body: JSON.stringify(body) })).json() as { alarms: Record<string, number> };
+    await tick(); // arms the starve clock
+    // Starved ≥2m with an empty attention stamp: the FIRST class alarm.
+    const first = await tick({ starve_age_ms: 200_000 });
+    expect(first.alarms.dispatch_starved ?? 0).toBeGreaterThanOrEqual(1);
+    // The 30m throttle holds while the starvation persists.
+    const second = await tick();
+    expect(second.alarms.dispatch_starved ?? 0).toBe(0);
+    // Aging the throttle stamp past 30m re-arms the alarm (re-fire law).
+    const third = await tick({ attention_age_ms: 1_900_000 });
+    expect(third.alarms.dispatch_starved ?? 0).toBe(1);
+    // 31 retry-budget holds: ONE pile class alarm, then the 30m throttle.
+    const pile = await (await stub.fetch("https://fixture/fixture/hold-pile", { method: "POST", body: JSON.stringify({ count: 31 }) })).json() as { ok: boolean };
+    expect(pile.ok).toBe(true);
+    const fourth = await tick();
+    expect(fourth.alarms.retry_budget_pile ?? 0).toBe(1);
+    const fifth = await tick();
+    expect(fifth.alarms.retry_budget_pile ?? 0).toBe(0);
+    // starved_1h: a host starved ≥1h is counted in stats without fetching schedule_status.
+    const aged = await (await stub.fetch("https://fixture/fixture/hold-pile", { method: "POST", body: JSON.stringify({ count: 0, starve_age_ms: 3_700_000 }) })).json() as { starved_1h: number | null };
+    expect(aged.starved_1h).toBe(1);
   });
   it("bootstraps from the authenticated reservation without caller-supplied worker attribution, never from a peer or stale session", async () => {
     const project = "bootstrap", g = await gateway(project), peer = await gateway(project);
