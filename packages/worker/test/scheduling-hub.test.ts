@@ -21,6 +21,17 @@ beforeEach(async () => {
     export class SchedulingRig extends KnowledgeHub {
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path === "/fixture/expired-stopping") {
+          const { id } = await request.json();
+          const row = this.state.storage.sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0];
+          const state = JSON.parse(row.state);
+          state.attempt.phase = "stopping";
+          state.attempt.lease_until = 1;
+          state.attempt.action_deadline = 1;
+          this.state.storage.sql.exec("UPDATE execution_state SET state=? WHERE task_id=?", JSON.stringify(state), id);
+          this.reconcileSchedulingHealth(Date.now());
+          return Response.json(this.executionState(id));
+        }
         if (path === "/fixture/attempt-diagnosis") {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
@@ -620,6 +631,16 @@ describe("eligibility-first scheduling on real SQLite", () => {
     // Consume the released fixture so later global eligibility censuses do not
     // inherit its deliberately retained host affinity.
     expect((await post("transition", { ...g.auth, id, to: "in_progress" })).error).toBeUndefined();
+  });
+  it("never converts expired deadlines into stopped-writer proof during scheduling maintenance", async () => {
+    const g = await gateway("expired-stopping"), id = await task("expired-stopping"), r = await reserve(g);
+    if (r.kind !== "reserved") throw new Error("no reservation");
+    await g.cmd({ kind: "begin", attempt_id: "needs-proof", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin", id, r.session);
+    const expired = await stub.fetch("https://fixture/fixture/expired-stopping", { method: "POST", body: JSON.stringify({ id }) });
+    expect(await expired.json()).toMatchObject({ attempt: { phase: "stopping", lease_until: 1, action_deadline: 1 } });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
+    expect(status.hosts[0].active).toBe(1);
+    expect((await reserve(g)).kind).toBe("at_capacity");
   });
   it("bootstraps from the authenticated reservation without caller-supplied worker attribution, never from a peer or stale session", async () => {
     const project = "bootstrap", g = await gateway(project), peer = await gateway(project);

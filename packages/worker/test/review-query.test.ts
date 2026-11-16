@@ -1,10 +1,10 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "../src/kb/review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "../src/kb/review-query";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
-interface ReviewRow { id: string; status: string; meta: string }
+interface ReviewRow { id: string; status: string; meta: string; cursor: number }
 async function query(sql: string, args: (string | number)[] = []) {
   const response = await stub.fetch("https://query/", { method: "POST", body: JSON.stringify({ sql, args }) });
   expect(response.status, await response.clone().text()).toBe(200);
@@ -43,6 +43,18 @@ beforeAll(async () => {
 afterAll(async () => { await mf?.dispose(); });
 
 describe("canonical review lookup with a retained SQLite backlog", () => {
+  it("bounds background repair independently of 12,000 retained completed reviews", async () => {
+    const page = await query(REVIEW_RECONCILE_BATCH_SQL, [0, REVIEW_RECONCILE_BATCH_SIZE]);
+    expect(page.rows.map(r => r.id)).toEqual(["parent", "other"]);
+    expect(page.reads).toBeLessThan(100);
+    const historical = await query(REVIEW_BACKFILL_BATCH_SQL, [0, REVIEW_RECONCILE_BATCH_SIZE]);
+    expect(historical.rows).toHaveLength(REVIEW_RECONCILE_BATCH_SIZE);
+    expect(historical.reads).toBeLessThan(150);
+    const next = await query(REVIEW_BACKFILL_BATCH_SQL, [historical.rows.at(-1)!.cursor, REVIEW_RECONCILE_BATCH_SIZE]);
+    expect(next.rows).toHaveLength(REVIEW_RECONCILE_BATCH_SIZE);
+    expect(next.rows.every(row => row.cursor > historical.rows.at(-1)!.cursor)).toBe(true);
+    expect(next.reads).toBeLessThan(150);
+  });
   it("does not scan unrelated review history to find no current round", async () => {
     const result = await current();
     expect(result.rows).toEqual([]);

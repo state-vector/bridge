@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { KnowledgeHub } from "../src/kb/do";
 import { RequestDiagnostics } from "../src/kb/request-diagnostics";
 import type { HubRequestStage } from "@bridge/contracts";
+import { REVIEW_RECONCILE_BATCH_SQL } from "../src/kb/review-query";
 
 interface BoardHarness {
   broadcastEvent(event: unknown): void;
@@ -88,5 +89,53 @@ describe("foreground control and cooperative hub maintenance", () => {
     await maintenance;
     expect(phases).toEqual(["foreground request", "next phase"]);
     expect(trace.finish(200).stages.some(stage => stage.stage === "task.maintenance" && stage.elapsed_ms > 0)).toBe(true);
+  });
+});
+
+interface ReviewMaintenanceHarness {
+  reconcileCompletedReviews(): Promise<void>;
+  reconcileDeliveryClosures(): Promise<void>;
+  replayDeliveryAdmissions(): Promise<void>;
+  currentTaskReview(id: string): { phase: "none" };
+  settingValue(key: string, fallback: string): string;
+}
+
+describe("bounded review maintenance", () => {
+  it("lets foreground work run within a page, then rotates past an unchanged backlog and survives restart", async () => {
+    vi.useFakeTimers();
+    const settings = new Map<string, string>();
+    const visited: string[] = [];
+    const sql = { exec: vi.fn((query: string, ...args: unknown[]) => {
+      if (query === REVIEW_RECONCILE_BATCH_SQL) {
+        const after = Number(args[0]), limit = Number(args[1]);
+        return { toArray: () => Array.from({ length: 60 }, (_, i) => ({ cursor: i + 1, id: `task-${i + 1}` }))
+          .filter(row => row.cursor > after).slice(0, limit) };
+      }
+      if (query.startsWith("INSERT OR REPLACE INTO settings")) settings.set(String(args[0]), String(args[1]));
+      return { toArray: () => [] };
+    }) };
+    const makeHub = () => {
+      const hub = new KnowledgeHub({ storage: { sql } } as unknown as DurableObjectState, {}) as unknown as ReviewMaintenanceHarness;
+      vi.spyOn(hub, "reconcileDeliveryClosures").mockResolvedValue();
+      vi.spyOn(hub, "replayDeliveryAdmissions").mockResolvedValue();
+      vi.spyOn(hub, "settingValue").mockImplementation((key, fallback) => settings.get(key) ?? fallback);
+      vi.spyOn(hub, "currentTaskReview").mockImplementation(id => { visited.push(id); return { phase: "none" }; });
+      return hub;
+    };
+    const hub = makeHub();
+    const first = hub.reconcileCompletedReviews();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(visited.length).toBeLessThan(25); // foreground request admitted before the page completes
+    await vi.runAllTimersAsync(); await first;
+    expect(visited).toHaveLength(25);
+    expect(settings.get("review_reconcile_cursor")).toBe("25");
+    // A new isolate picks up the persistent cursor, not the first page again.
+    for (const expected of [50, 60, 85]) {
+      const pass = makeHub().reconcileCompletedReviews();
+      await vi.runAllTimersAsync(); await pass;
+      expect(visited).toHaveLength(expected);
+    }
+    expect(new Set(visited.slice(0, 60)).size).toBe(60);
+    expect(visited[60]).toBe("task-1");
   });
 });

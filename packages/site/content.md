@@ -86,6 +86,13 @@ checks explain missing evidence and executor state rather than declaring main re
 Maintenance yields between committed phases, and mutation acknowledgements do not
 run board aggregation synchronously. Indexed current-review lookups preserve exact
 review authority without repeatedly scanning unrelated retained history.
+Background review recovery also rotates over bounded 25-card pages and yields
+between individual closure/admission/verdict operations. Durable cursors survive
+restarts; authority is re-read after each yield. The diagnostics name review
+subphases separately. Direct review completion remains immediate. Lease expiry
+never substitutes for an originating-host stopped-writer receipt to free a slot.
+Capacity is a ceiling: measure sustained task starts and accepted completions,
+not just occupied slots, when diagnosing throughput or slow gateway refill.
 Indexed receipt-ledger lookups keep per-task history, activity and maintenance
 queries independent of unrelated retained receipts, preserving their exact
 history order, actor attribution and time windows.

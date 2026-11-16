@@ -4,7 +4,21 @@ const subject = `COALESCE(json_extract(c.meta,'$.review_subject.task_id'),json_e
 export const REVIEW_LOOKUP_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_task_review_subject ON artefacts(${subjectExpression},created_ts DESC) WHERE type='task';
   CREATE INDEX IF NOT EXISTS idx_relations_incoming ON relations(dst_id,relation,src_id);
+  CREATE INDEX IF NOT EXISTS idx_open_review_reconcile ON artefacts(status)
+    WHERE type='task' AND status IN ('in_review','todo');
 `;
+
+/** Background repair rotates across a bounded page, not every open card on
+ * every alarm. The authoritative current-review lookup still runs immediately
+ * before applying each verdict; this query grants no acceptance authority. */
+export const REVIEW_RECONCILE_BATCH_SIZE = 25;
+export const REVIEW_RECONCILE_BATCH_SQL = `SELECT rowid AS cursor,id FROM artefacts
+  WHERE type='task' AND status IN ('in_review','todo') AND rowid>?
+  ORDER BY rowid LIMIT ?`;
+
+export const REVIEW_BACKFILL_BATCH_SQL = `SELECT rowid AS cursor,id,meta,status_ts FROM artefacts
+  WHERE type='task' AND status='done' AND roles LIKE '%review%' AND rowid>?
+  ORDER BY rowid LIMIT ?`;
 
 // Separate indexed declared subjects from the legacy child lookup. An OR with
 // a correlated relation subquery scanned every retained review for EACH task

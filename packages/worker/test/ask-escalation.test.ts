@@ -258,7 +258,7 @@ describe("ask TTL escalation (real DO)", () => {
   it("the alarm sweep carries the escalation step (source-level, so prod can't drift from the drill)", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../src/kb/do.ts", import.meta.url), "utf8");
-    expect(src).toContain("await this.escalateStaleAsks(now0)");
+    expect(src).toContain("await this.escalateStaleAsks(now0, trace)");
 
     /** index of the `}` matching the `{` at openIdx (balanced-text match —
      *  the alarmSweep region holds no unbalanced braces in strings/comments) */
@@ -292,7 +292,7 @@ describe("ask TTL escalation (real DO)", () => {
     expect(starveCall).toBeGreaterThan(-1);
     const starveTry = body.lastIndexOf("try", starveCall);
     const starveStmt = tryCatchStmt(body, starveTry);
-    const escCall = body.indexOf("await this.escalateStaleAsks(now0);");
+    const escCall = body.indexOf("await this.escalateStaleAsks(now0, trace);");
     expect(escCall).toBeGreaterThan(-1);
     // the call lives OUTSIDE the starvation sweep's try/catch — a successful
     // starvation sweep no longer skips it
@@ -302,7 +302,7 @@ describe("ask TTL escalation (real DO)", () => {
     // escalation error degrades alone instead of riding another phase's catch
     const escTry = body.lastIndexOf("try", escCall);
     const escStmt = tryCatchStmt(body, escTry);
-    expect(escStmt).toContain("await this.escalateStaleAsks(now0);");
+    expect(escStmt).toContain("await this.escalateStaleAsks(now0, trace);");
     expect(escStmt).toContain("} catch");
     expect(escStmt).toContain("ask_escalation_error");
   });

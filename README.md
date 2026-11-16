@@ -121,6 +121,24 @@ uses indexed declared subjects and incoming child relations instead of scanning
 retained review history per task; pending, findings and detached rounds retain
 their exact submission/revision authority.
 
+Review recovery follows the same foreground-first rule: historical backfill and
+current-verdict repair rotate over at most 25 cards per pass, with durable cursors
+that survive a hub restart. Admission replay and closure repair yield **between
+individual operations**, before re-reading their authority; no transaction spans a
+yield. Diagnostics split `review.closures`, `review.backfill`, `review.admissions`,
+`review.verdicts`, and `coordination.maintenance`, so a long maintenance phase is
+measurable instead of inferred from a slow HTTP request. Normal review completion
+still applies its exact verdict immediately; background paging only heals missed
+hooks. Expired leases and action deadlines never manufacture stopped-writer proof
+or release a slot: the originating-host receipt protocol remains authoritative.
+
+Judge throughput by completed work and sustained start rate as well as slot usage.
+Twenty execution slots are a ceiling, not a guarantee of twenty productive agents:
+the gateway uses bounded preparation/finalization pools and one idempotent reserve
+stream. Diagnose slow refill using request/ingress stages, current starting/running
+slots, and durable result delivery. Increasing concurrency or adding a status cache
+does not cure long synchronous maintenance, failed startups, or missing tool access.
+
 The append-only receipt ledger has canonical lookup indexes for card history,
 actor activity, per-card actions and action/time windows. Watchdog and control
 queries use these indexes through the existing event/version views; unrelated

@@ -500,7 +500,7 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA } from "./review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "./review-query";
 import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
@@ -863,7 +863,7 @@ export class KnowledgeHub {
     // mask (or ride) the starvation sweep's own audit.
     try {
       await this.maintenanceCheckpoint(trace, "review.maintenance");
-      await this.escalateStaleAsks(now0);
+      await this.escalateStaleAsks(now0, trace);
     } catch (e) {
       this.audit("system:watchdog", "ask_escalation_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
     }
@@ -5879,23 +5879,23 @@ export class KnowledgeHub {
     // Scoped to THIS sweep (never cached across calls — admission stays
     // first-hand; only redundant intra-sweep recomputation is eliminated).
     const ids = rows.map(r => String(r.id));
-    const idList = ids.length ? `('${ids.join("','")}')` : `('')`;
+    const idList = JSON.stringify(ids);
     const stateById = new Map<string, ExecutionState | null>();
     for (const r of this.state.storage.sql.exec(
       `SELECT e.task_id AS tid, e.state AS state, a.meta AS meta FROM execution_state e
-       JOIN artefacts a ON a.id = e.task_id WHERE e.task_id IN ${idList}`,
+       JOIN artefacts a ON a.id = e.task_id WHERE e.task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) {
-      try {
-        const state = ExecutionStateSchema.parse(JSON.parse(String(r.state)));
-        state.requirements = ExecutionRequirementsSchema.parse(JSON.parse(String(r.meta ?? "{}")).execution_requirements ?? state.requirements);
-        stateById.set(String(r.tid), state);
-      } catch { /* malformed state — read as absent */ }
+      // Corrupt persisted execution evidence is not an absent writer. Keep the
+      // original fail-closed parse semantics rather than making it eligible.
+      const state = ExecutionStateSchema.parse(JSON.parse(String(r.state)));
+      state.requirements = ExecutionRequirementsSchema.parse(JSON.parse(String(r.meta ?? "{}")).execution_requirements ?? state.requirements);
+      stateById.set(String(r.tid), state);
     }
     // hasEvidence bulk: done review/analysis children + accepted decisions per id.
     const analysisEv = new Set<string>(), reviewEv = new Set<string>();
     for (const r of this.state.storage.sql.exec(
       `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status = 'done' AND r.dst_id IN ${idList}`,
+       WHERE r.relation = 'child_of' AND c.status = 'done' AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) {
       const roles: string[] = parseTags(String(r.roles));
       if (roles.includes("review")) { reviewEv.add(String(r.pid)); analysisEv.add(String(r.pid)); }
@@ -5903,27 +5903,27 @@ export class KnowledgeHub {
     }
     for (const r of this.state.storage.sql.exec(
       `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted' AND r.dst_id IN ${idList}`,
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted' AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) { const t = String(r.tid); analysisEv.add(t); reviewEv.add(t); }
     const openAskIds = new Set<string>();
     for (const r of this.state.storage.sql.exec(
-      `SELECT artefact_id AS pid FROM asks WHERE status = 'open' AND artefact_id IN ${idList}`,
+      `SELECT artefact_id AS pid FROM asks WHERE status = 'open' AND artefact_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) openAskIds.add(String(r.pid));
     for (const r of this.state.storage.sql.exec(
       `SELECT r.dst_id AS pid FROM relations r JOIN artefacts c ON c.id = r.src_id
        WHERE r.relation = 'child_of' AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked')
-         AND json_extract(c.meta, '$.ask') IS NOT NULL AND r.dst_id IN ${idList}`,
+          AND json_extract(c.meta, '$.ask') IS NOT NULL AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) openAskIds.add(String(r.pid));
     const startupWaitIds = new Set<string>();
     for (const r of this.state.storage.sql.exec(
-      `SELECT task_id AS tid FROM executor_start_waits WHERE task_id IN ${idList}`,
+      `SELECT task_id AS tid FROM executor_start_waits WHERE task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) startupWaitIds.add(String(r.tid));
     // BR#14767 — startup rejections bulk: (task_id, host, fingerprint) rows
     // for the sweep's ids; the row loop computes taskStartupProof from the
     // already-fetched artefact columns and checks membership in memory.
     const startupRejections = new Set<string>();
     for (const r of this.state.storage.sql.exec(
-      `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN ${idList}`,
+      `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) startupRejections.add(`${String(r.tid)}\u0000${String(r.host)}\u0000${String(r.fp)}`);
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
@@ -6213,17 +6213,10 @@ export class KnowledgeHub {
   }
   private reconcileSchedulingHealth(now: number) {
     this.rootFixDispatchStarvationSweep(now);
-    // BR#14703 (W2) — stale-stopping attempt reaper: an attempt in `stopping`
-    // past BOTH its lease and action deadline is a zombie slot — it still
-    // counts as active occupancy (gatewayOccupancy counts running/restoring/
-    // stopping) so nothing else dispatches onto it while its writer has been
-    // gone for a full grace window. Observed live: BR#14133 sat in stopping
-    // with a lease from ~24h earlier, the ONLY active slot on the gateway,
-    // while the scheduler starved. Flip it to quiesced (the slot-freeing
-    // terminal-for-occupancy phase — the execution record is preserved) with
-    // a named audit; lease expiry alone never proves writer quiescence, but
-    // lease + action deadline + no subsequent begin/finalize on that attempt
-    // means the slot is unowned by any live writer.
+    // Deadlines are not stopped-writer proof. An earlier throughput patch
+    // incorrectly relabelled expired stopping attempts as quiesced. Keep the
+    // slot charged and name the missing proof; only the existing originating-
+    // host stopped/finalize receipt protocol may discharge it.
     const stale = this.state.storage.sql.exec(
       `SELECT e.task_id, e.state, e.worker_token_id FROM execution_state e
        WHERE json_extract(e.state,'$.attempt.phase')='stopping'
@@ -6234,14 +6227,11 @@ export class KnowledgeHub {
     for (const row of stale) {
       const cur = JSON.parse(String(row.state));
       if (!cur?.attempt || cur.attempt.phase !== "stopping") continue;
-      cur.attempt.phase = "quiesced";
-      this.state.storage.sql.exec(
-        `UPDATE execution_state SET state = ? WHERE task_id = ?`,
-        JSON.stringify(cur), String(row.task_id),
-      );
-      this.audit("system:scheduler", "stale_stopping_reaped", String(row.task_id), {
+      if (this.one(`SELECT seq FROM ledger WHERE artefact_id=? AND kind='signal'
+        AND action='stopping_writer_proof_pending' AND ts>? LIMIT 1`, row.task_id, now - 1_800_000)) continue;
+      this.audit("system:scheduler", "stopping_writer_proof_pending", String(row.task_id), {
         attempt_id: cur.attempt.attempt_id, lease_until: cur.attempt.lease_until,
-        action_deadline: cur.attempt.action_deadline, reaped_at: now,
+        action_deadline: cur.attempt.action_deadline, observed_at: now,
       });
     }
     for (const status of this.schedulingStatus(undefined, now)) {
@@ -7346,10 +7336,15 @@ export class KnowledgeHub {
 
   /** Repair the create-duty/attach-source and accepted-receipt/retire-source
    * interruption windows using the existing alarm, never a second close. */
-  private async reconcileDeliveryClosures(): Promise<void> {
+  private async reconcileDeliveryClosures(trace?: RequestTrace): Promise<void> {
     const rows = this.state.storage.sql.exec(`SELECT d.id,d.status,d.meta FROM artefacts d JOIN artefacts p ON p.id=json_extract(d.meta,'$.machine_duty.subject') WHERE json_extract(d.meta,'$.machine_duty.kind')='delivery-close' AND (json_extract(p.meta,'$.delivery_disposition') IS NULL OR json_extract(p.meta,'$.delivery_disposition.closure.phase')='pending') LIMIT 10`).toArray();
     for (const r of rows) {
-      const dm = JSON.parse(String(r.meta ?? "{}"));
+      await this.maintenanceCheckpoint(trace, "review.closures");
+      // Foreground mutations can run at the checkpoint. Reload the duty before
+      // consulting its authority rather than using the page's stale metadata.
+      const current = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, r.id);
+      if (!current) continue;
+      const dm = JSON.parse(String(current.meta ?? "{}"));
       const source = this.one(`SELECT * FROM artefacts WHERE id=?`, String(dm.machine_duty.subject));
       if (!source) continue;
       const sm = JSON.parse(String(source.meta ?? "{}"));
@@ -7357,7 +7352,7 @@ export class KnowledgeHub {
         try { await this.holdOrAbandonDelivery(source, { kind: "abandon", reason: dm.closure_authority.reason }, String(dm.closure_authority.actor)); }
         catch (e) { this.audit("system:delivery", "closure_attachment_held", String(source.id), { duty: r.id, error: String(e) }); }
       }
-      if (r.status === "done") {
+      if (current.status === "done") {
         const review = this.one(`SELECT c.meta FROM relations rel JOIN artefacts c ON c.id=rel.src_id WHERE rel.dst_id=? AND rel.relation='child_of' AND c.status='done' AND json_extract(c.meta,'$.review_result.kind')='accepted_execution' ORDER BY c.status_ts DESC LIMIT 1`, r.id);
         if (review) this.completeDeliveryClosure(String(r.id), JSON.parse(String(review.meta)).review_result.receipts);
       }
@@ -9553,8 +9548,9 @@ export class KnowledgeHub {
 
   /** Recover failed peer delivery on the same request. Human audience is
    * explicit and never inferred from a timeout. `now` is injectable for drills. */
-  private async escalateStaleAsks(now: number): Promise<string[]> {
-    await this.reconcileCompletedReviews();
+  private async escalateStaleAsks(now: number, trace?: RequestTrace): Promise<string[]> {
+    await this.reconcileCompletedReviews(trace);
+    await this.maintenanceCheckpoint(trace, "coordination.maintenance");
     this.retireCompletedCoordination(now);
     this.retryExpiredRecoveryCoordination(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
@@ -9681,7 +9677,7 @@ export class KnowledgeHub {
 
   private readonly admissionReplay = new Set<string>();
 
-  private async replayDeliveryAdmissions(reviewId?: string): Promise<void> {
+  private async replayDeliveryAdmissions(reviewId?: string, trace?: RequestTrace): Promise<void> {
     // Process the verdict that just committed immediately. Background replay
     // still rotates past held history and also catches recent pending verdicts
     // whose close hooks stopped before the exact replay ran.
@@ -9707,6 +9703,9 @@ export class KnowledgeHub {
       ORDER BY a.rowid DESC LIMIT 4`).toArray();
     const attempted = new Set<string>();
     for (const row of [...recent, ...mergeWaits, ...rows]) {
+      // Yield only between complete replay operations, before re-reading the
+      // admission/parent fences. No SQLite transaction crosses this yield.
+      if (!reviewId) await this.maintenanceCheckpoint(trace, "review.admissions");
       const id = String(row.review_id);
       const advance = () => {
         if (row.cursor != null) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
@@ -9790,31 +9789,53 @@ export class KnowledgeHub {
    * This repairs interrupted accept hooks without inventing a new verdict. */
   private reviewReconcileRunning = false;
 
-  private async reconcileCompletedReviews(): Promise<void> {
+  private async reconcileCompletedReviews(trace?: RequestTrace): Promise<void> {
     // Mutation hooks can yield while repairing an admission. Concurrent
     // ingress must not start the same historical scan again in that window.
     if (this.reviewReconcileRunning) return;
     this.reviewReconcileRunning = true;
-    try { await this.reconcileCompletedReviewsPass(); }
+    try { await this.reconcileCompletedReviewsPass(trace); }
     finally { this.reviewReconcileRunning = false; }
   }
 
-  private async reconcileCompletedReviewsPass(): Promise<void> {
-    await this.reconcileDeliveryClosures();
+  private async reconcileCompletedReviewsPass(trace?: RequestTrace): Promise<void> {
+    await this.reconcileDeliveryClosures(trace);
     // Backfill explicit historical PR acceptances including already-done
     // parents, then replay the durable outbox on every existing repair pass.
-    const accepted = this.state.storage.sql.exec(`SELECT c.id,c.meta,c.status_ts FROM artefacts c WHERE c.type='task' AND c.status='done' AND c.roles LIKE '%review%' AND NOT EXISTS(SELECT 1 FROM delivery_admissions a WHERE a.review_id=c.id) AND NOT EXISTS(SELECT 1 FROM delivery_review_backfill b WHERE b.review_id=c.id AND b.status_ts=c.status_ts) ORDER BY c.rowid LIMIT 10`).toArray();
+    // Both scans are cursor-bounded on the existing settings store. Historical
+    // reviews that have already been backfilled must not make every alarm scan
+    // the full retained history merely to discover that there is no work.
+    const page = (key: string, sql: string) => {
+      const cursor = Number(this.settingValue(key, "0"));
+      const read = (after: number) => this.state.storage.sql.exec(sql, after, REVIEW_RECONCILE_BATCH_SIZE).toArray();
+      const first = read(cursor);
+      return first.length || !cursor ? first : read(0);
+    };
+    const advance = (key: string, cursor: unknown) => this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, key, String(cursor),
+    );
+    const accepted = page("review_backfill_cursor", REVIEW_BACKFILL_BATCH_SQL);
     for (const r of accepted) {
+      await this.maintenanceCheckpoint(trace, "review.backfill");
+      advance("review_backfill_cursor", r.cursor);
+      if (this.one(`SELECT review_id FROM delivery_admissions WHERE review_id=?`, r.id)
+        || this.one(`SELECT review_id FROM delivery_review_backfill WHERE review_id=? AND status_ts=?`, r.id, r.status_ts)) continue;
+      const fresh = this.one(`SELECT status,meta,status_ts FROM artefacts WHERE id=?`, r.id);
+      if (fresh?.status !== "done" || fresh.status_ts !== r.status_ts) continue;
       const receipt = this.one(`SELECT actor FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, r.id);
-      if (receipt) this.persistDeliveryAdmission(String(r.id), JSON.parse(String(r.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
+      if (receipt) this.persistDeliveryAdmission(String(r.id), JSON.parse(String(fresh.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
-    await this.replayDeliveryAdmissions();
+    await this.replayDeliveryAdmissions(undefined, trace);
     // BR#9510 additive leg: the scan also covers todo-position parents — an
     // exact-subject accepted_direct_main round whose close stranded because
     // the parent had been watchdog-released back to todo (BR#7642).
-    const rows = this.state.storage.sql.exec(`SELECT id FROM artefacts WHERE type='task' AND status IN ('in_review','todo')`).toArray();
+    const rows = page("review_reconcile_cursor", REVIEW_RECONCILE_BATCH_SQL);
     for (const row of rows) {
+      await this.maintenanceCheckpoint(trace, "review.verdicts");
+      advance("review_reconcile_cursor", row.cursor);
+      // Re-read current review authority AFTER yielding. New findings, a newer
+      // round, a changed revision or executor must still fence historical work.
       const current = this.currentTaskReview(String(row.id));
       if (current.phase !== "accepted") continue;
       const receipt = this.one(`SELECT actor FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, current.id);

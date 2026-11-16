@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const HubRequestStageSchema = z.enum(["schema", "alarm", "body", "dispatch", "readiness", "inventory", "board", "capability.maintenance", "startup.maintenance", "task.maintenance", "review.maintenance", "train.maintenance"]);
+export const HubRequestStageSchema = z.enum(["schema", "alarm", "body", "dispatch", "readiness", "inventory", "board", "capability.maintenance", "startup.maintenance", "task.maintenance", "review.maintenance", "review.closures", "review.backfill", "review.admissions", "review.verdicts", "coordination.maintenance", "train.maintenance"]);
 const Timing = z.object({ id: z.string(), operation: z.string(), started_at: z.number(), elapsed_ms: z.number().nonnegative(), ingress_ms: z.number().nonnegative(),
   stage: HubRequestStageSchema, stages: z.array(z.object({ stage: HubRequestStageSchema, elapsed_ms: z.number().nonnegative() })) });
 export const HubRequestTimingSchema = z.discriminatedUnion("phase", [
