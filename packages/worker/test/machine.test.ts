@@ -2286,6 +2286,55 @@ describe("breachClass: execution_acceptance_fence (BR#7721)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#14689 — the interactive-claim human-decision fence (execution-work.ts
+// assertInteractiveClaim :117, reached from the interactive claim op do.ts:6471
+// and the direct-interactive-claim transition path do.ts:7819): a claim
+// attempt on a card whose exit an open human decision owns — a bound ask, or
+// an open human-routed child question — is refused with "gate: an open human
+// decision owns this exit; answer it before claiming" (a bare throw, no
+// [rule:] tag). The refusal IS the BR#6068 pause law working: the open ask
+// owns the exit until it is answered, zero state is destroyed, and the
+// refusal's own instruction is the cure (answer it; the answer auto-resumes
+// the flow). Priced never-a-breach — the BR#4562/BR#6654/BR#7008/BR#7684
+// family; pricing it FINITE would re-arm breach cards on exactly the
+// enforcement the pause law prescribes. Specimen: BR#14684, 3 refusals
+// 2026-11-15 12:44:57–12:47:17Z during the open human gate ask BR#14688
+// (main-red merge hold) — the ask was answered 12:48:17Z and the re-claim
+// succeeded 12:48:42Z; the events folded "unclassified" (default threshold 3)
+// and raised breach card BR#14689.
+// ---------------------------------------------------------------------------
+describe("breachClass: claim:held-human-decision (BR#14689)", () => {
+  // the exact audited reason shape (execution-work.ts:117, thrown message,
+  // no [rule:] tag)
+  const FENCE = "gate: an open human decision owns this exit; answer it before claiming";
+
+  it("the claim-hold refusal classifies claim:held-human-decision from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("claim:held-human-decision");
+    // the stem sits ~7 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("claim:held-human-decision");
+  });
+
+  it("a claim-hold refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#14684", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["claim:held-human-decision"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("the fence's sister wording (typed local/capability wait owns this exit) stays in its own class", () => {
+    // "owns this exit" alone is shared language — the stem is the full
+    // "an open human decision owns this exit" fragment, so the typed-wait
+    // gate (release:held-execution-wait, BR#6740) must not be captured
+    expect(breachClass("gate: typed local/capability wait owns this exit; ordinary transitions/asks/timeout cannot release it")).toBe("release:held-execution-wait");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#4416 — the prose-card disposition ladder (closure tier): the decision
 // table that replaced the per-card "awaits nothing" ask factory. Same shape
 // as the PR disposition law (decidePrDisposition, BR#3315): a pure table,
