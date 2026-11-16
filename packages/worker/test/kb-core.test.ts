@@ -206,7 +206,7 @@ describe("trigram fuzzy vectors", () => {
 import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from "../src/kb/core.ts";
 
 const zero: AgentSignals = {
-  progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
+  progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, launch_failed: 0,
   reassigned: 0, asks_received: 0, asks_answered_on_time: 0,
   artefacts_created: 0, verify_duty_backlog: 0, train_red: 0,
 };
