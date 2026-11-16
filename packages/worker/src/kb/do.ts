@@ -219,6 +219,7 @@ import {
   PROXY_WAIT_HOLD_RESULT_CLASS,
   BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
   MACHINE_WAIT_STALL_RESULT_CLASS,
+  LAUNCH_FAILED_RESULT_CLASS,
   // question human-claim hold (BR#3911)
   humanClaimLive,
   QUESTION_CLAIM_MINUTES,
@@ -326,6 +327,24 @@ function schedulerRouteScope(host: string, route: Pick<ExecutorCapabilities, "ba
 function schedulerRouteKey(scope: SchedulerRouteScope): string {
   return JSON.stringify([scope.host, scope.backend, scope.model, scope.config_revision, scope.tier, scope.inventory_revision]);
 }
+/** BR#14696 (W1) — consecutive dead-at-launch fence releases with NO healthy
+ *  launch in between before the circuit opens: claims pause (backoff) and one
+ *  class alarm fires. Two dead launches is dispatch noise; three in a row is
+ *  an environment fault. */
+const LAUNCH_FENCE_TRIP_THRESHOLD = 3;
+/** BR#14696 (W1) — how long a tripped circuit pauses a worker token's claims.
+ *  Matches the pause_claims command budget cap (execution.ts), and re-arms on
+ *  every subsequent fence while tripped — a rolling pause, never a stale row:
+ *  it lifts the moment a healthy launch resets the circuit. */
+const LAUNCH_FENCE_PAUSE_MS = 5 * 60_000;
+/** BR#14696 (W1) — a launch counts as healthy (and resets the circuit) only
+ *  while it is this young: a fresh run's signal proves the environment works
+ *  NOW; an old healthy card proves nothing about the current fault. */
+const LAUNCH_HEALTHY_LAUNCH_WINDOW_MS = 60 * 60_000;
+/** BR#14696 (W1) — a ping stamped at claim time is the dispatch's own session
+ *  registration, not a signal from the launched run: signals within this skew
+ *  of the claim are not "first signal since claim" (clock-skew tolerant). */
+const LAUNCH_SIGNAL_SKEW_MS = 10_000;
 /** BR#5916: the machine re-arm window for unclaimable infra anchors — when a
  *  do-not-claim anchor's typed time await expires, the sweep re-parks it on a
  *  fresh wait of this length instead of leaving an expired atom in place
@@ -1747,6 +1766,14 @@ export class KnowledgeHub {
   private async stallSweep(now: number, trace?: RequestTrace) {
     const staleMin = this.staleMinutes();
     const staleMs = staleMin * 60_000;
+    // BR#14696 (W1) — launch circuit state: consecutive dead-at-launch fences
+    // with no healthy launch in between trip the breaker (class alarm + claim
+    // backoff); any young healthy launch resets it. Mutated in the sweep loop
+    // below, applied + persisted after it (one write per tick).
+    const fenceMs = this.launchFenceMs();
+    let fence = this.launchFenceState();
+    const fenceTokens = new Set<string>();
+    let healthyLaunch = false;
     for await (const r of this.stallCandidates(trace)) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
@@ -1891,33 +1918,54 @@ export class KnowledgeHub {
         }
       }
       // BR#14696 (W1) — launch-health fence: a dispatched session that has
-      // NEVER signaled since claim (no alive stamp, no session ping, no
-      // matching progress) is dead-at-launch, not working-quietly — the
-      // BR#10049 gen-1 class ("MCP UNAVAILABLE: bridge tools missing", zero
-      // board effects). Waiting the full stall window per dead session is
-      // what made dispatch look idle at 0/20 while the pool churned: each
+      // NEVER signaled since claim (no alive stamp, no post-claim session
+      // ping, no matching progress) is dead-at-launch, not working-quietly —
+      // the BR#10049 gen-1 class ("MCP UNAVAILABLE: bridge tools missing",
+      // zero board effects). Waiting the full stall window per dead session
+      // is what made dispatch look idle at 0/20 while the pool churned: each
       // launch failure burned a whole 10m watchdog window before the reap,
       // so the loop's effective throughput was ~zero. Release at the fence
-      // (half the stall window) with a NAMED cause so the release is
-      // distinguishable from a working stall in the log and the score side
-      // can exempt it (result_class) — a false positive (slow boot past the
-      // fence) costs one re-dispatch, never a lost claim: the card releases
-      // claimable either way.
+      // (launch_fence_minutes, default 2 — the old staleMs/2 was 5m and each
+      // dead launch still burned half the stall window) with a NAMED cause so
+      // the release is distinguishable from a working stall in the log and
+      // the score side can exempt it (result_class) — a false positive (slow
+      // boot past the fence) costs one re-dispatch, never a lost claim: the
+      // card releases claimable either way. Three consecutive dead launches
+      // with no healthy launch in between open the circuit (below the loop).
       const firstSignal = Math.max(
         meta.session_alive_ts ?? 0,
         sessionSignal,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0,
       );
       const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
-      if (firstSignal === 0 && now - claimedAt > staleMs / 2) {
+      // A ping stamped at claim time is the dispatch's own session
+      // registration, not a signal from the launched run — only a signal
+      // NEWER than the claim (skew-tolerant) proves the run came up.
+      const launchSignal = firstSignal > claimedAt + LAUNCH_SIGNAL_SKEW_MS ? firstSignal : 0;
+      if (launchSignal > 0 && now - claimedAt < LAUNCH_HEALTHY_LAUNCH_WINDOW_MS) healthyLaunch = true;
+      if (launchSignal === 0 && now - claimedAt > fenceMs) {
+        const stderrTail = this.launchTerminalStderr(String(r.id));
+        // The circuit pauses the failing HOST's gateway claim token — read
+        // BEFORE the release transition (doTransition deletes the claim row).
+        // executor_start_claims is the durable claim→gateway binding written
+        // at claim; executor_claim_pauses is read by executorReadiness per
+        // gateway token, so pausing it stops that host dispatching while
+        // healthy hosts keep claiming.
+        const gatewayToken = String(this.one(
+          `SELECT token_id FROM executor_start_claims WHERE task_id = ?`, String(r.id),
+        )?.token_id ?? "");
+        if (gatewayToken) fenceTokens.add(gatewayToken);
         await this.audit("system:watchdog", "launch_failed", r.id, {
-          claimed_ago_ms: now - claimedAt, fence_ms: staleMs / 2,
+          claimed_ago_ms: now - claimedAt, fence_ms: fenceMs,
+          stderr_tail: stderrTail, // null: the writer died before recording a terminal receipt
         });
         await this.transition({
           id: r.id, to: "todo",
-          note: `launch_failed — no first signal (alive/progress/ping) since claim ${Math.round((now - claimedAt) / 60000)}m ago; released to the pool by watchdog at the fence (dead-at-launch class, BR#14696), not a working stall`,
-          result_class: "launch_failed",
+          note: `launch_failed — no first signal (alive/progress/ping) since claim ${Math.round((now - claimedAt) / 60000)}m ago; released to the pool by watchdog at the ${Math.round(fenceMs / 60000)}m fence (dead-at-launch class, BR#14696), not a working stall${stderrTail ? `; terminal stderr: ${stderrTail}` : "; no terminal stderr captured — the writer died before recording an outcome"}`,
+          result_class: LAUNCH_FAILED_RESULT_CLASS,
         }, "system:watchdog");
+        fence.consecutive += 1;
+        fence.last_failed_ts = now;
         continue;
       }
       if (now - lastTs <= staleMs) {
@@ -2118,6 +2166,107 @@ export class KnowledgeHub {
       `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.stale_claims', ?)`,
       JSON.stringify({ ts: now, claims: heldRows.map(row => ({ reason: String(row.reason), cards: Number(row.n), oldest_since: Number(row.oldest_since ?? 0) })) }),
     );
+
+    // BR#14696 (W1) — the launch circuit breaker. Dispatch churn (the 0/20
+    // idle class) was not just slow reaps: each dead launch re-dispatched
+    // into the SAME broken environment, burning attempt after attempt with
+    // zero alarms. THREE consecutive fence releases with no healthy launch
+    // in between is an environment fault, not noise: open the circuit —
+    // pause the failing hosts' claim tokens (readiness returns `paused`, so
+    // the starve sweep stops seeing them as flapping), file ONE class alarm
+    // duty on the train alarm sink (deduped by the open-duty guard), audit
+    // once per trip. Any young healthy launch resets it — evidence the
+    // environment works NOW beats any failure streak.
+    if (healthyLaunch) {
+      if (fence.consecutive > 0 || fence.trip) {
+        this.audit("system:watchdog", "launch_circuit_reset", null, {
+          consecutive: fence.consecutive, was_tripped: fence.trip, tokens: fence.tokens ?? [],
+        });
+        if (fence.trip) {
+          for (const token of fence.tokens ?? []) {
+            if (!token) continue;
+            this.state.storage.sql.exec(
+              `DELETE FROM executor_claim_pauses WHERE token_id = ? AND reason LIKE 'launch-fence:%'`, token,
+            );
+          }
+        }
+        fence = { consecutive: 0, trip: false };
+      }
+    } else if (fence.consecutive >= LAUNCH_FENCE_TRIP_THRESHOLD) {
+      const tokens = [...new Set([...(fence.tokens ?? []), ...fenceTokens])].filter(Boolean);
+      const untilTs = now + LAUNCH_FENCE_PAUSE_MS;
+      const reason = `launch-fence: ${fence.consecutive} consecutive dead-at-launch launches (BR#14696) — claims paused until a healthy launch resets the circuit`;
+      if (!fence.trip) {
+        this.audit("system:watchdog", "launch_circuit_open", null, {
+          consecutive: fence.consecutive, tokens, until_ts: untilTs, threshold: LAUNCH_FENCE_TRIP_THRESHOLD,
+        });
+        try {
+          await this.ensureTaskRecovery(this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID), "execution_environment");
+        } catch (e) {
+          this.audit("system:watchdog", "launch_circuit_duty_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
+        }
+      }
+      for (const token of tokens) {
+        this.state.storage.sql.exec(
+          `INSERT INTO executor_claim_pauses (token_id, until_ts, reason) VALUES (?, ?, ?)
+           ON CONFLICT(token_id) DO UPDATE SET until_ts = excluded.until_ts, reason = excluded.reason`,
+          token, untilTs, reason,
+        );
+      }
+      fence = { consecutive: fence.consecutive, trip: true, trip_at: fence.trip_at ?? now, tokens, last_failed_ts: fence.last_failed_ts ?? now };
+    }
+    this.saveLaunchFenceState(fence, now);
+  }
+
+  /** BR#14696 (W1) — the launch fence window: how long a claimed card with no
+   *  signal since claim may sit before the watchdog reaps it dead-at-launch.
+   *  The staleMs/2 fence (5m at the default) still burned half the stall
+   *  window per dead launch; the churn loop needs ~2 minutes. Setting
+   *  `launch_fence_minutes`, default 2, clamped 1–10 (a fence below 1m would
+   *  reap slow boots; above 10m is the old churn again). */
+  private launchFenceMs(): number {
+    const minutes = parseInt(this.settingValue("launch_fence_minutes", "2"), 10) || 2;
+    return Math.max(1, Math.min(10, minutes)) * 60_000;
+  }
+
+  /** BR#14696 (W1) — the fenced launch's terminal stderr tail, from the
+   *  runner's full terminal receipt the hub already stores
+   *  (execution_state.state.terminal.outcome.stderr_tail, written by the
+   *  stopped/finalize writer receipts — contracts TerminalOutcomeSchema).
+   *  The bounce finding: a fenced launch with NO captured cause left the
+   *  release note guessing. Read via json_extract (not the schema parse) so
+   *  older policy-version rows still surface their tail. Null = no terminal
+   *  receipt: say so explicitly in the release note. */
+  private launchTerminalStderr(id: string): string | null {
+    try {
+      const tail = String(this.one(
+        `SELECT json_extract(state, '$.terminal.outcome.stderr_tail') AS tail FROM execution_state WHERE task_id = ?`, id,
+      )?.tail ?? "").replace(/\s+/g, " ").trim();
+      return tail ? tail.slice(0, 400) : null;
+    } catch { return null; }
+  }
+
+  private launchFenceState(): { consecutive: number; trip: boolean; trip_at?: number; tokens?: string[]; last_failed_ts?: number } {
+    const row = this.one(`SELECT value FROM settings WHERE key = 'watchdog.launch_fence'`);
+    if (!row) return { consecutive: 0, trip: false };
+    try {
+      const st = JSON.parse(String(row.value));
+      return {
+        consecutive: Math.max(0, Number(st.consecutive ?? 0)) || 0,
+        trip: st.trip === true,
+        ...(Number(st.trip_at) > 0 ? { trip_at: Number(st.trip_at) } : {}),
+        ...(Array.isArray(st.tokens) ? { tokens: st.tokens.map(String).filter(Boolean) } : {}),
+        ...(Number(st.last_failed_ts) > 0 ? { last_failed_ts: Number(st.last_failed_ts) } : {}),
+      };
+    } catch { return { consecutive: 0, trip: false }; }
+  }
+
+  private saveLaunchFenceState(st: { consecutive: number; trip: boolean; trip_at?: number; tokens?: string[]; last_failed_ts?: number }, _now: number): void {
+    try {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.launch_fence', ?)`, JSON.stringify(st),
+      );
+    } catch { /* recounted on the next tick */ }
   }
 
   /** BR-flow-unblock — name a silent in_progress hold on the card (the
@@ -4496,7 +4645,7 @@ export class KnowledgeHub {
     const sig = (label: string): AgentSignals => {
       let s = signals.get(label);
       if (!s) {
-        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
+        s = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, launch_failed: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
         signals.set(label, s);
       }
       return s;
@@ -4530,6 +4679,12 @@ export class KnowledgeHub {
       try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
       const s = sig(String(d?.released_owner || r.owner || "") || "unknown");
       if (d?.result_class === "completed_result_lost") s.result_lost++;
+      else if (d?.result_class === LAUNCH_FAILED_RESULT_CLASS) {
+        // BR#14696: a dead-at-launch fence release — the run never signaled
+        // since claim. A machine reap of a claim that never started is not an
+        // abandonment: count the churn class (launch_failed), zero score impact.
+        s.launch_failed++;
+      }
       else if (d?.result_class === PROXY_WAIT_HOLD_RESULT_CLASS) {
         // BR#4067: a hold-park preserves a machine wait (train queue slot /
         // typed await / bound ask) — it is neither an abandonment nor a lost
@@ -12301,6 +12456,16 @@ export class KnowledgeHub {
         `SELECT COUNT(*) AS n FROM ledger WHERE kind = 'signal' AND action = 'dispatch_starved' AND ts > ?`, Date.now() - 3600_000,
       ).one() as any)?.n ?? 0);
     } catch { /* ledger shape varies — best-effort */ }
+    // BR#14696 (W1) — the launch circuit breaker itself on the stats surface:
+    // consecutive dead-at-launch fences + trip state, so an open circuit is
+    // named on the operator read (not re-derived from card notes).
+    let launch_circuit: { consecutive: number; tripped: boolean; tripped_at?: number } | undefined;
+    try {
+      const st = this.launchFenceState();
+      if (st.consecutive > 0 || st.trip) {
+        launch_circuit = { consecutive: st.consecutive, tripped: st.trip, ...(st.trip_at ? { tripped_at: st.trip_at } : {}) };
+      }
+    } catch { /* best-effort */ }
     // BR#14703 (W3) — scheduler starvation + hold visibility: the dispatch
     // loop starving (eligible work, free capacity, zero reservations) and
     // the hold pile (retry_budget/provider_route/...) fencing the backlog
@@ -12329,6 +12494,7 @@ export class KnowledgeHub {
       ...(occupancy?.length ? { occupancy } : {}),
       ...(launch_failed_1h ? { launch_failed_1h } : {}),
       ...(starved_1h ? { starved_1h } : {}),
+      ...(launch_circuit ? { launch_circuit } : {}),
       ...(scheduler?.length ? { scheduler } : {}),
       channel: {
         window_started_ts: this.routeStatsStarted,
@@ -13678,7 +13844,22 @@ export class KnowledgeHub {
     const parent = this.one(`SELECT * FROM artefacts WHERE id = ?`, taskId);
     if (!parent || parent.type !== "task") throw new Error(`independent review requires an existing task: ${taskId}`);
     if (parent.status === "done" || parent.status === "superseded") return { kind: "independent_review", task_id: taskId, id: taskId, status: "complete", message: "This work is already complete. No action is needed from you." };
-    if (parent.status !== "in_review") throw new Error("submit the implementation to in_review with delivery receipts first; Bridge automatically assigns an independent review");
+    if (parent.status !== "in_review") {
+      // BR#14696 (W2): a repair card parked todo/blocked on a receipts-met
+      // verifying episode can still arrange the same review-pool duty — its
+      // acceptance IS what holds the recovery line (the episode's close is
+      // gated on this card's review), and "submit to in_review first" was a
+      // gate the dispatched pool had no way past. Same spawn, same dedupe as
+      // the trainStatus auto-spawn; anything else outside in_review still
+      // gets the original refusal.
+      const episodes = this.openVerifyingEpisodesFor(taskId);
+      if (!episodes.length) throw new Error("submit the implementation to in_review with delivery receipts first; Bridge automatically assigns an independent review");
+      await this.ensureRecoveryAcceptanceDuties(episodes, Date.now());
+      const pending = this.currentTaskReview(taskId);
+      if (pending.phase === "pending") return { kind: "independent_review", task_id: taskId, id: pending.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
+      if (pending.phase === "accepted") return { kind: "independent_review", task_id: taskId, id: pending.id, status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
+      throw new Error("gate: no open acceptance review could be arranged for a card outside in_review");
+    }
     const meta = JSON.parse(parent.meta ?? "{}");
     const current = this.currentTaskReview(taskId);
     const target = taskReviewTarget(meta);
@@ -14748,7 +14929,7 @@ export class KnowledgeHub {
       ? `\n\nGAUGE DEBT — these in-flight tasks have no reported gauges. Your next log_progress on each must include completion_pct, confidence_pct, risk_pct and context_pct (0-100) — the board cannot prioritise or score your work without them: ${gaugeDebt.map((t) => `${t.id} "${t.title.slice(0, 60)}"`).join("; ")}.`
       : "";
     const my_score = this.agentScores().find((a) => a.label === label)
-      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 }) };
+      ?? { label, ...scoreAgent({ progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, launch_failed: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 }) };
     // score optimisation is an explicit standing directive: the agent sees its
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.
@@ -15990,6 +16171,100 @@ export class KnowledgeHub {
     }
     lane.recovery_episodes = ledger;
     return Object.values(ledger);
+  }
+
+  /** BR#14696 (W2) — verifying-phase acceptance-duty auto-spawn. A recovery
+   *  episode whose deployment receipts are MET still closes only when the
+   *  REPAIR CARD's review accepts — but nothing staffed that acceptance on
+   *  the critical path: an unclaimed repair card (todo/blocked) left the
+   *  episode sitting in verifying with the merge line held while the
+   *  dispatch pool idled past it (the boost stamp alone ranked the card, it
+   *  did not staff the review). Auto-spawn the SAME review-pool duty the
+   *  in_review flow spawns (roles review, execution_review_of subject) —
+   *  never a duplicate: any OPEN review-role round bound to the repair
+   *  (in_review-spawned OR recovery-review duties ride execution_review_of)
+   *  already covers the leg. No SoD change: this spawns the duty; the
+   *  verdict stays with the fresh-session reviewer.
+   *  Errors are per-episode: one bad spawn must not kill the lane read. */
+  private async ensureRecoveryAcceptanceDuties(recoveries: RecoveryEpisode[], now: number): Promise<void> {
+    for (const episode of recoveries) {
+      try {
+        if (!recoveryIsOpen(episode) || episode.stage.phase !== "verifying") continue;
+        if (episode.verified_receipts.length < episode.successful_deployments_required) continue;
+        const repairId = episode.stage.task_id;
+        const repair = this.one(`SELECT id, title, status, meta, tags, project FROM artefacts WHERE id = ?`, repairId);
+        if (!repair || (repair.status !== "todo" && repair.status !== "blocked")) continue;
+        const rmeta = JSON.parse(String(repair.meta ?? "{}"));
+        const repairAccepted = episode.delivery.kind === "train_merge" || episode.delivery.kind === "observed_merge" ||
+          (episode.cause.kind === "check_failure" && episode.attempts.some((a) => a.kind === "retry" && a.status === "finished" && a.outcome === "delivered"));
+        if (repairAccepted) continue;
+        // Indexed declared-subject read (review-query): covers the
+        // in_review-spawned verify duties AND the recovery-review duties.
+        const existing = this.one(
+          `SELECT id FROM artefacts WHERE type = 'task' AND status NOT IN ('done','superseded')
+           AND roles LIKE '%"review"%' AND json_extract(meta, '$.execution_review_of') = ? LIMIT 1`, repairId,
+        );
+        if (existing) continue;
+        const review = await this.spawnRecoveryAcceptanceDuty(repair, rmeta, episode);
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+          String(review.id), repairId, now,
+        );
+        this.version(repairId, "system:train", "recovery_acceptance_duty",
+          `Verify duty ${review.id} auto-spawned: the episode's deployment receipts are met (${episode.verified_receipts.length}/${episode.successful_deployments_required}) and the repair card still awaits acceptance review.`,
+          { duty: review.id, episode: episode.id });
+      } catch (e) {
+        this.audit("system:train", "recovery_acceptance_duty_error", episode.stage.task_id, { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
+  }
+
+  /** The spawn itself — the same shape createIndependentReview lays (BR#14366
+   *  criteria render into the body AND spawn-freeze via acceptance_snapshot). */
+  private async spawnRecoveryAcceptanceDuty(
+    repair: { id: unknown; title: unknown; meta: unknown; tags: unknown; project: unknown },
+    rmeta: Record<string, unknown>,
+    episode: RecoveryEpisode,
+  ) {
+    const acc = parentAcceptanceCriteria(rmeta);
+    const acceptance = acc?.criteria ?? [];
+    const review = await this.create({
+      type: "task",
+      title: `Verify: ${String(repair.title).slice(0, 200)}`,
+      body_md: mergeCompletesTask(rmeta)
+        ? verifyDutyBody(String(repair.id), String(repair.title), "see delivery receipts on the card", undefined, undefined, acceptance)
+        : executionDutyBody(String(repair.id), String(repair.title), acceptance),
+      roles: ["review"],
+      project: String(repair.project ?? ""),
+      session: "",
+      meta: { ...recoveryReviewMeta(String(repair.id), rmeta, parseTags(String(repair.tags ?? "[]"))), ...(acc ? { acceptance_snapshot: acc } : {}) },
+    }, "system:train");
+    this.audit("system:train", "recovery_acceptance_duty_spawned", String(review.id), {
+      parent: String(repair.id), episode: episode.id, phase: episode.stage.phase,
+      receipts: episode.verified_receipts.length, required: episode.successful_deployments_required,
+    });
+    return review;
+  }
+
+  /** BR#14696 (W2) — OPEN verifying episodes with receipts met, bound to this
+   *  repair task, across every registered train lane. Bounded read: one row
+   *  per lane card. */
+  private openVerifyingEpisodesFor(taskId: string): RecoveryEpisode[] {
+    const rows = this.state.storage.sql.exec(
+      `SELECT meta FROM lane_cards WHERE json_type(meta, '$.lane.recovery_episodes') = 'object'`,
+    ).toArray() as any[];
+    const out: RecoveryEpisode[] = [];
+    for (const row of rows) {
+      try {
+        const lane = JSON.parse(String(row.meta ?? "{}")).lane ?? {};
+        const ledger = RecoveryLedgerSchema.parse(lane.recovery_episodes ?? {});
+        for (const ep of Object.values(ledger)) {
+          if (ep.stage.task_id === taskId && ep.stage.phase === "verifying"
+            && ep.verified_receipts.length >= ep.successful_deployments_required) out.push(ep);
+        }
+      } catch { /* one bad lane row never blocks the read */ }
+    }
+    return out;
   }
 
   private async trainObserveDeploy(body: unknown, actor: string): Promise<unknown> {
@@ -23803,6 +24078,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const assignedLine = await this.ensureLineRecovery(l.id, projectedLine, now0);
       const latestMeta = JSON.parse(this.one(`SELECT id,meta FROM lane_cards WHERE id = ?`, l.id)?.meta ?? "{}");
       const recoveries = this.recoveryEpisodesForLine(latestMeta, now0);
+      // BR#14696 (W2) — a receipts-met verifying episode whose repair card is
+      // still todo/blocked staffs its acceptance duty on the same read (the
+      // boost stamp alone left the critical path unowned). Per-episode errors
+      // are caught inside; the lane read never dies on a spawn.
+      await this.ensureRecoveryAcceptanceDuties(recoveries, now0);
       // A continued episode may still name the task for the previous tip.
       // Retain the journal, but only use exact-bound tasks as current repairs.
       const projectionScope = assignedLine.phase === "base_red" && repairScope.kind === "current"

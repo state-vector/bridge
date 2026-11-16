@@ -102,6 +102,7 @@ export const OrientResponseSchema = z.looseObject({
     reassigned: z.number().optional(),
     thin_notes: z.number().optional(),
     verify_duty_backlog: z.number().optional(),
+    launch_failed: z.number().optional(),
   }),
   build: z.string(),
   you: z.object({

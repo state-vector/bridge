@@ -1036,6 +1036,11 @@ export interface AgentSignals {
   abandoned: number;
   /** watchdog releases classed completed_result_lost (BR#3352) — a delivery-channel incident, NOT abandonment */
   result_lost: number;
+  /** BR#14696: watchdog fence releases classed launch_failed — the run never
+   *  signaled since claim (dead at launch, the MCP-unavailable class). A
+   *  machine release of a claim that never started is NOT agent abandonment;
+   *  counted for observability (the churn class) with zero score impact. */
+  launch_failed: number;
   /** tasks taken away and reassigned after the agent stayed silent post-abandonment */
   reassigned: number;
   /** asks addressed to this agent in the window */
@@ -1054,7 +1059,7 @@ export interface AgentSignals {
 
 export function scoreAgent(raw: AgentSignals): { score: number; grade: string; hints: string[] } {
   const s = { ...raw } as Record<string, number>;
-  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "result_lost", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
+  for (const k of ["progress_count", "gauge_count", "thin_notes", "abandoned", "result_lost", "launch_failed", "reassigned", "asks_received", "asks_answered_on_time", "artefacts_created"])
     if (typeof s[k] !== "number" || Number.isNaN(s[k])) s[k] = 0;
   let score = 50;
   const hints: string[] = [];
@@ -1071,6 +1076,12 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   // hints speak of the label, not "you".
   if (s.result_lost > 0)
     hints.push(`${s.result_lost} completed run(s) on this label had their result lost in delivery (completed_result_lost) — a delivery-channel incident, not abandonment; the side effects landed`);
+  // BR#14696: a dead-at-launch fence release is a machine reap of a claim
+  // whose run never signaled — zero score impact (a launch failure is the
+  // environment/dispatch channel's fault, not the agent's heartbeat). The
+  // hint names the class so the churn stays visible without punishing anyone.
+  if (s.launch_failed > 0)
+    hints.push(`${s.launch_failed} launch(es) were fenced dead-at-launch (launch_failed) — the run never signaled after claim; the environment or dispatch channel is the suspect, not your heartbeat`);
   score -= Math.min(30, s.reassigned * 15);
   if (s.reassigned > 0)
     hints.push(`${s.reassigned} task(s) were taken from this label after going silent post-abandonment — reclaim abandoned work or it is reassigned to other agents`);
@@ -2699,6 +2710,13 @@ export const BOUNCE_REENTRY_DEMOTE_RESULT_CLASS = "bounce_reentry_demote";
  *  stays a release (claim drops, work is claimable), but the score side
  *  exempts it: watching a machine job is not abandonment. */
 export const MACHINE_WAIT_STALL_RESULT_CLASS = "machine_wait_stall";
+
+/** result_class stamped on the watchdog's launch-health fence release
+ *  (BR#14696): a claimed card whose run NEVER signaled since claim — dead at
+ *  launch (the MCP-unavailable / boot-failure class, zero board effects). The
+ *  score side exempts it: a machine reap of a claim that never started is
+ *  nobody's abandonment; the launch counter tracks the churn class instead. */
+export const LAUNCH_FAILED_RESULT_CLASS = "launch_failed";
 
 /** The PR leg a card's merge-train state points at, from any of the shapes
  *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).
