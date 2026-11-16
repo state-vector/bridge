@@ -5993,7 +5993,10 @@ export class KnowledgeHub {
 
   private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     if (!host && !retryRoute) {
-      if (this.schedulingMemo && this.schedulingMemo.at > now - 15_000) return this.schedulingMemo.value;
+      // BR#14764 — TTL 15s→60s: the cold recompute measures ~9s (238+ rows ×
+      // ~8 queries ≈ 2000 SQLite queries on the loop); at 15s TTL most polls
+      // landed inside a recompute window and stalled. Observability-only.
+      if (this.schedulingMemo && this.schedulingMemo.at > now - 60_000) return this.schedulingMemo.value;
       // BR#14763 — isolates EVICT under load and the in-memory memo died with
       // them: every post-eviction poll re-ran the ~4s sweep (measured: stats
       // 4.9s, cascading stalls, 503 "kb temporarily unavailable", 15s client
@@ -6005,7 +6008,7 @@ export class KnowledgeHub {
       if (row) {
         try {
           const memo = JSON.parse(String(row.value)) as { at: number; value: unknown };
-          if (Number(memo.at) > now - 15_000) {
+          if (Number(memo.at) > now - 60_000) {
             this.schedulingMemo = { at: Number(memo.at), value: memo.value as never };
             return this.schedulingMemo.value;
           }
