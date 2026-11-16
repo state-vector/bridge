@@ -4381,7 +4381,19 @@ export class KnowledgeHub {
             ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
           case "/board": return this.limited("board", 30, 60_000, request)
             ?? this.json(await this.boardPayload());
-          case "/stats": return this.json(await this.stats());
+          case "/stats": {
+            // BR#14413: stats rides the same weak-ETag short-circuit as the
+            // artefact reads — the machine plane's gateway poller (and the web
+            // board) re-validate instead of rebuilding counts+watchdog+
+            // channel+scheduler sweeps per poll on the DO's event loop. The
+            // board revision bumps on every artefact write, the channel
+            // window resets at isolate boot, and the watchdog tick folds in
+            // via the observed tick age bucket — a poll within the same tick
+            // window with the same validator is a 304.
+            const etag = `W/"stats${this.contentRev("board")}.${Math.floor((Number(this.one(`SELECT value FROM settings WHERE key = 'watchdog.last_tick'`)?.value ?? 0)) / 30_000)}"`;
+            if (this.ifNoneMatchHit(request.headers.get("if-none-match"), etag)) return this.notModified(etag);
+            return this.json(await this.stats(), 200, { etag });
+          }
           case "/diagnostics": return this.json(this.requestDiagnostics.snapshot());
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
           case "/metrics.reports": return this.json(await this.metricsReports(url.searchParams));

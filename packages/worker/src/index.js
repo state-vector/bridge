@@ -62,7 +62,17 @@ export default {
       if (!bearer) return new Response("unauthorized", { status: 401 });
       const r = await kbAuthenticateBearer(env, bearer);
       if (r instanceof Response) return r;
-      return kbGuard("kb.stats", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/stats"));
+      // BR#14413 conditional GET: the gateway polls machine-plane stats every
+      // few seconds; every unchanged poll was a full stats() rebuild on the
+      // DO's single-threaded event loop (counts + watchdog + channel + the
+      // schedulingStatus sweep) — amplifying load into the exact loop the
+      // advertise/schedule 8s/30s deadlines ride on. Pass the validator
+      // through so unchanged polls cost one counter read + a 304, same as the
+      // /artefacts and /list short-circuits.
+      const inm = request.headers.get("if-none-match");
+      return kbGuard("kb.stats", env.KB.get(env.KB.idFromName(doWs(r.ws))).fetch("https://kb/stats", {
+        method: "GET", ...(inm ? { headers: { "if-none-match": inm } } : {}),
+      }));
     }
     // machine-plane list mirror (bearer): lets runners/scripts enumerate artefacts
     // without a browser cookie — same DO list op the webapp uses, via the GET
