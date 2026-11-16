@@ -5979,7 +5979,29 @@ export class KnowledgeHub {
     }
   }
 
+  /** BR#14749 — all-hosts scheduling sweep memo. The sweep is O(all todo rows)
+   *  SQLite + per-row eligibility work, and it was recomputed on EVERY alarm
+   *  tick, EVERY stats poll, and EVERY schedule_status route hit — three full
+   *  sweeps per tick on the DO's single-threaded loop, the contention the
+   *  gateway's 8s advertise / 30s schedule deadlines were tripping on (live
+   *  gateway logs 2026-11-16). Memo serves the all-hosts shape for ≤5s AND
+   *  while the board revision (bumped by every artefact write) is unchanged;
+   *  host-specific and retryRoute reads bypass — admission decisions stay
+   *  first-hand fresh. */
+  private schedulingMemo: { at: number; rev: number; value: ReturnType<KnowledgeHub["schedulingStatusUncached"]> } | null = null;
+
   private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
+    if (!host && !retryRoute) {
+      const rev = this.contentRev("board");
+      if (this.schedulingMemo && this.schedulingMemo.at > now - 5_000 && this.schedulingMemo.rev === rev) return this.schedulingMemo.value;
+      const value = this.schedulingStatusUncached(undefined, now);
+      this.schedulingMemo = { at: now, rev, value };
+      return value;
+    }
+    return this.schedulingStatusUncached(host, now, retryRoute);
+  }
+
+  private schedulingStatusUncached(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     return this.state.storage.sql.exec(`SELECT h.token_id,t.label,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray()
       .filter(row => !host || row.label === host).map(row => {
         const tokenId = String(row.token_id), label = String(row.label), capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
