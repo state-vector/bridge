@@ -1326,6 +1326,31 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   "recovery-priority": "release_held",
   "takeover-verdict-duty": "gate:separation",
   "takeover-stale-holder": "claim_race",
+  // BR#9820: the execution receipts gates (execution-submission-needs-outcome,
+  // machine.ts:552; execution-done-needs-outcome, :558) refusing an
+  // in_review submission / a done completion that carries no
+  // from-this-submission execution_result {outcome,receipts} — "A commit
+  // link, old result or process exit cannot establish the actual outcome."
+  // The refusal IS the execution-completion contract working, same
+  // receipts-contract family as verdict-done-needs-receipts. Both messages
+  // are short enough that the trailing [rule: …] tag survives the 300-char
+  // audit slice (submission ≈224 chars with the tag, done ≈196), so these
+  // entries alone classify the live specimens' folded reasons; the ladder
+  // arm below owns the tag-cut/bare forms (BR#4295 anchoring: the entry
+  // fires first, the stem is the fallback). Priced DEFAULT (no
+  // BREACH_THRESHOLDS entry): the fence working is benign, but a
+  // 3-refusal storm is a real struggle — a writer that cannot produce
+  // receipts keeps refusing — same family as
+  // gate:review-needs-pr/gate:verdict-receipts. The named class coalesces
+  // the pile and the Log says WHAT gated. Specimens (one shared class,
+  // coalescing): BR#9692, 3 events 2026-11-10 00:16:43–00:19:05Z (breach
+  // card BR#9820) and BR#9664, 3 events 2026-11-09 14:29:48–14:33:55Z
+  // (breach card BR#9761 — cited in this commit's coalesce list per
+  // answered coordination ask BR#10579). The analysis-done gate's reasons
+  // belong to the analysis receipts class (gate:analysis-outcome, PR #450)
+  // and are kept out of this one.
+  "execution-submission-needs-outcome": "gate:execution-result-missing",
+  "execution-done-needs-outcome": "gate:execution-result-missing",
 };
 
 export function breachClass(reason: string): string {
@@ -1491,6 +1516,24 @@ export function breachClass(reason: string): string {
   // audit slice, so the classification survives any tail. Specimen:
   // BR#7699, 3 events 2026-11-07 09:20:32–09:23:47Z (breach card BR#7721).
   if (r.includes("execution acceptance requires")) return "execution_acceptance_fence";
+  // BR#9820: the execution receipts gates' tag-cut/bare backstop (the same
+  // two rules whose anchored [rule: …] tags the table above owns). Match
+  // the structural PAIR, not a sentence literal (BR#3611/BR#3612 lesson):
+  // "requires execution_result" AND one of the rule-openers "execution
+  // submission" / "execution completion". The pair keeps the
+  // analysis-done gate's reasons ("analysis <id> requires execution_result
+  // …" — no execution-submission/completion stem) OUT of this class: they
+  // belong to the analysis receipts gate (PR #450, gate:analysis-outcome),
+  // whose loose "requires execution_result" stem must stay AFTER this arm
+  // when rebasing so the execution gates classify under their own name.
+  // The pair also owns the bare do.ts backstop throw ("execution
+  // completion requires execution_result with the actual outcome and
+  // receipts; …") which carries no [rule:] tag at all. Both stems sit well
+  // inside the 300-char audit slice (the pair opens the message), so the
+  // classification survives any tail. Specimens: BR#9692 (breach card
+  // BR#9820) and BR#9664 (breach card BR#9761, coordination ask BR#10579).
+  if (r.includes("requires execution_result") && (r.includes("execution submission") || r.includes("execution completion")))
+    return "gate:execution-result-missing";
   return "unclassified";
 }
 

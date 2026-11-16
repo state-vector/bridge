@@ -2145,6 +2145,63 @@ describe("breachClass: close_leg_fence (BR#9534)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#9820 — the execution receipts gates (machine.ts
+// execution-submission-needs-outcome :552 / execution-done-needs-outcome
+// :558) refusing an in_review submission / a done completion without a
+// from-this-submission execution_result {outcome,receipts}: "execution
+// submission for BR#9692 requires execution_result {outcome,receipts} from
+// this submission. A commit link, old result or process exit cannot
+// establish the actual outcome. [rule: execution-submission-needs-outcome]".
+// The refusal IS the execution-completion contract working, priced DEFAULT
+// (a 3-refusal storm is a real struggle, same family as
+// gate:review-needs-pr/gate:verdict-receipts). Specimens (one shared class,
+// coalescing): BR#9692, 3 events 2026-11-10 00:16:43–00:19:05Z (breach card
+// BR#9820) and BR#9664, 3 events 2026-11-09 14:29:48–14:33:55Z (breach card
+// BR#9761, coordination ask BR#10579 — this commit's coalesce list cites
+// that specimen). The analysis-done gate's reasons belong to the analysis
+// receipts class (gate:analysis-outcome, PR #450) and must NOT fold here.
+describe("breachClass: gate:execution-result-missing (BR#9820)", () => {
+  const SUBMISSION =
+    "execution submission for BR#9692 requires execution_result {outcome,receipts} from this submission. A commit link, old result or process exit cannot establish the actual outcome. [rule: execution-submission-needs-outcome]";
+  const DONE =
+    "execution completion for BR#9692 requires execution_result {outcome,receipts}; prerequisite delivery is not task completion. [rule: execution-done-needs-outcome]";
+  const BARE_BACKSTOP =
+    "execution completion requires execution_result with the actual outcome and receipts; prerequisite delivery is not task completion";
+
+  it("the anchored tagged reasons classify by their rule names (tag survives the 300-char audit slice)", () => {
+    expect(SUBMISSION.length).toBeLessThanOrEqual(300); // the tag survives
+    expect(breachClass(SUBMISSION)).toBe("gate:execution-result-missing");
+    expect(DONE.length).toBeLessThanOrEqual(300);
+    expect(breachClass(DONE)).toBe("gate:execution-result-missing");
+  });
+
+  it("the tag-cut and bare forms classify from the structural pair (opener + requires execution_result)", () => {
+    // the breach card's 200-char sample cuts the tag mid-way — the ladder
+    // pair-match owns it ("execution submission" + "requires execution_result")
+    expect(SUBMISSION.slice(0, 200)).not.toMatch(/\[rule: [a-z0-9-]+\]$/);
+    expect(breachClass(SUBMISSION.slice(0, 200))).toBe("gate:execution-result-missing");
+    // the bare do.ts backstop throw carries no [rule:] tag at all
+    expect(breachClass(BARE_BACKSTOP)).toBe("gate:execution-result-missing");
+  });
+
+  it("the analysis-done gate's reasons are kept OUT of this class (PR #450's gate:analysis-outcome)", () => {
+    const ANALYSIS =
+      "analysis BR#6074 requires execution_result {outcome,receipts} describing its actual findings. A process exit or a completed diagnostic does not prove the incident recovered. [rule: analysis-done-needs-outcome]";
+    expect(breachClass(ANALYSIS)).not.toBe("gate:execution-result-missing");
+  });
+
+  it("pricing is DEFAULT (3) — a 3-refusal storm coalesces into one named breach", () => {
+    expect(BREACH_THRESHOLDS["gate:execution-result-missing"]).toBeUndefined();
+    const events = Array.from({ length: 3 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#9692", ts: 1000 + i * 60_000, reason: SUBMISSION,
+    }));
+    const breaches = detectBreaches(events as any, new Set());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0]).toMatchObject({ task: "BR#9692", klass: "gate:execution-result-missing", count: 3 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#9703 — the recovery review's replacement-binding gate (do.ts:7387, the
 // doTransition unblock_result path): a task-recovery duty closing in_review
 // with unblock_result {kind:"reblocked"} is refused with "gate: recovery
