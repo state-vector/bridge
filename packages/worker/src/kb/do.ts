@@ -202,6 +202,12 @@ import {
   decideConsumedWaitResume,
   type ConsumedWaitResumeInput,
   type ConsumedWaitResume,
+  // mortal asks + recovery-duty coalescing (BR#14583)
+  decideAskReap,
+  type AskReap,
+  ASK_TTL_HOURS_DEFAULT,
+  decideRecoveryCoalesce,
+  type RecoveryCoalesce,
   PROSE_CLASS_QUIET_MS,
   type ProseLeg,
   type ProseLegVerdict,
@@ -12684,6 +12690,10 @@ export class KnowledgeHub {
     await this.maintenanceCheckpoint(trace, "coordination.maintenance");
     this.retireCompletedCoordination();
     this.retryExpiredRecoveryCoordination(now);
+    // BR#14583 — reap mortal asks FIRST: an ask whose asker died and whose TTL
+    // lapsed is beyond rerouting rescue; expire it (system:reaper) and unbind
+    // its bound cards before the reroute pass sees the survivors.
+    const reaped = await this.reapMortalAsks(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
     const ttlMs = ttlMin * 60_000;
@@ -12725,7 +12735,114 @@ export class KnowledgeHub {
       this.audit("system:watchdog", "ask_rerouted", r.id, { to, ttl_min: ttlMin, presence_source: presence.source, artefact_bound: ask.artefact_id ?? null });
       escalated.push(r.id);
     }
-    return escalated;
+    return [...reaped, ...escalated];
+  }
+
+  /** BR#14583 — the ask reaper: machine coordination asks are MORTAL. An open
+   *  ask (`to: any` or an agent target, never to: human/ray/rayh) whose asker
+   *  session is provably offline (not seen in the auth/session presence
+   *  tables — a never-connected label is offline by construction, BR#3930)
+   *  and whose TTL (settings `ask_ttl_hours`, default 48) has lapsed is
+   *  expired by the HUB as system:reaper — the dispatched-credential churn
+   *  class (nobody alive to answer, nobody scheduled to reap) ends here.
+   *  Expiring unbinds every card the ask parked: a typed
+   *  blocked.await_event {event:ask, ask_id} leg consumes to the dispatch
+   *  pool (todo — continueBlockedWork's CAS guard set: live executors,
+   *  verdict duties and interactive holds stay protected), re-parking on the
+   *  card's underlying machine-checkable typed await_event when the park
+   *  recorded one (blocked.repairing.original); a bare awaiting_ask marker is
+   *  cleared and the card released only when no other hold owns the exit.
+   *  Human-targeted asks NEVER expire here (decideAskReap guards, pinned
+   *  A4) — Ray's inbox is Ray's alone. */
+  private async reapMortalAsks(now: number): Promise<string[]> {
+    const ttlHours = Math.max(1, Math.min(720, parseInt(String(this.one(`SELECT value FROM settings WHERE key = 'ask_ttl_hours'`)?.value ?? "").replace(/[^0-9]/g, ""), 10) || ASK_TTL_HOURS_DEFAULT));
+    const ttlMs = ttlHours * 3_600_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, meta, created_ts, created_by FROM artefacts
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked') AND created_ts < ?`,
+      now - ttlMs,
+    ).toArray() as any[];
+    const reaped: string[] = [];
+    for (const r of rows) {
+      let m: any;
+      try { m = JSON.parse(r.meta ?? "{}"); } catch { continue; }
+      const ask = m.ask;
+      if (!ask) continue;
+      const asker = String(ask.from ?? r.created_by ?? "");
+      const decision = decideAskReap({
+        askId: String(r.id),
+        open: askLifecycle({ status: String(r.status), meta: m }).state === "open",
+        ageMs: now - Number(r.created_ts ?? 0),
+        ttlMs,
+        humanTargeted: isHumanDecisionAsk(ask),
+        inRecovery: !!ask.recovery,
+        askerLive: asker ? this.askTargetPresence(asker, now).online : false,
+      });
+      if (decision.kind !== "reap") continue;
+      const ts = Date.now();
+      m.ask.resolution = { kind: "expired", reason: decision.reason, by: "system:reaper", ts };
+      delete m.human_claimed;
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ? AND status IN ('todo','in_progress','blocked')`,
+        ts, ts, JSON.stringify(m), r.id,
+      );
+      this.version(String(r.id), "system:reaper", "transition", `ask expired: ${decision.reason}`, { from: String(r.status), to: "done", resolution: m.ask.resolution, ttl_hours: ttlHours, asker });
+      this.audit("system:reaper", "ask_expired", String(r.id), { ttl_hours: ttlHours, asker: asker || null });
+      // unbind every card this ask parked (typed leg or bare marker)
+      const bound = this.state.storage.sql.exec(
+        `SELECT id, status, meta FROM artefacts
+         WHERE type = 'task' AND status = 'blocked' AND id != ? AND (
+           (json_extract(meta, '$.blocked.await_event.event') = 'ask' AND json_extract(meta, '$.blocked.await_event.ask_id') = ?)
+           OR json_extract(meta, '$.awaiting_ask.ask_id') = ?)`,
+        r.id, r.id, r.id,
+      ).toArray() as any[];
+      for (const b of bound) {
+        const bmeta = JSON.parse(String(b.meta ?? "{}"));
+        const aw = validateAwaitEvent(bmeta.blocked?.await_event);
+        const onThisAsk = aw?.event === "ask" && aw.ask_id === String(r.id);
+        if (onThisAsk) {
+          // the card's underlying machine-checkable typed wait, when the park
+          // recorded one — re-park on it instead of releasing
+          const original = validateAwaitEvent(bmeta.blocked?.repairing?.original);
+          if (original && original.event !== "ask" && !isSelfAwait(String(b.id), original)) {
+            const repaired = { ...bmeta.blocked };
+            delete repaired.repairing;
+            repaired.reason = `re-parked by system:reaper on the underlying typed wait after ask ${r.id} expired (BR#14583)`;
+            repaired.unblock_condition = describeAwaitEvent(original);
+            repaired.await_event = original;
+            bmeta.blocked = repaired;
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(bmeta), ts, b.id);
+            this.version(String(b.id), "system:reaper", "wait_reparked", `ask ${r.id} expired — card re-parked on its underlying typed await_event`, { ask: String(r.id), await_event: original });
+            this.audit("system:reaper", "bound_card_reparked", String(b.id), { ask: String(r.id), await_event: original });
+            continue;
+          }
+          if (this.continueBlockedWork(String(b.id), bmeta, { kind: "expired_coordination", ask_id: String(r.id) })) {
+            this.audit("system:reaper", "bound_card_released", String(b.id), { ask: String(r.id) });
+          } else {
+            // a protection holds (live executor / interactive hold / verdict
+            // duty / park moved) — the wait survives the ask; audited, never
+            // forced
+            this.audit("system:reaper", "bound_card_unbind_skipped", String(b.id), { ask: String(r.id) });
+          }
+        } else if (bmeta.awaiting_ask?.ask_id === String(r.id)) {
+          delete bmeta.awaiting_ask;
+          const hold = releaseHold(bmeta);
+          if (hold) {
+            // another typed wait owns the exit — keep the park, clear the marker
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(bmeta), ts, b.id);
+            this.audit("system:reaper", "bound_marker_cleared", String(b.id), { ask: String(r.id), hold: String(hold).slice(0, 160) });
+          } else {
+            await this.transition({
+              id: String(b.id), to: "todo",
+              note: `ask ${r.id} expired (asker dead past TTL) — the marker card released to the pool (BR#14583 reaper)`,
+            }, "system:reaper");
+            this.audit("system:reaper", "bound_card_released", String(b.id), { ask: String(r.id), via: "marker" });
+          }
+        }
+      }
+      reaped.push(String(r.id));
+    }
+    return reaped;
   }
 
   private retryExpiredRecoveryCoordination(now: number): void {
@@ -21551,6 +21668,44 @@ export class KnowledgeHub {
         AND json_extract(meta, '$.blocked.await_event.n') = ?, 0)
       ORDER BY created_ts DESC LIMIT 1`, reason, taskId, waitEpisode ?? "", reason, conflict?.repo ?? null, conflict?.pr ?? null);
     if (active) return String(active.id);
+    // BR#14583 — cite, don't re-derive: the most recent DONE duty for this
+    // exact (subject, wait episode) already dispositioned this park when the
+    // park predates the duty (nothing moved under it — the fingerprint is
+    // stable). A stable satisfied-but-held park costs ONE duty, not one per
+    // sweep tick; the subject's meta carries the cite pointer.
+    const subjectRow = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, taskId);
+    const subjectMeta = subjectRow ? JSON.parse(String(subjectRow.meta ?? "{}")) : {};
+    const lastDone = this.one(
+      `SELECT id, status, created_ts, meta FROM artefacts
+       WHERE type = 'task' AND status IN ('done','superseded')
+         AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery'
+         AND json_extract(meta, '$.machine_duty.subject') = ?
+         AND coalesce(json_extract(meta, '$.machine_duty.wait_episode'), '') = ?
+       ORDER BY created_ts DESC LIMIT 1`, taskId, waitEpisode ?? "",
+    ) as any;
+    const lastDisposition = lastDone
+      ? String(JSON.parse(String(lastDone.meta ?? "{}")).execution_result?.outcome ?? "") || null
+      : null;
+    const coalesced = decideRecoveryCoalesce({
+      subjectId: taskId,
+      waitEpisode: waitEpisode ?? "",
+      lastDuty: lastDone ? { id: String(lastDone.id), status: String(lastDone.status), created_ts: Number(lastDone.created_ts), disposition: lastDisposition } : null,
+      park: { awaitEvent: validateAwaitEvent(subjectMeta.blocked?.await_event), blockedTs: subjectMeta.blocked?.ts ?? null },
+    });
+    if (coalesced.kind === "dedupe") return coalesced.duty;
+    if (coalesced.kind === "coalesce") {
+      // stable-fingerprint stamp only (never a fresh timestamp — a per-tick
+      // `at` would re-write and re-version every sweep: cite-idempotence)
+      const stamp = { duty: coalesced.duty, fingerprint: coalesced.fingerprint, disposition: coalesced.disposition, reason, at: Number(lastDone.created_ts) };
+      if (JSON.stringify(subjectMeta.recovery_coalesce ?? null) !== JSON.stringify(stamp)) {
+        subjectMeta.recovery_coalesce = stamp;
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(subjectMeta), Date.now(), taskId);
+        this.version(taskId, "system:recovery", "recovery_coalesced",
+          `Stable park: citing ${coalesced.duty}'s recorded disposition instead of re-deriving identical state (BR#14583 cite-don't-re-derive)`, { duty: coalesced.duty, fingerprint: coalesced.fingerprint, wait_episode: waitEpisode ?? "" });
+        this.audit("system:recovery", "recovery_coalesced", taskId, { duty: coalesced.duty, wait_episode: waitEpisode ?? "" });
+      }
+      return coalesced.duty;
+    }
     const parent = this.one(`SELECT title, project FROM artefacts WHERE id = ?`, taskId);
     if (!parent) throw new Error(`recovery subject missing: ${taskId}`);
     const description = reason === "resume_condition" ? "Repair the task's resume condition" : reason === "repeated_failure" ? "Diagnose repeated execution failures" : reason === "conflict" ? "Resolve conflicting changes" : reason === "execution_environment" ? "Restore execution environment" : reason === "head_checks" ? "Repair failing candidate checks" : "Restore delivery tracking";
@@ -21646,6 +21801,12 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       || (expected.event === "br_done" && before.meta.recovery?.task_id === expected.id)) return false;
     const episode = JSON.stringify([expected, since]);
     const duty = await this.ensureTaskRecovery(id, expected.event === "time" || expected.event === "recovery_required" ? "repeated_failure" : "resume_condition", episode);
+    // BR#14583 — never BIND a fresh wait on a duty that already closed: a
+    // coalesced (done) disposition means this exact park was already
+    // dispositioned — parking on br_done of a done duty would mint another
+    // instantly-satisfied park. The sweep continues on the original wait.
+    const dutyRow = this.one(`SELECT status FROM artefacts WHERE id = ?`, duty);
+    if (dutyRow && ["done", "superseded"].includes(String(dutyRow.status))) return false;
     const replacement = current();
     if (!replacement) return false;
     const { meta, oldDuties } = replacement;
@@ -21673,6 +21834,14 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   private async parkOnRecovery(taskId: string, dutyId: string, reason: string): Promise<void> {
     const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, taskId);
     if (!row || row.status === "done" || row.status === "superseded") return;
+    // BR#14583 — a coalesced (done) duty cannot take a NEW park: the wait it
+    // would gate already has its recorded disposition. Binding br_done on a
+    // closed duty mints an instantly-satisfied park; cite, don't re-derive.
+    const dutyRow = this.one(`SELECT status FROM artefacts WHERE id = ?`, dutyId);
+    if (dutyRow && ["done", "superseded"].includes(String(dutyRow.status))) {
+      this.audit("system:recovery", "park_on_closed_duty_skipped", taskId, { duty: dutyId, reason: reason.slice(0, 200) });
+      return;
+    }
     const event = { event: "br_done", id: dutyId };
     if (row.status === "blocked") {
       const meta = JSON.parse(String(row.meta ?? "{}"));

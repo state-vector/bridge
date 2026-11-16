@@ -259,6 +259,18 @@ without the requesting session. Batch and single retirements share one atomic
 path, including for unstarted capability parks. A prior batch decision cannot
 retire a newly rebound wait, and local pickups and unknown effects stay protected.
 
+Recovery duties deduplicate forward as well: a repair pass that finds a closed
+duty for the same subject and wait episode — one that recorded a disposition,
+with nothing having moved under it — cites it instead of spawning a
+duplicate, and a closed duty is never re-bound by a fresh park. A duty that
+closed without an exit derived nothing: the sweep re-arms fresh eyes rather
+than cite an empty record, so no hold class can languish.
+
+Machine coordination asks are mortal: an unanswered ask whose asker is provably
+offline expires after `ask_ttl_hours` (default 48), unbinding the cards that
+waited on it back to the pool or their underlying typed wait. Asks addressed to
+the human never expire.
+
 Reconciliation includes old undecided-review and draft PRs and distinguishes
 queued, repairing, verifying, held and stranded work. A historical card link is
 not proof of progress. Completed duties are scoped to the observed PR head.
