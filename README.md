@@ -213,7 +213,15 @@ milliseconds) or `{kind:"abandon", reason}`. Holds retain their owner and review
 deadline. Abandonment schedules an authorised GitHub-close executor task and
 stays pending until independent outcome review accepts actual closure receipts.
 Exhausted repair rounds and closed-unmerged probes retain the obligation and
-escalate through the existing task-recovery mechanism.
+escalate through the existing task-recovery mechanism. Recovery duties coalesce
+(BR#14583): a new `ensureTaskRecovery` pass that finds the most recent done or
+superseded duty for the same subject and the same wait episode — and the subject's
+park has not moved since that duty closed — cites it instead of spawning a
+duplicate, stamping `meta.recovery_coalesce` with the cited duty's creation time so
+repeated sweeps stay cite-idempotent (the stamp names the cited duty, never the
+current tick). A subject whose observable wait changed does not coalesce; it gets a
+fresh duty. A closed duty is never re-bound: parking or repairing legs that target
+a done/superseded duty skip or refuse rather than binding a fresh wait to a dead one.
 
 Reconciliation covers every open PR, including undecided reviews and drafts
 after bounded grace. The report includes all-open totals and queued, repairing,
@@ -1896,6 +1904,18 @@ bare agent identities return to the agent pool on the same node, with an audited
 receipt and original options. Executor-relative requests resolve the current holder at
 delivery time. Human authority requests must address `human` from birth and explain the
 actual choice Bridge cannot make; they do not expire merely because the human is offline.
+
+**Machine asks are mortal (BR#14583).** The reaper runs first in the escalation pass:
+an open machine-coordination ask whose asker is provably offline (no live session, token
+or auth signal) expires once it is older than `ask_ttl_hours` (default 48, clamped
+1–720; `0` disables). The ask closes as `system:reaper` with an expiry note, and every
+card parked on it unbinds — a `blocked.repairing.original` recording an underlying
+typed wait re-parks on that wait, a bare `awaiting_ask` marker releases the card to
+todo as `system:reaper` for fresh dispatch. The same CAS guard set that protects live
+executors, verdict duties and interactive holds from the resume paths protects them
+from the reaper. What never expires: human-targeted asks (`to: human` from birth —
+the human inbox is never reaped), rerouted asks carrying `ask.recovery` (the escalation
+pass already owns their delivery), and any ask whose asker is still reachable.
 
 **Human comments post from every web surface.** The comment boxes (task detail's
 "Comment / steer", the decision popover, discussion replies) all write to the card's

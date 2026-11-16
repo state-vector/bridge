@@ -165,6 +165,14 @@ live successor, or explicitly abandoned with independently accepted GitHub-close
 receipts. Replacement transfers bindings and ownership atomically. A bounded
 hold records its owner, reason, next observation and deadline. Failed repair
 rounds escalate existing recovery; they never silently cancel product work.
+Recovery duties deduplicate forward as well: a repair pass that finds a closed
+duty for the same subject and wait episode cites it instead of spawning a
+duplicate, and a closed duty is never re-bound by a fresh park.
+
+Machine coordination asks are mortal: an unanswered ask whose asker is provably
+offline expires after `ask_ttl_hours` (default 48), unbinding the cards that
+waited on it back to the pool or their underlying typed wait. Asks addressed to
+the human never expire.
 
 Reconciliation includes old undecided-review and draft PRs and distinguishes
 queued, repairing, verifying, held and stranded work. A historical card link is

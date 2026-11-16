@@ -1795,6 +1795,98 @@ export function decideConsumedWaitResume(i: ConsumedWaitResumeInput): ConsumedWa
 }
 
 // ---------------------------------------------------------------------------
+// BR#14583 — mortal asks. Machine-to-machine coordination asks (`to: any` or
+// an agent target) whose asker session died used to sit OPEN forever: no TTL,
+// no dead-asker reaping, and every card the ask parked (`blocked
+// await_event {event:ask, ask_id}`) was skipped by the sweeps because the
+// open ask paused the watchdog — the 50-ask pile-up class. The reaper is a
+// pure decision table: the DO (kb/do.ts reapMortalAsks, riding the
+// escalateStaleAsks sweep) supplies live-board facts and executes the winning
+// leg. Human-targeted asks (to: human / ray / rayh — isHumanDecisionAsk) are
+// NEVER mortal: Ray's inbox is Ray's alone (non-goal, pinned A4).
+// ---------------------------------------------------------------------------
+
+/** Default ask TTL before the reaper may expire a machine coordination ask
+ *  (settings key `ask_ttl_hours`, clamped 1–720). */
+export const ASK_TTL_HOURS_DEFAULT = 48;
+
+export interface AskReapInput {
+  askId: string;
+  /** the ask node is still open (todo/in_progress/blocked question, no answer) */
+  open: boolean;
+  ageMs: number;
+  ttlMs: number;
+  /** human-targeted (to: human / ray / rayh) — never expires mechanically */
+  humanTargeted: boolean;
+  /** already rerouted to the pool by escalateStaleAsks (meta.ask.recovery) */
+  inRecovery: boolean;
+  /** asker presence in the auth/session tables (askTargetPresence) — false
+   *  includes never-connected labels (offline by construction, BR#3930) */
+  askerLive: boolean;
+}
+
+export type AskReap =
+  | { kind: "keep" }
+  | { kind: "reap"; reason: string };
+
+/** Reap only what the machine can prove: an OPEN machine-coordination ask,
+ *  past TTL, whose ASKER is provably offline. Exactly one disposition; a
+ *  live asker, a young ask, a rerouted ask or a human target all keep. */
+export function decideAskReap(i: AskReapInput): AskReap {
+  if (!i.open) return { kind: "keep" };
+  if (i.humanTargeted) return { kind: "keep" };
+  if (i.inRecovery) return { kind: "keep" };
+  if (i.ageMs < i.ttlMs) return { kind: "keep" };
+  if (i.askerLive) return { kind: "keep" };
+  return { kind: "reap", reason: `ask ${i.askId} exceeded its TTL (${Math.round(i.ttlMs / 3_600_000)}h) and the asker session is dead — machine coordination expired, bound cards unbound by the hub (BR#14583 reaper)` };
+}
+
+// ---------------------------------------------------------------------------
+// BR#14583 — recovery-duty coalescing (cite, don't re-derive). Recovery
+// spawns (queue_binding / task-recovery duties) deduped only LIVE duties: a
+// DONE duty's subject re-spawned a fresh full re-derivation EVERY sweep tick
+// even when the park was stable (BR#4709: 12+ duties, BR#12180→BR#12771).
+// The coalescer keys the spawn on (subject, wait episode) high-water: when
+// the most recent duty already dispositioned THIS EXACT park (the park
+// fingerprint — typed await_event + blocked.ts — predates the duty, so
+// nothing moved under it), the caller cites that disposition instead of
+// spawning. One duty per stable park, not one per tick (pinned A3).
+// ---------------------------------------------------------------------------
+
+export interface RecoveryCoalesceInput {
+  subjectId: string;
+  /** the spawn's wait episode key (JSON of [awaitEvent, since] or reason) */
+  waitEpisode: string;
+  /** most recent prior duty for this (subject, waitEpisode), any status —
+   *  null when this is the first spawn */
+  lastDuty: { id: string; status: string; created_ts: number; disposition: string | null } | null;
+  /** the subject's CURRENT park fingerprint — its typed await_event and the
+   *  park stamp (blocked.ts). null awaitEvent = not parked (or park-less
+   *  spawn) — nothing to move under the duty. */
+  park: { awaitEvent: unknown; blockedTs: number | null };
+}
+
+export type RecoveryCoalesce =
+  | { kind: "spawn" } // no prior duty, or the park MOVED under it — fresh eyes
+  | { kind: "dedupe"; duty: string } // a live duty already owns this episode (today's law)
+  | { kind: "coalesce"; duty: string; disposition: string | null; fingerprint: string }; // stable park: cite the last disposition
+
+/** Pure decision: dedupe live duties first (today's law), then coalesce a
+ *  done/superseded duty whose park predates it (stable — the duty already
+ *  derived this exact state). A park that moved (new await_event or a newer
+ *  blocked.ts) is a NEW situation: spawn fresh, never cite a stale
+ *  disposition. */
+export function decideRecoveryCoalesce(i: RecoveryCoalesceInput): RecoveryCoalesce {
+  if (!i.lastDuty) return { kind: "spawn" };
+  if (i.lastDuty.status !== "done" && i.lastDuty.status !== "superseded") return { kind: "dedupe", duty: i.lastDuty.id };
+  const parkTs = i.park.blockedTs;
+  const stable = parkTs === null || parkTs <= i.lastDuty.created_ts;
+  if (!stable) return { kind: "spawn" };
+  const fingerprint = JSON.stringify([i.waitEpisode, i.park.awaitEvent, parkTs]);
+  return { kind: "coalesce", duty: i.lastDuty.id, disposition: i.lastDuty.disposition, fingerprint };
+}
+
+// ---------------------------------------------------------------------------
 // Serialized merge train (decision BR#3516, accepted; impl BR#3517): one merge
 // at a time per (repo, base) lane, leased to an opportunistic edge executor.
 // Division of labour — the hub holds no VCS credentials, ever: the executor
