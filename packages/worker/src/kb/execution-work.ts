@@ -30,6 +30,8 @@ export function ownsInteractiveClaim(meta: TaskMeta, tokenId: string, session: s
 
 export class ExecutionWork {
   private hostSnapshot: (() => HostInventory[]) | null = null;
+  private readinessSnapshot: Map<string, ExecutorReadiness> | null = null;
+  private policySnapshot: ModelPolicy | null = null;
   constructor(private storage: DurableObjectStorage, private audit: (actor: string, op: string, id: string, data: object) => void, private workspace: string,
     private readiness: (token: string, host: string, capabilities: ExecutorCapabilities, now: number) => ExecutorReadiness,
     private modelPolicy: () => ModelPolicy = () => DEFAULT_MODEL_POLICY,
@@ -75,7 +77,7 @@ export class ExecutionWork {
     floor = maxTier(floor, state?.attempt?.executor?.tier ?? "small");
     floor = maxTier(floor, state?.retry_strategy?.minimum_tier ?? "small");
     if (state?.attempt) return { ...required, tier: floor };
-    const selection = selectModelTier({ lane, policy: this.modelPolicy(), required: { ...required, tier: floor }, hosts: this.hostsBare(), project: r.project, now: Date.now() });
+    const selection = selectModelTier({ lane, policy: this.policySnapshot ?? this.modelPolicy(), required: { ...required, tier: floor }, hosts: row ? this.hostsBare() : this.hosts(id), project: r.project, now: Date.now() });
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
@@ -153,15 +155,22 @@ export class ExecutionWork {
    *  exactly host-level readiness. Memo dies with the snapshot
    *  (withHostSnapshot clears it) — never cached across sweeps. */
   private hostsBareCache: CapabilityObservation[] | null = null;
+  private hostReadiness(token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
+    const cached = this.readinessSnapshot?.get(token);
+    if (cached) return cached;
+    const proof = this.readiness(token, host, capabilities, Date.now());
+    this.readinessSnapshot?.set(token, proof);
+    return proof;
+  }
   private hostsBare(): CapabilityObservation[] {
     if (this.hostSnapshot && this.hostsBareCache) return this.hostsBareCache;
     const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
-      readiness: this.readiness(tokenId, host.host, host.capabilities, Date.now()) }));
+      readiness: this.hostReadiness(tokenId, host.host, host.capabilities) }));
     if (this.hostSnapshot) this.hostsBareCache = value;
     return value;
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
-    const proof = this.readiness(token, host, capabilities, Date.now());
+    const proof = this.hostReadiness(token, host, capabilities);
     const task = id ? this.one<{ body_md: string; project: string; meta: string }>(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id) : null;
     const meta = JSON.parse(task?.meta ?? "{}");
     const fingerprint = task && proof.kind === "ready" ? startupPrerequisiteFingerprint(proof.fingerprint, { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } }) : "";
@@ -201,8 +210,7 @@ export class ExecutionWork {
     const h = this.state(task).handoff;
     return h.phase !== "none" && grant.handoff_id === h.id && grant.version === h.version && grant.expires_at > now ? grant : null;
   }
-  blockers(task: TaskRow, now: number, grant: LocalGrant | null = null): ExecutionBlocker[] {
-    const state = this.state(task);
+  blockers(task: TaskRow, now: number, grant: LocalGrant | null = null, state = this.state(task)): ExecutionBlocker[] {
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
     const requirements = state.requirements;
@@ -384,13 +392,25 @@ export class ExecutionWork {
    * and the final reservation transaction still check their own fences. */
   withHostSnapshot<T>(run: () => T): T {
     const previous = this.hostSnapshot;
+    const previousReadiness = this.readinessSnapshot, previousPolicy = this.policySnapshot, previousBare = this.hostsBareCache;
     let inventory: HostInventory[] | undefined;
     this.hostSnapshot ??= () => inventory ??= this.hostInventory();
-    // BR#14767: hostsBare's memo dies with the snapshot — readiness can
-    // change between sweeps, so it is never cached across them.
-    this.hostsBareCache = null;
-    try { return run(); }
-    finally { this.hostSnapshot = previous; }
+    try {
+      if (!previous) {
+        // Host proof and model policy are shared within one synchronous pass.
+        // Task-specific rejection reads remain per task. No proof survives a
+        // yield or a later reservation transaction.
+        this.readinessSnapshot = new Map();
+        this.policySnapshot = this.modelPolicy();
+        this.hostsBareCache = null;
+      }
+      return run();
+    } finally {
+      this.hostSnapshot = previous;
+      this.readinessSnapshot = previousReadiness;
+      this.policySnapshot = previousPolicy;
+      this.hostsBareCache = previousBare;
+    }
   }
   private sweepBatch(now: number) {
     // Legacy workspaces without any managed executor inventory retain their
@@ -400,7 +420,7 @@ export class ExecutionWork {
     const first = batch(cursor);
     const rows = first.length || !cursor ? first : batch(0);
     for (const task of rows) {
-      const state = this.state(task); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now);
+      const state = this.state(task); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now, null, state);
       const unavailable = blockers.find(isExecutorAvailabilityBlocker);
       const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
       let status = task.status;

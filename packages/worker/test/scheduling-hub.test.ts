@@ -45,19 +45,23 @@ beforeEach(async () => {
           return Response.json({ok:true});
         }
         if (path === "/fixture/dispatch-inventory") {
-          const { host } = await request.json();
+           const { host, repeat = false } = await request.json();
           const executor = this.state.storage.sql.exec(
             "SELECT h.token_id,h.capabilities FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=?", host,
           ).toArray()[0];
-          const work = this.executionWork();
-          const inventory = work.hostInventory.bind(work);
-          let scans = 0;
-          work.hostInventory = () => { scans++; return inventory(); };
+           const work = this.executionWork();
+           const inventory = work.hostInventory.bind(work);
+           const readiness = work.readiness, policy = work.modelPolicy;
+           let scans = 0, readinessReads = 0, policyReads = 0;
+           work.hostInventory = () => { scans++; return inventory(); };
+           work.readiness = (...args) => { readinessReads++; return readiness(...args); };
+           work.modelPolicy = () => { policyReads++; return policy(); };
           const original = this.executionWork;
           this.executionWork = () => work;
           try {
-            const selection = this.dispatchCandidates(executor.token_id, host, JSON.parse(executor.capabilities));
-            return Response.json({ scans, eligible: selection.eligible.map(row => row.id) });
+             const selection = this.dispatchCandidates(executor.token_id, host, JSON.parse(executor.capabilities));
+             if (repeat) this.dispatchCandidates(executor.token_id, host, JSON.parse(executor.capabilities));
+             return Response.json({ scans, readinessReads, policyReads, eligible: selection.eligible.map(row => row.id) });
           } finally {
             this.executionWork = original;
           }
@@ -171,7 +175,15 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const response = await stub.fetch("https://kb/fixture/dispatch-inventory", {
       method: "POST", body: JSON.stringify({ host: g.host }),
     });
-    expect(await response.json()).toEqual({ scans: 1, eligible: expected });
+    expect(await response.json()).toEqual({ scans: 1, readinessReads: 1, policyReads: 1, eligible: expected });
+  });
+  it("discards readiness and model-policy snapshots between independent passes", async () => {
+    const project = "snapshot-lifetime", g = await gateway(project);
+    const expected = [await task(project), await task(project)];
+    const response = await stub.fetch("https://kb/fixture/dispatch-inventory", {
+      method: "POST", body: JSON.stringify({ host: g.host, repeat: true }),
+    });
+    expect(await response.json()).toEqual({ scans: 2, readinessReads: 2, policyReads: 2, eligible: expected });
   });
 
   it("never reserves or claims the configured standing alarm sink", async () => {

@@ -113,6 +113,10 @@ running global backlog reconciliation or building a board snapshot. The schedule
 and watchdog reconcile at most 25 capability-waiting tasks per pass with a durable
 fair cursor and one host/occupancy snapshot per synchronous pass. Reservations
 still check current capability, ownership and execution fences before starting work.
+Host-level readiness and model policy are resolved once per synchronous fleet
+snapshot, while task-specific startup rejections remain task-scoped. Capability
+reconciliation reuses each task's parsed execution state instead of resolving it
+again for blocker projection. Snapshot data is discarded before the next pass.
 Watchdog maintenance yields between committed phases so foreground control requests
 can interleave. Mutation events are sent immediately; coalesced board aggregation
 starts after yielding, and failed builds remain dirty for a later retry. An
