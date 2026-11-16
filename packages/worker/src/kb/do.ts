@@ -5979,23 +5979,23 @@ export class KnowledgeHub {
     }
   }
 
-  /** BR#14749 — all-hosts scheduling sweep memo. The sweep is O(all todo rows)
-   *  SQLite + per-row eligibility work, and it was recomputed on EVERY alarm
-   *  tick, EVERY stats poll, and EVERY schedule_status route hit — three full
-   *  sweeps per tick on the DO's single-threaded loop, the contention the
-   *  gateway's 8s advertise / 30s schedule deadlines were tripping on (live
-   *  gateway logs 2026-11-16). Memo serves the all-hosts shape for ≤5s AND
-   *  while the board revision (bumped by every artefact write) is unchanged;
-   *  host-specific and retryRoute reads bypass — admission decisions stay
-   *  first-hand fresh. */
-  private schedulingMemo: { at: number; rev: number; value: ReturnType<KnowledgeHub["schedulingStatusUncached"]> } | null = null;
+  /** BR#14762 — the all-hosts sweep memo is TTL-ONLY (15s), never rev-gated:
+   *  under write churn (3+ live sessions logging progress) the board rev
+   *  bumps every second, so BR#14749's rev condition missed on every poll
+   *  and stats() re-ran the O(150-row × ~8-query) sweep per poll — 1-5s of
+   *  DO event loop per request, the stall the gateway's 8s advertise /
+   *  30s schedule deadlines trip on (measured first-hand: /api/kb-machine/
+   *  stats 4.9s, list 2.6s while statics ran 90ms). Eligible/hold counts in
+   *  stats are OBSERVABILITY — 15s staleness is honest; every ADMISSION path
+   *  (host-specific, retryRoute, per-task holds) bypasses the memo and
+   *  stays first-hand. */
+  private schedulingMemo: { at: number; value: ReturnType<KnowledgeHub["schedulingStatusUncached"]> } | null = null;
 
   private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     if (!host && !retryRoute) {
-      const rev = this.contentRev("board");
-      if (this.schedulingMemo && this.schedulingMemo.at > now - 5_000 && this.schedulingMemo.rev === rev) return this.schedulingMemo.value;
+      if (this.schedulingMemo && this.schedulingMemo.at > now - 15_000) return this.schedulingMemo.value;
       const value = this.schedulingStatusUncached(undefined, now);
-      this.schedulingMemo = { at: now, rev, value };
+      this.schedulingMemo = { at: now, value };
       return value;
     }
     return this.schedulingStatusUncached(host, now, retryRoute);
