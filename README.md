@@ -144,9 +144,18 @@ or release a slot: the originating-host receipt protocol remains authoritative.
 Judge throughput by completed work and sustained start rate as well as slot usage.
 Twenty execution slots are a ceiling, not a guarantee of twenty productive agents:
 the gateway uses bounded preparation/finalization pools and one idempotent reserve
-stream. Diagnose slow refill using request/ingress stages, current starting/running
-slots, and durable result delivery. Increasing concurrency or adding a status cache
-does not cure long synchronous maintenance, failed startups, or missing tool access.
+stream. A run that never signals after claim is dead at launch, not working quietly:
+the watchdog's launch-health fence reaps it at `launch_fence_minutes` (default 2,
+clamped 1–10) with the terminal stderr tail named on the release note and the
+`launch_failed` result class (score-exempt), and three consecutive dead launches
+with no healthy launch between them trip the launch circuit — the failing hosts'
+claim tokens pause, one class alarm files on the train alarm sink, and any young
+signalling launch resets it. stats carries the breaker (`launch_circuit`), the
+hourly fence count (`launch_failed_1h`) and per-host occupancy, so an idle slot
+read names its stall class. Diagnose slow refill using request/ingress stages,
+current starting/running slots, and durable result delivery. Increasing
+concurrency or adding a status cache does not cure long synchronous maintenance,
+failed startups, or missing tool access.
 
 The append-only receipt ledger has canonical lookup indexes for card history,
 actor activity, per-card actions and action/time windows. Watchdog and control
