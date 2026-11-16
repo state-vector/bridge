@@ -1279,6 +1279,25 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // "unclassified" (default threshold 3) and raised breach card BR#7721.
   // Named so the Log says WHAT fenced; priced never-a-breach.
   execution_acceptance_fence: Number.POSITIVE_INFINITY,
+  // BR#14689 — the interactive-claim human-decision fence (execution-work.ts
+  // assertInteractiveClaim :117, reached from the interactive claim op
+  // do.ts:6471 and the direct-interactive-claim transition path do.ts:7819):
+  // a claim attempt on a card whose exit an open human decision owns — a
+  // bound ask, or an open human-routed child question — is refused with
+  // "gate: an open human decision owns this exit; answer it before
+  // claiming". The refusal IS the BR#6068 pause law working: the open ask
+  // owns the exit until it is answered, zero state is destroyed, and the
+  // refusal's own instruction is the cure (answer it; the answer
+  // auto-resumes the flow) — so it joins the BR#4562/BR#6654/BR#7008/
+  // BR#7684 never-a-breach pricing family. Pricing it FINITE would re-arm
+  // breach cards on exactly the enforcement the pause law prescribes (the
+  // BR#6654 lesson). Named so the Log says WHAT held: a claim, held by a
+  // human decision. Specimen: BR#14684, 3 refusals 2026-11-15
+  // 12:44:57–12:47:17Z during the open human gate ask BR#14688 — the ask
+  // was answered 12:48:17Z and the re-claim succeeded 12:48:42Z; the events
+  // folded "unclassified" (default threshold 3) and raised breach card
+  // BR#14689.
+  "claim:held-human-decision": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1534,6 +1553,24 @@ export function breachClass(reason: string): string {
   // BR#9820) and BR#9664 (breach card BR#9761, coordination ask BR#10579).
   if (r.includes("requires execution_result") && (r.includes("execution submission") || r.includes("execution completion")))
     return "gate:execution-result-missing";
+  // BR#14689: the interactive-claim human-decision fence (execution-work.ts
+  // assertInteractiveClaim :117, reached from the interactive claim op
+  // do.ts:6471 and the direct-interactive-claim transition path do.ts:7819)
+  // refusing a claim on a card whose exit an open human decision owns — a
+  // bound ask, or an open human-routed child question — with "gate: an open
+  // human decision owns this exit; answer it before claiming". The refusal
+  // IS the BR#6068 pause law working: the open ask owns the exit until it is
+  // answered, zero state destroyed, and the refusal's own instruction is the
+  // cure (answer it; the answer auto-resumes the flow). The throw carries no
+  // [rule:] tag, so the table above can't own it; match the structural
+  // fragment "an open human decision owns this exit", not the whole sentence
+  // (BR#3611/BR#3612 wording-drift lesson); it sits ~7 chars in, far inside
+  // the 300-char audit slice, so the classification survives any tail.
+  // Specimen: BR#14684, 3 refusals 2026-11-15 12:44:57–12:47:17Z during the
+  // open human gate ask BR#14688 (main-red merge hold) — answered 12:48:17Z,
+  // re-claim succeeded 12:48:42Z; folded "unclassified" and raised breach
+  // card BR#14689. Priced never-a-breach (thresholds above).
+  if (r.includes("an open human decision owns this exit")) return "claim:held-human-decision";
   return "unclassified";
 }
 
