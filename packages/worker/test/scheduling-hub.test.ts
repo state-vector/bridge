@@ -129,7 +129,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const older = await task(project), newer = await task(project);
     await new Promise(resolve => setTimeout(resolve, 10));
     expect((await post("update", { id: older, actor: "author", title: "Older task with updated evidence" })).error).toBeUndefined();
-    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([older, newer]);
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: older });
   });
@@ -148,7 +148,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const cancelled = await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true },
       undefined, first, reservation.session);
     expect(cancelled.kind).toBe("released");
-    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([second, first]);
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: second });
   });
@@ -387,7 +387,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const stopped = await g.cmd({ ...final, kind: "stopped" }, "terminal-stopped", id, claim.session);
     expect(stopped).toMatchObject({ attempt: { phase: "finalizing", writers: "process_group_empty" } });
     expect((await post("get", { id })).status).toBe("in_progress");
-    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0].occupancy.held).toBe(0);
+    expect((await g.cmd({ kind: "schedule_status", refresh: true, host: g.host })).hosts[0].occupancy.held).toBe(0);
     expect((await g.cmd({ ...final, kind: "stopped", outcome: { ...final.outcome, stdout_tail: "replacement" } }, "changed-evidence", id, claim.session)).error).toMatch(/immutable/);
     expect((await g.cmd({ kind: "begin", attempt_id: "premature", worker: g.auth.agent, action_budget_ms: 60_000 }, "before-finalize", id, claim.session)).error).toMatch(/quiescence/);
     const first = await g.cmd(final, "terminal-final", id, claim.session);
@@ -465,7 +465,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const final = await g.cmd(command, "unknown-final", id, claim.session);
     expect(final.operations).toMatchObject([{ id: "publish", state: "prepared" }, { id: "deploy", state: "prepared" }]);
     expect((await post("get", { id })).status).toBe("in_progress");
-    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].occupancy.held).toBe(0);
     expect((await g.cmd({ kind: "begin", attempt_id: "unsafe-retry", worker: g.auth.agent, action_budget_ms: 60_000 }, "unknown-retry", id, claim.session)).error).toMatch(/unknown external operations/);
     const result = { kind: "result", generation: 1, attempt_id: "unknown-one", operation_id: "publish",
@@ -597,25 +597,25 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const project = "truthful-occupancy", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), r = await reserve(g);
     if (r.kind !== "reserved") throw new Error("no reservation");
-    let status = await g.cmd({ kind: "schedule_status", host: g.host });
+    let status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 0, starting: 1, unconfirmed: 0, held: 1 });
     const begun = await g.cmd({ kind: "begin", attempt_id: "retained-writer", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-retained", id, r.session);
     expect(begun.error).toBeUndefined();
-    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 1, starting: 0, unconfirmed: 0, held: 1 });
     expect((await post("transition", { id, to: "todo", actor: "system:test", note: "Card released, but no stopped-process evidence exists" })).error).toBeUndefined();
     const released = await g.cmd({ kind: "inspect" }, "released-writer-inspect", id, r.session);
     expect(released).toMatchObject({ attempt: { phase: "stopping" }, revision: begun.revision + 1, messages: [] });
     const fenced = await g.cmd({ kind: "poll", generation: 1, attempt_id: "retained-writer" }, "released-writer-poll", id, r.session);
     expect(fenced.attempt.phase).toBe("stopping");
-    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0]).toMatchObject({ active: 1, reserved: 0, occupancy: { leased: 0, starting: 0, unconfirmed: 1, held: 1,
       slots: [{ kind: "unconfirmed", task_id: id, generation: 1, attempt_id: "retained-writer", session: r.session, reason: "claim_changed", task_status: "todo" }] } });
     expect(await reserve(g)).toMatchObject({ kind: "at_capacity", active: 1 });
     const stop = { kind: "quiesce", generation: 1, attempt_id: "retained-writer", writers: "process_group_empty" };
     expect((await peer.cmd(stop, "foreign-stop", id, r.session)).error).toMatch(/authority|host/);
     expect((await g.cmd(stop, "confirmed-stop", id, r.session)).error).toBeUndefined();
-    status = await g.cmd({ kind: "schedule_status", host: g.host });
+    status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].occupancy).toMatchObject({ leased: 0, unconfirmed: 0, starting: 0, held: 0 });
     // Consume the released fixture so later global eligibility censuses do not
     // inherit its deliberately retained host affinity.
@@ -643,7 +643,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(orientation.unclaimed_work.map((t: { id: string }) => t.id)).toContain(runnable);
     const outcome = await reserve(ec2);
     expect(outcome).toMatchObject({ kind: "reserved", task_id: runnable, eligible: 1, capacity: 12, reasons: { host_affinity: 15 } });
-    const status = await ec2.cmd({ kind: "schedule_status", host: ec2.host });
+    const status = await ec2.cmd({ kind: "schedule_status", refresh: true, host: ec2.host });
     expect(status.hosts).toHaveLength(1);
     expect(status.hosts[0]).toMatchObject({ host: ec2.host, capacity: 12, active: 0, reserved: 1, eligible: 0, last_dispatch: { kind: "reserved", task_id: runnable } });
   });
@@ -727,7 +727,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(replay).toMatchObject({ kind: "reserved", task_id: id });
     if (replay.kind !== "reserved") throw new Error("missing reservation");
     expect(replay.session).not.toBe(`dispatch-${id.replace("#", "-")}`);
-    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0].reserved).toBe(1);
+    expect((await g.cmd({ kind: "schedule_status", refresh: true, host: g.host })).hosts[0].reserved).toBe(1);
     await g.cmd({ kind: "start_failed", stage: "begin", reason: "transport temporary", retained_work: false, failure_class: "transport" }, "failure", id, replay.session);
     // Retry transport acknowledgement is idempotent; it cannot extend backoff.
     const failure = { kind: "gateway_failure", reason: "provider disconnected", cooldown_ms: 10_000 };
@@ -761,7 +761,7 @@ describe("priority line recovery capacity", () => {
     const review = (await report("MERGEABLE", "UNSTABLE")).spawned.find((x: { action: string }) => x.action === "verify")?.duty;
     expect(review).toBeTruthy();
     expect((await post("get", { id: review })).project).toBe(project);
-    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0].held.independent_wait).toContain(parent);
+    expect((await g.cmd({ kind: "schedule_status", refresh: true, host: g.host })).hosts[0].held.independent_wait).toContain(parent);
     expect((await transition(review, "in_progress", "pr-reviewer")).error).toBeUndefined();
     expect((await transition(review, "done", "pr-reviewer", { review_result: {
       kind: "findings", summary: "The feature still needs a regression repair",
@@ -805,7 +805,7 @@ describe("priority line recovery capacity", () => {
       execution_scope: { id: repair, generation: 1, attempt_id: "fifo-repair" }, to: "in_review",
       note: "PR https://github.com/state-vector/bridge/pull/6998 — repair delivered, independent review required" });
     expect(handoff.error).toBeUndefined();
-    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([handoff.verify_task, later]);
     const reviewClaim = await reserve(g);
     if (reviewClaim.kind !== "reserved") throw new Error("review not reserved");
@@ -845,7 +845,7 @@ describe("priority line recovery capacity", () => {
       return;
     }
     const unrelated = await linkUnrelated();
-    const status = await g.cmd({ kind: "schedule_status", host: g.host });
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].candidates.slice(0, 3)).toEqual([submitted.verify_task, later, unrelated]);
     const review = await reserve(g);
     if (review.kind !== "reserved") throw new Error("train review was not reserved");
@@ -910,7 +910,7 @@ describe("priority line recovery capacity", () => {
     expect((await post("get", { id: victim })).status).toBe("todo");
     expect((await g.cmd({ kind: "inspect" }, "stopped-verifier", victim, r.session)).attempt.checkpoint).toBeNull();
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: repair });
-    expect((await g.cmd({ kind: "schedule_status", host: g.host })).hosts[0]).toMatchObject({ active: 0, reserved: 1 });
+    expect((await g.cmd({ kind: "schedule_status", refresh: true, host: g.host })).hosts[0]).toMatchObject({ active: 0, reserved: 1 });
   });
   it.each(["recovery-review", "pending-effect"])("does not interrupt protected verification: %s", async protection => {
     const project = `repair-protection-${protection}`, g = await gateway(project);

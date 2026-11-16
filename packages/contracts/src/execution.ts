@@ -330,7 +330,11 @@ export function initialExecution(requirements: ExecutionRequirements = Execution
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), mode: z.enum(["inspect", "reserve", "request_capacity"]) }),
-  z.object({ kind: z.literal("schedule_status"), host: text.optional() }),
+  z.object({ kind: z.literal("schedule_status"), host: text.optional(),
+    // BR#14765 — bypass the per-host scheduling memo for first-hand reads
+    // (tests + any caller needing un-cached state; the reserve loop's polls
+    // ride the memo).
+    refresh: z.boolean().optional() }),
   z.object({ kind: z.literal("provider_route_verified"), proof: ProviderRecoveryProofSchema, limit: z.number().int().min(1).max(4).default(4) }),
   z.object({ kind: z.literal("recover_provider_failure"), terminal: TerminalReceiptSchema,
     proof: ProviderRecoveryProofSchema, diagnosis: recoveryPermitFields.diagnosis,

@@ -5991,6 +5991,17 @@ export class KnowledgeHub {
    *  stays first-hand. */
   private schedulingMemo: { at: number; value: ReturnType<KnowledgeHub["schedulingStatusUncached"]> } | null = null;
 
+  /** BR#14765 — per-HOST memo. The gateway reserve loop polls HOST-specific
+   *  schedule_status every ~15s; BR#14749-14764 only memoized the all-hosts
+   *  shape, so the host path bypassed and paid the full ~9s sweep per poll —
+   *  measured live: mixed 1-12s latencies, the loop continuously hogged,
+   *  503 input-gate rejections, 12s client timeouts. Per-host TTL 30s.
+   *  SAFETY: the reserve itself is CAS'd server-side (execution/schedule
+   *  re-validates eligibility transactionally) — a stale host read can cause
+   *  a rejected reserve attempt, never a double dispatch. retryRoute still
+   *  bypasses entirely (retry admission stays first-hand). */
+  private hostSchedulingMemo: Map<string, { at: number; value: ReturnType<KnowledgeHub["schedulingStatusUncached"]> }> = new Map();
+
   private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     if (!host && !retryRoute) {
       // BR#14764 — TTL 15s→60s: the cold recompute measures ~9s (238+ rows ×
@@ -6017,6 +6028,13 @@ export class KnowledgeHub {
       const value = this.schedulingStatusUncached(undefined, now);
       this.schedulingMemo = { at: now, value };
       try { this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('scheduling.memo', ?)`, JSON.stringify({ at: now, value })); } catch { /* best-effort persistence */ }
+      return value;
+    }
+    if (host && !retryRoute) {
+      const memo = this.hostSchedulingMemo.get(host);
+      if (memo && memo.at > now - 30_000) return memo.value;
+      const value = this.schedulingStatusUncached(host, now);
+      this.hostSchedulingMemo.set(host, { at: now, value });
       return value;
     }
     return this.schedulingStatusUncached(host, now, retryRoute);
@@ -6433,7 +6451,12 @@ export class KnowledgeHub {
         return result;
       });
     }
-    if (command.kind === "schedule_status") return { hosts: this.schedulingStatus(command.host) };
+    // BR#14765 — `refresh: true` bypasses the per-host memo: the reserve loop's
+    // schedule_status polls ride the 30s memo (safe: reserve itself is CAS'd
+    // server-side), while tests and any first-hand-needing caller opt in.
+    if (command.kind === "schedule_status") return { hosts: command.refresh === true
+      ? this.schedulingStatusUncached(command.host ?? undefined)
+      : this.schedulingStatus(command.host) };
     if (command.kind === "gateway_control") {
       const tags = parseTags(token.tags).map(t => t.toLowerCase());
       const target = this.one(`SELECT id,tags FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, command.host);
