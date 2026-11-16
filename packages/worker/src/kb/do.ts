@@ -5869,10 +5869,66 @@ export class KnowledgeHub {
     const sinks = this.alarmSinkIds();
     const work = this.executionWork();
     let readiness: ExecutorReadiness | undefined;
+    // BR#14767 — per-sweep bulk prefetch: every per-row helper below hit its
+    // own SQL per row (executionState 2x via protectedExecution+admission,
+    // hasEvidence 1-2x via unmetBars, startupWait, startupHasAsk 2x,
+    // startupRejected+taskStartupProof 2x) — measured ~8 queries x 238 rows
+    // ≈ 2000 synchronous statements per sweep ≈ 9s on the DO's single event
+    // loop, the stall the gateway's 8s advertise windows trip on. One set-based
+    // query per lookup family, swept into Maps; the row loop reads memory.
+    // Scoped to THIS sweep (never cached across calls — admission stays
+    // first-hand; only redundant intra-sweep recomputation is eliminated).
+    const ids = rows.map(r => String(r.id));
+    const idList = ids.length ? `('${ids.join("','")}')` : `('')`;
+    const stateById = new Map<string, ExecutionState | null>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT e.task_id AS tid, e.state AS state, a.meta AS meta FROM execution_state e
+       JOIN artefacts a ON a.id = e.task_id WHERE e.task_id IN ${idList}`,
+    ).toArray()) {
+      try {
+        const state = ExecutionStateSchema.parse(JSON.parse(String(r.state)));
+        state.requirements = ExecutionRequirementsSchema.parse(JSON.parse(String(r.meta ?? "{}")).execution_requirements ?? state.requirements);
+        stateById.set(String(r.tid), state);
+      } catch { /* malformed state — read as absent */ }
+    }
+    // hasEvidence bulk: done review/analysis children + accepted decisions per id.
+    const analysisEv = new Set<string>(), reviewEv = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status = 'done' AND r.dst_id IN ${idList}`,
+    ).toArray()) {
+      const roles: string[] = parseTags(String(r.roles));
+      if (roles.includes("review")) { reviewEv.add(String(r.pid)); analysisEv.add(String(r.pid)); }
+      else if (roles.includes("analysis")) analysisEv.add(String(r.pid));
+    }
+    for (const r of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted' AND r.dst_id IN ${idList}`,
+    ).toArray()) { const t = String(r.tid); analysisEv.add(t); reviewEv.add(t); }
+    const openAskIds = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT artefact_id AS pid FROM asks WHERE status = 'open' AND artefact_id IN ${idList}`,
+    ).toArray()) openAskIds.add(String(r.pid));
+    for (const r of this.state.storage.sql.exec(
+      `SELECT r.dst_id AS pid FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked')
+         AND json_extract(c.meta, '$.ask') IS NOT NULL AND r.dst_id IN ${idList}`,
+    ).toArray()) openAskIds.add(String(r.pid));
+    const startupWaitIds = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT task_id AS tid FROM executor_start_waits WHERE task_id IN ${idList}`,
+    ).toArray()) startupWaitIds.add(String(r.tid));
+    // BR#14767 — startup rejections bulk: (task_id, host, fingerprint) rows
+    // for the sweep's ids; the row loop computes taskStartupProof from the
+    // already-fetched artefact columns and checks membership in memory.
+    const startupRejections = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN ${idList}`,
+    ).toArray()) startupRejections.add(`${String(r.tid)}\u0000${String(r.host)}\u0000${String(r.fp)}`);
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
-      const state = this.executionState(id);
+      const state = stateById.get(id) ?? null;
       let requirements: ReturnType<ExecutionWork["schedulingRequirements"]> | undefined;
       const schedulingRequirements = () => requirements ??= work.schedulingRequirements(
         id, state?.requirements ?? ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), state ?? undefined,
@@ -5880,8 +5936,18 @@ export class KnowledgeHub {
       let reason: SchedulingReason | null = null;
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
-      else if (this.unmetBars(row).length) reason = "qualification";
-      else if (this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta) || this.startupHasAsk(id)) reason = "independent_wait";
+      // BR#14767 — unmetBars inline (bulk evidence): enforceable bars need
+      // analysis evidence (review also satisfies analysis, per hasEvidence).
+      else if ((() => {
+        const bars: string[] = (meta.qualification ?? {}).bars ?? [];
+        return this.enforceableBars(bars).some(b => /review/.test(b) ? !reviewEv.has(id) : !analysisEv.has(id));
+      })()) reason = "qualification";
+      // BR#14767 — protectedExecution/startupHasAsk inline (bulk state/waits/asks):
+      // startupWait OR typed execution wait/meta OR an un-returned handoff phase
+      // OR an open (or ask-carrying-question-child) ask.
+      else if (startupWaitIds.has(id) || isExecutionWait(meta)
+        || (state?.handoff && state.handoff.phase !== "none" && state.handoff.phase !== "returned")
+        || this.todoLifecycleHold(id, meta) || openAskIds.has(id)) reason = "independent_wait";
       else {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state ?? undefined, revision);
@@ -5898,7 +5964,17 @@ export class KnowledgeHub {
         else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
         else {
           readiness ??= this.executorReadiness(tokenId, host, capabilities, Date.now());
-          if (readiness.kind === "ready" && this.startupRejected(id, host, readiness.fingerprint)) reason = "startup_prerequisite";
+          // BR#14767 — startupRejected inline (bulk rejections + the row's own
+          // artefact columns for taskStartupProof; no per-row SQL).
+          if (readiness.kind === "ready") {
+            const metaForProof = JSON.parse(String(row.meta ?? "{}"));
+            const proof2 = startupPrerequisiteFingerprint(readiness.fingerprint, {
+              body_md: String(row.body_md ?? ""), project: String(row.project ?? ""),
+              meta: { ...metaForProof, execution_requirements: ExecutionRequirementsSchema.parse(metaForProof.execution_requirements ?? {}) },
+            });
+            if (startupRejections.has(`${id}\u0000${host}\u0000${readiness.fingerprint}`)
+              || startupRejections.has(`${id}\u0000${host}\u0000${proof2}`)) reason = "startup_prerequisite";
+          }
         }
       }
       if (retryRoute && reason === "provider_route" && state?.terminal && state.attempt?.host === host
