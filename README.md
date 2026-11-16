@@ -3301,6 +3301,51 @@ a parent parked in `todo` (the BR#7642 shape — the close previously
 required `in_review` and stranded verified delivered work in the pool).
 Pinned in `packages/worker/test/br9510-admission-livelock.test.ts`.
 
+### The queue gates on the ledger, not the observation; an observed merge lands its own row (BR#15528)
+
+The derived queue retired a queued car the moment any delivery observation
+recorded its leg PR MERGED (`delivery_pr_outcomes` / `proxy_probes`) —
+without consulting the merge ledger. The executor walk's already-merged
+stamp arm (the ledger's writer, the `merged` train event) never reached the
+car again: the superpositional@main lane merged ~12 cars via PRs that ended
+with **zero** `train_history` rows, every accepted admission re-parked on
+the missing stamp, and the fired `pr_merged` waits could not resolve — the
+BR#14683 class (11 accepted admissions, zero rows; the same shape on
+BR#14737/BR#14719/BR#14610 and the 2026-11-17 sweep asks). Now a leg leaves
+the queue only when its merge is BOTH observed AND ledgered (a provenance
+row or a merged train event); observed-but-unledgered stays queued so the
+walk reaches it, and re-queueing such a car names itself
+(`queue_observed_merged_no_ledger` audit) instead of hiding silently. The
+walk's own window names itself too: a bounded scan that stops before a queue
+entry logs the exact entry it never classified (the next pass resumes
+there) — a silent stop was indistinguishable from "the walk looked at
+everything", which is how the gap stayed invisible for days.
+
+The land flow stamps what it owns. The BR#9510 terminal test gains a third,
+weakest receipt class — the hub's own durable delivery observation
+(`delivery_pr_outcomes` carrying BOTH the merge sha and a recorded head the
+acceptance covers, fail-closed) — and before closing on it the hub stamps
+the missing provenance + `train_events` rows itself (historical, signer
+`hub:land-flow`; the BR#5151 law holds — a different recorded merge sha is a
+named refusal, never overwritten). The merge commit is now recorded at the
+door (`reconcile.report` / `proxy.verify` MERGED observations keep the merge
+sha; previously dropped, which made every later ledger stamp impossible from
+recorded evidence). Pinned in `packages/worker/test/train-hub.test.ts`.
+
+And an ask answer can no longer strand a train car. A card holding a
+merge-train slot (queued / awaiting-ci / awaiting / conflicting) does NOT
+flip `in_progress` under an ask answer — the train owns the exit, the car
+stays blocked+queued and the walk drives it (the BR#14683 / BR#14719 /
+BR#14640 dead-claim strand class: answers resumed `in_progress` under runner
+sessions whose lease had expired ~10h earlier, and the card then left the
+queue forever). Holder liveness stops folding the owner label's shared host
+token — a host dispatching ANY other session keeps that token fresh forever
+— so a dead session's answer releases to the pool instead of resuming onto a
+corpse. A standing lane card's expired typed `time` wait machine re-arms
+like any unclaimable anchor (the BR#5916 extension; BR#5733 sat 233h past
+due because blocked-work continuation refuses lane cards and the capped
+spawner stamped `spawn_skipped` — the expired atom had no legal leg left).
+
 ### Duplicate citations bind once; the stale re-queue fails closed (BR#6349)
 
 The `unbound` phase's writer is now fail-closed at the source. The

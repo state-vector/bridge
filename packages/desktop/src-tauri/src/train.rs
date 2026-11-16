@@ -3257,8 +3257,18 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
     let ready_limit = if burst_cap == 0 { 10 } else { (burst_cap as usize).min(10) };
     ctx.operation_deadline = Some(Instant::now() + SCAN_BUDGET);
     for &qi in &scan_order {
+        // BR#15528 (loud skips): a bounded scan that stops BEFORE the queue's
+        // end must NAME the entry it never reached — a silent stop here was
+        // indistinguishable from "the walk looked at everything", which is
+        // exactly how the already-merged-car stamp gap stayed invisible for
+        // days. The next pass resumes from this entry (queue_scan_order), so
+        // naming it is honest, not alarmist.
         if visited.len() >= SCAN_MAX_ENTRIES || candidates.len() >= ready_limit
             || !ctx.operation_budget(SCAN_BUDGET).is_ok_and(|remaining| remaining >= CARD_FIRST_ATTEMPT) {
+            log(Some(key), &format!(
+                "scan window reached BEFORE queue[{qi}] of {} (visited {}, {} ready candidate(s)) — this entry and everything past it is NOT classified this tick; the next pass resumes here (BR#15528)",
+                queue.len(), visited.len(), candidates.len()
+            ));
             break;
         }
         let head = &queue[qi];

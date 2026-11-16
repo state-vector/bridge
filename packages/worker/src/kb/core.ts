@@ -2941,13 +2941,18 @@ export function trainQueueRemainingReason(meta: any): string {
  *  when it recorded the merged head; `via "leg-stamp"` — the train's
  *  per-leg stamp on THIS card (meta.merge_train.legs.<n>.merge_sha, written
  *  only by the train's own merge observation of the card's leg, head
- *  coverage enforced walk-side at merge time). */
+ *  coverage enforced walk-side at merge time); `via "observed"` (BR#15528)
+ *  — the hub's durable delivery observation (delivery_pr_outcomes with the
+ *  recorded merge sha), head-checked against the acceptance the same way —
+ *  the land flow stamps the missing provenance row from it, hub-side, so an
+ *  already-merged delivery never re-parks waiting for a train stamp that
+ *  cannot come. */
 export type MergedLegReceipt = {
   repo: string;
   number: number;
   head: string;
   mergeSha: string;
-  via: "provenance" | "leg-stamp";
+  via: "provenance" | "leg-stamp" | "observed";
 };
 
 /** The coverage facts one admitted leg brings to the terminal test. */
@@ -2978,6 +2983,7 @@ export function admissionMergedTerminal(
   legs: AdmissionLegCoverage[],
   provenance: Map<string, { merge_sha?: string | null; head_sha?: string | null } | undefined>,
   legStamps: Record<string, { merge_sha?: string | null } | undefined>,
+  observed?: Map<string, { merge_sha?: string | null; head_sha?: string | null } | undefined>,
 ): MergedLegReceipt[] | null {
   if (!legs.length) return null;
   const merged: MergedLegReceipt[] = [];
@@ -2997,6 +3003,21 @@ export function admissionMergedTerminal(
     const stampSha = SHA40(stamp?.merge_sha);
     if (stampSha) {
       merged.push({ repo: leg.repo, number: leg.number, head: String(leg.accepted_head ?? leg.stamped_head ?? ""), mergeSha: stampSha, via: "leg-stamp" });
+      continue;
+    }
+    // BR#15528: the hub's durable delivery observation is the weakest but
+    // still hub-owned receipt — admitted only when it carries BOTH a merge
+    // sha AND a recorded head the acceptance covers (a headless merge sha
+    // proves nothing about WHICH head the verdict accepted: fail-closed).
+    const obs = observed?.get(`${leg.repo}#${leg.number}`);
+    const obsSha = SHA40(obs?.merge_sha);
+    const obsHead = String(obs?.head_sha ?? "").toLowerCase();
+    const obsCovered =
+      !!obsHead &&
+      (headCoveredBy(String(leg.accepted_head ?? "").toLowerCase(), undefined, obsHead) ||
+        headCoveredBy(String(leg.stamped_head ?? "").toLowerCase(), leg.carry, obsHead));
+    if (obsSha && obsCovered) {
+      merged.push({ repo: leg.repo, number: leg.number, head: obsHead, mergeSha: obsSha, via: "observed" });
       continue;
     }
     return null; // an unmerged leg: the admission is not terminal — fail-closed

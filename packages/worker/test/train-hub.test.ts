@@ -443,7 +443,19 @@ describe("BR#6776 durable check recovery", () => {
     expect(probe).toBeTruthy();
     expect((await kbJson("/proxy.verify", { actor, key: probe.key, ok: true, conclusion: "MERGED",
       head_sha: "b".repeat(40), receipt: `https://github.com/${repo}/pull/1` })).body.ok).toBe(true);
+    // BR#15528: a confirmed OBSERVED merge no longer retires the car by
+    // itself — the old drop-on-observation contract is exactly how 12 merged
+    // PRs ended up with zero ledger rows (the executor walk never saw them).
+    // The car stays queued (visible) until the ledger row exists; the
+    // executor's merged event stamps provenance/train_events, and only then
+    // does the queue retire the leg — with the independent wait retained.
     await kbJson("/reconcile.report", { repo, actor, prs: [{ number: 1, state: "OPEN", headRefOid: head }] });
+    expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).toContain(1);
+    expect((await kbJson("/get", { id })).body.meta.blocked.await_event).toEqual(wait);
+    const stamped = await kbJson("/train.event", { repo, actor, kind: "merged", pr: 1,
+      head_sha: "b".repeat(40), merge_sha: "c".repeat(40), merged_at: Date.now() });
+    expect(stamped.body.error).toBeUndefined();
+    await kbJson("/reconcile.report", { repo, actor, prs: [] });
     expect((await laneSnap(repo)).queue.map((car: { pr: number }) => car.pr)).not.toContain(1);
     expect((await kbJson("/get", { id })).body.meta.blocked.await_event).toEqual(wait);
   });

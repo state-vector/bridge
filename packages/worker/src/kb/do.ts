@@ -2009,7 +2009,11 @@ export class KnowledgeHub {
       );
       if (probe.kind === "pr_merged" && conclusion === "MERGED" && /^[0-9a-f]{40}$/.test(headSha)
         && receipt === `https://github.com/${probe.repo}/pull/${probe.pr}`) {
-        this.recordDeliveryPrOutcome(String(probe.repo), Number(probe.pr), "MERGED", null, now);
+        // BR#15528: record the verified PR head, not null — the outcome row
+        // is the merge fact the land flow head-checks against the accepted
+        // leg stamp (the probe grammar carries no merge sha; the walk or the
+        // reconcile cycle stamps that half when it observes the merge).
+        this.recordDeliveryPrOutcome(String(probe.repo), Number(probe.pr), "MERGED", headSha, null, now);
       }
       const note = `proxy_verified: ${probe.kind} SATISFIED — ${receipt}${headSha ? ` (head ${headSha.slice(0, 9)})` : ""} (worker-executor ${actor}, BR#4658)`;
       this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 1, receipt: receipt.slice(0, 300), head_sha: headSha || null });
@@ -2383,14 +2387,19 @@ export class KnowledgeHub {
       // (machine re-arm: no flip, no spawn, no breach event). Leaving the
       // expired atom in place is how BR#3124 became a zombie park — expired
       // wait + capped spawner + do-not-touch guards = no legal leg left.
-      if (this.isUnclaimableAnchor(r, meta)) {
+      // BR#15528: a STANDING LANE CARD (meta.lane) parks the same way —
+      // agents can never claim it (the hub refuses), so its expired
+      // backoff timer has no leg either: continueBlockedWork refuses
+      // meta.lane cards, the capped spawner stamps spawn_skipped, and the
+      // card sat 233h past due (BR#5733). The machine re-arm covers it.
+      if (this.isUnclaimableAnchor(r, meta) || !!meta.lane) {
         const rearm = now + ANCHOR_REARM_MS;
         meta.blocked = { ...(meta.blocked ?? {}), await_event: { event: "time", until_ts: rearm } };
         this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
         this.stampProxyCheck(r.id, meta, now, "waiting",
-          `BR#5916 machine re-arm: unclaimable anchor's typed time await expired (${new Date(aw.until_ts).toISOString()}) — re-parked on a fresh ${Math.round(ANCHOR_REARM_MS / 60_000)}m wait until ${new Date(rearm).toISOString()}`, prev);
-        this.audit("hub:proxy-watch", "anchor_rearm", r.id, { expired_until_ts: aw.until_ts, rearm_until_ts: rearm });
-        this.version(r.id, "hub:proxy-watch", "note", `BR#5916: unclaimable anchor's time await expired — machine re-parked on a fresh typed wait until ${new Date(rearm).toISOString()} (no flip, no spawn, no breach)`);
+          `BR#5916/BR#15528 machine re-arm: ${meta.lane ? "standing lane card" : "unclaimable anchor"}'s typed time await expired (${new Date(aw.until_ts).toISOString()}) — re-parked on a fresh ${Math.round(ANCHOR_REARM_MS / 60_000)}m wait until ${new Date(rearm).toISOString()}`, prev);
+        this.audit("hub:proxy-watch", "anchor_rearm", r.id, { expired_until_ts: aw.until_ts, rearm_until_ts: rearm, lane_card: !!meta.lane });
+        this.version(r.id, "hub:proxy-watch", "note", `BR#5916/BR#15528: ${meta.lane ? "standing lane card" : "unclaimable anchor"}'s time await expired — machine re-parked on a fresh typed wait until ${new Date(rearm).toISOString()} (no flip, no spawn, no breach)`);
         return;
       }
       await this.spawnProxyDuty(r, meta, now, prev, cond,
@@ -3722,6 +3731,7 @@ export class KnowledgeHub {
       CREATE TABLE IF NOT EXISTS delivery_pr_outcomes (
         repo TEXT NOT NULL, pr INTEGER NOT NULL, state TEXT NOT NULL,
         head TEXT, receipt TEXT NOT NULL, observed_at INTEGER NOT NULL,
+        merge_sha TEXT,
         PRIMARY KEY(repo,pr)
       );
       CREATE TABLE IF NOT EXISTS reconcile_duties (
@@ -3809,6 +3819,7 @@ export class KnowledgeHub {
       `ALTER TABLE artefacts ADD COLUMN created_by TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE pairings ADD COLUMN type TEXT`,
       `ALTER TABLE pairings ADD COLUMN principal TEXT`,
+      `ALTER TABLE delivery_pr_outcomes ADD COLUMN merge_sha TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN principal TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN prev_hash TEXT`,
       `ALTER TABLE auth_tokens ADD COLUMN rotated_ts INTEGER`,
@@ -10648,11 +10659,23 @@ export class KnowledgeHub {
               taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
             }
           } else if (this.askAgeGuardHold(Number(node.created_ts ?? 0)) || this.holderIsAlive(sm, subject.owner)) {
-            await this.transition({
-              id: subject.id, to: "in_progress",
-              note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
-            }, asActor);
-            taskStatus = "in_progress";
+            // BR#15528: a card holding a merge-train slot NEVER resumes
+            // under the answer — the train owns the exit, and flipping
+            // in_progress (even under a live session) removes the car from
+            // laneQueue (in_progress ≠ blocked) so the walk can never stamp
+            // or close it. The fired wait's bookkeeping is consumed above;
+            // the queued car stays blocked+queued and the walk drives it.
+            const trainHold = ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(sm.merge_train?.state ?? ""));
+            if (trainHold) {
+              this.audit(actor, "answer_dispatch_train_hold_skipped", subject.id, { ask_id: id, train_state: String(sm.merge_train?.state ?? ""), note: "the merge train owns this exit — the queued car stays blocked+queued for the walk (BR#15528)" });
+              taskStatus = "blocked";
+            } else {
+              await this.transition({
+                id: subject.id, to: "in_progress",
+                note: `ask ${id} answered — resumed: ${answer.slice(0, 100)}`,
+              }, asActor);
+              taskStatus = "in_progress";
+            }
           } else {
             // BR#3819 (D): the answer resumes work only onto a LIVE executor.
             // The holder's session produced no live signal within the stale
@@ -10780,11 +10803,19 @@ export class KnowledgeHub {
         }
         if (t.status === "blocked" && !sinkAnchored) {
           if (this.askAgeGuardHold(Number(row.created_ts ?? 0)) || this.holderIsAlive(meta, t.owner)) {
-            await this.transition({
-              id: String(row.artefact_id), to: "in_progress",
-              note: `decision ${id} answered — resumed: ${answer.slice(0, 100)}`,
-            }, `system:decision(${actor})`);
-            taskStatus = "in_progress";
+            // BR#15528: train-held cards never resume under the answer —
+            // the walk owns the exit (see the KB-node path above).
+            const trainHold = ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state ?? ""));
+            if (trainHold) {
+              this.audit(actor, "answer_dispatch_train_hold_skipped", String(row.artefact_id), { ask_id: id, train_state: String(meta.merge_train?.state ?? ""), note: "the merge train owns this exit — the queued car stays blocked+queued for the walk (BR#15528)" });
+              taskStatus = "blocked";
+            } else {
+              await this.transition({
+                id: String(row.artefact_id), to: "in_progress",
+                note: `decision ${id} answered — resumed: ${answer.slice(0, 100)}`,
+              }, `system:decision(${actor})`);
+              taskStatus = "in_progress";
+            }
           } else {
             // BR#3819 (D): dead holder — release to the pool, never resume
             // onto a runner that already finished.
@@ -10814,10 +10845,14 @@ export class KnowledgeHub {
    *  already use. The holder's freshest live signal is the max of:
    *    - the runner's liveness vouch on the card (meta.session_alive_ts),
    *    - the card's own heartbeat (meta.last_progress.ts — log_progress),
-   *    - the stamped session's hub ping (sessions.last_seen_ts by name),
-   *    - the owner identity's hub ping (auth_tokens.last_seen_ts — a live
-   *      runner waiting on the answer keeps polling the hub, so its token
-   *      stays fresh; a finished runner stops polling and goes stale).
+   *    - the stamped session's hub ping (sessions.last_seen_ts by name).
+   *  BR#15528: the owner identity's auth_tokens.last_seen_ts is deliberately
+   *  NOT a signal — the owner label resolves to the runner host's SHARED
+   *  token, which stays fresh while that host dispatches any other session,
+   *  so it could vouch for a session whose own lease expired hours ago (the
+   *  dead-claim resume strand). A live session keeps its own pings fresh;
+   *  a finished runner stops and goes stale — the answer releases to the
+   *  pool instead of resuming onto a runner that already finished.
    *  updated_ts is deliberately NOT a signal here: the watchdog's hourly
    *  blocked-age annotation touches it on parked cards, and annotated noise
    *  must never read as a live holder. meta.session is read but never
@@ -10837,14 +10872,19 @@ export class KnowledgeHub {
     const sessRow = sess
       ? this.one(`SELECT last_seen_ts FROM sessions WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1`, sess)
       : null;
-    const ownerToken = ownerLabel
-      ? this.one(`SELECT id, last_seen_ts FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, ownerLabel, ownerLabel)
-      : null;
+    // BR#15528: the owner credential's last_seen_ts is NO LONGER a holder
+    // liveness signal. The owner label resolves to the runner HOST's shared
+    // token, which stays permanently fresh while that host dispatches ANY
+    // other session — folding it in read every dead session as alive, and
+    // ask answers then flipped train-queued cards in_progress under claims
+    // whose lease had expired ~10h earlier (the dispatch-BR-14683 strand
+    // class). The SESSION's own signals (its hub pings, the card's liveness
+    // vouch and heartbeat) are the whole truth: a live session keeps them
+    // fresh; a finished runner stops and goes stale.
     const lastSignal = Math.max(
       Number(holderMeta?.session_alive_ts ?? 0),
       Number(holderMeta?.last_progress?.ts ?? 0),
       Number(sessRow?.last_seen_ts ?? 0),
-      Number(ownerToken?.last_seen_ts ?? 0),
     );
     if (!lastSignal) return false;
     return Date.now() - lastSignal <= staleMin * 60_000;
@@ -15798,8 +15838,12 @@ export class KnowledgeHub {
   /** BR#9510 — fetch the hub merge receipts for an admission's legs and run
    *  the pure terminal test (core.ts admissionMergedTerminal). The card's
    *  own leg stamps and the provenance index are both the hub's internal
-   *  record of THE TRAIN's own merges — zero GitHub calls. Returns the
-   *  per-leg receipts when EVERY leg is merged, else null. */
+   *  record of THE TRAIN's own merges — zero GitHub calls. BR#15528 adds
+   *  the hub's durable delivery observations (delivery_pr_outcomes rows
+   *  carrying a recorded merge sha) as the third, weakest receipt class —
+   *  the land flow stamps the missing provenance row from them hub-side, so
+   *  an already-merged delivery never re-parks on a stamp that never comes.
+   *  Returns the per-leg receipts when EVERY leg is merged, else null. */
   private admissionMergedReceipts(
     meta: any,
     legs: { repo: string; number: number; head_sha_at_acceptance?: string; carry?: any[] }[],
@@ -15816,6 +15860,16 @@ export class KnowledgeHub {
       const row = this.one(`SELECT merge_sha, head_sha FROM provenance WHERE repo = ? AND pr = ?`, l.repo, l.number) as any;
       if (row) provenance.set(key, { merge_sha: row.merge_sha, head_sha: row.head_sha });
     }
+    const observed = new Map<string, { merge_sha?: string | null; head_sha?: string | null }>();
+    for (const l of legs) {
+      const key = `${l.repo}#${l.number}`;
+      if (observed.has(key)) continue;
+      const row = this.one(
+        `SELECT merge_sha, head FROM delivery_pr_outcomes WHERE repo = ? AND pr = ? AND state = 'MERGED'`,
+        l.repo, l.number,
+      ) as any;
+      if (row) observed.set(key, { merge_sha: row.merge_sha, head_sha: row.head });
+    }
     const coverage: AdmissionLegCoverage[] = legs.map((l) => ({
       repo: l.repo,
       number: l.number,
@@ -15823,7 +15877,7 @@ export class KnowledgeHub {
       carry: Array.isArray(l.carry) ? l.carry : undefined,
       accepted_head: acceptedLegs?.find((a) => a.repo === l.repo && Number(a.number) === l.number)?.head_sha_at_acceptance,
     }));
-    return admissionMergedTerminal(coverage, provenance, stampLegs);
+    return admissionMergedTerminal(coverage, provenance, stampLegs, observed);
   }
 
   /** BR#9510 — the merged-provenance terminal close (machine proxy,
@@ -15853,6 +15907,38 @@ export class KnowledgeHub {
     if (this.protectedExecution(parentId, meta)) {
       this.audit(actor, "merged_admission_close_held", parentId, { via, reason: "an explicit execution wait or live writer owns this exit" });
       return false;
+    }
+    // BR#15528: an "observed" receipt is the hub's durable delivery
+    // observation (delivery_pr_outcomes with a recorded merge sha) — the
+    // hub-side writer owns the merge LEDGER, so the missing provenance +
+    // train_events rows are stamped HERE, before the close. A delivery whose
+    // PR is first-hand merged must never re-park demanding an external train
+    // stamp that the observed-merge exclusion guarantees never comes.
+    // BR#5151 dedupe law holds: a PR with a DIFFERENT recorded merge sha is
+    // a protocol violation (named, never overwritten); a matching row
+    // dedupes to a no-op.
+    for (const r of merged.filter((m) => m.via === "observed")) {
+      const priorEv = this.one(`SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' LIMIT 1`, r.repo, r.number) as any;
+      const priorProv = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, r.repo, r.number) as any;
+      const seen = String(priorEv?.merge_sha ?? "") || String(priorProv?.merge_sha ?? "");
+      if (seen && seen.toLowerCase() !== r.mergeSha.toLowerCase()) {
+        this.audit(actor, "observed_merge_stamp_refused", parentId, { repo: r.repo, pr: r.number, recorded: seen.slice(0, 9), cited: r.mergeSha.slice(0, 9), reason: "a different merge sha is already recorded for this PR (BR#5151) — never overwritten" });
+        continue;
+      }
+      if (seen) continue; // the ledger already carries exactly this merge
+      const legBase = String(legs.find((l) => l.number === r.number)?.base ?? meta.pr?.base ?? "main");
+      const observedAt = Number(this.one(`SELECT observed_at FROM delivery_pr_outcomes WHERE repo = ? AND pr = ?`, r.repo, r.number)?.observed_at ?? 0) || now;
+      this.trainStampProvenance({ repo: r.repo, pr: r.number, merge_sha: r.mergeSha, head_sha: r.head || null, task_id: parentId, verdict_id: reviewId ?? null, session: null, signer: "hub:land-flow", merged_at: Math.min(observedAt, now) });
+      this.state.storage.sql.exec(
+        `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail)
+         SELECT ?, 'merged', ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' AND merge_sha = ?)`,
+        Math.min(observedAt, now), r.repo, legBase, actor, r.number, parentId, r.mergeSha, r.head || null,
+        JSON.stringify({ historical: true, via, observed_receipt: `https://github.com/${r.repo}/pull/${r.number}`, land_flow_stamp: true, br: "BR#15528" }),
+        r.repo, r.number, r.mergeSha,
+      );
+      this.audit(actor, "observed_merge_stamp_provenance", parentId, { repo: r.repo, pr: r.number, merge_sha: r.mergeSha.slice(0, 9), via });
+      this.version(parentId, actor, "merged_admission_ledger_stamp", `land flow stamped the missing merge-ledger row hub-side: ${r.repo}#${r.number} merged as ${r.mergeSha.slice(0, 9)} (observed receipt, BR#15528)`, { repo: r.repo, pr: r.number, merge_sha: r.mergeSha });
     }
     // stamp the legs the acceptance names (same shape as the queue path —
     // trainLegs() readers and the acceptance-qualify gate read meta.prs/
@@ -15998,6 +16084,22 @@ export class KnowledgeHub {
     if (mergedReceipts) {
       await this.closeAdmittedMergedCard(parentId, mergedReceipts, withStampHeads, actor, "admission-replay");
       return;
+    }
+    // BR#15528 loud naming: a leg the hub's OWN delivery observations record
+    // MERGED while the merge ledger (provenance/train_events) has no row is
+    // exactly the zero-row strand shape — re-queueing it is the walk's
+    // already-merged arm doing its job, but the gap must NAME itself at
+    // every re-queue instead of silently hiding the car from the snapshot
+    // (the 12 verified-merged PRs whose ledgers stayed empty for days).
+    const observedNoLedger = withStampHeads.filter((l) =>
+      !!this.one(`SELECT 1 FROM delivery_pr_outcomes WHERE repo = ? AND pr = ? AND state = 'MERGED'`, l.repo, l.number)
+      && !this.one(`SELECT 1 FROM provenance WHERE repo = ? AND pr = ? AND merge_sha <> ''`, l.repo, l.number)
+      && !this.one(`SELECT 1 FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged'`, l.repo, l.number));
+    if (observedNoLedger.length) {
+      this.audit("system:merge-train", "queue_observed_merged_no_ledger", parentId, {
+        legs: observedNoLedger.map((l) => `${l.repo}#${l.number}`),
+        note: "re-queueing a car whose PR is observed MERGED while the merge ledger has no row — the walk's already-merged arm must stamp it; if this repeats across admissions the walk is not reaching the entry (BR#15528)",
+      });
     }
     // ---- bounce budget (BR#4688): an ACTIVE escalation stops re-serving —
     // the bound ask is the live leg and the PR rides out its clock DE-QUEUED.
@@ -16209,6 +16311,17 @@ export class KnowledgeHub {
          AND conclusion='MERGED' AND length(head_sha)=40 AND head_sha NOT GLOB '*[^0-9a-f]*'
          AND receipt='https://github.com/' || repo || '/pull/' || pr`, repo, repo,
     ).toArray().map(row => Number(row.pr)));
+    // BR#15528: the merge LEDGER the train writes (provenance rows + merged
+    // train events). An observed merge is only a STALE TRAIN SLOT once the
+    // ledger itself records it — the executor walk's already-merged arm is
+    // the ledger's stamp writer, so a car observed merged but not yet
+    // ledgered MUST stay queued (dropping it on observed evidence alone hid
+    // 12 verified-merged PRs from the walk forever: zero ledger rows, every
+    // accepted admission re-parked, the fired pr_merged waits unresolvable).
+    const ledgeredMerges = new Set(this.state.storage.sql.exec(
+      `SELECT pr FROM provenance WHERE repo=? AND merge_sha<>''
+       UNION SELECT pr FROM train_events WHERE repo=? AND kind='merged'`, repo, repo,
+    ).toArray().map(row => Number(row.pr)));
     const recordedOwners = new Map(this.state.storage.sql.exec(
       `SELECT pr, task_id FROM provenance WHERE repo=? AND task_id IS NOT NULL`, repo,
     ).toArray().map(row => [Number(row.pr), String(row.task_id)]));
@@ -16230,7 +16343,12 @@ export class KnowledgeHub {
       // A duplicate single-leg slot cannot drive a merge already recorded
       // against another card. Leave the original binding to settlement.
       const recordedOwner = legs.length === 1 ? recordedOwners.get(legs[0].number) : undefined;
-      return (!recordedOwner || recordedOwner === c.id) && legs.some(leg => !observedMerges.has(leg.number));
+      // BR#15528: a leg leaves the queue only when its merge is BOTH
+      // observed (the delivery observations above) AND ledgered (the train's
+      // own provenance/train_events row). Observed-but-unledgered stays
+      // queued so the walk reaches it and stamps the row it exists to stamp.
+      return (!recordedOwner || recordedOwner === c.id)
+        && legs.some(leg => !observedMerges.has(leg.number) || !ledgeredMerges.has(leg.number));
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
@@ -19358,13 +19476,20 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     }
   }
 
-  private recordDeliveryPrOutcome(repo: string, pr: number, state: "OPEN" | "CLOSED" | "MERGED", head: string | null, now: number): void {
+  /** BR#15528: the outcome row is the hub's durable observation of a PR's
+   *  GitHub state — for MERGED rows it now carries the merge commit sha too
+   *  (previously DROPPED at the door, which made every later merge-ledger
+   *  stamp impossible from recorded evidence: the BR#9510 land flow could
+   *  never admit an observed merge). mergeSha is the 40-hex merge commit
+   *  when the observation carries one, else null. */
+  private recordDeliveryPrOutcome(repo: string, pr: number, state: "OPEN" | "CLOSED" | "MERGED", head: string | null, mergeSha: string | null, now: number): void {
     this.state.storage.sql.exec(`
-      INSERT INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at) VALUES(?,?,?,?,?,?)
+      INSERT INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at,merge_sha) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(repo,pr) DO UPDATE SET state=excluded.state, head=coalesce(excluded.head, delivery_pr_outcomes.head),
-        receipt=excluded.receipt, observed_at=excluded.observed_at
+        receipt=excluded.receipt, observed_at=excluded.observed_at,
+        merge_sha=coalesce(excluded.merge_sha, delivery_pr_outcomes.merge_sha)
       WHERE delivery_pr_outcomes.state <> 'MERGED' OR excluded.state = 'MERGED'`,
-      repo, pr, state, head, `https://github.com/${repo}/pull/${pr}`, now);
+      repo, pr, state, head, `https://github.com/${repo}/pull/${pr}`, now, mergeSha);
   }
 
   /** reconcile.report — one daemon observation cycle for one repo. Runs the
@@ -19382,7 +19507,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       const state = String(p.state ?? "OPEN").toUpperCase();
       if (state !== "OPEN" && state !== "CLOSED" && state !== "MERGED") continue;
       if (state === "MERGED" && !/^[0-9a-f]{40}$/i.test(p.mergeCommit ?? "")) continue;
-      this.recordDeliveryPrOutcome(repo, p.number, state, p.headRefOid, now);
+      // BR#15528: keep the merge commit — an outcome row that records the
+      // merge sha is the evidence the land flow stamps the provenance
+      // ledger from (head + merge sha = a complete hub-owned merge receipt).
+      this.recordDeliveryPrOutcome(repo, p.number, state, p.headRefOid, state === "MERGED" ? String(p.mergeCommit) : null, now);
     }
     // Comments/head updates cannot renew review/draft grace forever. The
     // hub's own first-observation clock bounds even malformed timestamps.
