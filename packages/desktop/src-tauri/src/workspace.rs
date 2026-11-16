@@ -667,7 +667,20 @@ fn is_bridge_cli_target(repository: &Path, target: &Path) -> Result<bool, String
 
 fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
     let ignored=git(path,&["ls-files","--others","--ignored","--exclude-standard","--directory","-z"])?;
-    if let Some(input)=ignored.split('\0').find(|input| !input.is_empty()) {
+    // BR#14740 — recreatable caches are disposable BY CLASS, not by per-allocation
+    // declaration: node_modules/target (the exact names `disposable()` sanctions
+    // and `retire_disposable_children` journally removes) rebuild from committed
+    // lockfiles — they are cache, never unique evidence. Fencing the whole
+    // allocation on them is the 2026-11-15 gateway deadlock: ~100GB of a
+    // 100GiB budget was node_modules/.worktrees/layers-class cache retained by
+    // THIS check while the disk held 308GB free and dispatch starved. The
+    // retention fence exists for unique evidence (.env, measurement outputs,
+    // uncommitted source); a cache basename must never wedge the ladder.
+    // `.worktrees/` and undeclared layers stay fenced below — unknowns are
+    // evidence until proven otherwise.
+    if let Some(input)=ignored.split('\0').find(|input| {
+        !input.is_empty() && !disposable(input.trim_end_matches('/').rsplit('/').next().unwrap_or(""))
+    }) {
         return Err(format!("ignored input is not a declared disposable allocation; source retained: {input}"));
     }
     Ok(())
