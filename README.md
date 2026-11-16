@@ -117,6 +117,11 @@ Host-level readiness and model policy are resolved once per synchronous fleet
 snapshot, while task-specific startup rejections remain task-scoped. Capability
 reconciliation reuses each task's parsed execution state instead of resolving it
 again for blocker projection. Snapshot data is discarded before the next pass.
+A reserve pays no maintenance page of unrelated tasks: its scheduling duty
+reopens the blocked capability waits the live fleet can serve, paged by the same
+durable fair cursor over one shared snapshot, and a narrow partial index keeps
+that reopen seek on matching rows instead of the retained board span. Full-board
+maintenance stays on the alarm tick and the admin drill.
 Watchdog maintenance yields between committed phases so foreground control requests
 can interleave. Mutation events are sent immediately; coalesced board aggregation
 starts after yielding, and failed builds remain dirty for a later retry. An

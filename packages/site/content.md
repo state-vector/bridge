@@ -85,6 +85,9 @@ from bounded, fairly scheduled backlog maintenance. Paused or overdue health
 checks explain missing evidence and executor state rather than declaring main red.
 Each synchronous fleet pass shares host readiness and model policy while retaining
 per-task startup checks; task blocker projection reuses its parsed execution state.
+A reserve reopens only the capability waits the live fleet can serve — paged by the
+durable fair cursor over one shared snapshot — instead of walking a maintenance
+page of unrelated tasks; the alarm tick and admin drill keep full-board maintenance.
 Maintenance yields between committed phases, and mutation acknowledgements do not
 run board aggregation synchronously. Indexed current-review lookups preserve exact
 review authority without repeatedly scanning unrelated retained history.

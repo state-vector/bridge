@@ -254,7 +254,7 @@ import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrere
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
-import { ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
+import { CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta, trainReviewParentJoin } from "./recovery-capacity.ts";
@@ -3885,6 +3885,12 @@ export class KnowledgeHub {
         json_extract(state, '$.attempt.host'),
         json_extract(state, '$.attempt.phase'))`,
       `CREATE INDEX IF NOT EXISTS idx_events_op_ts ON events (op, ts)`,
+      // BR#14761 — the capability-wait reopen pass must seek its matching
+      // rows, not walk the retained board span per reserve. Narrow partial
+      // expression index over exactly the reopen predicate (todo rows and
+      // every other lifecycle shape are untouched; the scheduler's other
+      // queries cannot select this index).
+      CAPABILITY_WAIT_INDEX_SCHEMA,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
     }
@@ -5840,7 +5846,11 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string }) {
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string },
+    /** BR#14761 — the caller's already-open fleet pass; default keeps the
+     *  per-call instance. Sharing one instance lets the reserve path pay one
+     *  host-inventory/readiness/policy read across the reopen + selection. */
+    work: ExecutionWork = this.executionWork()) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
@@ -5867,7 +5877,6 @@ export class KnowledgeHub {
     const taskHolds = new Map<string, SchedulingReason>();
     const routeCandidates: { id: string; created: number }[] = [];
     const sinks = this.alarmSinkIds();
-    const work = this.executionWork();
     let readiness: ExecutorReadiness | undefined;
     // BR#14767 — per-sweep bulk prefetch: every per-row helper below hit its
     // own SQL per row (executionState 2x via protectedExecution+admission,
@@ -6278,11 +6287,21 @@ export class KnowledgeHub {
       }
       return result;
     }
-    this.executionWork().sweep();
     const observation = this.one(`SELECT capabilities,observed_ts FROM execution_hosts WHERE token_id=?`, tokenId);
     const capabilities = observation ? ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)) : null;
     const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
-    const selection = capabilities ? this.dispatchCandidates(tokenId, host, capabilities) : { eligible: [], reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
+    // BR#14761 — a reserve no longer pays a 25-card capability-maintenance
+    // page. Its scheduling-relevant sweep duty runs bounded here: reopen
+    // blocked capability waits the live fleet can now serve, sharing ONE
+    // host-inventory/readiness/policy pass with selection. Full-board
+    // maintenance stays on the alarm tick and the admin drill; nothing is
+    // cached past this synchronous statement. dispatchCandidates and the
+    // final claim transaction keep every eligibility/CAS fence first-hand.
+    const work = this.executionWork();
+    const selection = capabilities ? work.withHostSnapshot(() => {
+      work.reopenCapabilityWaits();
+      return this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
+    }) : { eligible: [], reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
     const recoveryCapacity = this.recoveryCapacity();
     const pending = recoveryCapacity.prepare(tokenId, selection.eligible.map(priorityTask), mode !== "inspect");
     if (pending?.phase === "slot_available") {

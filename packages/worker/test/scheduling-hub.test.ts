@@ -66,6 +66,78 @@ beforeEach(async () => {
             this.executionWork = original;
           }
         }
+        // BR#14761 — the reserve path's own scheduling duty, with the fleet
+        // pass instrumented. The reserve reopens the blocked capability wait
+        // AND selects work under ONE shared ExecutionWork instance, so the
+        // host inventory / host readiness / model policy reads happen once
+        // for the pair; the claim's own scheduling-requirements annotation
+        // stays a per-reserved-task read (first-hand by design).
+        if (path === "/fixture/reserve-inventory") {
+          const { host, mode = "reserve" } = await request.json();
+          const executor = this.state.storage.sql.exec(
+            "SELECT h.token_id,h.capabilities FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=?", host,
+          ).toArray()[0];
+          const work = this.executionWork();
+          const inventory = work.hostInventory.bind(work);
+          const readiness = work.readiness, policy = work.modelPolicy;
+          let scans = 0, readinessReads = 0, policyReads = 0;
+          work.hostInventory = () => { scans++; return inventory(); };
+          work.readiness = (...args) => { readinessReads++; return readiness(...args); };
+          work.modelPolicy = () => { policyReads++; return policy(); };
+          const original = this.executionWork;
+          this.executionWork = () => work;
+          try {
+            const started = Date.now();
+            const probeId = "reserve-inventory-" + crypto.randomUUID();
+            const outcome = await this.scheduleGateway(
+              { actor: host, token_id: executor.token_id, runner_protocol: "worker-ready-v2", inventory_protocol: 2 },
+              executor.token_id, host, mode, probeId);
+            const rejections = this.state.storage.sql.exec(
+              "SELECT data FROM ledger WHERE action='dispatch_candidate_rejected' AND ts>=? ORDER BY seq DESC LIMIT 3", started).toArray();
+            return Response.json({ scans, readinessReads, policyReads, kind: outcome.kind,
+              task_id: outcome.task_id ?? null, candidates: outcome.candidates ?? [], reasons: outcome.reasons ?? {},
+              rejections: rejections.map(r => JSON.parse(String(r.data)).reason) });
+          } finally {
+            this.executionWork = original;
+          }
+        }
+        // BR#14761 — statement counter for the reserve's scheduling duty: the
+        // bounded reopen pass must pay for matching capability-wait rows only,
+        // never a full maintenance page of unrelated tasks.
+        if (path === "/fixture/capability-cost") {
+          const { host, with_reserve = false } = await request.json();
+          const work = this.executionWork();
+          const proto = Object.getPrototypeOf(work);
+          const sqlDesc = Object.getOwnPropertyDescriptor(proto, "sql");
+          let count = 0;
+          Object.defineProperty(proto, "sql", {
+            get() {
+              const real = sqlDesc.get.call(this);
+              if (!this.__probe) return real;
+              if (!this.__probeSql) {
+                const exec = real.exec.bind(real);
+                this.__probeSql = { exec: (...args) => { count++; return exec(...args); } };
+              }
+              return this.__probeSql;
+            },
+            configurable: true,
+          });
+          const executor = this.state.storage.sql.exec(
+            "SELECT h.token_id FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.label=?", host,
+          ).toArray()[0];
+          try {
+            proto.__probe = true;
+            const sweepStatements = (count = 0, work.sweep(), count);
+            const reopenStatements = (count = 0, work.reopenCapabilityWaits(), count);
+            const reserveStatements = with_reserve ? (count = 0, await this.scheduleGateway(
+              { actor: "cost-probe", token_id: executor.token_id, runner_protocol: "worker-ready-v2", inventory_protocol: 2 },
+              executor.token_id, host, "inspect", "capability-cost-" + crypto.randomUUID()), count) : null;
+            return Response.json({ sweepStatements, reopenStatements, reserveStatements });
+          } finally {
+            proto.__probe = false;
+            Object.defineProperty(proto, "sql", sqlDesc);
+          }
+        }
         if (path === "/fixture/root-fix-starve") {
           const { id, age_ms = 180_000 } = await request.json();
           // Age the card past the dispatch grace so the invariant sweep sees
@@ -368,6 +440,103 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(advanced).toBeLessThanOrEqual(25);
     for (let pass = 0; pass < 4; pass++) await post("admin.execution_sweep", {});
     expect((await Promise.all(ids.map(id => post("get", { id })))).every(t => t.status === "todo")).toBe(true);
+  });
+
+  it("reopens and claims a newly serviceable wait through one shared fleet pass per reserve", async () => {
+    const project = "reserve-shared-pass", g = await gateway(project, 2);
+    const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });
+    expect((await post("get", { id })).status).toBe("blocked");
+    // Capability renewal advertises without reconciling the backlog; the
+    // reserve's own bounded duty must flip the wait and claim it.
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
+    expect((await post("get", { id })).status).toBe("blocked");
+    const reserveFixture = async () => JSON.parse(await (await stub.fetch("https://kb/fixture/reserve-inventory", {
+      method: "POST", body: JSON.stringify({ host: g.host }),
+    })).text()) as { scans: number; readinessReads: number; policyReads: number; kind: string; task_id: string | null; reasons?: Record<string, number> };
+    const base = await reserveFixture();
+    expect(base).toMatchObject({ kind: "reserved", task_id: id });
+    expect((await post("get", { id })).status).toBe("in_progress");
+    // Grow the board by 100 rows of unrelated todo/blocked work: the reserve
+    // pays the SAME bounded fleet passes. The counts decompose as the shared
+    // reopen+selection pass, the claim fence's own blockers read and the
+    // claim's per-task scheduling-requirements read — all small constants,
+    // never a 25-card maintenance page per reserve.
+    const extra: string[] = [];
+    for (let i = 0; i < 60; i++) extra.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
+    for (let i = 0; i < 40; i++) await task(project);
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
+    const scaled = await reserveFixture();
+    expect(scaled).toMatchObject({ kind: "reserved", task_id: extra[0] });
+    expect(scaled.scans).toBe(base.scans);
+    expect(scaled.readinessReads).toBe(base.readinessReads);
+    expect(scaled.policyReads).toBe(base.policyReads);
+    expect(base.scans).toBeLessThanOrEqual(3);
+    expect(base.readinessReads).toBeLessThanOrEqual(3);
+    expect(base.policyReads).toBeLessThanOrEqual(3);
+    expect((await post("get", { id: extra[0] })).status).toBe("in_progress");
+  });
+
+  it("advances the reopen cursor fairly across reserves and never flips an ask-owned wait", async () => {
+    const project = "reopen-fairness", g = await gateway(project, 3);
+    const ids: string[] = [];
+    for (let i = 0; i < 30; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
+    // The held wait carries an open human decision: it occupies the reopen
+    // page and advances the cursor, but no reserve may flip it.
+    const held = ids[15];
+    const ask = await post("create", { actor: "author", type: "question", title: "Resume the held repair despite the outstanding policy choice?",
+      meta: { ask: { route: { kind: "human_decision" }, decision: {
+        kind: "preference", task_id: held,
+        context: "The held repair waits on a policy choice while the fleet gains the capability it needs.",
+        why_human: "The operator owns the policy; the scheduler must not flip the wait implicitly.",
+        choices: [
+          { label: "Resume the repair", executor: "bridge", consequence: "The wait returns to the eligible queue.", action: "resume" },
+          { label: "Hold the repair", executor: "bridge", consequence: "The card stays blocked on the human decision.", action: "hold" },
+        ],
+      } } } });
+    expect(ask.error).toBeUndefined();
+    await post("link", { src: ask.id, relation: "child_of", dst: held });
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
+    const claimed: string[] = [];
+    for (let n = 0; n < 3; n++) {
+      const outcome = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "reserve" }));
+      expect(outcome.kind).toBe("reserved");
+      if (outcome.kind === "reserved") claimed.push(outcome.task_id);
+    }
+    expect(claimed).toEqual(ids.slice(0, 3));
+    const states = await Promise.all(ids.map(id => post("get", { id })));
+    expect(states.filter(t => t.status === "blocked").map(t => t.id)).toEqual([held]);
+    expect(states.filter(t => t.status === "in_progress").map(t => t.id)).toEqual(ids.slice(0, 3));
+    expect(states.filter(t => t.status === "todo").map(t => t.id)).toEqual(ids.slice(3).filter(id => id !== held));
+    const heldState = await post("get", { id: held });
+    expect(heldState.meta?.execution_wait).toMatchObject({ kind: "capability" });
+  });
+
+  it("pays the reopen duty for matching capability waits only, never a full maintenance page", async () => {
+    const project = "reopen-cost", g = await gateway(project);
+    for (let i = 0; i < 120; i++) await task(project, { operator_gated: "Unrelated maintenance hold" });
+    // Probe 1 carries with_reserve:true so the fixture measures the reserve's
+    // whole scheduling duty on the unrelated board; the flip-heavy probe 2
+    // below stays reserve-free so the fixture's reserve segment cannot reopen
+    // the tail it is meant to pin.
+    let probe = await (await stub.fetch("https://kb/fixture/capability-cost", { method: "POST", body: JSON.stringify({ host: g.host, with_reserve: true }) })).json() as { sweepStatements: number; reopenStatements: number; reserveStatements: number };
+    expect(probe.reopenStatements).toBeLessThanOrEqual(5);
+    expect(probe.sweepStatements).toBeGreaterThanOrEqual(100);
+    // The reserve's whole scheduling duty costs less than one maintenance
+    // page walk over the same board — it never pays the 25-card sweep.
+    expect(probe.reserveStatements).toBeGreaterThan(0);
+    expect(probe.reserveStatements).toBeLessThan(probe.sweepStatements);
+    const ids: string[] = [];
+    for (let i = 0; i < 30; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
+    probe = await (await stub.fetch("https://kb/fixture/capability-cost", { method: "POST", body: JSON.stringify({ host: g.host }) })).json() as { sweepStatements: number; reopenStatements: number; reserveStatements: number };
+    // Flipping the matching page costs per-matching-row work, bounded by the
+    // 25-row page — never the 120-row retained todo board behind it.
+    expect(probe.reopenStatements).toBeGreaterThanOrEqual(25);
+    expect(probe.reopenStatements).toBeLessThan(500);
+    expect(probe.sweepStatements).toBeGreaterThanOrEqual(100);
+    const states = await Promise.all(ids.map(id => post("get", { id })));
+    expect(states.filter(t => t.status === "todo")).toHaveLength(25);
+    expect(states.filter(t => t.status === "blocked")).toHaveLength(5);
   });
 
   it("dispatches an unowned bounced TODO repair without consuming real waits or another recovery owner's work", async () => {

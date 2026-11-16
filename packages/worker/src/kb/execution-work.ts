@@ -14,6 +14,21 @@ interface Credential { id: string; label: string; principal: string | null; tags
 interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" }; blocked?: unknown; session?: string; [key: string]: unknown }
 interface HostInventory { tokenId: string; host: string; capabilities: ExecutorCapabilities; observed_at: number;
   active: number; occupancy: ReturnType<typeof gatewayOccupancy>["occupancy"] }
+/** BR#14761: already-fetched artefact columns a page holds in hand. Passing
+ *  them down keeps tier selection on hostsBare and lets taskReadiness skip
+ *  its per-row artefact re-SELECT — the same BR#14767 dispatch-sweep pattern,
+ *  now shared by the alarm page and the scheduler's bounded reopen pass. */
+interface TaskColumns { roles: string; body_md: string; project: string; meta: string }
+/** BR#14761 — the reserve path no longer pays a 25-card maintenance page.
+ *  Its scheduling-relevant sweep duty is bounded here: reopen blocked
+ *  capability waits the live fleet can serve, paged by a durable fair
+ *  cursor. `idx_artefact_capability_waits` (guarded in ensureSchema) serves
+ *  exactly this predicate, so the seek stays bounded by matching rows —
+ *  never by the retained board span. */
+export const CAPABILITY_WAIT_REOPEN_PAGE = 25;
+export const CAPABILITY_WAIT_REOPEN_CURSOR_KEY = "execution_reopen_cursor";
+export const CAPABILITY_WAIT_REOPEN_SQL = `SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability' AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT ${CAPABILITY_WAIT_REOPEN_PAGE}`;
+export const CAPABILITY_WAIT_INDEX_SCHEMA = `CREATE INDEX IF NOT EXISTS idx_artefact_capability_waits ON artefacts(json_extract(meta,'$.execution_wait.kind')) WHERE type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability'`;
 export function isExecutionWait(meta: TaskMeta): boolean {
   const b = meta.blocked as { await_event?: { event?: string } } | undefined;
   return b?.await_event?.event === "local_handoff" || b?.await_event?.event === "executor_capability";
@@ -43,12 +58,12 @@ export class ExecutionWork {
     if (!task) throw new Error("gate: no such task");
     return task;
   }
-  state(task: TaskRow): ExecutionState {
+  state(task: TaskRow, columns?: TaskColumns): ExecutionState {
     const row = this.one<{ state: string }>(`SELECT state FROM execution_state WHERE task_id=?`, task.id);
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
     const state = row ? ExecutionStateSchema.parse(JSON.parse(row.state)) : initialExecution();
     state.requirements = ExecutionRequirementsSchema.parse(meta.execution_requirements ?? state.requirements);
-    state.requirements = this.schedulingRequirements(task.id, state.requirements, state);
+    state.requirements = this.schedulingRequirements(task.id, state.requirements, state, columns);
     return state;
   }
   /** Preferences resolve globally; actual execution and explicit minima never downgrade. */
@@ -142,9 +157,9 @@ export class ExecutionWork {
         active: n.active + n.reserved, occupancy: n.occupancy,
      }; });
   }
-  private hosts(taskId?: string): CapabilityObservation[] {
+  private hosts(taskId?: string, columns?: TaskColumns): CapabilityObservation[] {
     return (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
-      readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities) }));
+      readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities, columns) }));
   }
   /** BR#14767 sweep path: host-LEVEL readiness (the injected readiness
    *  callback), memoized per snapshot — NOT per-task taskReadiness, whose
@@ -169,9 +184,13 @@ export class ExecutionWork {
     if (this.hostSnapshot) this.hostsBareCache = value;
     return value;
   }
-  private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
+  private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities, columns?: TaskColumns): ExecutorReadiness {
     const proof = this.hostReadiness(token, host, capabilities);
-    const task = id ? this.one<{ body_md: string; project: string; meta: string }>(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id) : null;
+    // BR#14761 — a page that holds the row's own columns skips the per-row
+    // re-SELECT; the values are the same synchronous snapshot the row came
+    // from. The startup-rejection SELECT stays: it is the fail-closed fence.
+    const task = columns ? { body_md: columns.body_md, project: columns.project, meta: columns.meta }
+      : id ? this.one<{ body_md: string; project: string; meta: string }>(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id) : null;
     const meta = JSON.parse(task?.meta ?? "{}");
     const fingerprint = task && proof.kind === "ready" ? startupPrerequisiteFingerprint(proof.fingerprint, { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } }) : "";
     return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint IN (?,?)`, id, host, proof.fingerprint, fingerprint)
@@ -210,11 +229,11 @@ export class ExecutionWork {
     const h = this.state(task).handoff;
     return h.phase !== "none" && grant.handoff_id === h.id && grant.version === h.version && grant.expires_at > now ? grant : null;
   }
-  blockers(task: TaskRow, now: number, grant: LocalGrant | null = null, state = this.state(task)): ExecutionBlocker[] {
+  blockers(task: TaskRow, now: number, grant: LocalGrant | null = null, state = this.state(task), columns?: TaskColumns): ExecutionBlocker[] {
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
     const requirements = state.requirements;
-    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id), asks: this.asks(task.id), now, local });
+    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id, columns), asks: this.asks(task.id), now, local });
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
@@ -388,6 +407,22 @@ export class ExecutionWork {
   sweep(now = Date.now()) {
     this.withHostSnapshot(() => this.sweepBatch(now));
   }
+  /** BR#14761 — the scheduler's bounded duty before selecting work: reopen
+   *  blocked capability waits the live fleet can now serve, over its own
+   *  durable fair cursor. A reserve no longer pays a 25-card maintenance
+   *  page; full-board maintenance (todo parks, blocker refresh, the original
+   *  sweep cursor) stays on the alarm tick and the admin drill. Selection
+   *  and the claim transaction still recheck every fence first-hand. */
+  reopenCapabilityWaits(now = Date.now()) {
+    this.withHostSnapshot(() => {
+      const cursor = Number(this.one<{ value: string }>(`SELECT value FROM settings WHERE key=?`, CAPABILITY_WAIT_REOPEN_CURSOR_KEY)?.value ?? 0);
+      const batch = (after: number) => this.sql.exec(CAPABILITY_WAIT_REOPEN_SQL, after).toArray() as unknown as (TaskRow & { body_md: string; roles: string; sweep_cursor: number })[];
+      const first = batch(cursor);
+      const rows = first.length || !cursor ? first : batch(0);
+      for (const task of rows) this.reconcileTaskCapability(task, now, task);
+      if (rows.length) this.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, CAPABILITY_WAIT_REOPEN_CURSOR_KEY, String(rows.at(-1)!.sweep_cursor));
+    });
+  }
   /** Share the fleet inventory across a synchronous pass. Per-task readiness
    * and the final reservation transaction still check their own fences. */
   withHostSnapshot<T>(run: () => T): T {
@@ -416,34 +451,41 @@ export class ExecutionWork {
     // Legacy workspaces without any managed executor inventory retain their
     // manual workflow. Once a gateway advertises, global defaults apply too.
     const cursor = Number(this.one<{ value: string }>(`SELECT value FROM settings WHERE key='execution_sweep_cursor'`)?.value ?? 0);
-    const batch = (after: number) => this.sql.exec(`SELECT rowid AS sweep_cursor,id,title,project,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status IN ('todo','blocked') AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT 25`, after).toArray() as unknown as (TaskRow & { sweep_cursor: number })[];
+    const batch = (after: number) => this.sql.exec(`SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status IN ('todo','blocked') AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT 25`, after).toArray() as unknown as (TaskRow & { body_md: string; roles: string; sweep_cursor: number })[];
     const first = batch(cursor);
     const rows = first.length || !cursor ? first : batch(0);
-    for (const task of rows) {
-      const state = this.state(task); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now, null, state);
-      const unavailable = blockers.find(isExecutorAvailabilityBlocker);
-      const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
-      let status = task.status;
-      const attemptHold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
-      const capabilityWait = status === "blocked" && meta.execution_wait?.kind === "capability"
-        && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability";
-      const independent = blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required");
-      if (this.startupWait(task.id)) {
-        // Startup reconciliation owns this episode.
-      } else if (status === "todo" && unavailable && !attemptHold && !independent && !todoDispatchHold(meta) && !meta.operator_gated) {
-        status = "blocked"; meta.execution_wait = { kind: "capability" };
-        meta.blocked = { reason: unavailable.text, unblock_condition: "A live eligible executor capability becomes usable; all other blockers must also clear", ts: Date.now(), await_event: { event: "executor_capability", id: task.id } };
-      } else if (capabilityWait && !task.owner && !independent && (attemptHold || !unavailable)) {
-        // Remove only the capability sweep's own marker. The scheduler still
-        // enforces the original attempt fence, even while the host is down.
-        status = "todo"; delete meta.blocked; delete meta.execution_wait;
-      }
-      if (prior === JSON.stringify(blockers) && status === task.status) continue;
-      this.sql.exec(`UPDATE artefacts SET status=?,meta=?,updated_ts=?,status_ts=CASE WHEN status!=? THEN ? ELSE status_ts END WHERE id=?`, status, JSON.stringify(meta), Date.now(), status, Date.now(), task.id);
-      // Stable per task/requirements episode; flapping updates the same card,
-      // never manufactures an approval ask or an unblock-child storm.
-      this.audit("system:capabilities", "execution_blockers_changed", task.id, { blockers: blockers.map(b => ({ kind: b.kind, episode: b.episode_id })), status });
-    }
+    for (const task of rows) this.reconcileTaskCapability(task, now, task);
     this.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('execution_sweep_cursor',?)`, String(rows.at(-1)?.sweep_cursor ?? 0));
+  }
+  /** ONE task's capability reconciliation — the alarm page and the
+   *  scheduler's reopen pass share this exact predicate and write, so the
+   *  two paths can never drift. `columns` are the page's own artefact
+   *  columns (the same synchronous snapshot the page was read in); tier
+   *  selection reads host-level readiness through them exactly as the
+   *  dispatch sweep does, and taskReadiness skips its per-row re-SELECT. */
+  private reconcileTaskCapability(task: TaskRow, now: number, columns?: TaskColumns) {
+    const state = this.state(task, columns); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now, null, state, columns);
+    const unavailable = blockers.find(isExecutorAvailabilityBlocker);
+    const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
+    let status = task.status;
+    const attemptHold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
+    const capabilityWait = status === "blocked" && meta.execution_wait?.kind === "capability"
+      && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability";
+    const independent = blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required");
+    if (this.startupWait(task.id)) {
+      // Startup reconciliation owns this episode.
+    } else if (status === "todo" && unavailable && !attemptHold && !independent && !todoDispatchHold(meta) && !meta.operator_gated) {
+      status = "blocked"; meta.execution_wait = { kind: "capability" };
+      meta.blocked = { reason: unavailable.text, unblock_condition: "A live eligible executor capability becomes usable; all other blockers must also clear", ts: Date.now(), await_event: { event: "executor_capability", id: task.id } };
+    } else if (capabilityWait && !task.owner && !independent && (attemptHold || !unavailable)) {
+      // Remove only the capability sweep's own marker. The scheduler still
+      // enforces the original attempt fence, even while the host is down.
+      status = "todo"; delete meta.blocked; delete meta.execution_wait;
+    }
+    if (prior === JSON.stringify(blockers) && status === task.status) return;
+    this.sql.exec(`UPDATE artefacts SET status=?,meta=?,updated_ts=?,status_ts=CASE WHEN status!=? THEN ? ELSE status_ts END WHERE id=?`, status, JSON.stringify(meta), Date.now(), status, Date.now(), task.id);
+    // Stable per task/requirements episode; flapping updates the same card,
+    // never manufactures an approval ask or an unblock-child storm.
+    this.audit("system:capabilities", "execution_blockers_changed", task.id, { blockers: blockers.map(b => ({ kind: b.kind, episode: b.episode_id })), status });
   }
 }
