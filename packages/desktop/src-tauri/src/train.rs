@@ -2674,8 +2674,114 @@ fn request_main_recovery_retry(ctx: &mut Ctx, lane: &Value, repo: &str, base: &s
     None
 }
 
+/// BR#15528 — the merged-car pre-pass: stamp already-merged queued cars ON
+/// SIGHT, at the very top of the lane tick, ungated by phase, burst cap,
+/// settle window, or base verdict.
+///
+/// The wedge (2026-11-17, superpositional@main): the walk's already-merged
+/// stamp sits deep inside the drain loop behind the burst-cap break, the
+/// mid-drain tip-red early return, the scan budget, and the awaiting-CI arm —
+/// during a base settle the whole tick returns at the awaiting-CI arm and the
+/// loop is NEVER reached. 12 merged PRs rode the queue 13+ hours with ZERO
+/// train_events rows (BR#14683: 11 accepted admissions, zero stamps), and
+/// every accepted verify round re-queued its card onto the unstamped train.
+///
+/// Write-only bookkeeping: it stamps merges that ALREADY happened on GitHub,
+/// it never merges anything, so it needs no phase gate. The hub's merged
+/// handler is idempotent per (repo, pr, merge_sha) (BR#5151b dedupe) and its
+/// `historical` guard keeps an old merge from hijacking the lane's live
+/// settle phase — that guard needs the REAL merge time, so `merged_at` rides
+/// every stamp from live `gh` facts (never "now"). Budget: ONE train_history
+/// read (hub-side ledger, zero GitHub calls) + ≤12 gh pr_facts per tick;
+/// already-stamped prs are skipped gh-free. Per-entry failures log and
+/// continue — the pre-pass never fails the tick.
+const MERGED_PRE_PASS_MAX_GH_CALLS: usize = 12;
+
+fn merged_pre_pass(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &Value) {
+    if !ctx.base_probe {
+        return; // hermetic drills never shell out to gh
+    }
+    let mut wanted: Vec<(String, i64)> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    for head in lane.get("queue").and_then(|v| v.as_array()).map(|q| q.as_slice()).unwrap_or(&[]) {
+        let pr = head.get("pr").and_then(|v| v.as_i64()).unwrap_or(0);
+        if pr > 0 && seen.insert(pr) {
+            wanted.push((vstr(head, "id").unwrap_or("").to_string(), pr));
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    let hist = match ctx.mcp("train_history", json!({ "repo": repo, "base": base, "kind": "merged", "limit": 200 })) {
+        Ok(h) => h,
+        Err(e) => {
+            log(Some(key), &format!("merged pre-pass: train_history read failed — {} (retry next tick)", trunc(&e, 200)));
+            return;
+        }
+    };
+    let stamped: HashSet<i64> = hist
+        .get("events")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|e| e.get("pr").and_then(|p| p.as_i64())).collect())
+        .unwrap_or_default();
+    let mut budget = MERGED_PRE_PASS_MAX_GH_CALLS;
+    let mut stamped_now: usize = 0;
+    for (task_id, pr) in wanted {
+        if budget == 0 {
+            log(Some(key), &format!("merged pre-pass: {pr} — per-tick gh budget spent; the rest ride the next tick"));
+            break;
+        }
+        if stamped.contains(&pr) {
+            continue;
+        }
+        budget -= 1;
+        let facts = match ctx.pr_facts(repo, pr) {
+            Ok(f) => f,
+            Err(e) => {
+                log(Some(key), &format!("merged pre-pass: PR #{pr} read failed — {} (retry next tick)", trunc(&e, 200)));
+                continue;
+            }
+        };
+        if vstr(&facts, "state") != Some("MERGED") || facts.pointer("/mergeCommit/oid").is_none() {
+            continue; // open / closed / unreadable — the normal walk owns it
+        }
+        // GitHub's own merge wall-clock — the hub's `historical` guard reads
+        // it to keep a stale stamp from hijacking the lane's live settle.
+        let merged_at = match github_merge_time(&facts) {
+            Some(t) => t,
+            None => {
+                log(Some(key), &format!("merged pre-pass: PR #{pr} merged but GitHub returned no merge time — skipping (never stamp without it)"));
+                continue;
+            }
+        };
+        renew_lease(ctx, repo, base);
+        let ev = json!({
+            "repo": repo, "base": base, "kind": "merged", "pr": pr,
+            "merge_sha": facts.pointer("/mergeCommit/oid"), "head_sha": vstr(&facts, "headRefOid"),
+            "merged_at": merged_at, "task_id": task_id, "signer": ctx.holder,
+            "reason": "reconcile pre-pass: already-merged queued car stamped on sight (BR#15528)",
+        });
+        match ctx.mcp("train_event", ev) {
+            Ok(_) => {
+                stamped_now += 1;
+                ctx.note(&format!("reconcile pre-pass: stamped already-merged PR #{pr}"));
+                log(Some(key), &format!("merged pre-pass: PR #{pr} was already merged — stamped from live GitHub, continuing"));
+            }
+            Err(e) => {
+                log(Some(key), &format!("merged pre-pass: PR #{pr} stamp refused — {} (retry next tick)", trunc(&e, 200)));
+            }
+        }
+    }
+    if stamped_now > 0 {
+        log(Some(key), &format!("merged pre-pass: {stamped_now} already-merged queued car(s) stamped (BR#15528)"));
+    }
+}
+
 fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &str, _typical_ms: u64, burst_cap: u32) -> Result<(), String> {
     let required = lane_required_workflows(lane);
+    // BR#15528: the pre-pass runs before EVERY phase arm — the wedge was the
+    // awaiting-CI/settle window consuming whole ticks before the queue walk.
+    merged_pre_pass(ctx, key, repo, base, lane);
     // ---- 2026-11-02 BYPASS + RERUN legs (Ray: "I keep answering B and nothing
     // happens — it's broken"): the answered alarm ask IS the authority. The
     // hub's askAnswer stamps `meta.lane.bypass_merge {pr}` (a BYPASS answer on
@@ -7969,6 +8075,118 @@ mod tests {
     }
 
     #[test]
+    fn merged_pre_pass_stamps_unstamped_merged_cars_on_sight_br15528() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let merged_gh = |n: i64| {
+            json!({
+                "state": "MERGED", "headRefOid": format!("{n:040x}"),
+                "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                "mergedAt": "2026-10-23T22:12:57Z",
+                "mergeCommit": { "oid": format!("{n:039x}a") },
+            })
+            .to_string()
+        };
+        let open_gh = json!({
+            "state": "OPEN", "headRefOid": "e".repeat(40),
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "mergeCommit": Value::Null,
+        })
+        .to_string();
+
+        // 1) an already-merged queued car is stamped from live GitHub with the
+        //    REAL merge time; a second pass (ledger now shows the row) is
+        //    gh-free and stamps nothing; an open pr is left to the walk.
+        let stamps = Arc::new(AtomicUsize::new(0));
+        let stamped_row = Arc::new(AtomicBool::new(false));
+        let stamps_c = stamps.clone();
+        let stamped_row_c = stamped_row.clone();
+        let (hub, calls) = mock_hub_with(move |params| {
+            match call_name(params).as_str() {
+                "train_history" => {
+                    if stamped_row_c.load(Ordering::SeqCst) {
+                        Ok(json!({ "events": [ { "pr": 2, "kind": "merged" } ] }))
+                    } else {
+                        Ok(json!({ "events": [] }))
+                    }
+                }
+                "train_event" => {
+                    stamps_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({}))
+                }
+                "train_lease" => Ok(json!({})),
+                other => panic!("unexpected hub operation {other}"),
+            }
+        });
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.sh_mock = Some(Arc::new(move |cmd, args| {
+            if cmd != "gh" || args.first() != Some(&"pr") || args[1] != "view" {
+                panic!("pre-pass must only gh pr view, got {cmd} {args:?}");
+            }
+            let pr: i64 = args[2].parse().unwrap();
+            Some(Ok(if pr == 2 { merged_gh(pr) } else { open_gh.clone() }))
+        }));
+        let lane = json!({ "queue": [ { "id": "BR#2", "pr": 2 }, { "id": "BR#3", "pr": 3 } ] });
+        merged_pre_pass(&mut ctx, "o/r@main", "o/r", "main", &lane);
+        assert_eq!(stamps.load(Ordering::SeqCst), 1, "one merged car stamped");
+        let ev = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| call_name(p) == "train_event")
+            .map(|p| call_args(p).clone())
+            .unwrap();
+        assert_eq!(ev["kind"], json!("merged"));
+        assert_eq!(ev["pr"], json!(2));
+        assert_eq!(ev["base"], json!("main"));
+        assert_eq!(ev["task_id"], json!("BR#2"));
+        assert_eq!(ev["merged_at"], json!(1_792_793_577_000_u64), "the REAL merge time rides the stamp (hub historical guard)");
+        stamped_row.store(true, Ordering::SeqCst);
+        merged_pre_pass(&mut ctx, "o/r@main", "o/r", "main", &lane);
+        assert_eq!(stamps.load(Ordering::SeqCst), 1, "the stamped ledger row skips the car gh-free — no duplicate event");
+
+        // 2) the per-tick gh budget: 20 unstamped merged cars → exactly
+        //    MERGED_PRE_PASS_MAX_GH_CALLS stamps; the rest ride the next tick.
+        let stamps = Arc::new(AtomicUsize::new(0));
+        let views = Arc::new(AtomicUsize::new(0));
+        let views_c = views.clone();
+        let stamps_c = stamps.clone();
+        let (hub, _calls) = mock_hub_with(move |params| match call_name(params).as_str() {
+            "train_history" => Ok(json!({ "events": [] })),
+            "train_event" => {
+                stamps_c.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({}))
+            }
+            "train_lease" => Ok(json!({})),
+            other => panic!("unexpected hub operation {other}"),
+        });
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = true;
+        ctx.sh_mock = Some(Arc::new(move |cmd, args| {
+            if cmd != "gh" || args.first() != Some(&"pr") || args[1] != "view" {
+                panic!("pre-pass must only gh pr view, got {cmd} {args:?}");
+            }
+            views_c.fetch_add(1, Ordering::SeqCst);
+            let pr: i64 = args[2].parse().unwrap();
+            Some(Ok(merged_gh(pr)))
+        }));
+        let lane = json!({ "queue": (1..=20).map(|i| json!({ "id": format!("BR#{i}"), "pr": i })).collect::<Vec<_>>() });
+        merged_pre_pass(&mut ctx, "o/r@main", "o/r", "main", &lane);
+        assert_eq!(stamps.load(Ordering::SeqCst), MERGED_PRE_PASS_MAX_GH_CALLS);
+        assert_eq!(views.load(Ordering::SeqCst), MERGED_PRE_PASS_MAX_GH_CALLS);
+
+        // 3) hermetic drills (base_probe=false) make zero hub calls.
+        let (hub, calls) = mock_hub_with(|_| panic!("pre-pass must be silent when base_probe is off"));
+        let mut ctx = test_ctx(&hub);
+        ctx.base_probe = false;
+        let lane = json!({ "queue": [ { "id": "BR#2", "pr": 2 } ] });
+        merged_pre_pass(&mut ctx, "o/r@main", "o/r", "main", &lane);
+        assert_eq!(calls.lock().unwrap().len(), 0);
+    }
+
+    #[test]
     fn reviewed_independent_heads_batch_without_rewrites_and_fence_main_changes() {
         use std::sync::atomic::AtomicUsize;
 
@@ -9291,6 +9509,7 @@ mod tests {
         let (hub, calls) = mock_hub(vec![
             // ---- Tick 1 (dark tip -> auto-dispatch deploy-dev.yml, hold car) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "events": [] })),                 // merged pre-pass ledger read (BR#15528)
             ok(json!({ "ok": true })),                   // fresh base facts before candidate work
             ok(card_val.clone()),                        // get_artefact BR#6165
             ok(json!({ "ok": true })),                   // train_queue_facts
@@ -9298,6 +9517,7 @@ mod tests {
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 2 (in_progress + redundant queued -> cancel 41798949143, no 2nd dispatch) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "events": [] })),                 // merged pre-pass ledger read (BR#15528)
             ok(json!({ "ok": true })),                   // fresh base facts before observation
             ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165
@@ -9306,6 +9526,7 @@ mod tests {
             ok(json!({ "note": "lease released" })),     // train_lease release
             // ---- Tick 3 (base settled green -> PR #2880 merges, burst_settle_feed) ----
             ok(json!({ "note": "lease granted" })),      // train_lease acquire
+            ok(json!({ "events": [] })),                 // merged pre-pass ledger read (BR#15528; pr still OPEN at this point)
             ok(json!({ "ok": true })),                   // fresh base facts before observation
             ok(json!({ "ok": true })),                   // independent deployment observation
             ok(card_val.clone()),                        // get_artefact BR#6165

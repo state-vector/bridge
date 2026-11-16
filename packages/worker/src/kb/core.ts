@@ -2952,7 +2952,7 @@ export type MergedLegReceipt = {
   number: number;
   head: string;
   mergeSha: string;
-  via: "provenance" | "leg-stamp" | "observed";
+  via: "provenance" | "leg-stamp" | "observed" | "train-events";
 };
 
 /** The coverage facts one admitted leg brings to the terminal test. */

@@ -15894,7 +15894,7 @@ export class KnowledgeHub {
     merged: MergedLegReceipt[],
     legs: { repo: string; number: number; head_sha_at_acceptance?: string; base?: string }[],
     actor: string,
-    via: "admission-replay" | "observed-merge-carry",
+    via: "admission-replay" | "observed-merge-carry" | "accepted-verdict-ledger",
     reviewId?: string,
   ): Promise<boolean> {
     const row = this.one(`SELECT id, status, meta, roles FROM artefacts WHERE id = ?`, parentId);
@@ -16085,12 +16085,48 @@ export class KnowledgeHub {
       await this.closeAdmittedMergedCard(parentId, mergedReceipts, withStampHeads, actor, "admission-replay");
       return;
     }
-    // BR#15528 loud naming: a leg the hub's OWN delivery observations record
-    // MERGED while the merge ledger (provenance/train_events) has no row is
-    // exactly the zero-row strand shape — re-queueing it is the walk's
-    // already-merged arm doing its job, but the gap must NAME itself at
-    // every re-queue instead of silently hiding the car from the snapshot
-    // (the 12 verified-merged PRs whose ledgers stayed empty for days).
+    // ---- BR#15528: the train_events ledger is the third receipt source. A
+    // verify accept whose EVERY leg already carries a merged ledger row is
+    // TERMINAL — the accept must not re-queue a merge that already happened.
+    // The 2026-11-17 wedge: 12 merged PRs rode the queue 13+ hours with ZERO
+    // ledger rows (BR#14683: 11 accepted admissions, zero stamps), so every
+    // accepted verify round re-parked its card onto the unstamped train. A
+    // merged PR's head is immutable (GitHub closes merged PRs — nothing more
+    // can ever land there), so the row is conclusive delivery even when the
+    // head-law terminal above cannot fire (head-less or mismatched accepts).
+    // That precise terminal stays FIRST: it carries the receipts and the
+    // carry-chain head law. Multi-leg cards with an unmerged leg take the
+    // normal path unchanged. ----
+    const ledgerReceipts: MergedLegReceipt[] = [];
+    for (const l of withStampHeads) {
+      const row = this.one(
+        `SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
+        l.repo, l.number,
+      ) as any;
+      const mergeSha = String(row?.merge_sha ?? "").toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(mergeSha)) {
+        ledgerReceipts.length = 0;
+        break; // an unmerged leg: the normal re-queue owns this card (BR#3659)
+      }
+      ledgerReceipts.push({ repo: l.repo, number: l.number, head: String(l.head_sha_at_acceptance ?? ""), mergeSha, via: "train-events" });
+    }
+    if (ledgerReceipts.length === withStampHeads.length) {
+      const closed = await this.closeAdmittedMergedCard(parentId, ledgerReceipts, withStampHeads, actor, "accepted-verdict-ledger");
+      this.audit(actor, "train_queue_skipped_already_merged", parentId, {
+        legs: ledgerReceipts.map((r) => ({ repo: r.repo, pr: r.number, merge_sha: r.mergeSha })),
+        closed,
+        reason: "every accepted leg already carries a merged train_events row — the accepted verdict closes the card instead of re-queuing an already-merged delivery (BR#15528)",
+      });
+      return;
+    }
+    // BR#15528 loud naming (ca647dce6): a leg the hub's OWN delivery
+    // observations record MERGED while the merge ledger (provenance /
+    // train_events) has no row is exactly the zero-row strand shape —
+    // re-queueing it is the walk's already-merged arm doing its job, but the
+    // gap must NAME itself at every re-queue instead of silently hiding the
+    // car from the snapshot (the 12 verified-merged PRs whose ledgers stayed
+    // empty for days). The executor pre-pass (BR#15528, train.rs) stamps
+    // these on sight each tick, ungated by phase or cap.
     const observedNoLedger = withStampHeads.filter((l) =>
       !!this.one(`SELECT 1 FROM delivery_pr_outcomes WHERE repo = ? AND pr = ? AND state = 'MERGED'`, l.repo, l.number)
       && !this.one(`SELECT 1 FROM provenance WHERE repo = ? AND pr = ? AND merge_sha <> ''`, l.repo, l.number)
