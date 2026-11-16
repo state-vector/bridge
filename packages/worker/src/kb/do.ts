@@ -5994,8 +5994,26 @@ export class KnowledgeHub {
   private schedulingStatus(host?: string, now = Date.now(), retryRoute?: { backend: string; model: string; config_revision: string }) {
     if (!host && !retryRoute) {
       if (this.schedulingMemo && this.schedulingMemo.at > now - 15_000) return this.schedulingMemo.value;
+      // BR#14763 — isolates EVICT under load and the in-memory memo died with
+      // them: every post-eviction poll re-ran the ~4s sweep (measured: stats
+      // 4.9s, cascading stalls, 503 "kb temporarily unavailable", 15s client
+      // timeouts). The settings table is same-DO SQLite — sync to read and
+      // persistent across eviction — so the memo survives restarts. Read once
+      // per TTL expiry; write on recompute. Observability staleness only:
+      // admission paths bypass (host-specific / retryRoute).
+      const row = this.one(`SELECT value FROM settings WHERE key = 'scheduling.memo'`);
+      if (row) {
+        try {
+          const memo = JSON.parse(String(row.value)) as { at: number; value: unknown };
+          if (Number(memo.at) > now - 15_000) {
+            this.schedulingMemo = { at: Number(memo.at), value: memo.value as never };
+            return this.schedulingMemo.value;
+          }
+        } catch { /* malformed — recompute */ }
+      }
       const value = this.schedulingStatusUncached(undefined, now);
       this.schedulingMemo = { at: now, value };
+      try { this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('scheduling.memo', ?)`, JSON.stringify({ at: now, value })); } catch { /* best-effort persistence */ }
       return value;
     }
     return this.schedulingStatusUncached(host, now, retryRoute);
