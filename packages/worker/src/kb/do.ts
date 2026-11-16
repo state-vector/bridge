@@ -3870,6 +3870,24 @@ export class KnowledgeHub {
     } catch (e) {
       console.log("ledger migration:", String(e).slice(0, 200));
     }
+    // BR#14766 — the audit-read indexes, each guarded (events is a VIEW on
+    // migrated hubs — unindexable; ledger/execution_state always exist).
+    // stats() launch_failed_1h and the watchdog prose sweep read
+    // events/ledger by (op|action, ts); the BR#14696 launch fence, BR#14703
+    // reaper and stats occupancy read execution_state by attempt host/phase
+    // (json_extract). All were full-table scans on the DO's single event
+    // loop — events/ledger is append-only and very large, and the scans ran
+    // per stats poll and per ~15s alarm tick (measured live 2026-11-16:
+    // mixed 1-12s latencies, 503 input-gate rejections).
+    for (const ddl of [
+      `CREATE INDEX IF NOT EXISTS idx_ledger_action_ts ON ledger (action, ts)`,
+      `CREATE INDEX IF NOT EXISTS idx_exec_state_attempt ON execution_state (
+        json_extract(state, '$.attempt.host'),
+        json_extract(state, '$.attempt.phase'))`,
+      `CREATE INDEX IF NOT EXISTS idx_events_op_ts ON events (op, ts)`,
+    ]) {
+      try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
+    }
     this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA);
 
     // sessions.kind backfill: gateway identity via the local token registry
