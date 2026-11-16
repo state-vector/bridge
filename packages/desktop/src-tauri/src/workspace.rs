@@ -471,6 +471,20 @@ impl Owner {
         let records = self.records()?;
         let mut measured = HashMap::new();
         let mut positions = Vec::new();
+        // BR#14739 — bytes in ERRORED resources are PRESERVED (retention rules
+        // hold them: unpublished source, protected inputs, invisible readers).
+        // They are outside the workspace owner's control and therefore outside
+        // the admission budget: the budget gates owner-controllable GROWTH, the
+        // floor gates real free disk. Counting preserved bytes against the
+        // budget is the 2026-11-15 deadlock: ~100GB of a 100GiB budget was
+        // legitimately-retained-by-policy (node_modules/.worktrees/layers
+        // "source retained" classes), every pending record errored on a
+        // preservation rule, so `owned >= budget` held admission forever while
+        // reclamation could never free a byte — dispatch fully fenced with no
+        // exit except ops raising the budget. Admission compares only
+        // admissible (non-preserved) bytes; the disk floor remains the hard
+        // safety either way.
+        let mut preserved_bytes: u64 = 0;
         for record in &records {
             if matches!(record.phase, Phase::Removed { .. }) { continue; }
             let path = accounting_path(allocation_path(record));
@@ -478,6 +492,7 @@ impl Owner {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(disk_bytes(&path)?),
             };
+            if record.error.is_some() { preserved_bytes = preserved_bytes.saturating_add(bytes); }
             if !matches!(record.location, Location::RepositoryCache { .. }) {
                 positions.push(path);
             }
@@ -513,8 +528,13 @@ impl Owner {
             }
         }
         let available_bytes = available_bytes(&self.allocations)?;
-        let admission = if managed_bytes.saturating_add(cache_bytes).saturating_add(evidence_bytes) >= budget_bytes || available_bytes < floor {
-            Admission::Held { reason: format!("workspace disk budget: {} bytes owned, {} cache, {} retained evidence, {} budget, {} available; reclamation continues", managed_bytes, cache_bytes, evidence_bytes, budget_bytes, available_bytes) }
+        // BR#14739 — admission gates ADMISSIBLE growth only (see preserved_bytes
+        // above): preserved resources cannot shrink under any amount of held
+        // admission, so holding on their account is a pure deadlock, never a
+        // control. The disk floor stays the hard safety.
+        let admissible_bytes = managed_bytes.saturating_sub(preserved_bytes).saturating_add(cache_bytes).saturating_add(evidence_bytes);
+        let admission = if admissible_bytes >= budget_bytes || available_bytes < floor {
+            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget, {} available; reclamation continues", managed_bytes, preserved_bytes, managed_bytes.saturating_sub(preserved_bytes), cache_bytes, evidence_bytes, budget_bytes, available_bytes) }
         } else { Admission::Ready };
         // BR#14716 — the silent wedge: `retained == resources` (EVERY record
         // errored) with a held admission means the reclaim ladder cannot
