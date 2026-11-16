@@ -50,11 +50,18 @@ export class ExecutionWork {
     return state;
   }
   /** Preferences resolve globally; actual execution and explicit minima never downgrade. */
-  schedulingRequirements(id: string, required: ExecutionRequirements, state?: ExecutionState): ExecutionRequirements {
-    const row = this.one<{ roles: string; project: string; meta: string }>(`SELECT roles,project,meta FROM artefacts WHERE id=?`, id);
-    if (!row) return required;
-    const roles: string[] = JSON.parse(row.roles || "[]");
-    const meta: TaskMeta = JSON.parse(row.meta || "{}");
+  /** BR#14767: `row` accepts the caller's already-fetched artefact columns
+   *  (roles/project/meta) — the dispatch sweep has them in hand; the
+   *  per-row re-SELECT was one of the ~2000-statement sweep costs. Tier
+   *  selection uses hostsBare (host-level readiness): availableModelTiers
+   *  filters on readiness.kind === "ready", which host readiness answers —
+   *  task-specific startup rejection is layered by the sweep loop itself. */
+  schedulingRequirements(id: string, required: ExecutionRequirements, state?: ExecutionState,
+    row?: { roles: string; project: string; meta: string }): ExecutionRequirements {
+    const r = row ?? this.one<{ roles: string; project: string; meta: string }>(`SELECT roles,project,meta FROM artefacts WHERE id=?`, id);
+    if (!r) return required;
+    const roles: string[] = JSON.parse(r.roles || "[]");
+    const meta: TaskMeta = JSON.parse(r.meta || "{}");
     const lane = roles.includes("analysis") ? "analysis" : roles.includes("review") ? "verify" : "impl";
     let floor = required.tier;
     if (lane === "verify") {
@@ -68,7 +75,7 @@ export class ExecutionWork {
     floor = maxTier(floor, state?.attempt?.executor?.tier ?? "small");
     floor = maxTier(floor, state?.retry_strategy?.minimum_tier ?? "small");
     if (state?.attempt) return { ...required, tier: floor };
-    const selection = selectModelTier({ lane, policy: this.modelPolicy(), required: { ...required, tier: floor }, hosts: this.hosts(id), project: row.project, now: Date.now() });
+    const selection = selectModelTier({ lane, policy: this.modelPolicy(), required: { ...required, tier: floor }, hosts: this.hostsBare(), project: r.project, now: Date.now() });
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
@@ -136,6 +143,22 @@ export class ExecutionWork {
   private hosts(taskId?: string): CapabilityObservation[] {
     return (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
       readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities) }));
+  }
+  /** BR#14767 sweep path: host-LEVEL readiness (the injected readiness
+   *  callback), memoized per snapshot — NOT per-task taskReadiness, whose
+   *  per-row artefact+rejection SELECTs made hosts() cost ~2 queries x hosts
+   *  x 238 rows ≈ 7000 statements per sweep (~9s measured). The sweep loop
+   *  layers task-specific startup rejection itself (bulk-fetched); the tier
+   *  selection only needs "is this host usable for the lane", which is
+   *  exactly host-level readiness. Memo dies with the snapshot
+   *  (withHostSnapshot clears it) — never cached across sweeps. */
+  private hostsBareCache: CapabilityObservation[] | null = null;
+  private hostsBare(): CapabilityObservation[] {
+    if (this.hostSnapshot && this.hostsBareCache) return this.hostsBareCache;
+    const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
+      readiness: this.readiness(tokenId, host.host, host.capabilities, Date.now()) }));
+    if (this.hostSnapshot) this.hostsBareCache = value;
+    return value;
   }
   private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities): ExecutorReadiness {
     const proof = this.readiness(token, host, capabilities, Date.now());
@@ -363,6 +386,9 @@ export class ExecutionWork {
     const previous = this.hostSnapshot;
     let inventory: HostInventory[] | undefined;
     this.hostSnapshot ??= () => inventory ??= this.hostInventory();
+    // BR#14767: hostsBare's memo dies with the snapshot — readiness can
+    // change between sweeps, so it is never cached across them.
+    this.hostsBareCache = null;
     try { return run(); }
     finally { this.hostSnapshot = previous; }
   }

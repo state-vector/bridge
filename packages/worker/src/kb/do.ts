@@ -5930,8 +5930,12 @@ export class KnowledgeHub {
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
       const state = stateById.get(id) ?? null;
       let requirements: ReturnType<ExecutionWork["schedulingRequirements"]> | undefined;
+      // BR#14767 — pass the row's own columns through: the sweep already
+      // fetched roles/project/meta; schedulingRequirements' re-SELECT was a
+      // per-row cost across the whole board.
       const schedulingRequirements = () => requirements ??= work.schedulingRequirements(
         id, state?.requirements ?? ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), state ?? undefined,
+        { roles: String(row.roles ?? "[]"), project: String(row.project ?? ""), meta: String(row.meta ?? "{}") },
       );
       let reason: SchedulingReason | null = null;
       if (meta.operator_gated) reason = "operator_gate";
