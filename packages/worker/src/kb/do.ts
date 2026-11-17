@@ -254,7 +254,7 @@ import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrere
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
-import { CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
+import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta, trainReviewParentJoin } from "./recovery-capacity.ts";
@@ -500,7 +500,7 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "./review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL } from "./review-query";
 import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
@@ -3913,6 +3913,8 @@ export class KnowledgeHub {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
     this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(CAPABILITY_SWEEP_SCHEMA);
     this.state.storage.sql.exec(LANE_VIEW_SQL);
 
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
@@ -8502,7 +8504,7 @@ export class KnowledgeHub {
     if (row.type === "task" && verdict.status === "in_progress" && row.status !== "in_progress") {
       this.recordTaskRecovery(id, { kind: "executor_assigned", task_id: id }, actor);
     }
-    if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(ts);
+    if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(id);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
     // onto the train (the train owns delivery; the verifier never merges).
@@ -9666,7 +9668,7 @@ export class KnowledgeHub {
   private async escalateStaleAsks(now: number, trace?: RequestTrace): Promise<string[]> {
     await this.reconcileCompletedReviews(trace);
     await this.maintenanceCheckpoint(trace, "coordination.maintenance");
-    this.retireCompletedCoordination(now);
+    this.retireCompletedCoordination();
     this.retryExpiredRecoveryCoordination(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
@@ -9742,11 +9744,10 @@ export class KnowledgeHub {
   /** Terminal work retires its coordination obligations, not human decisions.
    * No fabricated answer and no answer-dispatch side effects. Also runs on the
    * alarm to heal old rows and on task completion for immediate convergence. */
-  private retireCompletedCoordination(now: number): void {
-    const rows = this.state.storage.sql.exec(`SELECT DISTINCT q.id, q.meta, p.id AS parent_id, p.status AS parent_status FROM artefacts q JOIN artefacts p ON p.id IN (
-      SELECT dst_id FROM relations WHERE src_id=q.id AND relation='child_of'
-      UNION SELECT json_extract(q.meta,'$.ask.route.task_id') WHERE json_extract(q.meta,'$.ask.route.kind')='executor_coordination'
-    ) WHERE q.type = 'question' AND q.status IN ('todo','in_progress','blocked') AND p.type = 'task' AND p.status IN ('done','superseded')`).toArray();
+  private retireCompletedCoordination(taskId?: string): void {
+    const sql = this.state.storage.sql;
+    const rows = taskId === undefined ? sql.exec(RETIRE_COORDINATION_SWEEP_SQL).toArray()
+      : sql.exec(RETIRE_COORDINATION_FOR_TASK_SQL, taskId).toArray();
     for (const row of rows) {
       const meta = JSON.parse(String(row.meta ?? "{}"));
       if (!meta.ask || isHumanDecisionAsk(meta.ask)) continue;
@@ -9808,14 +9809,7 @@ export class KnowledgeHub {
     ) WHERE json_extract(record,'$.state.phase')='pending' LIMIT 4`).toArray();
     // A repaired typed merge wait can be ready now even when its admission
     // was held in a previous pass. Prioritize it over historical held rows.
-    const mergeWaits = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor, a.review_id
-      FROM artefacts t JOIN delivery_admissions a ON json_extract(a.record,'$.task_id')=t.id
-      WHERE t.status='blocked' AND json_extract(t.meta,'$.blocked.await_event.event')='pr_merged'
-        AND json_extract(a.record,'$.state.phase')='held'
-        AND EXISTS (SELECT 1 FROM json_each(a.record,'$.legs') leg
-          WHERE json_extract(leg.value,'$.repo')=json_extract(t.meta,'$.blocked.await_event.repo')
-            AND json_extract(leg.value,'$.number')=json_extract(t.meta,'$.blocked.await_event.n'))
-      ORDER BY a.rowid DESC LIMIT 4`).toArray();
+    const mergeWaits = reviewId ? [] : this.state.storage.sql.exec(HELD_MERGE_ADMISSIONS_SQL).toArray();
     const attempted = new Set<string>();
     for (const row of [...recent, ...mergeWaits, ...rows]) {
       // Yield only between complete replay operations, before re-reading the
@@ -9832,7 +9826,10 @@ export class KnowledgeHub {
       const a = JSON.parse(String(current.record)) as DeliveryAdmission;
       this.admissionReplay.add(id);
       attempted.add(id);
-      const save = () => this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
+      const save = () => {
+        const record = JSON.stringify(a);
+        if (record !== current.record) this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, record, a.review_id);
+      };
       try {
         const reviewed = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, a.review_id);
         const authorization = ReviewResultSchema.safeParse(JSON.parse(String(reviewed?.meta ?? "{}")).review_result);

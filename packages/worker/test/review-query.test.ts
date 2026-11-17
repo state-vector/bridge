@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "../src/kb/review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL } from "../src/kb/review-query";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
@@ -31,8 +31,9 @@ beforeAll(async () => {
   const ns = await mf.getDurableObjectNamespace("QUERY");
   stub = await ns.get(ns.idFromName("retained-backlog")) as unknown as typeof stub;
   await query(`CREATE TABLE artefacts(id TEXT PRIMARY KEY,type TEXT,roles TEXT,status TEXT,meta TEXT,created_ts INTEGER,status_ts INTEGER);
-    CREATE TABLE relations(src_id TEXT,relation TEXT,dst_id TEXT,PRIMARY KEY(src_id,relation,dst_id));`);
-  if (REVIEW_LOOKUP_SCHEMA) await query(REVIEW_LOOKUP_SCHEMA);
+    CREATE TABLE relations(src_id TEXT,relation TEXT,dst_id TEXT,PRIMARY KEY(src_id,relation,dst_id));
+    CREATE TABLE delivery_admissions(review_id TEXT PRIMARY KEY,record TEXT);`);
+  await query(REVIEW_LOOKUP_SCHEMA + WATCHDOG_REVIEW_LOOKUP_SCHEMA);
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<6000)
     INSERT INTO artefacts SELECT 'unrelated-'||i,'task','["review"]','done',json_object('execution_review_of','other-'||i),i,i FROM n`);
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<6000)
@@ -94,5 +95,41 @@ describe("canonical review lookup with a retained SQLite backlog", () => {
     expect((await current()).rows[0].id).toBe("ambiguous");
     await review("newest", 18, { review_subject: { task_id: "parent", revision: "two" } }, "in_progress");
     expect((await current()).rows[0]).toMatchObject({ id: "newest", status: "in_progress" });
+  });
+});
+
+
+describe("watchdog work with retained history", () => {
+  it("finds only held admissions for matching active merge waits", async () => {
+    await query(`INSERT INTO delivery_admissions
+      SELECT id,json_object('task_id',id,'state',json_object('phase','held')) FROM artefacts WHERE id LIKE 'unrelated-%'`);
+    await review("waiting", 30, { blocked: { await_event: { event: "pr_merged", repo: "owner/repo", n: 7 } } }, "blocked");
+    for (const [id, phase, repo, number] of [
+      ["matching", "held", "owner/repo", 7],
+      ["wrong-phase", "pending", "owner/repo", 7],
+      ["wrong-repo", "held", "other/repo", 7],
+      ["wrong-number", "held", "owner/repo", 8],
+    ]) await query("INSERT INTO delivery_admissions VALUES(?,?)", [id, JSON.stringify({
+      task_id: "waiting", state: { phase }, legs: [{ repo, number }],
+    })]);
+    const result = await query(HELD_MERGE_ADMISSIONS_SQL);
+    expect(result.rows).toEqual([{ cursor: null, review_id: "matching" }]);
+    expect(result.reads).toBeLessThan(50);
+  });
+
+  it("targets a terminal task without scanning unrelated coordination", async () => {
+    await review("finished-task", 31);
+    await review("other-finished-task", 32, {}, "superseded");
+    await review("linked-question", 33, {}, "todo", "question");
+    await child("linked-question", "finished-task");
+    await review("routed-question", 34, { ask: { route: { kind: "executor_coordination", task_id: "finished-task" } } }, "todo", "question");
+    await review("other-question", 35, {}, "todo", "question");
+    await child("other-question", "other-finished-task");
+    const targeted = await query(RETIRE_COORDINATION_FOR_TASK_SQL, ["finished-task"]);
+    expect(targeted.rows.map(row => row.id).sort()).toEqual(["linked-question", "routed-question"]);
+    expect(targeted.reads).toBeLessThan(50);
+    const sweep = await query(RETIRE_COORDINATION_SWEEP_SQL);
+    expect(sweep.rows.map(row => row.id).sort()).toEqual(["linked-question", "other-question", "routed-question"]);
+    expect(sweep.reads).toBeLessThan(50);
   });
 });
