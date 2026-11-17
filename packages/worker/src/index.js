@@ -262,6 +262,7 @@ export default {
           })));
         }
         const kbUrl = sub === "board" ? "https://kb/board"
+          : sub === "work-graph" ? "https://kb/work-graph"
           : sub === "events" ? "https://kb/events"
           : sub === "artefacts" ? "https://kb/artefacts"
           : sub === "artefact" ? "https://kb/artefact"

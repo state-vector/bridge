@@ -7,6 +7,7 @@ import { KnowledgeView } from "./components/KnowledgeView";
 import { LogView } from "./components/LogView";
 import { PairView } from "./components/PairView";
 import { TopView } from "./components/TopView";
+import { WorkGraph } from "./components/WorkGraph";
 import { WorkspacePicker } from "./components/WorkspacePicker";
 import type { WsFrame } from "@bridge/specs";
 import { cardIdFromPathSegment, cardPath } from "@bridge/specs";
@@ -21,11 +22,12 @@ import "./App.css";
 /** Full web UI — no desktop-shell forks. The gateway/dispatch experience lives
  *  in packages/desktop/ui; mobile fleet view in packages/mobile. */
 
-type Tab = "top" | "reports" | "backlog" | "completed" | "log" | "knowledge" | "discussions" | "connect";
+type Tab = "top" | "reports" | "backlog" | "graph" | "completed" | "log" | "knowledge" | "discussions" | "connect";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "top", label: "Top" },
   { key: "reports", label: "Reports" },
   { key: "backlog", label: "Backlog" },
+  { key: "graph", label: "Graph" },
   { key: "completed", label: "Completed" },
   { key: "log", label: "Log" },
   { key: "knowledge", label: "Knowledge" },
@@ -200,6 +202,7 @@ export default function App() {
         {tab === "top" && <TopView openTask={openCard} />}
         {tab === "reports" && <ReportsView />}
         {tab === "backlog" && <BacklogView openTask={openCard} />}
+        {tab === "graph" && <WorkGraph openCard={openCard} />}
         {tab === "completed" && <CompletedView openTask={openCard} />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}

@@ -61,6 +61,43 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(rounds[0].status).toBe("superseded");
   });
 
+  it("projects all open work and its typed dependencies without completed cards", async () => {
+    const upstream = await task("Graph prerequisite");
+    for (let i = 0; i < 250; i++) await task(`Graph queued task ${i}`);
+    const downstream = await task("Graph dependent");
+    const exit = { event: "br_done", id: upstream };
+    const parked = await call("transition", { id: downstream, to: "blocked", actor: "author",
+      note: "Waiting on the graph prerequisite", await_event: exit });
+    expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+    const closed = await task("Graph completed task", {}, ["analysis"]);
+    await call("transition", { id: closed, to: "in_progress", actor: "author", session: "graph-test" });
+    const completion = await call("transition", { id: closed, to: "done", actor: "author", session: "graph-test",
+      execution_result: { outcome: "Analysis delivered", receipts: [closed] }, note: "Analysis delivered" });
+    expect(completion.status, JSON.stringify(completion.body)).toBe(200);
+
+    const tasks: { id: string; status: string }[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const url = new URL("https://kb/work-graph");
+      if (cursor !== null) url.searchParams.set("after", cursor);
+      const response = await stub.fetch(url);
+      expect(response.status).toBe(200);
+      const page = await response.json();
+      expect(page.tasks.length).toBeLessThanOrEqual(100);
+      tasks.push(...page.tasks);
+      cursor = page.next_cursor;
+      expect(++pages).toBeLessThan(5);
+    } while (cursor !== null);
+    expect(pages).toBe(3);
+    expect(tasks.length).toBeGreaterThan(250);
+    expect(new Set(tasks.map(row => row.id)).size).toBe(tasks.length);
+    expect(tasks).toContainEqual(expect.objectContaining({ id: upstream, status: "todo" }));
+    expect(tasks).toContainEqual(expect.objectContaining({ id: downstream, status: "blocked",
+      work_waits: expect.arrayContaining([{ kind: "prerequisite", exit }]) }));
+    expect(tasks.some((row: { status: string }) => ["done", "superseded"].includes(row.status))).toBe(false);
+  }, 20_000);
+
   it("retires unbound executor coordination when its addressed task is terminal, without inventing an answer", async () => {
     const subject = await task("Completed coordination recipient", {}, ["analysis"]);
     const ask = await call("ask.create", { route: { kind: "executor_coordination", task_id: subject },

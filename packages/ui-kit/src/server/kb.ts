@@ -504,9 +504,16 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
   return parsed;
 }
 
+export type KbGraphTask = Pick<KbArtefact, "id" | "type" | "title" | "status" | "part_of"> & {
+  work_waits: WorkWait[];
+  condition?: string;
+};
+
 export const kbApi = {
   executionAttention: () => j<unknown>("/api/kb/execution_attention"),
   handoffControl: (body: import("@bridge/contracts").HandoffControl) => j<{ kind: string; prerequisites?: unknown[] }>("/api/kb/handoff_control", { method: "POST", body: JSON.stringify(body) }),
+  workGraph: (after: string | null, signal: AbortSignal) => j<{ tasks: KbGraphTask[]; next_cursor: string | null }>(
+    after === null ? "/api/kb/work-graph" : `/api/kb/work-graph?after=${encodeURIComponent(after)}`, { signal }),
   board: () => j<KbBoard>("/api/kb/board"),
   throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));

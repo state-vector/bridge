@@ -3020,35 +3020,74 @@ export class KnowledgeHub {
     return { events, last_seq: events.length ? events[events.length - 1].seq : since };
   }
 
+  private boardOpenAsks(taskIds?: string) {
+    // open question children: the DERIVED source for awaiting_ask (phase 4 —
+    // the marker was a second source of truth that could drift)
+    const openAskChildren = this.state.storage.sql.exec(
+      `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
+       FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
+         AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
+         ${taskIds === undefined ? "" : "AND r.dst_id IN (SELECT value FROM json_each(?))"}
+       ORDER BY c.created_ts DESC`, ...(taskIds === undefined ? [] : [taskIds]),
+    ).toArray();
+    const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
+    for (const c of openAskChildren) {
+      const ask = JSON.parse(String(c.cmeta ?? "{}")).ask;
+      if (!ask || askLifecycle({ status: "todo", meta: { ask } }).state !== "open") continue;
+      const parent = String(c.parent);
+      const asks = askChildrenByParent.get(parent) ?? [];
+      asks.push({ id: String(c.id), route: askRoute(ask), to: this.askRecipient(ask) });
+      askChildrenByParent.set(parent, asks);
+    }
+    return askChildrenByParent;
+  }
+
   async board() {
+    const { tasks, links, askChildrenByParent } = this.projectBoardWork();
+    return this.boardDetails(tasks, links, askChildrenByParent);
+  }
+
+  private projectBoardWork(after?: string) {
+    const pageSize = 100;
+    const graphPage = after !== undefined;
     // owner renders via the BR#4262 render-time join (principal at rest →
     // label on display); matching below stays on ids/meta, never owner text.
     // BR#6395: order open items before terminal (done/superseded) items so a
     // burst of closures never pushes active/blocked/queued tasks out of the
     // board payload window.
-    const tasks = this.state.storage.sql.exec(
-      `WITH recent AS (
-         SELECT id FROM artefacts WHERE type IN ('task','question')
-         ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END, updated_ts DESC
-         LIMIT 250
-       )
-       SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
+    const rows = graphPage
+      ? this.state.storage.sql.exec(
+        `SELECT id, type, title, status, meta FROM artefacts
+         WHERE id > ? AND type IN ('task','question') AND status NOT IN ('done','superseded')
+         ORDER BY id LIMIT ?`, after, pageSize + 1,
+      ).toArray()
+      : this.state.storage.sql.exec(
+      `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.id IN (SELECT id FROM recent)
+       WHERE a.id IN (
+          SELECT id FROM artefacts WHERE type IN ('task','question')
+          ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END, updated_ts DESC
+          LIMIT 250
+       )
           OR (a.type = 'question' AND a.status IN ('todo','in_progress','blocked')
               AND coalesce(json_extract(a.meta, '$.ask.answer'), '') = ''
               AND (json_extract(a.meta, '$.ask.route.kind') = 'human_decision'
                    OR (json_type(a.meta, '$.ask.route') IS NULL
                        AND json_extract(a.meta, '$.ask.to') IN ('human','ray','rayh'))))
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END, a.updated_ts DESC`,
-    ).toArray().map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    ).toArray();
+    const nextCursor = graphPage && rows.length > pageSize ? String(rows[pageSize - 1].id) : null;
+    const tasks = (graphPage ? rows.slice(0, pageSize) : rows).map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    const taskIds = JSON.stringify(tasks.map(task => String(task.id)));
     // Open human decisions stay visible beyond the recent-work window. Use
     // one JSON parameter to keep the execution lookup within SQLite limits.
-    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, JSON.stringify(tasks.map(task => String(task.id)))).toArray() : [];
+    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, taskIds).toArray() : [];
     const executionByTask = new Map(executionRows
       .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
     const executionNow = Date.now();
-    for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
+    if (!graphPage) for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
     const sinks = this.alarmSinkIds();
     for (const task of tasks) if (this.isUnclaimableAnchor(task, task.meta, sinks)) task.meta.infra_anchor = true;
@@ -3056,7 +3095,7 @@ export class KnowledgeHub {
     for (const task of tasks) {
       const view = dispatch.get(String(task.id));
       const state = executionByTask.get(String(task.id));
-      if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
+      if (!graphPage && view?.kind === "held" && view.reasons.includes("retry_budget")) {
         const terminal = state?.terminal;
         const outcome = terminal && terminal.generation === state?.attempt?.generation
           && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
@@ -3071,10 +3110,36 @@ export class KnowledgeHub {
     }
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
-      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
+      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'
+       ${graphPage ? "AND src_id IN (SELECT value FROM json_each(?))" : ""}`, ...(graphPage ? [taskIds] : []),
     ).toArray();
+    const parentOf = new Map(links.map(l => [String(l.src_id), String(l.dst_id)]));
+    const askChildrenByParent = this.boardOpenAsks(graphPage ? taskIds : undefined);
+    for (const t of tasks) {
+      t.part_of = parentOf.get(t.id);
+      t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), askChildrenByParent.get(t.id) ?? []);
+    }
+    return { tasks, links, askChildrenByParent, nextCursor };
+  }
+
+  private workGraph(after: string) {
+    const { tasks, nextCursor } = this.projectBoardWork(after);
+    return {
+      next_cursor: nextCursor,
+      tasks: tasks.filter(t => !t.meta.infra_anchor).map(t => {
+        const legacyCondition = t.meta.blocked?.unblock_condition || t.meta.depends_on;
+        const condition = t.status === "blocked" && !t.work_waits.length && typeof legacyCondition === "string"
+          ? legacyCondition.trim() || undefined : undefined;
+        return {
+          id: t.id, type: t.type, title: t.title, status: t.status, part_of: t.part_of,
+          work_waits: t.work_waits, condition,
+        };
+      }),
+    };
+  }
+
+  private boardDetails(tasks: any[], links: Record<string, SqlStorageValue>[], askChildrenByParent: ReturnType<KnowledgeHub["boardOpenAsks"]>) {
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const parentOf = new Map(links.map((l: any) => [l.src_id, l.dst_id]));
     for (const t of tasks) {
       const recoveryId = t.meta?.recovery?.task_id;
       if (recoveryId) {
@@ -3084,8 +3149,6 @@ export class KnowledgeHub {
           ? { kind: "working", task_id: recoveryId, owner: this.displayOwner(String(duty.owner)) }
           : duty && !["done", "superseded"].includes(String(duty.status)) ? { kind: "scheduled", task_id: recoveryId } : { kind: "not_scheduled" };
       }
-      const parent = parentOf.get(t.id);
-      if (parent) t.part_of = parent;
       t.children_open = 0;
       t.children_done = 0;
     }
@@ -3130,25 +3193,6 @@ export class KnowledgeHub {
       `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
     ).toArray();
-    // open question children: the DERIVED source for awaiting_ask (phase 4 —
-    // the marker was a second source of truth that could drift)
-    const openAskChildren = this.state.storage.sql.exec(
-      `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
-       FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
-         AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
-       ORDER BY c.created_ts DESC`,
-    ).toArray();
-    const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
-    for (const c of openAskChildren) {
-      const ask = JSON.parse(String(c.cmeta ?? "{}")).ask;
-      if (!ask || askLifecycle({ status: "todo", meta: { ask } }).state !== "open") continue;
-      const parent = String(c.parent);
-      const asks = askChildrenByParent.get(parent) ?? [];
-      asks.push({ id: String(c.id), route: askRoute(ask), to: this.askRecipient(ask) });
-      askChildrenByParent.set(parent, asks);
-    }
     const progress = this.state.storage.sql.exec(
       `SELECT seq, ts, actor, artefact_id, detail FROM events
        WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
@@ -3167,7 +3211,6 @@ export class KnowledgeHub {
       const openAsks = askChildrenByParent.get(t.id) ?? [];
       const openAsk = openAsks.find(ask => ask.route.kind === "human_decision") ?? openAsks[0];
       if (openAsk) t.meta.awaiting_ask = { ask_id: openAsk.id, route: openAsk.route, to: openAsk.to };
-      t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), openAsks);
       if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
         t.meta.ask.route = askRoute(t.meta.ask);
         if (!isHumanDecisionAsk(t.meta.ask)) t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
@@ -3468,6 +3511,8 @@ export class KnowledgeHub {
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_artefacts_open_work_id ON artefacts(id)
+        WHERE type IN ('task','question') AND status NOT IN ('done','superseded');
       CREATE TABLE IF NOT EXISTS relations (
         src_id TEXT NOT NULL,
         relation TEXT NOT NULL,
@@ -4414,6 +4459,8 @@ export class KnowledgeHub {
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/events": return this.limited("events", 120, 60_000, request)
             ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+          case "/work-graph": return this.limited("work-graph", 120, 60_000, request)
+            ?? this.json(this.workGraph(url.searchParams.get("after") ?? ""));
           case "/board": return this.limited("board", 30, 60_000, request)
             ?? this.json(await this.boardPayload());
           case "/stats": {
