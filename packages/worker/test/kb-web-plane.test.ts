@@ -246,11 +246,11 @@ describe("AskBand rows render their artefact id (BR#3462 leg 2)", () => {
 });
 
 describe("TaskDetail loads artefact/related/history in parallel (BR#3462 leg 3)", () => {
-  it("issues the three section loads together (allSettled), not as a sequential await chain", () => {
-    // the load effect must NOT contain the old sequential chain
-    // (artefact → related → history, each awaiting the previous)
-    expect(taskDetailSrc).toContain("Promise.allSettled");
-    expect(taskDetailSrc).not.toMatch(/await kbApi\.artefact[\s\S]{0,400}await kbApi\.related[\s\S]{0,400}await kbApi\.history/);
+  it("starts all three loads together and handles each result independently", () => {
+    for (const request of ["artefact", "related", "history"]) {
+      expect(taskDetailSrc).toContain(`void withTimeout(kbApi.${request}(taskId)`);
+    }
+    expect(taskDetailSrc).not.toContain("Promise.allSettled");
     // per-section error handling, correctly labeled (the old catches both said
     // "load task relations" — including the history one)
     expect(taskDetailSrc).toContain("load related tasks");
@@ -288,6 +288,19 @@ describe("BandNodeAskRow offers a typed answer as the last option (BR#3912)", ()
     expect(body).toMatch(/void answer\(custom\)/);
     // no silent sends: empty text and busy both disable/ignore submission
     expect(body).toMatch(/!custom\.trim\(\) \|\| !busy|custom\.trim\(\) && !busy/);
+  });
+});
+
+describe("GET /api/kb/work-graph", () => {
+  it("forwards the revision cursor to the authenticated delta read", async () => {
+    const initial = await api("/api/kb/work-graph");
+    expect(initial.status).toBe(200);
+    const { revision } = await initial.json() as { revision: number };
+    expect(Number.isSafeInteger(revision)).toBe(true);
+    const delta = await api(`/api/kb/work-graph?since=${revision}`);
+    expect(delta.status).toBe(200);
+    expect(await delta.json()).toEqual({ revision, has_more: false, tasks: [], removed_ids: [] });
+    expect((await api("/api/kb/work-graph?since=bad")).status).toBe(400);
   });
 });
 

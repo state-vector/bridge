@@ -202,7 +202,7 @@ export default function App() {
         {tab === "top" && <TopView openTask={openCard} />}
         {tab === "reports" && <ReportsView />}
         {tab === "backlog" && <BacklogView openTask={openCard} />}
-        {tab === "graph" && <WorkGraph openCard={openCard} />}
+        <WorkGraph active={tab === "graph"} openCard={openCard} />
         {tab === "completed" && <CompletedView openTask={openCard} />}
         {tab === "log" && <LogView />}
         {tab === "knowledge" && <KnowledgeView />}

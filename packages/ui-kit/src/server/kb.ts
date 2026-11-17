@@ -512,8 +512,11 @@ export type KbGraphTask = Pick<KbArtefact, "id" | "type" | "title" | "status" | 
 export const kbApi = {
   executionAttention: () => j<unknown>("/api/kb/execution_attention"),
   handoffControl: (body: import("@bridge/contracts").HandoffControl) => j<{ kind: string; prerequisites?: unknown[] }>("/api/kb/handoff_control", { method: "POST", body: JSON.stringify(body) }),
-  workGraph: (after: string | null, signal: AbortSignal) => j<{ tasks: KbGraphTask[]; next_cursor: string | null }>(
+  workGraph: (after: string | null, signal: AbortSignal) => j<{ tasks: KbGraphTask[]; next_cursor: string | null; revision: number }>(
     after === null ? "/api/kb/work-graph" : `/api/kb/work-graph?after=${encodeURIComponent(after)}`, { signal }),
+  workGraphDelta: (revision: number, signal: AbortSignal) => j<{
+    tasks: KbGraphTask[]; removed_ids: string[]; revision: number; has_more: boolean;
+  }>(`/api/kb/work-graph?since=${revision}`, { signal }),
   board: () => j<KbBoard>("/api/kb/board"),
   throughput: (q?: { bucket?: "hour" | "day" | "week"; range?: string }) => {
     const p = new URLSearchParams(Object.entries(q ?? {}).filter(([, v]) => v).map(([k, v]) => [k, String(v)]));

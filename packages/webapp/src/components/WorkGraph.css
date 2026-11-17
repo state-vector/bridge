@@ -1,7 +1,11 @@
 .work-graph {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
   margin: 0 auto;
-  max-width: 1440px;
-  padding: clamp(14px, 3vw, 32px);
+  height: calc(100dvh - 12px);
+  padding: clamp(12px, 2vw, 24px);
   width: 100%;
   box-sizing: border-box;
   min-width: 0;
@@ -16,7 +20,6 @@
 }
 
 .work-graph h1 { margin: 0; font-size: 23px; }
-.work-graph h2 { margin: 24px 0 12px; font-size: 15px; }
 .work-graph p { color: var(--text-dim); margin: 6px 0 14px; }
 .work-graph input {
   font: inherit;
@@ -38,18 +41,58 @@
 }
 .work-graph-legend span:first-child { color: var(--amber); }
 
-.work-graph-group {
-  overflow: auto;
-  max-height: 70vh;
+.work-graph-canvas {
+  position: relative;
+  flex: 1;
+  min-height: 0;
   border: 1px solid var(--line);
   border-radius: 12px;
-  margin-bottom: 12px;
-  padding: 16px;
   background: radial-gradient(circle, var(--line) 1px, transparent 1px) 0 0 / 18px 18px var(--bg);
 }
-.work-graph-component { position: relative; }
-.work-graph-component svg { position: absolute; inset: 0; overflow: visible; }
-.work-graph-component path { fill: none; stroke-width: 1.5px; }
+.work-graph-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  border-radius: inherit;
+  touch-action: none;
+  user-select: none;
+  cursor: grab;
+}
+.work-graph-viewport[data-dragging] { cursor: grabbing; }
+.work-graph-world { position: absolute; transform-origin: 0 0; }
+.work-graph-world svg { position: absolute; inset: 0; overflow: visible; }
+.work-graph-world path { fill: none; stroke-width: 1.5px; }
+.work-graph-controls {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--text);
+}
+.work-graph-controls button {
+  min-width: 38px;
+  min-height: 36px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.work-graph-controls button:disabled { opacity: 0.5; cursor: default; }
+.work-graph-controls button:last-child { border-left: 1px solid var(--line); padding-inline: 12px; }
+.work-graph-controls button:hover:not(:disabled) { background: var(--bg-hover); }
+.work-graph-controls button:focus-visible { outline-offset: -3px; }
+.work-graph-controls output {
+  align-self: center;
+  text-align: center;
+  min-width: 46px;
+  font: 11px var(--mono);
+}
 .work-graph-dependency { stroke: var(--amber); }
 .work-graph-dependency path:first-of-type { animation: work-graph-flow 900ms ease-out both; }
 .work-graph-containment { stroke: var(--text-dim); stroke-dasharray: 4 4; }
@@ -92,11 +135,6 @@ button.work-graph-node:focus-visible { background: var(--bg-hover); border-color
   -webkit-line-clamp: 2;
   overflow: hidden;
   overflow-wrap: anywhere;
-}
-.work-graph-standalone {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(248px, 100%), 1fr));
-  gap: 10px;
 }
 .work-graph-sr {
   position: absolute;

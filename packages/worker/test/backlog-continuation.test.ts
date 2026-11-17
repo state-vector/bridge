@@ -1,3 +1,4 @@
+import { decisionFixture } from "./ask-fixture";
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -97,6 +98,56 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
       work_waits: expect.arrayContaining([{ kind: "prerequisite", exit }]) }));
     expect(tasks.some((row: { status: string }) => ["done", "superseded"].includes(row.status))).toBe(false);
   }, 20_000);
+
+  it("catches changes between snapshot pages and removes closed cards via deltas", async () => {
+    const parent = await task("Graph delta parent", {}, ["analysis"]);
+    const child = await task("Graph delta unchanged");
+    const initial = await (await stub.fetch("https://kb/work-graph")).json();
+    const delta = async (revision: number) => {
+      const response = await stub.fetch(`https://kb/work-graph?since=${revision}`);
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await delta(initial.revision)).toEqual({
+      revision: initial.revision, has_more: false, tasks: [], removed_ids: [],
+    });
+    const older = await delta(0);
+    expect(older.tasks.length + older.removed_ids.length).toBe(100);
+    expect(older.has_more).toBe(true);
+    const next = await delta(older.revision);
+    expect(next.revision).toBeGreaterThan(older.revision);
+    const seen = new Set([...older.removed_ids, ...older.tasks.map((row: { id: string }) => row.id)]);
+    expect([...next.removed_ids, ...next.tasks.map((row: { id: string }) => row.id)]
+      .some(id => seen.has(id))).toBe(false);
+    const question = await call("ask.create", { to: "human", artefact_id: parent,
+      question: "Should Bridge retain the graph data?",
+      decision: decisionFixture(parent, ["Retain it", "Delete it"]) });
+    expect(question.status, JSON.stringify(question.body)).toBe(200);
+    const pending = await delta(initial.revision);
+    expect(pending.tasks).toContainEqual(expect.objectContaining({
+      id: question.body.id, part_of: parent,
+    }));
+    expect(pending.tasks).toContainEqual(expect.objectContaining({
+      id: parent, work_waits: [{ kind: "human_decision", exit: { event: "ask_answered", ask_id: question.body.id } }],
+    }));
+    expect(pending.tasks.some((row: { id: string }) => row.id === child)).toBe(false);
+
+    const answered = await call("ask.answer", { id: question.body.id, answer: "Retain it", actor: "web:ray" });
+    expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    const resolved = await delta(pending.revision);
+    expect(resolved.removed_ids).toContain(question.body.id);
+    expect(resolved.tasks).toContainEqual(expect.objectContaining({ id: parent, work_waits: [] }));
+    expect(await delta(resolved.revision)).toEqual({
+      revision: resolved.revision, has_more: false, tasks: [], removed_ids: [],
+    });
+    await call("transition", { id: parent, to: "in_progress", actor: "author", session: "graph-delta-test" });
+    const completed = await call("transition", { id: parent, to: "done", actor: "author", session: "graph-delta-test",
+      execution_result: { outcome: "Analysis delivered", receipts: [parent] }, note: "Analysis delivered" });
+    expect(completed.status, JSON.stringify(completed.body)).toBe(200);
+    const closed = await delta(resolved.revision);
+    expect(closed.removed_ids).toContain(parent);
+    expect(closed.tasks.some((row: { id: string }) => row.id === parent)).toBe(false);
+  });
 
   it("retires unbound executor coordination when its addressed task is terminal, without inventing an answer", async () => {
     const subject = await task("Completed coordination recipient", {}, ["analysis"]);

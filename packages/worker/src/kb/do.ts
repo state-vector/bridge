@@ -502,6 +502,7 @@ import {
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "./review-query";
 import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
 import type { ExecutorReadiness } from "@bridge/contracts";
@@ -3049,21 +3050,14 @@ export class KnowledgeHub {
     return this.boardDetails(tasks, links, askChildrenByParent);
   }
 
-  private projectBoardWork(after?: string) {
-    const pageSize = 100;
-    const graphPage = after !== undefined;
+  private projectBoardWork(graphRows?: Record<string, SqlStorageValue>[]) {
+    const graphPage = graphRows !== undefined;
     // owner renders via the BR#4262 render-time join (principal at rest →
     // label on display); matching below stays on ids/meta, never owner text.
     // BR#6395: order open items before terminal (done/superseded) items so a
     // burst of closures never pushes active/blocked/queued tasks out of the
     // board payload window.
-    const rows = graphPage
-      ? this.state.storage.sql.exec(
-        `SELECT id, type, title, status, meta FROM artefacts
-         WHERE id > ? AND type IN ('task','question') AND status NOT IN ('done','superseded')
-         ORDER BY id LIMIT ?`, after, pageSize + 1,
-      ).toArray()
-      : this.state.storage.sql.exec(
+    const rows = graphRows ?? this.state.storage.sql.exec(
       `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
        WHERE a.id IN (
@@ -3078,8 +3072,7 @@ export class KnowledgeHub {
                        AND json_extract(a.meta, '$.ask.to') IN ('human','ray','rayh'))))
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END, a.updated_ts DESC`,
     ).toArray();
-    const nextCursor = graphPage && rows.length > pageSize ? String(rows[pageSize - 1].id) : null;
-    const tasks = (graphPage ? rows.slice(0, pageSize) : rows).map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    const tasks = rows.map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     const taskIds = JSON.stringify(tasks.map(task => String(task.id)));
     // Open human decisions stay visible beyond the recent-work window. Use
     // one JSON parameter to keep the execution lookup within SQLite limits.
@@ -3091,22 +3084,24 @@ export class KnowledgeHub {
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
     const sinks = this.alarmSinkIds();
     for (const task of tasks) if (this.isUnclaimableAnchor(task, task.meta, sinks)) task.meta.infra_anchor = true;
-    const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo" && !t.meta.infra_anchor).map(t => String(t.id)), executionNow);
-    for (const task of tasks) {
-      const view = dispatch.get(String(task.id));
-      const state = executionByTask.get(String(task.id));
-      if (!graphPage && view?.kind === "held" && view.reasons.includes("retry_budget")) {
-        const terminal = state?.terminal;
-        const outcome = terminal && terminal.generation === state?.attempt?.generation
-          && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
-        const cause = outcome && providerRecoveryDiagnosis(outcome);
-        view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
-          : cause === "provider_authentication" ? "provider_auth"
-          : cause === "provider_quota" ? "provider_quota"
-          : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
-            ? outcome.kind : "unclassified";
+    if (!graphPage) {
+      const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo" && !t.meta.infra_anchor).map(t => String(t.id)), executionNow);
+      for (const task of tasks) {
+        const view = dispatch.get(String(task.id));
+        const state = executionByTask.get(String(task.id));
+        if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
+          const terminal = state?.terminal;
+          const outcome = terminal && terminal.generation === state?.attempt?.generation
+            && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
+          const cause = outcome && providerRecoveryDiagnosis(outcome);
+          view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
+            : cause === "provider_authentication" ? "provider_auth"
+            : cause === "provider_quota" ? "provider_quota"
+            : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
+              ? outcome.kind : "unclassified";
+        }
+        task.gateway_dispatch = view;
       }
-      task.gateway_dispatch = view;
     }
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
@@ -3119,22 +3114,57 @@ export class KnowledgeHub {
       t.part_of = parentOf.get(t.id);
       t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), askChildrenByParent.get(t.id) ?? []);
     }
-    return { tasks, links, askChildrenByParent, nextCursor };
+    return { tasks, links, askChildrenByParent };
+  }
+
+  private graphCards(rows: Record<string, SqlStorageValue>[]) {
+    if (!rows.length) return [];
+    // Graph waits are persisted prerequisites. Computing live dispatch eligibility
+    // here would run every gateway's scheduler on every graph page.
+    const { tasks } = this.projectBoardWork(rows);
+    return tasks.filter(t => !t.meta.infra_anchor).map(t => {
+      const legacyCondition = t.meta.blocked?.unblock_condition || t.meta.depends_on;
+      const condition = t.status === "blocked" && !t.work_waits.length && typeof legacyCondition === "string"
+        ? legacyCondition.trim() || undefined : undefined;
+      return {
+        id: t.id, type: t.type, title: t.title, status: t.status, part_of: t.part_of,
+        work_waits: t.work_waits, condition,
+      };
+    });
   }
 
   private workGraph(after: string) {
-    const { tasks, nextCursor } = this.projectBoardWork(after);
+    // The client keeps the FIRST page's watermark. Any write that interleaves
+    // with hydration is replayed from there, even before the ID cursor.
+    const revision = Number(this.one("SELECT MAX(seq) AS seq FROM work_graph_changes")?.seq ?? 0);
+    const rows = this.state.storage.sql.exec(
+      `SELECT id,type,title,status,meta FROM artefacts WHERE id > ? AND ${OPEN_GRAPH_CARD}
+       ORDER BY id LIMIT ?`, after, GRAPH_PAGE_SIZE + 1,
+    ).toArray();
+    const page = rows.slice(0, GRAPH_PAGE_SIZE);
     return {
-      next_cursor: nextCursor,
-      tasks: tasks.filter(t => !t.meta.infra_anchor).map(t => {
-        const legacyCondition = t.meta.blocked?.unblock_condition || t.meta.depends_on;
-        const condition = t.status === "blocked" && !t.work_waits.length && typeof legacyCondition === "string"
-          ? legacyCondition.trim() || undefined : undefined;
-        return {
-          id: t.id, type: t.type, title: t.title, status: t.status, part_of: t.part_of,
-          work_waits: t.work_waits, condition,
-        };
-      }),
+      revision,
+      tasks: this.graphCards(page),
+      next_cursor: rows.length > GRAPH_PAGE_SIZE ? String(page.at(-1)?.id) : null,
+    };
+  }
+
+  private workGraphDelta(since: number) {
+    const changes = this.state.storage.sql.exec(
+      "SELECT seq,id FROM work_graph_changes WHERE seq > ? ORDER BY seq LIMIT ?", since, GRAPH_PAGE_SIZE + 1,
+    ).toArray();
+    const page = changes.slice(0, GRAPH_PAGE_SIZE);
+    const ids = page.map(row => String(row.id));
+    const tasks = ids.length ? this.graphCards(this.state.storage.sql.exec(
+      `SELECT id,type,title,status,meta FROM artefacts WHERE id IN (SELECT value FROM json_each(?))
+       AND ${OPEN_GRAPH_CARD}`, JSON.stringify(ids),
+    ).toArray()) : [];
+    const live = new Set(tasks.map(task => task.id));
+    return {
+      revision: Number(page.at(-1)?.seq ?? since),
+      has_more: changes.length > GRAPH_PAGE_SIZE,
+      tasks,
+      removed_ids: ids.filter(id => !live.has(id)),
     };
   }
 
@@ -4298,6 +4328,7 @@ export class KnowledgeHub {
         UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
       END;
     `);
+    this.state.storage.sql.exec(workGraphChangeSchema(TRAIN_ALARM_SINK_ID));
   }
 
   // ---------- BR#4212: the fetch entry NEVER throws ----------
@@ -4459,8 +4490,15 @@ export class KnowledgeHub {
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/events": return this.limited("events", 120, 60_000, request)
             ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
-          case "/work-graph": return this.limited("work-graph", 120, 60_000, request)
-            ?? this.json(this.workGraph(url.searchParams.get("after") ?? ""));
+          case "/work-graph": {
+            const limited = this.limited("work-graph", 120, 60_000, request);
+            if (limited) return limited;
+            const since = url.searchParams.get("since");
+            if (since === null) return this.json(this.workGraph(url.searchParams.get("after") ?? ""));
+            const revision = Number(since);
+            if (!/^\d+$/.test(since) || !Number.isSafeInteger(revision)) return this.json({ error: "invalid graph revision" }, 400);
+            return this.json(this.workGraphDelta(revision));
+          }
           case "/board": return this.limited("board", 30, 60_000, request)
             ?? this.json(await this.boardPayload());
           case "/stats": {
