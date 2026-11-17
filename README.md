@@ -150,7 +150,11 @@ clamped 1–10) with the terminal stderr tail named on the release note and the
 `launch_failed` result class (score-exempt), and three consecutive dead launches
 with no healthy launch between them trip the launch circuit — the failing hosts'
 claim tokens pause, one class alarm files on the train alarm sink, and any young
-signalling launch resets it. stats carries the breaker (`launch_circuit`), the
+signalling launch resets it. The fence only takes cards whose next leg is agent
+work: a card carrying a machine wait — a merge-train queue slot, a typed
+await_event, a bound ask — is never fenced; its exit is machine-owned and the
+stall-window legs (satisfied-proxy route-to-exit, re-entry demote, hold-park)
+own its silence. stats carries the breaker (`launch_circuit`), the
 hourly fence count (`launch_failed_1h`) and per-host occupancy, so an idle slot
 read names its stall class. Diagnose slow refill using request/ingress stages,
 current starting/running slots, and durable result delivery. Increasing

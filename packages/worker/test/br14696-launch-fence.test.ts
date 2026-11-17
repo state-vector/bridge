@@ -232,6 +232,35 @@ describe("BR#14696 W1: launch-health fence", () => {
     expect((await kbJson("/get", { id: card2.id })).body.status).toBe("todo");
     expect(await fenceReleaseNote(card2.id)).toContain("at the 10m fence");
   });
+
+  it("does not fence a card under a machine hold — a live queue slot keeps its wait (BR#4067), never a launch_failed release", async () => {
+    const host = await gatewayHost("fence-hold-host");
+    const card = await claimedCard(host, 1, "Held specimen (merge-train queue slot)");
+    await canary(1);
+    // a live machine wait rides the claimed card: the train owns the exit,
+    // the dispatched session's silence is not the card's blocker
+    const stamp = await kbJson("/update", {
+      id: card.id, actor: "drill-train-stamp",
+      meta: { merge_train: { state: "queued", pr: 2400, repo: "state-vector/superpositional" } },
+    });
+    expect(stamp.status, JSON.stringify(stamp.body)).toBe(200);
+
+    // well past the 2m fence, inside the 10m stall window: held, not fenced
+    await sweep(card.status_ts + 3 * MIN);
+    expect((await kbJson("/get", { id: card.id })).body.status).toBe("in_progress");
+
+    // past the stall window too: the hold-park owns it (parks-not-releases,
+    // BR#4067) — the release would sever the live queue slot (the PR #257
+    // class); the park must keep the merge-train prefix (BR#5750/BR#4995)
+    await sweep(card.status_ts + 11 * MIN);
+    const after = (await kbJson("/get", { id: card.id })).body;
+    expect(after.status, "a held card parks blocked, it is never fenced to todo").toBe("blocked");
+    expect(String(after.meta?.blocked?.reason ?? "")).toContain("merge-train queued");
+    expect(String(after.meta?.blocked?.reason ?? "")).toContain("parked on the typed proxy, not released");
+    // and the release that never happened left no launch_failed signal
+    const events = await kbJson("/events?since=0&limit=500");
+    expect((events.body.events as any[]).some(e => e.op === "launch_failed" && e.artefact_id === card.id)).toBe(false);
+  });
 });
 
 describe("BR#14696 W1: launch circuit breaker", () => {
