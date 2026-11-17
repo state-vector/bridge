@@ -501,7 +501,7 @@ import {
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
-import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
@@ -1471,10 +1471,14 @@ export class KnowledgeHub {
         if (meta.subprocess.deadline_ts > now) continue;
         // lapsed: the declaration is a lie — fall through to abandoned below
       }
+      // Both liveness views come from one indexed read of the named session.
+      const ping = meta.session ? this.one(STALL_SESSION_PINGS_SQL, String(meta.session)) : null;
+      const sessionSignal = Number(ping?.seen ?? 0);
+      const workerPing = Number(ping?.worker_seen ?? 0);
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
         meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
-        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
+        sessionSignal, // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
       );
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
@@ -1483,7 +1487,7 @@ export class KnowledgeHub {
       // Repair pre-BR#6839 phantom claims even when a train/board write just
       // refreshed updated_ts. Only the actual worker's signals prove liveness;
       // another duty's progress and a bounce itself do not start a writer.
-      const workerSignal = Math.max(meta.session_alive_ts ?? 0, this.sessionPing(meta, true),
+      const workerSignal = Math.max(meta.session_alive_ts ?? 0, workerPing,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0);
       if (meta.merge_train?.state === "bounced" && !this.executionState(String(r.id))?.attempt &&
           !meta.interactive_execution && now - workerSignal > staleMs) {
@@ -1507,7 +1511,7 @@ export class KnowledgeHub {
       // claimable either way.
       const firstSignal = Math.max(
         meta.session_alive_ts ?? 0,
-        this.sessionPing(meta),
+        sessionSignal,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0,
       );
       const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
@@ -3985,7 +3989,7 @@ export class KnowledgeHub {
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
     }
-    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA + STALL_SESSION_LOOKUP_SCHEMA + BREACH_CARD_LOOKUP_SCHEMA);
 
     // sessions.kind backfill: gateway identity via the local token registry
     try {
@@ -5258,8 +5262,9 @@ export class KnowledgeHub {
     shaped.row_bytes = shaped.meta_bytes + utf8Bytes(String((row as any).title ?? "")) + utf8Bytes(String((row as any).body_md ?? ""))
       + utf8Bytes(String((row as any).tags ?? "")) + utf8Bytes(String((row as any).roles ?? ""));
     if (row.type === "task") {
-      shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
-      shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
+      const execution = this.executionState(id);
+      shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements, execution);
+      shaped.execution = projectExecutionModel(execution, { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
     }
     const admissions = this.state.storage.sql.exec(`SELECT record FROM delivery_admissions WHERE review_id=? OR json_extract(record,'$.task_id')=?`, id, id).toArray().map(r => JSON.parse(String(r.record)) as DeliveryAdmission);
     return { ...shaped, delivery_admissions: admissions };
@@ -5781,8 +5786,7 @@ export class KnowledgeHub {
     return (!ignoreStartup && !!this.startupWait(id)) || isExecutionWait(meta) || (h && h.phase !== "none" && h.phase !== "returned");
   }
 
-  private executionSchedulingRequirements(id: string, fallback: unknown) {
-    const state = this.executionState(id);
+  private executionSchedulingRequirements(id: string, fallback: unknown, state = this.executionState(id)) {
     return this.executionWork().schedulingRequirements(id, state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {}), state ?? undefined);
   }
 
@@ -9426,16 +9430,11 @@ export class KnowledgeHub {
    *  predated the predecessor card's close). */
   private async foldBreaches(taskId: string) {
     const since = Date.now() - BREACH_WINDOW_MS * 8; // look back several windows
-    const rows = this.state.storage.sql.exec(
-      `SELECT ts, op, detail FROM events WHERE artefact_id = ? AND ts > ?
-        AND op IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch')
-        ORDER BY seq ASC LIMIT 200`,
-      taskId, since,
-    ).toArray() as any[];
+    const rows = this.state.storage.sql.exec(BREACH_EVENTS_SQL, taskId, since).toArray();
     if (!rows.length) return;
     const events = rows.map((r) => {
       let d: any = {};
-      try { d = JSON.parse(r.detail ?? "{}"); } catch { /* tolerate junk detail */ }
+      try { d = JSON.parse(String(r.detail ?? "{}")); } catch { /* tolerate junk detail */ }
       const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
       return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
     });
@@ -9445,12 +9444,11 @@ export class KnowledgeHub {
     const openKeys = new Set<string>();
     const highWater = new Map<string, number>(); // key → newest already-folded event ts
     const openCards = new Map<string, { id: string; meta: string; stamped: number }>();
-    for (const b of this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts, created_ts FROM artefacts WHERE type = 'task' AND meta LIKE ?`,
-      `%"breach_key":"${taskId}|%`,
-    ).toArray() as any[]) {
+    // The separator is ASCII |, immediately before }. This prefix range
+    // also finds legacy rows that only carry breach_key.
+    for (const b of this.state.storage.sql.exec(BREACH_CARDS_SQL, `${taskId}|`, `${taskId}}`).toArray()) {
       let m: any = {};
-      try { m = JSON.parse(b.meta ?? "{}"); } catch { /* garbage meta is not a breach */ }
+      try { m = JSON.parse(String(b.meta ?? "{}")); } catch { /* garbage meta is not a breach */ }
       const key = m?.breach_key;
       if (typeof key !== "string") continue;
       if (b.status === "done" || b.status === "superseded") {

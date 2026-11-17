@@ -13,7 +13,7 @@ interface TaskRow { id: string; title: string; project: string; status: string; 
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
 interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" }; blocked?: unknown; session?: string; [key: string]: unknown }
 interface HostInventory { tokenId: string; host: string; capabilities: ExecutorCapabilities; observed_at: number;
-  active: number; occupancy: ReturnType<typeof gatewayOccupancy>["occupancy"] }
+  active: number; occupancy?: ReturnType<typeof gatewayOccupancy>["occupancy"] }
 /** BR#14761: already-fetched artefact columns a page holds in hand. Passing
  *  them down keeps tier selection on hostsBare and avoids reloading the
  *  artefact when testing task-specific startup fences — the same BR#14767 dispatch-sweep pattern,
@@ -101,7 +101,7 @@ export class ExecutionWork {
     floor = maxTier(floor, state?.attempt?.executor?.tier ?? "small");
     floor = maxTier(floor, state?.retry_strategy?.minimum_tier ?? "small");
     if (state?.attempt) return { ...required, tier: floor };
-    const selection = selectModelTier({ lane, policy: this.policySnapshot ?? this.modelPolicy(), required: { ...required, tier: floor }, hosts: row ? this.hostsBare() : this.hosts(id), project: r.project, now: Date.now() });
+    const selection = selectModelTier({ lane, policy: this.policySnapshot ?? this.modelPolicy(), required: { ...required, tier: floor }, hosts: row ? this.hostsBare() : this.hosts(id, false), project: r.project, now: Date.now() });
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
@@ -109,7 +109,7 @@ export class ExecutionWork {
     const task = this.task(id); const state = this.state(task);
     if (!["in_review", "in_progress"].includes(task.status) || (state.attempt && state.attempt.phase !== "quiesced") || !["none", "returned"].includes(state.handoff.phase)) throw new Error("gate: stronger implementation verdict requires an idle delivered parent, not a live writer or local handoff");
     const current = state.delivery?.tier ?? state.attempt?.executor?.tier ?? state.requirements.tier;
-    const tier = nextAvailableTier(current, availableModelTiers(this.hosts(id), state.requirements, task.project, Date.now()));
+    const tier = nextAvailableTier(current, availableModelTiers(this.hosts(id, false), state.requirements, task.project, Date.now()));
     if (!tier) throw new Error("gate: no larger model tier is available; report findings or an explicit unmet tier requirement instead");
     if (!apply) return tier;
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
@@ -158,16 +158,16 @@ export class ExecutionWork {
     this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
     this.audit(token.label, "interactive_claim", id, { session, checkpoint: state.attempt?.checkpoint?.commit ?? null });
   }
-  private hostInventory(): HostInventory[] {
+  private hostInventory(includeOccupancy = true): HostInventory[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => {
-      const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label));
+      const n = includeOccupancy ? gatewayOccupancy(this.sql, String(row.token_id), String(row.label)) : null;
       return {
       tokenId: String(row.token_id), host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
-        active: n.active + n.reserved, occupancy: n.occupancy,
+        active: n ? n.active + n.reserved : 0, occupancy: n?.occupancy,
      }; });
   }
-  private hosts(taskId?: string, columns?: TaskColumns): CapabilityObservation[] {
-    const inventory = this.hostSnapshot?.() ?? this.hostInventory();
+  private hosts(taskId: string, includeOccupancy = true, columns?: TaskColumns): CapabilityObservation[] {
+    const inventory = this.hostSnapshot?.() ?? this.hostInventory(includeOccupancy);
     if (!inventory.length) return [];
     const rejections = new Map<string, Set<string>>();
     if (taskId) for (const row of this.sql.exec(
@@ -211,7 +211,7 @@ export class ExecutionWork {
   }
   private hostsBare(): CapabilityObservation[] {
     if (this.hostSnapshot && this.hostsBareCache) return this.hostsBareCache;
-    const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
+    const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory(false)).map(({ tokenId, ...host }) => ({ ...host,
       readiness: this.hostReadiness(tokenId, host.host, host.capabilities) }));
     if (this.hostSnapshot) this.hostsBareCache = value;
     return value;
@@ -235,7 +235,7 @@ export class ExecutionWork {
     });
     const startup_wait = this.startupWait(id);
     return { requirements, blockers, startup_wait, model_policy: this.modelPolicy(),
-      next_available_tier: nextAvailableTier(state.attempt?.executor?.tier ?? state.requirements.tier, availableModelTiers(this.hosts(id), requirements, task.project, Date.now())),
+      next_available_tier: nextAvailableTier(state.attempt?.executor?.tier ?? state.requirements.tier, availableModelTiers(this.hosts(id, false), requirements, task.project, Date.now())),
       phase: startup_wait ? "unavailable" : capability?.kind === "capability_unavailable" ? capability.reason : capability?.kind === "executor_not_ready" ? "executor_not_ready"
       : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts };
   }
@@ -253,7 +253,7 @@ export class ExecutionWork {
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
     const requirements = state.requirements;
-    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id, columns), asks: this.asks(task.id), now, local });
+    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id, true, columns), asks: this.asks(task.id), now, local });
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
     const meta: TaskMeta = JSON.parse(task.meta || "{}");

@@ -12,3 +12,22 @@ export const TASK_HISTORY_SQL = `SELECT seq, ts, actor, action, summary, data FR
 export const LAST_ACTOR_SIGNAL_SQL = `SELECT MAX(ts) AS ts FROM events WHERE artefact_id = ? AND actor = ?`;
 export const LAST_NUDGE_SQL = `SELECT ts FROM events WHERE artefact_id = ? AND op = 'nudge' ORDER BY ts DESC LIMIT 1`;
 export const RECENT_PROGRESS_SQL = `SELECT actor, data FROM artefact_versions WHERE action = 'progress' AND ts >= ?`;
+
+export const STALL_SESSION_LOOKUP_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS idx_session_name_ping ON sessions(name,last_seen_ts DESC,kind);
+`;
+export const STALL_SESSION_PINGS_SQL = `SELECT MAX(last_seen_ts) AS seen,
+  MAX(CASE WHEN COALESCE(kind,'') <> 'gateway' THEN last_seen_ts END) AS worker_seen
+  FROM sessions WHERE name=?`;
+
+export const BREACH_CARD_LOOKUP_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS idx_breach_card_key ON artefacts(json_extract(meta,'$.breach_key'))
+  WHERE type='task' AND json_extract(meta,'$.breach_key') IS NOT NULL;
+`;
+export const BREACH_CARDS_SQL = `SELECT id,status,meta,status_ts,created_ts FROM artefacts
+  WHERE type='task' AND json_extract(meta,'$.breach_key')>=? AND json_extract(meta,'$.breach_key')<?`;
+
+export const BREACH_EVENTS_SQL = `SELECT ts,action AS op,data AS detail
+  FROM ledger INDEXED BY idx_ledger_card_action_time WHERE artefact_id=? AND kind='signal'
+    AND action IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch') AND ts>?
+  ORDER BY seq ASC LIMIT 200`;

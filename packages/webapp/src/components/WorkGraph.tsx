@@ -3,10 +3,10 @@ import { kbApi, type KbGraphTask } from "@bridge/ui-kit";
 import "./WorkGraph.css";
 
 type Exit = KbGraphTask["work_waits"][number]["exit"];
-type Node = { id: string; title: string; label: string; card?: KbGraphTask };
+type Node = { id: string; title: string; label: string; card?: KbGraphTask; blocker?: string };
 type Edge = { from: string; to: string; label: string };
 const width = 248;
-const height = 76;
+const height = 92;
 const columnGap = 76;
 const rowGap = 18;
 
@@ -58,17 +58,32 @@ function makeGraph(tasks: KbGraphTask[]) {
   for (const card of ordered) addNode({ id: card.id, title: card.title, label: `${card.id} · ${words(card.status)}`, card });
   for (const card of ordered) {
     if (card.part_of) addEdge(card.part_of, card.id, "Contains child work");
+    const conditions: string[] = [];
     for (const { exit } of card.work_waits) {
       const [title, target] = describe(exit);
       const id = `event:${JSON.stringify(exit)}`;
-      addNode({ id, title, label: "Event" });
+      conditions.push(title);
+      addNode({ id, title, label: target && nodes.has(target) ? "Card event" : "Condition" });
       addEdge(card.id, id, "Waits for");
       if (target) addEdge(id, target, "Depends on card");
     }
     if (card.condition) {
       const id = `condition:${card.id}`;
+      conditions.push(card.condition);
       addNode({ id, title: card.condition, label: "Condition" });
       addEdge(card.id, id, "Waits for");
+    }
+    if (card.status === "blocked") {
+      const node = nodes.get(card.id)!;
+      const distinct = [...new Set(conditions)];
+      if (distinct.length) {
+        node.blocker = distinct.length > 1 ? `${distinct[0]} (+${distinct.length - 1})` : distinct[0];
+      } else {
+        node.blocker = "No unblock condition recorded";
+        const id = `missing-condition:${card.id}`;
+        addNode({ id, title: node.blocker, label: "Missing condition" });
+        addEdge(card.id, id, "Missing unblock condition");
+      }
     }
   }
   const groups: Node[][] = [];
@@ -93,7 +108,7 @@ function makeGraph(tasks: KbGraphTask[]) {
 }
 
 function NodeButton({ node, openCard }: { node: Node; openCard: (id: string) => void }) {
-  const content = <><span>{node.label}</span><strong>{node.title}</strong></>;
+  const content = <><span>{node.label}</span><strong>{node.title}</strong>{node.blocker && <small className="work-graph-blocker" title={node.blocker}>{node.blocker}</small>}</>;
   return node.card
     ? <button type="button" className="work-graph-node" data-status={node.card.status} title={node.title} onClick={() => openCard(node.id)}>{content}</button>
     : <div className="work-graph-node work-graph-condition" title={node.title}>{content}</div>;
