@@ -895,7 +895,7 @@ describe("effects decided executor-side (F4)", () => {
     const capped = baseCtx();
     capped.openUnblockChild = () => ({ id: "BR#50" });
     const v2 = ok(await decide(input(typedBlock()), capped));
-    expect(v2.effects).toEqual([{ kind: "skip_unblock_spawn", parent: "BR#1", reason: "existing unblock child BR#50 reused" }]);
+    expect(v2.effects).toEqual([{ kind: "skip_unblock_spawn", parent: "BR#1", reason: "existing unblock child BR#50 reused", reuse: true }]);
 
     const flooded = input(typedBlock({
       unblock_condition: "PR https://github.com/a/b/pull/9 merged",
@@ -907,8 +907,10 @@ describe("effects decided executor-side (F4)", () => {
     // BR#4282: a flood skip is the dedup WORKING, not a spawn attempt — the
     // flag lets the executor audit it without folding a breach card.
     expect((v3.effects[0] as any).flood).toBe(true);
-    // the CAP skip is a different beast — a live child owns the round
+    // the CAP skip is a different beast — a live child owns the round, and
+    // BR#15833: the reuse skip carries its own flag for the same reason
     expect((v2.effects[0] as any).flood).toBeUndefined();
+    expect((v2.effects[0] as any).reuse).toBe(true);
 
     // a DIFFERENT exit condition is a new round, not a flood repeat
     const freshExit = input({
@@ -1331,6 +1333,21 @@ describe("breach fold (dedupe by task+class)", () => {
       ev(n, "BR#7", "unblock spawner cap (5 rounds, cap 3) — escalation already filed", "spawn_cap_skipped"));
     expect(detectBreaches(ticks, new Set())).toHaveLength(0);
     expect(detectBreaches(ticks, new Set(["BR#7|spawn-while-open"]))).toHaveLength(0);
+  });
+
+  it("spawn_child_reused never folds — the reuse skip is the dedup working (BR#15833)", () => {
+    // The one-open-child reuse skip used to be the LAST skip arm that still
+    // audited foldable spawn_skipped: every re-park of a parent whose unblock
+    // child was still open raised a threshold-1 spawn-while-open card on the
+    // dedup's own working (specimen BR#15616: the human-signoff re-park loop
+    // reused unblock child BR#15829 and the fold raised breach BR#15833).
+    // BR#15833 moves the reuse arm to observable-only (spawn_child_reused),
+    // the BR#4282/BR#4702 law. A FOLDABLE spawn_skipped row (a legacy row or
+    // a future regression) must keep folding — the pin above holds that.
+    const reuse = [0, 1, 2, 3, 4, 5].map((n) =>
+      ev(n, "BR#8", "existing unblock child BR#50 reused", "spawn_child_reused"));
+    expect(detectBreaches(reuse, new Set())).toHaveLength(0);
+    expect(detectBreaches(reuse, new Set(["BR#8|spawn-while-open"]))).toHaveLength(0);
   });
 
   it("replay mismatches breach immediately — one corrupted fold is never noise", () => {

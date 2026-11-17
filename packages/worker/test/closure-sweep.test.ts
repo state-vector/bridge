@@ -1138,6 +1138,70 @@ describe("BR#4702 — capped re-attempts under a standing escalation are observa
   });
 });
 
+// ---------- (g2) BR#15833 — the one-open-child reuse skip audits spawn_child_reused, never a breach card ----------
+
+describe("BR#15833 — a re-park whose unblock child is still open REUSES the round, audited observable-only", () => {
+  it("parking with an open unblock child reuses it (no second duty), audits spawn_child_reused (not foldable spawn_skipped), and raises NO spawn-while-open card (specimen BR#15616)", async () => {
+    // 1. the parent: a qualified impl card, in_progress. The specimen shape
+    //    (BR#15616): an unblock child was minted WHILE the parent sat
+    //    in_progress — production was the proxy-watch consumed-wait fallback
+    //    (BR#14544) spawning BR#15829 at 03:28:57Z; the drill mints the same
+    //    shape directly. The park gate reads the SHAPE (an open unblock-role
+    //    child_of), not the spawner. Note the park-path detour
+    //    (blocked → in_progress → blocked) can NOT reach the reuse branch:
+    //    any →in_progress/todo supersedes open children (machine.ts) — the
+    //    reuse arm only fires for a child that appeared outside that law.
+    const c = await kbJson("/create", { type: "task", title: "IMPL: br15833 drill", qualified: true, session: "drill-exec-br15833" });
+    expect(c.status).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br15833", session: "drill-exec-br15833" });
+    const kid = await kbJson("/create", {
+      type: "task", title: "Unblock: IMPL: br15833 drill", roles: ["unblock"], session: "drill-sweep-br15833",
+      body_md: `Unblock duty for ${id} (drill: sweep-fallback-shaped open child, BR#15833).`,
+      meta: { machine_duty: { by: "drill-sweep-br15833", kind: "unblock", subject: id } },
+    });
+    expect(kid.status, `child create failed: ${JSON.stringify(kid.body)}`).toBe(200);
+    const kidId = String(kid.body.id);
+    const link = await kbJson("/link", { src: kidId, relation: "child_of", dst: id });
+    expect(link.status, `link failed: ${JSON.stringify(link.body)}`).toBe(200);
+
+    // 2. the re-park: in_progress → blocked with the child OPEN. Pre-BR#15833
+    //    this reuse arm audited foldable spawn_skipped → a threshold-1
+    //    spawn-while-open card rose on the dedup's own working (breach card
+    //    BR#15833, sample "existing unblock child BR#15829 reused").
+    const before = await kbJson(`/events?since=0&limit=1`);
+    const cursor = Number(before.body?.last_seq ?? 0);
+    const parked = await block(id, "drill-exec-br15833", "Exit A: PR https://github.com/a/b/pull/41 merged", "parked while the sweep-fallback child is open");
+    expect(parked.status, `park failed: ${JSON.stringify(parked.body)}`).toBe(200);
+
+    // 3. the dedup held: still exactly ONE open unblock child — no second
+    //    duty was spawned for this parent.
+    const rounds = (await unblockDuties()).filter((x: any) =>
+      x.title.startsWith("Unblock: IMPL: br15833 drill") && ["todo", "in_progress", "blocked"].includes(x.status));
+    expect(rounds, `duplicate duty spawned: ${JSON.stringify(rounds.map((r: any) => [r.id, r.status]))}`).toHaveLength(1);
+    expect(rounds[0].id).toBe(kidId);
+
+    // 4. the audit is observable-only: spawn_child_reused on the parent,
+    //    zero foldable spawn_skipped rows (incremental window from the
+    //    pre-park cursor — deterministic, not the newest-200 race).
+    const evs = (((await kbJson(`/events?since=${cursor}&limit=500`)).body ?? {}) as any).events ?? [];
+    expect(evs.filter((e: any) => e.op === "spawn_child_reused" && e.artefact_id === id),
+      "the reuse must audit spawn_child_reused").toHaveLength(1);
+    expect(evs.filter((e: any) => e.op === "spawn_skipped" && e.artefact_id === id),
+      "no foldable spawn_skipped may remain on the reuse path").toHaveLength(0);
+
+    // 5. run the fold over the audit stream (a rejected transition folds its
+    //    subject; blocked → done is an illegal edge, so this rejection is
+    //    safe): NO spawn-while-open card may rise — the dedup's own reuse is
+    //    the system working, never a breach (the BR#4282/BR#4702 law).
+    const rejected = await kbJson("/transition", { id, to: "done", actor: "drill-exec-br15833", note: "no receipts — must be rejected to trigger the fold" });
+    expect(rejected.status, "blocked → done must be rejected").toBeGreaterThanOrEqual(400);
+    const breaches = ((await kbJson("/list", { type: "task", tag: "breach", limit: 200 })).body?.artefacts ?? [])
+      .filter((a: any) => String(a.meta?.breach_task ?? "") === id);
+    expect(breaches, `breach cards leaked: ${JSON.stringify(breaches.map((b: any) => [b.id, b.meta?.breach_key]))}`).toHaveLength(0);
+  });
+});
+
 // ---------- (h) BR#6518 — a depth-capped card entering in_review gets a DETACHED verify duty, not a stranded review leg ----------
 
 describe("BR#6518 — the depth guard reroutes the verify round instead of dropping it", () => {

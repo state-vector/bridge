@@ -8834,6 +8834,18 @@ export class KnowledgeHub {
             this.audit(actor, "spawn_flood_skipped", id, { auto: "unblock", reason: fx.reason });
             break;
           }
+          if (fx.reuse) {
+            // BR#15833: a reuse skip is the one-open-child dedup WORKING —
+            // the existing unblock round already owns this exit, no second
+            // child is spawned. Audit observably (spawn_child_reused, not in
+            // the fold's op list), never fold a breach card: pre-fix this arm
+            // audited foldable spawn_skipped, so every re-park of a parent
+            // whose child was still open raised a threshold-1
+            // spawn-while-open card on the dedup's own working (specimen
+            // BR#15616 → breach BR#15833; the BR#4282/BR#4702 law again).
+            this.audit(actor, "spawn_child_reused", id, { auto: "unblock", reason: fx.reason });
+            break;
+          }
           this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
           try { await this.foldBreaches(id); } catch { /* the breach door never blocks the gate */ }
           break;
