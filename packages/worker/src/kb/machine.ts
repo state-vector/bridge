@@ -261,7 +261,7 @@ export type Effect =
   | { kind: "reuse_verify"; parent: string; verify: string }
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
-  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean }
+  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean; reuse?: boolean }
   | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "interactive_handoff"; previous_attempt: unknown }
@@ -999,7 +999,16 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   ) {
     const open = await c.openUnblockChild();
     if (open) {
-      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open.id} reused` });
+      // BR#15833: a reuse skip is the ONE-OPEN-CHILD dedup WORKING — the
+      // existing round already owns this exit, no second child is spawned.
+      // The flag lets the executor audit it observably (spawn_child_reused)
+      // without folding a breach card: pre-fix the reuse arm was the last
+      // skip that still audited foldable spawn_skipped, so every re-park of
+      // a parent whose child was still open raised a threshold-1
+      // spawn-while-open card on the dedup's own working (specimen BR#15616:
+      // the human-signoff re-park loop reused unblock child BR#15829 and the
+      // fold raised BR#15833 on exactly that reuse).
+      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open.id} reused`, reuse: true });
     } else {
       const exit = String(i.body?.unblock_condition ?? "").trim();
       const last = meta.last_unblock_spawn;

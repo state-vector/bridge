@@ -1535,7 +1535,12 @@ audited without folding a breach card, and a resume consumes the unblock round s
 silence issues one fresh round instead of flooding for an hour. The spawner cap re-suppresses
 the same way (BR#4702): once the BR#2893 escalation stands, further capped attempts audit
 `spawn_cap_skipped` without folding a breach card — the escalation, not a per-tick breach
-card, carries the recurring block to the human ledger. The verify spawn's nesting guard
+card, carries the recurring block to the human ledger. The one-open-child reuse skip plays
+the same law (BR#15833): a re-park whose unblock child is still open reuses the round —
+no second duty — and audits `spawn_child_reused` without folding a breach card (pre-fix it
+was the last skip auditing foldable `spawn_skipped`, so every such re-park raised a
+threshold-1 spawn-while-open card on the dedup's own working; specimen BR#15616 → breach
+BR#15833). The verify spawn's nesting guard
 plays the same law (BR#6518): the BR#532 depth cap (`child_of` chains ≤ 3) used to make a
 depth-capped card entering `in_review` skip the verify spawn outright — no review leg ever
 existed, the card sat in review believing a verifier was coming, and the skip folded a
