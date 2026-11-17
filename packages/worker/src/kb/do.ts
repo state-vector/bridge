@@ -501,7 +501,7 @@ import {
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
-import { STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { STALL_SWEEP_PAGE_SIZE, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
@@ -817,7 +817,7 @@ export class KnowledgeHub {
     // method (stallSweep below) so the admin.stall_sweep drill runs it in
     // isolation, mirroring admin.unblock_proxy_sweep.
     await this.maintenanceCheckpoint(trace, "task.maintenance");
-    await this.stallSweep(now0);
+    await this.stallSweep(now0, trace);
     // (A1) BR#5226 awaiting-park re-evaluation — the migration + steady-state
     // pass: every Awaiting park whose anchored accepted verdict covers the
     // head it parked on re-queues (the machine verdict IS the review);
@@ -1414,15 +1414,27 @@ export class KnowledgeHub {
     return applied;
   }
 
-  private async stallSweep(nowIn: number) {
+  private async *stallCandidates(trace?: RequestTrace) {
+    const end = Number(this.one("SELECT MAX(rowid) AS cursor FROM artefacts")?.cursor ?? 0);
+    let cursor = 0;
+    while (cursor < end) {
+      const page = this.state.storage.sql.exec<{
+        cursor: number; id: string; status: string; owner: string; title: string;
+        meta: string; status_ts: number | null; updated_ts: number;
+      }>(STALL_SWEEP_PAGE_SQL, cursor, end).toArray();
+      for (const row of page) yield row;
+      if (page.length < STALL_SWEEP_PAGE_SIZE) return;
+      cursor = page[page.length - 1].cursor;
+      // The next page reads fresh rows after yielding. No transaction,
+      // pending transition, or eligibility decision crosses this checkpoint.
+      await this.maintenanceCheckpoint(trace, "task.maintenance");
+    }
+  }
+
+  private async stallSweep(now: number, trace?: RequestTrace) {
     const staleMin = this.staleMinutes();
     const staleMs = staleMin * 60_000;
-    const now = nowIn;
-    const rows = this.state.storage.sql.exec(
-      `SELECT id, status, owner, title, meta, status_ts, updated_ts FROM artefacts
-       WHERE type = 'task' AND status = 'in_progress'`,
-    ).toArray();
-    for (const r of rows as any[]) {
+    for await (const r of this.stallCandidates(trace)) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
       if (this.protectedExecution(String(r.id), meta)) continue;

@@ -15,10 +15,17 @@ export const RECENT_PROGRESS_SQL = `SELECT actor, data FROM artefact_versions WH
 
 export const STALL_SESSION_LOOKUP_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_session_name_ping ON sessions(name,last_seen_ts DESC,kind);
+  CREATE INDEX IF NOT EXISTS idx_stall_sweep_active ON artefacts(type)
+    WHERE type='task' AND status='in_progress';
 `;
 export const STALL_SESSION_PINGS_SQL = `SELECT MAX(last_seen_ts) AS seen,
   MAX(CASE WHEN COALESCE(kind,'') <> 'gateway' THEN last_seen_ts END) AS worker_seen
   FROM sessions WHERE name=?`;
+
+export const STALL_SWEEP_PAGE_SIZE = 4;
+export const STALL_SWEEP_PAGE_SQL = `SELECT rowid AS cursor,id,status,owner,title,meta,status_ts,updated_ts
+  FROM artefacts INDEXED BY idx_stall_sweep_active
+  WHERE type='task' AND status='in_progress' AND rowid>? AND rowid<=? ORDER BY rowid LIMIT ${STALL_SWEEP_PAGE_SIZE}`;
 
 export const BREACH_CARD_LOOKUP_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_breach_card_key ON artefacts(json_extract(meta,'$.breach_key'))

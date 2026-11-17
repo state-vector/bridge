@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA } from "../src/kb/ledger-query";
+import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA } from "../src/kb/ledger-query";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
@@ -85,7 +85,8 @@ describe("canonical ledger lookups with retained unrelated receipts", () => {
 
 
 it("reads only the named session and preserves all-session and worker-only signals", async () => {
-  await query(`CREATE TABLE sessions(token_id TEXT,name TEXT,last_seen_ts INTEGER,kind TEXT,UNIQUE(token_id,name));
+  await query(`CREATE TABLE artefacts(id TEXT,type TEXT,status TEXT,owner TEXT,title TEXT,meta TEXT,status_ts INTEGER,created_ts INTEGER,updated_ts INTEGER);
+    CREATE TABLE sessions(token_id TEXT,name TEXT,last_seen_ts INTEGER,kind TEXT,UNIQUE(token_id,name));
     WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12000)
     INSERT INTO sessions SELECT 'token','unrelated-'||i,i,'worker' FROM n;
     INSERT INTO sessions VALUES
@@ -107,13 +108,28 @@ it("folds only this card's breach signals and finds closed and legacy breach car
   const events = await query(BREACH_EVENTS_SQL, ["BR#42", 100]);
   expect(events.rows.map(row => row.ts)).toEqual([300, 200]);
   expect(events.reads).toBeLessThan(20);
-  await query(`CREATE TABLE artefacts(id TEXT,type TEXT,status TEXT,meta TEXT,status_ts INTEGER,created_ts INTEGER);
-    WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12000)
-    INSERT INTO artefacts SELECT 'unrelated-'||i,'task','done',json_object('breach_key','other|'||i),0,0 FROM n;
-    INSERT INTO artefacts VALUES ('legacy','task','done','{"breach_key":"BR#42|scope"}',0,0),
+  await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12000)
+    INSERT INTO artefacts(id,type,status,meta,status_ts,created_ts)
+      SELECT 'unrelated-'||i,'task','done',json_object('breach_key','other|'||i),0,0 FROM n;
+    INSERT INTO artefacts(id,type,status,meta,status_ts,created_ts) VALUES ('legacy','task','done','{"breach_key":"BR#42|scope"}',0,0),
       ('open','task','todo','{"breach_key":"BR#42|state"}',0,0),('wrong','task','todo','{"breach_key":"BR#420|state"}',0,0);`);
   await query(BREACH_CARD_LOOKUP_SCHEMA);
   const cards = await query(BREACH_CARDS_SQL, ["BR#42|", "BR#42}"]);
   expect(cards.rows.map(row => row.id).sort()).toEqual(["legacy", "open"]);
   expect(cards.reads).toBeLessThan(10);
+});
+
+
+it("seeks only active rows, with a stable cursor and bounded pages", async () => {
+  await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12)
+    INSERT INTO artefacts(id,type,status) SELECT 'running-'||i,'task','in_progress' FROM n`);
+  const end = await query("SELECT MAX(rowid) AS cursor FROM artefacts");
+  const limit = Number(end.rows[0].cursor);
+  const first = await query(STALL_SWEEP_PAGE_SQL, [0, limit]);
+  expect(first.rows.map(row => row.id)).toEqual(["running-1", "running-2", "running-3", "running-4"]);
+  expect(first.reads).toBeLessThan(12);
+  await query("UPDATE artefacts SET status='done' WHERE id='running-5'");
+  const second = await query(STALL_SWEEP_PAGE_SQL, [Number(first.rows.at(-1)!.cursor), limit]);
+  expect(second.rows.map(row => row.id)).toEqual(["running-6", "running-7", "running-8", "running-9"]);
+  expect(second.reads).toBeLessThan(12);
 });
