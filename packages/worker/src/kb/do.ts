@@ -1589,7 +1589,15 @@ export class KnowledgeHub {
       // NEWER than the claim (skew-tolerant) proves the run came up.
       const launchSignal = firstSignal > claimedAt + LAUNCH_SIGNAL_SKEW_MS ? firstSignal : 0;
       if (launchSignal > 0 && now - claimedAt < LAUNCH_HEALTHY_LAUNCH_WINDOW_MS) healthyLaunch = true;
-      if (launchSignal === 0 && now - claimedAt > fenceMs) {
+      if (launchSignal === 0 && now - claimedAt > fenceMs && !releaseHold(meta)) {
+        // The hold exemption (BR#4067): a card carrying machine-wait state —
+        // a merge-train queue slot, a typed await_event, a bound ask — is NOT
+        // waiting on its dispatched session; its exit is machine-owned and the
+        // stale-window legs below own its silence (the BR#4282 satisfied-proxy
+        // route-to-exit, the BR#4494/5750 re-entry demote, the hold-park).
+        // Fencing those would sever the live wait to re-dispatch an agent
+        // nobody needs — the PR #257 release-severs-queue-slot class, observed
+        // as the closure-sweep regressions on the first fenced candidate.
         const stderrTail = this.launchTerminalStderr(String(r.id));
         // The circuit pauses the failing HOST's gateway claim token — read
         // BEFORE the release transition (doTransition deletes the claim row).
