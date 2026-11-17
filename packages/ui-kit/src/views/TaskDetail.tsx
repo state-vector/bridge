@@ -307,6 +307,23 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#16195: the human sign-off click — the done edge the sign-off fence
+  // reserves for humans. role:human cards rest in_review with their accepted
+  // verdict bound (BR#15659): machine closes are refused by design (machine.ts
+  // human-signoff-done), so THIS click is the one legal close. It rides the
+  // human web plane — the worker stamps actor `web:<login>` (HUMAN_ACTOR) —
+  // and every gate the card already owes (accepted review, bound
+  // execution_result) is re-checked server-side; any refusal renders inline.
+  const signOff = async () => {
+    setBusy(true);
+    try {
+      await kbApi.transition(task.id, "done", { note: "done — human sign-off (web plane, BR#15659 law)" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "sign-off failed"); useKb.getState().reportError("human sign-off", e); } finally {
+      setBusy(false);
+    }
+  };
   // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
   // force-review — approve re-anchors the verdict at the parked head and
   // re-queues the train; request_changes bounces impl. No ask was filed;
@@ -427,6 +444,29 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             >Take over claim</Btn>
             <span className="muted-note">
               held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
+            </span>
+            {cardErr && <span className="k-err">{cardErr}</span>}
+          </div>
+        </div>
+      )}
+      {/* BR#16195: the Done control — the human sign-off row. A role:human card
+          in in_review is the BR#15659 designed hold: the machine close is
+          fence-refused (human-signoff-done) and the card waits for exactly this
+          click from the logged-in human authority. The row renders ONLY here —
+          role:human cards, in_review, human web plane — so non-authorised
+          viewers (any non-human plane; cards without the human role) still see
+          no Done, and the fence itself is untouched (their transition attempt
+          is still refused server-side, failing loudly per ADR BR#2673). */}
+      {!m.blocked && task.type === "task" && task.status === "in_review" && (task.roles ?? []).includes("human") && (
+        <div className="task-blocked-info" style={{ marginBottom: 6 }}>
+          <div className="row" style={{ marginTop: 0 }}>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title="Sign off: your click is the legal done edge for this card (BR#15659). The machine close stays fence-refused; your accepted verdict stays bound and the card closes as human-authoritative delivery."
+              onClick={() => void signOff()}
+            >Done — sign off</Btn>
+            <span className="muted-note">
+              human sign-off (BR#15659): this card rests in_review until you mark it done — machine closes are refused by design; your web click is the one legal close.
             </span>
             {cardErr && <span className="k-err">{cardErr}</span>}
           </div>
