@@ -502,6 +502,7 @@ import {
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
 import { STALL_SWEEP_PAGE_SIZE, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { ARTEFACT_SEARCH_SCHEMA, ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL, ARTEFACT_SEARCH_MIGRATION_SQL } from "./artefact-search-schema";
 import { BOARD_INDEX_SCHEMA, BOARD_RECENT_IDS_SQL } from "./board-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
@@ -3567,21 +3568,7 @@ export class KnowledgeHub {
         PRIMARY KEY (src_id, relation, dst_id)
       );
       -- events: now a VIEW over ledger (migration below)
-      CREATE VIRTUAL TABLE IF NOT EXISTS artefacts_fts USING fts5(
-        title, body_md, content='artefacts', content_rowid='rowid'
-      );
-      CREATE TRIGGER IF NOT EXISTS artefacts_ai AFTER INSERT ON artefacts BEGIN
-        INSERT INTO artefacts_fts(rowid, title, body_md) VALUES (new.rowid, new.title, new.body_md);
-      END;
-      CREATE TRIGGER IF NOT EXISTS artefacts_ad AFTER DELETE ON artefacts BEGIN
-        INSERT INTO artefacts_fts(artefacts_fts, rowid, title, body_md)
-          VALUES ('delete', old.rowid, old.title, old.body_md);
-      END;
-      CREATE TRIGGER IF NOT EXISTS artefacts_au AFTER UPDATE ON artefacts BEGIN
-        INSERT INTO artefacts_fts(artefacts_fts, rowid, title, body_md)
-          VALUES ('delete', old.rowid, old.title, old.body_md);
-        INSERT INTO artefacts_fts(rowid, title, body_md) VALUES (new.rowid, new.title, new.body_md);
-      END;
+      ${ARTEFACT_SEARCH_SCHEMA}
       CREATE TABLE IF NOT EXISTS auth_tokens (
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL UNIQUE,
@@ -3927,6 +3914,9 @@ export class KnowledgeHub {
       `ALTER TABLE train_check_retries ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''`,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    }
+    if (this.one(ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL)) {
+      this.state.storage.transactionSync(() => this.state.storage.sql.exec(ARTEFACT_SEARCH_MIGRATION_SQL));
     }
     this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA + BOARD_INDEX_SCHEMA);
     this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);

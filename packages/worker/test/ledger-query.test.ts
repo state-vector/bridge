@@ -1,5 +1,6 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ARTEFACT_SEARCH_SCHEMA, ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL, ARTEFACT_SEARCH_MIGRATION_SQL } from "../src/kb/artefact-search-schema";
 import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA } from "../src/kb/ledger-query";
 
 let mf: Miniflare;
@@ -7,7 +8,7 @@ let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
 async function query(sql: string, args: (string | number)[] = []) {
   const response = await stub.fetch("https://query/", { method: "POST", body: JSON.stringify({ sql, args }) });
   expect(response.status, await response.clone().text()).toBe(200);
-  return await response.json() as { rows: Record<string, unknown>[]; reads: number };
+  return await response.json() as { rows: Record<string, unknown>[]; reads: number; writes: number };
 }
 const probes = [
   { sql: RECENT_TASK_MUTATIONS_SQL, args: ["absent"] },
@@ -22,7 +23,7 @@ beforeAll(async () => {
   // application; this isolated fixture exposes cursor row-read accounting.
   mf = new Miniflare({ modules: true, compatibilityDate: "2025-09-06", durableObjects: { QUERY: { className: "QueryRig", useSQLite: true } },
     script: `export class QueryRig { constructor(state){this.sql=state.storage.sql;}
-      async fetch(request){const {sql,args}=await request.json();const cursor=this.sql.exec(sql,...args);const rows=cursor.toArray();return Response.json({rows,reads:cursor.rowsRead});}
+      async fetch(request){const {sql,args}=await request.json();const cursor=this.sql.exec(sql,...args);const rows=cursor.toArray();return Response.json({rows,reads:cursor.rowsRead,writes:cursor.rowsWritten});}
     } export default {fetch(){return new Response('query fixture');}};` });
   const ns = await mf.getDurableObjectNamespace("QUERY");
   stub = await ns.get(ns.idFromName("retained-ledger")) as unknown as typeof stub;
@@ -132,4 +133,32 @@ it("seeks only active rows, with a stable cursor and bounded pages", async () =>
   const second = await query(STALL_SWEEP_PAGE_SQL, [Number(first.rows.at(-1)!.cursor), limit]);
   expect(second.rows.map(row => row.id)).toEqual(["running-6", "running-7", "running-8", "running-9"]);
   expect(second.reads).toBeLessThan(12);
+});
+
+
+it("migrates the old FTS trigger and indexes only effective title or body changes", async () => {
+  await query(`ALTER TABLE artefacts ADD COLUMN body_md TEXT DEFAULT '';`);
+  await query(ARTEFACT_SEARCH_SCHEMA);
+  await query(`DROP TRIGGER artefacts_au; CREATE TRIGGER artefacts_au AFTER UPDATE ON artefacts BEGIN
+    INSERT INTO artefacts_fts(artefacts_fts,rowid,title,body_md) VALUES('delete',old.rowid,old.title,old.body_md);
+    INSERT INTO artefacts_fts(rowid,title,body_md) VALUES(new.rowid,new.title,new.body_md);
+  END;
+  INSERT INTO artefacts(id,type,status,title,body_md,meta) VALUES
+    ('fts-fixture','task','todo','original title','original body','{}');`);
+  const old = await query(`UPDATE artefacts SET meta='{"heartbeat":1}' WHERE id='fts-fixture'`);
+  expect((await query(ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL)).rows).toHaveLength(1);
+  await query(ARTEFACT_SEARCH_MIGRATION_SQL);
+  await query(ARTEFACT_SEARCH_SCHEMA);
+  expect((await query(ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL)).rows).toHaveLength(0);
+  expect((await query(`UPDATE artefacts SET meta='{"heartbeat":2}' WHERE id='fts-fixture'`)).writes).toBe(1);
+  expect(old.writes).toBeGreaterThan(1);
+  expect((await query(`UPDATE artefacts SET title=title,body_md=body_md WHERE id='fts-fixture'`)).writes).toBe(1);
+  const search = (term: string) => query("SELECT rowid FROM artefacts_fts WHERE artefacts_fts MATCH ?", [term]);
+  expect((await search("original")).rows).toHaveLength(1);
+  await query(`UPDATE artefacts SET title='replacement',body_md='new passage' WHERE id='fts-fixture'`);
+  expect((await search("original")).rows).toEqual([]);
+  expect((await search("replacement")).rows).toHaveLength(1);
+  expect((await search("passage")).rows).toHaveLength(1);
+  await query(`DELETE FROM artefacts WHERE id='fts-fixture'`);
+  expect((await search("replacement")).rows).toEqual([]);
 });
