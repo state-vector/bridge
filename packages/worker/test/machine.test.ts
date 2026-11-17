@@ -2335,6 +2335,71 @@ describe("breachClass: claim:held-human-decision (BR#14689)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#15659 — the human sign-off completion fence (machine.ts
+// human-signoff-done rule): a machine `done` on a role:["human"] task is
+// refused with "task <id> is a human sign-off task (role: human) — completion
+// is human-authoritative; a human marks it done in the webapp.
+// [rule: human-signoff-done]". The refusal IS the completion-authority fence
+// working: zero state is destroyed, the subject's accepted review stays
+// bound, and the refusal's own instruction is the cure (a human completes the
+// sign-off in the webapp — HUMAN_ACTOR passes the gate). Priced never-a-breach
+// — the BR#4562/BR#6654/BR#7008/BR#7684/BR#14689/BR#15643 family; pricing it
+// FINITE would re-arm breach cards on exactly the completion authority the
+// roles law prescribes. The live emitter was the hub's own acceptance
+// machinery (applyCurrentReview, do.ts — the review-duty close hook plus the
+// review-reconcile sweep) retrying the impossible close on every ~5-min
+// watchdog pass; the emitter now defers once per review and stands down, so a
+// compliant acceptance emits ZERO of these refusals. Specimen: BR#15615, 3
+// events 2026-11-16 23:44:05–23:55:08Z, folded "unclassified" (default
+// threshold 3) and raised breach card BR#15659; the first event is the same
+// millisecond as accepted_execution review duty BR#15644's own close, the
+// next two are sweep passes.
+// ---------------------------------------------------------------------------
+describe("breachClass: close:held-human-signoff (BR#15659)", () => {
+  // the exact audited reason shape (guard message + trailing [rule:] tag,
+  // machine.ts human-signoff-done — ~175 chars with the id, well inside the
+  // 300-char audit slice)
+  const FENCE = "task BR#15615 is a human sign-off task (role: human) — completion is human-authoritative; a human marks it done in the webapp. [rule: human-signoff-done]";
+
+  it("the sign-off refusal classifies close:held-human-signoff from its anchored [rule:] tag", () => {
+    expect(breachClass(FENCE)).toBe("close:held-human-signoff");
+    // the tag sits at ~175 chars — the classification survives the 300-char
+    // audit slice (and any shorter emitter tail)
+    expect(breachClass(FENCE.slice(0, 300))).toBe("close:held-human-signoff");
+  });
+
+  it("the tag-cut/bare form classifies from the structural stem", () => {
+    // an emitter that appends its own tail after the message+tag pushes the
+    // anchored tag past the slice — the stem owns the wrapper form
+    const cut = FENCE.slice(0, FENCE.indexOf("[rule:")) + "; wrapped by the acceptance apply";
+    expect(cut.includes("human sign-off task")).toBe(true);
+    expect(cut.includes("[rule:")).toBe(false);
+    expect(breachClass(cut)).toBe("close:held-human-signoff");
+  });
+
+  it("a sign-off refusal storm never raises a breach, however many pile up", () => {
+    // the live cadence: one refused close per watchdog sweep pass (~5.5 min)
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#15615", ts: 1000 + i * 330_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["close:held-human-signoff"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("the fence's sister close-protection wording (infrastructure/merge-train lane card) is not captured by this stem", () => {
+    // the infrastructure-close-protection guard shares the "a human … close"
+    // neighborhood but never says "human sign-off task" — it keeps folding
+    // "unclassified" (a different specimen's to-do), never joins this class
+    const INFRA = "task BR#7000 is an infrastructure/merge-train lane card — closing it retires a live subsystem (BR#4977: a done lane card is never ticked again; BR#5061; owner identity removed as an exemption by BR#5151). Only a human (web/human:) or the machinery (system:) may close it. If your duty reached this card, close YOURSELF done-with-findings instead — never the lane card.";
+    expect(breachClass(INFRA)).toBe("unclassified");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
 // BR#15643 — the publisher-confirmation claim-bars gate (machine.ts
 // claim-bars rule): a claim on a QUALIFIED task whose publisher set
 // confirmation bars is refused with "gate: task <id> is qualified but its
@@ -2391,6 +2456,7 @@ describe("breachClass: claim:held-publisher-bars (BR#15643)", () => {
     expect(breachClass("parent BR#1 still has 1 open child task(s) — finish or close them first")).toBe("gate:open-children");
   });
 });
+
 
 // BR#14071 — the analysis-done receipts gate (machine.ts
 // analysis-done-needs-outcome rule) refusing a done whose body carries no
