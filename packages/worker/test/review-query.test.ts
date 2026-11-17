@@ -1,6 +1,6 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL } from "../src/kb/review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "../src/kb/review-query";
 
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
@@ -32,7 +32,8 @@ beforeAll(async () => {
   stub = await ns.get(ns.idFromName("retained-backlog")) as unknown as typeof stub;
   await query(`CREATE TABLE artefacts(id TEXT PRIMARY KEY,type TEXT,roles TEXT,status TEXT,meta TEXT,created_ts INTEGER,status_ts INTEGER);
     CREATE TABLE relations(src_id TEXT,relation TEXT,dst_id TEXT,PRIMARY KEY(src_id,relation,dst_id));
-    CREATE TABLE delivery_admissions(review_id TEXT PRIMARY KEY,record TEXT);`);
+    CREATE TABLE delivery_admissions(review_id TEXT PRIMARY KEY,record TEXT);
+    CREATE TABLE train_events(repo TEXT,pr INTEGER,kind TEXT,ts INTEGER,merge_sha TEXT);`);
   await query(REVIEW_LOOKUP_SCHEMA + WATCHDOG_REVIEW_LOOKUP_SCHEMA);
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<6000)
     INSERT INTO artefacts SELECT 'unrelated-'||i,'task','["review"]','done',json_object('execution_review_of','other-'||i),i,i FROM n`);
@@ -115,6 +116,32 @@ describe("watchdog work with retained history", () => {
     const result = await query(HELD_MERGE_ADMISSIONS_SQL);
     expect(result.rows).toEqual([{ cursor: null, review_id: "matching" }]);
     expect(result.reads).toBeLessThan(50);
+  });
+
+  it("seeks the replay phases and merge receipts without reading unrelated history", async () => {
+    await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12000)
+      INSERT INTO delivery_admissions SELECT 'admitted-'||i,json_object('state',json_object('phase','admitted')) FROM n`);
+    const cursor = await query("SELECT MAX(rowid) AS cursor FROM delivery_admissions");
+    await query(`INSERT INTO delivery_admissions VALUES
+      ('new-held','{"state":{"phase":"held"}}'),('new-pending','{"state":{"phase":"pending"}}')`);
+    const replay = await query(DELIVERY_ADMISSION_REPLAY_SQL, [cursor.rows[0].cursor]);
+    expect(replay.rows).toEqual([
+      { cursor: cursor.rows[0].cursor + 1, review_id: "new-held" },
+      { cursor: cursor.rows[0].cursor + 2, review_id: "new-pending" },
+    ]);
+    expect(replay.reads).toBeLessThan(30);
+    const empty = await query(DELIVERY_ADMISSION_REPLAY_SQL, [replay.rows.at(-1)!.cursor]);
+    expect(empty.rows).toEqual([]);
+    expect(empty.reads).toBeLessThan(30);
+
+    await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<12000)
+      INSERT INTO train_events SELECT 'owner/repo',i,'merged',i,'unrelated' FROM n;
+      INSERT INTO train_events VALUES
+        ('owner/repo',42,'merged',12001,'earlier'),('owner/repo',42,'merged',12002,'latest'),
+        ('owner/repo',42,'landed',12003,'landed'),('other/repo',42,'merged',12004,'elsewhere');`);
+    const receipt = await query(LATEST_PR_MERGE_SQL, ["owner/repo", 42]);
+    expect(receipt.rows).toEqual([{ merge_sha: "latest" }]);
+    expect(receipt.reads).toBeLessThan(20);
   });
 
   it("targets a terminal task without scanning unrelated coordination", async () => {

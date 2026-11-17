@@ -500,7 +500,7 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL } from "./review-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
 import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
@@ -778,6 +778,7 @@ export class KnowledgeHub {
     await this.maintenanceCheckpoint(trace, "task.maintenance");
     const now0 = Date.now();
     this.reconcileDispatchReservations(now0);
+    await this.maintenanceCheckpoint(trace, "task.maintenance");
     this.reconcileSchedulingHealth(now0);
     // Readiness owns startup waits, not the task churn/timer machinery.
     await this.maintenanceCheckpoint(trace, "startup.maintenance");
@@ -822,6 +823,7 @@ export class KnowledgeHub {
     // head it parked on re-queues (the machine verdict IS the review);
     // genuine human-leg parks stay parked. Idempotent, converges.
     try {
+      await this.maintenanceCheckpoint(trace, "train.maintenance");
       await this.awaitingRequeueSweep(now0);
     } catch (e) {
       this.audit("system:watchdog", "awaiting_requeue_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -833,6 +835,7 @@ export class KnowledgeHub {
     // effect supersedes the decision's orphan Feedback round, so the
     // duplicated cards collapse in the same tick. Idempotent, converges.
     try {
+      await this.maintenanceCheckpoint(trace, "review.maintenance");
       await this.verifyVerdictAdoptionSweep();
     } catch (e) {
       this.audit("system:watchdog", "verdict_adoption_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -9801,8 +9804,7 @@ export class KnowledgeHub {
     const rows = reviewId
       ? this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM delivery_admissions WHERE review_id=?
           AND json_extract(record,'$.state.phase') IN ('pending','held')`, reviewId).toArray()
-      : this.state.storage.sql.exec(`SELECT rowid AS cursor,review_id FROM delivery_admissions
-          WHERE rowid>? AND json_extract(record,'$.state.phase') IN ('pending','held') ORDER BY rowid LIMIT 10`, cursor).toArray();
+      : this.state.storage.sql.exec(DELIVERY_ADMISSION_REPLAY_SQL, cursor).toArray();
     if (!reviewId && !rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
     const recent = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM (
       SELECT review_id,record FROM delivery_admissions ORDER BY rowid DESC LIMIT 32
@@ -16203,10 +16205,7 @@ export class KnowledgeHub {
     // normal path unchanged. ----
     const ledgerReceipts: MergedLegReceipt[] = [];
     for (const l of withStampHeads) {
-      const row = this.one(
-        `SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
-        l.repo, l.number,
-      ) as any;
+      const row = this.one(LATEST_PR_MERGE_SQL, l.repo, l.number);
       const mergeSha = String(row?.merge_sha ?? "").toLowerCase();
       if (!/^[0-9a-f]{40}$/.test(mergeSha)) {
         ledgerReceipts.length = 0;

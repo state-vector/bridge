@@ -40,6 +40,10 @@ export const CURRENT_REVIEW_SQL = `
 `;
 
 export const WATCHDOG_REVIEW_LOOKUP_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS idx_delivery_admission_phase
+    ON delivery_admissions(json_extract(record,'$.state.phase'));
+  CREATE INDEX IF NOT EXISTS idx_train_events_pr_kind_ts
+    ON train_events(repo,pr,kind,ts DESC) WHERE pr IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_held_admission_task
     ON delivery_admissions(json_extract(record,'$.task_id'))
     WHERE json_extract(record,'$.state.phase')='held';
@@ -92,3 +96,18 @@ export const RETIRE_COORDINATION_FOR_TASK_SQL = `WITH candidates(id) AS (
   FROM candidates c JOIN artefacts q ON q.id=c.id JOIN artefacts p ON p.id=?1
   WHERE q.type='question' AND q.status IN ('todo','in_progress','blocked')
     AND p.type='task' AND p.status IN ('done','superseded')`;
+
+
+// Both arms can seek (phase, rowid), including at the end of retained
+// history when there are no replay candidates. Merge the bounded results in
+// the same rowid order as the durable replay cursor.
+export const DELIVERY_ADMISSION_REPLAY_SQL = `SELECT cursor,review_id FROM (
+  SELECT rowid AS cursor,review_id FROM delivery_admissions INDEXED BY idx_delivery_admission_phase
+  WHERE json_extract(record,'$.state.phase')='pending' AND rowid>?1 ORDER BY rowid LIMIT 10
+) UNION ALL SELECT cursor,review_id FROM (
+  SELECT rowid AS cursor,review_id FROM delivery_admissions INDEXED BY idx_delivery_admission_phase
+  WHERE json_extract(record,'$.state.phase')='held' AND rowid>?1 ORDER BY rowid LIMIT 10
+) ORDER BY cursor LIMIT 10`;
+
+export const LATEST_PR_MERGE_SQL = `SELECT merge_sha FROM train_events
+  WHERE repo=? AND pr=? AND kind='merged' ORDER BY ts DESC LIMIT 1`;
