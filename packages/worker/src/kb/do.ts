@@ -2811,7 +2811,8 @@ export class KnowledgeHub {
       || !!this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, id)
       || (Boolean(String(meta.session ?? "").trim()) && this.holderIsAlive(meta, "")) // BR#3819-D: never resume onto a live runner's plate blind
       || !!meta.lane || this.isUnclaimableAnchor({ id }, meta) // standing infrastructure / machinery-owned slots
-      || ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state)); // the train owns the exit
+      || ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state)) // the train owns the exit
+      || (String(meta.merge_train?.state) === "landed" && meta.merge_train?.close_held === "human-signoff"); // the held human sign-off owns the exit (BR#15722) — a satisfied merge wait must not machine-resume it
     return {
       cardId: id,
       verified: receiptLines.length > 0,
@@ -2862,6 +2863,7 @@ export class KnowledgeHub {
     if (this.isUnclaimableAnchor(row, meta) || meta.lane || meta.operator_gated || meta.delivery_disposition
       || meta.interactive_execution || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id, expiredAsk)) return false;
     if (["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))) return false;
+    if (String(meta.merge_train?.state) === "landed" && meta.merge_train?.close_held === "human-signoff") return false; // BR#15722: the close is held for the human sign-off — the exit is human-owned, never machine-resumed
     const execution = this.executionState(id);
     if (execution?.attempt && execution.attempt.phase !== "quiesced"
       || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
@@ -9804,6 +9806,12 @@ export class KnowledgeHub {
           // — the acceptance is applied (card done, legs landed), never a
           // pending row the replay churns on.
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
+        } else if (queued?.status === "blocked" && qm.merge_train?.state === "landed" && qm.merge_train?.close_held === "human-signoff") {
+          // BR#15722: the merged-provenance close was HELD for the human
+          // sign-off — the acceptance is carried, the board close is the
+          // human's webapp leg. Mark the admission admitted exactly like the
+          // terminal above; re-driving it would only re-stamp the hold.
+          a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
         }
       } catch (e) {
         // Keep the pending row on errors. Audit is diagnostic, NOT the retry queue.
@@ -14423,7 +14431,7 @@ export class KnowledgeHub {
     const settled = settledSha.toLowerCase();
     const evidence = new Set(ancestors.map((s) => s.toLowerCase()));
     const parked = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM artefacts WHERE type = 'task' AND status = 'blocked'
+      `SELECT id, status, meta, roles FROM artefacts WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
     let closed = 0;
@@ -14458,6 +14466,26 @@ export class KnowledgeHub {
         const note = `Burst-settle close (BR#4934): PR #${leg.number} merged as ${String(legRec.merge_sha).slice(0, 9)} — its runs were cancelled-by-next-push (GH#2261: cancelled says nothing); the pass settled GREEN at ${settledSha.slice(0, 9)} and this sha is a fed git ancestor of it. Closed by the merge train's burst-drain settle, zero hub GitHub calls.`;
         // Persist the decisive leg receipt before asking the completion gate.
         this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(cm), row.id);
+        // BR#15722 — same human-signoff hold as landedFlow: the burst pass
+        // stamped the leg landed (above) but never machine-closes a
+        // role:["human"] subject. Defer once and stand down — the per-card
+        // try/catch below would otherwise audit the refused close on every
+        // pass (status untouched, so a typed wait keeps its wait).
+        if (parseTags(String(row.roles ?? "")).includes("human")) {
+          const deferred = this.one(
+            `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.merge_sha')=? LIMIT 1`,
+            row.id, String(legRec.merge_sha),
+          );
+          if (!deferred)
+            this.version(row.id, actor, "signoff_close_deferred",
+              `burst-settle: PR #${leg.number} landed as ${String(legRec.merge_sha).slice(0, 9)} (pass green at ${settledSha.slice(0, 9)}) — the board close is held for the human sign-off (role: human, machine.ts human-signoff-done; BR#15722): the machine close will not retry — a human marks ${row.id} done in the webapp`,
+              { merge_sha: String(legRec.merge_sha), burst: true });
+          const held = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, row.id).meta ?? "{}");
+          held.merge_train = { ...cm.merge_train, state: "landed", pr: leg.number, merge_sha: String(legRec.merge_sha), landed_at: now, burst_evidence: settledSha, close_held: "human-signoff" };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(held), now, row.id);
+          this.audit(actor, "train:burst_park_signoff_held", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: leg.number, task: row.id, merge_sha: String(legRec.merge_sha), evidence_sha: settledSha });
+          continue;
+        }
         if (row.status === "blocked") await this.transition({ id: row.id, to: "in_progress", session: "", note: `merge-train: landed — closing on the burst pass's green settle (evidence ${settledSha.slice(0, 9)})`, merge_train: true }, actor);
         await this.transition({ id: row.id, to: "done", session: "", note }, actor);
         const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, row.id).meta ?? "{}");
@@ -14796,7 +14824,7 @@ export class KnowledgeHub {
     const laneSpec = laneOfMeta(meta)!;
     let taskId: string | null = p.receiptTaskId ?? meta.currently?.task_id ?? null;
     if (taskId) {
-      const card = this.one(`SELECT id, status, meta FROM artefacts WHERE id = ?`, taskId);
+      const card = this.one(`SELECT id, status, meta, roles FROM artefacts WHERE id = ?`, taskId);
       const cm = JSON.parse(card?.meta ?? "{}");
       if (card && this.protectedExecution(taskId, cm)) {
         if (p.receiptTaskId) return;
@@ -14844,6 +14872,41 @@ export class KnowledgeHub {
         }));
         const note = trainLandedCloseNote({ repo: laneSpec.repo, prNumber: p.pr, mergeSha: p.mergeSha, gateway: actor, greenRunUrl: p.greenRunUrl, legs: allLegs });
         this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(cm), taskId);
+        // BR#15722 — a human sign-off subject (roles:["human"]) cannot be
+        // machine-closed (machine.ts human-signoff-done; completion is
+        // human-authoritative, the machine proxy is not). Retrying the
+        // impossible close laddered the BR#4753 close-bounce on every
+        // episode — the bounce stamped breach_class "unclassified" and
+        // raised breach card BR#15722 (specimen BR#15616; PR #462 prices
+        // the class but does not stop THIS emitter). Defer ONCE per
+        // (card, merge) with the visible signoff_close_deferred marker,
+        // stamp the landed bookkeeping, and stand down: no transition is
+        // attempted, so the card keeps its own lifecycle — status
+        // untouched (a typed wait keeps its wait) — and a human completes
+        // the sign-off in the webapp (HUMAN_ACTOR passes the fence).
+        if (parseTags(String(card.roles ?? "")).includes("human")) {
+          const deferred = this.one(
+            `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.merge_sha')=? LIMIT 1`,
+            taskId, p.mergeSha,
+          );
+          if (!deferred)
+            this.version(taskId, actor, "signoff_close_deferred",
+              `PR #${p.pr} landed green (${p.mergeSha.slice(0, 9)}) — the board close is held for the human sign-off (role: human, machine.ts human-signoff-done; BR#15722, specimen BR#15616): the delivery is landed, completion stays human-authoritative, the machine close will not retry — a human marks ${taskId} done in the webapp`,
+              { pr: p.pr, repo: laneSpec.repo, merge_sha: p.mergeSha });
+          const held = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, taskId).meta ?? "{}");
+          held.merge_train = { ...(cm.merge_train ?? {}), state: "landed", pr: p.pr, repo: laneSpec.repo, merge_sha: p.mergeSha, landed_at: now, close_held: "human-signoff" };
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(held), now, taskId);
+          if (p.receiptTaskId) return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, held_signoff: true };
+          meta.currently = null;
+          const reason = this.laneSyncReason(lane.id, meta, now);
+          this.state.storage.sql.exec(
+            `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail) VALUES (?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?)`,
+            now, laneSpec.repo, laneSpec.base, actor, p.pr, taskId, p.mergeSha, JSON.stringify({ run: p.greenRunUrl ?? null, close_held: "human-signoff", ...(p.canary ? { canary: true } : {}) }),
+          );
+          this.audit(actor, "train:landed_signoff_held", lane.id, { lane: laneKey(laneSpec.repo, laneSpec.base), pr: p.pr, task: taskId, merge_sha: p.mergeSha });
+          this.version(lane.id, actor, "train:landed", `PR #${p.pr} landed green — card ${taskId} close held for the human sign-off (role: human; BR#15722): the delivery is landed, the lane idles, completion stays human-authoritative`, { reason });
+          return { ok: true, kind: "landed", pr: p.pr, merge_sha: p.mergeSha, task: taskId, held_signoff: true, reason };
+        }
         const authority = p.receiptTaskId ? this.landedReceiptAuthority(taskId, laneSpec.repo, p.pr) : undefined;
         const beforeWrite = authority ? () => {
           if (!authority()) throw new Error("The accepted landing no longer owns this closeout.");
@@ -15983,6 +16046,34 @@ export class KnowledgeHub {
       legs: merged.map((m) => ({ repo: m.repo, number: m.number, head: m.head || m.mergeSha, mergeSha: m.mergeSha })),
     });
     const first = merged[0];
+    // BR#15722 — a human sign-off subject cannot be machine-closed here
+    // either. The carry paths (admission replay, merged-park sweep, ledger
+    // receipts) re-drive this close on every pass, and each pass re-stamped
+    // the landed legs and refused the done — specimen BR#15616: 7
+    // merged_admission_close_refused events 2026-11-17 00:47–01:30Z on top
+    // of the walk's own close-bounce that raised breach card BR#15722
+    // (PR #462 stops the review-acceptance emitter, not this one). Defer
+    // ONCE per merge with the signoff_close_deferred marker, stamp the
+    // landed state, and report the carry TERMINAL (true): the delivery
+    // obligation is complete — every leg carries a hub merge receipt and
+    // the acceptance is carried — while the board close is the human's
+    // webapp leg. No transition is attempted, so a typed wait keeps its
+    // wait; the carry is never retried.
+    if (parseTags(String(row.roles ?? "")).includes("human")) {
+      const deferred = this.one(
+        `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.merge_sha')=? LIMIT 1`,
+        parentId, first.mergeSha,
+      );
+      if (!deferred)
+        this.version(parentId, actor, "signoff_close_deferred",
+          `merged-provenance carry held for the human sign-off (role: human, machine.ts human-signoff-done; BR#15722, specimen BR#15616): every leg carries a hub merge receipt (${merged.map((m) => `${m.repo}#${m.number} merged as ${m.mergeSha.slice(0, 9)}`).join(", ")}) and the acceptance is carried — the machine close will not retry; a human marks ${parentId} done in the webapp`,
+          { merge_sha: first.mergeSha, via, ...(reviewId ? { review: reviewId } : {}) });
+      const heldMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, parentId).meta ?? "{}");
+      heldMeta.merge_train = { ...(heldMeta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via, close_held: "human-signoff" };
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(heldMeta), now, parentId);
+      this.audit(actor, "merged_admission_signoff_held", parentId, { via, review: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      return true;
+    }
     try {
       if (row.status === "blocked" || row.status === "todo") {
         await this.transition(
