@@ -15788,6 +15788,28 @@ export class KnowledgeHub {
       this.audit("system:completion", "stale_acceptance_retained", parentId, { review: reviewId, reason: "Only the current subject-bound positive review can accept this submission." });
       return;
     }
+    // BR#15659 — a human sign-off subject cannot be machine-closed (machine.ts
+    // human-signoff-done; completion is human-authoritative). The acceptance
+    // itself is legal and stays bound to the exact reviewed submission; the
+    // close is the human's webapp leg (HUMAN_ACTOR passes the gate).
+    // Attempting it — and retrying the impossible close on every
+    // review-reconcile pass — was the emitter defect (specimen BR#15615: 3
+    // refusals 2026-11-16 23:44:05–23:55:08Z, breach card BR#15659; the
+    // review-reconcile sweep revisits an in_review parent every pass). Defer
+    // ONCE per review id, then stand down: the marker row is the visible
+    // "accepted verdict retained, awaiting the human" receipt.
+    if (parseTags(parent.roles ?? "").includes("human")) {
+      const deferred = this.one(
+        `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review')=? LIMIT 1`,
+        parentId, current.id,
+      );
+      if (!deferred) {
+        this.version(parentId, actor, "signoff_close_deferred",
+          `accepted verdict ${current.id} retained — completion is human-authoritative (role: human); a human marks ${parentId} done in the webapp (BR#15659)`,
+          { review: current.id });
+      }
+      return;
+    }
     const result = current.result;
     if (!mergeCompletesTask(meta)) {
       if (parent.status === "in_review" && result.kind === "accepted_execution" && result.task_id === parentId && ExecutionResultSchema.safeParse(meta.execution_result).success) {

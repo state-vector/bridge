@@ -1298,6 +1298,25 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // folded "unclassified" (default threshold 3) and raised breach card
   // BR#14689.
   "claim:held-human-decision": Number.POSITIVE_INFINITY,
+  // BR#15659 — the human sign-off completion fence (machine.ts
+  // human-signoff-done rule): a machine `done` on a role:["human"] task is
+  // refused with "task <id> is a human sign-off task (role: human) —
+  // completion is human-authoritative; a human marks it done in the webapp."
+  // The refusal IS the completion-authority fence working (zero state
+  // destroyed, the accepted review stays bound, and the refusal's own
+  // instruction is the cure: a human completes the sign-off in the webapp) —
+  // the BR#4562/BR#6654/BR#7008/BR#7684/BR#14689/BR#15643 never-a-breach
+  // pricing family. Pricing it FINITE would re-arm breach cards on exactly
+  // the completion authority the roles law prescribes (the BR#6654 lesson).
+  // The live storm's emitter was the hub's own acceptance machinery
+  // (applyCurrentReview, reached from the review-duty close hook and the
+  // review-reconcile sweep) retrying the impossible close on every pass; that
+  // emitter now defers once and stands down, so a compliant acceptance emits
+  // ZERO of these refusals. Named so the Log says WHAT held: the close, held
+  // for a human sign-off. Specimen: BR#15615, 3 events 2026-11-16
+  // 23:44:05–23:55:08Z, folded "unclassified" (default threshold 3) and
+  // raised breach card BR#15659.
+  "close:held-human-signoff": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1379,6 +1398,27 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // owns the wrapper forms (the BR#9510 emitter appends its own suffix
   // AFTER the message+tag, which defeats the anchored tag match).
   "analysis-done-needs-outcome": "gate:analysis-outcome",
+  // BR#15659: the human sign-off completion fence (machine.ts
+  // human-signoff-done rule, :502) refusing a machine `done` on a
+  // role:["human"] task — "task <id> is a human sign-off task (role: human) —
+  // completion is human-authoritative; a human marks it done in the webapp."
+  // The refusal IS the completion-authority fence working: zero state is
+  // destroyed, the subject's accepted review stays bound, and the refusal's
+  // own instruction is the cure (a human completes the sign-off in the webapp
+  // — HUMAN_ACTOR passes the gate). It joins the BR#4562/BR#6654/BR#7008/
+  // BR#7684 never-a-breach pricing family. The message is short enough that
+  // the trailing [rule: human-signoff-done] tag survives the 300-char audit
+  // slice, so this entry alone classifies the live specimens' folded reasons;
+  // the ladder arm below owns the tag-cut/bare forms (BR#4295 anchoring).
+  // The LIVE emitter was the hub's own acceptance machinery: applyCurrentReview
+  // (do.ts, reached from the review-duty close hook and the review-reconcile
+  // sweep — ~1 watchdog pass ≈5 min) retried the impossible close on every
+  // pass until BR#15659's emitter fix defers once and stands down. Specimens
+  // (one shared class, coalescing): BR#15615, 3 events 2026-11-16
+  // 23:44:05–23:55:08Z (breach card BR#15659) — the first event is the same
+  // millisecond as accepted_execution review duty BR#15644's own close
+  // (version seq 1374220), the next two are sweep passes.
+  "human-signoff-done": "close:held-human-signoff",
 };
 
 export function breachClass(reason: string): string {
@@ -1599,6 +1639,13 @@ export function breachClass(reason: string): string {
   // these refusals — the default threshold 3 prices only genuinely
   // stubborn loops; no BREACH_THRESHOLDS entry.
   if (r.includes("requires execution_result")) return "gate:analysis-outcome";
+  // BR#15659: the human sign-off completion fence, tag-cut/bare form — the
+  // structural fragment "human sign-off task" (the guard's message,
+  // machine.ts human-signoff-done rule) survives any slice; the anchored
+  // [rule: human-signoff-done] tag above fires first (BR#4295 anchoring).
+  // Fragment uniqueness: the only generator of this text is the
+  // human-signoff-done guard, so no sister gate can be captured.
+  if (r.includes("human sign-off task")) return "close:held-human-signoff";
   return "unclassified";
 }
 
