@@ -86,10 +86,10 @@ const getVersions = async (id: string) => {
 /** A task stamped with the given PR legs, picked up, then parked on the train
  *  (the live accept shape: the admission replay only drives blocked/queued
  *  or bounce-fresh parents). */
-const pickupCard = async (title: string, legs: { number: number; head: string }[]) => {
+const pickupCard = async (title: string, legs: { number: number; head: string }[], roles?: string[]) => {
   const created = await post("/create", {
     type: "task",
-    title,
+    title, roles,
     meta: {
       pr: { repo: REPO, number: legs[0].number, head_sha_at_acceptance: legs[0].head, base: "main" },
       prs: legs.map((l) => ({ repo: REPO, number: l.number, head_sha_at_acceptance: l.head, base: "main" })),
@@ -133,6 +133,31 @@ describe("BR#15528: an accepted verdict on a fully-merged card closes it instead
     const versions = await getVersions(id);
     expect(versions.some((v) => v.action === "train_queued"), "no re-queue after the terminal close").toBe(false);
     expect(versions.some((v) => v.action === "merged_admission_closed"), "the terminal close is on the trail").toBe(true);
+  });
+
+  it("settles a merged human sign-off admission without retries or a machine close", async () => {
+    const id = await pickupCard("Human sign-off on merged delivery", [{ number: 33404, head: NEW }], ["human"]);
+    await stampMergedRow(33404, MERGE, OLD2);
+    await completePrReview(post, id, [{ repo: REPO, number: 33404, head_sha_at_acceptance: NEW }]);
+    const pending = await getOne(id);
+    expect(pending.status).not.toBe("done");
+    expect(pending.meta?.merge_train?.state).toBe("landed");
+    expect(pending.meta?.merge_train?.legs?.["33404"]).toMatchObject({ state: "landed", merge_sha: MERGE });
+    expect(pending.delivery_admissions.map((a: any) => a.state.phase)).toEqual(["admitted"]);
+    const markerCount = (entries: Array<Record<string, any>>) => entries.filter(v => v.action === "signoff_close_deferred").length;
+    expect(markerCount(await getVersions(id))).toBe(1);
+    for (let i = 0; i < 3; i++) {
+      const sweep = await kb("/admin.ask_escalation_sweep", {
+        method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: "{}",
+      });
+      expect(sweep.status).toBe(200);
+    }
+    const after = await getOne(id);
+    expect(after.status).toBe(pending.status);
+    expect(after.meta.merge_train).toEqual(pending.meta.merge_train);
+    const history = await getVersions(id);
+    expect(markerCount(history)).toBe(1);
+    expect(history.some(v => v.action === "merged_admission_close_refused")).toBe(false);
   });
 
   it("one unmerged leg → the normal re-queue is unchanged", async () => {

@@ -502,6 +502,7 @@ import {
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
 import { STALL_SWEEP_PAGE_SIZE, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { BOARD_INDEX_SCHEMA, BOARD_RECENT_IDS_SQL } from "./board-query";
 import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
@@ -3040,7 +3041,7 @@ export class KnowledgeHub {
     return { events, last_seq: events.length ? events[events.length - 1].seq : since };
   }
 
-  private boardOpenAsks(taskIds?: string) {
+  private boardOpenAsks(taskIds: string) {
     // open question children: the DERIVED source for awaiting_ask (phase 4 —
     // the marker was a second source of truth that could drift)
     const openAskChildren = this.state.storage.sql.exec(
@@ -3049,8 +3050,8 @@ export class KnowledgeHub {
        WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
          AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
          AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
-         ${taskIds === undefined ? "" : "AND r.dst_id IN (SELECT value FROM json_each(?))"}
-       ORDER BY c.created_ts DESC`, ...(taskIds === undefined ? [] : [taskIds]),
+         AND r.dst_id IN (SELECT value FROM json_each(?))
+       ORDER BY c.created_ts DESC`, taskIds,
     ).toArray();
     const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
     for (const c of openAskChildren) {
@@ -3079,11 +3080,7 @@ export class KnowledgeHub {
     const rows = graphRows ?? this.state.storage.sql.exec(
       `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.id IN (
-          SELECT id FROM artefacts WHERE type IN ('task','question')
-          ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END, updated_ts DESC
-          LIMIT 250
-       )
+       WHERE a.id IN (${BOARD_RECENT_IDS_SQL})
           OR (a.type = 'question' AND a.status IN ('todo','in_progress','blocked')
               AND coalesce(json_extract(a.meta, '$.ask.answer'), '') = ''
               AND (json_extract(a.meta, '$.ask.route.kind') = 'human_decision'
@@ -3125,10 +3122,10 @@ export class KnowledgeHub {
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
       `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'
-       ${graphPage ? "AND src_id IN (SELECT value FROM json_each(?))" : ""}`, ...(graphPage ? [taskIds] : []),
+       AND src_id IN (SELECT value FROM json_each(?))`, taskIds,
     ).toArray();
     const parentOf = new Map(links.map(l => [String(l.src_id), String(l.dst_id)]));
-    const askChildrenByParent = this.boardOpenAsks(graphPage ? taskIds : undefined);
+    const askChildrenByParent = this.boardOpenAsks(taskIds);
     for (const t of tasks) {
       t.part_of = parentOf.get(t.id);
       t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), askChildrenByParent.get(t.id) ?? []);
@@ -3209,7 +3206,7 @@ export class KnowledgeHub {
       else parent.children_open++;
     }
     // readiness projection (bulk): declared state + evidence maps + stacked bars
-    const { analysisEv, reviewEv } = this.qualificationEvidence();
+    const { analysisEv, reviewEv } = this.qualificationEvidence([...byId.keys()]);
     for (const t of tasks) {
       const q = t.meta.qualification ?? {};
       const declared = q.state ?? (t.meta.qualified === true ? "qualified" : undefined);
@@ -3931,7 +3928,7 @@ export class KnowledgeHub {
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
-    this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA + BOARD_INDEX_SCHEMA);
     this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);
     this.state.storage.sql.exec(CAPABILITY_SWEEP_SCHEMA);
     this.state.storage.sql.exec(LANE_VIEW_SQL);
@@ -5753,11 +5750,13 @@ export class KnowledgeHub {
 
   /** Bulk evidence for readiness projections: done role-tagged children per parent +
    *  accepted decisions per task. Review evidence also satisfies the analysis kind. */
-  private qualificationEvidence(): { analysisEv: Set<string>; reviewEv: Set<string> } {
+  private qualificationEvidence(taskIds?: string[]): { analysisEv: Set<string>; reviewEv: Set<string> } {
+    const scope = taskIds ? " AND r.dst_id IN (SELECT value FROM json_each(?))" : "";
+    const bindings = taskIds ? [JSON.stringify(taskIds)] : [];
     const analysisEv = new Set<string>(), reviewEv = new Set<string>();
     for (const k of this.state.storage.sql.exec(
       `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status = 'done'`,
+       WHERE r.relation = 'child_of' AND c.status = 'done'${scope}`, ...bindings,
     ).toArray() as any[]) {
       const roles: string[] = parseTags(k.roles);
       if (roles.includes("review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
@@ -5765,7 +5764,7 @@ export class KnowledgeHub {
     }
     for (const d of this.state.storage.sql.exec(
       `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'`,
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'${scope}`, ...bindings,
     ).toArray() as any[]) { analysisEv.add(d.tid); reviewEv.add(d.tid); }
     return { analysisEv, reviewEv };
   }
@@ -6144,19 +6143,22 @@ export class KnowledgeHub {
     let ready = false;
     const eligible = new Set<string>();
     const holds = new Map<string, Set<SchedulingReason>>();
-    for (const row of hosts) {
-      const tokenId = String(row.token_id), host = String(row.label);
-      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
-      if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
-      ready = true;
-      const candidates = this.dispatchCandidates(tokenId, host, capabilities, ids);
-      for (const task of candidates.eligible) eligible.add(String(task.id));
-      for (const [id, reason] of candidates.taskHolds) {
-        const reasons = holds.get(id) ?? new Set<SchedulingReason>();
-        reasons.add(reason);
-        holds.set(id, reasons);
+    const work = this.executionWork();
+    work.withHostSnapshot(() => {
+      for (const row of hosts) {
+        const tokenId = String(row.token_id), host = String(row.label);
+        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+        if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
+        ready = true;
+        const candidates = this.dispatchCandidates(tokenId, host, capabilities, ids, undefined, work);
+        for (const task of candidates.eligible) eligible.add(String(task.id));
+        for (const [id, reason] of candidates.taskHolds) {
+          const reasons = holds.get(id) ?? new Set<SchedulingReason>();
+          reasons.add(reason);
+          holds.set(id, reasons);
+        }
       }
-    }
+    });
     // A missing gateway must not hide task-level holds. Run the same
     // checks without a capability to classify the backlog during an outage.
     if (!ready) {
@@ -9901,14 +9903,16 @@ export class KnowledgeHub {
         }
         const target = String(parent.id);
         await this.queueAcceptedPrLegs(target, a.legs, a.actor);
-        const queued = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, target);
+        const queued = this.one(`SELECT status,meta,roles FROM artefacts WHERE id=?`, target);
         const qm = JSON.parse(queued?.meta ?? "{}");
         if (queued?.status === "blocked" && qm.merge_train?.state === "queued" && a.legs.every(l => trainLegs(qm).some(q => q.repo === l.repo && q.number === l.number && q.head_sha_at_acceptance === l.head_sha_at_acceptance))) {
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
-        } else if (queued?.status === "done" && trainLegs(qm).length > 0 && trainLegs(qm).every(l => trainLegLanded(qm, l))) {
-          // BR#9510: the admission took the merged-provenance terminal close
-          // — the acceptance is applied (card done, legs landed), never a
-          // pending row the replay churns on.
+        } else if (queued && (queued.status === "done" ||
+          (effectiveRole(parseTags(queued.roles ?? "")) === "human" && qm.merge_train?.state === "landed"))
+          && trainLegs(qm).length > 0 && trainLegs(qm).every(l => trainLegLanded(qm, l))
+          && a.legs.every(l => trainLegs(qm).some(q => q.repo === l.repo && q.number === l.number))) {
+          // All machine delivery legs are settled. A human sign-off card
+          // stays open without occupying the pending replay queue.
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
         }
       } catch (e) {
@@ -9973,7 +9977,7 @@ export class KnowledgeHub {
       // Re-read current review authority AFTER yielding. New findings, a newer
       // round, a changed revision or executor must still fence historical work.
       const current = this.currentTaskReview(String(row.id));
-      if (current.phase !== "accepted") continue;
+      if (current.phase !== "accepted" || current.result.kind === "accepted_pr") continue;
       const receipt = this.one(`SELECT actor FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, current.id);
       if (!receipt) continue;
       try {
@@ -14630,6 +14634,8 @@ export class KnowledgeHub {
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
     if (!row || ["done", "superseded"].includes(String(row.status))) return { kind: "retained", reason: "Historical terminal state is preserved." };
     const meta = JSON.parse(row.meta ?? "{}");
+    if (effectiveRole(parseTags(row.roles ?? "")) === "human" && meta.merge_train?.state === "landed")
+      return { kind: "retained", reason: "Merged delivery is recorded and the human owns sign-off." };
     if (!mergeCompletesTask(meta)) {
       await this.resumePrerequisite(id, repo, pr, mergeSha);
       return { kind: "retained", reason: "Prerequisite observed; the actual execution outcome remains outstanding." };
@@ -14733,8 +14739,11 @@ export class KnowledgeHub {
       const closed = await this.closeAdmittedMergedCard(id, merged, cardLegs, actor, "observed-merge-carry", String(a.review_id));
       if (!closed) return null; // gate-refused: loud audit already written; never spawn past it
       a.state = { phase: "admitted", task_id: id, subject_revision: meta.work_revision ?? "legacy" };
-      this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
-      this.audit(actor, "merged_admission_carried", id, { admission: a.review_id, repo, pr, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      const record = JSON.stringify(a);
+      if (record !== r.record) {
+        this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, record, a.review_id);
+        this.audit(actor, "merged_admission_carried", id, { admission: a.review_id, repo, pr, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      }
       return String(a.review_id);
     }
     return null;
@@ -15881,6 +15890,17 @@ export class KnowledgeHub {
     return { ok: true, kind: "carry", lane: laneKey(repo, base), task: id, pr, from_head: fromHead, to_head: toHead };
   }
 
+  private recordSignoffDeferral(taskId: string, reviewId: string | undefined, actor: string): void {
+    const review = reviewId ?? null;
+    const deferred = this.one(
+      `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review') IS ? LIMIT 1`,
+      taskId, review,
+    );
+    if (!deferred) this.version(taskId, actor, "signoff_close_deferred",
+      `Accepted delivery retained${review ? ` from verdict ${review}` : ""}. A human must mark ${taskId} done in the webapp.`,
+      { review });
+  }
+
    /** Apply only the current typed, exact-revision acceptance. PR delivery uses
     * the transactional admission outbox; execution and direct-main acceptance
     * close through the same guarded transition and preserve terminal cleanup. */
@@ -15904,16 +15924,8 @@ export class KnowledgeHub {
     // review-reconcile sweep revisits an in_review parent every pass). Defer
     // ONCE per review id, then stand down: the marker row is the visible
     // "accepted verdict retained, awaiting the human" receipt.
-    if (parseTags(parent.roles ?? "").includes("human")) {
-      const deferred = this.one(
-        `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review')=? LIMIT 1`,
-        parentId, current.id,
-      );
-      if (!deferred) {
-        this.version(parentId, actor, "signoff_close_deferred",
-          `accepted verdict ${current.id} retained — completion is human-authoritative (role: human); a human marks ${parentId} done in the webapp (BR#15659)`,
-          { review: current.id });
-      }
+    if (effectiveRole(parseTags(parent.roles ?? "")) === "human") {
+      this.recordSignoffDeferral(parentId, current.id, actor);
       return;
     }
     const result = current.result;
@@ -16029,6 +16041,16 @@ export class KnowledgeHub {
     if (!row || ["done", "superseded"].includes(String(row.status))) return true;
     const now = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
+    const parentRoles = parseTags(String(row.roles ?? ""));
+    const humanSignoff = effectiveRole(parentRoles) === "human";
+    const first = merged[0];
+    // An admitted delivery may be observed again by merge reconciliation.
+    // Receipt settlement is idempotent while the task awaits the human.
+    if (humanSignoff && meta.merge_train?.state === "landed" && merged.every(receipt =>
+      meta.merge_train.legs?.[String(receipt.number)]?.merge_sha === receipt.mergeSha)) {
+      this.recordSignoffDeferral(parentId, reviewId, actor);
+      return true;
+    }
     // Same law as landedFlow/closeBurstParks: an explicit execution wait or
     // live writer owns the exit — the admission stays pending and the next
     // pass retries once the execution machinery quiesces.
@@ -16082,13 +16104,24 @@ export class KnowledgeHub {
       legsMap[String(r.number)] = { ...prior, state: "landed", merge_sha: r.mergeSha, landed_at: now, via: "merged-provenance" };
     }
     meta.merge_train = { ...(meta.merge_train ?? {}), legs: legsMap };
+    if (humanSignoff) {
+      // The train owns the merge receipt; the human owns the transition.
+      // Settle the machine leg without touching the card's status or claim.
+      meta.merge_train = { ...meta.merge_train, state: "landed", pr: first.number, repo: first.repo,
+        merge_sha: first.mergeSha, landed_at: now };
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, parentId);
+        this.recordSignoffDeferral(parentId, reviewId, actor);
+      });
+      return true;
+    }
+
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
     const note = admissionLandedCloseNote({
       gateway: actor,
       reviewId: reviewId ?? "the carried admission",
       legs: merged.map((m) => ({ repo: m.repo, number: m.number, head: m.head || m.mergeSha, mergeSha: m.mergeSha })),
     });
-    const first = merged[0];
     try {
       if (row.status === "blocked" || row.status === "todo") {
         await this.transition(
@@ -16116,7 +16149,6 @@ export class KnowledgeHub {
       // artifact IS the analysis findings, so the derived outcome is
       // honest; the close lands first try, lifecycle-legal, with full
       // bookkeeping instead of storming the breach door.
-      const parentRoles = parseTags(String((row as any).roles ?? ""));
       const closeBody: Record<string, unknown> = { id: parentId, to: "done", session: "", note };
       if (parentRoles.includes("analysis")) {
         closeBody.execution_result = {
@@ -16236,11 +16268,11 @@ export class KnowledgeHub {
       ledgerReceipts.push({ repo: l.repo, number: l.number, head: String(l.head_sha_at_acceptance ?? ""), mergeSha, via: "train-events" });
     }
     if (ledgerReceipts.length === withStampHeads.length) {
-      const closed = await this.closeAdmittedMergedCard(parentId, ledgerReceipts, withStampHeads, actor, "accepted-verdict-ledger");
+      const settled = await this.closeAdmittedMergedCard(parentId, ledgerReceipts, withStampHeads, actor, "accepted-verdict-ledger");
       this.audit(actor, "train_queue_skipped_already_merged", parentId, {
         legs: ledgerReceipts.map((r) => ({ repo: r.repo, pr: r.number, merge_sha: r.mergeSha })),
-        closed,
-        reason: "every accepted leg already carries a merged train_events row — the accepted verdict closes the card instead of re-queuing an already-merged delivery (BR#15528)",
+        closed: settled && this.one(`SELECT status FROM artefacts WHERE id=?`, parentId)?.status === "done",
+        reason: "every accepted leg already carries a merged train_events row — the accepted verdict settles the delivery without re-queuing an already-merged PR (BR#15528)",
       });
       return;
     }

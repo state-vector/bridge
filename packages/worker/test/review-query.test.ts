@@ -1,5 +1,6 @@
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { BOARD_INDEX_SCHEMA, BOARD_RECENT_IDS_SQL } from "../src/kb/board-query";
 import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "../src/kb/review-query";
 
 let mf: Miniflare;
@@ -159,4 +160,17 @@ describe("watchdog work with retained history", () => {
     expect(sweep.rows.map(row => row.id).sort()).toEqual(["linked-question", "other-question", "routed-question"]);
     expect(sweep.reads).toBeLessThan(50);
   });
+});
+
+
+it("seeks the bounded board snapshot without scanning retained closed cards", async () => {
+  await query(`ALTER TABLE artefacts ADD COLUMN updated_ts INTEGER;
+    UPDATE artefacts SET updated_ts=rowid`);
+  const before = await query(BOARD_RECENT_IDS_SQL);
+  await query(BOARD_INDEX_SCHEMA);
+  const after = await query(BOARD_RECENT_IDS_SQL);
+  expect(after.rows).toEqual(before.rows);
+  expect(after.rows).toHaveLength(250);
+  expect(before.reads).toBeGreaterThanOrEqual(12000);
+  expect(after.reads).toBeLessThan(600);
 });
