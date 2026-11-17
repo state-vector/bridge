@@ -2398,6 +2398,66 @@ describe("breachClass: close:held-human-signoff (BR#15659)", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// BR#15643 — the publisher-confirmation claim-bars gate (machine.ts
+// claim-bars rule): a claim on a QUALIFIED task whose publisher set
+// confirmation bars is refused with "gate: task <id> is qualified but its
+// publisher requested further confirmation before it goes ready — unmet
+// bars: <ids>. Satisfy them with a done child task of that role or an
+// accepted decision. [rule: claim-bars]" until the bars are satisfied (a
+// done role-tagged child of the task, or an accepted decision supporting it
+// — the bar id selects the evidence KIND, it is not itself the evidence,
+// which is why the specimen's third refusal fired 2m46s after the bar task
+// went done). The refusal IS the publisher-confirmation flow working —
+// priced never-a-breach, the BR#4562/BR#6654/BR#7008/BR#7684/BR#14689
+// family. Specimen: BR#14714 (publisher bars [BR#14683], opencode-ray) — 3
+// refusals 2026-11-16 23:31:24–23:34:39Z (one single-attempt claim probe +
+// two advisory writes by the BR#15638 investigator resolving the parent's
+// open-children deadlock), folded "unclassified" (default threshold 3) and
+// raised breach card BR#15643.
+// ---------------------------------------------------------------------------
+describe("breachClass: claim:held-publisher-bars (BR#15643)", () => {
+  // the exact audited reason shape (the machine.ts claim-bars guard message
+  // with the do.ts-appended " [rule: …]" tag) — verbatim specimen
+  const REFUSAL =
+    "gate: task BR#14714 is qualified but its publisher requested further confirmation before it goes ready — unmet bars: BR#14683. Satisfy them with a done child task of that role or an accepted decision. [rule: claim-bars]";
+
+  it("the claim-bars refusal classifies claim:held-publisher-bars from its anchored rule tag", () => {
+    expect(REFUSAL.length).toBeLessThanOrEqual(300); // the tag survives the audit slice
+    expect(breachClass(REFUSAL)).toBe("claim:held-publisher-bars");
+  });
+
+  it("the tag-cut form (300-char audit slice) still classifies via the ladder stem", () => {
+    // the live fold's sample cut the tag mid-way: "…accepted decision. [rule"
+    expect(breachClass(REFUSAL.slice(0, 300))).toBe("claim:held-publisher-bars");
+    // and the stem survives arbitrary emitter tails (BR#3611: structure,
+    // not sentence literals)
+    expect(breachClass(REFUSAL + "; the landed legs stamp stands and the next replay/sweep retries")).toBe("claim:held-publisher-bars");
+  });
+
+  it("a claim-bars refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#14714", ts: 1000 + i * 60_000, reason: REFUSAL,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["claim:held-publisher-bars"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("the sister claim-hold wording (an open human decision owns this exit) stays in its own class", () => {
+    // "unmet bars" / "requested further confirmation" are unique to the
+    // claim-bars message; the BR#14689 human-decision fence keeps its class
+    expect(breachClass("gate: an open human decision owns this exit; answer it before claiming")).toBe("claim:held-human-decision");
+    // and done-open-children rejections are untouched — the claim-bars
+    // message's "a done child task" phrase contains no "open child" stem
+    expect(breachClass("parent BR#1 still has 1 open child task(s) — finish or close them first")).toBe("gate:open-children");
+  });
+});
+
+
 // BR#14071 — the analysis-done receipts gate (machine.ts
 // analysis-done-needs-outcome rule) refusing a done whose body carries no
 // execution_result {outcome,receipts}: "analysis BR#6074 requires
