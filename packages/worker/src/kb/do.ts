@@ -9819,7 +9819,6 @@ export class KnowledgeHub {
       ? this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM delivery_admissions WHERE review_id=?
           AND json_extract(record,'$.state.phase') IN ('pending','held')`, reviewId).toArray()
       : this.state.storage.sql.exec(DELIVERY_ADMISSION_REPLAY_SQL, cursor).toArray();
-    if (!reviewId && !rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
     const recent = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM (
       SELECT review_id,record FROM delivery_admissions ORDER BY rowid DESC LIMIT 32
     ) WHERE json_extract(record,'$.state.phase')='pending' LIMIT 4`).toArray();
@@ -9832,13 +9831,10 @@ export class KnowledgeHub {
       // admission/parent fences. No SQLite transaction crosses this yield.
       if (!reviewId) await this.maintenanceCheckpoint(trace, "review.admissions");
       const id = String(row.review_id);
-      const advance = () => {
-        if (row.cursor != null) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
-      };
-      if (attempted.has(id) || this.admissionReplay.has(id)) { advance(); continue; }
+      if (attempted.has(id) || this.admissionReplay.has(id)) continue;
       const current = this.one(`SELECT record FROM delivery_admissions WHERE review_id=?
         AND json_extract(record,'$.state.phase') IN ('pending','held')`, id);
-      if (!current) { advance(); continue; }
+      if (!current) continue;
       const a = JSON.parse(String(current.record)) as DeliveryAdmission;
       this.admissionReplay.add(id);
       attempted.add(id);
@@ -9910,9 +9906,9 @@ export class KnowledgeHub {
         this.audit("system:delivery", "admission_retry", a.task_id, { review: a.review_id, error: String(e) });
       } finally {
         this.admissionReplay.delete(id);
-        advance();
       }
     }
+    if (!reviewId) this.saveReplayCursor("delivery_admission_cursor", Number(rows.at(-1)?.cursor ?? 0), cursor);
   }
 
   /** Replay only the latest review round, completed after this submission.
@@ -9939,15 +9935,11 @@ export class KnowledgeHub {
       const cursor = Number(this.settingValue(key, "0"));
       const read = (after: number) => this.state.storage.sql.exec(sql, after, REVIEW_RECONCILE_BATCH_SIZE).toArray();
       const first = read(cursor);
-      return first.length || !cursor ? first : read(0);
+      return { cursor, rows: first.length || !cursor ? first : read(0) };
     };
-    const advance = (key: string, cursor: unknown) => this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, key, String(cursor),
-    );
     const accepted = page("review_backfill_cursor", REVIEW_BACKFILL_BATCH_SQL);
-    for (const r of accepted) {
+    for (const r of accepted.rows) {
       await this.maintenanceCheckpoint(trace, "review.backfill");
-      advance("review_backfill_cursor", r.cursor);
       if (this.one(`SELECT review_id FROM delivery_admissions WHERE review_id=?`, r.id)
         || this.one(`SELECT review_id FROM delivery_review_backfill WHERE review_id=? AND status_ts=?`, r.id, r.status_ts)) continue;
       const fresh = this.one(`SELECT status,meta,status_ts FROM artefacts WHERE id=?`, r.id);
@@ -9956,14 +9948,15 @@ export class KnowledgeHub {
       if (receipt) this.persistDeliveryAdmission(String(r.id), JSON.parse(String(fresh.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
+    const backfillEnd = accepted.rows.at(-1);
+    if (backfillEnd) this.saveReplayCursor("review_backfill_cursor", Number(backfillEnd.cursor), accepted.cursor);
     await this.replayDeliveryAdmissions(undefined, trace);
     // BR#9510 additive leg: the scan also covers todo-position parents — an
     // exact-subject accepted_direct_main round whose close stranded because
     // the parent had been watchdog-released back to todo (BR#7642).
-    const rows = page("review_reconcile_cursor", REVIEW_RECONCILE_BATCH_SQL);
-    for (const row of rows) {
+    const verdicts = page("review_reconcile_cursor", REVIEW_RECONCILE_BATCH_SQL);
+    for (const row of verdicts.rows) {
       await this.maintenanceCheckpoint(trace, "review.verdicts");
-      advance("review_reconcile_cursor", row.cursor);
       // Re-read current review authority AFTER yielding. New findings, a newer
       // round, a changed revision or executor must still fence historical work.
       const current = this.currentTaskReview(String(row.id));
@@ -9976,6 +9969,16 @@ export class KnowledgeHub {
         this.audit("system:coordination", "review_reconcile_error", String(row.id), { review: current.id, error: String(e) });
       }
     }
+    const verdictEnd = verdicts.rows.at(-1);
+    if (verdictEnd) this.saveReplayCursor("review_reconcile_cursor", Number(verdictEnd.cursor), verdicts.cursor);
+  }
+
+  /** The repair is idempotent and rechecks authority after each yield. A
+   * crash before the page checkpoint can repeat reads without granting
+   * authority from stale work or needing a durable write for every skipped row. */
+  private saveReplayCursor(key: string, next: number, previous: number): void {
+    if (next === previous) return;
+    this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, key, String(next));
   }
 
   /**
