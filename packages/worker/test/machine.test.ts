@@ -895,7 +895,7 @@ describe("effects decided executor-side (F4)", () => {
     const capped = baseCtx();
     capped.openUnblockChild = () => ({ id: "BR#50" });
     const v2 = ok(await decide(input(typedBlock()), capped));
-    expect(v2.effects).toEqual([{ kind: "skip_unblock_spawn", parent: "BR#1", reason: "existing unblock child BR#50 reused" }]);
+    expect(v2.effects).toEqual([{ kind: "skip_unblock_spawn", parent: "BR#1", reason: "existing unblock child BR#50 reused", reuse: true }]);
 
     const flooded = input(typedBlock({
       unblock_condition: "PR https://github.com/a/b/pull/9 merged",
@@ -907,8 +907,10 @@ describe("effects decided executor-side (F4)", () => {
     // BR#4282: a flood skip is the dedup WORKING, not a spawn attempt — the
     // flag lets the executor audit it without folding a breach card.
     expect((v3.effects[0] as any).flood).toBe(true);
-    // the CAP skip is a different beast — a live child owns the round
+    // the CAP skip is a different beast — a live child owns the round, and
+    // BR#15833: the reuse skip carries its own flag for the same reason
     expect((v2.effects[0] as any).flood).toBeUndefined();
+    expect((v2.effects[0] as any).reuse).toBe(true);
 
     // a DIFFERENT exit condition is a new round, not a flood repeat
     const freshExit = input({
@@ -1331,6 +1333,21 @@ describe("breach fold (dedupe by task+class)", () => {
       ev(n, "BR#7", "unblock spawner cap (5 rounds, cap 3) — escalation already filed", "spawn_cap_skipped"));
     expect(detectBreaches(ticks, new Set())).toHaveLength(0);
     expect(detectBreaches(ticks, new Set(["BR#7|spawn-while-open"]))).toHaveLength(0);
+  });
+
+  it("spawn_child_reused never folds — the reuse skip is the dedup working (BR#15833)", () => {
+    // The one-open-child reuse skip used to be the LAST skip arm that still
+    // audited foldable spawn_skipped: every re-park of a parent whose unblock
+    // child was still open raised a threshold-1 spawn-while-open card on the
+    // dedup's own working (specimen BR#15616: the human-signoff re-park loop
+    // reused unblock child BR#15829 and the fold raised breach BR#15833).
+    // BR#15833 moves the reuse arm to observable-only (spawn_child_reused),
+    // the BR#4282/BR#4702 law. A FOLDABLE spawn_skipped row (a legacy row or
+    // a future regression) must keep folding — the pin above holds that.
+    const reuse = [0, 1, 2, 3, 4, 5].map((n) =>
+      ev(n, "BR#8", "existing unblock child BR#50 reused", "spawn_child_reused"));
+    expect(detectBreaches(reuse, new Set())).toHaveLength(0);
+    expect(detectBreaches(reuse, new Set(["BR#8|spawn-while-open"]))).toHaveLength(0);
   });
 
   it("replay mismatches breach immediately — one corrupted fold is never noise", () => {
@@ -2397,6 +2414,66 @@ describe("breachClass: close:held-human-signoff (BR#15659)", () => {
     expect(breachClass(INFRA)).toBe("unclassified");
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// BR#15643 — the publisher-confirmation claim-bars gate (machine.ts
+// claim-bars rule): a claim on a QUALIFIED task whose publisher set
+// confirmation bars is refused with "gate: task <id> is qualified but its
+// publisher requested further confirmation before it goes ready — unmet
+// bars: <ids>. Satisfy them with a done child task of that role or an
+// accepted decision. [rule: claim-bars]" until the bars are satisfied (a
+// done role-tagged child of the task, or an accepted decision supporting it
+// — the bar id selects the evidence KIND, it is not itself the evidence,
+// which is why the specimen's third refusal fired 2m46s after the bar task
+// went done). The refusal IS the publisher-confirmation flow working —
+// priced never-a-breach, the BR#4562/BR#6654/BR#7008/BR#7684/BR#14689
+// family. Specimen: BR#14714 (publisher bars [BR#14683], opencode-ray) — 3
+// refusals 2026-11-16 23:31:24–23:34:39Z (one single-attempt claim probe +
+// two advisory writes by the BR#15638 investigator resolving the parent's
+// open-children deadlock), folded "unclassified" (default threshold 3) and
+// raised breach card BR#15643.
+// ---------------------------------------------------------------------------
+describe("breachClass: claim:held-publisher-bars (BR#15643)", () => {
+  // the exact audited reason shape (the machine.ts claim-bars guard message
+  // with the do.ts-appended " [rule: …]" tag) — verbatim specimen
+  const REFUSAL =
+    "gate: task BR#14714 is qualified but its publisher requested further confirmation before it goes ready — unmet bars: BR#14683. Satisfy them with a done child task of that role or an accepted decision. [rule: claim-bars]";
+
+  it("the claim-bars refusal classifies claim:held-publisher-bars from its anchored rule tag", () => {
+    expect(REFUSAL.length).toBeLessThanOrEqual(300); // the tag survives the audit slice
+    expect(breachClass(REFUSAL)).toBe("claim:held-publisher-bars");
+  });
+
+  it("the tag-cut form (300-char audit slice) still classifies via the ladder stem", () => {
+    // the live fold's sample cut the tag mid-way: "…accepted decision. [rule"
+    expect(breachClass(REFUSAL.slice(0, 300))).toBe("claim:held-publisher-bars");
+    // and the stem survives arbitrary emitter tails (BR#3611: structure,
+    // not sentence literals)
+    expect(breachClass(REFUSAL + "; the landed legs stamp stands and the next replay/sweep retries")).toBe("claim:held-publisher-bars");
+  });
+
+  it("a claim-bars refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#14714", ts: 1000 + i * 60_000, reason: REFUSAL,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["claim:held-publisher-bars"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("the sister claim-hold wording (an open human decision owns this exit) stays in its own class", () => {
+    // "unmet bars" / "requested further confirmation" are unique to the
+    // claim-bars message; the BR#14689 human-decision fence keeps its class
+    expect(breachClass("gate: an open human decision owns this exit; answer it before claiming")).toBe("claim:held-human-decision");
+    // and done-open-children rejections are untouched — the claim-bars
+    // message's "a done child task" phrase contains no "open child" stem
+    expect(breachClass("parent BR#1 still has 1 open child task(s) — finish or close them first")).toBe("gate:open-children");
+  });
+});
+
 
 // BR#14071 — the analysis-done receipts gate (machine.ts
 // analysis-done-needs-outcome rule) refusing a done whose body carries no

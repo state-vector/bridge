@@ -261,7 +261,7 @@ export type Effect =
   | { kind: "reuse_verify"; parent: string; verify: string }
   | { kind: "skip_verify_spawn"; parent: string; reason: string }
   | { kind: "spawn_unblock"; parent: string; reason: string; exit_condition: string }
-  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean }
+  | { kind: "skip_unblock_spawn"; parent: string; reason: string; flood?: boolean; reuse?: boolean }
   | { kind: "supersede_children"; parent: string; tag: "review" | "unblock" | "question"; keep_newest: boolean; cause: string }
   | { kind: "escalate"; attempts: number; silent_cycles: number; reason: string }
   | { kind: "interactive_handoff"; previous_attempt: unknown }
@@ -999,7 +999,16 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   ) {
     const open = await c.openUnblockChild();
     if (open) {
-      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open.id} reused` });
+      // BR#15833: a reuse skip is the ONE-OPEN-CHILD dedup WORKING — the
+      // existing round already owns this exit, no second child is spawned.
+      // The flag lets the executor audit it observably (spawn_child_reused)
+      // without folding a breach card: pre-fix the reuse arm was the last
+      // skip that still audited foldable spawn_skipped, so every re-park of
+      // a parent whose child was still open raised a threshold-1
+      // spawn-while-open card on the dedup's own working (specimen BR#15616:
+      // the human-signoff re-park loop reused unblock child BR#15829 and the
+      // fold raised BR#15833 on exactly that reuse).
+      effects.push({ kind: "skip_unblock_spawn", parent: i.id, reason: `existing unblock child ${open.id} reused`, reuse: true });
     } else {
       const exit = String(i.body?.unblock_condition ?? "").trim();
       const last = meta.last_unblock_spawn;
@@ -1317,6 +1326,32 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // 23:44:05–23:55:08Z, folded "unclassified" (default threshold 3) and
   // raised breach card BR#15659.
   "close:held-human-signoff": Number.POSITIVE_INFINITY,
+  // BR#15643 — the publisher-confirmation claim-bars gate (machine.ts
+  // claim-bars rule): a claim on a QUALIFIED task whose publisher set
+  // confirmation bars (meta.qualification.bars) is refused with "gate: task
+  // <id> is qualified but its publisher requested further confirmation
+  // before it goes ready — unmet bars: <ids>. Satisfy them with a done child
+  // task of that role or an accepted decision. [rule: claim-bars]" until the
+  // bars are satisfied (a done role-tagged child of the task, or an accepted
+  // decision supporting it — the bar id selects the evidence KIND, it is not
+  // itself the evidence). The refusal IS the publisher-confirmation flow
+  // working: the task stays parked until the confirmation its publisher
+  // asked for exists, zero state is destroyed, and the refusal's own
+  // instruction names the cure — the BR#4562/BR#6654/BR#7008/BR#7684/
+  // BR#14689 never-a-breach pricing family again (pricing it FINITE would
+  // re-arm breach cards on exactly the enforcement the publisher asked
+  // for). Named so the Log says WHAT held: a claim, held by a publisher bar.
+  // Specimen: BR#14714 (publisher bars [BR#14683], set by opencode-ray) — 3
+  // refusals 2026-11-16 23:31:24–23:34:39Z from the sibling breach card
+  // BR#15638's investigator session resolving the parent's open-children
+  // deadlock: one single-attempt unclosability claim probe (refused while
+  // the parent was still open) and two advisory writes refused by the same
+  // gate after the parent's audited force-close — note the bar does NOT
+  // flip on the bar task's own done (bar-as-evidence-kind semantics), which
+  // is why the third refusal fired 2m46s after BR#14683 went done. The
+  // events folded "unclassified" (default threshold 3) and raised breach
+  // card BR#15643.
+  "claim:held-publisher-bars": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1419,6 +1454,18 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // millisecond as accepted_execution review duty BR#15644's own close
   // (version seq 1374220), the next two are sweep passes.
   "human-signoff-done": "close:held-human-signoff",
+  // BR#15643: the publisher-confirmation claim-bars gate (machine.ts
+  // claim-bars rule) refusing a claim on a qualified task whose publisher
+  // set unmet confirmation bars — "task <id> is qualified but its publisher
+  // requested further confirmation before it goes ready — unmet bars: …".
+  // The refusal IS the publisher-confirmation flow working (see the
+  // BREACH_THRESHOLDS entry above for the pricing law and the specimen).
+  // The message is short enough that its trailing [rule: claim-bars] tag
+  // survives the 300-char audit slice for typical ids (~216 chars with one
+  // bar), so this entry alone classifies the live specimens; the ladder
+  // stem below owns the tag-cut forms (a long bar list pushes the tag past
+  // the slice — the BR#4562 tag-cut case).
+  "claim-bars": "claim:held-publisher-bars",
 };
 
 export function breachClass(reason: string): string {
@@ -1620,6 +1667,18 @@ export function breachClass(reason: string): string {
   // re-claim succeeded 12:48:42Z; folded "unclassified" and raised breach
   // card BR#14689. Priced never-a-breach (thresholds above).
   if (r.includes("an open human decision owns this exit")) return "claim:held-human-decision";
+  // BR#15643: the publisher-confirmation claim-bars gate's tag-cut backstop
+  // (the same rule whose anchored [rule: claim-bars] tag the table above
+  // owns). Match the structural fragments "unmet bars" / "requested further
+  // confirmation" — invariant stems of the message (the BR#3611/BR#3612
+  // wording-drift lesson), both sitting well inside the 300-char audit
+  // slice, so the classification survives any tail. The claim:held-human-
+  // decision arm above keeps its own wording, and the claim-bars message's
+  // "a done child task" phrase contains neither "open child" nor any other
+  // captured stem, so done-open-children rejections stay in
+  // gate:open-children.
+  if (r.includes("unmet bars") || r.includes("requested further confirmation"))
+    return "claim:held-publisher-bars";
   // BR#14071: the analysis-done gate (machine.ts analysis-done-needs-outcome
   // rule) refusing a done whose body carries no execution_result
   // {outcome,receipts} — "analysis <id> requires execution_result

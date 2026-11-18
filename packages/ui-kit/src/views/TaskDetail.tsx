@@ -52,12 +52,19 @@ const RELATED_TIMEOUT_MS = 5000;
 const SECTION_TIMEOUT_MS = 15000;
 
 /** race a section's fetch against a timeout — every section answers, one way or another */
-const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T> =>
-  Promise.race([
-    p,
-    new Promise<never>((_, rej) =>
-      setTimeout(() => rej(new Error(`${label}: no answer in ${ms / 1000}s — retry`)), ms)),
-  ]);
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}: no answer in ${ms / 1000}s — retry`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export function SentimentBar({ tasks }: { tasks: KbArtefact[] }) {
   const inFlight = tasks.filter((t) => ["in_progress", "blocked", "todo"].includes(t.status));
@@ -300,6 +307,23 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       setBusy(false);
     }
   };
+  // BR#16195: the human sign-off click — the done edge the sign-off fence
+  // reserves for humans. role:human cards rest in_review with their accepted
+  // verdict bound (BR#15659): machine closes are refused by design (machine.ts
+  // human-signoff-done), so THIS click is the one legal close. It rides the
+  // human web plane — the worker stamps actor `web:<login>` (HUMAN_ACTOR) —
+  // and every gate the card already owes (accepted review, bound
+  // execution_result) is re-checked server-side; any refusal renders inline.
+  const signOff = async () => {
+    setBusy(true);
+    try {
+      await kbApi.transition(task.id, "done", { note: "done — human sign-off (web plane, BR#15659 law)" });
+      await useKb.getState().refresh();
+      onChanged?.();
+    } catch (e) { setCardErr((e as Error).message || "sign-off failed"); useKb.getState().reportError("human sign-off", e); } finally {
+      setBusy(false);
+    }
+  };
   // BR#4962 (per accepted BR#4960): an Awaiting review park's unblock IS the
   // force-review — approve re-anchors the verdict at the parked head and
   // re-queues the train; request_changes bounces impl. No ask was filed;
@@ -420,6 +444,29 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             >Take over claim</Btn>
             <span className="muted-note">
               held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
+            </span>
+            {cardErr && <span className="k-err">{cardErr}</span>}
+          </div>
+        </div>
+      )}
+      {/* BR#16195: the Done control — the human sign-off row. A role:human card
+          in in_review is the BR#15659 designed hold: the machine close is
+          fence-refused (human-signoff-done) and the card waits for exactly this
+          click from the logged-in human authority. The row renders ONLY here —
+          role:human cards, in_review, human web plane — so non-authorised
+          viewers (any non-human plane; cards without the human role) still see
+          no Done, and the fence itself is untouched (their transition attempt
+          is still refused server-side, failing loudly per ADR BR#2673). */}
+      {!m.blocked && task.type === "task" && task.status === "in_review" && (task.roles ?? []).includes("human") && (
+        <div className="task-blocked-info" style={{ marginBottom: 6 }}>
+          <div className="row" style={{ marginTop: 0 }}>
+            <Btn
+              size="sm" variant="accept" disabled={busy}
+              title="Sign off: your click is the legal done edge for this card (BR#15659). The machine close stays fence-refused; your accepted verdict stays bound and the card closes as human-authoritative delivery."
+              onClick={() => void signOff()}
+            >Done — sign off</Btn>
+            <span className="muted-note">
+              human sign-off (BR#15659): this card rests in_review until you mark it done — machine closes are refused by design; your web click is the one legal close.
             </span>
             {cardErr && <span className="k-err">{cardErr}</span>}
           </div>
@@ -693,51 +740,32 @@ export function TaskDetail({ taskId, onClose, onOpen }: {
   useEffect(() => {
     let on = true;
     const errOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
-    // parallel loads (BR#3462 leg 3): artefact, related and history are
-    // independent reads — the old sequential chain paid the auth + DO round
-    // trip three times over (cold DO = seconds), left later sections empty on
-    // any mid-chain failure, and mislabeled the history failure "load task
-    // relations". allSettled renders each section as its own data lands;
-    // per-section error + retry below. related is non-essential enrichment —
-    // it races a timeout and the panel renders without it when slow/failed.
-    void (async () => {
-      const [a, r, h] = await Promise.allSettled([
-        withTimeout(kbApi.artefact(taskId), SECTION_TIMEOUT_MS, "load task"),
-        Promise.race([
-          kbApi.related(taskId),
-          new Promise<never>((_, rej) =>
-            setTimeout(() => rej(new Error(`no answer in ${RELATED_TIMEOUT_MS / 1000}s`)), RELATED_TIMEOUT_MS)),
-        ]),
-        withTimeout(kbApi.history(taskId), SECTION_TIMEOUT_MS, "load history"),
-      ]);
+    // Handle each response as it arrives. A slow history or related query
+    // cannot delay the task, its actions, or its own error and retry.
+    const failed = (label: string, setError: (message: string) => void) => (error: unknown) => {
       if (!on) return;
-      if (a.status === "fulfilled") {
-        const art = a.value as KbArtefact & { meta?: TaskMeta };
-        setTask(art);
-        setBody(art.body_md ?? "");
-        setTitle(art.title);
-        setTags(((art.tags as string[] | null) ?? []).join(", "));
-        setRelations(((art as any).relations ?? []) as Array<{ relation: string; artefact_id: string; dir: string }>);
-        setTaskErr("");
-      } else {
-        setTaskErr(errOf(a.reason));
-        useKb.getState().reportError("load task", a.reason);
-      }
-      if (r.status === "fulfilled") {
-        setRelated(r.value.artefacts ?? []);
-        setRelErr("");
-      } else {
-        setRelErr(errOf(r.reason)); // panel renders without it
-        useKb.getState().reportError("load related tasks", r.reason);
-      }
-      if (h.status === "fulfilled") {
-        setVersions(h.value.versions ?? []);
-        setHistErr("");
-      } else {
-        setHistErr(errOf(h.reason));
-        useKb.getState().reportError("load history", h.reason);
-      }
-    })();
+      setError(errOf(error));
+      useKb.getState().reportError(label, error);
+    };
+    void withTimeout(kbApi.artefact(taskId), SECTION_TIMEOUT_MS, "load task").then(art => {
+      if (!on) return;
+      setTask(art as KbArtefact & { meta?: TaskMeta });
+      setBody(art.body_md ?? "");
+      setTitle(art.title);
+      setTags((art.tags ?? []).join(", "));
+      setRelations(art.relations ?? []);
+      setTaskErr("");
+    }, failed("load task", setTaskErr));
+    void withTimeout(kbApi.related(taskId), RELATED_TIMEOUT_MS, "load related tasks").then(result => {
+      if (!on) return;
+      setRelated(result.artefacts ?? []);
+      setRelErr("");
+    }, failed("load related tasks", setRelErr));
+    void withTimeout(kbApi.history(taskId), SECTION_TIMEOUT_MS, "load history").then(result => {
+      if (!on) return;
+      setVersions(result.versions ?? []);
+      setHistErr("");
+    }, failed("load history", setHistErr));
     return () => { on = false; };
   }, [taskId, reloadKey]);
   // per-section retry: the loads are parallel + idempotent GETs, so re-running

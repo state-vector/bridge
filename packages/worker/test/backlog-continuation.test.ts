@@ -1,3 +1,4 @@
+import { decisionFixture } from "./ask-fixture";
 import { Miniflare } from "miniflare";
 import { realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -59,6 +60,93 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     const rounds = (await children(parent)).filter(c => c.roles.includes("unblock"));
     expect(rounds).toHaveLength(1);
     expect(rounds[0].status).toBe("superseded");
+  });
+
+  it("projects all open work and its typed dependencies without completed cards", async () => {
+    const upstream = await task("Graph prerequisite");
+    for (let i = 0; i < 250; i++) await task(`Graph queued task ${i}`);
+    const downstream = await task("Graph dependent");
+    const exit = { event: "br_done", id: upstream };
+    const parked = await call("transition", { id: downstream, to: "blocked", actor: "author",
+      note: "Waiting on the graph prerequisite", await_event: exit });
+    expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+    const closed = await task("Graph completed task", {}, ["analysis"]);
+    await call("transition", { id: closed, to: "in_progress", actor: "author", session: "graph-test" });
+    const completion = await call("transition", { id: closed, to: "done", actor: "author", session: "graph-test",
+      execution_result: { outcome: "Analysis delivered", receipts: [closed] }, note: "Analysis delivered" });
+    expect(completion.status, JSON.stringify(completion.body)).toBe(200);
+
+    const tasks: { id: string; status: string }[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const url = new URL("https://kb/work-graph");
+      if (cursor !== null) url.searchParams.set("after", cursor);
+      const response = await stub.fetch(url);
+      expect(response.status).toBe(200);
+      const page = await response.json();
+      expect(page.tasks.length).toBeLessThanOrEqual(100);
+      tasks.push(...page.tasks);
+      cursor = page.next_cursor;
+      expect(++pages).toBeLessThan(5);
+    } while (cursor !== null);
+    expect(pages).toBe(3);
+    expect(tasks.length).toBeGreaterThan(250);
+    expect(new Set(tasks.map(row => row.id)).size).toBe(tasks.length);
+    expect(tasks).toContainEqual(expect.objectContaining({ id: upstream, status: "todo" }));
+    expect(tasks).toContainEqual(expect.objectContaining({ id: downstream, status: "blocked",
+      work_waits: expect.arrayContaining([{ kind: "prerequisite", exit }]) }));
+    expect(tasks.some((row: { status: string }) => ["done", "superseded"].includes(row.status))).toBe(false);
+  }, 20_000);
+
+  it("catches changes between snapshot pages and removes closed cards via deltas", async () => {
+    const parent = await task("Graph delta parent", {}, ["analysis"]);
+    const child = await task("Graph delta unchanged");
+    const initial = await (await stub.fetch("https://kb/work-graph")).json();
+    const delta = async (revision: number) => {
+      const response = await stub.fetch(`https://kb/work-graph?since=${revision}`);
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await delta(initial.revision)).toEqual({
+      revision: initial.revision, has_more: false, tasks: [], removed_ids: [],
+    });
+    const older = await delta(0);
+    expect(older.tasks.length + older.removed_ids.length).toBe(100);
+    expect(older.has_more).toBe(true);
+    const next = await delta(older.revision);
+    expect(next.revision).toBeGreaterThan(older.revision);
+    const seen = new Set([...older.removed_ids, ...older.tasks.map((row: { id: string }) => row.id)]);
+    expect([...next.removed_ids, ...next.tasks.map((row: { id: string }) => row.id)]
+      .some(id => seen.has(id))).toBe(false);
+    const question = await call("ask.create", { to: "human", artefact_id: parent,
+      question: "Should Bridge retain the graph data?",
+      decision: decisionFixture(parent, ["Retain it", "Delete it"]) });
+    expect(question.status, JSON.stringify(question.body)).toBe(200);
+    const pending = await delta(initial.revision);
+    expect(pending.tasks).toContainEqual(expect.objectContaining({
+      id: question.body.id, part_of: parent,
+    }));
+    expect(pending.tasks).toContainEqual(expect.objectContaining({
+      id: parent, work_waits: [{ kind: "human_decision", exit: { event: "ask_answered", ask_id: question.body.id } }],
+    }));
+    expect(pending.tasks.some((row: { id: string }) => row.id === child)).toBe(false);
+
+    const answered = await call("ask.answer", { id: question.body.id, answer: "Retain it", actor: "web:ray" });
+    expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    const resolved = await delta(pending.revision);
+    expect(resolved.removed_ids).toContain(question.body.id);
+    expect(resolved.tasks).toContainEqual(expect.objectContaining({ id: parent, work_waits: [] }));
+    expect(await delta(resolved.revision)).toEqual({
+      revision: resolved.revision, has_more: false, tasks: [], removed_ids: [],
+    });
+    await call("transition", { id: parent, to: "in_progress", actor: "author", session: "graph-delta-test" });
+    const completed = await call("transition", { id: parent, to: "done", actor: "author", session: "graph-delta-test",
+      execution_result: { outcome: "Analysis delivered", receipts: [parent] }, note: "Analysis delivered" });
+    expect(completed.status, JSON.stringify(completed.body)).toBe(200);
+    const closed = await delta(resolved.revision);
+    expect(closed.removed_ids).toContain(parent);
+    expect(closed.tasks.some((row: { id: string }) => row.id === parent)).toBe(false);
   });
 
   it("retires unbound executor coordination when its addressed task is terminal, without inventing an answer", async () => {

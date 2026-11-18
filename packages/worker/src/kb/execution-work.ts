@@ -13,10 +13,10 @@ interface TaskRow { id: string; title: string; project: string; status: string; 
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
 interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" }; blocked?: unknown; session?: string; [key: string]: unknown }
 interface HostInventory { tokenId: string; host: string; capabilities: ExecutorCapabilities; observed_at: number;
-  active: number; occupancy: ReturnType<typeof gatewayOccupancy>["occupancy"] }
+  active: number; occupancy?: ReturnType<typeof gatewayOccupancy>["occupancy"] }
 /** BR#14761: already-fetched artefact columns a page holds in hand. Passing
- *  them down keeps tier selection on hostsBare and lets taskReadiness skip
- *  its per-row artefact re-SELECT — the same BR#14767 dispatch-sweep pattern,
+ *  them down keeps tier selection on hostsBare and avoids reloading the
+ *  artefact when testing task-specific startup fences — the same BR#14767 dispatch-sweep pattern,
  *  now shared by the alarm page and the scheduler's bounded reopen pass. */
 interface TaskColumns { roles: string; body_md: string; project: string; meta: string }
 /** BR#14761 — the reserve path no longer pays a 25-card maintenance page.
@@ -29,6 +29,15 @@ export const CAPABILITY_WAIT_REOPEN_PAGE = 25;
 export const CAPABILITY_WAIT_REOPEN_CURSOR_KEY = "execution_reopen_cursor";
 export const CAPABILITY_WAIT_REOPEN_SQL = `SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability' AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT ${CAPABILITY_WAIT_REOPEN_PAGE}`;
 export const CAPABILITY_WAIT_INDEX_SCHEMA = `CREATE INDEX IF NOT EXISTS idx_artefact_capability_waits ON artefacts(json_extract(meta,'$.execution_wait.kind')) WHERE type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability'`;
+export const CAPABILITY_SWEEP_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS idx_capability_sweep_open ON artefacts(type)
+    WHERE type='task' AND status IN ('todo','blocked');
+  CREATE INDEX IF NOT EXISTS idx_executor_start_claim_token ON executor_start_claims(token_id);
+`;
+export const CAPABILITY_SWEEP_SQL = `SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts
+  FROM artefacts INDEXED BY idx_capability_sweep_open WHERE type='task' AND status IN ('todo','blocked') AND rowid>?
+    AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts))
+  ORDER BY rowid LIMIT 25`;
 export function isExecutionWait(meta: TaskMeta): boolean {
   const b = meta.blocked as { await_event?: { event?: string } } | undefined;
   return b?.await_event?.event === "local_handoff" || b?.await_event?.event === "executor_capability";
@@ -92,7 +101,7 @@ export class ExecutionWork {
     floor = maxTier(floor, state?.attempt?.executor?.tier ?? "small");
     floor = maxTier(floor, state?.retry_strategy?.minimum_tier ?? "small");
     if (state?.attempt) return { ...required, tier: floor };
-    const selection = selectModelTier({ lane, policy: this.policySnapshot ?? this.modelPolicy(), required: { ...required, tier: floor }, hosts: row ? this.hostsBare() : this.hosts(id), project: r.project, now: Date.now() });
+    const selection = selectModelTier({ lane, policy: this.policySnapshot ?? this.modelPolicy(), required: { ...required, tier: floor }, hosts: row ? this.hostsBare() : this.hosts(id, false), project: r.project, now: Date.now() });
     return { ...required, tier: selection.kind === "selected" ? selection.tier : selection.minimum };
   }
   private save(id: string, state: ExecutionState) { this.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(ExecutionStateSchema.parse(state)), id); }
@@ -100,7 +109,7 @@ export class ExecutionWork {
     const task = this.task(id); const state = this.state(task);
     if (!["in_review", "in_progress"].includes(task.status) || (state.attempt && state.attempt.phase !== "quiesced") || !["none", "returned"].includes(state.handoff.phase)) throw new Error("gate: stronger implementation verdict requires an idle delivered parent, not a live writer or local handoff");
     const current = state.delivery?.tier ?? state.attempt?.executor?.tier ?? state.requirements.tier;
-    const tier = nextAvailableTier(current, availableModelTiers(this.hosts(id), state.requirements, task.project, Date.now()));
+    const tier = nextAvailableTier(current, availableModelTiers(this.hosts(id, false), state.requirements, task.project, Date.now()));
     if (!tier) throw new Error("gate: no larger model tier is available; report findings or an explicit unmet tier requirement instead");
     if (!apply) return tier;
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
@@ -149,22 +158,45 @@ export class ExecutionWork {
     this.sql.exec(`DELETE FROM executor_start_waits WHERE task_id=?`, id);
     this.audit(token.label, "interactive_claim", id, { session, checkpoint: state.attempt?.checkpoint?.commit ?? null });
   }
-  private hostInventory(): HostInventory[] {
+  private hostInventory(includeOccupancy = true): HostInventory[] {
     return this.sql.exec(`SELECT t.label,h.token_id,h.capabilities,h.observed_ts FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL`).toArray().map(row => {
-      const n = gatewayOccupancy(this.sql, String(row.token_id), String(row.label));
+      const n = includeOccupancy ? gatewayOccupancy(this.sql, String(row.token_id), String(row.label)) : null;
       return {
       tokenId: String(row.token_id), host: String(row.label), capabilities: ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities))), observed_at: Number(row.observed_ts),
-        active: n.active + n.reserved, occupancy: n.occupancy,
+        active: n ? n.active + n.reserved : 0, occupancy: n?.occupancy,
      }; });
   }
-  private hosts(taskId?: string, columns?: TaskColumns): CapabilityObservation[] {
-    return (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
-      readiness: this.taskReadiness(taskId, tokenId, host.host, host.capabilities, columns) }));
+  private hosts(taskId: string, includeOccupancy = true, columns?: TaskColumns): CapabilityObservation[] {
+    const inventory = this.hostSnapshot?.() ?? this.hostInventory(includeOccupancy);
+    if (!inventory.length) return [];
+    const rejections = new Map<string, Set<string>>();
+    if (taskId) for (const row of this.sql.exec(
+      `SELECT host,fingerprint FROM executor_start_rejections WHERE task_id=?`, taskId,
+    ).toArray()) {
+      const host = String(row.host);
+      const fingerprints = rejections.get(host) ?? new Set<string>();
+      fingerprints.add(String(row.fingerprint));
+      rejections.set(host, fingerprints);
+    }
+    const task = rejections.size ? columns ?? this.one<{ body_md: string; project: string; meta: string }>(
+      `SELECT body_md,project,meta FROM artefacts WHERE id=?`, taskId!,
+    ) : null;
+    const meta = task ? JSON.parse(task.meta || "{}") : null;
+    const prerequisite = task && { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } };
+    return inventory.map(({ tokenId, ...host }) => {
+      const proof = this.hostReadiness(tokenId, host.host, host.capabilities);
+      const rejected = rejections.get(host.host);
+      const fenced = proof.kind === "ready" && rejected && (rejected.has(proof.fingerprint)
+        || (prerequisite && rejected.has(startupPrerequisiteFingerprint(proof.fingerprint, prerequisite))));
+      const readiness: ExecutorReadiness = fenced
+        ? { kind: "task_prerequisite", reason: "This task's startup prerequisite requires changed executor/configuration proof" }
+        : proof;
+      return { ...host, readiness };
+    });
   }
   /** BR#14767 sweep path: host-LEVEL readiness (the injected readiness
-   *  callback), memoized per snapshot — NOT per-task taskReadiness, whose
-   *  per-row artefact+rejection SELECTs made hosts() cost ~2 queries x hosts
-   *  x 238 rows ≈ 7000 statements per sweep (~9s measured). The sweep loop
+   *  callback), memoized per snapshot. Task-specific startup fences belong
+   *  to blocker projection rather than the tier selection pass. The sweep loop
    *  layers task-specific startup rejection itself (bulk-fetched); the tier
    *  selection only needs "is this host usable for the lane", which is
    *  exactly host-level readiness. Memo dies with the snapshot
@@ -179,22 +211,10 @@ export class ExecutionWork {
   }
   private hostsBare(): CapabilityObservation[] {
     if (this.hostSnapshot && this.hostsBareCache) return this.hostsBareCache;
-    const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory()).map(({ tokenId, ...host }) => ({ ...host,
+    const value: CapabilityObservation[] = (this.hostSnapshot?.() ?? this.hostInventory(false)).map(({ tokenId, ...host }) => ({ ...host,
       readiness: this.hostReadiness(tokenId, host.host, host.capabilities) }));
     if (this.hostSnapshot) this.hostsBareCache = value;
     return value;
-  }
-  private taskReadiness(id: string | undefined, token: string, host: string, capabilities: ExecutorCapabilities, columns?: TaskColumns): ExecutorReadiness {
-    const proof = this.hostReadiness(token, host, capabilities);
-    // BR#14761 — a page that holds the row's own columns skips the per-row
-    // re-SELECT; the values are the same synchronous snapshot the row came
-    // from. The startup-rejection SELECT stays: it is the fail-closed fence.
-    const task = columns ? { body_md: columns.body_md, project: columns.project, meta: columns.meta }
-      : id ? this.one<{ body_md: string; project: string; meta: string }>(`SELECT body_md,project,meta FROM artefacts WHERE id=?`, id) : null;
-    const meta = JSON.parse(task?.meta ?? "{}");
-    const fingerprint = task && proof.kind === "ready" ? startupPrerequisiteFingerprint(proof.fingerprint, { ...task, meta: { ...meta, execution_requirements: ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}) } }) : "";
-    return id && proof.kind === "ready" && this.one(`SELECT task_id FROM executor_start_rejections WHERE task_id=? AND host=? AND fingerprint IN (?,?)`, id, host, proof.fingerprint, fingerprint)
-      ? { kind: "task_prerequisite", reason: "This task's startup prerequisite requires changed executor/configuration proof" } : proof;
   }
   private startupWait(id: string) {
     const row = this.one<{ state: string }>(`SELECT state FROM executor_start_waits WHERE task_id=?`, id);
@@ -215,7 +235,7 @@ export class ExecutionWork {
     });
     const startup_wait = this.startupWait(id);
     return { requirements, blockers, startup_wait, model_policy: this.modelPolicy(),
-      next_available_tier: nextAvailableTier(state.attempt?.executor?.tier ?? state.requirements.tier, availableModelTiers(this.hosts(id), requirements, task.project, Date.now())),
+      next_available_tier: nextAvailableTier(state.attempt?.executor?.tier ?? state.requirements.tier, availableModelTiers(this.hosts(id, false), requirements, task.project, Date.now())),
       phase: startup_wait ? "unavailable" : capability?.kind === "capability_unavailable" ? capability.reason : capability?.kind === "executor_not_ready" ? "executor_not_ready"
       : blockers.some(b => b.kind === "capacity_wait") ? "capacity_wait" : "ready", hosts };
   }
@@ -233,7 +253,7 @@ export class ExecutionWork {
     const local = grant ? { host: grant.host, capabilities: grant.capabilities }
       : state.handoff.phase === "accepted" ? { host: state.handoff.host, capabilities: state.handoff.capabilities } : undefined;
     const requirements = state.requirements;
-    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id, columns), asks: this.asks(task.id), now, local });
+    const blockers = projectExecutionBlockers({ id: task.id, project: task.project, requirements, handoff: state.handoff, hosts: this.hosts(task.id, true, columns), asks: this.asks(task.id), now, local });
     const wait = this.startupWait(task.id);
     if (wait) blockers.push({ kind: "startup_wait", episode_id: `startup:${task.id}:${wait.since}`, text: startupWaitReason(wait), wait });
     const meta: TaskMeta = JSON.parse(task.meta || "{}");
@@ -451,7 +471,7 @@ export class ExecutionWork {
     // Legacy workspaces without any managed executor inventory retain their
     // manual workflow. Once a gateway advertises, global defaults apply too.
     const cursor = Number(this.one<{ value: string }>(`SELECT value FROM settings WHERE key='execution_sweep_cursor'`)?.value ?? 0);
-    const batch = (after: number) => this.sql.exec(`SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status IN ('todo','blocked') AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT 25`, after).toArray() as unknown as (TaskRow & { body_md: string; roles: string; sweep_cursor: number })[];
+    const batch = (after: number) => this.sql.exec(CAPABILITY_SWEEP_SQL, after).toArray() as unknown as (TaskRow & { body_md: string; roles: string; sweep_cursor: number })[];
     const first = batch(cursor);
     const rows = first.length || !cursor ? first : batch(0);
     for (const task of rows) this.reconcileTaskCapability(task, now, task);

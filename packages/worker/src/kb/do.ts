@@ -254,7 +254,7 @@ import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrere
 import { HandoffCheckpointSchema } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
-import { CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
+import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta, trainReviewParentJoin } from "./recovery-capacity.ts";
@@ -500,8 +500,11 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL } from "./review-query";
-import { LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
+import { STALL_SWEEP_PAGE_SIZE, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
+import { ARTEFACT_SEARCH_SCHEMA, ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL, ARTEFACT_SEARCH_MIGRATION_SQL } from "./artefact-search-schema";
+import { BOARD_INDEX_SCHEMA, BOARD_RECENT_IDS_SQL } from "./board-query";
+import { GRAPH_PAGE_SIZE, OPEN_GRAPH_CARD, workGraphChangeSchema } from "./work-graph";
 import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./lane-store";
 import type { HubRequestStage } from "@bridge/contracts";
 import type { ExecutorReadiness } from "@bridge/contracts";
@@ -777,6 +780,7 @@ export class KnowledgeHub {
     await this.maintenanceCheckpoint(trace, "task.maintenance");
     const now0 = Date.now();
     this.reconcileDispatchReservations(now0);
+    await this.maintenanceCheckpoint(trace, "task.maintenance");
     this.reconcileSchedulingHealth(now0);
     // Readiness owns startup waits, not the task churn/timer machinery.
     await this.maintenanceCheckpoint(trace, "startup.maintenance");
@@ -815,12 +819,13 @@ export class KnowledgeHub {
     // method (stallSweep below) so the admin.stall_sweep drill runs it in
     // isolation, mirroring admin.unblock_proxy_sweep.
     await this.maintenanceCheckpoint(trace, "task.maintenance");
-    await this.stallSweep(now0);
+    await this.stallSweep(now0, trace);
     // (A1) BR#5226 awaiting-park re-evaluation — the migration + steady-state
     // pass: every Awaiting park whose anchored accepted verdict covers the
     // head it parked on re-queues (the machine verdict IS the review);
     // genuine human-leg parks stay parked. Idempotent, converges.
     try {
+      await this.maintenanceCheckpoint(trace, "train.maintenance");
       await this.awaitingRequeueSweep(now0);
     } catch (e) {
       this.audit("system:watchdog", "awaiting_requeue_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -832,6 +837,7 @@ export class KnowledgeHub {
     // effect supersedes the decision's orphan Feedback round, so the
     // duplicated cards collapse in the same tick. Idempotent, converges.
     try {
+      await this.maintenanceCheckpoint(trace, "review.maintenance");
       await this.verifyVerdictAdoptionSweep();
     } catch (e) {
       this.audit("system:watchdog", "verdict_adoption_error", null, { error: String((e as Error).message ?? e).slice(0, 300) });
@@ -1410,15 +1416,27 @@ export class KnowledgeHub {
     return applied;
   }
 
-  private async stallSweep(nowIn: number) {
+  private async *stallCandidates(trace?: RequestTrace) {
+    const end = Number(this.one("SELECT MAX(rowid) AS cursor FROM artefacts")?.cursor ?? 0);
+    let cursor = 0;
+    while (cursor < end) {
+      const page = this.state.storage.sql.exec<{
+        cursor: number; id: string; status: string; owner: string; title: string;
+        meta: string; status_ts: number | null; updated_ts: number;
+      }>(STALL_SWEEP_PAGE_SQL, cursor, end).toArray();
+      for (const row of page) yield row;
+      if (page.length < STALL_SWEEP_PAGE_SIZE) return;
+      cursor = page[page.length - 1].cursor;
+      // The next page reads fresh rows after yielding. No transaction,
+      // pending transition, or eligibility decision crosses this checkpoint.
+      await this.maintenanceCheckpoint(trace, "task.maintenance");
+    }
+  }
+
+  private async stallSweep(now: number, trace?: RequestTrace) {
     const staleMin = this.staleMinutes();
     const staleMs = staleMin * 60_000;
-    const now = nowIn;
-    const rows = this.state.storage.sql.exec(
-      `SELECT id, status, owner, title, meta, status_ts, updated_ts FROM artefacts
-       WHERE type = 'task' AND status = 'in_progress'`,
-    ).toArray();
-    for (const r of rows as any[]) {
+    for await (const r of this.stallCandidates(trace)) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
       if (this.protectedExecution(String(r.id), meta)) continue;
@@ -1467,10 +1485,14 @@ export class KnowledgeHub {
         if (meta.subprocess.deadline_ts > now) continue;
         // lapsed: the declaration is a lie — fall through to abandoned below
       }
+      // Both liveness views come from one indexed read of the named session.
+      const ping = meta.session ? this.one(STALL_SESSION_PINGS_SQL, String(meta.session)) : null;
+      const sessionSignal = Number(ping?.seen ?? 0);
+      const workerPing = Number(ping?.worker_seen ?? 0);
       const lastTs = Math.max(
         meta.last_progress?.ts ?? 0, r.status_ts ?? 0, r.updated_ts ?? 0,
         meta.session_alive_ts ?? 0, // runner vouches the session is alive (stdout/ACP movement) — quiet work is not dead work
-        this.sessionPing(meta), // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
+        sessionSignal, // BR#4067: a dispatched run pings the hub (orient/claim) — a fresh session signal means the run is plausibly still in flight
       );
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
@@ -1479,7 +1501,7 @@ export class KnowledgeHub {
       // Repair pre-BR#6839 phantom claims even when a train/board write just
       // refreshed updated_ts. Only the actual worker's signals prove liveness;
       // another duty's progress and a bounce itself do not start a writer.
-      const workerSignal = Math.max(meta.session_alive_ts ?? 0, this.sessionPing(meta, true),
+      const workerSignal = Math.max(meta.session_alive_ts ?? 0, workerPing,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0);
       if (meta.merge_train?.state === "bounced" && !this.executionState(String(r.id))?.attempt &&
           !meta.interactive_execution && now - workerSignal > staleMs) {
@@ -1503,7 +1525,7 @@ export class KnowledgeHub {
       // claimable either way.
       const firstSignal = Math.max(
         meta.session_alive_ts ?? 0,
-        this.sessionPing(meta),
+        sessionSignal,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0,
       );
       const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
@@ -3022,61 +3044,151 @@ export class KnowledgeHub {
     return { events, last_seq: events.length ? events[events.length - 1].seq : since };
   }
 
+  private boardOpenAsks(taskIds: string) {
+    // open question children: the DERIVED source for awaiting_ask (phase 4 —
+    // the marker was a second source of truth that could drift)
+    const openAskChildren = this.state.storage.sql.exec(
+      `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
+       FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
+         AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
+         AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
+         AND r.dst_id IN (SELECT value FROM json_each(?))
+       ORDER BY c.created_ts DESC`, taskIds,
+    ).toArray();
+    const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
+    for (const c of openAskChildren) {
+      const ask = JSON.parse(String(c.cmeta ?? "{}")).ask;
+      if (!ask || askLifecycle({ status: "todo", meta: { ask } }).state !== "open") continue;
+      const parent = String(c.parent);
+      const asks = askChildrenByParent.get(parent) ?? [];
+      asks.push({ id: String(c.id), route: askRoute(ask), to: this.askRecipient(ask) });
+      askChildrenByParent.set(parent, asks);
+    }
+    return askChildrenByParent;
+  }
+
   async board() {
+    const { tasks, links, askChildrenByParent } = this.projectBoardWork();
+    return this.boardDetails(tasks, links, askChildrenByParent);
+  }
+
+  private projectBoardWork(graphRows?: Record<string, SqlStorageValue>[]) {
+    const graphPage = graphRows !== undefined;
     // owner renders via the BR#4262 render-time join (principal at rest →
     // label on display); matching below stays on ids/meta, never owner text.
     // BR#6395: order open items before terminal (done/superseded) items so a
     // burst of closures never pushes active/blocked/queued tasks out of the
     // board payload window.
-    const tasks = this.state.storage.sql.exec(
-      `WITH recent AS (
-         SELECT id FROM artefacts WHERE type IN ('task','question')
-         ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END, updated_ts DESC
-         LIMIT 250
-       )
-       SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
+    const rows = graphRows ?? this.state.storage.sql.exec(
+      `SELECT a.id, a.type, a.title, a.status, ${OWNER_DISPLAY_SQL} AS owner, a.tags, a.roles, a.meta, a.body_md, a.status_ts, a.created_ts, a.updated_ts, a.project
        FROM artefacts a
-       WHERE a.id IN (SELECT id FROM recent)
+       WHERE a.id IN (${BOARD_RECENT_IDS_SQL})
           OR (a.type = 'question' AND a.status IN ('todo','in_progress','blocked')
               AND coalesce(json_extract(a.meta, '$.ask.answer'), '') = ''
               AND (json_extract(a.meta, '$.ask.route.kind') = 'human_decision'
                    OR (json_type(a.meta, '$.ask.route') IS NULL
                        AND json_extract(a.meta, '$.ask.to') IN ('human','ray','rayh'))))
        ORDER BY CASE WHEN a.status IN ('done','superseded') THEN 1 ELSE 0 END, a.updated_ts DESC`,
-    ).toArray().map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    ).toArray();
+    const tasks = rows.map((t: any) => ({ ...t, meta: this.laneStore().publicMeta(String(t.id), t.meta ?? "{}"), tags: parseTags(t.tags), roles: parseTags(t.roles) }));
+    const taskIds = JSON.stringify(tasks.map(task => String(task.id)));
     // Open human decisions stay visible beyond the recent-work window. Use
     // one JSON parameter to keep the execution lookup within SQLite limits.
-    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, JSON.stringify(tasks.map(task => String(task.id)))).toArray() : [];
+    const executionRows = tasks.length ? this.state.storage.sql.exec(`SELECT task_id,state FROM execution_state WHERE task_id IN (SELECT value FROM json_each(?))`, taskIds).toArray() : [];
     const executionByTask = new Map(executionRows
       .map(row => [String(row.task_id), ExecutionStateSchema.parse(JSON.parse(String(row.state)))]));
     const executionNow = Date.now();
-    for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
+    if (!graphPage) for (const task of tasks) task.execution = projectExecutionModel(executionByTask.get(task.id) ?? null,
       { status: task.status, session: task.meta.session, requirements: task.meta.execution_requirements, interactive_execution: task.meta.interactive_execution }, executionNow);
     const sinks = this.alarmSinkIds();
     for (const task of tasks) if (this.isUnclaimableAnchor(task, task.meta, sinks)) task.meta.infra_anchor = true;
-    const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo" && !t.meta.infra_anchor).map(t => String(t.id)), executionNow);
-    for (const task of tasks) {
-      const view = dispatch.get(String(task.id));
-      const state = executionByTask.get(String(task.id));
-      if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
-        const terminal = state?.terminal;
-        const outcome = terminal && terminal.generation === state?.attempt?.generation
-          && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
-        const cause = outcome && providerRecoveryDiagnosis(outcome);
-        view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
-          : cause === "provider_authentication" ? "provider_auth"
-          : cause === "provider_quota" ? "provider_quota"
-          : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
-            ? outcome.kind : "unclassified";
+    if (!graphPage) {
+      const dispatch = this.boardDispatch(tasks.filter(t => t.type === "task" && t.status === "todo" && !t.meta.infra_anchor).map(t => String(t.id)), executionNow);
+      for (const task of tasks) {
+        const view = dispatch.get(String(task.id));
+        const state = executionByTask.get(String(task.id));
+        if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
+          const terminal = state?.terminal;
+          const outcome = terminal && terminal.generation === state?.attempt?.generation
+            && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
+          const cause = outcome && providerRecoveryDiagnosis(outcome);
+          view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
+            : cause === "provider_authentication" ? "provider_auth"
+            : cause === "provider_quota" ? "provider_quota"
+            : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
+              ? outcome.kind : "unclassified";
+        }
+        task.gateway_dispatch = view;
       }
-      task.gateway_dispatch = view;
     }
     // flat structure, relations only: child tasks carry part_of, parents get a rollup
     const links = this.state.storage.sql.exec(
-      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'`,
+      `SELECT src_id, dst_id FROM relations WHERE relation = 'child_of'
+       AND src_id IN (SELECT value FROM json_each(?))`, taskIds,
     ).toArray();
+    const parentOf = new Map(links.map(l => [String(l.src_id), String(l.dst_id)]));
+    const askChildrenByParent = this.boardOpenAsks(taskIds);
+    for (const t of tasks) {
+      t.part_of = parentOf.get(t.id);
+      t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), askChildrenByParent.get(t.id) ?? []);
+    }
+    return { tasks, links, askChildrenByParent };
+  }
+
+  private graphCards(rows: Record<string, SqlStorageValue>[]) {
+    if (!rows.length) return [];
+    // Graph waits are persisted prerequisites. Computing live dispatch eligibility
+    // here would run every gateway's scheduler on every graph page.
+    const { tasks } = this.projectBoardWork(rows);
+    return tasks.filter(t => !t.meta.infra_anchor).map(t => {
+      const legacyCondition = t.meta.blocked?.unblock_condition || t.meta.depends_on;
+      const condition = t.status === "blocked" && !t.work_waits.length && typeof legacyCondition === "string"
+        ? legacyCondition.trim() || undefined : undefined;
+      return {
+        id: t.id, type: t.type, title: t.title, status: t.status, part_of: t.part_of,
+        work_waits: t.work_waits, condition,
+      };
+    });
+  }
+
+  private workGraph(after: string) {
+    // The client keeps the FIRST page's watermark. Any write that interleaves
+    // with hydration is replayed from there, even before the ID cursor.
+    const revision = Number(this.one("SELECT MAX(seq) AS seq FROM work_graph_changes")?.seq ?? 0);
+    const rows = this.state.storage.sql.exec(
+      `SELECT id,type,title,status,meta FROM artefacts WHERE id > ? AND ${OPEN_GRAPH_CARD}
+       ORDER BY id LIMIT ?`, after, GRAPH_PAGE_SIZE + 1,
+    ).toArray();
+    const page = rows.slice(0, GRAPH_PAGE_SIZE);
+    return {
+      revision,
+      tasks: this.graphCards(page),
+      next_cursor: rows.length > GRAPH_PAGE_SIZE ? String(page.at(-1)?.id) : null,
+    };
+  }
+
+  private workGraphDelta(since: number) {
+    const changes = this.state.storage.sql.exec(
+      "SELECT seq,id FROM work_graph_changes WHERE seq > ? ORDER BY seq LIMIT ?", since, GRAPH_PAGE_SIZE + 1,
+    ).toArray();
+    const page = changes.slice(0, GRAPH_PAGE_SIZE);
+    const ids = page.map(row => String(row.id));
+    const tasks = ids.length ? this.graphCards(this.state.storage.sql.exec(
+      `SELECT id,type,title,status,meta FROM artefacts WHERE id IN (SELECT value FROM json_each(?))
+       AND ${OPEN_GRAPH_CARD}`, JSON.stringify(ids),
+    ).toArray()) : [];
+    const live = new Set(tasks.map(task => task.id));
+    return {
+      revision: Number(page.at(-1)?.seq ?? since),
+      has_more: changes.length > GRAPH_PAGE_SIZE,
+      tasks,
+      removed_ids: ids.filter(id => !live.has(id)),
+    };
+  }
+
+  private boardDetails(tasks: any[], links: Record<string, SqlStorageValue>[], askChildrenByParent: ReturnType<KnowledgeHub["boardOpenAsks"]>) {
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const parentOf = new Map(links.map((l: any) => [l.src_id, l.dst_id]));
     for (const t of tasks) {
       const recoveryId = t.meta?.recovery?.task_id;
       if (recoveryId) {
@@ -3086,8 +3198,6 @@ export class KnowledgeHub {
           ? { kind: "working", task_id: recoveryId, owner: this.displayOwner(String(duty.owner)) }
           : duty && !["done", "superseded"].includes(String(duty.status)) ? { kind: "scheduled", task_id: recoveryId } : { kind: "not_scheduled" };
       }
-      const parent = parentOf.get(t.id);
-      if (parent) t.part_of = parent;
       t.children_open = 0;
       t.children_done = 0;
     }
@@ -3099,7 +3209,7 @@ export class KnowledgeHub {
       else parent.children_open++;
     }
     // readiness projection (bulk): declared state + evidence maps + stacked bars
-    const { analysisEv, reviewEv } = this.qualificationEvidence();
+    const { analysisEv, reviewEv } = this.qualificationEvidence([...byId.keys()]);
     for (const t of tasks) {
       const q = t.meta.qualification ?? {};
       const declared = q.state ?? (t.meta.qualified === true ? "qualified" : undefined);
@@ -3132,25 +3242,6 @@ export class KnowledgeHub {
       `SELECT s.token_id, s.name, s.worktree, s.first_seen_ts, s.last_seen_ts, t.label
        FROM sessions s LEFT JOIN auth_tokens t ON t.id = s.token_id ORDER BY s.last_seen_ts DESC LIMIT 100`,
     ).toArray();
-    // open question children: the DERIVED source for awaiting_ask (phase 4 —
-    // the marker was a second source of truth that could drift)
-    const openAskChildren = this.state.storage.sql.exec(
-      `SELECT r.dst_id AS parent, c.id AS id, c.created_ts AS created_ts, c.meta AS cmeta
-       FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question' AND json_type(c.meta, '$.ask') = 'object'
-         AND coalesce(json_extract(c.meta, '$.ask.answer'), '') = ''
-       ORDER BY c.created_ts DESC`,
-    ).toArray();
-    const askChildrenByParent = new Map<string, { id: string; route: ReturnType<typeof askRoute>; to: string }[]>();
-    for (const c of openAskChildren) {
-      const ask = JSON.parse(String(c.cmeta ?? "{}")).ask;
-      if (!ask || askLifecycle({ status: "todo", meta: { ask } }).state !== "open") continue;
-      const parent = String(c.parent);
-      const asks = askChildrenByParent.get(parent) ?? [];
-      asks.push({ id: String(c.id), route: askRoute(ask), to: this.askRecipient(ask) });
-      askChildrenByParent.set(parent, asks);
-    }
     const progress = this.state.storage.sql.exec(
       `SELECT seq, ts, actor, artefact_id, detail FROM events
        WHERE op = 'progress' ORDER BY seq DESC LIMIT 120`,
@@ -3169,7 +3260,6 @@ export class KnowledgeHub {
       const openAsks = askChildrenByParent.get(t.id) ?? [];
       const openAsk = openAsks.find(ask => ask.route.kind === "human_decision") ?? openAsks[0];
       if (openAsk) t.meta.awaiting_ask = { ask_id: openAsk.id, route: openAsk.route, to: openAsk.to };
-      t.work_waits = this.boardWorkWaits(t, executionByTask.get(t.id), openAsks);
       if (t.type === "question" && t.meta?.ask && ["todo", "in_progress", "blocked"].includes(t.status)) {
         t.meta.ask.route = askRoute(t.meta.ask);
         if (!isHumanDecisionAsk(t.meta.ask)) t.ask_target = this.askTargetPresence(this.askRecipient(t.meta.ask), Date.now());
@@ -3470,6 +3560,8 @@ export class KnowledgeHub {
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_artefacts_open_work_id ON artefacts(id)
+        WHERE type IN ('task','question') AND status NOT IN ('done','superseded');
       CREATE TABLE IF NOT EXISTS relations (
         src_id TEXT NOT NULL,
         relation TEXT NOT NULL,
@@ -3478,21 +3570,7 @@ export class KnowledgeHub {
         PRIMARY KEY (src_id, relation, dst_id)
       );
       -- events: now a VIEW over ledger (migration below)
-      CREATE VIRTUAL TABLE IF NOT EXISTS artefacts_fts USING fts5(
-        title, body_md, content='artefacts', content_rowid='rowid'
-      );
-      CREATE TRIGGER IF NOT EXISTS artefacts_ai AFTER INSERT ON artefacts BEGIN
-        INSERT INTO artefacts_fts(rowid, title, body_md) VALUES (new.rowid, new.title, new.body_md);
-      END;
-      CREATE TRIGGER IF NOT EXISTS artefacts_ad AFTER DELETE ON artefacts BEGIN
-        INSERT INTO artefacts_fts(artefacts_fts, rowid, title, body_md)
-          VALUES ('delete', old.rowid, old.title, old.body_md);
-      END;
-      CREATE TRIGGER IF NOT EXISTS artefacts_au AFTER UPDATE ON artefacts BEGIN
-        INSERT INTO artefacts_fts(artefacts_fts, rowid, title, body_md)
-          VALUES ('delete', old.rowid, old.title, old.body_md);
-        INSERT INTO artefacts_fts(rowid, title, body_md) VALUES (new.rowid, new.title, new.body_md);
-      END;
+      ${ARTEFACT_SEARCH_SCHEMA}
       CREATE TABLE IF NOT EXISTS auth_tokens (
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL UNIQUE,
@@ -3839,7 +3917,12 @@ export class KnowledgeHub {
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
-    this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA);
+    if (this.one(ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL)) {
+      this.state.storage.transactionSync(() => this.state.storage.sql.exec(ARTEFACT_SEARCH_MIGRATION_SQL));
+    }
+    this.state.storage.sql.exec(REVIEW_LOOKUP_SCHEMA + BOARD_INDEX_SCHEMA);
+    this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(CAPABILITY_SWEEP_SCHEMA);
     this.state.storage.sql.exec(LANE_VIEW_SQL);
 
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
@@ -3907,7 +3990,7 @@ export class KnowledgeHub {
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
     }
-    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA);
+    this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA + STALL_SESSION_LOOKUP_SCHEMA + BREACH_CARD_LOOKUP_SCHEMA);
 
     // sessions.kind backfill: gateway identity via the local token registry
     try {
@@ -4255,6 +4338,7 @@ export class KnowledgeHub {
         UPDATE artefact_rev SET rev = rev + 1 WHERE scope = 'wide';
       END;
     `);
+    this.state.storage.sql.exec(workGraphChangeSchema(TRAIN_ALARM_SINK_ID));
   }
 
   // ---------- BR#4212: the fetch entry NEVER throws ----------
@@ -4416,6 +4500,15 @@ export class KnowledgeHub {
           case "/search": return this.json(await this.search({ q: url.searchParams.get("q") ?? "", type: url.searchParams.get("type") ?? undefined, limit: url.searchParams.get("limit") ?? undefined }));
           case "/events": return this.limited("events", 120, 60_000, request)
             ?? this.json(await this.eventsSince(Number(url.searchParams.get("since") ?? 0), Math.min(Number(url.searchParams.get("limit") ?? 100), 500)));
+          case "/work-graph": {
+            const limited = this.limited("work-graph", 120, 60_000, request);
+            if (limited) return limited;
+            const since = url.searchParams.get("since");
+            if (since === null) return this.json(this.workGraph(url.searchParams.get("after") ?? ""));
+            const revision = Number(since);
+            if (!/^\d+$/.test(since) || !Number.isSafeInteger(revision)) return this.json({ error: "invalid graph revision" }, 400);
+            return this.json(this.workGraphDelta(revision));
+          }
           case "/board": return this.limited("board", 30, 60_000, request)
             ?? this.json(await this.boardPayload());
           case "/stats": {
@@ -5170,8 +5263,9 @@ export class KnowledgeHub {
     shaped.row_bytes = shaped.meta_bytes + utf8Bytes(String((row as any).title ?? "")) + utf8Bytes(String((row as any).body_md ?? ""))
       + utf8Bytes(String((row as any).tags ?? "")) + utf8Bytes(String((row as any).roles ?? ""));
     if (row.type === "task") {
-      shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements);
-      shaped.execution = projectExecutionModel(this.executionState(id), { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
+      const execution = this.executionState(id);
+      shaped.meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, shaped.meta.execution_requirements, execution);
+      shaped.execution = projectExecutionModel(execution, { status: row.status, session: shaped.meta.session, requirements: shaped.meta.execution_requirements, interactive_execution: shaped.meta.interactive_execution }, Date.now());
     }
     const admissions = this.state.storage.sql.exec(`SELECT record FROM delivery_admissions WHERE review_id=? OR json_extract(record,'$.task_id')=?`, id, id).toArray().map(r => JSON.parse(String(r.record)) as DeliveryAdmission);
     return { ...shaped, delivery_admissions: admissions };
@@ -5648,11 +5742,13 @@ export class KnowledgeHub {
 
   /** Bulk evidence for readiness projections: done role-tagged children per parent +
    *  accepted decisions per task. Review evidence also satisfies the analysis kind. */
-  private qualificationEvidence(): { analysisEv: Set<string>; reviewEv: Set<string> } {
+  private qualificationEvidence(taskIds?: string[]): { analysisEv: Set<string>; reviewEv: Set<string> } {
+    const scope = taskIds ? " AND r.dst_id IN (SELECT value FROM json_each(?))" : "";
+    const bindings = taskIds ? [JSON.stringify(taskIds)] : [];
     const analysisEv = new Set<string>(), reviewEv = new Set<string>();
     for (const k of this.state.storage.sql.exec(
       `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status = 'done'`,
+       WHERE r.relation = 'child_of' AND c.status = 'done'${scope}`, ...bindings,
     ).toArray() as any[]) {
       const roles: string[] = parseTags(k.roles);
       if (roles.includes("review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
@@ -5660,7 +5756,7 @@ export class KnowledgeHub {
     }
     for (const d of this.state.storage.sql.exec(
       `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'`,
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'${scope}`, ...bindings,
     ).toArray() as any[]) { analysisEv.add(d.tid); reviewEv.add(d.tid); }
     return { analysisEv, reviewEv };
   }
@@ -5693,8 +5789,7 @@ export class KnowledgeHub {
     return (!ignoreStartup && !!this.startupWait(id)) || isExecutionWait(meta) || (h && h.phase !== "none" && h.phase !== "returned");
   }
 
-  private executionSchedulingRequirements(id: string, fallback: unknown) {
-    const state = this.executionState(id);
+  private executionSchedulingRequirements(id: string, fallback: unknown, state = this.executionState(id)) {
     return this.executionWork().schedulingRequirements(id, state?.requirements ?? ExecutionRequirementsSchema.parse(fallback ?? {}), state ?? undefined);
   }
 
@@ -6040,19 +6135,22 @@ export class KnowledgeHub {
     let ready = false;
     const eligible = new Set<string>();
     const holds = new Map<string, Set<SchedulingReason>>();
-    for (const row of hosts) {
-      const tokenId = String(row.token_id), host = String(row.label);
-      const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
-      if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
-      ready = true;
-      const candidates = this.dispatchCandidates(tokenId, host, capabilities, ids);
-      for (const task of candidates.eligible) eligible.add(String(task.id));
-      for (const [id, reason] of candidates.taskHolds) {
-        const reasons = holds.get(id) ?? new Set<SchedulingReason>();
-        reasons.add(reason);
-        holds.set(id, reasons);
+    const work = this.executionWork();
+    work.withHostSnapshot(() => {
+      for (const row of hosts) {
+        const tokenId = String(row.token_id), host = String(row.label);
+        const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(String(row.capabilities)));
+        if (this.executorReadiness(tokenId, host, capabilities, now).kind !== "ready") continue;
+        ready = true;
+        const candidates = this.dispatchCandidates(tokenId, host, capabilities, ids, undefined, work);
+        for (const task of candidates.eligible) eligible.add(String(task.id));
+        for (const [id, reason] of candidates.taskHolds) {
+          const reasons = holds.get(id) ?? new Set<SchedulingReason>();
+          reasons.add(reason);
+          holds.set(id, reasons);
+        }
       }
-    }
+    });
     // A missing gateway must not hide task-level holds. Run the same
     // checks without a capability to classify the backlog during an outage.
     if (!ready) {
@@ -8419,7 +8517,7 @@ export class KnowledgeHub {
     if (row.type === "task" && verdict.status === "in_progress" && row.status !== "in_progress") {
       this.recordTaskRecovery(id, { kind: "executor_assigned", task_id: id }, actor);
     }
-    if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(ts);
+    if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(id);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl
     // card is the ACCEPT event — stamp the card's PR provenance and queue it
     // onto the train (the train owns delivery; the verifier never merges).
@@ -8728,6 +8826,18 @@ export class KnowledgeHub {
             // spawn-while-open on the guard's own suppression was the
             // BR#4023/4135/4177/4113 loop's detection noise.
             this.audit(actor, "spawn_flood_skipped", id, { auto: "unblock", reason: fx.reason });
+            break;
+          }
+          if (fx.reuse) {
+            // BR#15833: a reuse skip is the one-open-child dedup WORKING —
+            // the existing unblock round already owns this exit, no second
+            // child is spawned. Audit observably (spawn_child_reused, not in
+            // the fold's op list), never fold a breach card: pre-fix this arm
+            // audited foldable spawn_skipped, so every re-park of a parent
+            // whose child was still open raised a threshold-1
+            // spawn-while-open card on the dedup's own working (specimen
+            // BR#15616 → breach BR#15833; the BR#4282/BR#4702 law again).
+            this.audit(actor, "spawn_child_reused", id, { auto: "unblock", reason: fx.reason });
             break;
           }
           this.audit(actor, "spawn_skipped", id, { auto: "unblock", reason: fx.reason });
@@ -9338,16 +9448,11 @@ export class KnowledgeHub {
    *  predated the predecessor card's close). */
   private async foldBreaches(taskId: string) {
     const since = Date.now() - BREACH_WINDOW_MS * 8; // look back several windows
-    const rows = this.state.storage.sql.exec(
-      `SELECT ts, op, detail FROM events WHERE artefact_id = ? AND ts > ?
-        AND op IN ('transition_rejected','invariant_violation','spawn_skipped','replay_mismatch')
-        ORDER BY seq ASC LIMIT 200`,
-      taskId, since,
-    ).toArray() as any[];
+    const rows = this.state.storage.sql.exec(BREACH_EVENTS_SQL, taskId, since).toArray();
     if (!rows.length) return;
     const events = rows.map((r) => {
       let d: any = {};
-      try { d = JSON.parse(r.detail ?? "{}"); } catch { /* tolerate junk detail */ }
+      try { d = JSON.parse(String(r.detail ?? "{}")); } catch { /* tolerate junk detail */ }
       const reason = String(d?.reason ?? (Array.isArray(d?.violations) ? d.violations[0] : "") ?? "unknown");
       return { ts: Number(r.ts), task: taskId, op: String(r.op), reason };
     });
@@ -9357,12 +9462,11 @@ export class KnowledgeHub {
     const openKeys = new Set<string>();
     const highWater = new Map<string, number>(); // key → newest already-folded event ts
     const openCards = new Map<string, { id: string; meta: string; stamped: number }>();
-    for (const b of this.state.storage.sql.exec(
-      `SELECT id, status, meta, status_ts, created_ts FROM artefacts WHERE type = 'task' AND meta LIKE ?`,
-      `%"breach_key":"${taskId}|%`,
-    ).toArray() as any[]) {
+    // The separator is ASCII |, immediately before }. This prefix range
+    // also finds legacy rows that only carry breach_key.
+    for (const b of this.state.storage.sql.exec(BREACH_CARDS_SQL, `${taskId}|`, `${taskId}}`).toArray()) {
       let m: any = {};
-      try { m = JSON.parse(b.meta ?? "{}"); } catch { /* garbage meta is not a breach */ }
+      try { m = JSON.parse(String(b.meta ?? "{}")); } catch { /* garbage meta is not a breach */ }
       const key = m?.breach_key;
       if (typeof key !== "string") continue;
       if (b.status === "done" || b.status === "superseded") {
@@ -9583,7 +9687,7 @@ export class KnowledgeHub {
   private async escalateStaleAsks(now: number, trace?: RequestTrace): Promise<string[]> {
     await this.reconcileCompletedReviews(trace);
     await this.maintenanceCheckpoint(trace, "coordination.maintenance");
-    this.retireCompletedCoordination(now);
+    this.retireCompletedCoordination();
     this.retryExpiredRecoveryCoordination(now);
     const sMin = this.one(`SELECT value FROM settings WHERE key = 'ask_escalation_minutes'`) as any;
     const ttlMin = Math.max(5, Math.min(240, parseInt(String(sMin?.value ?? "").replace(/[^0-9]/g, ""), 10) || 30));
@@ -9659,11 +9763,10 @@ export class KnowledgeHub {
   /** Terminal work retires its coordination obligations, not human decisions.
    * No fabricated answer and no answer-dispatch side effects. Also runs on the
    * alarm to heal old rows and on task completion for immediate convergence. */
-  private retireCompletedCoordination(now: number): void {
-    const rows = this.state.storage.sql.exec(`SELECT DISTINCT q.id, q.meta, p.id AS parent_id, p.status AS parent_status FROM artefacts q JOIN artefacts p ON p.id IN (
-      SELECT dst_id FROM relations WHERE src_id=q.id AND relation='child_of'
-      UNION SELECT json_extract(q.meta,'$.ask.route.task_id') WHERE json_extract(q.meta,'$.ask.route.kind')='executor_coordination'
-    ) WHERE q.type = 'question' AND q.status IN ('todo','in_progress','blocked') AND p.type = 'task' AND p.status IN ('done','superseded')`).toArray();
+  private retireCompletedCoordination(taskId?: string): void {
+    const sql = this.state.storage.sql;
+    const rows = taskId === undefined ? sql.exec(RETIRE_COORDINATION_SWEEP_SQL).toArray()
+      : sql.exec(RETIRE_COORDINATION_FOR_TASK_SQL, taskId).toArray();
     for (const row of rows) {
       const meta = JSON.parse(String(row.meta ?? "{}"));
       if (!meta.ask || isHumanDecisionAsk(meta.ask)) continue;
@@ -9717,39 +9820,30 @@ export class KnowledgeHub {
     const rows = reviewId
       ? this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM delivery_admissions WHERE review_id=?
           AND json_extract(record,'$.state.phase') IN ('pending','held')`, reviewId).toArray()
-      : this.state.storage.sql.exec(`SELECT rowid AS cursor,review_id FROM delivery_admissions
-          WHERE rowid>? AND json_extract(record,'$.state.phase') IN ('pending','held') ORDER BY rowid LIMIT 10`, cursor).toArray();
-    if (!reviewId && !rows.length) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor','0')`);
+      : this.state.storage.sql.exec(DELIVERY_ADMISSION_REPLAY_SQL, cursor).toArray();
     const recent = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor,review_id FROM (
       SELECT review_id,record FROM delivery_admissions ORDER BY rowid DESC LIMIT 32
     ) WHERE json_extract(record,'$.state.phase')='pending' LIMIT 4`).toArray();
     // A repaired typed merge wait can be ready now even when its admission
     // was held in a previous pass. Prioritize it over historical held rows.
-    const mergeWaits = reviewId ? [] : this.state.storage.sql.exec(`SELECT NULL AS cursor, a.review_id
-      FROM artefacts t JOIN delivery_admissions a ON json_extract(a.record,'$.task_id')=t.id
-      WHERE t.status='blocked' AND json_extract(t.meta,'$.blocked.await_event.event')='pr_merged'
-        AND json_extract(a.record,'$.state.phase')='held'
-        AND EXISTS (SELECT 1 FROM json_each(a.record,'$.legs') leg
-          WHERE json_extract(leg.value,'$.repo')=json_extract(t.meta,'$.blocked.await_event.repo')
-            AND json_extract(leg.value,'$.number')=json_extract(t.meta,'$.blocked.await_event.n'))
-      ORDER BY a.rowid DESC LIMIT 4`).toArray();
+    const mergeWaits = reviewId ? [] : this.state.storage.sql.exec(HELD_MERGE_ADMISSIONS_SQL).toArray();
     const attempted = new Set<string>();
     for (const row of [...recent, ...mergeWaits, ...rows]) {
       // Yield only between complete replay operations, before re-reading the
       // admission/parent fences. No SQLite transaction crosses this yield.
       if (!reviewId) await this.maintenanceCheckpoint(trace, "review.admissions");
       const id = String(row.review_id);
-      const advance = () => {
-        if (row.cursor != null) this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES('delivery_admission_cursor',?)`, String(row.cursor));
-      };
-      if (attempted.has(id) || this.admissionReplay.has(id)) { advance(); continue; }
+      if (attempted.has(id) || this.admissionReplay.has(id)) continue;
       const current = this.one(`SELECT record FROM delivery_admissions WHERE review_id=?
         AND json_extract(record,'$.state.phase') IN ('pending','held')`, id);
-      if (!current) { advance(); continue; }
+      if (!current) continue;
       const a = JSON.parse(String(current.record)) as DeliveryAdmission;
       this.admissionReplay.add(id);
       attempted.add(id);
-      const save = () => this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
+      const save = () => {
+        const record = JSON.stringify(a);
+        if (record !== current.record) this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, record, a.review_id);
+      };
       try {
         const reviewed = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, a.review_id);
         const authorization = ReviewResultSchema.safeParse(JSON.parse(String(reviewed?.meta ?? "{}")).review_result);
@@ -9797,14 +9891,16 @@ export class KnowledgeHub {
         }
         const target = String(parent.id);
         await this.queueAcceptedPrLegs(target, a.legs, a.actor);
-        const queued = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, target);
+        const queued = this.one(`SELECT status,meta,roles FROM artefacts WHERE id=?`, target);
         const qm = JSON.parse(queued?.meta ?? "{}");
         if (queued?.status === "blocked" && qm.merge_train?.state === "queued" && a.legs.every(l => trainLegs(qm).some(q => q.repo === l.repo && q.number === l.number && q.head_sha_at_acceptance === l.head_sha_at_acceptance))) {
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
-        } else if (queued?.status === "done" && trainLegs(qm).length > 0 && trainLegs(qm).every(l => trainLegLanded(qm, l))) {
-          // BR#9510: the admission took the merged-provenance terminal close
-          // — the acceptance is applied (card done, legs landed), never a
-          // pending row the replay churns on.
+        } else if (queued && (queued.status === "done" ||
+          (effectiveRole(parseTags(queued.roles ?? "")) === "human" && qm.merge_train?.state === "landed"))
+          && trainLegs(qm).length > 0 && trainLegs(qm).every(l => trainLegLanded(qm, l))
+          && a.legs.every(l => trainLegs(qm).some(q => q.repo === l.repo && q.number === l.number))) {
+          // All machine delivery legs are settled. A human sign-off card
+          // stays open without occupying the pending replay queue.
           a.state = { phase: "admitted", task_id: target, subject_revision: qm.work_revision ?? "legacy" }; save();
         } else if (queued?.status === "blocked" && qm.merge_train?.state === "landed" && qm.merge_train?.close_held === "human-signoff") {
           // BR#15722: the merged-provenance close was HELD for the human
@@ -9818,9 +9914,9 @@ export class KnowledgeHub {
         this.audit("system:delivery", "admission_retry", a.task_id, { review: a.review_id, error: String(e) });
       } finally {
         this.admissionReplay.delete(id);
-        advance();
       }
     }
+    if (!reviewId) this.saveReplayCursor("delivery_admission_cursor", Number(rows.at(-1)?.cursor ?? 0), cursor);
   }
 
   /** Replay only the latest review round, completed after this submission.
@@ -9847,15 +9943,11 @@ export class KnowledgeHub {
       const cursor = Number(this.settingValue(key, "0"));
       const read = (after: number) => this.state.storage.sql.exec(sql, after, REVIEW_RECONCILE_BATCH_SIZE).toArray();
       const first = read(cursor);
-      return first.length || !cursor ? first : read(0);
+      return { cursor, rows: first.length || !cursor ? first : read(0) };
     };
-    const advance = (key: string, cursor: unknown) => this.state.storage.sql.exec(
-      `INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, key, String(cursor),
-    );
     const accepted = page("review_backfill_cursor", REVIEW_BACKFILL_BATCH_SQL);
-    for (const r of accepted) {
+    for (const r of accepted.rows) {
       await this.maintenanceCheckpoint(trace, "review.backfill");
-      advance("review_backfill_cursor", r.cursor);
       if (this.one(`SELECT review_id FROM delivery_admissions WHERE review_id=?`, r.id)
         || this.one(`SELECT review_id FROM delivery_review_backfill WHERE review_id=? AND status_ts=?`, r.id, r.status_ts)) continue;
       const fresh = this.one(`SELECT status,meta,status_ts FROM artefacts WHERE id=?`, r.id);
@@ -9864,18 +9956,19 @@ export class KnowledgeHub {
       if (receipt) this.persistDeliveryAdmission(String(r.id), JSON.parse(String(fresh.meta ?? "{}")).review_result, String(receipt.actor), Number(r.status_ts));
       this.state.storage.sql.exec(`INSERT OR REPLACE INTO delivery_review_backfill(review_id,status_ts) VALUES(?,?)`, r.id, r.status_ts);
     }
+    const backfillEnd = accepted.rows.at(-1);
+    if (backfillEnd) this.saveReplayCursor("review_backfill_cursor", Number(backfillEnd.cursor), accepted.cursor);
     await this.replayDeliveryAdmissions(undefined, trace);
     // BR#9510 additive leg: the scan also covers todo-position parents — an
     // exact-subject accepted_direct_main round whose close stranded because
     // the parent had been watchdog-released back to todo (BR#7642).
-    const rows = page("review_reconcile_cursor", REVIEW_RECONCILE_BATCH_SQL);
-    for (const row of rows) {
+    const verdicts = page("review_reconcile_cursor", REVIEW_RECONCILE_BATCH_SQL);
+    for (const row of verdicts.rows) {
       await this.maintenanceCheckpoint(trace, "review.verdicts");
-      advance("review_reconcile_cursor", row.cursor);
       // Re-read current review authority AFTER yielding. New findings, a newer
       // round, a changed revision or executor must still fence historical work.
       const current = this.currentTaskReview(String(row.id));
-      if (current.phase !== "accepted") continue;
+      if (current.phase !== "accepted" || current.result.kind === "accepted_pr") continue;
       const receipt = this.one(`SELECT actor FROM artefact_versions WHERE artefact_id=? AND action='transition' AND json_extract(data,'$.to')='done' ORDER BY seq DESC LIMIT 1`, current.id);
       if (!receipt) continue;
       try {
@@ -9884,6 +9977,16 @@ export class KnowledgeHub {
         this.audit("system:coordination", "review_reconcile_error", String(row.id), { review: current.id, error: String(e) });
       }
     }
+    const verdictEnd = verdicts.rows.at(-1);
+    if (verdictEnd) this.saveReplayCursor("review_reconcile_cursor", Number(verdictEnd.cursor), verdicts.cursor);
+  }
+
+  /** The repair is idempotent and rechecks authority after each yield. A
+   * crash before the page checkpoint can repeat reads without granting
+   * authority from stale work or needing a durable write for every skipped row. */
+  private saveReplayCursor(key: string, next: number, previous: number): void {
+    if (next === previous) return;
+    this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)`, key, String(next));
   }
 
   /**
@@ -14552,6 +14655,8 @@ export class KnowledgeHub {
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
     if (!row || ["done", "superseded"].includes(String(row.status))) return { kind: "retained", reason: "Historical terminal state is preserved." };
     const meta = JSON.parse(row.meta ?? "{}");
+    if (effectiveRole(parseTags(row.roles ?? "")) === "human" && meta.merge_train?.state === "landed")
+      return { kind: "retained", reason: "Merged delivery is recorded and the human owns sign-off." };
     if (!mergeCompletesTask(meta)) {
       await this.resumePrerequisite(id, repo, pr, mergeSha);
       return { kind: "retained", reason: "Prerequisite observed; the actual execution outcome remains outstanding." };
@@ -14655,8 +14760,11 @@ export class KnowledgeHub {
       const closed = await this.closeAdmittedMergedCard(id, merged, cardLegs, actor, "observed-merge-carry", String(a.review_id));
       if (!closed) return null; // gate-refused: loud audit already written; never spawn past it
       a.state = { phase: "admitted", task_id: id, subject_revision: meta.work_revision ?? "legacy" };
-      this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, JSON.stringify(a), a.review_id);
-      this.audit(actor, "merged_admission_carried", id, { admission: a.review_id, repo, pr, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      const record = JSON.stringify(a);
+      if (record !== r.record) {
+        this.state.storage.sql.exec(`UPDATE delivery_admissions SET record=? WHERE review_id=?`, record, a.review_id);
+        this.audit(actor, "merged_admission_carried", id, { admission: a.review_id, repo, pr, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      }
       return String(a.review_id);
     }
     return null;
@@ -15838,6 +15946,17 @@ export class KnowledgeHub {
     return { ok: true, kind: "carry", lane: laneKey(repo, base), task: id, pr, from_head: fromHead, to_head: toHead };
   }
 
+  private recordSignoffDeferral(taskId: string, reviewId: string | undefined, actor: string): void {
+    const review = reviewId ?? null;
+    const deferred = this.one(
+      `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review') IS ? LIMIT 1`,
+      taskId, review,
+    );
+    if (!deferred) this.version(taskId, actor, "signoff_close_deferred",
+      `Accepted delivery retained${review ? ` from verdict ${review}` : ""}. A human must mark ${taskId} done in the webapp.`,
+      { review });
+  }
+
    /** Apply only the current typed, exact-revision acceptance. PR delivery uses
     * the transactional admission outbox; execution and direct-main acceptance
     * close through the same guarded transition and preserve terminal cleanup. */
@@ -15861,16 +15980,8 @@ export class KnowledgeHub {
     // review-reconcile sweep revisits an in_review parent every pass). Defer
     // ONCE per review id, then stand down: the marker row is the visible
     // "accepted verdict retained, awaiting the human" receipt.
-    if (parseTags(parent.roles ?? "").includes("human")) {
-      const deferred = this.one(
-        `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review')=? LIMIT 1`,
-        parentId, current.id,
-      );
-      if (!deferred) {
-        this.version(parentId, actor, "signoff_close_deferred",
-          `accepted verdict ${current.id} retained — completion is human-authoritative (role: human); a human marks ${parentId} done in the webapp (BR#15659)`,
-          { review: current.id });
-      }
+    if (effectiveRole(parseTags(parent.roles ?? "")) === "human") {
+      this.recordSignoffDeferral(parentId, current.id, actor);
       return;
     }
     const result = current.result;
@@ -15986,6 +16097,25 @@ export class KnowledgeHub {
     if (!row || ["done", "superseded"].includes(String(row.status))) return true;
     const now = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
+    const parentRoles = parseTags(String(row.roles ?? ""));
+    const humanSignoff = effectiveRole(parentRoles) === "human";
+    const first = merged[0];
+    // An admitted delivery may be observed again by merge reconciliation.
+    // Receipt settlement is idempotent while the task awaits the human.
+    if (humanSignoff && meta.merge_train?.state === "landed" && merged.every(receipt =>
+      meta.merge_train.legs?.[String(receipt.number)]?.merge_sha === receipt.mergeSha)) {
+      // BR#15722: the stand-down is merge-keyed — a repeat observation adds
+      // no second marker and never re-drives the held close.
+      const deferred = this.one(
+        `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.merge_sha')=? LIMIT 1`,
+        parentId, first.mergeSha,
+      );
+      if (!deferred)
+        this.version(parentId, actor, "signoff_close_deferred",
+          `merged-provenance carry held for the human sign-off (BR#15722): the carry stands down — a human marks ${parentId} done in the webapp`,
+          { merge_sha: first.mergeSha, via, ...(reviewId ? { review: reviewId } : {}) });
+      return true;
+    }
     // Same law as landedFlow/closeBurstParks: an explicit execution wait or
     // live writer owns the exit — the admission stays pending and the next
     // pass retries once the execution machinery quiesces.
@@ -16039,27 +16169,16 @@ export class KnowledgeHub {
       legsMap[String(r.number)] = { ...prior, state: "landed", merge_sha: r.mergeSha, landed_at: now, via: "merged-provenance" };
     }
     meta.merge_train = { ...(meta.merge_train ?? {}), legs: legsMap };
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
-    const note = admissionLandedCloseNote({
-      gateway: actor,
-      reviewId: reviewId ?? "the carried admission",
-      legs: merged.map((m) => ({ repo: m.repo, number: m.number, head: m.head || m.mergeSha, mergeSha: m.mergeSha })),
-    });
-    const first = merged[0];
-    // BR#15722 — a human sign-off subject cannot be machine-closed here
-    // either. The carry paths (admission replay, merged-park sweep, ledger
-    // receipts) re-drive this close on every pass, and each pass re-stamped
-    // the landed legs and refused the done — specimen BR#15616: 7
-    // merged_admission_close_refused events 2026-11-17 00:47–01:30Z on top
-    // of the walk's own close-bounce that raised breach card BR#15722
-    // (PR #462 stops the review-acceptance emitter, not this one). Defer
-    // ONCE per merge with the signoff_close_deferred marker, stamp the
-    // landed state, and report the carry TERMINAL (true): the delivery
-    // obligation is complete — every leg carries a hub merge receipt and
-    // the acceptance is carried — while the board close is the human's
-    // webapp leg. No transition is attempted, so a typed wait keeps its
-    // wait; the carry is never retried.
-    if (parseTags(String(row.roles ?? "")).includes("human")) {
+    if (humanSignoff) {
+      // The train owns the merge receipt; the human owns the transition.
+      // Settle the machine leg without touching the card's status or claim.
+      // BR#15722 (ported onto the replay-churn restructure): the held close
+      // stays observable and guard-visible — the merge_sha-keyed
+      // signoff_close_deferred marker once per merge, close_held:
+      // "human-signoff" on the landed stamp (the BR#14544 consumed-wait
+      // guards and the admission-replay settlement read it), and the
+      // terminal carry audit. No transition is attempted, so a typed wait
+      // keeps its wait and the carry is never retried.
       const deferred = this.one(
         `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.merge_sha')=? LIMIT 1`,
         parentId, first.mergeSha,
@@ -16068,12 +16187,21 @@ export class KnowledgeHub {
         this.version(parentId, actor, "signoff_close_deferred",
           `merged-provenance carry held for the human sign-off (role: human, machine.ts human-signoff-done; BR#15722, specimen BR#15616): every leg carries a hub merge receipt (${merged.map((m) => `${m.repo}#${m.number} merged as ${m.mergeSha.slice(0, 9)}`).join(", ")}) and the acceptance is carried — the machine close will not retry; a human marks ${parentId} done in the webapp`,
           { merge_sha: first.mergeSha, via, ...(reviewId ? { review: reviewId } : {}) });
-      const heldMeta = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id=?`, parentId).meta ?? "{}");
-      heldMeta.merge_train = { ...(heldMeta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via, close_held: "human-signoff" };
-      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(heldMeta), now, parentId);
-      this.audit(actor, "merged_admission_signoff_held", parentId, { via, review: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      meta.merge_train = { ...meta.merge_train, state: "landed", pr: first.number, repo: first.repo,
+        merge_sha: first.mergeSha, landed_at: now, closed_via: via, close_held: "human-signoff" };
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, parentId);
+        this.audit(actor, "merged_admission_signoff_held", parentId, { via, review: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`) });
+      });
       return true;
     }
+
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+    const note = admissionLandedCloseNote({
+      gateway: actor,
+      reviewId: reviewId ?? "the carried admission",
+      legs: merged.map((m) => ({ repo: m.repo, number: m.number, head: m.head || m.mergeSha, mergeSha: m.mergeSha })),
+    });
     try {
       if (row.status === "blocked" || row.status === "todo") {
         await this.transition(
@@ -16101,7 +16229,6 @@ export class KnowledgeHub {
       // artifact IS the analysis findings, so the derived outcome is
       // honest; the close lands first try, lifecycle-legal, with full
       // bookkeeping instead of storming the breach door.
-      const parentRoles = parseTags(String((row as any).roles ?? ""));
       const closeBody: Record<string, unknown> = { id: parentId, to: "done", session: "", note };
       if (parentRoles.includes("analysis")) {
         closeBody.execution_result = {
@@ -16212,10 +16339,7 @@ export class KnowledgeHub {
     // normal path unchanged. ----
     const ledgerReceipts: MergedLegReceipt[] = [];
     for (const l of withStampHeads) {
-      const row = this.one(
-        `SELECT merge_sha FROM train_events WHERE repo = ? AND pr = ? AND kind = 'merged' ORDER BY ts DESC LIMIT 1`,
-        l.repo, l.number,
-      ) as any;
+      const row = this.one(LATEST_PR_MERGE_SQL, l.repo, l.number);
       const mergeSha = String(row?.merge_sha ?? "").toLowerCase();
       if (!/^[0-9a-f]{40}$/.test(mergeSha)) {
         ledgerReceipts.length = 0;
@@ -16224,11 +16348,11 @@ export class KnowledgeHub {
       ledgerReceipts.push({ repo: l.repo, number: l.number, head: String(l.head_sha_at_acceptance ?? ""), mergeSha, via: "train-events" });
     }
     if (ledgerReceipts.length === withStampHeads.length) {
-      const closed = await this.closeAdmittedMergedCard(parentId, ledgerReceipts, withStampHeads, actor, "accepted-verdict-ledger");
+      const settled = await this.closeAdmittedMergedCard(parentId, ledgerReceipts, withStampHeads, actor, "accepted-verdict-ledger");
       this.audit(actor, "train_queue_skipped_already_merged", parentId, {
         legs: ledgerReceipts.map((r) => ({ repo: r.repo, pr: r.number, merge_sha: r.mergeSha })),
-        closed,
-        reason: "every accepted leg already carries a merged train_events row — the accepted verdict closes the card instead of re-queuing an already-merged delivery (BR#15528)",
+        closed: settled && this.one(`SELECT status FROM artefacts WHERE id=?`, parentId)?.status === "done",
+        reason: "every accepted leg already carries a merged train_events row — the accepted verdict settles the delivery without re-queuing an already-merged PR (BR#15528)",
       });
       return;
     }

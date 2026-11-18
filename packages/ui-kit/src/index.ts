@@ -20,7 +20,7 @@ export {
   kbApi, KbAuthError, connectKbWs, setKbTransport, type KbTransport,
 } from "./server/kb";
 export type {
-  KbArtefact, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
+  KbArtefact, KbGraphTask, KbEvent, KbSession, KbAuthToken, KbGatewayAgentEdge,
   KbProgress, KbSeriesPoint, KbVersion, KbBoard, KbAsk, KbConsensus,
   KbReports, KbReportBucket,
 } from "./server/kb";
