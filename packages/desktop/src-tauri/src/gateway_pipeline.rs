@@ -854,6 +854,78 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
             } }
         } }
     }
+    // BR#14703 (W2 loop-closure, law-compliant): the hub keeps a stopping-phase
+    // attempt capacity-charged past its lease and action deadline — expiry is
+    // never stopped-writer proof (BR#14761), so only this original host may
+    // discharge the slot, and only with original-host/kernel proof through the
+    // normal stopped→finalize protocol. When the hub still charges such a
+    // zombie while this host holds NO local journal evidence at all (a daemon
+    // loss before the terminal record, or journal-root drift), read the hub's
+    // typed schedule_status occupancy facts and adopt every stale stopping
+    // fence that names this host's exact identity. Hub facts are pointers, not
+    // proof: the adopted record flows through reconcile_record's normal
+    // writer-receipt lookup, original-worker stop proof or fence-scoped same-UID
+    // /proc census before any receipt is delivered, and drifted fences (newer
+    // generation, non-stopping phase, handoff or prepared operations) are
+    // skipped, never acted on. A schedule_status failure only skips this leg:
+    // the local journals stay authoritative and the next pass retries.
+    if recovered.is_empty() && known.is_empty() {
+        match super::scheduling_status(&cfg, Some(host)) {
+            Ok(status) => {
+                let now = now_ms();
+                let hosts = status.get("hosts").and_then(|hosts| hosts.as_array()).into_iter().flatten();
+                for row in hosts.filter(|row| row.get("host").and_then(|value| value.as_str()) == Some(host)) {
+                    let slots = row.pointer("/occupancy/slots").and_then(|slots| slots.as_array()).into_iter().flatten();
+                    for slot in slots {
+                        if slot.get("kind").and_then(|value| value.as_str()) != Some("unconfirmed")
+                            || slot.get("phase").and_then(|value| value.as_str()) != Some("stopping") { continue; }
+                        let (lease, deadline) = (slot.get("lease_until").and_then(|value| value.as_u64()), slot.get("action_deadline").and_then(|value| value.as_u64()));
+                        let (Some(lease), Some(deadline)) = (lease, deadline) else { continue };
+                        if lease >= now || deadline >= now { continue; }
+                        let (Some(task_id), Some(session), Some(generation), Some(attempt_id)) = (
+                            slot.get("task_id").and_then(|value| value.as_str()).map(String::from),
+                            slot.get("session").and_then(|value| value.as_str()).map(String::from),
+                            slot.get("generation").and_then(|value| value.as_u64()),
+                            slot.get("attempt_id").and_then(|value| value.as_str()).map(String::from),
+                        ) else { continue };
+                        let ticket = Ticket { task_id, session };
+                        if !known.insert(ticket.clone()) { continue; }
+                        // The occupancy row is a pointer; the execution state is
+                        // the fence authority. Re-read it before adopting.
+                        let state = match execution_request(&cfg, &ticket.task_id, &ticket.session,
+                            &format!("recover-zombie-{now}"), json!({"kind":"inspect"})) {
+                            Ok(state) => state,
+                            Err(error) => { dlog(&ticket.task_id, &format!("zombie fence observation deferred: {error}")); continue; },
+                        };
+                        let attempt = &state["attempt"];
+                        let drifted = attempt.get("host").and_then(|value| value.as_str()) != Some(host)
+                            || attempt.get("session").and_then(|value| value.as_str()) != Some(ticket.session.as_str())
+                            || attempt.get("generation").and_then(|value| value.as_u64()) != Some(generation)
+                            || attempt.get("attempt_id").and_then(|value| value.as_str()) != Some(attempt_id.as_str())
+                            || attempt.get("phase").and_then(|value| value.as_str()) != Some("stopping")
+                            || state.pointer("/handoff/phase").and_then(|value| value.as_str()) != Some("none")
+                            || state.get("operations").and_then(|ops| ops.as_array()).is_some_and(|ops|
+                                ops.iter().any(|op| matches!(op.get("state").and_then(|value| value.as_str()), Some("prepared" | "outcome_unknown"))));
+                        if drifted { continue; }
+                        let worktree = begin_intent(&cfg, &ticket).ok().flatten()
+                            .filter(|intent| intent.host == host && intent.url == cfg.url.trim_end_matches('/') && intent.expected_attempt == attempt_id)
+                            .and_then(|intent| intent.worktree);
+                        let owner = Ownership::Attempt { ticket: ticket.clone(), host: host.into(), generation, attempt_id };
+                        let record = Record { owner, host: host.into(), url: cfg.url.clone(), observed_at: now, process: None,
+                            disposition: Disposition::Pending,
+                            work: Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
+                                stderr_tail: "Hub still charges this host for a stopping attempt past its lease and action deadline while this host holds no local journal evidence (daemon loss before the terminal record); adopted for original-host kernel reconciliation, never discharged on time alone".into(), cause: None },
+                                worktree } };
+                        match journal::insert(&root.join("terminal"), record) {
+                            Ok(saved) => recovered.push(Recovered::Final(saved.owner.clone(), FinalWork::Journal(saved))),
+                            Err(error) => dlog(&ticket.task_id, &format!("zombie adoption deferred: {error}")),
+                        }
+                    }
+                }
+            },
+            Err(error) => dlog("gateway", &format!("zombie reconciliation observation deferred; local journals stay authoritative: {error}")),
+        }
+    }
     Ok(recovered)
 }
 
@@ -1944,6 +2016,82 @@ pub(crate) mod tests {
         let Ownership::Attempt { generation, .. } = &identified.owner else { panic!("fence required") };
         assert_eq!(*generation, 7);
         assert!(matches!(record_for("foreign-begin").work, Work::UnknownWriter { .. }), "an attempt this daemon never began stays fail-closed");
+        drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // ---- BR#14703 W2 loop-closure: hub-named zombie slots -----------------
+    // The hub keeps a stopping-phase slot capacity-charged past its lease and
+    // action deadline (expiry is never proof, BR#14761); the ORIGINAL host
+    // adopts the fence from the typed schedule_status occupancy facts ONLY
+    // while it holds no local journal evidence, re-verifies the execution
+    // state first-hand, and hands the record to the normal kernel discharge
+    // paths. Drifted fences (any mismatch vs the inspect reply) are skipped.
+    #[test]
+    fn stale_stopping_zombie_is_adopted_from_hub_facts_and_drifted_fences_are_skipped() {
+        let host = Arc::new(Mutex::new(String::new())); let bound = host.clone();
+        let inspects = Arc::new(Mutex::new(Vec::<String>::new())); let seen_inspects = inspects.clone();
+        let hub = Hub::new(move |request| {
+            let args = &request["params"]["arguments"];
+            let kind = args["command"]["kind"].as_str().unwrap_or("").to_string();
+            if kind == "schedule_status" {
+                let now = now_ms();
+                let zombie = json!({"kind":"unconfirmed","reason":"lease_expired","task_id":"zombie-task","session":"zombie-session","generation":3,"attempt_id":"zombie-one","phase":"stopping","lease_until":1,"action_deadline":1,"task_status":"in_progress"});
+                let renewed = json!({"kind":"unconfirmed","reason":"claim_changed","task_id":"renewed-task","session":"renewed-session","generation":1,"attempt_id":"renewed-one","phase":"stopping","lease_until":now+3_600_000,"action_deadline":now+3_600_000,"task_status":"in_progress"});
+                let drifted = json!({"kind":"unconfirmed","reason":"action_expired","task_id":"drifted-task","session":"drifted-session","generation":2,"attempt_id":"drifted-one","phase":"stopping","lease_until":1,"action_deadline":1,"task_status":"in_progress"});
+                // Real occupancy slots carry no host field: a host's row only
+                // ever contains that host's own attempts (built per-host from
+                // execution_state), so another host's zombie lives in ITS row.
+                let foreign = json!({"kind":"unconfirmed","reason":"lease_expired","task_id":"foreign-task","session":"foreign-session","generation":1,"attempt_id":"foreign-one","phase":"stopping","lease_until":1,"action_deadline":1,"task_status":"in_progress"});
+                return Some(json!({"hosts":[
+                    {"host":"another-host","occupancy":{"slots":[foreign]}},
+                    {"host":*bound.lock().unwrap(),"occupancy":{"slots":[zombie, renewed, drifted]}},
+                ]}));
+            }
+            if kind == "inspect" {
+                let id = args["id"].as_str().unwrap_or("").to_string();
+                seen_inspects.lock().unwrap().push(id.clone());
+                return Some(match id.as_str() {
+                    // Exact fence match: adoptable.
+                    "zombie-task" => json!({"attempt":{"host":*bound.lock().unwrap(),"session":"zombie-session","generation":3,"attempt_id":"zombie-one","phase":"stopping","lease_until":1,"action_deadline":1},"handoff":{"phase":"none"},"operations":[],"terminal":null}),
+                    // The hub's pointer is stale: the writer moved on (running
+                    // again) — never adopt a drifted fence.
+                    "drifted-task" => json!({"attempt":{"host":*bound.lock().unwrap(),"session":"drifted-session","generation":2,"attempt_id":"drifted-one","phase":"running","lease_until":now_ms()+600_000,"action_deadline":now_ms()+600_000},"handoff":{"phase":"none"},"operations":[],"terminal":null}),
+                    _ => json!({"attempt":null}),
+                });
+            }
+            panic!("zombie adoption may only read schedule_status facts and re-inspect the exact fence, got {kind}");
+        });
+        let (cfg, ready, _) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
+        let recovered = recover(&ready.data, Vec::new()).unwrap();
+        // Only the exact-match stale fence is adopted; the foreign-host row is
+        // filtered before inspection, the renewed lease is skipped unopened.
+        assert_eq!(inspects.lock().unwrap().clone(), vec!["zombie-task".to_string(), "drifted-task".to_string()], "renewed leases are never inspected");
+        let adopted = recovered.iter().find_map(|item| match item {
+            Recovered::Final(_, FinalWork::Journal(record)) if record.ticket().task_id == "zombie-task" => Some(record.clone()),
+            _ => None,
+        }).expect("the stale stopping fence must be adopted for kernel reconciliation");
+        let Ownership::Attempt { ticket, generation, attempt_id, host: owner_host } = &adopted.owner else { panic!("attempt fence required") };
+        assert_eq!((ticket.task_id.as_str(), ticket.session.as_str(), *generation, attempt_id.as_str()), ("zombie-task", "zombie-session", 3, "zombie-one"));
+        assert_eq!(owner_host.as_str(), cfg.label.as_deref().unwrap());
+        match &adopted.work {
+            Work::Unproven { outcome, .. } => {
+                assert!(matches!(outcome.kind, OutcomeKind::ResultUnavailable), "the adopted record is an honest unproven result");
+                assert!(outcome.stderr_tail.contains("never discharged on time alone"), "the outcome names the law: expiry is not proof");
+            },
+            Work::Stopped { .. } | Work::Unstarted { .. } | Work::UnknownWriter { .. } => {
+                panic!("adoption must not fabricate a result")
+            },
+        }
+        assert!(recovered.iter().all(|item| !matches!(item, Recovered::Final(_, FinalWork::Journal(r)) if r.ticket().task_id == "drifted-task")), "a drifted fence is skipped, never acted on");
+        assert!(recovered.iter().all(|item| !matches!(item, Recovered::Final(_, FinalWork::Journal(r)) if r.ticket().task_id == "foreign-task")), "another host's slot is never touched");
+        // The adopted record is journalled: the next pass replays it as its
+        // single pending Final (the normal discharge path) and the leg never
+        // re-adopts — it is gated on `recovered.is_empty() && known.is_empty()`.
+        let terminal = terminal_root(&cfg).unwrap();
+        assert_eq!(journal::pending(&terminal, cfg.label.as_deref().unwrap(), cfg.url.trim_end_matches('/')).unwrap().len(), 1);
+        let again = recover(&ready.data, Vec::new()).unwrap();
+        assert_eq!(again.iter().filter(|item| matches!(item, Recovered::Final(_, FinalWork::Journal(r)) if r.ticket().task_id == "zombie-task")).count(), 1, "the journalled adoption replays once — the leg never re-adopts");
+        assert_eq!(journal::pending(&terminal, cfg.label.as_deref().unwrap(), cfg.url.trim_end_matches('/')).unwrap().len(), 1, "no duplicate adoption is written");
         drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
 }

@@ -151,6 +151,47 @@ beforeEach(async () => {
           ).toArray();
           return Response.json({ ok: true, alarms });
         }
+        // BR#14703 — scheduler-health probe: seed the starved shape (eligible
+        // work, free capacity, since/attention backdated past the alarm and
+        // re-fire thresholds), tick the sweep once, and report the class
+        // alarms it raised so a test can assert the throttle windows exactly.
+        if (path === "/fixture/scheduling-health") {
+          const { age_s = 0, backdate_attention_s = 0, backdate_alarm_ms = 0 } = await request.json();
+          const now = Date.now();
+          if (age_s) {
+            // Seed a dispatch_health row for every advertised host so the
+            // backdate lands even before the first sweep saw this host.
+            this.state.storage.sql.exec(
+              "INSERT OR IGNORE INTO dispatch_health(token_id, since) SELECT h.token_id, ? FROM execution_hosts h JOIN auth_tokens t ON t.id=h.token_id WHERE t.revoked_ts IS NULL", now,
+            );
+            this.state.storage.sql.exec("UPDATE dispatch_health SET since=?", now - age_s * 1000);
+          }
+          if (backdate_attention_s) this.state.storage.sql.exec("UPDATE dispatch_health SET attention_at=?", now - backdate_attention_s * 1000);
+          if (backdate_alarm_ms) this.state.storage.sql.exec("UPDATE ledger SET ts=? WHERE kind='signal' AND action='dispatch_starved'", now - backdate_alarm_ms);
+          const started = now;
+          this.reconcileSchedulingHealth(Date.now());
+          const alarms = this.state.storage.sql.exec(
+            "SELECT action, data FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile') AND ts>=? ORDER BY seq", started,
+          ).toArray().map(row => ({ action: String(row.action), data: JSON.parse(String(row.data)) }));
+          return Response.json({ ok: true, alarms });
+        }
+        // BR#14703 — arm the retry-budget hold shape on plain todo tasks:
+        // 3 budget charges inside the decay window hold admission
+        // (executionAttemptBudgetExhausted), the churn-storm residue class.
+        if (path === "/fixture/budget-pile") {
+          const { ids } = await request.json();
+          const now = Date.now();
+          let stamped = 0;
+          for (const id of ids) {
+            const row = this.state.storage.sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0];
+            const state = row ? JSON.parse(row.state) : { policy_version: 1, revision: 0, generation: 0, attempt: null, requirements: {}, messages: [], operations: [] };
+            state.budget_exhaustions = 3;
+            state.budget_exhausted_at = now - 60_000;
+            this.state.storage.sql.exec("INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, '') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state", id, JSON.stringify(state));
+            stamped++;
+          }
+          return Response.json({ ok: true, stamped });
+        }
         if (path !== "/fixture/spent-route" && path !== "/fixture/watchdog-release") return super.fetch(request);
         const { id } = await request.json();
         const sql = this.state.storage.sql;
@@ -822,6 +863,50 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].active).toBe(1);
     expect((await reserve(g)).kind).toBe("at_capacity");
+  });
+  it("BR#14703: a starved scheduler re-fires one throttled class alarm and stats carries starved_1h plus held-by-reason", async () => {
+    const project = "starve-1h", g = await gateway(project, 2);
+    // Eligible work with free capacity and no reserve poll: the work-starved
+    // shape. Two tasks keep eligible > 0 across both health ticks.
+    await task(project);
+    await task(project);
+    const health = async (options: object) => (await stub.fetch("https://fixture/fixture/scheduling-health", { method: "POST", body: JSON.stringify(options) })).json() as Promise<{ alarms: { action: string; data: Record<string, unknown> }[] }>;
+    const first = await health({ age_s: 7200 });
+    expect(first.alarms).toHaveLength(1);
+    expect(first.alarms[0]).toMatchObject({ action: "dispatch_starved" });
+    expect(String(first.alarms[0].data.host)).toBe(g.host);
+    // One class alarm per 30m window: an immediate re-tick is silent.
+    expect((await health({})).alarms).toHaveLength(0);
+    // Past the throttle window the alarm re-fires for the still-starved host.
+    const refire = await health({ backdate_attention_s: 1801 });
+    expect(refire.alarms).toHaveLength(1);
+    expect(refire.alarms[0]).toMatchObject({ action: "dispatch_starved" });
+    const stats = await post("stats", {});
+    expect(stats.starved_1h).toBe(2);
+    const scheduler = stats.scheduler as { host: string; starved_since: number; eligible: number; held: Record<string, number> }[];
+    expect(scheduler?.[0]).toMatchObject({ host: g.host, eligible: 2 });
+    expect(scheduler?.[0].starved_since).toBeLessThanOrEqual(Date.now() - 120_000);
+    // A healthy re-check clears the counter's source: alarms age out of the
+    // trailing hour only — here the counter still reflects the live storm.
+    expect((await health({})).alarms).toHaveLength(0);
+    expect((await post("stats", {})).starved_1h).toBe(2);
+  });
+  it("BR#14703: a retry-budget pile over 30 raises one throttled class alarm and stats carries held-by-reason", async () => {
+    const project = "budget-pile", g = await gateway(project);
+    const ids: string[] = [];
+    for (let i = 0; i < 31; i++) ids.push(await task(project));
+    expect(await post("fixture/budget-pile", { ids })).toMatchObject({ ok: true, stamped: 31 });
+    const health = async (options: object) => (await stub.fetch("https://fixture/fixture/scheduling-health", { method: "POST", body: JSON.stringify(options) })).json() as Promise<{ alarms: { action: string; data: Record<string, unknown> }[] }>;
+    const first = await health({});
+    const pile = first.alarms.filter(alarm => alarm.action === "retry_budget_pile");
+    expect(pile).toHaveLength(1);
+    expect(Number(pile[0].data.pile)).toBeGreaterThanOrEqual(31);
+    expect(Number(pile[0].data.threshold)).toBe(30);
+    // One class alarm per 30m window while the storm persists.
+    expect((await health({})).alarms.filter(alarm => alarm.action === "retry_budget_pile")).toHaveLength(0);
+    const stats = await post("stats", {});
+    const scheduler = stats.scheduler as { held: Record<string, number> }[];
+    expect((scheduler?.[0].held.retry_budget ?? 0)).toBeGreaterThanOrEqual(31);
   });
   it("bootstraps from the authenticated reservation without caller-supplied worker attribution, never from a peer or stale session", async () => {
     const project = "bootstrap", g = await gateway(project), peer = await gateway(project);

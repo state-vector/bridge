@@ -6354,7 +6354,8 @@ export class KnowledgeHub {
         action_deadline: cur.attempt.action_deadline, observed_at: now,
       });
     }
-    for (const status of this.schedulingStatus(undefined, now)) {
+    const statuses = this.schedulingStatus(undefined, now);
+    for (const status of statuses) {
       if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
         this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
       }
@@ -6375,6 +6376,19 @@ export class KnowledgeHub {
           this.audit("system:scheduler", "dispatch_starved", null, { host: status.host, eligible: status.eligible, active: status.active, reserved: status.reserved, capacity: status.capacity, since: pending.since });
         });
       }
+    }
+    // BR#14703 (W3) — the retry-budget hold pile: dozens of simultaneous
+    // cooldowns ARE the starvation's other face (the churn storm armed a
+    // budget on every dead-at-launch session; 69/193 todo tasks sat fenced
+    // with no global view or alarm). retry_budget is a task-intrinsic hold,
+    // so the largest per-host count is the pile size. While it exceeds the
+    // threshold, raise ONE class alarm naming the storm — throttled to one
+    // per 30m like dispatch_starved — so failure cooldowns cannot silently
+    // fence off a third of the backlog.
+    const pile = statuses.reduce((n, s) => Math.max(n, Number(s.reasons?.retry_budget ?? 0)), 0);
+    if (pile > 30 && !this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='retry_budget_pile' AND ts>? LIMIT 1`, now - 1_800_000)) {
+      const sample = [...new Set(statuses.flatMap(s => s.held?.retry_budget ?? []))].slice(0, 10);
+      this.audit("system:scheduler", "retry_budget_pile", null, { pile, threshold: 30, hosts: statuses.filter(s => Number(s.reasons?.retry_budget ?? 0) > 0).length, sample });
     }
   }
 
@@ -9233,6 +9247,20 @@ export class KnowledgeHub {
         `SELECT COUNT(*) AS n FROM events WHERE op = 'launch_failed' AND ts > ?`, Date.now() - 3600_000,
       ).one() as any)?.n ?? 0);
     } catch { /* events shape varies — best-effort */ }
+    // BR#14703 (W1) — starved_1h: how many dispatch_starved alarms fired in
+    // the trailing hour. The repeating 30m-throttled alarm yields 2/hour
+    // while a dispatch loop stays dead and decays to zero an hour after
+    // recovery, so a 24h-dead loop is visible as a sustained nonzero counter
+    // on the stats route alone — a dead dispatch loop must never look like
+    // an empty backlog on ANY operator surface. The alarms live in `ledger`
+    // as signal rows (audit writes ledger kind='signal'); the legacy `events`
+    // table no longer receives them.
+    let starved_1h = 0;
+    try {
+      starved_1h = Number((this.state.storage.sql.exec(
+        `SELECT COUNT(*) AS n FROM ledger WHERE kind = 'signal' AND action = 'dispatch_starved' AND ts > ?`, Date.now() - 3600_000,
+      ).one() as any)?.n ?? 0);
+    } catch { /* ledger shape varies — best-effort */ }
     // BR#14703 (W3) — scheduler starvation + hold visibility: the dispatch
     // loop starving (eligible work, free capacity, zero reservations) and
     // the hold pile (retry_budget/provider_route/...) fencing the backlog
@@ -9256,6 +9284,7 @@ export class KnowledgeHub {
       watchdog,
       ...(occupancy?.length ? { occupancy } : {}),
       ...(launch_failed_1h ? { launch_failed_1h } : {}),
+      ...(starved_1h ? { starved_1h } : {}),
       ...(scheduler?.length ? { scheduler } : {}),
       channel: {
         window_started_ts: this.routeStatsStarted,

@@ -635,9 +635,32 @@ files remain host-affine. A delayed old launch is refused by the claim/session g
 command `schedule_status`) reports running/uncertain writers, reservations,
 capacity, eligible work, exclusion counts, readiness, last scheduling result and
 work-conservation health. A ready gateway with free slots and eligible work but
-no new reservations for two minutes raises one `dispatch_starved` audit incident
-per episode. Reservations clear the episode; this is machine diagnosis, not a
-human approval queue.
+no new reservations for two minutes raises a `dispatch_starved` audit incident,
+and the alarm REPEATS every 30 minutes while the scheduler stays starved — a
+dispatch loop dead for a day is never silent after its first alarm.
+Reservations clear the episode; this is machine diagnosis, not a human approval
+queue.
+
+The `stats` surface carries the same truth without fetching `schedule_status`:
+`starved_1h` counts `dispatch_starved` alarms in the trailing hour (nonzero
+exactly while starvation is live, decaying to zero an hour after recovery),
+each scheduler host reports `starved_since` plus held counts by reason
+(`retry_budget`, `provider_route`, `unknown_operations`, ...), and a
+retry-budget pile over 30 simultaneously held tasks raises one
+`retry_budget_pile` class alarm per 30 minutes naming the storm — failure
+cooldowns cannot silently fence off a third of the backlog.
+
+A stopping-phase attempt never frees its slot on time alone: an expired lease
+and action deadline keep it capacity-charged, and the hub only names the
+missing proof (`stopping_writer_proof_pending`). The original host's recovery
+loop closes the class: when the hub still charges a stale stopping fence while
+the host holds no local journal evidence, the fence is adopted from the typed
+schedule_status occupancy facts and discharged through the normal
+original-host proof paths — hub writer receipt, original-worker stop proof or
+the fence-scoped same-UID `/proc` census — and only the resulting
+`stopped`/`finalize` receipts free the slot with an honest result-unavailable
+outcome. Drifted fences (newer generation, non-stopping phase, handoff or
+prepared operations) are skipped, never acted on.
 
 To retire a laptop from autonomous execution, an authenticated full agent or
 human uses `execution` with `id:"gateway"` and command
