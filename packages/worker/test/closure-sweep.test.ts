@@ -1400,4 +1400,96 @@ describe("BR#5916 — expired time awaits on unclaimable infra anchors re-arm (m
     expect(nAfter.meta?.proxy_check?.receipts.join(" ")).toContain("timer elapsed");
   });
 });
+
+// ---------- (g4) BR#16864 — the spawner cap is per satisfaction epoch, not lifetime ----------
+
+describe("BR#16864 — a later-TRUE wait re-arms the capped spawner exactly once per changed epoch", () => {
+  it("3 capped rounds, then the wait BECOMES true: one fresh round spawns; a steady-true re-fire never re-arms again (specimens BR#14944/BR#14634)", async () => {
+    // parent shaped like the stranded specimens: a card whose satisfied-
+    // consumption guards route the TRUE flip to the duty path (operator_gated
+    // is the caller-settable stand-in for the interactive/human-held claim
+    // family the first-hand specimens BR#14944/BR#14634 carry — same guard
+    // arm in consumedWaitResumeGuards/continueBlockedWork; sweep 2026-11-19,
+    // GH #3365 comment 6994075013)
+    const c = await kbJson("/create", {
+      type: "task", title: "IMPL: br16864 stranded-park drill", qualified: true, session: "drill-exec-br16864",
+      meta: { operator_gated: true },
+    });
+    expect(c.status, JSON.stringify(c.body)).toBe(200);
+    const id = String(c.body.id);
+    await kbJson("/transition", { id, to: "in_progress", actor: "drill-exec-br16864", session: "drill-exec-br16864" });
+
+    // the dependency whose done-ness IS the wait — todo at park time
+    const dep = await kbJson("/create", { type: "question", title: "br16864 drill dependency", session: "drill-exec-br16864" });
+    expect(dep.status, JSON.stringify(dep.body)).toBe(200);
+    const depId = String(dep.body.id);
+
+    // three rounds EVER (the BR#2893 cap), all closed with findings — fired
+    // while the wait was NOT satisfied, exactly the legacy-epoch shape
+    const mkChild = async (tag: string) => {
+      const cc = await kbJson("/create", { type: "task", title: `Unblock: br16864 ${tag}`, qualified: true, session: `duty-${tag}`, roles: ["unblock"] });
+      expect(cc.status, `child create failed: ${JSON.stringify(cc.body)}`).toBe(200);
+      const cid = String(cc.body.id);
+      await kbJson("/link", { src: cid, relation: "child_of", dst: id });
+      await kbJson("/transition", { id: cid, to: "in_progress", actor: `duty-${tag}`, session: `duty-${tag}` });
+      const done = await kbJson("/transition", {
+        id: cid, to: "done", actor: `duty-${tag}`, session: `duty-${tag}`,
+        execution_result: { outcome: "Wait not satisfied; findings recorded", receipts: [`${depId} status=todo — wait not held`] },
+        note: `receipts: ${depId} re-verified todo — wait not held; findings recorded`,
+      });
+      expect(done.status, `child done failed: ${JSON.stringify(done.body)}`).toBe(200);
+    };
+    for (const tag of ["r1", "r2", "r3"]) await mkChild(tag);
+
+    // park on the br_done wait (FALSE at park) — the park-time cap arm
+    // stamps the escalation, the exact legacy stamp the specimens carry
+    const park = await kbJson("/transition", {
+      id, to: "blocked", actor: "drill-exec-br16864", session: "drill-exec-br16864",
+      note: "waiting on the dependency", await_event: { event: "br_done", id: depId },
+    });
+    expect(park.status, `park failed: ${JSON.stringify(park.body)}`).toBe(200);
+    const parked = await taskById(id);
+    expect(parked.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(parked.meta?.unblock_escalated?.predicate).toBeUndefined();
+
+    // the world changes: the dependency closes done
+    const depDone = await kbJson("/transition", { id: depId, to: "done", actor: "drill-exec-br16864", session: "drill-exec-br16864" });
+    expect(depDone.status, `dep done failed: ${JSON.stringify(depDone.body)}`).toBe(200);
+
+    // sweep: the wait evaluates TRUE with receipts the capped epoch never
+    // saw → the cap RE-ARMS (one fresh round) instead of stranding the
+    // satisfied park forever
+    const sweep = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 700 * 60_000 });
+    expect(sweep.body.error).toBeUndefined();
+    const after = await taskById(id);
+    expect(after.status, "the parent stays parked — the fresh duty re-verifies first").toBe("blocked");
+    const fresh = (await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br16864 stranded-park drill"));
+    expect(fresh, "the changed epoch must spawn exactly ONE fresh round").toHaveLength(1);
+    expect(after.meta?.unblock_escalated?.re_arms).toBe(1);
+    expect(after.meta?.unblock_escalated?.rounds).toBe(3);
+    expect(String(after.meta?.unblock_escalated?.predicate ?? "")).toContain("br_done");
+    expect(Array.isArray(after.meta?.unblock_escalated?.receipts)).toBe(true);
+    expect(after.meta?.proxy_check?.verdict).toBe("true");
+
+    // close the fresh round with findings (it may or may not resume the
+    // parent — either way the round is consumed like any duty)
+    await kbJson("/transition", { id: fresh[0].id, to: "in_progress", actor: "duty-br16864-fresh", session: "duty-br16864-fresh" });
+    const freshDone = await kbJson("/transition", {
+      id: fresh[0].id, to: "done", actor: "duty-br16864-fresh", session: "duty-br16864-fresh",
+      execution_result: { outcome: "Wait verified true; parent handed to its executor per findings", receipts: [`${depId} status=done`] },
+      note: `receipts: ${depId} done re-verified live — epoch fire discharged`,
+    });
+    expect(freshDone.status, `fresh round close failed: ${JSON.stringify(freshDone.body)}`).toBe(200);
+
+    // steady-true: a later sweep with the SAME predicate/receipts must NOT
+    // re-arm again — the BR#4702/BR#2893 anti-churn law holds per epoch
+    const sweep2 = await kbJson("/admin.unblock_proxy_sweep", { now: t0 + 800 * 60_000 });
+    expect(sweep2.body.error).toBeUndefined();
+    const after2 = await taskById(id);
+    const rounds2 = (await unblockDuties()).filter((x: any) => String(x.title).startsWith("Unblock: IMPL: br16864 stranded-park drill"));
+    expect(rounds2, "steady-true must not spawn a second re-arm round").toHaveLength(1);
+    expect(after2.meta?.unblock_escalated?.re_arms).toBe(1);
+    expect(String(after2.meta?.proxy_check?.spawn_skipped ?? "")).toBeTruthy();
+  });
+});
 import { completeExecutionReview } from "./completion-fixture";

@@ -2618,8 +2618,20 @@ export class KnowledgeHub {
    *  escalates ONCE (flag-guarded), so the human ledger carries the recurring
    *  block instead of the pool. Counts both child generations (roles-based
    *  machine spawns and the pre-refactor tags-based ones). Returns true when
-   *  the spawn must be skipped (cap reached; escalation stamped first hit). */
-  private unblockSpawnCapped(r: { id: string }, meta: any, actor: string, ts: number): boolean {
+   *  the spawn must be skipped (cap reached; escalation stamped first hit).
+   *  BR#16864 re-arm: the cap is per SATISFACTION EPOCH, not per lifetime.
+   *  On the sweep's TRUE flip (fire context provided), a predicate or
+   *  receipt set that CHANGED since the epoch the cap consumed is a new
+   *  world state — the stranded-park class (BR#14944/BR#14634: waits that
+   *  became true days after earlier unsatisfied rounds exhausted the cap,
+   *  first-hand in the 2026-11-19 sweep, GH #3365 comment 6994075013) gets
+   *  exactly ONE fresh round per changed epoch. A steady-true re-fire
+   *  (unchanged predicate + receipts) still caps, and the park-time churn
+   *  law (BR#4702) is untouched: park-time callers pass no fire context. */
+  private unblockSpawnCapped(
+    r: { id: string }, meta: any, actor: string, ts: number,
+    fire?: { predicate: string; receipts: string[] },
+  ): boolean {
     // BR#5916: do-not-claim infra anchors — an anchor that cannot be claimed
     // should not burn the shared unblock-spawn budget or stamp escalation
     // noise on a card no agent may touch. Carve-out: skip quietly (one audit
@@ -2633,6 +2645,40 @@ export class KnowledgeHub {
        WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND (c.roles LIKE '%"unblock"%' OR c.tags LIKE '%"role:unblock"%')`, r.id,
     )?.n ?? 0;
     if (roundsEver < UNBLOCK_SPAWN_CAP) return false;
+    if (fire) {
+      // BR#16864: compare against the epoch the cap consumed. A legacy
+      // escalation stamp (pre-BR#16864) records no epoch — treat it as a
+      // changed epoch: every stranded legacy park re-arms exactly once, and
+      // the stamp below records the new epoch so steady-true caps again.
+      const esc = meta.unblock_escalated ?? {};
+      const epochChanged = (typeof esc.predicate === "string" ? esc.predicate : undefined) !== fire.predicate
+        || !sameProxyReceipts(Array.isArray(esc.receipts) ? esc.receipts : [], fire.receipts);
+      if (epochChanged) {
+        const reArms = (typeof esc.re_arms === "number" ? esc.re_arms : 0) + 1;
+        meta.unblock_escalated = {
+          at: ts, rounds: roundsEver, re_arms: reArms,
+          predicate: fire.predicate, receipts: fire.receipts,
+          rearmed_from: {
+            at: typeof esc.at === "number" ? esc.at : null,
+            rounds: typeof esc.rounds === "number" ? esc.rounds : roundsEver,
+          },
+        };
+        // the human ledger still carries the recurring block (BR#2893 law):
+        // a first cap hit reached on the sweep path stamps the same
+        // escalation the park-time path would have
+        if (!meta.escalate) {
+          meta.escalate = {
+            at: ts,
+            attempts: roundsEver,
+            reason: `${roundsEver} unblock rounds spawned for this block and none cleared it — the spawner stopped (cap ${UNBLOCK_SPAWN_CAP}, BR#2893); re-armed ${reArms}× on a changed satisfaction epoch (BR#16864). Human: resolve the recurring block directly (re-scope, supersede, or land the fix), or clear this escalation to re-arm the spawner.`,
+          };
+        }
+        this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+        this.audit("system:unblock-spawner", "spawn_cap_rearmed", r.id, { auto: "unblock", rounds: roundsEver, cap: UNBLOCK_SPAWN_CAP, re_arms: reArms, reason: "satisfaction epoch changed since the capped fire — one fresh round (BR#16864)" });
+        this.version(r.id, "system:unblock-spawner", "note", `unblock spawner re-armed (#${reArms}) — the satisfaction state changed since the cap was exhausted; one fresh round spawns (BR#16864)`, { rounds: roundsEver, re_arms: reArms });
+        return false;
+      }
+    }
     if (!meta.unblock_escalated) {
       meta.unblock_escalated = { at: ts, rounds: roundsEver };
       meta.escalate = {
@@ -2760,7 +2806,10 @@ export class KnowledgeHub {
     }
     const ts = Date.now();
     // BR#2893 spawner cap: UNBLOCK_SPAWN_CAP rounds ever → stop + escalate once.
-    if (this.unblockSpawnCapped(r, meta, "hub:proxy-watch", ts)) {
+    // BR#16864: the sweep's TRUE flip carries its fire context so the cap is
+    // enforced per satisfaction epoch (re-armed once per changed
+    // predicate/receipts) instead of stranding a later-true park forever.
+    if (this.unblockSpawnCapped(r, meta, "hub:proxy-watch", ts, { predicate, receipts: receiptLines })) {
       this.stampProxyCheck(r.id, meta, now, "true", null, prev, { spawn_skipped: `unblock spawner cap (${UNBLOCK_SPAWN_CAP} rounds)` });
       return;
     }
