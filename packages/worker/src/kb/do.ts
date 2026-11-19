@@ -4077,6 +4077,14 @@ export class KnowledgeHub {
          WHERE type = 'task' AND status = 'blocked'
            AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
       `CREATE INDEX IF NOT EXISTS idx_proxy_probes_repo ON proxy_probes(repo, kind)`,
+      // …and the awaiting-review census (BR#5349/BR#5677) read the FULL meta
+      // of every open task per lane per poll to lane-match a handful of
+      // bounced/awaiting cars — partial index over exactly that predicate
+      // (entries: bounced/awaiting cars only).
+      `CREATE INDEX IF NOT EXISTS idx_artefacts_train_awaiting
+         ON artefacts(json_extract(meta, '$.merge_train.state'))
+         WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+           AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
     ]) {
       this.state.storage.sql.exec(ddl);
     }
@@ -12431,6 +12439,9 @@ export class KnowledgeHub {
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     train_verified_merges:
       `SELECT pr FROM proxy_probes WHERE repo = 'state-vector/bridge' AND kind = 'pr_merged' AND state = 'verified'`,
+    train_awaiting_census:
+      `SELECT id, meta FROM artefacts INDEXED BY idx_artefacts_train_awaiting WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked')
+       AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
   };
 
   /** BR#16935 — admin-gated planner probe: EXPLAIN QUERY PLAN over every
@@ -18841,7 +18852,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // awaiting-review figure with zombies (the census decode: 24 "awaiting
       // review" against a handful of live parks).
       const awaitingReview = (this.state.storage.sql.exec(
-        `SELECT id, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked') AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
+        `SELECT id, meta FROM artefacts INDEXED BY idx_artefacts_train_awaiting WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked') AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
       ).toArray() as any[]).filter((c) => {
         const m = JSON.parse(c.meta ?? "{}");
         return trainCardMatchesLane(m, lane.repo, lane.base);
