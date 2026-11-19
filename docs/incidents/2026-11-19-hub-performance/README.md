@@ -50,3 +50,17 @@ Production query-level counters identify `train.review_children`: 426 calls read
 The surviving authoritative lookup remains the incoming `child_of` relation. `TRAIN_REVIEW_CHILDREN_SQL` now explicitly starts with `relations INDEXED BY idx_relations_incoming`, then CROSS JOINs children by primary key. No child status, history, ordering or result limit changed. A workerd test emulates the observed historical-task-first plan: 10,008 reads versus 13 for the parent-driven lookup, same done/pending children and sequence; empty lookups read fewer than five rows. The full 125-test train lifecycle suite passes.
 
 The first two attempts to capture a named CPU profile returned Cloudflare control-plane errors (no recent execution, then profiling could not start). These are profile-API failures, not hub request samples. The preceding native CPU profile and direct live row-read counters identify the train bottleneck independently. A post-fix native profile and latency verification are still required.
+
+The subsequent script-scope native profile succeeded: `train-named-before-fix.pprof.gz` reports 30.06s duration and 20.939s sampled CPU. **trainReviewChildRows accounts for 7.826s CPU (37.38%)**, directly confirming the row-read diagnosis. The actor-specific profiling control-plane failures above did not prevent a sampled CPU attribution.
+
+## Watchdog acceptance failure and category-level repair
+
+382fc124a removed the broad train review-child scan. A five-minute acceptance capture observed 942 requests and no HTTP 5xx, but retained 3–6s stalls roughly once per minute, so it was **not** accepted as resolved. The diagnostics place those spikes in coordination maintenance.
+
+The actor-targeted native profile (`after-train-hub-cpu.pprof.gz`, 49.63s, 18.671s sampled CPU) identifies `retireCompletedCoordination` at 2.617s cumulative CPU and `currentTaskReview` at 3.700s. The review-child query no longer appears among the expensive functions. A separate script-scope capture selected an edge isolate and was discarded for stateful CPU analysis.
+
+The coordination query used a correlated `p.id IN (relation UNION route)` expression. Despite an outer CROSS JOIN, SQLite could choose the terminal-task status index for each open question. The repair expands relation and typed-route bindings as two equivalent UNION arms, then seeks each parent by its exact ID. Relation+route duplicates still collapse. With the production type/status indexes present, the workerd regression reproduces **144,123 old row reads versus 19 new**, with identical requests retired.
+
+The same production indexes exposed two related traps: the board's existing recency index was ignored (24,037 row reads for 250 IDs), and current-review/legacy-parent lookups could start from historical task status/type ranges. The board recency query now pins its existing recency index; review lookup pins the declared-subject index and drives legacy children/parents from relations. The complete review-query fixture now includes those competing production indexes, rather than testing an unrealistically favorable fresh schema. All query tests and the 125 train lifecycle tests pass.
+
+These are access-path repairs to existing authoritative data, with no retries, task caps, new state owners or lifecycle semantics. Final live verification follows after this repair deploys.

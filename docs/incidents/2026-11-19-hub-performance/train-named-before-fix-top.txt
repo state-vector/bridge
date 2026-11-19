@@ -1,0 +1,28 @@
+Type: cpu
+Duration: 30.06s, Total samples = 20939ms (69.66%)
+Showing nodes accounting for 18516ms, 88.43% of 20939ms total
+Dropped 184 nodes (cum <= 104.69ms)
+Showing top 22 nodes out of 64
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    20939ms   100%  (root)
+   15067ms 71.96% 71.96%    15067ms 71.96%  exec
+      10ms 0.048% 72.00%     8436ms 40.29%  trainStatus
+      13ms 0.062% 72.07%     7855ms 37.51%  <unknown>
+      28ms  0.13% 72.20%     7827ms 37.38%  rows
+         0     0% 72.20%     7826ms 37.38%  trainReviewChildRows
+       9ms 0.043% 72.24%     4753ms 22.70%  doFetch
+         0     0% 72.24%     4356ms 20.80%  <unknown>
+       1ms 0.0048% 72.25%     4356ms 20.80%  pushBoardSnapshot
+       8ms 0.038% 72.29%     4355ms 20.80%  board
+         0     0% 72.29%     4355ms 20.80%  boardPayload
+      44ms  0.21% 72.50%     3764ms 17.98%  agentScores
+     726ms  3.47% 75.96%     3720ms 17.77%  computeAgentScores
+      21ms   0.1% 76.06%     3242ms 15.48%  one
+    2482ms 11.85% 87.92%     2482ms 11.85%  toArray
+      25ms  0.12% 88.04%     2321ms 11.08%  boardDetails
+       1ms 0.0048% 88.04%     2172ms 10.37%  progressLog
+      46ms  0.22% 88.26%     2026ms  9.68%  projectBoardWork
+       1ms 0.0048% 88.27%     1754ms  8.38%  currentTaskReview
+         0     0% 88.27%     1208ms  5.77%  laneRow
+         0     0% 88.27%     1096ms  5.23%  withHostSnapshot
+      34ms  0.16% 88.43%     1081ms  5.16%  dispatchCandidates

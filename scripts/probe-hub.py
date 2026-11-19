@@ -13,6 +13,7 @@ import urllib.request
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--seconds', type=int, default=180)
 p.add_argument('--task', required=True)
+p.add_argument('--include-train', action='store_true')
 p.add_argument('--origin', default='https://hub.fleetbridge.run')
 p.add_argument('--session-file', type=Path, default=Path.home() / '.bridge/session.json')
 a = p.parse_args()
@@ -20,6 +21,8 @@ secret = json.loads(a.session_file.read_text())['value']
 headers = {'Cookie': 'bridge_session=' + secret, 'User-Agent': 'Mozilla/5.0'}
 paths = {'task': '/api/kb/artefact?id=' + urllib.parse.quote(a.task), 'diagnostics': '/api/kb/diagnostics',
          'stateful_version': '/__version?scope=stateful', 'edge_version': '/__version'}
+if a.include_train:
+    paths['train'] = '/api/kb/train'
 
 def call(name, path):
     started = time.monotonic()
@@ -43,7 +46,7 @@ def call(name, path):
     return result
 
 end = time.monotonic() + a.seconds
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(paths)) as pool:
     while time.monotonic() < end:
         at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         pending = [pool.submit(call, name, path) for name, path in paths.items()]

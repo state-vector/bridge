@@ -6,5 +6,5 @@ export const BOARD_INDEX_SCHEMA = `
     ON artefacts(${terminalRank}, updated_ts DESC) WHERE ${boardKind};
 `;
 
-export const BOARD_RECENT_IDS_SQL = `SELECT id FROM artefacts
+export const BOARD_RECENT_IDS_SQL = `SELECT id FROM artefacts INDEXED BY idx_board_recent_cards
   WHERE ${boardKind} ORDER BY ${terminalRank}, updated_ts DESC LIMIT 250`;

@@ -36,6 +36,10 @@ beforeAll(async () => {
     CREATE TABLE delivery_admissions(review_id TEXT PRIMARY KEY,record TEXT);
     CREATE TABLE train_events(repo TEXT,pr INTEGER,kind TEXT,ts INTEGER,merge_sha TEXT);`);
   await query(REVIEW_LOOKUP_SCHEMA + WATCHDOG_REVIEW_LOOKUP_SCHEMA);
+  // Match the production planner's competing indexes: without these, a
+  // fresh fixture hides historical-task-first join regressions.
+  await query(`CREATE INDEX idx_artefacts_type_status ON artefacts(type,status);
+    CREATE INDEX idx_artefacts_status_updated ON artefacts(status);`);
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<6000)
     INSERT INTO artefacts SELECT 'unrelated-'||i,'task','["review"]','done',json_object('execution_review_of','other-'||i),i,i FROM n`);
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<6000)
@@ -151,6 +155,8 @@ describe("watchdog work with retained history", () => {
     await review("linked-question", 33, {}, "todo", "question");
     await child("linked-question", "finished-task");
     await review("routed-question", 34, { ask: { route: { kind: "executor_coordination", task_id: "finished-task" } } }, "todo", "question");
+    // A route and relation naming the same parent must still retire once.
+    await child("routed-question", "finished-task");
     await review("other-question", 35, {}, "todo", "question");
     await child("other-question", "other-finished-task");
     const targeted = await query(RETIRE_COORDINATION_FOR_TASK_SQL, ["finished-task"]);
@@ -159,6 +165,16 @@ describe("watchdog work with retained history", () => {
     const sweep = await query(RETIRE_COORDINATION_SWEEP_SQL);
     expect(sweep.rows.map(row => row.id).sort()).toEqual(["linked-question", "other-question", "routed-question"]);
     expect(sweep.reads).toBeLessThan(50);
+    const legacy=await query(`SELECT q.id,q.meta,p.id AS parent_id,p.status AS parent_status
+      FROM artefacts q INDEXED BY idx_open_question_id
+      CROSS JOIN artefacts p ON p.id IN (
+        SELECT dst_id FROM relations WHERE src_id=q.id AND relation='child_of'
+        UNION SELECT json_extract(q.meta,'$.ask.route.task_id') WHERE json_extract(q.meta,'$.ask.route.kind')='executor_coordination')
+      WHERE q.type='question' AND q.status IN ('todo','in_progress','blocked')
+        AND p.type='task' AND p.status IN ('done','superseded')`);
+    expect(legacy.rows.map(r=>r.id).sort()).toEqual(sweep.rows.map(r=>r.id).sort());
+    expect(legacy.reads).toBeGreaterThan(12000);
+    console.log(JSON.stringify({old_coordination_reads:legacy.reads,new_coordination_reads:sweep.reads}));
   });
 });
 
@@ -166,7 +182,7 @@ describe("watchdog work with retained history", () => {
 it("seeks the bounded board snapshot without scanning retained closed cards", async () => {
   await query(`ALTER TABLE artefacts ADD COLUMN updated_ts INTEGER;
     UPDATE artefacts SET updated_ts=rowid`);
-  const before = await query(BOARD_RECENT_IDS_SQL);
+  const before = await query(BOARD_RECENT_IDS_SQL.replace(" INDEXED BY idx_board_recent_cards", ""));
   await query(BOARD_INDEX_SCHEMA);
   const after = await query(BOARD_RECENT_IDS_SQL);
   expect(after.rows).toEqual(before.rows);

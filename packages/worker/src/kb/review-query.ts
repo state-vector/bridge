@@ -26,15 +26,16 @@ export const REVIEW_BACKFILL_BATCH_SQL = `SELECT rowid AS cursor,id,meta,status_
 // predicates; newest round (including pending/findings) wins, never a cache.
 export const CURRENT_REVIEW_SQL = `
   SELECT c.id,c.status,c.meta,c.created_ts,c.status_ts,c.rowid AS review_order
-  FROM artefacts c
+  FROM artefacts c INDEXED BY idx_task_review_subject
   WHERE c.type='task' AND c.roles LIKE '%"review"%' AND c.status!='superseded' AND ${subject}=?
   UNION ALL
   SELECT c.id,c.status,c.meta,c.created_ts,c.status_ts,c.rowid AS review_order
-  FROM relations r JOIN artefacts c ON c.id=r.src_id
+  FROM relations r INDEXED BY idx_relations_incoming
+  CROSS JOIN artefacts c ON c.id=r.src_id
   WHERE r.dst_id=? AND r.relation='child_of'
     AND c.type='task' AND c.roles LIKE '%"review"%' AND c.status!='superseded'
     AND ${subject} IS NULL
-    AND (SELECT COUNT(*) FROM relations parents JOIN artefacts p ON p.id=parents.dst_id
+    AND (SELECT COUNT(*) FROM relations parents CROSS JOIN artefacts p ON p.id=parents.dst_id
       WHERE parents.src_id=c.id AND parents.relation='child_of' AND p.type='task')=1
   ORDER BY created_ts DESC,review_order DESC LIMIT 1
 `;
@@ -72,15 +73,22 @@ export const HELD_MERGE_ADMISSIONS_SQL = `SELECT NULL AS cursor, a.review_id
         AND json_extract(leg.value,'$.number')=json_extract(t.meta,'$.blocked.await_event.n'))
   ORDER BY a.rowid DESC LIMIT 4`;
 
+// Expand the two authoritative parent bindings before looking up each parent.
+// An id IN (correlated UNION) allowed the terminal-status index to scan all
+// historical tasks for every open question, despite the outer CROSS JOIN.
 export const RETIRE_COORDINATION_SWEEP_SQL = `
-  SELECT q.id, q.meta, p.id AS parent_id, p.status AS parent_status
+  SELECT q.id,q.meta,p.id AS parent_id,p.status AS parent_status
   FROM artefacts q INDEXED BY idx_open_question_id
-  CROSS JOIN artefacts p ON p.id IN (
-    SELECT dst_id FROM relations WHERE src_id=q.id AND relation='child_of'
-    UNION SELECT json_extract(q.meta,'$.ask.route.task_id')
-      WHERE json_extract(q.meta,'$.ask.route.kind')='executor_coordination'
-  )
+  CROSS JOIN relations r ON r.src_id=q.id AND r.relation='child_of'
+  CROSS JOIN artefacts p ON p.id=r.dst_id
   WHERE q.type='question' AND q.status IN ('todo','in_progress','blocked')
+    AND p.type='task' AND p.status IN ('done','superseded')
+  UNION
+  SELECT q.id,q.meta,p.id AS parent_id,p.status AS parent_status
+  FROM artefacts q INDEXED BY idx_open_question_id
+  CROSS JOIN artefacts p ON p.id=json_extract(q.meta,'$.ask.route.task_id')
+  WHERE q.type='question' AND q.status IN ('todo','in_progress','blocked')
+    AND json_extract(q.meta,'$.ask.route.kind')='executor_coordination'
     AND p.type='task' AND p.status IN ('done','superseded')`;
 
 // A foreground close only retires requests bound to that task. The watchdog
