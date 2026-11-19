@@ -28,8 +28,13 @@ export const LANE_VIEW_SQL = `
     SELECT ${columns(canonicalMeta, "MAX(a.updated_ts,s.updated_ts)")}
     FROM lane_state s JOIN artefacts a ON a.id=s.lane_id WHERE s.snapshot_json IS NOT NULL
     UNION ALL
+    -- BR#16935: INDEXED BY pins this arm to its partial expression index —
+    -- a new artefacts(type,status) index lured the planner into a (type=?)
+    -- scan of every task card, and lane-key reads went from ~2 rows to the
+    -- whole retained backlog.
     SELECT ${columns(`json_set(a.meta,'$.${LANE_REVISION}',0)`, "a.updated_ts")}
-    FROM artefacts a WHERE a.type='task' AND json_extract(a.meta,'$.lane.key') IS NOT NULL
+    FROM artefacts a INDEXED BY idx_artefacts_lane_key
+    WHERE a.type='task' AND json_extract(a.meta,'$.lane.key') IS NOT NULL
       AND NOT EXISTS(SELECT 1 FROM lane_state s WHERE s.lane_id=a.id AND s.snapshot_json IS NOT NULL);
 `;
 

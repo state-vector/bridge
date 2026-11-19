@@ -3904,6 +3904,14 @@ queue and classification) and `test/train-hub.test.ts` (real-DO train drills: le
 landed / stopped / bounced flows, the stop-the-line ask).
 `admin.unblock_proxy_sweep` drills on demand.
 
+Hot-path planner probe (BR#16935): `admin.explain` runs `EXPLAIN QUERY PLAN` over the hub's
+canonical hot queries (orient's open cards, ask inbox, watchdog sweeps, lane/relations walks,
+dispatch-reservation expiry) and returns each plan — one admin call answers "is the hub
+full-scanning again?" instead of guessing from latency. `test/br16935-hot-path-indexes.test.ts`
+pins every plan to an index seek; the indexes it guards (`artefacts(type,status)`,
+`artefacts(status,updated_ts)`, `dispatch_reservations(expires_at)`) plus the lane_cards
+backlog-arm pin are the fix for the 2026-11 coordinator latency reports.
+
 ## Answers unblock structurally: no self-edges, live-holder resume, the force-close exit (BR#3819)
 
 The specimen: a watchdog rollup stamped a card `child_of` **itself** at creation; the done gate

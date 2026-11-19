@@ -3973,6 +3973,14 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);
     this.state.storage.sql.exec(CAPABILITY_SWEEP_SCHEMA);
     this.state.storage.sql.exec(LANE_VIEW_SQL);
+    // BR#16935: the lane_cards view body changed (backlog arm pinned via
+    // INDEXED BY) — IF NOT EXISTS keeps the old definition on existing DBs,
+    // so recreate it once where the stored SQL predates the pin.
+    const laneViewSql = this.one(`SELECT sql FROM sqlite_master WHERE type='view' AND name='lane_cards'`);
+    if (laneViewSql && !String(laneViewSql.sql).includes("INDEXED BY idx_artefacts_lane_key")) {
+      this.state.storage.sql.exec(`DROP VIEW lane_cards`);
+      this.state.storage.sql.exec(LANE_VIEW_SQL);
+    }
 
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
     this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
@@ -4040,6 +4048,27 @@ export class KnowledgeHub {
       try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
     }
     this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA + STALL_SESSION_LOOKUP_SCHEMA + BREACH_CARD_LOOKUP_SCHEMA);
+
+    // BR#16935 — the coordinator's remaining full scans. BR#14766 indexed the
+    // ledger and the stall-sweep/board partials; these hot paths still
+    // full-scanned on every call while the single DO's input gate serialized
+    // all traffic behind them:
+    //   - artefacts(type,status): ~20 sweep/list queries (`type='task' AND
+    //     status='blocked'|'in_progress'|…`), askInbox's open questions, and
+    //     every join that drives from open cards — the stall-sweep partial
+    //     only covers in_progress tasks
+    //   - artefacts(status,updated_ts): orient's open-cards query
+    //     (`status IN (…) ORDER BY updated_ts DESC LIMIT 30`) — all types
+    //   - dispatch_reservations(expires_at): the execution sweep's expiry scan
+    // (relations dst-first lookups were already covered by
+    //  idx_relations_incoming from REVIEW_LOOKUP_SCHEMA.)
+    for (const ddl of [
+      `CREATE INDEX IF NOT EXISTS idx_artefacts_type_status ON artefacts(type, status)`,
+      `CREATE INDEX IF NOT EXISTS idx_artefacts_status_updated ON artefacts(status, updated_ts)`,
+      `CREATE INDEX IF NOT EXISTS idx_dispatch_reservations_expiry ON dispatch_reservations(expires_at)`,
+    ]) {
+      this.state.storage.sql.exec(ddl);
+    }
 
     // sessions.kind backfill: gateway identity via the local token registry
     try {
@@ -4760,6 +4789,7 @@ export class KnowledgeHub {
         case "admin.token_tags":
         case "admin.alias":
         case "admin.aliases":
+        case "admin.explain":
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
@@ -4776,6 +4806,7 @@ export class KnowledgeHub {
           if (op === "admin.mint") return this.json(await this.tokenMint(body));
           if (op === "admin.alias") return this.json(await this.adminAliasSet(body, actor));
           if (op === "admin.aliases") return this.json({ aliases: this.state.storage.sql.exec(`SELECT label, canonical, ts FROM identity_aliases ORDER BY ts DESC`).toArray() });
+          if (op === "admin.explain") return this.json(this.explainHotPaths());
           if (op === "admin.list_tokens") return this.json(await this.tokenList());
           if (op === "admin.revoke") return this.json(await this.tokenRevoke(body));
           if (op === "admin.token_tags") return this.json(await this.tokenTags(body));
@@ -11090,12 +11121,15 @@ export class KnowledgeHub {
     return Date.now() - Number(askCreatedTs ?? 0) < staleMin * 60_000;
   }
   private async orient(body: any) {
-    // open question children: DERIVED awaiting_ask (phase 4 — no marker cache)
+    // open question children: DERIVED awaiting_ask (phase 4 — no marker cache).
+    // BR#16935: drive from the OPEN QUESTION side (a handful of rows via
+    // idx_artefacts_type_status) probing relations by its PK — the old shape
+    // walked EVERY child_of edge joined back to artefacts on every orient.
     const askChildOf = new Map<string, any>();
     for (const c of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS parent, c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status IN ('todo','in_progress','blocked')
-         AND c.type = 'question' ORDER BY c.created_ts DESC`,
+      `SELECT r.dst_id AS parent, c.id AS id FROM artefacts c JOIN relations r ON r.src_id = c.id
+       WHERE c.type = 'question' AND c.status IN ('todo','in_progress','blocked')
+         AND r.relation = 'child_of' ORDER BY c.created_ts DESC`,
     ).toArray() as any[]) {
       if (!askChildOf.has(c.parent)) askChildOf.set(c.parent, c);
     }
@@ -12354,6 +12388,45 @@ export class KnowledgeHub {
     );
     this.audit("admin", "tags", id, { label: row.label, tags: tags ?? [] });
     return { id, label: row.label, tags: tags ?? [] };
+  }
+
+  /** BR#16935 — the coordinator's canonical hot queries, kept verbatim so
+   * admin.explain and its regression test observe the SAME shapes the
+   * handlers run (drift here is a test failure, not a silent rescan). */
+  private static readonly HOT_PATH_QUERIES: Record<string, string> = {
+    orient_open_cards:
+      `SELECT id, type, title, status, owner, meta, updated_ts FROM artefacts ` +
+      `WHERE status IN ('draft','proposed','active','open','todo','in_progress','blocked') ` +
+      `ORDER BY updated_ts DESC LIMIT 30`,
+    ask_inbox_questions:
+      `SELECT id, title, meta, created_ts FROM artefacts ` +
+      `WHERE type = 'question' AND status IN ('todo','in_progress','blocked') ORDER BY created_ts DESC`,
+    sweep_blocked:
+      `SELECT id, owner, meta, status_ts, updated_ts FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    sweep_owned:
+      `SELECT id, status, owner, meta, status_ts, updated_ts FROM artefacts ` +
+      `WHERE type = 'task' AND owner != '' AND status IN ('in_progress','blocked','in_review')`,
+    orient_ask_children:
+      `SELECT r.dst_id AS parent, c.id AS id FROM artefacts c JOIN relations r ON r.src_id = c.id ` +
+      `WHERE c.type = 'question' AND c.status IN ('todo','in_progress','blocked') ` +
+      `AND r.relation = 'child_of' ORDER BY c.created_ts DESC`,
+    children_of_parent:
+      `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id ` +
+      `WHERE r.relation = 'child_of' AND r.dst_id = 'BR#1'`,
+    dispatch_reservation_expiry:
+      `SELECT r.*, t.label FROM dispatch_reservations r JOIN auth_tokens t ON t.id = r.token_id WHERE r.expires_at <= 0`,
+  };
+
+  /** BR#16935 — admin-gated planner probe: EXPLAIN QUERY PLAN over every
+   * canonical hot query. The regression test pins each plan to an index
+   * seek; live, one call answers "is the hub scanning again?". */
+  private explainHotPaths() {
+    const plans = Object.entries(KnowledgeHub.HOT_PATH_QUERIES).map(([name, sql]) => ({
+      name,
+      plan: (this.state.storage.sql.exec(`EXPLAIN QUERY PLAN ${sql}`).toArray() as any[])
+        .map((r: any) => String(r.detail ?? "")).filter(Boolean),
+    }));
+    return { plans };
   }
 
   private async settingsGet() {
