@@ -1,3 +1,4 @@
+import { trainProvenanceRows, trainMergedProbeRows, trainTerminalOutcomeRows, trainIgnoredPrRows, trainReviewChildRows, trainSeenPrRows } from "./train-read-query";
 import { logInfraError } from "../infra-error";
 import { SCOPED_ROLE_EVIDENCE_SQL, SCOPED_DECISION_EVIDENCE_SQL, SCOPED_OPEN_ASKS_SQL } from "./qualification-query";
 import { DUTY_LOOKUP_SCHEMA, backfillDutyLookup } from "./duty-lookup";
@@ -18949,21 +18950,18 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const laneCanLand = capable?.ready && !meta.stop && !meta.currently
           && observedBase?.verdict === "green" && !observedBase?.gate_blocked;
         const mergedPrs = new Set<number>(
-          (this.state.storage.sql.exec(`SELECT pr FROM provenance WHERE repo = ?`, lane.repo).toArray() as any[])
+          (trainProvenanceRows(this.state.storage.sql, lane.repo) as any[])
             .map((r) => Number(r.pr ?? 0))
             .filter((n) => n > 0),
         );
-        for (const observed of this.state.storage.sql.exec(`SELECT pr FROM proxy_probes
-          WHERE repo=? AND kind='pr_merged' AND state='verified' AND ok=1`, lane.repo).toArray()) mergedPrs.add(Number(observed.pr));
+        for (const observed of trainMergedProbeRows(this.state.storage.sql, lane.repo)) mergedPrs.add(Number(observed.pr));
         // The reconciler already persists explicit GitHub outcomes. Delivery
         // verification can remain open after a merge, but that PR can no
         // longer be a candidate for a future batch.
         const terminalPrs = new Set(mergedPrs);
-        for (const observed of this.state.storage.sql.exec(
-          `SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND state IN ('MERGED','CLOSED')`, lane.repo,
-        ).toArray()) terminalPrs.add(Number(observed.pr));
+        for (const observed of trainTerminalOutcomeRows(this.state.storage.sql, lane.repo)) terminalPrs.add(Number(observed.pr));
         const ignoredPrs = new Set<number>(
-          (this.state.storage.sql.exec(`SELECT pr FROM reconcile_ignores WHERE repo = ?`, lane.repo).toArray() as any[])
+          (trainIgnoredPrRows(this.state.storage.sql, lane.repo) as any[])
             .map((r) => Number(r.pr ?? 0))
             .filter((n) => n > 0),
         );
@@ -19064,13 +19062,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           const rRoles = parseTags(r.roles);
           const rTags = parseTags(r.tags);
           if (isStandingCard(rm, rTags) || rRoles.includes("review") || rRoles.includes("unblock")) continue;
-          const vKids = this.state.storage.sql.exec(
-            `SELECT a.id AS id, a.status AS status, a.body_md AS body_md, a.meta AS meta, a.updated_ts AS updated_ts
-             FROM relations rel JOIN artefacts a ON a.id = rel.src_id
-             WHERE rel.relation = 'child_of' AND rel.dst_id = ? AND a.type = 'task' AND a.roles LIKE '%"review"%'
-             ORDER BY a.created_ts DESC`,
-            cid,
-          ).toArray() as any[];
+          const vKids = trainReviewChildRows(this.state.storage.sql, cid) as any[];
           const vBodies = vKids.map((k) => String(k.body_md ?? "")).join("\n");
           const legs = cardLegsForLane(rm, String(r.title ?? ""), String(r.body_md ?? ""), vBodies);
           if (!legs.length) continue;
@@ -19137,10 +19129,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
         // 5. Reconcile-seen open PRs on this repo not yet covered above
         if (lane.base === "main") {
-          for (const rs of this.state.storage.sql.exec(
-            `SELECT pr, card FROM reconcile_seen WHERE repo = ? AND missing = 0 ORDER BY pr ASC`,
-            lane.repo,
-          ).toArray() as any[]) {
+          for (const rs of trainSeenPrRows(this.state.storage.sql, lane.repo) as any[]) {
             const prNum = Number(rs.pr ?? 0);
             if (!prNum || seenPrs.has(prNum) || terminalPrs.has(prNum) || ignoredPrs.has(prNum)) continue;
             seenPrs.add(prNum);

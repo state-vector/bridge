@@ -34,3 +34,11 @@ node scripts/diagnose-hub.mjs --seconds 180 --events > /tmp/hub-tail.jsonl
 ```
 
 Full new reset exceptions are emitted as `bridge.infra_error` with message, stack, runtime flags and nested cause, with known credentials redacted. Final diagnosis and post-deployment verification will follow.
+
+## First fix and full failure capture (3913105a1)
+
+The full runtime error is **Durable Object is overloaded. Requests queued for too long.**, with `overloaded: true`. Its supplied stack is the same message, with no JavaScript frames or nested cause. See timestamped `rollout-full-tail.jsonl`. This proves queue starvation for these failures; it does not retroactively recover the old coarse-classified reset exception.
+
+After the board query fix, sampled board CPU fell from 14.672s / 22.01s capture to 1.862s / 25.28s, an approximately 89% reduction in board CPU per second. However trainStatus now dominates (8.382s / 12.005s total sampled CPU, 69.82%). Concurrent probes still include multi-second stalls, so the incident is not resolved by that first fix.
+
+A desktop SQLite plan suggested train child joins could scan history, but the workerd fixture did not reproduce that plan. That speculative change was discarded. Instead the six raw train SQL families are being named in the production CPU stack, with row-read counters for broad reads, to identify the actual remaining query. The full train suite (125 tests) passes with this behavior-preserving extraction.

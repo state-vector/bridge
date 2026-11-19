@@ -34,10 +34,11 @@ export function observation(event) {
   const request = event.event?.request;
   let path = "internal";
   try { path = new URL(request?.url).pathname.replace(/bkw_[\w-]+/g, "[redacted]"); } catch { /* alarm/RPC */ }
-  const stages = [], infra_errors = [];
+  const stages = [], infra_errors = [], sql_reads = [];
   for (const entry of event.logs ?? []) for (const message of entry.message ?? []) {
     let log;
     try { log = typeof message === "string" ? JSON.parse(message) : message; } catch { continue; }
+    if (log?.type === "bridge.sql") sql_reads.push({ operation: operation(log.operation), rows_read: number(log.rows_read), rows_returned: number(log.rows_returned) });
     if (log?.type === "bridge.infra_error") infra_errors.push({ stage: operation(log.stage), error: log.error });
     if (log?.type === "bridge.request") stages.push({ operation: operation(log.operation), elapsed_ms: number(log.elapsed_ms), ingress_ms: number(log.ingress_ms),
       status: number(log.status), stages: (log.stages ?? []).map(s => ({ stage: operation(s.stage), elapsed_ms: number(s.elapsed_ms) })) });
@@ -45,7 +46,7 @@ export function observation(event) {
   // Select known fields only. Never emit headers, request bodies, query strings,
   // arbitrary exception text, arbitrary logs or complete raw tail events.
   // infra_errors originate only from the credential-redacting Error serializer.
-  return { timestamp: number(event.eventTimestamp), infra_errors,
+  return { timestamp: number(event.eventTimestamp), infra_errors, sql_reads,
     route: `${request?.method ?? "internal"} ${path}`, status: number(event.event?.response?.status),
     outcome: ["ok", "canceled", "exception", "exceededCpu", "exceededMemory", "unknown"].includes(event.outcome) ? event.outcome : "unknown",
     wall_ms: number(event.wallTime), cpu_ms: number(event.cpuTime), stages };
