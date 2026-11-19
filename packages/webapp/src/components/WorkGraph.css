@@ -124,7 +124,23 @@ button.work-graph-node:focus-visible { background: var(--bg-hover); border-color
 .work-graph-node[data-status="in_progress"] { border-left-color: var(--green); }
 .work-graph-node[data-status="blocked"] { border-left-color: var(--amber); }
 .work-graph-node[data-status="in_review"] { border-left-color: var(--startup); }
-.work-graph-condition { border-color: var(--amber); }
+.work-graph-condition {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  border: 1px dashed var(--amber);
+  border-radius: 28px;
+  background: color-mix(in srgb, var(--amber) 8%, var(--bg));
+}
+.work-graph-condition[data-condition="system"] {
+  border-color: var(--startup);
+  background: color-mix(in srgb, var(--startup) 8%, var(--bg));
+}
+.work-graph-condition[data-condition="missing"] { border-color: var(--red); }
+.work-graph-condition .work-graph-condition-icon { font-size: 24px; flex: 0 0 26px; text-align: center; }
+.work-graph-condition-copy { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.work-graph-condition[data-condition="system"] span { color: var(--startup); }
+.work-graph-condition[data-condition="missing"] span { color: var(--red); }
 .work-graph-node span { color: var(--text-dim); font: 11px var(--mono); }
 .work-graph-condition span { color: var(--amber); }
 .work-graph-node strong {

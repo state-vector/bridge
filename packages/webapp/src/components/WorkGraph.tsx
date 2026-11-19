@@ -3,7 +3,7 @@ import { kbApi, type KbGraphTask } from "@bridge/ui-kit";
 import "./WorkGraph.css";
 
 type Exit = KbGraphTask["work_waits"][number]["exit"];
-type Node = { id: string; title: string; label: string; card?: KbGraphTask; blocker?: string };
+type Node = { id: string; title: string; label: string; card?: KbGraphTask; blocker?: string; conditionKind?: "time" | "system" | "event" | "missing" };
 type Edge = { from: string; to: string; label: string };
 const width = 248;
 const height = 92;
@@ -39,6 +39,19 @@ function describe(exit: Exit): [string, string?] {
   }
 }
 
+function conditionKind(exit: Exit): "time" | "system" | "event" {
+  switch (exit.event) {
+    case "time": return "time";
+    case "lane_health": case "run_success": case "pr_checks_green": case "deployed":
+    case "startup_ready": case "compatible_executor_ready": case "execution_admitted":
+    case "admission_satisfied": case "attempt_reconciled": return "system";
+    default: return "event";
+  }
+}
+
+const conditionLabels = { time: "Timer", system: "System condition", event: "Event", missing: "Missing condition" };
+const conditionIcons = { time: "◷", system: "◇", event: "◆", missing: "!" };
+
 function makeGraph(tasks: KbGraphTask[]) {
   const nodes = new Map<string, Node>();
   const edges = new Map<string, Edge>();
@@ -63,15 +76,16 @@ function makeGraph(tasks: KbGraphTask[]) {
       const [title, target] = describe(exit);
       const id = `event:${JSON.stringify(exit)}`;
       conditions.push(title);
-      addNode({ id, title, label: target && nodes.has(target) ? "Card event" : "Condition" });
-      addEdge(card.id, id, "Waits for");
-      if (target) addEdge(id, target, "Depends on card");
+      const kind = conditionKind(exit);
+      addNode({ id, title, label: conditionLabels[kind], conditionKind: kind });
+      addEdge(id, card.id, "Unblocks");
+      if (target) addEdge(target, id, "Satisfies event");
     }
     if (card.condition) {
       const id = `condition:${card.id}`;
       conditions.push(card.condition);
-      addNode({ id, title: card.condition, label: "Condition" });
-      addEdge(card.id, id, "Waits for");
+      addNode({ id, title: card.condition, label: "Unblock condition", conditionKind: "event" });
+      addEdge(id, card.id, "Unblocks");
     }
     if (card.status === "blocked") {
       const node = nodes.get(card.id)!;
@@ -81,8 +95,8 @@ function makeGraph(tasks: KbGraphTask[]) {
       } else {
         node.blocker = "No unblock condition recorded";
         const id = `missing-condition:${card.id}`;
-        addNode({ id, title: node.blocker, label: "Missing condition" });
-        addEdge(card.id, id, "Missing unblock condition");
+        addNode({ id, title: node.blocker, label: "Missing condition", conditionKind: "missing" });
+        addEdge(id, card.id, "Missing unblock condition");
       }
     }
   }
@@ -111,7 +125,10 @@ function NodeButton({ node, openCard }: { node: Node; openCard: (id: string) => 
   const content = <><span>{node.label}</span><strong>{node.title}</strong>{node.blocker && <small className="work-graph-blocker" title={node.blocker}>{node.blocker}</small>}</>;
   return node.card
     ? <button type="button" className="work-graph-node" data-status={node.card.status} title={node.title} onClick={() => openCard(node.id)}>{content}</button>
-    : <div className="work-graph-node work-graph-condition" title={node.title}>{content}</div>;
+    : <div className="work-graph-node work-graph-condition" data-condition={node.conditionKind} title={node.title}>
+      <span className="work-graph-condition-icon" aria-hidden="true">{conditionIcons[node.conditionKind ?? "event"]}</span>
+      <div className="work-graph-condition-copy">{content}</div>
+    </div>;
 }
 
 function placeGroup(nodes: Node[], edges: Edge[]) {
@@ -408,7 +425,7 @@ export function WorkGraph({ active, openCard }: { active: boolean; openCard: (id
     {tasks && !tasks.length && <p>No open work.</p>}
     {tasks && tasks.length > 0 && !layout.nodes.length && <p>No matching cards or conditions.</p>}
     {!!layout.nodes.length && <>
-      {!!layout.edges.length && <div className="work-graph-legend"><span>Waits for →</span><span>Contains child work ⇢</span></div>}
+      {!!layout.edges.length && <div className="work-graph-legend"><span>Blocker → blocked work</span><span>◷ Timer · ◇ System · ◆ Event</span><span>Contains child work ⇢</span></div>}
       <GraphCanvas key={term} layout={layout} openCard={openCard} />
     </>}
   </section>;

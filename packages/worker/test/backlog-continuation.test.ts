@@ -68,7 +68,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     const downstream = await task("Graph dependent");
     const exit = { event: "br_done", id: upstream };
     const parked = await call("transition", { id: downstream, to: "blocked", actor: "author",
-      note: "Waiting on the graph prerequisite", await_event: exit });
+      note: "Waiting on the graph prerequisite", unblock_condition: "Dependency finishes and system health recovers", await_event: exit });
     expect(parked.status, JSON.stringify(parked.body)).toBe(200);
     const closed = await task("Graph completed task", {}, ["analysis"]);
     await call("transition", { id: closed, to: "in_progress", actor: "author", session: "graph-test" });
@@ -94,7 +94,7 @@ describe("backlog continuation and recorded disposition (real SQLite)", () => {
     expect(tasks.length).toBeGreaterThan(250);
     expect(new Set(tasks.map(row => row.id)).size).toBe(tasks.length);
     expect(tasks).toContainEqual(expect.objectContaining({ id: upstream, status: "todo" }));
-    expect(tasks).toContainEqual(expect.objectContaining({ id: downstream, status: "blocked",
+    expect(tasks).toContainEqual(expect.objectContaining({ id: downstream, status: "blocked", condition: "Dependency finishes and system health recovers",
       work_waits: expect.arrayContaining([{ kind: "prerequisite", exit }]) }));
     expect(tasks.some((row: { status: string }) => ["done", "superseded"].includes(row.status))).toBe(false);
   }, 20_000);

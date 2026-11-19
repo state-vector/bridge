@@ -3213,7 +3213,7 @@ export class KnowledgeHub {
     const { tasks } = this.projectBoardWork(rows);
     return tasks.filter(t => !t.meta.infra_anchor).map(t => {
       const legacyCondition = t.meta.blocked?.unblock_condition || t.meta.depends_on;
-      const condition = t.status === "blocked" && !t.work_waits.length && typeof legacyCondition === "string"
+      const condition = t.status === "blocked" && typeof legacyCondition === "string"
         ? legacyCondition.trim() || undefined : undefined;
       return {
         id: t.id, type: t.type, title: t.title, status: t.status, part_of: t.part_of,
