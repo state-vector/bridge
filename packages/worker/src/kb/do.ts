@@ -4066,6 +4066,17 @@ export class KnowledgeHub {
       `CREATE INDEX IF NOT EXISTS idx_artefacts_type_status ON artefacts(type, status)`,
       `CREATE INDEX IF NOT EXISTS idx_artefacts_status_updated ON artefacts(status, updated_ts)`,
       `CREATE INDEX IF NOT EXISTS idx_dispatch_reservations_expiry ON dispatch_reservations(expires_at)`,
+      // BR#16935 (live tail 2026-11-19): the train panel's kb/train read was
+      // eating ~11s DO CPU per poll — laneQueue's blocked-cars scan
+      // (json_extract over the hub's BIGGEST metas — blocked train cars) ran
+      // per lane per poll, and the verified-merge lookups full-scanned
+      // proxy_probes by repo. Partial expression index over the exact queue
+      // predicate (entries: queued cars only) + repo-first probe index.
+      `CREATE INDEX IF NOT EXISTS idx_artefacts_train_queue
+         ON artefacts(CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER))
+         WHERE type = 'task' AND status = 'blocked'
+           AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+      `CREATE INDEX IF NOT EXISTS idx_proxy_probes_repo ON proxy_probes(repo, kind)`,
     ]) {
       this.state.storage.sql.exec(ddl);
     }
@@ -12415,6 +12426,11 @@ export class KnowledgeHub {
       `WHERE r.relation = 'child_of' AND r.dst_id = 'BR#1'`,
     dispatch_reservation_expiry:
       `SELECT r.*, t.label FROM dispatch_reservations r JOIN auth_tokens t ON t.id = r.token_id WHERE r.expires_at <= 0`,
+    train_queue_blocked_cars:
+      `SELECT id, status_ts, meta, tags FROM artefacts INDEXED BY idx_artefacts_train_queue WHERE type = 'task' AND status = 'blocked'
+       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
+    train_verified_merges:
+      `SELECT pr FROM proxy_probes WHERE repo = 'state-vector/bridge' AND kind = 'pr_merged' AND state = 'verified'`,
   };
 
   /** BR#16935 — admin-gated planner probe: EXPLAIN QUERY PLAN over every
@@ -14685,7 +14701,7 @@ export class KnowledgeHub {
     const settled = settledSha.toLowerCase();
     const evidence = new Set(ancestors.map((s) => s.toLowerCase()));
     const parked = this.state.storage.sql.exec(
-      `SELECT id, status, meta, roles FROM artefacts WHERE type = 'task' AND status = 'blocked'
+      `SELECT id, status, meta, roles FROM artefacts INDEXED BY idx_artefacts_train_queue WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
     let closed = 0;
@@ -16694,7 +16710,7 @@ export class KnowledgeHub {
   }
 
   private uniqueTrainPrBinding(repo: string, base: string, pr: number) {
-    const matches = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type='task' AND status='blocked'
+    const matches = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts INDEXED BY idx_artefacts_train_queue WHERE type='task' AND status='blocked'
       AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER)>0`).toArray().flatMap(row => {
       const meta = JSON.parse(String(row.meta));
       return trainLegsRemaining(meta, repo, base).filter(leg => leg.number === pr)
@@ -16725,7 +16741,7 @@ export class KnowledgeHub {
   private laneQueue(repo: string, base: string) {
     const scope = this.trainRepairScope(repo, base);
     const cards = this.state.storage.sql.exec(
-      `SELECT id, status_ts, meta, tags FROM artefacts WHERE type = 'task' AND status = 'blocked'
+      `SELECT id, status_ts, meta, tags FROM artefacts INDEXED BY idx_artefacts_train_queue WHERE type = 'task' AND status = 'blocked'
        AND CAST(json_extract(meta, '$.merge_train.pr') AS INTEGER) > 0`,
     ).toArray() as any[];
     const metaById = new Map<string, any>(cards.map((c) => [c.id, JSON.parse(c.meta ?? "{}")]));

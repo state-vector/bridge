@@ -102,6 +102,7 @@ describe("BR#16935 hot-path indexes (real SQLite planner)", () => {
     expect(names).toEqual([
       "orient_open_cards", "ask_inbox_questions", "sweep_blocked", "sweep_owned",
       "orient_ask_children", "children_of_parent", "dispatch_reservation_expiry",
+      "train_queue_blocked_cars", "train_verified_merges",
     ]);
     for (const p of r.body.plans) {
       expect(p.plan.length, `${p.name} returned no plan`).toBeGreaterThan(0);
@@ -150,6 +151,18 @@ describe("BR#16935 hot-path indexes (real SQLite planner)", () => {
   it("the dispatch-reservation expiry sweep seeks via idx_dispatch_reservations_expiry", async () => {
     const plan = (await planOf("dispatch_reservation_expiry")).join(" | ");
     expect(plan).toMatch(/SEARCH \S+ USING (COVERING )?INDEX idx_dispatch_reservations_expiry/);
+  });
+
+  it("the train queue's blocked-cars scan seeks the partial expression index — not every blocked card's meta (live tail: kb/train ate ~11s DO CPU per poll)", async () => {
+    const plan = (await planOf("train_queue_blocked_cars")).join(" | ");
+    expect(plan).toMatch(/SEARCH \S+ USING (COVERING )?INDEX idx_artefacts_train_queue/);
+    expect(plan).not.toMatch(/SCAN [a-z]+(?! USING)/);
+  });
+
+  it("the train's verified-merge lookups seek proxy_probes by repo — not a full probe-table scan per lane per poll", async () => {
+    const plan = (await planOf("train_verified_merges")).join(" | ");
+    expect(plan).toMatch(/SEARCH \S+ USING (COVERING )?INDEX idx_proxy_probes_repo/);
+    expect(plan).not.toMatch(/SCAN [a-z]+(?! USING)/);
   });
 });
 
