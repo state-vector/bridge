@@ -156,10 +156,13 @@ describe("BR#6045: empty-is-loud — a merge-train note matching no hook is audi
 
   it("a non-train park note writes no queue_hook_unmatched noise", async () => {
     const id = await pickupCard("BR#6045 quiet non-train park specimen", 25554, OLD);
+    const dependency = await post("/create", { type: "task", title: "Resolve pending disposition (rig)" });
+    expect(dependency.status).toBe(200);
+    const { id: dependencyId } = await dependency.json() as { id: string };
     const park = await post("/transition", {
       id, to: "blocked",
-      note: "CLOSE-PARK PENDING DISPOSITION — parked on ask BR#9999 (rig)",
-      await_event: { event: "br_done", id: "BR#9999" },
+      note: "CLOSE-PARK PENDING DISPOSITION — awaiting the disposition task (rig)",
+      await_event: { event: "br_done", id: dependencyId },
     });
     expect(park.status).toBe(200);
     const now = await getOne(id);

@@ -1745,23 +1745,45 @@ export class KnowledgeHub {
    *  run_success/pr_checks_green atoms: unprobed (needs enqueue) | pending |
    *  exhausted (cap reached — loud unresolvable again) | negative (conclusive
    *  no — the gate has not fired). */
-  private dependencyOutcome(id: string): { ok: boolean; receipt: string; probeState?: "negative" } {
-    const seen = new Set<string>();
+  private dependencyOutcome(id: string, forbidden: readonly string[] = []): { ok: boolean; receipt: string; probeState?: "negative" } {
+    const seen = new Set(forbidden);
     const chain: string[] = [];
+    let checkedPrerequisite = false;
+    // Leave repair of a broken upstream leg to the card that owns that leg.
+    const unavailable = (receipt: string) => ({ ok: false, receipt, ...(checkedPrerequisite ? {} : { probeState: "negative" as const }) });
     while (!seen.has(id)) {
       seen.add(id);
-      const row = this.one(`SELECT status,status_ts,meta FROM artefacts WHERE id=?`, id);
-      if (!row) return { ok: false, receipt: `${chain.join(" -> ")} ${id} not found`, probeState: "negative" };
+      const row = this.one(`SELECT type,status,status_ts,meta FROM artefacts WHERE id=?`, id);
+      if (!row) return unavailable([...chain, `${id} not found`].join(" -> "));
       chain.push(`${id} status=${row.status} revision=${row.status_ts}`);
-      if (row.status === "done") return { ok: true, receipt: chain.join(" -> ") };
-      if (row.status !== "superseded") return { ok: false, receipt: chain.join(" -> ") };
-      const meta = JSON.parse(String(row.meta ?? "{}"));
-      const successor = meta.delivery_disposition?.kind === "replace" ? meta.delivery_disposition.successor : meta.superseded_by;
-      const relation = successor ? null : this.one(`SELECT src_id FROM relations WHERE dst_id=? AND relation='supersedes' ORDER BY created_ts DESC LIMIT 1`, id);
-      if (!successor && !relation) return { ok: false, receipt: `${chain.join(" -> ")} — retired without a replacement outcome`, probeState: "negative" };
-      id = String(successor || relation.src_id);
+      if (row.status === "done") return { ok: !checkedPrerequisite, receipt: chain.join(" -> ") };
+      if (row.status === "superseded") {
+        const meta = JSON.parse(String(row.meta ?? "{}"));
+        const successor = meta.delivery_disposition?.kind === "replace" ? meta.delivery_disposition.successor : meta.superseded_by;
+        const relation = successor ? null : this.one(`SELECT src_id FROM relations WHERE dst_id=? AND relation='supersedes' ORDER BY created_ts DESC LIMIT 1`, id);
+        if (!successor && !relation) return unavailable(`${chain.join(" -> ")} — retired without a replacement outcome`);
+        id = String(successor || relation.src_id);
+        continue;
+      }
+      if (row.type !== "task" && row.type !== "question") return unavailable(`${chain.join(" -> ")} — ${row.type} cannot reach done`);
+      if (row.status === "blocked") {
+        const wait = validateAwaitEvent(JSON.parse(String(row.meta ?? "{}")).blocked?.await_event);
+        if (wait?.event === "br_done") {
+          checkedPrerequisite = true;
+          id = wait.id;
+          continue;
+        }
+      }
+      return { ok: false, receipt: chain.join(" -> ") };
     }
-    return { ok: false, receipt: `${chain.join(" -> ")} — replacement cycle, outcome unresolved`, probeState: "negative" };
+    return { ok: false, receipt: `${[...chain, id].join(" -> ")} — completion dependency cycle`, probeState: "negative" };
+  }
+
+  private assertCompletionWait(id: string, event: unknown): void {
+    const wait = validateAwaitEvent(event);
+    if (wait?.event !== "br_done") return;
+    const target = this.dependencyOutcome(wait.id, [id]);
+    if (target.probeState === "negative") throw new Error(`gate: ${id} cannot wait for ${wait.id} to finish — ${target.receipt}`);
   }
 
   private async evalProxyAtom(
@@ -6102,43 +6124,6 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  /** True when the failed attempt's route (backend+model+config_revision)
-   *  exists on NO live capability — the verified-route grant can never cover
-   *  it, so the provider_route hold/permit it guards is void and the card
-   *  dispatches FRESH at the current route (budget guards still apply). */
-  private routeGoneFor(execution: { attempt?: { executor?: { backend: string; model: string; config_revision: string } | null } | null } | null | undefined,
-    capabilities: ExecutorCapabilities | null): boolean {
-    const executor = execution?.attempt?.executor;
-    return !!executor && !!capabilities
-      && ![capabilities, ...capabilities.alternatives].some(c =>
-        c.backend === executor.backend && c.model === executor.model && c.config_revision === executor.config_revision);
-  }
-
-  /** BR#17365 — true when the hub's own execution lifecycle has recorded a
-   *  COMPLETED execution on the host's CURRENT exact route after the latest
-   *  recorded provider-route failure on that route. The provider_route hold
-   *  asserts "this route cannot serve requests"; a later completion through
-   *  the same backend+model+config_revision falsifies it, so the hold decays
-   *  and the card dispatches fresh (failure budgets still apply). Holds
-   *  armed before the failed-mark existed (pre-deploy failures) decay on any
-   *  matching health stamp — their premise is falsified the same way. */
-  private routeRecoveredFor(host: string, capabilities: ExecutorCapabilities | null): boolean {
-    if (!capabilities) return false;
-    const read = (key: string): { backend: string; model: string; config_revision: string; at: number } | null => {
-      const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
-      if (!row) return null;
-      try { return JSON.parse(String(row.value)); } catch { return null; }
-    };
-    const health = read(`route.health:${host}`);
-    if (!health) return false;
-    if (health.backend !== capabilities.backend || health.model !== capabilities.model
-      || health.config_revision !== capabilities.config_revision) return false;
-    const failed = read(`route.failed:${host}`);
-    if (failed && failed.backend === health.backend && failed.model === health.model
-      && failed.config_revision === health.config_revision && failed.at >= health.at) return false;
-    return true;
-  }
-
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string },
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
@@ -6213,10 +6198,6 @@ export class KnowledgeHub {
     for (const r of this.state.storage.sql.exec(
       `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) startupRejections.add(`${String(r.tid)}\u0000${String(r.host)}\u0000${String(r.fp)}`);
-    // BR#17365: one probe per pass — a later COMPLETED execution on this
-    // host's CURRENT exact route falsifies any same-route provider_route
-    // hold (see routeRecoveredFor). Depends only on host+capabilities.
-    const routeRecoveredProbe = this.routeRecoveredFor(host, capabilities);
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
@@ -6252,22 +6233,7 @@ export class KnowledgeHub {
           && recoveryPermitMatches(state, c, host, revision, Date.now()));
         const awaitingPermitHost = (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
           && state.recovery_permit?.task_revision === revision;
-        // A provider_route hold is satisfiable only while the failed route
-        // still exists on this host's live capabilities — the verified-route
-        // grant matches the attempt's exact backend+model+config_revision.
-        // When that route was REPLACED (deploy, model swap), no proof can
-        // ever cover the recorded attempt and the hold orphans forever
-        // (live specimen: provider_route 74 held, routeCandidates []). The
-        // route being gone dissolves the hold: the card re-enters
-        // eligibility for a FRESH dispatch at the current route, and
-        // repeated failures still land in the retry_budget guard.
-        const routeGone = hold === "provider_route" && state?.terminal && this.routeGoneFor(state, capabilities);
-        // BR#17365: a later COMPLETED execution on the same exact route
-        // falsifies the hold's premise — decay to a fresh dispatch
-        // (routeRecoveredProbe computed ONCE per pass — the condition
-        // depends only on host+capabilities, never on the card)
-        const routeRecovered = hold === "provider_route" && state?.terminal && routeRecoveredProbe;
-        reason = permit ? null : awaitingPermitHost ? "recovery_route" : routeGone || routeRecovered ? null : hold;
+        reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
       }
       if (!reason && capabilities) {
         const requirements = schedulingRequirements();
@@ -6671,17 +6637,10 @@ export class KnowledgeHub {
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           const execution = this.executionState(id);
           if (execution && executionNeedsRecoveryPermit(execution, String(meta.work_revision ?? "legacy"))) {
-            if (this.routeGoneFor(execution, capabilities) || this.routeRecoveredFor(host, capabilities)) {
-              // the recorded route exists on no live capability: the permit
-              // requirement guards a recovery that can never be proven —
-              // dispatch FRESH at the current route (selection dissolved the
-              // hold under the same predicate; budget guards still apply)
-            } else {
-              const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
-                && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
-              if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
-              meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
-            }
+            const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
+              && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
+            if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
+            meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
           }
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
@@ -7269,22 +7228,6 @@ export class KnowledgeHub {
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
-    // BR#17365 — route health is hub state, written by the authoritative
-    // observer (the execution lifecycle) and read by the scheduler: a
-    // provider-route failure marks the route failed; a COMPLETED execution
-    // on the same exact route marks it healthy. A provider_route hold whose
-    // route has a LATER success is a falsified premise — it must not hold.
-    const routeHost = String(next.attempt?.host ?? actor);
-    const routeExecutor = next.attempt?.executor ?? null;
-    if ((command.kind === "stopped" || command.kind === "finalize") && routeExecutor) {
-      if (providerRecoveryDiagnosis(command.outcome) === "provider_route_unavailable") {
-        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
-          `route.failed:${routeHost}`, JSON.stringify({ backend: routeExecutor.backend, model: routeExecutor.model, config_revision: routeExecutor.config_revision, at: now }));
-      } else if (command.outcome.kind === "completed") {
-        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
-          `route.health:${routeHost}`, JSON.stringify({ backend: routeExecutor.backend, model: routeExecutor.model, config_revision: routeExecutor.config_revision, at: now }));
-      }
-    }
     this.state.storage.transactionSync(() => {
       if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
@@ -8608,7 +8551,7 @@ export class KnowledgeHub {
       meta.wait_repair_result = { parent_id: parentId, episode: binding.episode, revision: meta.work_revision, await_event: wait, reason: String(unblockResult.reason), next: String(unblockResult.next) };
       unblockResult = undefined;
     }
-    let rebound: { id: string; meta: Record<string, unknown> } | null = null;
+    let rebound: { id: string; meta: Record<string, unknown>; wait: AwaitEvent } | null = null;
     if (unblockResult !== undefined) {
       const wait = validateAwaitEvent(unblockResult.await_event);
       if (verdict.status !== "done" || !tRoles.includes("unblock") || unblockResult.kind !== "reblocked" || !wait || wait.event === "issue_closed" || wait.event === "recovery_required" || isSelfAwait(String(unblockResult.parent_id), wait) || !String(unblockResult.reason ?? "").trim() || !String(unblockResult.next ?? "").trim()) throw new Error("gate: invalid unblock rebind result");
@@ -8618,12 +8561,17 @@ export class KnowledgeHub {
       if (this.protectedExecution(String(parent.id), pm)) throw new Error("gate: execution-owned waits cannot be replaced by an unblock duty");
       pm.blocked = { reason: unblockResult.reason, unblock_condition: unblockResult.next, await_event: wait, ts };
       delete pm.proxy_check; delete pm.last_unblock_spawn;
-      rebound = { id: String(parent.id), meta: pm };
+      rebound = { id: String(parent.id), meta: pm, wait };
     }
     if (terminalStartup) delete meta.startup_wait;
     this.atomicLaneMutation(() => {
       beforeWrite?.();
+      if (verdict.status === "in_review" || verdict.status === "done") {
+        this.requireAttemptDiagnosisContinuation(id, meta.machine_duty);
+      }
+      if (verdict.status === "blocked") this.assertCompletionWait(id, meta.blocked?.await_event);
       if (rebound) {
+        this.assertCompletionWait(rebound.id, rebound.wait);
         this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(rebound.meta), ts, rebound.id);
         if (laneOfMeta(rebound.meta)) this.saveLaneState(rebound.id, rebound.meta, ts);
       }
@@ -17768,11 +17716,35 @@ export class KnowledgeHub {
     }
   }
 
+  /** A diagnostic result is evidence, not a new retry or a continuation by itself. */
+  private requireAttemptDiagnosisContinuation(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }): void {
+    if (duty?.kind !== "task-recovery" || duty.reason !== "execution_environment" || !duty.subject) return;
+    const parent = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, duty.subject);
+    if (!parent || !["todo", "blocked"].includes(String(parent.status))) return;
+    const meta = JSON.parse(String(parent.meta ?? "{}"));
+    if (meta.execution_diagnosis?.duty !== dutyId) return;
+    const state = this.executionState(duty.subject);
+    const revision = String(meta.work_revision ?? "legacy");
+    const hold = executionAdmissionHold(state ?? undefined, revision);
+    if (!state || state.generation !== meta.execution_diagnosis.generation || hold !== meta.execution_diagnosis.hold) return;
+    if (state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now())) return;
+    if (this.startupHasAsk(duty.subject)) return;
+    const wait = parent.status === "blocked" ? validateAwaitEvent(meta.blocked?.await_event) : null;
+    if (wait && wait.event !== "time" && wait.event !== "recovery_required" && wait.event !== "ask" && wait.event !== "br_answered") {
+      if (wait.event !== "br_done") return;
+      const target = this.dependencyOutcome(wait.id, [duty.subject, dutyId]);
+      if (!target.ok && target.probeState !== "negative") return;
+    }
+    throw new Error(`gate: diagnosis of ${duty.subject} still needs a continuation — reconcile the effect, record an admissible retry, or bind a real repair dependency or a decision to that task`);
+  }
+
   /** Assign evidence-gathering for exhausted budgets and unknown effects.
    * The subject's admission fence continues to own its exit. */
   private async scheduleAttemptDiagnosis(): Promise<void> {
     const candidates = this.state.storage.sql.exec(`
-      SELECT a.id, a.meta, e.state FROM execution_state e JOIN artefacts a ON a.id=e.task_id
+      SELECT a.id, a.meta, e.state, duty.status AS diagnosis_status
+      FROM artefacts a CROSS JOIN execution_state e ON e.task_id=a.id
+      LEFT JOIN artefacts duty ON duty.id=json_extract(a.meta,'$.execution_diagnosis.duty')
       WHERE a.type='task' AND a.status='todo' AND a.owner=''
         -- A repair duty can itself need diagnosis. An execution-environment
         -- duty is the leaf, so the same fault cannot spawn an unbounded chain.
@@ -17781,7 +17753,7 @@ export class KnowledgeHub {
           OR json_extract(e.state,'$.retry_strategy') IS NOT NULL
           OR EXISTS (SELECT 1 FROM json_each(e.state,'$.operations') op
             WHERE json_extract(op.value,'$.state') IN ('prepared','outcome_unknown')))
-      ORDER BY a.updated_ts ASC`).toArray();
+      ORDER BY a.created_ts, a.id`).toArray();
     let scheduled = 0;
     for (const row of candidates) {
       if (scheduled >= 4) break;
@@ -17789,10 +17761,12 @@ export class KnowledgeHub {
       try {
         const meta = JSON.parse(String(row.meta ?? "{}"));
         const state = ExecutionStateSchema.parse(JSON.parse(String(row.state)));
-        const hold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
+        const revision = String(meta.work_revision ?? "legacy");
+        const hold = executionAdmissionHold(state, revision);
         if ((hold !== "retry_budget" && hold !== "unknown_operations")
-          || (meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis.hold === hold)
-          || (hold === "retry_budget" && recoveryPermitCoversAttempt(state, Date.now()))
+          || (meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis.hold === hold
+            && ["todo", "in_progress", "in_review", "blocked"].includes(String(row.diagnosis_status)))
+          || (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now()))
           || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
           || this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta)) continue;
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
@@ -17850,6 +17824,8 @@ Read the affected task and its current claim first. If another executor is activ
 
 When the affected task is waiting on this recovery duty, submit a replacement condition on transition to in_review with unblock_result {kind:"reblocked",parent_id:"${taskId}",reason,next,await_event}. The independent reviewer verifies that the replacement is causal and observable. If no replacement is feasible, obtain a receipt-backed disposition. Completion alone will not release the task.
 
+For a stopped-attempt diagnosis, establish the continuation on the affected task before submitting: an admissible attempt with evidence, a reachable repair dependency, or a bound decision for a concrete scope/authority question. If the cause is structural, fix or link the cause and the missing guard. A timer or this diagnosis's own completion is not the continuation.
+
 Keep changes and disposition receipts on the affected task. Finish this recovery task with execution_result {outcome:"<actual result>",receipts:["<per-action evidence>"]}. If no repair is needed, cite the current executor or delivered outcome as the receipt. Escalate only a concrete missing human authority, information or product choice, with its affected task and explicit consequences.` }, "system:recovery");
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, duty.id, taskId, Date.now());
     const fresh = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
@@ -17866,7 +17842,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     return next.event !== "issue_closed" && next.event !== "executor_capability" && next.event !== "local_handoff"
       && next.event !== "recovery_required" && next.event !== "ask" && next.event !== "br_answered"
       && !isSelfAwait(parent, next)
-      && !(next.event === "br_done" && (next.id === duty || !this.one(`SELECT 1 FROM artefacts WHERE id=? AND type='task'`, next.id)))
+      && !(next.event === "br_done" && (this.dependencyOutcome(next.id, [parent, duty]).probeState === "negative"
+        || !this.one(`SELECT 1 FROM artefacts WHERE id=? AND type='task'`, next.id)))
       && !((previous?.event === "time" || previous?.event === "recovery_required") && next.event === "time")
       && JSON.stringify(previous) !== JSON.stringify(next);
   }

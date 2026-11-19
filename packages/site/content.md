@@ -98,6 +98,12 @@ subphases separately. Direct review completion remains immediate. Lease expiry
 never substitutes for an originating-host stopped-writer receipt to free a slot.
 Capacity is a ceiling: measure sustained task starts and accepted completions,
 not just occupied slots, when diagnosing throughput or slow gateway refill.
+An exhausted execution budget sends the oldest actionable work to diagnosis.
+Time alone does not authorize another attempt. A diagnosis needs an evidenced
+continuation, a reachable repair dependency, or a bound decision for the stopped
+task. Task-completion waits reject missing or impossible targets and known
+cycles; Bridge reassesses a prerequisite that later becomes impossible.
+Provider recovery requires a witnessed request on the route the next attempt will use.
 Indexed receipt-ledger lookups keep per-task history, activity and maintenance
 queries independent of unrelated retained receipts, preserving their exact
 history order, actor attribution and time windows.

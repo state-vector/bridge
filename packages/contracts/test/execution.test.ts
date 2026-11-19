@@ -159,9 +159,7 @@ describe("witnessed legacy recovery fences", () => {
   function held() {
     let s = step(started(), {kind:"quiesce",...fence,writers:"process_group_empty"});
     s.budget_exhaustions = 3;
-    // BR#14726 — a budget hold needs RECENT exhaustions: stamp the decay clock
-    // (the predicate holds only within EXECUTION_BUDGET_DECAY_MS of this).
-    s.budget_exhausted_at = Date.now();
+    s.budget_exhausted_at = 100;
     const terminal = {...fence,writers:"process_group_empty" as const,outcome:{kind:"failed" as const,exit_code:1,stdout_tail:"",stderr_tail:"acp session/prompt failed: Authentication required: provider authentication required "}};
     s.terminal = terminal;
     s.recovery_permit = {phase:"available",id:"permit",...fence,task_revision:"revision",checkpoint_commit:null,terminal:structuredClone(terminal),
@@ -172,6 +170,13 @@ describe("witnessed legacy recovery fences", () => {
     return s;
   }
   const capability = {backend:"opencode",model:"route",config_revision:"config"} as const;
+  it("does not authorize another begin just because a recorded exhaustion is old", () => {
+    const state = held();
+    state.recovery_permit = null;
+    expect(executionAdmissionHold(state, "revision")).toBe("retry_budget");
+    expect(() => reduceExecution(state, { ...begin, attempt_id: "unchanged" }, "mac", "dispatch-BR-1",
+      3 * 86_400_000, "revision")).toThrow(/current recovery permit/);
+  });
   it("accepts a configured proxy receipt only for route recovery, with the observed request ceiling", () => {
     const proof = held().recovery_permit!.proof;
     const witness = { ...proof.witness, kind: "configured_proxy_request" as const };

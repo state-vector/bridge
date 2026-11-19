@@ -760,9 +760,21 @@ removing or changing the scope does not restore legacy write access.
   quiescence/transfer; refused polls stop the writer and retain WIP. The configured
   task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
-  diagnosis. Quiet ACP actions can run within their action budget. Unproven
+  diagnosis. Recorded exhausted budgets do not expire into retries. The hub
+  assigns the oldest actionable diagnoses first and reconciles a closed diagnosis
+  whose stopped subject still has no continuation. A diagnosis needs a usable
+  retry authorization, a reachable repair dependency, or a bound decision before
+  submission if its subject still holds the same unresolved attempt. Provider
+  recovery uses the same witnessed request and one-use permit at reservation
+  and begin; a configuration change or unrelated worker completion is not a
+  route witness. Quiet ACP actions can run within their action budget. Unproven
   process-tree isolation retains host affinity; agents must not detach writers
   from the runner's process group.
+- **Reachable waits:** a task-completion wait must name an existing card that
+  can finish. The hub follows replacements and rejects known wait cycles. If an
+  accepted prerequisite later becomes impossible, the existing recovery sweep
+  diagnoses the wait and finds a new continuation. Completing a prerequisite
+  allows the next step; it doesn't complete the dependent task.
 - **Active coordination:** safe-point polls reconcile task-addressed asks into a
   durable mailbox (`queued → delivered → acknowledged → acted`). For CLIs that
   cannot accept hot input, the runner stops and the next attempt receives the

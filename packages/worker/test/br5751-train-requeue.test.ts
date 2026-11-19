@@ -135,10 +135,13 @@ describe("BR#5751: the direct 'merge-train: queued' parent park rides trainQueue
 
   it("fix 2 — a non-train park ends the awaiting ghost state (BR#4999)", async () => {
     const id = await awaitingCard("BR#5751 close-park specimen", 25901, OLD);
+    const dependency = await post("/create", { type: "task", title: "Resolve pending disposition (rig)" });
+    expect(dependency.status).toBe(200);
+    const { id: dependencyId } = await dependency.json() as { id: string };
     const park = await post("/transition", {
       id, to: "blocked",
-      note: "CLOSE-PARK PENDING DISPOSITION — parked on ask BR#5686 (rig)",
-      await_event: { event: "br_done", id: "BR#5686" },
+      note: "CLOSE-PARK PENDING DISPOSITION — awaiting the disposition task (rig)",
+      await_event: { event: "br_done", id: dependencyId },
     });
     expect(park.status).toBe(200);
     const now = await getOne(id);

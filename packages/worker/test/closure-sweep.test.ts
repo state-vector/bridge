@@ -355,15 +355,15 @@ describe("BR#3986 — multi-atom conjunctions + self-await migration fence (real
     const r = await kbJson("/create", { type: "task", title: "IMPL: 3986 conjunction drill", qualified: true, session: "drill-3986-exec" });
     const pid = String(r.body.id);
     await kbJson("/transition", { id: pid, to: "in_progress", actor: "drill-3986-exec", session: "drill-3986-exec" });
-    const blk = await block(pid, "drill-3986-exec", "BR#999995 done", "parked on the conjunction (placeholder leg)");
+    const blk = await block(pid, "drill-3986-exec", `${legB} done`, "parked on the conjunction (placeholder leg)");
     expect(blk.status, JSON.stringify(blk.body)).toBe(200);
     const round = (await unblockDuties()).find((x: any) => x.title === "Unblock: IMPL: 3986 conjunction drill");
     expect(round, "the park-time round must spawn").toBeTruthy();
     await kbJson("/transition", { id: round.id, to: "in_progress", actor: "drill-3986-u", session: "drill-3986-u" });
     const rd = await kbJson("/transition", {
       id: round.id, to: "done", actor: "drill-3986-u",
-      execution_result: { outcome: "Placeholder leg does not exist; condition remains blocked.", receipts: [pid] },
-      note: "checked the condition first-hand — still blocked at check time (findings); placeholder leg does not exist",
+      execution_result: { outcome: "Placeholder leg is still in progress; condition remains blocked.", receipts: [legB] },
+      note: "checked the condition first-hand — still blocked at check time (findings)",
     });
     expect(rd.status, JSON.stringify(rd.body)).toBe(200);
     const row0 = await taskById(pid);
