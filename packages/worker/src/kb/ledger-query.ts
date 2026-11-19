@@ -1,6 +1,7 @@
 /** Index the canonical append-only ledger, including queries through its two
  * compatibility views. Retained unrelated receipts must not tax every card. */
 export const LEDGER_LOOKUP_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS idx_ledger_kind_action_seq ON ledger(kind,action,seq DESC);
   CREATE INDEX IF NOT EXISTS idx_ledger_card_kind_seq ON ledger(artefact_id,kind,seq);
   CREATE INDEX IF NOT EXISTS idx_ledger_card_actor_time ON ledger(artefact_id,kind,actor,ts);
   CREATE INDEX IF NOT EXISTS idx_ledger_card_action_time ON ledger(artefact_id,kind,action,ts);

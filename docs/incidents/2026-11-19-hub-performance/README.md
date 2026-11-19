@@ -1,0 +1,36 @@
+# Live hub performance incident — 2026-11-19
+
+Tracking: https://github.com/state-vector/bridge/issues/471
+
+These are sanitized captures from the previous investigation at c84a702eb. They contain no request headers, credentials, or bodies. The old runtime tail was filtered on CPU >100ms or HTTP >=500, omitted per-event timestamps and original exception text, and is not a complete traffic census. A coarse reset classification is not a root-cause determination. See the issue for the initial measurements.
+
+The task probe logs show concurrent (task, diagnostics, edge version) tuples of (HTTP status, milliseconds). Status 0 means the client timed out or failed; it is not an HTTP status. Stage timings use the Worker clock and cannot measure synchronous CPU accurately.
+
+New full-error captures and CPU profiles will be added with the actual diagnosis and verification.
+
+## Sampled production CPU diagnosis
+
+`before-hub-cpu.pprof.gz` targeted KnowledgeHub namespace `6c42bb0142c5412dbced50911bab0709`, actor `8175f3a6f149180752f88aae1cd19e369a5cbba9e707f65f65a88ca520803a05`, at c84a702eb. The request asked for 30 seconds; pprof reports 22.01 seconds and 19.397 seconds sampled CPU. It was captured during normal live traffic. Profiles were gzip-compressed for archival; they contain function stacks, not request arguments.
+
+- `boardPayload` / `pushBoardSnapshot` / `board`: 14.672s, 75.64% cumulative CPU.
+- `boardDetails`: 11.317s, 58.34%.
+- `qualificationEvidence`: 4.480s, 23.10%.
+- `dispatchCandidates`: 3.276s, 16.89% (overlaps board costs).
+- Native `SqlStorage.exec`: 10.584s, 54.57%; `cursor.toArray`: 7.370s, 38.00%.
+- Garbage collection: 0.381s, 1.96%.
+
+The production indexes caused a scoped qualification join to start from historical `status=done` cards and then probe every selected parent. A workerd SQLite reproduction with 10,000 unrelated completed cards reads 20,011 rows; an explicit parent-driven incoming-relation seek reads 12 and preserves the same evidence. Dispatch's copied evidence queries had the same problem.
+
+Board progress queries filtered the canonical ledger by kind/action, but the existing index ordered by timestamp rather than sequence. SQLite built a temporary B-tree and sorted retained progress history for every push. Adding `(kind,action,seq DESC)` permits bounded recency seeks for both compatibility views. Tests use 100,000 unrelated ledger receipts, verify sequence order, row reads and absence of temporary sorting.
+
+`before-full-tail.jsonl` retains timestamps and all observed request statuses; unlike the older filtered captures, it can count observed requests. No request headers, bodies or credentials are included. Profile stacks report sampled CPU, not per-request exclusive duration.
+
+Reproduce capture (refresh OAuth with `wrangler whoami`, or set `CLOUDFLARE_API_TOKEN`):
+
+```sh
+python3 scripts/profile-hub.py --account ACCOUNT_ID --worker bridge --namespace NAMESPACE_ID --actor ACTOR_ID --duration-ms 30000 --output /tmp/hub.pprof
+go tool pprof -top -cum /tmp/hub.pprof
+node scripts/diagnose-hub.mjs --seconds 180 --events > /tmp/hub-tail.jsonl
+```
+
+Full new reset exceptions are emitted as `bridge.infra_error` with message, stack, runtime flags and nested cause, with known credentials redacted. Final diagnosis and post-deployment verification will follow.

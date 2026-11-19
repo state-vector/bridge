@@ -1,3 +1,5 @@
+import { logInfraError } from "../infra-error";
+import { SCOPED_ROLE_EVIDENCE_SQL, SCOPED_DECISION_EVIDENCE_SQL, SCOPED_OPEN_ASKS_SQL } from "./qualification-query";
 import { DUTY_LOOKUP_SCHEMA, backfillDutyLookup } from "./duty-lookup";
 /**
  * KnowledgeHub Durable Object — the coordination layer's storage + rules.
@@ -5883,20 +5885,19 @@ export class KnowledgeHub {
   /** Bulk evidence for readiness projections: done role-tagged children per parent +
    *  accepted decisions per task. Review evidence also satisfies the analysis kind. */
   private qualificationEvidence(taskIds?: string[]): { analysisEv: Set<string>; reviewEv: Set<string> } {
-    const scope = taskIds ? " AND r.dst_id IN (SELECT value FROM json_each(?))" : "";
     const bindings = taskIds ? [JSON.stringify(taskIds)] : [];
     const analysisEv = new Set<string>(), reviewEv = new Set<string>();
     for (const k of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status = 'done'${scope}`, ...bindings,
+      taskIds ? SCOPED_ROLE_EVIDENCE_SQL : `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND c.status = 'done'`, ...bindings,
     ).toArray() as any[]) {
       const roles: string[] = parseTags(k.roles);
       if (roles.includes("review")) { reviewEv.add(k.pid); analysisEv.add(k.pid); }
       else if (roles.includes("analysis")) analysisEv.add(k.pid);
     }
     for (const d of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'${scope}`, ...bindings,
+      taskIds ? SCOPED_DECISION_EVIDENCE_SQL : `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
+       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted'`, ...bindings,
     ).toArray() as any[]) { analysisEv.add(d.tid); reviewEv.add(d.tid); }
     return { analysisEv, reviewEv };
   }
@@ -6149,27 +6150,13 @@ export class KnowledgeHub {
       stateById.set(String(r.tid), state);
     }
     // hasEvidence bulk: done review/analysis children + accepted decisions per id.
-    const analysisEv = new Set<string>(), reviewEv = new Set<string>();
-    for (const r of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS pid, c.roles AS roles FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.status = 'done' AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
-    ).toArray()) {
-      const roles: string[] = parseTags(String(r.roles));
-      if (roles.includes("review")) { reviewEv.add(String(r.pid)); analysisEv.add(String(r.pid)); }
-      else if (roles.includes("analysis")) analysisEv.add(String(r.pid));
-    }
-    for (const r of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS tid FROM relations r JOIN artefacts d ON d.id = r.src_id
-       WHERE r.relation = 'supports' AND d.type = 'decision' AND d.status = 'accepted' AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
-    ).toArray()) { const t = String(r.tid); analysisEv.add(t); reviewEv.add(t); }
+    const { analysisEv, reviewEv } = this.qualificationEvidence(ids);
     const openAskIds = new Set<string>();
     for (const r of this.state.storage.sql.exec(
       `SELECT artefact_id AS pid FROM asks WHERE status = 'open' AND artefact_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) openAskIds.add(String(r.pid));
     for (const r of this.state.storage.sql.exec(
-      `SELECT r.dst_id AS pid FROM relations r JOIN artefacts c ON c.id = r.src_id
-       WHERE r.relation = 'child_of' AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked')
-          AND json_extract(c.meta, '$.ask') IS NOT NULL AND r.dst_id IN (SELECT value FROM json_each(?))`, idList,
+      SCOPED_OPEN_ASKS_SQL, idList,
     ).toArray()) openAskIds.add(String(r.pid));
     const startupWaitIds = new Set<string>();
     for (const r of this.state.storage.sql.exec(
@@ -20531,7 +20518,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const rec = (this.storageFaults[stage] ??= { n: 0, last_ts: 0, last_error: "" });
     rec.n++; rec.last_ts = Date.now();
     rec.last_error = String((e as Error)?.message ?? e).slice(0, 200);
-    console.log(`kb storage fault (${stage}):`, rec.last_error);
+    logInfraError(`kb.storage.${stage}`, e);
   }
 
   private storageFaultResponse(stage: string, e: unknown): Response {

@@ -19,3 +19,11 @@ test("drops secrets and arbitrary payloads while retaining latency and approved 
   assert.equal(report.routes[0].failed, 1);
   assert.equal(report.routes[0].p95_ms, 8001);
 });
+
+test("retains timestamps and the full error from the redacting infra logger", () => {
+  const error = {name:"Error",message:"Durable Object reset: storage operation exceeded timeout",stack:"Error: reset\n    at kbGuard",retryable:true,cause:{message:"x".repeat(500)}};
+  const result = observation({eventTimestamp:123,outcome:"ok",event:{request:{method:"GET",url:"https://hub/__version"},response:{status:503}},
+    logs:[{message:[JSON.stringify({type:"bridge.infra_error",stage:"kb.version",error})]}]});
+  assert.equal(result.timestamp,123);
+  assert.deepEqual(result.infra_errors,[{stage:"kb.version",error}]);
+});

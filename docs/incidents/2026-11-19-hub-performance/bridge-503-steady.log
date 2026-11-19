@@ -1,0 +1,41 @@
+sample card BR%2310093
+sample (200, 802) (200, 796) (200, 65)
+hub watchdog.alarm active 2254 0 review.verdicts [('schema', 0), ('alarm', 736), ('capability.maintenance', 7), ('task.maintenance', 1), ('task.maintenance', 9), ('startup.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 0), ('task.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 0), ('task.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 2), ('train.maintenance', 0), ('review.maintenance', 1), ('train.maintenance', 3), ('review.maintenance', 3), ('review.backfill', 1), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 2), ('review.backfill', 2), ('review.backfill', 1), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.admissions', 4), ('review.admissions', 1), ('review.admissions', 2), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 1), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.verdicts', 2), ('review.verdicts', 2), ('review.verdicts', 1465), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1)]
+hub auth.identify completed 0 1727 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1629 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1571 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1500 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1467 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1439 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1430 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+sample (0, 22059) (0, 22053) (200, 118)
+sample (200, 2179) (200, 2179) (200, 68)
+hub diagnostics active 0 1233 dispatch [('schema', 0), ('alarm', 0)]
+hub watchdog.alarm completed 11720 0 train.maintenance [('schema', 0), ('alarm', 736), ('capability.maintenance', 7), ('task.maintenance', 1), ('task.maintenance', 9), ('startup.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 0), ('task.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 0), ('task.maintenance', 0), ('task.maintenance', 1), ('task.maintenance', 2), ('train.maintenance', 0), ('review.maintenance', 1), ('train.maintenance', 3), ('review.maintenance', 3), ('review.backfill', 1), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 2), ('review.backfill', 2), ('review.backfill', 1), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.backfill', 0), ('review.admissions', 4), ('review.admissions', 1), ('review.admissions', 2), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 1), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.admissions', 0), ('review.verdicts', 2), ('review.verdicts', 2), ('review.verdicts', 1465), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 0), ('review.verdicts', 1), ('review.verdicts', 10), ('review.verdicts', 0), ('review.verdicts', 894), ('review.verdicts', 2602), ('review.verdicts', 970), ('review.verdicts', 1745), ('review.verdicts', 1), ('coordination.maintenance', 3244), ('train.maintenance', 0)]
+hub artefact completed 0 1244 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0)]
+sample (200, 1599) (200, 1601) (200, 73)
+hub diagnostics completed 0 1233 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0)]
+sample (200, 907) (200, 906) (200, 72)
+sample (200, 2095) (200, 2093) (200, 79)
+sample (200, 3603) (200, 3605) (200, 75)
+sample (200, 668) (200, 668) (200, 65)
+hub auth.identify completed 0 2159 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub get completed 0 2044 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 2106 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 2097 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+sample (200, 929) (200, 929) (200, 106)
+hub auth.identify completed 0 1949 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1614 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+sample (200, 763) (200, 765) (200, 81)
+hub get completed 0 1760 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1776 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 1446 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+sample (200, 7175) (200, 7173) (200, 199)
+sample (200, 4816) (200, 4814) (200, 69)
+hub diagnostics active 0 1627 dispatch [('schema', 0), ('alarm', 0)]
+hub auth.identify completed 0 1216 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub auth.identify completed 0 2232 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub execution.stopped completed 0 2151 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub execution.stopped completed 0 2133 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+hub execution.receipt completed 0 2125 dispatch [('schema', 0), ('alarm', 0), ('dispatch', 0), ('body', 0), ('dispatch', 0)]
+card count median max 12 1847.0 22059

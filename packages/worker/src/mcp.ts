@@ -1,3 +1,4 @@
+import { logInfraError } from "./infra-error";
 /**
  * MCP streamable-HTTP endpoint for the knowledge layer.
  *
@@ -113,6 +114,7 @@ async function handleAuthenticatedMcp(request: Request, env: any): Promise<Respo
       ? DEFAULT_WS_SLUG
       : await resolveTokenWs(env, bearer);
   } catch (e) {
+    logInfraError("mcp.registry", e, [bearer]);
     // BR#4212: this path carries NO auth verdict — a failure here is the
     // registry/routing infrastructure (DO storage fault, reset, timeout).
     // The old catch mislabeled every one of those as "unauthorized: unknown
@@ -148,6 +150,7 @@ async function handleAuthenticatedMcp(request: Request, env: any): Promise<Respo
     // failures are 503 infra — a storage storm must never read as
     // "unauthorized".
     if (isInfraFault(e)) {
+      logInfraError("mcp.identify", e, [bearer]);
       return json(
         {
           jsonrpc: "2.0", id: msg.id ?? null,
@@ -233,6 +236,7 @@ async function handleAuthenticatedMcp(request: Request, env: any): Promise<Respo
     // flagged typed (HTTP 503 + result_class) so clients/watchdogs can
     // distinguish "retry the channel" from "the tool failed".
     if (isInfraFault(e)) {
+      logInfraError("mcp.tool", e, [bearer]);
       return json(
         {
           jsonrpc: "2.0", id: msg.id ?? null,

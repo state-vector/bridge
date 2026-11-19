@@ -1,0 +1,26 @@
+Type: cpu
+Duration: 22.01s, Total samples = 19397ms (88.12%)
+Showing nodes accounting for 18307ms, 94.38% of 19397ms total
+Dropped 141 nodes (cum <= 96.98ms)
+Showing top 20 nodes out of 38
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    19397ms   100%  (root)
+         0     0%     0%    14672ms 75.64%  boardPayload
+         0     0%     0%    14671ms 75.64%  <unknown>
+       6ms 0.031% 0.031%    14671ms 75.64%  board
+         0     0% 0.031%    14671ms 75.64%  pushBoardSnapshot
+      11ms 0.057% 0.088%    11317ms 58.34%  boardDetails
+   10584ms 54.57% 54.65%    10584ms 54.57%  exec
+    7370ms 38.00% 92.65%     7370ms 38.00%  toArray
+      24ms  0.12% 92.77%     4480ms 23.10%  qualificationEvidence
+      33ms  0.17% 92.94%     3348ms 17.26%  projectBoardWork
+       1ms 0.0052% 92.95%     3293ms 16.98%  withHostSnapshot
+      21ms  0.11% 93.06%     3276ms 16.89%  dispatchCandidates
+         0     0% 93.06%     2758ms 14.22%  boardDispatch
+       4ms 0.021% 93.08%     2757ms 14.21%  <unknown>
+       3ms 0.015% 93.09%     2495ms 12.86%  trainStatus
+       9ms 0.046% 93.14%     2315ms 11.93%  <unknown>
+       3ms 0.015% 93.15%     1404ms  7.24%  doFetch
+      13ms 0.067% 93.22%     1076ms  5.55%  agentScores
+     221ms  1.14% 94.36%     1063ms  5.48%  computeAgentScores
+       4ms 0.021% 94.38%      997ms  5.14%  one

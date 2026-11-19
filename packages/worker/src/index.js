@@ -1,3 +1,4 @@
+import { logInfraError } from "./infra-error.ts";
 // The DO class must be exported from the entrypoint for wrangler's DO migrations.
 export { FlowsHub } from "./do.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
@@ -758,6 +759,7 @@ function kbPreflight() {
 // relayed HTML body. This is the arm half of the DO-entry contract whose
 // wrapper lives in kb/do.ts (fetch).
 function kbInfra503(stage, e) {
+  logInfraError(stage, e);
   // Classify runtime failures without logging arbitrary error text (which can
   // contain credentials). A typed 503 must retain its operational cause.
   const message = String(e?.message ?? e);

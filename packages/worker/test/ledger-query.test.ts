@@ -47,6 +47,18 @@ describe("canonical ledger lookups with retained unrelated receipts", () => {
     }
     console.log(JSON.stringify({ retained: 100_000, unindexed_reads: before.map(result => result.reads) }));
   });
+  it("reads recent board progress in sequence order without sorting retained history", async () => {
+    for (const [view, action] of [["events", "op"], ["artefact_versions", "action"]]) {
+      const sql = `SELECT seq FROM ${view} WHERE ${action}='progress' ORDER BY seq DESC LIMIT 120`;
+      const recent = await query(sql);
+      expect(recent.rows).toHaveLength(120);
+      expect(recent.reads).toBeLessThan(500);
+      expect(recent.rows.map(r => Number(r.seq))).toEqual(recent.rows.map(r => Number(r.seq)).sort((a,b) => b-a));
+      const plan = await query("EXPLAIN QUERY PLAN " + sql);
+      expect(JSON.stringify(plan.rows)).toContain("idx_ledger_kind_action_seq");
+      expect(JSON.stringify(plan.rows)).not.toContain("TEMP B-TREE");
+    }
+  });
   it("keeps history in sequence order, excludes signals and respects its exact limit", async () => {
     await query(`INSERT INTO ledger(ts,actor,kind,action,artefact_id,summary) VALUES
       (300,'worker','mutation','transition','history','first'),

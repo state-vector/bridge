@@ -34,16 +34,19 @@ export function observation(event) {
   const request = event.event?.request;
   let path = "internal";
   try { path = new URL(request?.url).pathname.replace(/bkw_[\w-]+/g, "[redacted]"); } catch { /* alarm/RPC */ }
-  const stages = [];
+  const stages = [], infra_errors = [];
   for (const entry of event.logs ?? []) for (const message of entry.message ?? []) {
     let log;
     try { log = typeof message === "string" ? JSON.parse(message) : message; } catch { continue; }
+    if (log?.type === "bridge.infra_error") infra_errors.push({ stage: operation(log.stage), error: log.error });
     if (log?.type === "bridge.request") stages.push({ operation: operation(log.operation), elapsed_ms: number(log.elapsed_ms), ingress_ms: number(log.ingress_ms),
       status: number(log.status), stages: (log.stages ?? []).map(s => ({ stage: operation(s.stage), elapsed_ms: number(s.elapsed_ms) })) });
   }
   // Select known fields only. Never emit headers, request bodies, query strings,
-  // exception text, arbitrary logs or complete raw tail events.
-  return { route: `${request?.method ?? "internal"} ${path}`, status: number(event.event?.response?.status),
+  // arbitrary exception text, arbitrary logs or complete raw tail events.
+  // infra_errors originate only from the credential-redacting Error serializer.
+  return { timestamp: number(event.eventTimestamp), infra_errors,
+    route: `${request?.method ?? "internal"} ${path}`, status: number(event.event?.response?.status),
     outcome: ["ok", "canceled", "exception", "exceededCpu", "exceededMemory", "unknown"].includes(event.outcome) ? event.outcome : "unknown",
     wall_ms: number(event.wallTime), cpu_ms: number(event.cpuTime), stages };
 }
@@ -65,12 +68,17 @@ export function summarize(samples, started_at, finished_at) {
 async function main() {
   const args = process.argv.slice(2), secondsAt = args.indexOf("--seconds");
   const seconds = secondsAt < 0 ? 45 : Number(args[secondsAt + 1]);
+  const events = args.includes("--events");
   if (!Number.isFinite(seconds) || seconds < 1 || seconds > 300) throw new Error("--seconds must be between 1 and 300");
   const started_at = Date.now(), samples = [];
   let omitted = 0, parseError;
   const worker = fileURLToPath(new URL("../packages/worker", import.meta.url));
   const tail = spawn("npx", ["--no-install", "wrangler", "tail", "bridge", "--format", "json"], { cwd: worker, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
-  const parser = new JsonEvents(event => { if (samples.length < 10000) samples.push(observation(event)); else omitted++; });
+  const parser = new JsonEvents(event => {
+    const sample = observation(event);
+    if (events) console.log(JSON.stringify(sample));
+    if (samples.length < 10000) samples.push(sample); else omitted++;
+  });
   tail.stdout.setEncoding("utf8"); tail.stdout.on("data", chunk => { try { parser.push(chunk); } catch (error) { parseError = error; stop(); } });
   let error = "";
   tail.stderr.on("data", chunk => { error = (error + chunk).slice(-4096); });
@@ -84,6 +92,7 @@ async function main() {
   if (!samples.length && error) process.stderr.write("No requests captured. Check the Cloudflare tail connection and selected worker.\n");
   const report = summarize(samples, started_at, Date.now());
   report.omitted = omitted;
+  if (events) return;
   if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
   else {
     console.log(`Hub traffic: ${report.requests} requests in ${Math.round((report.finished_at - started_at) / 1000)}s`);
