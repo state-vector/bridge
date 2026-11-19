@@ -82,3 +82,18 @@ See `verification.json` for exact timestamps and checks; compressed raw probes a
 The live Graph tab displayed 349 open cards, 348 dependency edges, 41 system conditions, 230 event conditions and two timers, on one working pan/zoom canvas, with zero completed/superseded cards. The verification records counts and interactions without publishing card text.
 
 The incident was repeated historical SQL work inside a shared synchronous SQLite event loop: bad join orders, a correlated IN-subquery plan, an ignored recency index, and a mismatched ledger ordering index. These starved the Durable Object queue and produced the full overload error above. Repairs keep existing authorities and exact results, without adding retries or caps. Full redacted infrastructure errors, named query CPU boundaries and broad-read counters remain available for future diagnosis. The original old reset exception was not retained and cannot be reconstructed retrospectively.
+## lane_cards outer-predicate scan (BR#16950 local fixture)
+
+A local workerd fixture at production scale (14k corpus tasks, fat metas,
+full per-lane tables — `test/train-recompute-scale.test.ts`) attributed the
+remaining trainStatus cost with native `cursor.rowsRead`: the lane_cards
+read consumed **14,098 rows to return 1 lane** while every other family
+stayed bounded (≤3k). Cause: the OUTER `type='task'` predicate on
+lane_cards queries. The view only produces task rows, so the predicate is
+redundant — but the planner pushes it into the view's first arm, replacing
+the `lane_state→artefacts` PK join with a `(type=?)` walk of every task
+card through idx_artefacts_type_status, re-evaluating the view's per-row
+json_each projection machinery once per corpus card. Dropping the redundant
+predicate on all 9 consumer sites returns the read to a lane_state-driven
+PK join: **19 rowsRead for 1 lane (≈740×)**, pinned by the fixture
+(lane_reads < 100). No view or index changes.

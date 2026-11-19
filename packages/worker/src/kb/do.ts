@@ -12630,7 +12630,7 @@ export class KnowledgeHub {
     const repair = this.one(`SELECT meta FROM artefacts WHERE id = ?`, taskId);
     const repairMeta = JSON.parse(repair?.meta ?? "{}");
     if (!repairMeta.root_fix && !repairMeta.recovery_links) return;
-    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
+    const rows = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE json_extract(meta, '$.lane.recovery_episodes') IS NOT NULL`).toArray();
     const now = Date.now();
     for (const row of rows) {
       const meta = JSON.parse(String(row.meta ?? "{}"));
@@ -12775,7 +12775,7 @@ export class KnowledgeHub {
   private laneRow(laneKeyValue: string): any {
     return this.one(
       `SELECT id, type, status, title, body_md, meta, tags, roles, status_ts, owner FROM lane_cards
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ?
+       WHERE json_extract(meta, '$.lane.key') = ?
        ORDER BY CASE WHEN status IN ('done','superseded') THEN 1 ELSE 0 END ASC, created_ts DESC
        LIMIT 1`,
       laneKeyValue,
@@ -12789,7 +12789,7 @@ export class KnowledgeHub {
   private laneTerminalRows(laneKeyValue: string): any[] {
     return (this.state.storage.sql.exec(
       `SELECT id, status, title, meta, status_ts FROM lane_cards
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
+       WHERE json_extract(meta, '$.lane.key') = ? AND status IN ('done','superseded')
        ORDER BY created_ts ASC`,
       laneKeyValue,
     ).toArray() ?? []) as any[];
@@ -12850,7 +12850,7 @@ export class KnowledgeHub {
         if (!live) {
           live = this.one(
             `SELECT id FROM lane_cards
-             WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
+             WHERE json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
              ORDER BY created_ts DESC LIMIT 1`,
             key,
           );
@@ -12894,7 +12894,7 @@ export class KnowledgeHub {
         if (!vol.currently && !vol.stop && !vol.bypass_wait) continue;
         const liveRow = this.one(
           `SELECT id, meta FROM lane_cards
-           WHERE type = 'task' AND json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
+           WHERE json_extract(meta, '$.lane.key') = ? AND status NOT IN ('done','superseded')
            ORDER BY created_ts DESC LIMIT 1`,
           key,
         );
@@ -13310,7 +13310,7 @@ export class KnowledgeHub {
    *  incident — the red line is, and that lives in the stopped flow). */
   private async trainWatchSweep(now: number): Promise<void> {
     const rows = this.state.storage.sql.exec(
-      `SELECT id, status, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`,
+      `SELECT id, status, meta FROM lane_cards WHERE json_extract(meta, '$.lane.key') IS NOT NULL`,
     ).toArray() as any[];
     for (const r of rows) {
       try {
@@ -17565,7 +17565,7 @@ export class KnowledgeHub {
    * Join the recorded alarm episode to its exact old template, not a general
    * title classifier. No user-authored decision is cancelled by this migration. */
   private retireLegacyRecoveryRequests(): void {
-    const lanes = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL`).toArray();
+    const lanes = this.state.storage.sql.exec(`SELECT id, meta FROM lane_cards WHERE json_extract(meta, '$.lane.key') IS NOT NULL`).toArray();
     for (const lane of lanes) {
       const meta = JSON.parse(String(lane.meta ?? "{}"));
       let changed = false;
@@ -18791,7 +18791,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
       `SELECT id, title, status, meta, status_ts, updated_ts, project FROM lane_cards
-       WHERE type = 'task' AND json_extract(meta, '$.lane.key') IS NOT NULL
+       WHERE json_extract(meta, '$.lane.key') IS NOT NULL
        ORDER BY title`,
     ).toArray() as any[];
     // BR#5061: ONE row per lane key. A retired card whose lane has a LIVE
