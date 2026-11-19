@@ -97,3 +97,18 @@ json_each projection machinery once per corpus card. Dropping the redundant
 predicate on all 9 consumer sites returns the read to a lane_state-driven
 PK join: **19 rowsRead for 1 lane (≈740×)**, pinned by the fixture
 (lane_reads < 100). No view or index changes.
+
+## Broad-read detection scales by amplification, not absolute rows (BR#16950)
+
+The family counters' original gate (`rowsRead > 10,000`) was an absolute
+threshold — silent noise-floor on a large hub, never-firing on a small one.
+Replaced by `broadRead(rowsRead, rowsReturned)` in
+`packages/worker/src/kb/train-read-query.ts`: a read is broad when
+`rowsRead >= 200 && rowsRead > 10 × max(rowsReturned, 1)`. The invariant is
+size-independent — a bounded family reads proportionally to its result
+(3,000/3,000 bulk is healthy at any scale; 14,098/1 is a seek turned scan
+at any scale) — so the same broken plan is caught at a 2,000-card hub and a
+2,000,000-card hub with no threshold to recalibrate. The 200-row floor
+keeps micro-reads out of ratio noise; 10× headroom absorbs legitimate
+index-seek overread. Log lines now carry the amplification factor.
+Pinned across four magnitudes in `test/train-read-query.test.ts`.

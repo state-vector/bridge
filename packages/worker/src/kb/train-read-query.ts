@@ -1,8 +1,19 @@
+/** A read is BROAD when it reads disproportionately to what it returns —
+ *  the size-independent signal of a seek turned scan. A healthy bounded
+ *  family reads proportional to its result (3,000 read / 3,000 returned is
+ *  bulk, not waste); a broken plan reads the corpus to answer a point
+ *  question (14,098 read / 1 returned, or 200,000/1 after growth). The
+ *  floor keeps micro-reads out of ratio noise; the ratio carries all the
+ *  scaling — no absolute row threshold to recalibrate as the hub grows. */
+export function broadRead(rowsRead: number, rowsReturned: number): boolean {
+  return rowsRead >= 200 && rowsRead > 10 * Math.max(rowsReturned, 1);
+}
+
 /** Named SQL boundaries make native production CPU samples attributable to a
  * query family. Log row counts only; never SQL arguments or returned work. */
 function rows(sql: SqlStorage, operation: string, query: string, ...args: SqlStorageValue[]) {
   const cursor=sql.exec(query,...args), result=cursor.toArray();
-  if (cursor.rowsRead>10000) console.log(JSON.stringify({type:"bridge.sql",operation,rows_read:cursor.rowsRead,rows_returned:result.length}));
+  if (broadRead(cursor.rowsRead, result.length)) console.log(JSON.stringify({type:"bridge.sql",operation,rows_read:cursor.rowsRead,rows_returned:result.length,amplification:Number((cursor.rowsRead/Math.max(result.length,1)).toFixed(1))}));
   return result;
 }
 export function trainProvenanceRows(sql:SqlStorage,repo:string) {
