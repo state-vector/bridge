@@ -18788,6 +18788,21 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ).toArray() ?? []).map((r: any) => String(r.k ?? "")),
     );
     const out: any[] = [];
+    // BR#16935 hoist: the lane-independent censuses fetch ONCE per read —
+    // they used to run per LANE, re-reading every open card's full meta (the
+    // board's kb/train recompute was ~12s DO CPU at production scale).
+    // BR#5677: LIVE cards only (todo/in_progress/in_review/blocked) — the
+    // merge_train stamp is never cleaned on close, so terminal cards would
+    // inflate the awaiting-review figure with zombies.
+    const awaitingCensus: { id: string; m: any }[] = (this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked') AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
+    ).toArray() as any[]).map((c) => ({ id: String(c.id), m: JSON.parse(c.meta ?? "{}") }));
+    const reviewCensus = this.state.storage.sql.exec(
+      `SELECT id, title, body_md, meta, roles, tags, status_ts FROM artefacts WHERE type = 'task' AND status = 'in_review' ORDER BY status_ts ASC`,
+    ).toArray() as any[];
+    const progressCensus = this.state.storage.sql.exec(
+      `SELECT id, title, body_md, meta, roles, tags FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
+    ).toArray() as any[];
     for (const l of lanes) {
       const meta = JSON.parse(l.meta ?? "{}");
       const lane = laneOfMeta(meta);
@@ -18876,12 +18891,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // `bounced`/`awaiting` state forever — counting them inflated the
       // awaiting-review figure with zombies (the census decode: 24 "awaiting
       // review" against a handful of live parks).
-      const awaitingReview = (this.state.storage.sql.exec(
-        `SELECT id, meta FROM artefacts WHERE type = 'task' AND status IN ('todo','in_progress','in_review','blocked') AND json_extract(meta, '$.merge_train.state') IN ('bounced','awaiting')`,
-      ).toArray() as any[]).filter((c) => {
-        const m = JSON.parse(c.meta ?? "{}");
-        return trainCardMatchesLane(m, lane.repo, lane.base);
-      }).length;
+      const awaitingReview = awaitingCensus.filter((c) => trainCardMatchesLane(c.m, lane.repo, lane.base)).length;
       // BR#5349 (Ray directive ~07:55Z: "THIS IS WHAT FIXES IT, HERE IS WHAT
       // WE NEED TO DO — loud and clear and direct with no jargon"): when a
       // non-green base HOLDS cars, serve the RESOLUTION beside the lane —
@@ -19020,9 +19030,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
 
         // 2. in_review cards on this lane (PR open, Verify duty todo or in_progress)
-        for (const r of this.state.storage.sql.exec(
-          `SELECT id, title, body_md, meta, roles, tags, status_ts FROM artefacts WHERE type = 'task' AND status = 'in_review' ORDER BY status_ts ASC`,
-        ).toArray() as any[]) {
+        for (const r of reviewCensus) {
           const cid = String(r.id);
           if (seenCards.has(cid)) continue;
           const rm = JSON.parse(r.meta ?? "{}");
@@ -19071,9 +19079,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         }
 
         // 4. in_progress cards on this lane (active impl or bounced back to impl)
-        for (const r of this.state.storage.sql.exec(
-          `SELECT id, title, body_md, meta, roles, tags FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
-        ).toArray() as any[]) {
+        for (const r of progressCensus) {
           const cid = String(r.id);
           if (seenCards.has(cid)) continue;
           const rm = JSON.parse(r.meta ?? "{}");
