@@ -54,6 +54,7 @@ function fakeState(faults: Faults = {}): any {
       getAlarm: async () => { if (faults.getAlarm) boom("ALARM_FAULT: getAlarm injected"); return null; },
       setAlarm: async (_t: number) => { if (faults.setAlarm) boom("ALARM_FAULT: setAlarm injected"); },
     },
+    waitUntil: (_promise: Promise<unknown>) => {},
     getWebSockets: () => [],
     acceptWebSocket: (_ws: unknown) => {},
   };

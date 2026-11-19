@@ -1,3 +1,4 @@
+import { DUTY_LOOKUP_SCHEMA, backfillDutyLookup } from "./duty-lookup";
 /**
  * KnowledgeHub Durable Object — the coordination layer's storage + rules.
  *
@@ -523,6 +524,7 @@ import type { ExecutorReadiness } from "@bridge/contracts";
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
   private readonly schemaInitialization = new SchemaInitialization();
+  private dutyLookupReady: Promise<void> | undefined;
   private readonly requestDiagnostics = new RequestDiagnostics();
   /** BR#16935: panel-read cache (train status, throughput metrics) — the
    *  polled /api/kb/train and /api/kb/metrics/throughput reads cost ~2s DO
@@ -3609,6 +3611,13 @@ export class KnowledgeHub {
     return { ...a, relations: rel.relations };
   }
 
+  private prepareDutyLookup(): Promise<void> {
+    return this.dutyLookupReady ??= backfillDutyLookup(this.state.storage.sql).catch(error => {
+      this.dutyLookupReady = undefined;
+      throw error;
+    });
+  }
+
   ensureSchema(): Promise<void> {
     return this.schemaInitialization.run(() => this.initializeSchema());
   }
@@ -4378,6 +4387,9 @@ export class KnowledgeHub {
     } catch (e) {
       console.log("duties_v1 migration:", String(e).slice(0, 200));
     }
+
+    this.state.storage.sql.exec(DUTY_LOOKUP_SCHEMA);
+    this.state.waitUntil(this.prepareDutyLookup().catch(() => { /* a train read retries */ }));
 
     // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
     const projectName = this.settingsMap().project_name || "superpositional";
@@ -18159,9 +18171,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     if (bound?.active_agent || bound?.status === "todo" || bound?.status === "in_review") return {
       ...line, remediation: taskRemediation(bound),
     };
+    // Historical attempts count toward the retry budget, but finding them must
+    // seek their subject rather than parse every task's historical metadata.
     const duties = this.state.storage.sql.exec(
       `SELECT id, status, meta FROM artefacts WHERE type = 'task'
-       AND json_extract(meta, '$.machine_duty.subject') = ?
+       AND id IN (SELECT task_id FROM machine_duty_subjects WHERE subject=?)
        AND json_extract(meta, '$.machine_duty.kind') IN ('line_recovery','task-recovery','diagnostic')
        AND ((? NOT IN ('merge_failed','main_failed') AND json_extract(meta, '$.machine_duty.kind') != 'line_recovery' AND status NOT IN ('done','superseded'))
          OR (? != 'main_failed' AND json_extract(meta, '$.machine_duty.kind') = 'task-recovery' AND json_extract(meta, '$.machine_duty.reason') = 'execution_environment' AND status NOT IN ('done','superseded'))
@@ -18784,6 +18798,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const freshMs = body?.panel ? TRAIN_PANEL_FRESH_MS : PANEL_TTL_MS;
     const cached = this.panelReadCache.get(key);
     if (cached && Date.now() - cached.at < freshMs) return cached.body;
+    await this.prepareDutyLookup();
     const now0 = Date.now();
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
