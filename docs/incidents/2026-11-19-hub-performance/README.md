@@ -64,3 +64,21 @@ The coordination query used a correlated `p.id IN (relation UNION route)` expres
 The same production indexes exposed two related traps: the board's existing recency index was ignored (24,037 row reads for 250 IDs), and current-review/legacy-parent lookups could start from historical task status/type ranges. The board recency query now pins its existing recency index; review lookup pins the declared-subject index and drives legacy children/parents from relations. The complete review-query fixture now includes those competing production indexes, rather than testing an unrealistically favorable fresh schema. All query tests and the 125 train lifecycle tests pass.
 
 These are access-path repairs to existing authoritative data, with no retries, task caps, new state owners or lifecycle semantics. Final live verification follows after this repair deploys.
+
+## Accepted live verification
+
+Code revision **ae3cde0b9** passed all preflight and main checks. Five-minute concurrent probes included task detail, train panel, diagnostics, stateful version and edge version, while normal production work and watchdogs continued. Every endpoint had 128 successful samples, no client timeouts and no request lasting two seconds or longer. The complete observed tail contains **1,611 events, zero HTTP 5xx, zero infrastructure errors and zero broad train SQL records**. This is a bounded observed acceptance window, not a guarantee about arbitrary future traffic.
+
+| Endpoint | Samples | Median | p95 | Maximum |
+|---|---:|---:|---:|---:|
+| task | 128 | 95.0 ms | 798 ms | 1814 ms |
+| train | 128 | 171.5 ms | 949 ms | 1865 ms |
+| diagnostics | 128 | 95.5 ms | 797 ms | 1813 ms |
+| stateful_version | 128 | 89.5 ms | 822 ms | 1813 ms |
+| edge_version | 128 | 71.0 ms | 103 ms | 212 ms |
+
+See `verification.json` for exact timestamps and checks; compressed raw probes and complete tail are `accepted-read-probe.jsonl.gz` and `accepted-full-tail.jsonl.gz`. The stateful 50s native profile is `accepted-hub-cpu.pprof.gz`. Current-review lookup fell from 3.700s sampled CPU in the previous 49.63s capture to 9ms in this 50s capture; train review-child lookup fell from 7.826s in 30.06s to 141ms in 50s. Coordination retirement no longer appears among sampled CPU hotspots. Overall CPU totals should not be compared as a controlled throughput benchmark: the live workload changes.
+
+The live Graph tab displayed 349 open cards, 348 dependency edges, 41 system conditions, 230 event conditions and two timers, on one working pan/zoom canvas, with zero completed/superseded cards. The verification records counts and interactions without publishing card text.
+
+The incident was repeated historical SQL work inside a shared synchronous SQLite event loop: bad join orders, a correlated IN-subquery plan, an ignored recency index, and a mismatched ledger ordering index. These starved the Durable Object queue and produced the full overload error above. Repairs keep existing authorities and exact results, without adding retries or caps. Full redacted infrastructure errors, named query CPU boundaries and broad-read counters remain available for future diagnosis. The original old reset exception was not retained and cannot be reconstructed retrospectively.

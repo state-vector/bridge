@@ -1,0 +1,87 @@
+{
+  "verified_code_revision": "ae3cde0b969b1d3be6eddbd78ff12db477ae3cfd",
+  "requested_duration_seconds": 300,
+  "first_probe_at": "2026-11-19T05:45:31.304415+00:00",
+  "last_probe_at": "2026-11-19T05:50:29.277925+00:00",
+  "probe_metrics": {
+    "task": {
+      "count": 128,
+      "statuses": {
+        "200": 128
+      },
+      "median_ms": 95.0,
+      "p95_ms": 798,
+      "max_ms": 1814,
+      "at_least_2s": 0
+    },
+    "train": {
+      "count": 128,
+      "statuses": {
+        "200": 128
+      },
+      "median_ms": 171.5,
+      "p95_ms": 949,
+      "max_ms": 1865,
+      "at_least_2s": 0
+    },
+    "diagnostics": {
+      "count": 128,
+      "statuses": {
+        "200": 128
+      },
+      "median_ms": 95.5,
+      "p95_ms": 797,
+      "max_ms": 1813,
+      "at_least_2s": 0
+    },
+    "stateful_version": {
+      "count": 128,
+      "statuses": {
+        "200": 128
+      },
+      "median_ms": 89.5,
+      "p95_ms": 822,
+      "max_ms": 1813,
+      "at_least_2s": 0
+    },
+    "edge_version": {
+      "count": 128,
+      "statuses": {
+        "200": 128
+      },
+      "median_ms": 71.0,
+      "p95_ms": 103,
+      "max_ms": 212,
+      "at_least_2s": 0
+    }
+  },
+  "tail": {
+    "observed_records": 1611,
+    "http_5xx": 0,
+    "infra_errors": 0,
+    "broad_sql_records": 0
+  },
+  "native_profile": {
+    "duration_seconds": 50,
+    "sampled_cpu_ms": 21507,
+    "train_review_children_cpu_ms": 141,
+    "current_task_review_cpu_ms": 9,
+    "coordination_retirement": "not present among sampled CPU hotspots"
+  },
+  "graph": {
+    "cards": 349,
+    "edges": 348,
+    "conditions": {
+      "system": 41,
+      "event": 230,
+      "time": 2
+    },
+    "interaction": {
+      "before": "translate(24px, 24px) scale(1)",
+      "panned": "translate(-40px, 24px) scale(1)",
+      "zoomed": "translate(-222px, -63.75px) scale(1.25)",
+      "closed": 0,
+      "canvases": 1
+    }
+  }
+}

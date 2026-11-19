@@ -1,0 +1,38 @@
+Type: cpu
+Duration: 50s, Total samples = 21507ms (43.02%)
+Active filters:
+   focus=trainReviewChildRows|retireCompletedCoordination|currentTaskReview
+Showing nodes accounting for 150ms, 0.7% of 21507ms total
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      150ms   0.7%  (root)
+         0     0%     0%      141ms  0.66%  <unknown>
+      49ms  0.23%  0.23%      141ms  0.66%  rows
+         0     0%  0.23%      141ms  0.66%  trainReviewChildRows
+         0     0%  0.23%      141ms  0.66%  trainStatus
+      99ms  0.46%  0.69%       99ms  0.46%  exec
+         0     0%  0.69%        9ms 0.042%  currentTaskReview
+         0     0%  0.69%        8ms 0.037%  one
+         0     0%  0.69%        5ms 0.023%  <unknown>
+         0     0%  0.69%        5ms 0.023%  <unknown>
+         0     0%  0.69%        5ms 0.023%  <unknown>
+         0     0%  0.69%        5ms 0.023%  board
+         0     0%  0.69%        5ms 0.023%  boardDispatch
+         0     0%  0.69%        5ms 0.023%  boardPayload
+         0     0%  0.69%        5ms 0.023%  dispatchCandidates
+         0     0%  0.69%        5ms 0.023%  projectBoardWork
+         0     0%  0.69%        5ms 0.023%  pushBoardSnapshot
+         0     0%  0.69%        5ms 0.023%  recoveredPrFindings
+         0     0%  0.69%        5ms 0.023%  todoLifecycleHold
+         0     0%  0.69%        5ms 0.023%  withHostSnapshot
+         0     0%  0.69%        1ms 0.0046%  <unknown>
+         0     0%  0.69%        1ms 0.0046%  <unknown>
+       1ms 0.0046%  0.69%        1ms 0.0046%  <unknown>
+         0     0%  0.69%        1ms 0.0046%  <unknown>
+         0     0%  0.69%        1ms 0.0046%  <unknown>
+         0     0%  0.69%        1ms 0.0046%  inst._zod.parse
+         0     0%  0.69%        1ms 0.0046%  inst._zod.run
+         0     0%  0.69%        1ms 0.0046%  reconcileCompletedReviewsPass
+         0     0%  0.69%        1ms 0.0046%  replayDeliveryAdmissions
+         0     0%  0.69%        1ms 0.0046%  safeParse
+         0     0%  0.69%        1ms 0.0046%  sweepStrandedTrainCards
+       1ms 0.0046%   0.7%        1ms 0.0046%  toArray

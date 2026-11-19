@@ -1,0 +1,34 @@
+Type: cpu
+Duration: 50s, Total samples = 21507ms (43.02%)
+Showing nodes accounting for 18214ms, 84.69% of 21507ms total
+Dropped 259 nodes (cum <= 107.53ms)
+Showing top 28 nodes out of 80
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    21507ms   100%  (root)
+    9421ms 43.80% 43.80%     9421ms 43.80%  exec
+      16ms 0.074% 43.88%     6570ms 30.55%  doFetch
+         0     0% 43.88%     5212ms 24.23%  <unknown>
+      12ms 0.056% 43.93%     5212ms 24.23%  board
+         0     0% 43.93%     5212ms 24.23%  boardPayload
+         0     0% 43.93%     5212ms 24.23%  pushBoardSnapshot
+     188ms  0.87% 44.81%     4879ms 22.69%  one
+    4719ms 21.94% 66.75%     4719ms 21.94%  toArray
+      53ms  0.25% 67.00%     4136ms 19.23%  boardDetails
+       1ms 0.0046% 67.00%     4109ms 19.11%  laneRow
+      62ms  0.29% 67.29%     3977ms 18.49%  agentScores
+     770ms  3.58% 70.87%     3915ms 18.20%  computeAgentScores
+      46ms  0.21% 71.08%     3430ms 15.95%  trainRepairScope
+      43ms   0.2% 71.28%     2743ms 12.75%  trainStatus
+       4ms 0.019% 71.30%     2119ms  9.85%  trainQueueFacts
+    1780ms  8.28% 79.58%     1780ms  8.28%  (garbage collector)
+     462ms  2.15% 81.73%     1749ms  8.13%  search
+      25ms  0.12% 81.84%     1642ms  7.63%  laneQueue
+      67ms  0.31% 82.15%     1391ms  6.47%  orient
+      68ms  0.32% 82.47%     1064ms  4.95%  projectBoardWork
+     459ms  2.13% 84.61%     1031ms  4.79%  related
+       7ms 0.033% 84.64%      961ms  4.47%  transactionSync
+         0     0% 84.64%      943ms  4.38%  laneSyncReason
+         0     0% 84.64%      939ms  4.37%  atomicLaneMutation
+      11ms 0.051% 84.69%      867ms  4.03%  laneEnsure
+         0     0% 84.69%      831ms  3.86%  progressLog
+         0     0% 84.69%      810ms  3.77%  trainLease

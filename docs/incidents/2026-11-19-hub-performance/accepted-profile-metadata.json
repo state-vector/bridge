@@ -1,0 +1,12 @@
+{
+  "started_at": "2026-11-19T05:46:45.871663+00:00",
+  "finished_at": "2026-11-19T05:47:37.781204+00:00",
+  "worker": "bridge",
+  "request": {
+    "duration_ms": 50000,
+    "profile_type": "cpu",
+    "namespace_id": "6c42bb0142c5412dbced50911bab0709",
+    "actor_id": "8175f3a6f149180752f88aae1cd19e369a5cbba9e707f65f65a88ca520803a05"
+  },
+  "bytes": 458949
+}
