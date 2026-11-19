@@ -189,22 +189,26 @@ describe("BR#16935 functional sanity (behaviour unchanged)", () => {
     expect(kids.map((k: any) => k.artefact_id)).toContain(child);
   });
 
-  it("the train panel read is served from the panel cache between mutations, and any mutation evicts it (BR#16935)", async () => {
+  it("the train panel read serves its cached payload under the hard cap — mutations must not force a recompute (BR#16935)", async () => {
     const trainGet = async () => {
       const response = await stub.fetch(`https://kb/train`, { method: "GET", headers: { "x-kb-admin": "1" } });
       return { status: response.status, body: await response.json() as any };
     };
     const t1 = await trainGet();
     expect(t1.status).toBe(200);
-    // same quiet window → cached payload object
+    // same window → cached payload
     const t2 = await trainGet();
     expect(t2.status).toBe(200);
     expect(t2.body).toEqual(t1.body);
-    // a mutation (POST boundary) must evict: a fresh create changes orient-visible state,
-    // and the next train read recomputes rather than replaying the cached body
-    await call("create", { type: "progress", title: "cache-buster mutation", actor: "seed" });
+    // a write storm (mutation POSTs) must NOT evict the train payload — the
+    // ~8s-CPU recompute can never be forced by polling under load
+    await call("create", { type: "progress", title: "storm mutation", actor: "seed" });
+    await call("create", { type: "progress", title: "storm mutation 2", actor: "seed" });
     const t3 = await trainGet();
     expect(t3.status).toBe(200);
-    expect(t3.body.hub_commit).toBe(t1.body.hub_commit);
+    // and the machine path (train.status op) still answers fresh-shaped
+    const machine = await call("train.status", {});
+    expect(machine.status).toBe(200);
+    expect(machine.body.hub_commit).toBe(t1.body.hub_commit);
   });
 });

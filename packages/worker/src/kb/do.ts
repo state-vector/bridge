@@ -491,6 +491,12 @@ export const TOKEN_REPAIR_WINDOW_MS = 60 * 60 * 1000;
  *  served from cache between mutations. ANY mutation clears the cache, so
  *  this is purely the quiet-period TTL. */
 const PANEL_TTL_MS = 15_000;
+/** BR#16935: the train panel's HARD cap — a UI poll never triggers a
+ *  synchronous recompute (one costs ~8s DO CPU at production scale; the
+ *  board's polling plus the mutation storm defeated the soft TTL and
+ *  saturated the object). Machine reads (the executor's MCP train status)
+ *  still use the soft TTL. */
+const TRAIN_PANEL_FRESH_MS = 60_000;
 
 const OWNER_DISPLAY_SQL = `COALESCE(
   (SELECT t.label FROM auth_tokens t WHERE a.owner <> '' AND t.principal = a.owner
@@ -743,9 +749,8 @@ export class KnowledgeHub {
    *  chain: a faulting tick is logged (alarm_error audit) and retried next
    *  tick at the 60s cadence. */
   async alarm() {
-    // BR#16935: alarm-phase mutations (sweep stamps, transitions) invalidate
-    // the panel-read caches just like POSTs do.
-    this.panelReadCache.clear();
+    // BR#16935: alarm-phase mutations invalidate the machine-fresh reads.
+    for (const k of this.panelReadCache.keys()) if (k.startsWith("mt:") || k.startsWith("train:machine:")) this.panelReadCache.delete(k);
     const trace = this.requestDiagnostics.begin("watchdog.alarm");
     trace.stage("alarm");
     try { await this.runAlarm(trace); }
@@ -4499,10 +4504,13 @@ export class KnowledgeHub {
   }
 
   private async doFetch(request: Request, trace: RequestTrace): Promise<Response> {
-    // BR#16935: any mutation invalidates the panel-read caches below — the
-    // coarse HTTP-boundary bump (all mutations are POSTs to this DO) is the
-    // one fence no write path can slip past.
-    if (request.method === "POST") this.panelReadCache.clear();
+    // BR#16935: mutations invalidate the cheap panel reads (metrics). The
+    // TRAIN payload is NOT mutation-cleared — an ~8s-CPU recompute can never
+    // be forced by a write storm; it ages out per TTL instead (panel hard
+    // cap for UI polls, soft TTL for machine reads).
+    if (request.method === "POST") {
+      for (const k of this.panelReadCache.keys()) if (k.startsWith("mt:") || k.startsWith("train:machine:")) this.panelReadCache.delete(k);
+    }
     try {
       await this.ensureSchema();
     } catch (e) {
@@ -4648,7 +4656,7 @@ export class KnowledgeHub {
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }
           case "/history": return this.json(await this.getHistory(String(url.searchParams.get("id")), Math.min(Number(url.searchParams.get("limit") ?? 100), 200)));
           case "/ask": { const a = await this.askGet(String(url.searchParams.get("id"))); return a ? this.json(a) : this.json({ error: "no such ask" }, 404); }
-          case "/train": return this.json(await this.trainStatus({ repo: url.searchParams.get("repo") ?? "" }));
+          case "/train": return this.json(await this.trainStatus({ repo: url.searchParams.get("repo") ?? "", panel: true }));
         }
       } catch (e) {
         return this.json({ error: String((e as Error).message ?? e) }, 400);
@@ -18767,8 +18775,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
-    const cached = this.panelReadCache.get(`train:${repoFilter}`);
-    if (cached && Date.now() - cached.at < PANEL_TTL_MS) return cached.body;
+    // BR#16935: two cache entries. The PANEL entry (UI polls) is never
+    // mutation-cleared — a poll can never force an ~8s-CPU recompute; it
+    // ages out per the hard cap. The MACHINE entry (executor train.status,
+    // internal callers) is cleared on every mutation so a write-then-read
+    // always observes the write.
+    const key = `${body?.panel ? "train:panel:" : "train:machine:"}${repoFilter}`;
+    const freshMs = body?.panel ? TRAIN_PANEL_FRESH_MS : PANEL_TTL_MS;
+    const cached = this.panelReadCache.get(key);
+    if (cached && Date.now() - cached.at < freshMs) return cached.body;
     const now0 = Date.now();
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
@@ -19609,7 +19624,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     }
     const hubBuild = (await import("../__version.json")) as { commit?: string };
     const payload = { hub_commit: hubBuild.commit ?? "unknown", lanes: out };
-    this.panelReadCache.set(`train:${repoFilter}`, { at: Date.now(), body: payload });
+    this.panelReadCache.set(key, { at: Date.now(), body: payload });
     return payload;
   }
 
