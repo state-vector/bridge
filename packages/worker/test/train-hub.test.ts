@@ -5507,3 +5507,29 @@ describe("BR#5186: all-terminal reseed (real bundled worker)", () => {
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-rl2" });
   });
 });
+
+describe("train escalation census", () => {
+  it("shows open escalations and ignores retained escalation stamps on closed work", async () => {
+    const repo = "probe/escalation-census";
+    expect((await acquire(repo, "gw-census", { required_workflows: ["Test"] })).status).toBe(200);
+    const ids: string[] = [];
+    for (const status of ["todo", "superseded"]) {
+      const created = await kbJson("/create", { type: "task", title: `Escalation census ${status}`, session: "" });
+      expect(created.status, JSON.stringify(created.body)).toBe(200);
+      const updated = await kbJson("/update", { id: created.body.id, meta: {
+        merge_train: { pr: 904, repo, escalated: { at: Date.now(), pr: 904, repo, bounce_kind: "gate", bounce_no: 6 } },
+        prs: [{ repo, number: 904, base: "main" }],
+      } });
+      expect(updated.status, JSON.stringify(updated.body)).toBe(200);
+      ids.push(String(created.body.id));
+      if (status === "superseded") {
+        const parked = await kbJson("/transition", { id: created.body.id, to: "blocked", reason: "Retired historical work", await_event: { event: "time", until_ts: Date.now() + 3600000 }, actor: "web:drill" });
+        expect(parked.status, JSON.stringify(parked.body)).toBe(200);
+        const closed = await kbJson("/transition", { id: created.body.id, to: status, replacement_id: ids[0], actor: "web:drill", note: "Retired historical work" });
+        expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      }
+    }
+    const snap = await laneSnap(repo);
+    expect(snap.escalations.map((e: any) => e.task_id)).toEqual([ids[0]]);
+  });
+});

@@ -758,6 +758,14 @@ function kbPreflight() {
 // relayed HTML body. This is the arm half of the DO-entry contract whose
 // wrapper lives in kb/do.ts (fetch).
 function kbInfra503(stage, e) {
+  // Classify runtime failures without logging arbitrary error text (which can
+  // contain credentials). A typed 503 must retain its operational cause.
+  const message = String(e?.message ?? e);
+  const cause = e?.overloaded || /overloaded|too many requests/i.test(message) ? "overloaded"
+    : /reset|code.*updated|disconnected/i.test(message) ? "reset"
+    : /timeout|timed out|time limit/i.test(message) ? "timeout"
+    : /storage|sqlite/i.test(message) ? "storage" : "upstream";
+  console.log(JSON.stringify({ type: "bridge.infra", stage, cause }));
   return json(
     { error: `kb storage fault at ${stage} — retry`, result_class: "infra_storage_fault", stage },
     503,

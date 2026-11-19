@@ -18818,6 +18818,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const progressCensus = this.state.storage.sql.exec(
       `SELECT id, title, body_md, meta, roles, tags FROM artefacts WHERE type = 'task' AND status = 'in_progress'`,
     ).toArray() as any[];
+    // An escalation is actionable only while its work is open. Seek the
+    // existing (type,status) index before inspecting JSON; scanning historical
+    // metadata here monopolized the shared DO on every panel recompute.
+    const escalationCensus = (this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type = 'task'
+         AND status IN ('todo','in_progress','in_review','blocked')
+         AND json_extract(meta, '$.merge_train.escalated.at') IS NOT NULL
+         AND json_extract(meta, '$.merge_train.escalated.cleared_at') IS NULL
+         AND json_extract(meta, '$.merge_train.escalated.closed_at') IS NULL`,
+    ).toArray() as any[]).map((r) => ({ id: r.id, m: JSON.parse(r.meta ?? "{}") }));
     for (const l of lanes) {
       const meta = JSON.parse(l.meta ?? "{}");
       const lane = laneOfMeta(meta);
@@ -19503,13 +19513,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // PRs riding out their owner clock. `expired` + close_reason feed the
       // executor's gh close leg (the hub holds no VCS credentials — the
       // executor is the hand, the hub is the law).
-      const escalations = (this.state.storage.sql.exec(
-        `SELECT id, meta FROM artefacts WHERE type = 'task'
-         AND json_extract(meta, '$.merge_train.escalated.at') IS NOT NULL
-         AND json_extract(meta, '$.merge_train.escalated.cleared_at') IS NULL
-         AND json_extract(meta, '$.merge_train.escalated.closed_at') IS NULL`,
-      ).toArray() as any[])
-        .map((r) => ({ id: r.id, m: JSON.parse(r.meta ?? "{}") }))
+      const escalations = escalationCensus
         .filter(({ m }) => trainCardMatchesLane(m, lane.repo) && Number(m.merge_train?.escalated?.pr ?? m.merge_train?.pr ?? 0) > 0)
         .map(({ id, m }) => {
           const e = m.merge_train.escalated;
