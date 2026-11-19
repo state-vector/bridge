@@ -216,10 +216,16 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
               <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
               {fixer ? (
                 <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
-              ) : remediation?.kind === "queued" ? (
-                <Chip tone="warn" title={remediation.text}>Recovery queued</Chip>
-              ) : remediation?.kind === "blocked" ? (
-                <Chip tone="warn" title={remediation.text}>Recovery blocked</Chip>
+              ) : remediation?.kind === "queued" || remediation?.kind === "blocked" ? (
+                // BR#16950 review (Ray): the reason rode only in the hover
+                // title — the board showed a bare "Recovery blocked" with no
+                // explanation. Inline the (trimmed) blocker text; full text
+                // stays in the tooltip.
+                <Chip tone="warn" title={remediation.text}>
+                  {remediation.kind === "blocked" ? "Recovery blocked" : "Recovery queued"}
+                  {" — "}
+                  {remediation.text.length > 140 ? `${remediation.text.slice(0, 137)}…` : remediation.text}
+                </Chip>
               ) : (
                 <Chip tone="urgent" className="train-stopline-unowned" title={`${red.id} is open and unclaimed — claim it before anything else merges`}>
                   ⚠ UNOWNED — nobody is fixing it
