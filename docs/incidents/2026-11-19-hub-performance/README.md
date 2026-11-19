@@ -42,3 +42,11 @@ The full runtime error is **Durable Object is overloaded. Requests queued for to
 After the board query fix, sampled board CPU fell from 14.672s / 22.01s capture to 1.862s / 25.28s, an approximately 89% reduction in board CPU per second. However trainStatus now dominates (8.382s / 12.005s total sampled CPU, 69.82%). Concurrent probes still include multi-second stalls, so the incident is not resolved by that first fix.
 
 A desktop SQLite plan suggested train child joins could scan history, but the workerd fixture did not reproduce that plan. That speculative change was discarded. Instead the six raw train SQL families are being named in the production CPU stack, with row-read counters for broad reads, to identify the actual remaining query. The full train suite (125 tests) passes with this behavior-preserving extraction.
+
+## Remaining train root cause (0720149aa)
+
+Production query-level counters identify `train.review_children`: 426 calls read **5,872,570 rows** to return 8,466 children. Empty results read 13,746 rows each; one-child results read 13,747. This is the historical-task-first join plan, repeated for each review parent in the train snapshot. See `train-query-row-reads.jsonl`. Other named PR-stat families did not report broad reads in this window.
+
+The surviving authoritative lookup remains the incoming `child_of` relation. `TRAIN_REVIEW_CHILDREN_SQL` now explicitly starts with `relations INDEXED BY idx_relations_incoming`, then CROSS JOINs children by primary key. No child status, history, ordering or result limit changed. A workerd test emulates the observed historical-task-first plan: 10,008 reads versus 13 for the parent-driven lookup, same done/pending children and sequence; empty lookups read fewer than five rows. The full 125-test train lifecycle suite passes.
+
+The first two attempts to capture a named CPU profile returned Cloudflare control-plane errors (no recent execution, then profiling could not start). These are profile-API failures, not hub request samples. The preceding native CPU profile and direct live row-read counters identify the train bottleneck independently. A post-fix native profile and latency verification are still required.

@@ -17,11 +17,15 @@ export function trainTerminalOutcomeRows(sql:SqlStorage,repo:string) {
 export function trainIgnoredPrRows(sql:SqlStorage,repo:string) {
   return rows(sql,"train.ignored_prs",`SELECT pr FROM reconcile_ignores WHERE repo=?`,repo);
 }
-export function trainReviewChildRows(sql:SqlStorage,id:string) {
-  return rows(sql,"train.review_children",`SELECT a.id AS id,a.status AS status,a.body_md AS body_md,a.meta AS meta,a.updated_ts AS updated_ts
-    FROM relations rel JOIN artefacts a ON a.id=rel.src_id
+// Production chose the task-type index first: ~13,750 historical rows per
+// parent, even for an empty result. Pin the authoritative relation seek first.
+export const TRAIN_REVIEW_CHILDREN_SQL = `SELECT a.id AS id,a.status AS status,a.body_md AS body_md,a.meta AS meta,a.updated_ts AS updated_ts
+    FROM relations rel INDEXED BY idx_relations_incoming
+    CROSS JOIN artefacts a ON a.id=rel.src_id
     WHERE rel.relation='child_of' AND rel.dst_id=? AND a.type='task' AND a.roles LIKE '%"review"%'
-    ORDER BY a.created_ts DESC`,id);
+    ORDER BY a.created_ts DESC`;
+export function trainReviewChildRows(sql:SqlStorage,id:string) {
+  return rows(sql,"train.review_children",TRAIN_REVIEW_CHILDREN_SQL,id);
 }
 export function trainSeenPrRows(sql:SqlStorage,repo:string) {
   return rows(sql,"train.seen_prs",`SELECT pr,card FROM reconcile_seen WHERE repo=? AND missing=0 ORDER BY pr ASC`,repo);

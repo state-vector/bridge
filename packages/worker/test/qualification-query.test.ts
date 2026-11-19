@@ -1,3 +1,4 @@
+import { TRAIN_REVIEW_CHILDREN_SQL } from "../src/kb/train-read-query";
 import { Miniflare } from "miniflare";
 import { describe, expect, it } from "vitest";
 import { SCOPED_ROLE_EVIDENCE_SQL, SCOPED_DECISION_EVIDENCE_SQL, SCOPED_OPEN_ASKS_SQL } from "../src/kb/qualification-query";
@@ -36,7 +37,23 @@ describe("qualification joins with retained historical work", () => {
       expect((await query(SCOPED_DECISION_EVIDENCE_SQL,args)).rows).toEqual([{tid:"selected"}]);
       expect((await query(SCOPED_OPEN_ASKS_SQL,args)).rows).toEqual([{pid:"selected"}]);
       expect((await query(SCOPED_ROLE_EVIDENCE_SQL,['[]'])).reads).toBeLessThan(5);
-      console.log(JSON.stringify({retained:10000,old_reads:original.reads,new_reads:roles.reads}));
+      await query(`ALTER TABLE artefacts ADD COLUMN body_md TEXT DEFAULT ''; ALTER TABLE artefacts ADD COLUMN updated_ts INTEGER DEFAULT 0;
+        ALTER TABLE artefacts ADD COLUMN created_ts INTEGER DEFAULT 0; UPDATE artefacts SET created_ts=10 WHERE id='pending';`);
+      // Emulate the historical-task-first plan observed on production, whose
+      // statistics differ from this freshly created fixture's defaults.
+      const historicalFirst=await query(`SELECT a.id FROM artefacts a INDEXED BY idx_type_status
+        CROSS JOIN relations rel ON a.id=rel.src_id WHERE rel.relation='child_of' AND rel.dst_id=?
+        AND a.type='task' AND a.roles LIKE '%"review"%' ORDER BY a.created_ts DESC`,["selected"]);
+      const train=await query(TRAIN_REVIEW_CHILDREN_SQL,["selected"]);
+      expect(train.rows.map(r=>r.id)).toEqual(historicalFirst.rows.map(r=>r.id));
+      expect(train.rows.map(r=>r.id)).toEqual(["pending","review"]);
+      expect(historicalFirst.reads).toBeGreaterThan(10000);
+      expect(train.reads).toBeLessThan(40);
+      const empty=await query(TRAIN_REVIEW_CHILDREN_SQL,["absent"]);
+      expect(empty.rows).toEqual([]);expect(empty.reads).toBeLessThan(5);
+      const plan=await query("EXPLAIN QUERY PLAN "+TRAIN_REVIEW_CHILDREN_SQL,["selected"]);
+      expect(String(plan.rows[0].detail)).toContain("idx_relations_incoming");
+      console.log(JSON.stringify({retained:10000,old_reads:original.reads,new_reads:roles.reads,old_train_reads:historicalFirst.reads,new_train_reads:train.reads}));
     } finally {await mf.dispose();}
   });
 });
