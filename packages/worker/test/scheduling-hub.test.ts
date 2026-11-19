@@ -435,6 +435,47 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
   });
 
+  it("dissolves a provider_route hold when the failed route no longer exists — the gateway replaced its config (route orphan starvation)", async () => {
+    // live specimen 2026-11-19: provider_route held 74 cards while
+    // routeCandidates stayed [] — every recorded attempt predated a config
+    // change, so no verified proof could ever match, capacity idled at 5/20,
+    // and the scheduler starved with no exit.
+    const project = "provider-route-orphan", g = await gateway(project);
+    const larger = { ...g.capabilities, tier: "large" };
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [larger] } });
+    const id = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    const outcome = { kind: "failed", exit_code: 1, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    for (let generation = 1; generation <= 3; generation++) {
+      const claim = await reserve(g);
+      if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+      const attempt_id = `orphan-${generation}`;
+      expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,
+        selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, `orphan-begin-${generation}`, id, claim.session)).error).toBeUndefined();
+      // generations < 3 fail generically (retry budget); only the LAST failure
+      // carries the provider-route stderr that arms the provider_route hold
+      const stopped = { generation, attempt_id, writers: "process_group_empty",
+        outcome: generation < 3 ? { ...outcome, stderr_tail: "Task failed before delivery" } : outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, `orphan-stop-${generation}`, id, claim.session)).error).toBeUndefined();
+      expect((await g.cmd({ kind: "finalize", ...stopped }, `orphan-final-${generation}`, id, claim.session)).error).toBeUndefined();
+    }
+    // the recorded route (config_revision "one") holds the card for verified recovery
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    // the gateway replaces its config: the failed route no longer exists on
+    // any live capability, so NO proof can ever cover the recorded attempt —
+    // the hold dissolves and the card re-enters eligibility for a fresh
+    // dispatch at the current route (repeated failures still hit retry_budget)
+    const readvertised = await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, config_revision: "two",
+      alternatives: [{ ...larger, config_revision: "two" }] } });
+    expect(readvertised.ok).toBe(true);
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(id);
+    // fresh dispatch at the current route — NO recovery selection is stamped
+    // (there is no recovery to prove; budget guards still apply)
+    expect(resumed.task?.meta.execution_recovery_selection).toBeUndefined();
+  });
+
   it("carries the effective reasoning tier from reservation through begin", async () => {
     const project = "reservation-model-tier", g = await gateway(project);
     const large = { ...g.capabilities, tier: "large", model: "test/large" };

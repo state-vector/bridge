@@ -6102,6 +6102,18 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
+  /** True when the failed attempt's route (backend+model+config_revision)
+   *  exists on NO live capability — the verified-route grant can never cover
+   *  it, so the provider_route hold/permit it guards is void and the card
+   *  dispatches FRESH at the current route (budget guards still apply). */
+  private routeGoneFor(execution: { attempt?: { executor?: { backend: string; model: string; config_revision: string } | null } | null } | null | undefined,
+    capabilities: ExecutorCapabilities | null): boolean {
+    const executor = execution?.attempt?.executor;
+    return !!executor && !!capabilities
+      && ![capabilities, ...capabilities.alternatives].some(c =>
+        c.backend === executor.backend && c.model === executor.model && c.config_revision === executor.config_revision);
+  }
+
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string },
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
@@ -6211,7 +6223,17 @@ export class KnowledgeHub {
           && recoveryPermitMatches(state, c, host, revision, Date.now()));
         const awaitingPermitHost = (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
           && state.recovery_permit?.task_revision === revision;
-        reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
+        // A provider_route hold is satisfiable only while the failed route
+        // still exists on this host's live capabilities — the verified-route
+        // grant matches the attempt's exact backend+model+config_revision.
+        // When that route was REPLACED (deploy, model swap), no proof can
+        // ever cover the recorded attempt and the hold orphans forever
+        // (live specimen: provider_route 74 held, routeCandidates []). The
+        // route being gone dissolves the hold: the card re-enters
+        // eligibility for a FRESH dispatch at the current route, and
+        // repeated failures still land in the retry_budget guard.
+        const routeGone = hold === "provider_route" && state?.terminal && this.routeGoneFor(state, capabilities);
+        reason = permit ? null : awaitingPermitHost ? "recovery_route" : routeGone ? null : hold;
       }
       if (!reason && capabilities) {
         const requirements = schedulingRequirements();
@@ -6615,10 +6637,17 @@ export class KnowledgeHub {
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           const execution = this.executionState(id);
           if (execution && executionNeedsRecoveryPermit(execution, String(meta.work_revision ?? "legacy"))) {
-            const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
-              && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
-            if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
-            meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
+            if (this.routeGoneFor(execution, capabilities)) {
+              // the recorded route exists on no live capability: the permit
+              // requirement guards a recovery that can never be proven —
+              // dispatch FRESH at the current route (selection dissolved the
+              // hold under the same predicate; budget guards still apply)
+            } else {
+              const matched = [capabilities,...capabilities.alternatives].find(c => recoveryPermitMatches(execution,c,host,String(meta.work_revision??"legacy"),Date.now())
+                && usableFor(meta.execution_scheduling_requirements,c,host,String(assigned.project??"")));
+              if (!matched) throw new Error("gate: reserved recovery route no longer matches current proof");
+              meta.execution_recovery_selection = { backend:matched.backend,model:matched.model,config_revision:matched.config_revision,tier:matched.tier };
+            }
           }
           result = { kind: "reserved", ...facts, task_id: id, session, expires_at: Number(reservation.expires_at),
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
