@@ -383,7 +383,9 @@ describe("eligibility-first scheduling on real SQLite", () => {
     if (event) {
       const verified = { kind: "provider_route_verified", proof };
       const submit = (command_id: string) => post("execution", { ...auth, id: "gateway", command_id, command: verified });
-      expect((await g.cmd(verified)).error).toMatch(/full-agent/);
+      // BR#17364 — a gateway token may never vouch a proxy capture it did not
+      // make; only its own configured-route observation is admissible.
+      expect((await g.cmd(verified)).error).toMatch(/gateway host may only submit its own configured route observation/);
       const receipt = await submit("route-observed");
       expect(receipt).toEqual({ kind: "verified_route_recovery", granted: [id] });
       const resumed = await reserve(g);
@@ -433,6 +435,64 @@ describe("eligibility-first scheduling on real SQLite", () => {
       expect((await recover("repeat-proxy", { ...command, terminal: final.terminal,
         proof: { ...proof, id: "second-proxy", observed_at: fresh.observed_at } })).error).toMatch(/trial already ran/);
     }
+  });
+
+  it("releases provider_route holds on the routing gateway's own configured-route observation — the daemon's successes close its failures' loop (BR#17364)", async () => {
+    const project = "provider-route-observed", g = await gateway(project, 4);
+    const larger = { ...g.capabilities, tier: "large" };
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [larger] } });
+    const id = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    const outcome = { kind: "failed", exit_code: 1, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    for (let generation = 1; generation <= 3; generation++) {
+      const claim = await reserve(g);
+      if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+      const attempt_id = `daemon-${generation}`;
+      expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,
+        selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, `daemon-begin-${generation}`, id, claim.session)).error).toBeUndefined();
+      // generations < 3 fail generically (retry budget); only the LAST failure
+      // carries the provider-route stderr that arms the provider_route hold
+      const stopped = { generation, attempt_id, writers: "process_group_empty",
+        outcome: generation < 3 ? { ...outcome, stderr_tail: "Task failed before delivery" } : outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, `daemon-stop-${generation}`, id, claim.session)).error).toBeUndefined();
+      expect((await g.cmd({ kind: "finalize", ...stopped }, `daemon-final-${generation}`, id, claim.session)).error).toBeUndefined();
+    }
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    // The transport's own success through the SAME backend|model|config_revision:
+    // every receipt quotes a dispatch log line the gateway actually emitted.
+    const binding = `[ts] [dispatch] configured route binding: backend=${g.capabilities.backend} model=${g.capabilities.model} config_revision=${g.capabilities.config_revision}`;
+    const proof = { id: "route-proof-daemon", host: g.host, backend: g.capabilities.backend, model: g.capabilities.model,
+      config_revision: g.capabilities.config_revision,
+      result: { kind: "succeeded", response_receipt: `[ts] [dispatch] [provider-route] configured-model request completed through ${g.capabilities.backend}/${g.capabilities.model}: 42 output tokens observed` },
+      observed_at: Date.now(),
+      request: { kind: "configured_model_request", max_output_tokens: 42, tools: "none" },
+      actual_model: "provider/small",
+      configuration_receipt: binding, receipts: ["[ts] [dispatch] [provider-route] provider route unavailable — recovery proof armed", "[ts] [dispatch] [provider-route] configured-model request completed"],
+      witness: { kind: "configured_route_observed", configured_model: g.capabilities.model, allowed_actual_models: ["provider/small"],
+        configured_max_output_tokens: 42, observed_max_output_tokens: 42, configuration_receipt: binding } };
+    const verified = { kind: "provider_route_verified", proof, limit: 4 };
+    // The gateway token submits its own route observation and the hold releases.
+    const receipt = await g.cmd(verified);
+    expect(receipt).toEqual({ kind: "verified_route_recovery", granted: [id] });
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(id);
+    const begun = await g.cmd({ kind: "begin", attempt_id: "route-recovered", worker: g.auth.agent,
+      action_budget_ms: 60_000, selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } },
+      "route-recovered-begin", id, resumed.session);
+    expect(begun).toMatchObject({ generation: 4, budget_exhaustions: 2, recovery_permit: { phase: "consumed" } });
+    // Hub-side replay dedupe fences the same proof id under a fresh command id.
+    expect(await g.cmd(verified, "route-verified-replay")).toEqual(receipt);
+    // A gateway can never vouch a proxy request it did not make.
+    expect((await g.cmd({ ...verified, proof: { ...proof, id: "route-proof-proxy",
+      witness: { ...proof.witness, kind: "configured_proxy_request" } } }, "route-verified-proxy")).error)
+      .toMatch(/gateway host may only submit its own configured route observation/);
+    // Nor an observation for a host other than its own label.
+    expect((await g.cmd({ ...verified, proof: { ...proof, id: "route-proof-foreign", host: "other-gateway-host" } }, "route-verified-foreign")).error)
+      .toMatch(/own gateway host/);
+    // Stale evidence releases nothing.
+    expect((await g.cmd({ ...verified, proof: { ...proof, id: "route-proof-stale", observed_at: Date.now() - 301_000 } }, "route-verified-stale")).error)
+      .toMatch(/stale/);
   });
 
   it("dissolves a provider_route hold when the failed route no longer exists — the gateway replaced its config (route orphan starvation)", async () => {

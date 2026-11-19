@@ -93,6 +93,16 @@ pub fn stop_recovered(identity: &ProcessIdentity) -> GroupState {
     GroupState::Unobservable
 }
 
+/// What the transport itself observed about a COMPLETED configured-model
+/// request (BR#17364). Every field is read off a frame the transport actually
+/// received — the session's reported model and the prompt's end-turn usage —
+/// never derived or defaulted. `None` fields mean the wire did not say.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteWitness {
+    pub actual_model: Option<String>,
+    pub output_tokens: Option<u64>,
+}
+
 pub struct RunOutcome {
     pub ok: bool,
     pub stdout_tail: String,
@@ -104,6 +114,9 @@ pub struct RunOutcome {
     /// no adapter-typed provider discriminator (transport/process/timeout);
     /// `Some` provenance drives the canonical route incident end-to-end.
     pub cause: Option<ProviderCause>,
+    /// Observed success evidence for the route-proof producer (BR#17364);
+    /// `None` on every failure, spawn error and non-ACP transport.
+    pub route_witness: Option<RouteWitness>,
 }
 
 fn ms_now() -> u64 {
@@ -174,6 +187,300 @@ impl ProviderCause {
         if let Some(name) = &self.error_name { if !line.contains(name) { line = format!("[{name}] {line}"); } }
         if let Some(code) = self.code { if !line.contains(&code.to_string()) { line = format!("(code {code}) {line}"); } }
         line
+    }
+}
+
+/// The route identity one dispatch ran under (BR#17364) — the exact triple
+/// the hub records on `attempt.executor`, carried from the same strings the
+/// begin selection used, so a minted proof can only ever match the route it
+/// actually observed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionRoute {
+    pub backend: String,
+    pub model: String,
+    pub config_revision: String,
+}
+
+// ---------------------------------------------------------------------------
+// Provider-route proof producer (BR#17364)
+// ---------------------------------------------------------------------------
+
+pub mod route_recovery {
+    //! The missing closer of the provider_route loop: the transport's own
+    //! successes release the holds its failures arm. One incident is armed per
+    //! exact route (`backend|model|config_revision`) when the transport
+    //! classifies it `RouteUnavailable`; the next successful configured-model
+    //! request through that SAME route mints a fresh `ProviderRecoveryProof`
+    //! (witness `configured_route_observed`) for the dispatch leg to submit
+    //! through the hub's `provider_route_verified` gate.
+    //!
+    //! Honesty rule: every receipt quotes an exact line the transport logged
+    //! through `logging::emit` (arm evidence, completion, config binding); the
+    //! token triplet is the observed end-turn usage of the witnessed request —
+    //! never an invented ceiling. A proof lives 300s (the hub's freshness
+    //! gate) and is submitted once.
+
+    use super::{ProviderCause, ProviderCauseClass, RouteWitness};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    /// Milliseconds a minted proof stays fresh — the hub rejects anything
+    /// older or from the future.
+    pub const FRESH_MS: u64 = 300_000;
+
+    #[derive(Clone, Debug)]
+    struct RouteIncident { armed_line: String }
+    fn incidents() -> &'static Mutex<HashMap<String, RouteIncident>> {
+        static M: OnceLock<Mutex<HashMap<String, RouteIncident>>> = OnceLock::new();
+        M.get_or_init(Default::default)
+    }
+    fn ready() -> &'static Mutex<Vec<serde_json::Value>> {
+        static Q: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+        Q.get_or_init(Default::default)
+    }
+    fn route_key(backend: &str, model: &str, config_revision: &str) -> String {
+        format!("{backend}|{model}|{config_revision}")
+    }
+    /// The one logging door — emit the line and return it verbatim so every
+    /// receipt cites something the transport actually logged.
+    fn logged_line(scope: &str, msg: &str) -> String {
+        crate::logging::emit("dispatch", scope, msg);
+        let ts = crate::logging::iso(super::ms_now());
+        if scope.is_empty() { format!("[{ts}] [dispatch] {msg}") } else { format!("[{ts}] [dispatch] [{scope}] {msg}") }
+    }
+
+    /// ARM: the transport classified this exact route `RouteUnavailable`.
+    /// Re-arms refresh the incident (latest evidence wins).
+    pub fn arm_incident(backend: &str, model: Option<&str>, config_revision: &str, scope: &str, cause: &ProviderCause) {
+        if cause.class != ProviderCauseClass::RouteUnavailable { return; }
+        let Some(model) = model.filter(|m| !m.is_empty()) else {
+            logged_line(scope, &format!("provider route unavailable on {backend} carries no configured model identity; no recovery proof can be armed (exact-route matching requires one)"));
+            return;
+        };
+        if config_revision.is_empty() { return; }
+        let armed_line = logged_line(scope, &format!(
+            "provider route unavailable — recovery proof armed for {backend}/{model} (revision {config_revision}): {}",
+            cause.evidence_text()));
+        incidents().lock().expect("route incidents poisoned")
+        .insert(route_key(backend, model, config_revision), RouteIncident { armed_line });
+    }
+
+    /// WITNESS + MINT: a successful configured-model request through a route
+    /// with an armed incident mints exactly one fresh proof. Different-route
+    /// successes mint nothing; successes without observed usage evidence mint
+    /// nothing (honesty rule: no synthesized token figure).
+    pub fn witness_success(route: &super::ExecutionRoute, host: &str, scope: &str, witness: &RouteWitness) {
+        if route.backend.is_empty() || route.model.is_empty() || route.config_revision.is_empty() { return; }
+        let key = route_key(&route.backend, &route.model, &route.config_revision);
+        let incident = incidents().lock().expect("route incidents poisoned").remove(&key);
+        let Some(RouteIncident { armed_line }) = incident else { return };
+        let Some(tokens) = witness.output_tokens.filter(|t| *t > 0) else {
+            logged_line(scope, &format!(
+                "route success witnessed for {} (armed incident discarded) but the completion carried no end-turn usage evidence; no proof minted — receipts must cite observed data",
+                key.replace('|', " / ")));
+            return;
+        };
+        let Some(actual_model) = witness.actual_model.as_deref().filter(|m| !m.is_empty()) else {
+            logged_line(scope, &format!(
+                "route success witnessed for {} but neither the session response nor the injected config reports a model identity; no proof minted", key.replace('|', " / ")));
+            return;
+        };
+        let now = super::ms_now();
+        let id = format!("route-proof-{}-{}-{}", std::process::id(), now, ArmedOrdinal::next());
+        let completion_line = logged_line(scope, &format!(
+            "configured-model request completed through {}/{} (revision {}): {} output tokens observed (actual model {actual_model}); route armed by: {armed_line}",
+            route.backend, route.model, route.config_revision, tokens));
+        let binding_line = logged_line(scope, &format!(
+            "configured route binding: backend={} model={} config_revision={} (session model reported: {actual_model})",
+            route.backend, route.model, route.config_revision));
+        let proof = serde_json::json!({
+            "id": id,
+            "host": host,
+            "backend": route.backend,
+            "model": route.model,
+            "config_revision": route.config_revision,
+            "result": { "kind": "succeeded", "response_receipt": completion_line },
+            "observed_at": now,
+            "request": { "kind": "configured_model_request", "max_output_tokens": tokens, "tools": "none" },
+            "actual_model": actual_model,
+            "configuration_receipt": binding_line,
+            "receipts": [armed_line, completion_line],
+            "witness": {
+                "kind": "configured_route_observed",
+                "configured_model": route.model,
+                "allowed_actual_models": [actual_model],
+                "configured_max_output_tokens": tokens,
+                "observed_max_output_tokens": tokens,
+                "configuration_receipt": binding_line,
+            },
+        });
+        ready().lock().expect("route proofs poisoned").push(proof);
+        logged_line(scope, &format!("recovery proof {id} minted — ready for provider_route_verified submission"));
+    }
+
+    /// CONSUME: the freshest unsubmitted proof, dropping anything the hub's
+    /// 300s gate would reject as stale. One call = one submission.
+    pub fn take_fresh_proof(now_ms: u64) -> Option<serde_json::Value> {
+        let mut queue = ready().lock().expect("route proofs poisoned");
+        queue.retain(|proof| {
+            let at = proof.get("observed_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            at <= now_ms && now_ms - at <= FRESH_MS
+        });
+        queue.pop()
+    }
+
+    /// Monotonic per-process ordinal so two proofs minted in the same
+    /// millisecond can never collide on id.
+    struct ArmedOrdinal(u64);
+    impl ArmedOrdinal {
+        fn next() -> u64 {
+            static N: OnceLock<Mutex<u64>> = OnceLock::new();
+            let mut n = N.get_or_init(|| Mutex::new(0)).lock().expect("ordinal poisoned");
+            *n += 1;
+            *n
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_tests() {
+        incidents().lock().expect("route incidents poisoned").clear();
+        ready().lock().expect("route proofs poisoned").clear();
+    }
+
+    /// The mint queue and incident table are process-global; tests that touch
+    /// them serialize on this guard so parallel test threads cannot mint into
+    /// or drain each other's queues.
+    #[cfg(test)]
+    pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(Default::default).lock().expect("route test lock poisoned")
+    }
+
+    #[cfg(test)]
+    fn cause(class: ProviderCauseClass, backend: &str, model: Option<&str>) -> ProviderCause {
+        ProviderCause { class, backend: backend.into(), model: model.map(String::from), code: Some(-32603), error_name: Some("provider.route_unavailable".into()), message: format!("{backend}: provider route unavailable"), data: None, evidence_line: None, at_ms: 1 }
+    }
+
+    #[cfg(test)]
+    fn route(backend: &str, model: &str, revision: &str) -> super::ExecutionRoute {
+        super::ExecutionRoute { backend: backend.into(), model: model.into(), config_revision: revision.into() }
+    }
+
+    #[cfg(test)]
+    fn witness(model: &str, tokens: u64) -> RouteWitness {
+        RouteWitness { actual_model: Some(model.into()), output_tokens: Some(tokens) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn failure_then_success_same_route_mints_exactly_one_complete_proof() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            {
+                let queue = ready().lock().expect("route proofs poisoned");
+                assert_eq!(queue.len(), 1, "one armed incident + one witnessed success = one proof");
+                let proof = &queue[0];
+                assert_eq!(proof["host"], "host-a");
+                assert_eq!(proof["backend"], "kagi");
+                assert_eq!(proof["model"], "atlas-4");
+                assert_eq!(proof["config_revision"], "rev-7");
+                assert_eq!(proof["result"]["kind"], "succeeded");
+                assert!(proof["result"]["response_receipt"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "response_receipt quotes the logged completion line");
+                assert_eq!(proof["request"], serde_json::json!({"kind":"configured_model_request","max_output_tokens":42,"tools":"none"}));
+                assert_eq!(proof["actual_model"], "atlas-4-turbo");
+                assert_eq!(proof["witness"]["kind"], "configured_route_observed");
+                assert_eq!(proof["witness"]["configured_model"], "atlas-4");
+                assert_eq!(proof["witness"]["allowed_actual_models"], serde_json::json!(["atlas-4-turbo"]));
+                assert_eq!(proof["witness"]["configured_max_output_tokens"], 42, "the triplet is the observed usage, never an invented ceiling");
+                assert_eq!(proof["witness"]["observed_max_output_tokens"], 42);
+                assert_eq!(proof["witness"]["configuration_receipt"], proof["configuration_receipt"], "witness and proof bind the same configuration receipt");
+                let receipts = proof["receipts"].as_array().expect("receipts array");
+                assert!(receipts.len() >= 2, "arm evidence and completion must both be cited");
+                assert!(proof["observed_at"].as_u64().unwrap_or(0) > 0 && proof["observed_at"].as_u64().unwrap_or(0) <= super::super::ms_now() + 1);
+                assert!(proof["id"].as_str().map(|s| s.starts_with("route-proof-")).unwrap_or(false));
+            }
+            // Submission consumes it exactly once.
+            let now = super::super::ms_now();
+            assert!(take_fresh_proof(now).is_some());
+            assert!(take_fresh_proof(now).is_none(), "one proof = one submission");
+        }
+
+        #[test]
+        fn success_on_a_different_route_mints_nothing() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-OTHER"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            witness_success(&route("other", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            witness_success(&route("kagi", "atlas-5", "rev-7"), "host-a", "provider-route", &witness("atlas-5", 42));
+            let queue = ready().lock().expect("route proofs poisoned");
+            assert!(queue.is_empty(), "only an exact backend|model|config_revision match witnesses an armed incident");
+        }
+
+        #[test]
+        fn stale_proofs_are_dropped_at_the_hubs_freshness_boundary() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            // The hub rejects strictly-older-than-300s; the stamp inside the
+            // proof is the exact reference instant.
+            let at = ready().lock().expect("route proofs poisoned")[0]["observed_at"].as_u64().expect("observed_at");
+            assert!(take_fresh_proof(at + FRESH_MS).is_some(), "exactly FRESH_MS old is still submittable");
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            let at = ready().lock().expect("route proofs poisoned")[0]["observed_at"].as_u64().expect("observed_at");
+            assert!(take_fresh_proof(at + FRESH_MS + 1).is_none(), "past the hub's 300s gate the proof must not leave the queue");
+            assert!(take_fresh_proof(at).is_none(), "the stale sweep removed it, not submitted it");
+        }
+
+        #[test]
+        fn success_without_observed_usage_mints_nothing_and_drops_the_incident() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            // No usage frame on the wire at all.
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &RouteWitness { actual_model: Some("atlas-4-turbo".into()), output_tokens: None });
+            // A zero total is no evidence either.
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 0));
+            // No model identity anywhere on the wire.
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &RouteWitness { actual_model: None, output_tokens: Some(42) });
+            let queue = ready().lock().expect("route proofs poisoned");
+            assert!(queue.is_empty(), "receipts must cite observed data; a synthesized token figure or model name is forbidden");
+        }
+
+        #[test]
+        fn only_route_unavailable_failures_arm_and_model_identity_is_required() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RateLimit, "kagi", Some("atlas-4")));
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::AccountAction, "kagi", Some("atlas-4")));
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::ProviderInternal, "kagi", Some("atlas-4")));
+            arm_incident("kagi", None, "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", None));
+            arm_incident("kagi", Some(""), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 42));
+            let queue = ready().lock().expect("route proofs poisoned");
+            assert!(queue.is_empty(), "non-route failures and model-less route failures arm nothing");
+        }
+
+        #[test]
+        fn re_armed_incidents_refresh_and_ids_never_collide_within_a_millisecond() {
+            let _guard = test_guard(); reset_for_tests();
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-4")));
+            arm_incident("kagi", Some("atlas-9"), "rev-7", "provider-route", &cause(ProviderCauseClass::RouteUnavailable, "kagi", Some("atlas-9")));
+            witness_success(&route("kagi", "atlas-4", "rev-7"), "host-a", "provider-route", &witness("atlas-4-turbo", 1));
+            witness_success(&route("kagi", "atlas-9", "rev-7"), "host-a", "provider-route", &witness("atlas-9-turbo", 2));
+            let queue = ready().lock().expect("route proofs poisoned");
+            assert_eq!(queue.len(), 2, "re-arm refreshes in place; distinct routes mint independently");
+            let mut ids: Vec<&str> = queue.iter().filter_map(|proof| proof["id"].as_str()).collect();
+            let before = ids.len();
+            ids.sort(); ids.dedup();
+            assert_eq!(ids.len(), before, "two proofs minted in the same millisecond must never share an id");
+        }
     }
 }
 
@@ -633,6 +940,7 @@ impl AgentTransport for OpencodeRun {
                     timed_out: false,
                     session_id: None,
                     cause: None,
+                    route_witness: None,
                 };
             }
         };
@@ -709,6 +1017,7 @@ impl AgentTransport for OpencodeRun {
             timed_out,
             session_id: None,
             cause: None,
+            route_witness: None,
         }
     }
 }
@@ -755,6 +1064,7 @@ impl AgentTransport for OpencodeAcp {
                     timed_out: false,
                     session_id: None,
                     cause: None,
+                    route_witness: None,
                 };
             }
         };
@@ -912,6 +1222,20 @@ impl AgentTransport for OpencodeAcp {
             .get("sessionId")
             .and_then(|s| s.as_str())
             .map(String::from);
+        // BR#17364 — the session's model as the RESPONSE reports it (config
+        // options carry the live `model` binding; RFD-shape tolerant). If the
+        // wire does not say, fall back to the configured model this transport
+        // itself bound into the session config it injected — the session ran
+        // under exactly that binding, never a guess.
+        let session_model = {
+            let from_options = session.get("configOptions").and_then(|o| o.as_array()).and_then(|opts|
+                opts.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))
+                    .and_then(|o| o.get("currentValue").or_else(|| o.get("value")))
+                    .and_then(|v| v.as_str()).map(String::from));
+            from_options.or_else(|| session.get("model").and_then(|v| v.as_str()).map(String::from))
+                .or_else(|| req.model.map(String::from))
+                .filter(|m| !m.is_empty())
+        };
         let _ = &session_line;
 
         // 3. session/prompt — the actual work. Resume = loadSession + prompt
@@ -979,6 +1303,14 @@ impl AgentTransport for OpencodeAcp {
                     .and_then(|s| s.as_str())
                     .unwrap_or("end_turn")
                     .to_string();
+                // BR#17364 — observed end-turn usage. The output-token total
+                // the wire reports for this completed configured-model request
+                // is the only token quantity the transport may cite; absent
+                // usage means absent evidence.
+                let route_witness = (!timed_out && stop != "refusal" && stop != "cancelled").then(|| RouteWitness {
+                    actual_model: session_model.clone(),
+                    output_tokens: v.pointer("/usage/outputTokens").and_then(|t| t.as_u64()),
+                });
                 RunOutcome {
                     ok: !timed_out && stop != "refusal" && stop != "cancelled",
                     stdout_tail: tail(accumulated, 4000),
@@ -987,6 +1319,7 @@ impl AgentTransport for OpencodeAcp {
                     timed_out,
                     session_id,
                     cause: None,
+                    route_witness,
                 }
             }
             Err(e) if e.text.contains("timed out") => RunOutcome {
@@ -997,6 +1330,7 @@ impl AgentTransport for OpencodeAcp {
                 timed_out: true,
                 session_id,
                 cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
+                route_witness: None,
             },
             Err(e) => RunOutcome {
                 ok: false,
@@ -1006,6 +1340,7 @@ impl AgentTransport for OpencodeAcp {
                 timed_out,
                 session_id,
                 cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
+                route_witness: None,
             },
         }
     }
@@ -1023,6 +1358,7 @@ fn acp_fail(mut child: Child, msg: String, cause: Option<ProviderCause>) -> RunO
         timed_out: false,
         session_id: None,
         cause,
+        route_witness: None,
     }
 }
 
@@ -1153,6 +1489,7 @@ impl AgentTransport for KiroChat {
                     timed_out: false,
                     session_id: None,
                     cause: None,
+                    route_witness: None,
                 };
             }
         };
@@ -1181,6 +1518,7 @@ impl AgentTransport for KiroChat {
             timed_out,
             session_id,
             cause: None,
+            route_witness: None,
         }
     }
 }

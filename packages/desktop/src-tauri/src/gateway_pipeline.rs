@@ -194,7 +194,27 @@ fn remove_launch(cfg: &DispatchConfig, record: &Record) -> Result<(), String> {
 }
 
 pub(super) fn capture(cfg: &DispatchConfig, task: &str, runtime: &ExecutionRuntime, result: &opencode::RunOutcome, worktree: Option<PathBuf>) -> Result<Record, String> {
-    journal::insert(&terminal_root(cfg)?, record(cfg, task, runtime, result, worktree)?)
+    let saved = journal::insert(&terminal_root(cfg)?, record(cfg, task, runtime, result, worktree)?);
+    // BR#17364 — route observation rides a durable terminal record: exactly
+    // once per transport outcome (the worker-thread retry loop re-enters
+    // capture only after a failed insert), never for re-read journals.
+    if saved.is_ok() { observe_route_recovery(cfg, runtime, result); }
+    saved
+}
+/// BR#17364 — the transport's own outcomes arm the provider-route incident
+/// its failures name and mint the recovery proof its successes witness. This
+/// is the daemon-side producer the provider_route hold pile has been missing:
+/// hub-side release already gates on a fresh exact-route proof, but nothing
+/// produced one until now.
+fn observe_route_recovery(cfg: &DispatchConfig, runtime: &ExecutionRuntime, result: &opencode::RunOutcome) {
+    let Some(route) = &runtime.route else { return };
+    if let Some(cause) = &result.cause {
+        crate::transport::route_recovery::arm_incident(&route.backend, Some(&route.model), &route.config_revision, "provider-route", cause);
+    } else if result.ok {
+        if let Some(witness) = &result.route_witness {
+            crate::transport::route_recovery::witness_success(route, cfg.label.as_deref().unwrap_or(""), "provider-route", witness);
+        }
+    }
 }
 fn record(cfg: &DispatchConfig, task: &str, runtime: &ExecutionRuntime, result: &opencode::RunOutcome, worktree: Option<PathBuf>) -> Result<Record, String> {
     let owner = Ownership::Attempt { ticket: Ticket { task_id: task.into(), session: claim_session(cfg, task) },
@@ -758,6 +778,33 @@ fn finalize(shared: &Config, work: FinalWork, report: Reporter) -> Finished<Fina
     }
 }
 
+/// BR#17364 — the provider-route submission leg. Mirrors the hub's
+/// `provider_route_verified` math for the daemon's own ≤4/cycle cap: only
+/// after a scheduling_status poll that (a) reports provider_route holds on
+/// THIS host and (b) leaves free capacity, does one fresh proof leave the
+/// transport's mint queue. Without holds the proof stays queued (freshness
+/// permitting) — never burned on a no-op cycle.
+fn submit_route_proofs(cfg: &DispatchConfig) -> Result<serde_json::Value, String> {
+    let host = cfg.label.as_deref().ok_or("gateway host missing")?;
+    let status = scheduling_status(cfg, Some(host))?;
+    let row = status.get("hosts").and_then(|hosts| hosts.as_array()).into_iter().flatten()
+        .find(|row| row.get("host").and_then(|value| value.as_str()) == Some(host))
+        .ok_or_else(|| "gateway missing from scheduling facts".to_string())?;
+    let held = row.pointer("/reasons/provider_route").and_then(|value| value.as_f64()).unwrap_or(0.0);
+    if held <= 0.0 { return Ok(json!({"kind":"route_proof_idle","reason":"no provider_route holds"})); }
+    let occupancy = |field: &str| row.get(field).and_then(|value| value.as_u64()).unwrap_or(0);
+    let free = occupancy("capacity").saturating_sub(occupancy("active")).saturating_sub(occupancy("reserved")).saturating_sub(occupancy("eligible"));
+    let limit = free.min(4);
+    if limit == 0 { return Ok(json!({"kind":"route_proof_idle","reason":"provider_route holds present but no free capacity"})); }
+    // Consumed only once this cycle can actually carry it — a capacity-less
+    // cycle must not burn a minted proof.
+    let Some(proof) = crate::transport::route_recovery::take_fresh_proof(now_ms()) else {
+        return Ok(json!({"kind":"route_proof_idle","reason":"provider_route holds present but no fresh proof"}));
+    };
+    let reply = execution_call(cfg, "gateway", json!({"kind":"provider_route_verified","proof":proof,"limit":limit}))?;
+    Ok(json!({"kind":"route_proof_submitted","proof_id":proof.get("id"),"limit":limit,"reply":reply}))
+}
+
 fn reserve(shared: &Config, id: &str) -> Result<AdmissionReply, String> {
     let cfg = config(shared); let root = root(&cfg)?;
     journal::write_file(&root.join("admission.json"), &serde_json::to_vec(id).map_err(|e| e.to_string())?)?;
@@ -931,6 +978,9 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
 
 pub(super) struct Controller { registry: Registry, admission: Admission, shared: Config, recovery: Recovery, last_snapshot: Instant,
     capacity_probe: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_capacity_probe: Instant,
+    /// BR#17364 — provider-route proof submission (one fresh proof per cycle,
+    /// bounded by the hub's own capacity math).
+    route_proof: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_route_proof: Instant,
     workspace_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_workspace: Instant,
     disk_admission: workspace::Admission, disk_observed: Instant,
     /// BR#14716 — throttle stamp for the wedge class alarm (see the workspace tick).
@@ -954,7 +1004,7 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), route_proof: None, next_route_proof: Instant::now() + Duration::from_secs(10), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
     }
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
@@ -981,7 +1031,7 @@ impl Controller {
                 }
             },
             Err(TryRecvError::Disconnected) => {
-                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, cause: None };
+                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, cause: None, route_witness: None };
                 record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()).ok().map(|r| FinalWork::Active(r, running.execution.clone()))
             },
             Err(TryRecvError::Empty) => None,
@@ -1073,6 +1123,26 @@ impl Controller {
         if recovered && locally_ready && !stop && !update && !self.registry.can_admit() && self.capacity_probe.is_none() && self.next_capacity_probe <= Instant::now() {
             let cfg = cfg.clone();
             self.capacity_probe = Some(lifecycle::Job::start(move || execution_call(&cfg, "gateway", json!({"kind":"schedule","mode":"request_capacity"}))));
+        }
+        // BR#17364 — provider-route proof submission: after the periodic
+        // scheduling_status poll, if the host reports provider_route holds and
+        // a fresh minted proof exists, submit it once. The hub re-checks
+        // freshness, exact-route matching, quiesced terminals, its own
+        // capacity math and replay-dedupes by proof id; the daemon adds its
+        // own ≤4-grants-per-cycle bound. Bounded background work like the
+        // capacity probe — never admission-critical.
+        if let Some(job) = &mut self.route_proof {
+            if let Some(result) = job.poll() {
+                match result {
+                    Ok(Ok(reply)) => dlog("gateway", &format!("route-proof: {reply}")),
+                    Err(error) | Ok(Err(error)) => dlog("gateway", &format!("route-proof submission deferred: {error}")),
+                }
+                self.route_proof = None; self.next_route_proof = Instant::now() + Duration::from_secs(30);
+            }
+        }
+        if !stop && !update && self.route_proof.is_none() && self.next_route_proof <= Instant::now() {
+            let cfg = cfg.clone();
+            self.route_proof = Some(lifecycle::Job::start(move || submit_route_proofs(&cfg)));
         }
         let admission = std::mem::replace(&mut self.admission, Admission::Held { reason: "admission transition".into() });
         self.admission = match admission {
@@ -2093,5 +2163,145 @@ pub(crate) mod tests {
         assert_eq!(again.iter().filter(|item| matches!(item, Recovered::Final(_, FinalWork::Journal(r)) if r.ticket().task_id == "zombie-task")).count(), 1, "the journalled adoption replays once — the leg never re-adopts");
         assert_eq!(journal::pending(&terminal, cfg.label.as_deref().unwrap(), cfg.url.trim_end_matches('/')).unwrap().len(), 1, "no duplicate adoption is written");
         drop(ready); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // BR#17364 — the provider-route proof submission leg. Mock-hub tests:
+    // schedule_status reports the holds, provider_route_verified is counted
+    // and captured. The route_recovery queue is process-global, so every
+    // test here holds the shared test guard.
+    // -----------------------------------------------------------------------
+    fn route_failure(backend: &str, model: &str) -> crate::transport::ProviderCause {
+        crate::transport::ProviderCause { class: crate::transport::ProviderCauseClass::RouteUnavailable,
+            backend: backend.into(), model: Some(model.into()), code: Some(-32603),
+            error_name: Some("provider.route_unavailable".into()), message: format!("{backend}: provider route unavailable"),
+            data: None, evidence_line: None, at_ms: 1 }
+    }
+    fn holds_row(host: &str, capacity: u64, active: u64, reserved: u64, eligible: u64, provider_route: u64) -> serde_json::Value {
+        json!({"host":host,"capacity":capacity,"active":active,"reserved":reserved,"eligible":eligible,
+            "reasons": if provider_route > 0 { json!({"provider_route": provider_route}) } else { json!({}) },
+            "routeCandidates": []})
+    }
+
+    #[test]
+    fn failure_then_success_on_held_route_submits_one_fresh_proof() {
+        let _guard = crate::transport::route_recovery::test_guard();
+        crate::transport::route_recovery::reset_for_tests();
+        let submitted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let capture = submitted.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            match command["kind"].as_str() {
+                Some("schedule_status") => Some(json!({"hosts":[holds_row(command["host"].as_str().unwrap_or("fixture"), 9, 1, 1, 2, 3)]})),
+                Some("provider_route_verified") => { capture.lock().unwrap().push(command["proof"].clone()); Some(json!({"kind":"route_recovered","granted":1})) }
+                _ => None,
+            }
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        let host = cfg.label.clone().unwrap();
+        // The transport's own cycle: a RouteUnavailable failure arms, the next
+        // success through the SAME route witnesses and mints.
+        crate::transport::route_recovery::arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &route_failure("kagi", "atlas-4"));
+        let route = crate::transport::ExecutionRoute { backend: "kagi".into(), model: "atlas-4".into(), config_revision: "rev-7".into() };
+        crate::transport::route_recovery::witness_success(&route, &host, "provider-route",
+            &crate::transport::RouteWitness { actual_model: Some("atlas-4-turbo".into()), output_tokens: Some(42) });
+        let reply = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(reply["kind"], "route_proof_submitted", "a fresh proof rides the cycle that has holds: {reply}");
+        assert_eq!(reply["limit"], 4, "free capacity 9-1-1-2=5 is capped at four grants per cycle");
+        let submissions = submitted.lock().unwrap();
+        assert_eq!(submissions.len(), 1, "exactly one provider_route_verified call");
+        let proof = &submissions[0];
+        assert_eq!(proof["host"], host.as_str(), "the daemon submits only its own observation");
+        assert_eq!(proof["backend"], "kagi");
+        assert_eq!(proof["model"], "atlas-4");
+        assert_eq!(proof["config_revision"], "rev-7");
+        assert_eq!(proof["witness"]["kind"], "configured_route_observed");
+        assert_eq!(proof["request"]["kind"], "configured_model_request");
+        assert_eq!(proof["request"]["max_output_tokens"], 42);
+        assert_eq!(proof["witness"]["configured_max_output_tokens"], 42);
+        assert_eq!(proof["witness"]["observed_max_output_tokens"], 42);
+        assert_eq!(proof["receipts"].as_array().map(Vec::len), Some(2), "arm + completion receipts");
+        // Consumed: the next cycle must not resubmit (the hub dedupes by id,
+        // and the daemon must not even try).
+        let second = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(submissions.len(), 1, "one proof = one submission");
+        assert_eq!(second["kind"], "route_proof_idle");
+        assert_eq!(second["reason"], "provider_route holds present but no fresh proof");
+        drop(ready); drop(snap); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn no_provider_route_holds_burn_no_proof() {
+        let _guard = crate::transport::route_recovery::test_guard();
+        crate::transport::route_recovery::reset_for_tests();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let seen = count.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            if command["kind"] == "schedule_status" { return Some(json!({"hosts":[holds_row(command["host"].as_str().unwrap_or("fixture"), 4, 0, 0, 0, 0)]})); }
+            if command["kind"] == "provider_route_verified" { seen.fetch_add(1, Ordering::SeqCst); return Some(json!({"kind":"route_recovered"})); }
+            None
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        crate::transport::route_recovery::arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &route_failure("kagi", "atlas-4"));
+        let route = crate::transport::ExecutionRoute { backend: "kagi".into(), model: "atlas-4".into(), config_revision: "rev-7".into() };
+        crate::transport::route_recovery::witness_success(&route, cfg.label.as_deref().unwrap(), "provider-route",
+            &crate::transport::RouteWitness { actual_model: Some("atlas-4-turbo".into()), output_tokens: Some(42) });
+        let reply = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(reply["kind"], "route_proof_idle");
+        assert_eq!(reply["reason"], "no provider_route holds", "without holds the mint queue is untouched");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "no provider_route_verified call happens");
+        assert!(crate::transport::route_recovery::take_fresh_proof(now_ms()).is_some(), "the proof survives for a cycle that actually has holds");
+        drop(ready); drop(snap); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
+    }
+
+    #[test]
+    fn different_route_success_and_staleness_release_nothing() {
+        let _guard = crate::transport::route_recovery::test_guard();
+        crate::transport::route_recovery::reset_for_tests();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0)); let seen = count.clone();
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(false)); let full_probe = full.clone();
+        let hub = Hub::new(move |request| {
+            let command = &request["params"]["arguments"]["command"];
+            if command["kind"] == "schedule_status" {
+                let host = command["host"].as_str().unwrap_or("fixture");
+                let row = if full_probe.load(Ordering::SeqCst) { holds_row(host, 2, 2, 0, 0, 5) } else { holds_row(host, 8, 0, 0, 0, 2) };
+                return Some(json!({"hosts":[row]}));
+            }
+            if command["kind"] == "provider_route_verified" { seen.fetch_add(1, Ordering::SeqCst); return Some(json!({"kind":"route_recovered"})); }
+            None
+        });
+        let (cfg, ready, snap) = fixture(&hub);
+        // Success on a DIFFERENT route than the armed one mints nothing.
+        crate::transport::route_recovery::arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &route_failure("kagi", "atlas-4"));
+        let different = crate::transport::ExecutionRoute { backend: "kagi".into(), model: "atlas-5".into(), config_revision: "rev-7".into() };
+        crate::transport::route_recovery::witness_success(&different, cfg.label.as_deref().unwrap(), "provider-route",
+            &crate::transport::RouteWitness { actual_model: Some("atlas-5-turbo".into()), output_tokens: Some(42) });
+        let reply = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(reply["kind"], "route_proof_idle");
+        assert_eq!(reply["reason"], "provider_route holds present but no fresh proof");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a different-route success never releases a hold");
+        // Now a genuine proof goes stale before any submission cycle: the
+        // sweep drops it and the leg declines — a stale proof never rides.
+        crate::transport::route_recovery::arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &route_failure("kagi", "atlas-4"));
+        let same = crate::transport::ExecutionRoute { backend: "kagi".into(), model: "atlas-4".into(), config_revision: "rev-7".into() };
+        crate::transport::route_recovery::witness_success(&same, cfg.label.as_deref().unwrap(), "provider-route",
+            &crate::transport::RouteWitness { actual_model: Some("atlas-4-turbo".into()), output_tokens: Some(7) });
+        let drained = crate::transport::route_recovery::take_fresh_proof(now_ms() + crate::transport::route_recovery::FRESH_MS + 1);
+        assert!(drained.is_none(), "the freshness sweep drops the stale proof");
+        let reply = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(reply["kind"], "route_proof_idle");
+        assert_eq!(reply["reason"], "provider_route holds present but no fresh proof", "stale evidence is never submitted");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // And a capacity-less cycle neither submits nor burns the queued proof.
+        crate::transport::route_recovery::arm_incident("kagi", Some("atlas-4"), "rev-7", "provider-route", &route_failure("kagi", "atlas-4"));
+        crate::transport::route_recovery::witness_success(&same, cfg.label.as_deref().unwrap(), "provider-route",
+            &crate::transport::RouteWitness { actual_model: Some("atlas-4-turbo".into()), output_tokens: Some(9) });
+        full.store(true, Ordering::SeqCst);
+        let reply = submit_route_proofs(&cfg).unwrap();
+        assert_eq!(reply["kind"], "route_proof_idle");
+        assert_eq!(reply["reason"], "provider_route holds present but no free capacity");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(crate::transport::route_recovery::take_fresh_proof(now_ms()).is_some(), "a proof is never consumed by a cycle that cannot submit it");
+        drop(ready); drop(snap); let _ = std::fs::remove_dir_all(root(&cfg).unwrap());
     }
 }

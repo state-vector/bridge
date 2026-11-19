@@ -772,6 +772,12 @@ struct ExecutionRuntime {
     attempt_id: String,
     control: Arc<crate::transport::RunControl>,
     maintenance: Option<Arc<LeaseMaintenance>>,
+    /// The exact route (backend|model|config_revision) this attempt's begin
+    /// selection carried (BR#17364). `Some` lets the transport outcome arm a
+    /// provider-route incident on failure and mint a recovery proof on the
+    /// next success through the same route; `None` (recovered/adoption
+    /// runtimes that never dispatched locally) observes nothing.
+    route: Option<crate::transport::ExecutionRoute>,
 }
 
 /// One clock per attempt: preparing other workers, Git publication and the
@@ -3694,7 +3700,17 @@ fn spawn_opencode(
         dlog(tid, "Hub requested a retired checkpoint restore; no writer launched");
         return;
     }
-    let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
+    let mut execution = ExecutionRuntime {
+        generation, attempt_id, control: Arc::new(control), maintenance: None,
+        // BR#17364 — the exact route facts this begin selection used; the
+        // attempt's executor identity and any recovery proof minted from this
+        // dispatch both derive from these strings.
+        route: Some(crate::transport::ExecutionRoute {
+            backend: backend_name.to_string(),
+            model: model_str.clone(),
+            config_revision: worker_config_revision(cfg),
+        }),
+    };
     execution.control.grant_lease_from(begin_requested_at);
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
     prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));

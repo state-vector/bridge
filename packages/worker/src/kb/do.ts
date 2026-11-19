@@ -6837,10 +6837,18 @@ export class KnowledgeHub {
     }
     if (command.kind === "provider_route_verified") {
       const proof = command.proof;
-      if (!req.session || !this.executionWork().isInteractive(tokenId))
-        throw new Error("gate: verified route recovery requires an authenticated full-agent session");
-      if (proof.witness.kind !== "configured_proxy_request" || !validRecoveryRequestProof(proof, "provider_route_unavailable"))
-        throw new Error("gate: expected a witnessed configured proxy request");
+      if (!req.session) throw new Error("gate: verified route recovery requires an authenticated full-agent session");
+      // BR#17364 — who may submit which witness class: an interactive
+      // full-agent session may submit either a configured-proxy capture or a
+      // configured-route observation; the routing gateway itself may submit
+      // ONLY the transport observation of its own host label (a gateway can
+      // never vouch a proxy request it did not make); any other
+      // non-interactive caller may submit nothing.
+      const selfGateway = gateway && token.label === proof.host;
+      const interactive = this.executionWork().isInteractive(tokenId);
+      if (!interactive && !selfGateway) throw new Error("gate: verified route recovery requires an authenticated full-agent session or the proof's own gateway host");
+      if (!validRecoveryRequestProof(proof, "provider_route_unavailable")) throw new Error("gate: malformed provider route recovery proof");
+      if (!interactive && proof.witness.kind !== "configured_route_observed") throw new Error("gate: a gateway host may only submit its own configured route observation");
       const key = "provider-route:" + proof.host;
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, key, proof.id);
       if (replay) {
@@ -7007,7 +7015,12 @@ export class KnowledgeHub {
     if (command.kind === "recover_provider_failure") {
       // This is an audited human/full-agent diagnosis, never a worker's own
       // retry request. It preserves the failed attempt and grants one begin.
-      if (!this.executionWork().isInteractive(tokenId) || !req.session) throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
+      // BR#17364 — the gateway's own verified-route batch is the one
+      // non-interactive exception: the outer `provider_route_verified` gate
+      // has already authenticated the host against the proof and pinned the
+      // witness class, and this inner grant is only reachable through it.
+      if (!req.session || (!this.executionWork().isInteractive(tokenId) && !(inRecoveryBatch && gateway)))
+        throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
       if (!validRecoveryRequestProof(command.proof, command.diagnosis)) throw new Error("gate: recovery proof must bind the actual model and observed request ceiling to the configured route and failure diagnosis");
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);

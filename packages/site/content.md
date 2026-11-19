@@ -1118,6 +1118,8 @@ Given a fresh configured proxy receipt, run `python3 scripts/recover-provider-ba
 
 Submitting a fresh `provider_route_verified` receipt now triggers bounded recovery in the hub. The hub selects matching held work against current spare capacity and stores the grants and receipt together. Replaying the receipt returns the original batch. The batch helper uses this path with `--apply`; a trusted verifier still supplies the route receipt.
 
+The gateway daemon now produces the route receipt itself (BR#17364). When its transport classifies a route unavailable, it arms that exact backend, model and config revision; the next successful configured-model request through the same route mints a `ProviderRecoveryProof` whose receipts quote the gateway's own dispatch log, and the gateway submits it through `provider_route_verified` while the host still reports `provider_route` holds and spare capacity, at most four grants per cycle. A gateway may submit only an observation of its own configured route — proxy captures remain an interactive full-agent path, and the manual batch helper stays available for operator-supplied receipts.
+
 The backlog shows **Ready for gateway** only for tasks eligible on a ready gateway. Tasks held by the scheduler appear separately with their current reasons, such as an exhausted retry budget or an operation that needs reconciliation. Eligibility still depends on a free slot before launch.
 
 Gateway admission holds appear in the backlog’s Blocked sections with their exit conditions. Only work with no task-level admission hold can appear under **Waiting for a gateway**. A retry hold shows the latest attempt evidence when known, without inferring task impossibility from the counter.
