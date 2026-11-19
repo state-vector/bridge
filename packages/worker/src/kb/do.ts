@@ -4846,6 +4846,12 @@ export class KnowledgeHub {
         case "ws.pair.approve": return this.json(await this.wsPairApprove(body));
         case "ws.pair.poll": return this.json(await this.wsPairPoll(body));
         // ---- admin (human plane only; worker sets x-kb-admin after session auth) ----
+        case "admin.child_link_inspect":
+        case "admin.child_link_remove":
+          if (!isAdmin || !actor.startsWith("web:") || body.token_id) {
+            return this.json({ kind: "forbidden", error: "workspace owner only" }, 403);
+          }
+          return this.adminChildLink(body, actor, op === "admin.child_link_remove");
         case "admin.mint":
         case "admin.list_tokens":
         case "admin.revoke":
@@ -9199,6 +9205,88 @@ export class KnowledgeHub {
       id, id,
     ).toArray();
     return { id, relations: out };
+  }
+
+  private adminChildLink(body: Record<string, unknown>, actor: string, remove: boolean): Response {
+    const { src, dst, relation, operation_id, reason } = body;
+    const idPattern = /^BR#[1-9][0-9]*$/;
+    if (typeof src !== "string" || typeof dst !== "string" || !idPattern.test(src) || !idPattern.test(dst) || src === dst || relation !== "child_of") {
+      return this.json({ kind: "invalid_request", error: "provide two distinct task IDs and relation child_of" }, 400);
+    }
+    const edge = { src, dst, relation };
+    const edgeRow = () => this.one(`SELECT created_ts FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`, src, dst);
+    const endpoints = () => {
+      const child = this.one(`SELECT type, updated_ts FROM artefacts WHERE id = ?`, src);
+      const parent = this.one(`SELECT type, updated_ts FROM artefacts WHERE id = ?`, dst);
+      return child?.type === "task" && parent?.type === "task"
+        ? { child_ts: Number(child.updated_ts), parent_ts: Number(parent.updated_ts) }
+        : null;
+    };
+    type Fence = { edge_ts: number; child_ts: number; parent_ts: number };
+    const missingEndpoint = { kind: "endpoint_missing", error: "both task cards must exist", edge };
+    const missingEdge = { kind: "edge_missing", error: "no exact child_of edge exists", edge };
+    if (!remove) {
+      const versions = endpoints();
+      if (!versions) return this.json(missingEndpoint, 404);
+      const storedEdge = edgeRow();
+      return this.json(storedEdge
+        ? { kind: "present", edge, fence: { ...versions, edge_ts: Number(storedEdge.created_ts) } satisfies Fence }
+        : missingEdge, storedEdge ? 200 : 404);
+    }
+    const expected = body.fence as Partial<Fence> | undefined;
+    if (!expected || !Number.isSafeInteger(expected.edge_ts) || !Number.isSafeInteger(expected.child_ts) || !Number.isSafeInteger(expected.parent_ts)
+      || typeof operation_id !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(operation_id)
+      || typeof reason !== "string" || reason.trim().length === 0 || reason.length > 500) {
+      return this.json({ kind: "invalid_request", error: "inspect the exact edge first and provide an operation ID and audit reason" }, 400);
+    }
+
+    const action = "unlink_child_of";
+    const changed = { kind: "edge_changed", error: "the edge or a task changed since inspection", edge };
+    const result = this.state.storage.transactionSync(() => {
+      const versions = endpoints();
+      if (!versions) return { body: missingEndpoint, status: 404 };
+      const storedEdge = edgeRow();
+      const prior = this.one(`SELECT seq, data FROM ledger WHERE kind = 'mutation' AND action = ? AND artefact_id = ?
+        AND actor = ? AND json_extract(data, '$.operation_id') = ? AND json_extract(data, '$.direction') = 'out'`,
+      action, src, actor, operation_id);
+      if (prior) {
+        const audit = JSON.parse(String(prior.data));
+        if (storedEdge || audit.edge.dst !== dst || audit.fence.edge_ts !== expected.edge_ts
+          || audit.fence.child_ts !== expected.child_ts || audit.fence.parent_ts !== expected.parent_ts
+          || audit.reason !== reason.trim()) {
+          return { body: changed, status: 409 };
+        }
+        return { body: { kind: "already_removed", edge, source_audit_seq: Number(prior.seq), target_audit_seq: audit.target_audit_seq }, status: 200 };
+      }
+      if (!storedEdge) return { body: missingEdge, status: 404 };
+      const fence = { ...versions, edge_ts: Number(storedEdge.created_ts) };
+      if (fence.edge_ts !== expected.edge_ts || fence.child_ts !== expected.child_ts || fence.parent_ts !== expected.parent_ts) {
+        return { body: changed, status: 409 };
+      }
+      this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ? AND created_ts = ?`,
+        src, dst, fence.edge_ts);
+      if (edgeRow()) throw new Error("exact child_of edge is still present after removal");
+      const revision = Math.max(Date.now(), fence.child_ts + 1, fence.parent_ts + 1);
+      this.state.storage.sql.exec(`UPDATE artefacts SET updated_ts = ? WHERE id IN (?, ?)`, revision, src, dst);
+      const summary = `Removed child_of ${src} → ${dst}`;
+      const detail = { edge, fence, revision, operation_id, reason: reason.trim() };
+      const inbound = { ...detail, direction: "in" };
+      const target = this.ledgerWrite("mutation", actor, action, dst, summary, inbound);
+      const outbound = { ...detail, direction: "out", target_audit_seq: target.seq };
+      const source = this.ledgerWrite("mutation", actor, action, src, summary, outbound);
+      return {
+        body: { kind: "removed", edge, source_audit_seq: source.seq, target_audit_seq: target.seq }, status: 200,
+        events: [
+          { ...target, actor, op: action, artefact_id: dst, detail: inbound },
+          { ...source, actor, op: action, artefact_id: src, detail: outbound },
+        ],
+      };
+    });
+    if (result.events) {
+      this.scoreCache = null;
+      for (const event of result.events) this.broadcastEvent(event);
+    }
+    return this.json(result.body, result.status);
   }
 
   /** Done-transition events in range: true transition rows from the ledger

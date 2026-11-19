@@ -373,6 +373,8 @@ export default {
     // Knowledge admin API + page: human plane, forwarded to the KB DO.
     if (url.pathname === "/kb") {
       if (request.headers.get("Accept")?.includes("text/html")) {
+        const auth = await checkAuth(request, env);
+        if (auth instanceof Response) return auth;
         return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
       }
       return new Response("use the /kb page", { status: 404 });
@@ -383,6 +385,38 @@ export default {
       const op = url.pathname.slice("/api/kb/admin/".length);
       const kbId = env.KB.idFromName(doWs(auth.ws));
       const kbHub = env.KB.get(kbId);
+      if (op === "child-link") {
+        if (request.method !== "GET" && request.method !== "POST") {
+          return json({ kind: "invalid_request", error: "GET or POST only" }, 405);
+        }
+        if (!auth.login || (request.method === "POST" && request.headers.get("origin") !== url.origin)) {
+          return json({ kind: "forbidden", error: "a same-origin workspace owner session is required" }, 403);
+        }
+        const login = auth.login.toLowerCase();
+        let membership;
+        try {
+          membership = await wsCall(env, "ws.members", { ws: auth.ws, login });
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "not a member of this workspace") {
+            return json({ kind: "read_failed", error: "could not verify workspace ownership" }, 503);
+          }
+        }
+        if (membership?.owner !== login) {
+          return json({ kind: "forbidden", error: "only the workspace owner can remove a child link" }, 403);
+        }
+        const args = request.method === "GET"
+          ? { src: url.searchParams.get("src"), dst: url.searchParams.get("dst"), relation: "child_of" }
+          : await request.json().catch(() => null);
+        if (!args || typeof args !== "object" || Array.isArray(args)) {
+          return json({ kind: "invalid_request", error: "expected a JSON object" }, 400);
+        }
+        const operation = request.method === "GET" ? "admin.child_link_inspect" : "admin.child_link_remove";
+        return kbGuard(operation, kbHub.fetch(`https://kb/${operation}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-kb-admin": "1" },
+          body: JSON.stringify({ ...args, actor: `web:${login}` }),
+        }));
+      }
       const kbUrl =
         op === "tokens" && request.method === "GET" ? "https://kb/admin.list_tokens"
         : op === "tokens" ? "https://kb/admin.mint"

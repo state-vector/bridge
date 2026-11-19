@@ -40,6 +40,18 @@ export const ADMIN_HTML = `<!doctype html>
 <h1>Bridge — work orchestration</h1>
 
 <div class="card">
+  <h2>Remove a parent link</h2>
+  <div class="row">
+    <div><label for="link-child">Child task</label><input id="link-child" placeholder="BR#123"></div>
+    <div><label for="link-parent">Parent task</label><input id="link-parent" placeholder="BR#456"></div>
+  </div>
+  <label for="link-reason">Audit reason</label><input id="link-reason" maxlength="500">
+  <p><button onclick="inspectChildLink()" id="link-inspect">Check link</button>
+  <button onclick="removeChildLink()" id="link-remove" class="danger" disabled>Remove child_of link</button></p>
+  <p id="link-result" role="status"></p>
+</div>
+
+<div class="card">
   <h2>Auth tokens</h2>
   <p class="muted">One auth token per agent client. Sessions self-name uniquely. Secret is shown once — store it in the agent's config.</p>
   <div class="row">
@@ -93,6 +105,65 @@ const ROLE_DEFAULTS = ${ROLE_DEFAULTS_JSON};
 const j = async (u, o) => { const r = await fetch(u, { credentials: "include", headers: { "content-type": "application/json" }, ...o }); const b = await r.json().catch(() => ({})); if (!r.ok) throw new Error(b.error || r.status); return b; };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ago = (ts) => ts ? Math.round((Date.now() - ts) / 60000) + "m ago" : "never";
+
+const linkInput = (id) => document.getElementById("link-" + id);
+let checkedLink;
+function showLinkResult(message) { linkInput("result").textContent = message; }
+
+async function inspectChildLink() {
+  const src = linkInput("child").value.trim();
+  const dst = linkInput("parent").value.trim();
+  checkedLink = undefined;
+  linkInput("inspect").disabled = true;
+  linkInput("remove").disabled = true;
+  try {
+    const result = await j("/api/kb/admin/child-link?" + new URLSearchParams({ src, dst }));
+    if (result.kind !== "present") throw new Error("The hub did not confirm this edge.");
+    checkedLink = { ...result.edge, fence: result.fence, operation_id: crypto.randomUUID() };
+    linkInput("remove").disabled = false;
+    showLinkResult("Found child_of " + src + " → " + dst + ".");
+  } catch (error) {
+    showLinkResult(error.message);
+  } finally {
+    linkInput("inspect").disabled = false;
+  }
+}
+
+async function removeChildLink() {
+  const request = checkedLink;
+  if (!request || request.src !== linkInput("child").value.trim() || request.dst !== linkInput("parent").value.trim()) {
+    showLinkResult("Check the current task IDs before removing the link.");
+    return;
+  }
+  if (request.reason === undefined) request.reason = linkInput("reason").value.trim();
+  if (!request.reason) {
+    delete request.reason;
+    showLinkResult("Enter an audit reason.");
+    return;
+  }
+  linkInput("inspect").disabled = true;
+  linkInput("remove").disabled = true;
+  try {
+    const receipt = await j("/api/kb/admin/child-link", { method: "POST", body: JSON.stringify(request) });
+    if (!["removed", "already_removed"].includes(receipt.kind) || !receipt.source_audit_seq || !receipt.target_audit_seq) {
+      throw new Error("The hub did not return an audit receipt.");
+    }
+    const readTask = (id) => j("/api/kb/artefact?" + new URLSearchParams({ id }));
+    const [child, parent] = await Promise.all([readTask(request.src), readTask(request.dst)]);
+    const present = (card, other, dir) => card.relations.some((edge) =>
+      edge.artefact_id === other && edge.dir === dir && edge.relation === "child_of");
+    if (child.id !== request.src || parent.id !== request.dst || present(child, request.dst, "out") || present(parent, request.src, "in")) {
+      throw new Error("The audit receipt could not be confirmed by both task reads.");
+    }
+    checkedLink = undefined;
+    showLinkResult("Link removal verified on both cards. Audit entries " + receipt.source_audit_seq + " and " + receipt.target_audit_seq + ".");
+  } catch (error) {
+    showLinkResult(error.message);
+    linkInput("remove").disabled = false;
+  } finally {
+    linkInput("inspect").disabled = false;
+  }
+}
 
 async function mint() {
   try {

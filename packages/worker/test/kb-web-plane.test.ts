@@ -65,6 +65,89 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
     body: init?.body,
   });
 
+describe("workspace owner removes one audited parent link", () => {
+  it("fences consent, preserves dependency and wait, and verifies a lost-response retry", async () => {
+    const ownerCookie = sessionCookie("rayh");
+    const call = (path: string, body?: object, actor = ownerCookie, origin = "https://main") =>
+      mf.dispatchFetch(`https://main${path}`, {
+        method: body ? "POST" : "GET",
+        headers: { cookie: actor, origin, "content-type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    expect((await call("/api/workspaces")).status).toBe(200);
+    const newTask = async (title: string) => {
+      const response = await call("/api/kb/create", { type: "task", title });
+      expect(response.status).toBe(200);
+      return String((await response.json() as { id: string }).id);
+    };
+    const src = await newTask("Independent confirmation");
+    const dst = await newTask("Verified implementation");
+    const other = await newTask("Unrelated parent");
+    const edge = { src, dst, relation: "child_of" };
+    for (const relation of [edge, { ...edge, relation: "depends_on" }, { ...edge, dst: other }]) {
+      expect((await call("/api/kb/link", relation)).status).toBe(200);
+    }
+    const await_event = { event: "time", until_ts: Date.now() + 3_600_000 };
+    expect((await call("/api/kb/transition", { id: src, to: "blocked", note: "Wait for independent receipt", await_event })).status).toBe(200);
+    const getTask = async (id: string) => await (await call(`/api/kb/artefact?id=${encodeURIComponent(id)}`)).json() as {
+      status: string;
+      updated_ts: number;
+      meta: { blocked: { await_event: object } };
+      relations: { artefact_id: string; relation: string; dir: string }[];
+    };
+    const before = await getTask(src);
+    expect(before.status).toBe("blocked");
+    expect(before.meta.blocked.await_event).toEqual(await_event);
+
+    const route = "/api/kb/admin/child-link";
+    const inspection = `${route}?${new URLSearchParams({ src, dst })}`;
+    const inspected = await call(inspection);
+    expect(inspected.status).toBe(200);
+    const found = await inspected.json() as { kind: string; edge: object; fence: { edge_ts: number; child_ts: number; parent_ts: number } };
+    expect(found).toMatchObject({ kind: "present", edge });
+    const request = { ...edge, fence: found.fence, operation_id: "33c98616-671a-4558-ad50-9f28dc3709de", reason: "Restore independent confirmation without changing its wait" };
+    expect((await call(route, request, sessionCookie("someone-else"))).status).toBe(403);
+    expect((await call(route, request, ownerCookie, "https://other.example")).status).toBe(403);
+    expect((await mf.dispatchFetch(`https://main${route}`, { method: "POST", headers: { authorization: "Bearer agent-token" } })).status).toBe(401);
+    expect((await call(route, { ...request, relation: "depends_on" })).status).toBe(400);
+    expect((await call(route, { ...request, fence: { ...found.fence, edge_ts: found.fence.edge_ts + 1 } })).status).toBe(409);
+    expect((await call(inspection)).status).toBe(200);
+
+    const removed = await call(route, request);
+    expect(removed.status).toBe(200);
+    const receipt = await removed.json() as { kind: string; source_audit_seq: number; target_audit_seq: number };
+    expect(receipt).toMatchObject({ kind: "removed", edge });
+    expect(receipt.source_audit_seq).toBeGreaterThan(receipt.target_audit_seq);
+    const retry = await call(route, request);
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ ...receipt, kind: "already_removed" });
+    expect((await call(inspection)).status).toBe(404);
+    expect((await call(route, { ...request, operation_id: "22c98616-671a-4558-ad50-9f28dc3709de" })).status).toBe(404);
+
+    const child = await getTask(src);
+    const parent = await getTask(dst);
+    expect(child.status).toBe(before.status);
+    expect(child.meta.blocked.await_event).toEqual(await_event);
+    expect(child.updated_ts).toBeGreaterThan(before.updated_ts);
+    expect(child.relations).not.toContainEqual(expect.objectContaining({ artefact_id: dst, relation: "child_of", dir: "out" }));
+    expect(parent.relations).not.toContainEqual(expect.objectContaining({ artefact_id: src, relation: "child_of", dir: "in" }));
+    expect(child.relations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ artefact_id: dst, relation: "depends_on", dir: "out" }),
+      expect.objectContaining({ artefact_id: other, relation: "child_of", dir: "out" }),
+    ]));
+    expect(parent.relations).toContainEqual(expect.objectContaining({ artefact_id: src, relation: "depends_on", dir: "in" }));
+    for (const id of [src, dst]) {
+      const history = await (await call(`/api/kb/history?id=${encodeURIComponent(id)}`)).json() as { versions: { action: string; actor: string }[] };
+      expect(history.versions.filter(event => event.action === "unlink_child_of")).toEqual([
+        expect.objectContaining({ actor: "web:rayh" }),
+      ]);
+    }
+    expect((await call("/api/kb/link", edge)).status).toBe(200);
+    expect((await call(route, request)).status).toBe(409);
+    expect((await call(inspection)).status).toBe(200);
+  });
+});
+
 describe("POST /api/kb/progress — the human comment plane (BR#3462 leg 1)", () => {
   it("reports stateful deployment provenance separately from the web edge without requiring credentials", async () => {
     const response = await mf.dispatchFetch("https://main/__version?scope=stateful");
