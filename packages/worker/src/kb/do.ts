@@ -7195,6 +7195,10 @@ export class KnowledgeHub {
     }
     let workerTokenId = String(binding?.worker_token_id ?? "");
     let begunExecutor: ExecutorCapabilities | null = null;
+    // BR#17365 — hub-attested void premise for a begin under a falsified
+    // provider_route hold (computed in the begin leg below, consumed by the
+    // reducer at the bottom of this handler).
+    let premiseVoid = false;
     if (command.kind === "begin") {
       const handoff = this.recoveryCapacity().forVictim(req.id);
       if (handoff) throw new Error(`gate: priority recovery ${handoff.recovery_id} owns the reclaimed slot; return to the scheduler [rule: recovery-priority]`);
@@ -7207,7 +7211,14 @@ export class KnowledgeHub {
       const selection = command.selection;
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
-      if (executionNeedsRecoveryPermit(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: retry budget or provider route requires a current one-use recovery permit for the exact selected route");
+      // BR#17365 — a provider_route hold whose premise the hub's own records
+      // falsify (route gone, or a completed execution on the exact route after
+      // the terminal failure) cannot demand the recovery permit it guards:
+      // admission goes FRESH at the selected route. Budget holds keep their
+      // permit; the reducer enforces the same carve-out.
+      premiseVoid = executionAdmissionHold(current, String(meta.work_revision ?? "legacy")) === "provider_route" && !!current.terminal
+        && (this.routeGoneFor(current, inventory) || this.routeRecoveredFor(String(actor), inventory));
+      if (executionNeedsRecoveryPermit(current,String(meta.work_revision??"legacy")) && !premiseVoid && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: retry budget or provider route requires a current one-use recovery permit for the exact selected route");
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, inventory, now);
       if (readiness.kind === "cooldown" || readiness.kind === "paused" || readiness.kind === "updating" || readiness.kind === "draining") {
@@ -7242,7 +7253,7 @@ export class KnowledgeHub {
         .map(row=>parseResult({result:row.result})).filter((value):value is ExecutionState=>value!==null);
       current.failure_charged_generation=legacyTimeoutChargeGeneration(current,begun,polls);
     }
-    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
+    const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"), premiseVoid);
     const currentClaim = row.status === "in_progress" && meta.session === session;
     const finalizeCurrentClaim = command.kind === "finalize" && currentClaim;
     // Finalize can leave the claim in place while an external effect is unknown.

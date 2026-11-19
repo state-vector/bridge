@@ -474,6 +474,11 @@ describe("eligibility-first scheduling on real SQLite", () => {
     // fresh dispatch at the current route — NO recovery selection is stamped
     // (there is no recovery to prove; budget guards still apply)
     expect(resumed.task?.meta.execution_recovery_selection).toBeUndefined();
+    // BR#17365 — and the fresh begin is admitted: the void premise dissolves
+    // the one-use permit demand the hold armed (claim-side leg, both layers)
+    const freshBegin = await g.cmd({ kind: "begin", attempt_id: "orphan-fresh", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, "orphan-fresh-begin", id, resumed.session);
+    expect(freshBegin.error).toBeUndefined();
   });
 
   it("decays a provider_route hold when a completed execution falsifies the route-failure premise (BR#17365)", async () => {
@@ -516,6 +521,11 @@ describe("eligibility-first scheduling on real SQLite", () => {
     if (claim2.kind !== "reserved") throw new Error(JSON.stringify(claim2));
     expect(claim2.task_id).toBe(held); // held card must decay BEFORE the newer task reserves
     expect(claim2.task?.meta.execution_recovery_selection).toBeUndefined(); // fresh dispatch, no recovery
+    // BR#17365 — the fresh begin is ADMITTED: the decayed hold cannot demand
+    // the one-use recovery permit its falsified premise can never satisfy
+    // (hub begin-gate check + reduceExecution premiseVoid, both layers)
+    expect((await g.cmd({ kind: "begin", attempt_id: "health-fresh", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, "health-fresh-begin", held, claim2.session)).error).toBeUndefined();
   });
 
   it("a route failure AFTER a health stamp re-arms the provider_route hold (ordering guard)", async () => {

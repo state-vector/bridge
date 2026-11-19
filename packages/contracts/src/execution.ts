@@ -381,7 +381,16 @@ export const ExecutionRequestSchema = z.looseObject({
 /** Pure reducer: caller authenticates host/session; one SQLite transaction commits
  * this state AND the command receipt. An expired writer is NEVER automatically
  * declared quiescent, even after host death. */
-export function reduceExecution(previous: ExecutionState, command: ExecutionCommand, host: string, session: string, now: number, taskRevision = "legacy"): ExecutionState {
+export function reduceExecution(previous: ExecutionState, command: ExecutionCommand, host: string, session: string, now: number, taskRevision = "legacy",
+  /** BR#17365 — hub-attested void premise: the provider_route hold's assertion
+   *  ("this exact route cannot serve requests") is falsified by the hub's own
+   *  records — the route exists on no live capability, or the hub processed a
+   *  COMPLETED execution on that exact host+backend+model+config_revision
+   *  after the hold's terminal failure. The one-use recovery permit the hold
+   *  demands guards a recovery that can never be needed, so a FRESH begin at
+   *  the current route is admitted without one. Only the provider_route leg is
+   *  carved; retry_budget and every other hold still demand its permit. */
+  premiseVoid = false): ExecutionState {
   const s = structuredClone(previous);
   const a = s.attempt;
   const requireAttempt = (allowExpired = false): ExecutionAttempt => {
@@ -406,9 +415,11 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       return s;
     }
     case "begin": {
-      const needsRecoveryPermit = executionNeedsRecoveryPermit(s, taskRevision);
+      const admissionHold = executionAdmissionHold(s, taskRevision);
+      const needsRecoveryPermit = admissionHold === "provider_route" || admissionHold === "retry_budget";
+      const permitCovered = needsRecoveryPermit && !!(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now));
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
-      if (needsRecoveryPermit && !(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now))) throw new Error("gate: retry budget or provider route requires a current recovery permit");
+      if (needsRecoveryPermit && !permitCovered && !(premiseVoid && admissionHold === "provider_route")) throw new Error("gate: retry budget or provider route requires a current recovery permit");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
       if (a) {
