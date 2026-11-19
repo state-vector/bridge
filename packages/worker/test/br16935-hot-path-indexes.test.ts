@@ -188,4 +188,23 @@ describe("BR#16935 functional sanity (behaviour unchanged)", () => {
     const kids = (rel.body.relations as any[]).filter((r: any) => r.relation === "child_of" && r.dir === "in");
     expect(kids.map((k: any) => k.artefact_id)).toContain(child);
   });
+
+  it("the train panel read is served from the panel cache between mutations, and any mutation evicts it (BR#16935)", async () => {
+    const trainGet = async () => {
+      const response = await stub.fetch(`https://kb/train`, { method: "GET", headers: { "x-kb-admin": "1" } });
+      return { status: response.status, body: await response.json() as any };
+    };
+    const t1 = await trainGet();
+    expect(t1.status).toBe(200);
+    // same quiet window → cached payload object
+    const t2 = await trainGet();
+    expect(t2.status).toBe(200);
+    expect(t2.body).toEqual(t1.body);
+    // a mutation (POST boundary) must evict: a fresh create changes orient-visible state,
+    // and the next train read recomputes rather than replaying the cached body
+    await call("create", { type: "progress", title: "cache-buster mutation", actor: "seed" });
+    const t3 = await trainGet();
+    expect(t3.status).toBe(200);
+    expect(t3.body.hub_commit).toBe(t1.body.hub_commit);
+  });
 });

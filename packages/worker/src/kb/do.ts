@@ -487,6 +487,11 @@ export const TOKEN_REPAIR_WINDOW_MS = 60 * 60 * 1000;
  *  Empty owners are unclaimed, never identities (legacy token rows may have
  *  an empty principal, including revoked registrations). Match displayOwner's
  *  empty-owner guard. Requires the outer artefacts table aliased `a`. */
+/** BR#16935: how long a polled panel read (train status, throughput) may be
+ *  served from cache between mutations. ANY mutation clears the cache, so
+ *  this is purely the quiet-period TTL. */
+const PANEL_TTL_MS = 15_000;
+
 const OWNER_DISPLAY_SQL = `COALESCE(
   (SELECT t.label FROM auth_tokens t WHERE a.owner <> '' AND t.principal = a.owner
    ORDER BY (t.revoked_ts IS NULL) DESC, COALESCE(t.last_seen_ts, t.created_ts) DESC LIMIT 1),
@@ -513,6 +518,14 @@ export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
   private readonly schemaInitialization = new SchemaInitialization();
   private readonly requestDiagnostics = new RequestDiagnostics();
+  /** BR#16935: panel-read cache (train status, throughput metrics) — the
+   *  polled /api/kb/train and /api/kb/metrics/throughput reads cost ~2s DO
+   *  CPU each at production data size, and at UI + gateway poll cadence the
+   *  two together exceeded the DO's CPU budget and reset-looped the object
+   *  ("Durable Object exceeded its CPU time limit"). Serve a cached payload
+   *  for PANEL_TTL_MS; ANY mutation (POST boundary / alarm phase) clears it,
+   *  so writers and the next poll always see fresh state. */
+  private readonly panelReadCache = new Map<string, { at: number; body: any }>();
 
   /** ensureSchema runs once per isolate, not per request — its migration
    *  queries are full-table scans, and the free-tier DO row-read quota
@@ -730,6 +743,9 @@ export class KnowledgeHub {
    *  chain: a faulting tick is logged (alarm_error audit) and retried next
    *  tick at the 60s cadence. */
   async alarm() {
+    // BR#16935: alarm-phase mutations (sweep stamps, transitions) invalidate
+    // the panel-read caches just like POSTs do.
+    this.panelReadCache.clear();
     const trace = this.requestDiagnostics.begin("watchdog.alarm");
     trace.stage("alarm");
     try { await this.runAlarm(trace); }
@@ -4483,6 +4499,10 @@ export class KnowledgeHub {
   }
 
   private async doFetch(request: Request, trace: RequestTrace): Promise<Response> {
+    // BR#16935: any mutation invalidates the panel-read caches below — the
+    // coarse HTTP-boundary bump (all mutations are POSTs to this DO) is the
+    // one fence no write path can slip past.
+    if (request.method === "POST") this.panelReadCache.clear();
     try {
       await this.ensureSchema();
     } catch (e) {
@@ -9210,11 +9230,14 @@ export class KnowledgeHub {
   private async metricsThroughput(sp: URLSearchParams) {
     const parsed = parseThroughputParams(sp.get("bucket"), sp.get("range"));
     if ("error" in parsed) throw new Error(parsed.error);
+    const cacheKey = `mt:${parsed.bucket}:${parsed.rangeDays}`;
+    const cached = this.panelReadCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < PANEL_TTL_MS) return cached.body;
     const now = Date.now();
     const from = now - parsed.rangeDays * 86_400_000;
     const { events, fallback } = this.doneEventsInRange(from);
     const buckets = aggregateThroughput(events, fallback, { bucket: parsed.bucket, rangeDays: parsed.rangeDays, now });
-    return {
+    const body = {
       bucket: parsed.bucket,
       range_days: parsed.rangeDays,
       from_ts: buckets[0]?.t ?? from,
@@ -9222,6 +9245,8 @@ export class KnowledgeHub {
       total: buckets.reduce((n, b) => n + b.n, 0),
       buckets,
     };
+    this.panelReadCache.set(cacheKey, { at: now, body });
+    return body;
   }
 
   /** Reports view (BR#5126): tasks-done + PR merge throughput on ONE shared
@@ -18742,6 +18767,8 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
 
   private async trainStatus(body: any): Promise<any> {
     const repoFilter = String(body?.repo ?? "").trim();
+    const cached = this.panelReadCache.get(`train:${repoFilter}`);
+    if (cached && Date.now() - cached.at < PANEL_TTL_MS) return cached.body;
     const now0 = Date.now();
     const ttlMs = clampAwaitingTtlHours(this.settingValue("train.awaiting_ttl_h", ""), this.settingValue("train.review_ask_ttl_h", "24")) * 3_600_000;
     const lanes = this.state.storage.sql.exec(
@@ -19575,7 +19602,9 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       });
     }
     const hubBuild = (await import("../__version.json")) as { commit?: string };
-    return { hub_commit: hubBuild.commit ?? "unknown", lanes: out };
+    const payload = { hub_commit: hubBuild.commit ?? "unknown", lanes: out };
+    this.panelReadCache.set(`train:${repoFilter}`, { at: Date.now(), body: payload });
+    return payload;
   }
 
   /** train.history — the train_events ledger (provenance serving). */
