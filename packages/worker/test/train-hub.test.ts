@@ -4848,6 +4848,179 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect((await laneSnap(repo)).base_red_resolution.ask).toBeNull();
   });
 
+  it("BR#17154: accepted cures stay actionable when the same red repeats at a newer main SHA; a different cause never inherits", async () => {
+    const repo = "state-vector/episode-authority-17154", gateway = "gw-17154";
+    const sha1 = "1".repeat(40), sha2 = "2".repeat(40), sha3 = "3".repeat(40);
+    const headA = "a".repeat(40), headB = "b".repeat(40), headC = "c".repeat(40);
+    const smokeCheck = "Post-Deploy Smoke", healthCheck = "Lodestar Operational Health", dnsCheck = "DNS Chain";
+    const deployWf = "deploy / Deploy to dev";
+    await acquire(repo, gateway, { required_workflows: [deployWf] });
+    // Two DISTINCT cause repairs, independently accepted at exact heads, both open.
+    const smoke = await queueViaAccept({ repo, pr: 3525, head: headA, title: "ROOT-FIX: replace the retained smoke publication" });
+    const health = await queueViaAccept({ repo, pr: 3543, head: headB, title: "ROOT-FIX: bound the Phase R supersede spill" });
+    // An accepted repair for a DIFFERENT cause no current episode ever names…
+    const unrelated = await queueViaAccept({ repo, pr: 3544, head: headC, title: "ROOT-FIX: unrelated cortex quality cure" });
+    await kbJson("/update", { id: unrelated, tags: ["root_blocker", "main-red"], meta: {
+      root_fix: { repo, base: "main", head_sha: sha1, failing: ["Cortex Quality Smoke"] } } });
+    // …and an ordinary queued PR with no root-fix shape at all.
+    const bystander = await queueViaAccept({ repo, pr: 3545, head: "d".repeat(40) });
+
+    // The incident shape: ONE decisive deploy run per tip whose failed JOBS
+    // are the red checks (Smoke + Operational Health at sha1; + DNS at sha2).
+    const observeRed = async (tip: string, run: number, failures: { name: string; repair?: string }[]) => {
+      const result = await kbJson("/train.observe_deploy", { repo, actor: "observer", observation: {
+        tip_sha: tip, observed_at: Date.now(),
+        runs: [{ id: run, name: deployWf, head_sha: tip, run_attempt: 1,
+          status: "completed" as const, conclusion: "failure" as const, html_url: `https://github.com/${repo}/actions/runs/${run}` }],
+        failures: failures.map((f, i) => ({ run_id: run, name: f.name,
+          url: `https://github.com/${repo}/actions/runs/${run}/job/${i + 1}`,
+          ...(f.repair ? { repair_task_id: f.repair } : {}) })) } });
+      expect(result.status, JSON.stringify(result.body)).toBe(200);
+    };
+    const entries17154 = (bypass?: object) => [
+      { id: smoke, pr: 3525, cls: "blocked", ...(bypass ? { bypass } : {}) },
+      { id: health, pr: 3543, cls: "blocked" },
+      { id: unrelated, pr: 3544, cls: "blocked" },
+      { id: bystander, pr: 3545, cls: "blocked" },
+    ];
+    const facts17154 = (tip: string, entries: object[], reds: string[], extra: object = {}) => kbJson("/train.queue_facts", { repo, actor: gateway,
+      entries, base_state: { verdict: "red", tip_sha: tip, red: reds.map((name) => ({ name, url: `https://github.com/${repo}/actions/runs/1` })), unsettled: [], ...extra } });
+
+    // Episode 1 at sha1: both causes bind their repairs (root_fix bound at sha1).
+    await observeRed(sha1, 100, [{ name: smokeCheck, repair: smoke }, { name: healthCheck, repair: health }]);    await facts17154(sha1, entries17154(), [smokeCheck, healthCheck]);
+    let snap = await laneSnap(repo);
+    // eslint-disable-next-line no-console
+    console.log("DBG17154 sha1", JSON.stringify({
+      smokeTask: (await kbJson("/get", { id: smoke })).body,
+      lane: (await kbJson("/get", { id: (snap.line ?? {}).id ?? "" })).body?.meta?.lane,
+      queue: snap.queue,
+    }, null, 1).slice(0, 6000));
+    expect(snap.queue.find((q: any) => q.id === smoke).root_fix).toBe(true);
+    expect(snap.queue.find((q: any) => q.id === health).root_fix).toBe(true);
+    // Baseline: the exact binding still yields the actionable cure + fast lane.
+    await facts17154(sha1, entries17154({ kind: "bypass_required", base_sha: sha1, head_sha: headA }), [smokeCheck, healthCheck]);
+    snap = await laneSnap(repo);
+    expect(snap.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(snap.base_red_resolution.fix_card.id).toBe(smoke);
+    expect(snap.base_red_resolution.fix_card.pr).toBe(3525);
+
+    // THE RECURRENCE: main advances to sha2 and the SAME causes fail again,
+    // plus a genuinely NEW cause (dns) with no accepted repair anywhere.
+    await facts17154(sha2, entries17154(), [smokeCheck, healthCheck, dnsCheck]);
+    await observeRed(sha2, 200, [{ name: smokeCheck, repair: smoke }, { name: healthCheck, repair: health }, { name: dnsCheck }]);
+    const smokeTask = (await kbJson("/get", { id: smoke })).body;
+    expect(smokeTask.meta.root_fix.head_sha).toBe(sha1); // BR#9233: the historical binding is preserved
+    expect(smokeTask.meta.recovery_links).toEqual(expect.arrayContaining([
+      expect.objectContaining({ repo, head_sha: sha2, cause: { kind: "check_failure", check: smokeCheck } }),
+    ]));
+    snap = await laneSnap(repo);
+    // The incident regression: both accepted cures used to demote to ordinary
+    // held entries once the bound SHA no longer equalled the base. The open
+    // current episode is now the authority — they stay tier 0 and actionable.
+    expect(snap.queue.find((q: any) => q.id === smoke).root_fix).toBe(true);
+    expect(snap.queue.find((q: any) => q.id === health).root_fix).toBe(true);
+    expect(snap.queue.find((q: any) => q.id === unrelated).root_fix).toBe(false);
+    expect(snap.queue.find((q: any) => q.id === bystander).root_fix).not.toBe(true);
+    expect([smoke, health]).toContain(snap.queue[0].id);
+    // A changed PR head never becomes eligible (the accepted head is the only one).
+    await facts17154(sha2, entries17154({ kind: "bypass_required", base_sha: sha2, head_sha: "e".repeat(40) }),
+      [smokeCheck, healthCheck, dnsCheck]);
+    expect((await laneSnap(repo)).base_red_resolution.phase).not.toBe("cure_pr_awaiting_force_merge");
+    // The exact accepted head at the CURRENT base is the actionable cure.
+    await facts17154(sha2, entries17154({ kind: "bypass_required", base_sha: sha2, head_sha: headA }),
+      [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    expect(snap.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(snap.base_red_resolution.fix_card.id).toBe(smoke);
+    expect(snap.base_red_resolution.fix_card.pr).toBe(3525);
+    const askA = snap.base_red_resolution.ask.id;
+    expect((await kbJson("/get", { id: askA })).body.body_md).toContain(`--match-head-commit ${headA}`);
+
+    // A different/new cause does not inherit: even holding bypass evidence at
+    // the current base, the non-episode card is never the cure — the live
+    // episode's own repair is.
+    await facts17154(sha2, [
+      { id: smoke, pr: 3525, cls: "blocked" },
+      { id: health, pr: 3543, cls: "blocked" },
+      { id: unrelated, pr: 3544, cls: "blocked", bypass: { kind: "bypass_required", base_sha: sha2, head_sha: headC } },
+      { id: bystander, pr: 3545, cls: "blocked" },
+    ], [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    expect(snap.base_red_resolution.fix_card?.id ?? null).not.toBe(unrelated);
+    expect(snap.base_red_resolution.fix_card?.id ?? null).not.toBe(bystander);
+
+    // Re-arm cure A's fast lane (the negative stamps above revoked the
+    // pending ask, exactly as BR#8468 requires) and take the decisive path.
+    await facts17154(sha2, entries17154({ kind: "bypass_required", base_sha: sha2, head_sha: headA }),
+      [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    expect(snap.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
+    const askFinal = snap.base_red_resolution.ask.id;
+
+    // Decisive post-deploy acceptance, cure A then cure B: owner merges via
+    // the fast-lane ask, the train records each merge (awaiting-ci), and a
+    // green decisive deployment recovers BOTH cause episodes.
+    expect((await kbJson("/ask.answer", { id: askFinal, answer: "DONE", actor: "web:ray" })).status).toBe(200);
+    expect((await laneSnap(repo)).bypass_merge).toMatchObject({ kind: "owner_merge", base_sha: sha2, head_sha: headA, pr: 3525 });
+    expect((await kbJson("/train.event", { repo, actor: gateway, kind: "merged", pr: 3525,
+      task_id: smoke, head_sha: headA, merge_sha: "f".repeat(40) })).status).toBe(200);
+    await facts17154(sha2, [
+      { id: health, pr: 3543, cls: "blocked" },
+      { id: unrelated, pr: 3544, cls: "blocked" },
+      { id: bystander, pr: 3545, cls: "blocked" },
+    ], [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    // Cure A landed: its merged leg can never re-own the current episode
+    // (BR#8468) — the REMAINING open episode's accepted repair owns the
+    // resolution while its cause is still red, never the undispatched
+    // generated card and never an unrelated PR.
+    expect(snap.base_red_resolution.fix_card.id).toBe(health);
+    expect(snap.base_red_resolution.phase).toBe("fix_in_progress");
+    // Cure B stays independently actionable at the same newer SHA.
+    await facts17154(sha2, [
+      { id: health, pr: 3543, cls: "blocked", bypass: { kind: "bypass_required", base_sha: sha2, head_sha: headB } },
+      { id: unrelated, pr: 3544, cls: "blocked" },
+      { id: bystander, pr: 3545, cls: "blocked" },
+    ], [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    expect(snap.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
+    expect(snap.base_red_resolution.fix_card.id).toBe(health);
+    expect(snap.base_red_resolution.fix_card.pr).toBe(3543);
+    const askB = snap.base_red_resolution.ask.id;
+    expect((await kbJson("/ask.answer", { id: askB, answer: "DONE", actor: "web:ray" })).status).toBe(200);
+    expect((await kbJson("/train.event", { repo, actor: gateway, kind: "merged", pr: 3543,
+      task_id: health, head_sha: headB, merge_sha: "9".repeat(40) })).status).toBe(200);
+    await facts17154(sha2, [
+      { id: unrelated, pr: 3544, cls: "blocked" },
+      { id: bystander, pr: 3545, cls: "blocked" },
+    ], [smokeCheck, healthCheck, dnsCheck]);
+    snap = await laneSnap(repo);
+    // Both cause cures merged: the genuinely NEW cause (dns) inherits
+    // neither cure — it surfaces as its own still-undispatched fix work.
+    expect(snap.base_red_resolution.fix_card.title).toContain("DNS Chain");
+    expect(snap.base_red_resolution.phase).toBe("fix_undispatched");
+    expect([smoke, health, unrelated, bystander]).not.toContain(snap.base_red_resolution.fix_card.id);
+
+    // The decisive green deployment at sha3 recovers both cause episodes and
+    // ends the incident: no root-fix entries remain, nothing is held as a cure.
+    const proveGreen = async (tip: string, run: number) => {
+      await kbJson("/train.queue_facts", { repo, actor: gateway, entries: [],
+        base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [] } });
+      await kbJson("/train.observe_deploy", { repo, observation: { tip_sha: tip, observed_at: Date.now(),
+        runs: [{ id: run, name: deployWf, head_sha: tip, run_attempt: 1, status: "completed", conclusion: "success",
+          html_url: `https://github.com/${repo}/actions/runs/${run}` }] } });
+      await kbJson("/train.queue_facts", { repo, actor: gateway, entries: [],
+        base_state: { verdict: "green", tip_sha: tip, red: [], unsettled: [],
+          deploy_coverage: { phase: "covered", tip_sha: tip, tip_age_secs: 60, covered_by_sha: tip, covered_by_run_id: run } } });
+    };
+    await proveGreen(sha3, 300);
+    snap = await laneSnap(repo);
+    const recovered = snap.line.recoveries.filter((r: any) => [smoke, health].includes(r.task?.id)
+      && r.episode?.stage?.phase === "recovered");
+    expect(recovered.length).toBeGreaterThanOrEqual(2);
+    expect((snap.queue ?? []).filter((q: any) => q.root_fix)).toEqual([]);
+  });
+
   it("BR#8468: a newer stopped base invalidates old bypass proof before another queue scan", async () => {
     const repo = "state-vector/bypass-new-stop", gateway = "gw-new-stop";
     const base = "a".repeat(40), head = "b".repeat(40), next = "c".repeat(40);

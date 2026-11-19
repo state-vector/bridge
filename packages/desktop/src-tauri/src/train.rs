@@ -2026,10 +2026,38 @@ fn root_fix_head_under_stop(lane: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// BR#17154: the card stays THE root fix across a main SHA change when the
+/// hub's recovery journal EXPLICITLY associates it with the current base —
+/// `meta.recovery_links` carries {repo, head_sha} stamped by the hub when
+/// the SAME cause was observed failing at that exact newer head (the episode
+/// lineage continues on the same repair task; `root_fix.head_sha` keeps its
+/// historical binding, BR#9233). The hub's queue stamp already verified the
+/// episode is OPEN and the card's leg is unlanded; this mirror re-checks the
+/// explicit link so no card rides a base it never named. Ordinary PRs, stale
+/// or merged cures and unrelated checks carry no such link and stay
+/// ineligible — the walk's own live PR-state read (OPEN only) plus the
+/// signature and mechanical gates below are unchanged.
+fn card_bound_to_base_by_recovery(card: &Value, base_sha: &str) -> bool {
+    let repo = card.pointer("/meta/root_fix/repo").and_then(Value::as_str).unwrap_or("");
+    if repo.is_empty() {
+        return false;
+    }
+    card.pointer("/meta/recovery_links")
+        .and_then(Value::as_array)
+        .map(|links| {
+            links.iter().any(|l| {
+                l.get("repo").and_then(Value::as_str) == Some(repo)
+                    && l.get("head_sha").and_then(Value::as_str) == Some(base_sha)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn root_fix_matches_base(card: &Value, base_sha: &str) -> bool {
     !base_sha.is_empty()
         && is_root_fix_card(card)
-        && card.pointer("/meta/root_fix/head_sha").and_then(Value::as_str) == Some(base_sha)
+        && (card.pointer("/meta/root_fix/head_sha").and_then(Value::as_str) == Some(base_sha)
+            || card_bound_to_base_by_recovery(card, base_sha))
 }
 
 /// BR#4996: one gate-clean queue head, classified in phase A of the drain
@@ -6445,6 +6473,62 @@ mod tests {
         let (s2, f2) = stall_next(Some(&s1), &batch, attempted, 2, "e", T0 + 45_000, th);
         assert_eq!(s2, None, "a landed prefix settles the episode");
         assert!(!f2);
+    }
+
+    // ---- BR#17154: the episode-authority root-fix classifier mirror ----
+
+    fn root_fix_card_17154(root_sha: &str, links: Value) -> Value {
+        json!({
+            "tags": ["root_blocker", "main-red"],
+            "meta": {
+                "root_fix": { "repo": "state-vector/sp", "base": "main", "head_sha": root_sha },
+                "prs": [{ "repo": "state-vector/sp", "number": 3525, "head_sha_at_acceptance": "c".repeat(40) }],
+                "recovery_links": links,
+            },
+        })
+    }
+
+    #[test]
+    fn root_fix_matches_base_accepts_the_exact_binding_unchanged_17154() {
+        let old = "1".repeat(40);
+        let card = root_fix_card_17154(&old, json!([]));
+        assert!(root_fix_matches_base(&card, &old));
+        // the historical binding alone never matches a newer base
+        assert!(!root_fix_matches_base(&card, &"2".repeat(40)));
+    }
+
+    #[test]
+    fn root_fix_matches_base_holds_across_a_sha_change_only_via_an_explicit_recovery_link_17154() {
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        // the SAME cause observed failing at the newer head: the hub stamps a
+        // recovery link at that exact head onto the same repair card — the
+        // root-fix fast lane survives the base SHA change
+        let links = json!([{ "repo": "state-vector/sp", "base": "main", "head_sha": new,
+            "cause": { "kind": "check_failure", "check": "post-deploy / Lodestar Operational Health" } }]);
+        let card = root_fix_card_17154(&old, links);
+        assert!(root_fix_matches_base(&card, &new), "an explicitly linked current episode keeps the cure actionable");
+        assert!(root_fix_matches_base(&card, &old), "the historical exact binding still matches its own head");
+        // a link naming ANOTHER repo's episode, another head, or a repo-less
+        // card never qualifies — unrelated checks and foreign cures inherit
+        // nothing (BR#8468/BR#9233 guards)
+        let foreign = json!([{ "repo": "state-vector/other", "base": "main", "head_sha": new,
+            "cause": { "kind": "check_failure", "check": "x" } }]);
+        assert!(!root_fix_matches_base(&root_fix_card_17154(&old, foreign), &new));
+        let stale_head = json!([{ "repo": "state-vector/sp", "base": "main", "head_sha": "3".repeat(40),
+            "cause": { "kind": "check_failure", "check": "x" } }]);
+        assert!(!root_fix_matches_base(&root_fix_card_17154(&old, stale_head), &new));
+        // no root_fix binding at all → is_root_fix_card already rejects
+        let unbound = json!({ "tags": ["root_blocker", "main-red"], "meta": {
+            "recovery_links": links } });
+        assert!(!root_fix_matches_base(&unbound, &new));
+        // an ordinary card (no root-fix qualification) with a stray link
+        // cannot rank up either
+        let ordinary = json!({ "tags": [], "meta": {
+            "root_fix": { "repo": "state-vector/sp", "base": "main", "head_sha": old },
+            "recovery_links": links } });
+        assert!(!root_fix_matches_base(&ordinary, &new));
+        assert!(!root_fix_matches_base(&ordinary, &old));
     }
 
     // ---- BR#5633: the awaiting-park sweep decision (bridge#364) ----

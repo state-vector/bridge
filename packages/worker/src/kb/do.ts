@@ -109,6 +109,7 @@ import {
   MAIN_GREEN_GATE_PATTERN,
   isRootFixCard,
   isLaneBaseFixCard,
+  episodeScopedRootFix,
   isBaseCureCardTitle,
   mainRedBinding,
   rootFixCardTitle,
@@ -16938,7 +16939,14 @@ export class KnowledgeHub {
       const leg = trainLegsRemaining(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
       const root_fix = c.root_fix && scope.kind === "current" &&
-        mainRedBinding(cm, base)?.head_sha === scope.head_sha;
+        (mainRedBinding(cm, base)?.head_sha === scope.head_sha ||
+          // BR#17154: an accepted repair bound to a currently-OPEN recovery
+          // episode at the exact current observed head keeps tier 0 across a
+          // main SHA change (same cause observed failing at the newer SHA;
+          // root_fix.head_sha keeps its historical binding). Requires an
+          // unlanded leg here — merged/stale cures and ordinary PRs never
+          // rank up through the episode branch.
+          episodeScopedRootFix(c.id, cm, scope, repo));
       return { ...c, priority: root_fix ? "root_fix" : c.priority === "root_fix" ? "normal" : c.priority, root_fix, at: Number(cm.merge_train?.at ?? row.status_ts), ...(pr ? { pr } : {}) };
     });
     entries.sort((a, b) => Number(b.root_fix) - Number(a.root_fix));
@@ -18489,10 +18497,19 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     state: BaseRedEpisodeState;
   } {
     const scope = this.trainRepairScope(repo, base);
-    const inScope = (meta: unknown): boolean => {
+    const inScope = (meta: unknown, id?: string): boolean => {
       if (scope.kind === "unobserved") return true;
       const binding = mainRedBinding(meta, base);
-      return binding?.repo === repo && binding.head_sha === scope.head_sha;
+      if (binding?.repo === repo && binding.head_sha === scope.head_sha) return true;
+      // BR#17154: the current exact observed recovery episode is the single
+      // authority for actionable accepted repairs — when the SAME cause is
+      // observed failing at a NEWER main SHA, the lineage continues on the
+      // same repair card (its recovery_links gain the new head) while
+      // root_fix.head_sha keeps the historical binding (BR#9233). The card
+      // stays in scope through that open episode, but only with an UNLANDED
+      // leg on this repo — merged or stale cures (BR#8468) never re-own a
+      // current episode through this branch.
+      return episodeScopedRootFix(id, meta, scope, repo);
     };
     const bypassHead = (id: string, meta: unknown, pr: number): string | null => {
       const evidence = RecoveryMergeGateSchema.safeParse(entries?.find(e => e.id === id && e.pr === pr)?.bypass);
@@ -18537,6 +18554,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       mergedPr?: { repo: string; number: number; merge_sha: string } | null;
       culpritPr: number | null;
     } = { card: null, curePr: null, conflictPr: null, mergedPr: null, culpritPr: null };
+    // BR#17154: whether the standing candidate still carries an UNLANDED PR
+    // leg — among otherwise-equal plain candidates the current episode's
+    // accepted repair (a cure in flight) outranks a legless generated card.
+    let rootHasOpenLeg = false;
     if (repo) {
       const rows = this.state.storage.sql.exec(
         `SELECT id, title, status, meta, tags, owner, status_ts, updated_ts FROM artefacts
@@ -18553,7 +18574,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         // BR#6390: a qualified root-fix card OR the lane's BASE-FIX card
         // (agent-filed stop-the-line shape — BR#6378) heads the episode.
         if (!isRootFixCard({ tags: parseTags(r.tags), meta: m }) && !isLaneBaseFixCard({ tags: parseTags(r.tags), meta: m }, repo)) continue;
-        if (binding?.repo !== repo || !inScope(m)) continue;
+        if (binding?.repo !== repo || !inScope(m, String(r.id))) continue;
         const unlandedLegs = trainLegs(m)
           .filter((l) => !trainLegLanded(m, l))
           .map((l) => ({ repo: String(l.repo || repo), number: Number(l.number) }))
@@ -18598,13 +18619,30 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           mergedPr,
           culpritPr: Number(m.root_fix?.pr ?? 0) || root.culpritPr || null,
         };
-        if (!root.card) root = candidate;
+        if (!root.card) {
+          root = candidate;
+          rootHasOpenLeg = openLegs.length > 0;
+        }
         if (curePr) {
           root = candidate;
+          rootHasOpenLeg = openLegs.length > 0;
           break;
         }
         if (mergedPr && !root.mergedPr) {
           root = candidate;
+          rootHasOpenLeg = openLegs.length > 0;
+        }
+        // BR#17154 (episode authority): a plain candidate that still carries
+        // an unlanded PR leg — the open episode's independently accepted
+        // repair, mid-flight — outranks a legless candidate (the generated
+        // umbrella card heading the not-yet-repaired causes). Recency alone
+        // made the umbrella win every ensure-rebind, so the lane read
+        // fix_undispatched while an accepted cure for a live red cause was
+        // actively in flight — the umbrella surfaces only once every
+        // leg-bearing episode repair has landed.
+        if (!curePr && !mergedPr && openLegs.length > 0 && !root.curePr && !root.mergedPr && !rootHasOpenLeg) {
+          root = candidate;
+          rootHasOpenLeg = true;
         }
       }
     }
@@ -18622,7 +18660,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         ) as any;
         if (!row) continue;
         const m = JSON.parse(row.meta ?? "{}");
-        if (!inScope(m)) continue;
+        if (!inScope(m, id)) continue;
         if (isCardPrConflicting(m, pr)) continue;
         const unlanded = trainLegs(m).filter((l) => !trainLegLanded(m, l));
         const matchLeg = unlanded.find((l) => Number(l.number) === pr);

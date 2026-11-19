@@ -2392,6 +2392,30 @@ export function isLaneBaseFixCard(card: { tags?: unknown; meta?: any }, repo: st
   return lane.split("@")[0] === repo && mainRedBinding(card?.meta)?.repo === repo;
 }
 
+/** BR#17154: the episode-authority branch of root-fix scoping. The current
+ *  exact observed recovery episode — not the card's historical binding SHA —
+ *  decides which accepted repair PRs stay actionable when the SAME main
+ *  failure persists at a NEWER SHA. True iff (a) the scope is the lane's
+ *  current exact observed head, (b) the card is EXPLICITLY bound to a
+ *  currently-OPEN recovery episode at that head (the ledger's stage.task_id:
+ *  applyTrainRecoveryEvent continues the lineage onto the same repair task
+ *  when the cause is observed failing at the newer SHA and stamps
+ *  meta.recovery_links there, while root_fix.head_sha keeps its historical
+ *  binding — BR#9233 provenance), and (c) the card still carries an UNLANDED
+ *  PR leg on this repo — a merged or stale cure never re-owns a current
+ *  episode through this branch (BR#8468: the older merged cure stays a
+ *  historical binding; the open cause-bound repair owns the episode). */
+export function episodeScopedRootFix(
+  cardId: string | undefined,
+  meta: any,
+  scope: { kind: "unobserved" } | { kind: "current"; head_sha: string; task_ids: string[] },
+  repo: string,
+): boolean {
+  if (scope.kind !== "current" || !cardId) return false;
+  if (!scope.task_ids.includes(cardId)) return false;
+  return trainLegsRemaining(meta, repo).some((leg) => Number(leg.number) > 0);
+}
+
 /** BR#6012: true iff a queued card's title explicitly names a base-red /
  *  CI / deploy-health / merge-gate / stop-the-line fix — NEVER a generic
  *  product bugfix (`fix(chat): ...`, `fix(web): ...`), which previously

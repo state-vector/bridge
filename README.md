@@ -420,7 +420,16 @@ tag or the meta `root_blocker` / `root_blocker_for_lane` markers) plus a main-re
 tag (`main-red`, `main_red`, `stop-the-line`, or the BR#14075 synonyms `deploy-red` /
 `deploy_red`) plus a bound failing main-HEAD run (`meta.root_fix` repo+head_sha).
 Tags and meta markers never qualify alone — the binding does, so a non-red card
-cannot rank up by wearing the words. Wherever the hub spawns or binds root-fix work
+cannot rank up by wearing the words. When the SAME cause is later observed failing
+at a NEWER main SHA (BR#17154), the current exact observed recovery episode — not
+SHA equality with the historical binding — keeps an accepted repair actionable:
+the hub continues the episode lineage on the same repair card and stamps
+`meta.recovery_links` at the new head while `root_fix.head_sha` keeps its
+historical binding (BR#9233 provenance), and the card stays tier-0 root-fix and
+fast-lane-eligible for as long as that episode is open and the card still carries
+an unlanded PR leg on the lane. Merged or stale cures, unrelated checks, ordinary
+PRs and changed PR heads never qualify through the episode branch — the exact
+independent PR/head acceptance, signature and mechanical gates are unchanged. Wherever the hub spawns or binds root-fix work
 from a required-workflow red on a tracked base (deploy observation, train
 stop-the-line, the recovery bind), it stamps that exact shape onto the card
 regardless of the authoring session's own vocabulary (BR#14075). When a compatible
