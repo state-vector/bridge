@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { createHmac } from "node:crypto";
+import { Script } from "node:vm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ExecutionAttentionSchema } from "@bridge/contracts";
 
@@ -66,6 +67,26 @@ const api = (path: string, init?: { method?: string; body?: string }) =>
   });
 
 describe("workspace owner removes one audited parent link", () => {
+  it("serves the signed-in operator form and valid browser script", async () => {
+    const workerConfig = readFileSync(new URL("../wrangler.toml", import.meta.url).pathname, "utf8");
+    expect(workerConfig.match(/run_worker_first\s*=\s*\[([^\]]*)\]/)?.[1]).toContain('"/kb"');
+    const anonymous = await mf.dispatchFetch("https://main/kb", {
+      headers: { accept: "text/html" }, redirect: "manual",
+    });
+    expect(anonymous.status).toBe(302);
+    const signedIn = await mf.dispatchFetch("https://main/kb", {
+      headers: { accept: "text/html", cookie: sessionCookie("rayh") },
+    });
+    expect(signedIn.status).toBe(200);
+    const page = await signedIn.text();
+    for (const control of ["link-child", "link-parent", "link-reason", "link-inspect", "link-remove", "link-result"]) {
+      expect(page).toContain(`id="${control}"`);
+    }
+    const script = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    expect(script).toContain("/api/kb/admin/child-link");
+    expect(() => new Script(script ?? "")).not.toThrow();
+  });
+
   it("fences consent, preserves dependency and wait, and verifies a lost-response retry", async () => {
     const ownerCookie = sessionCookie("rayh");
     const call = (path: string, body?: object, actor = ownerCookie, origin = "https://main") =>
@@ -75,8 +96,8 @@ describe("workspace owner removes one audited parent link", () => {
         body: body ? JSON.stringify(body) : undefined,
       });
     expect((await call("/api/workspaces")).status).toBe(200);
-    const newTask = async (title: string) => {
-      const response = await call("/api/kb/create", { type: "task", title });
+    const newTask = async (title: string, roles: string[] = []) => {
+      const response = await call("/api/kb/create", { type: "task", title, roles });
       expect(response.status).toBe(200);
       return String((await response.json() as { id: string }).id);
     };
@@ -145,6 +166,19 @@ describe("workspace owner removes one audited parent link", () => {
     expect((await call("/api/kb/link", edge)).status).toBe(200);
     expect((await call(route, request)).status).toBe(409);
     expect((await call(inspection)).status).toBe(200);
+
+    // Legacy review selection can rely solely on child_of. The operator
+    // route must never detach duties and expose an older review round.
+    const duty = await newTask("Current pending legacy review", ["review"]);
+    const dutyEdge = { src: duty, dst, relation: "child_of" };
+    expect((await call("/api/kb/link", dutyEdge)).status).toBe(200);
+    const inspectDuty = await call(`${route}?${new URLSearchParams(dutyEdge)}`);
+    expect(inspectDuty.status).toBe(409);
+    expect(await inspectDuty.json()).toMatchObject({ kind: "protected_duty" });
+    const removeDuty = await call(route, { ...request, ...dutyEdge });
+    expect(removeDuty.status).toBe(409);
+    expect(await removeDuty.json()).toMatchObject({ kind: "protected_duty" });
+    expect((await getTask(duty)).relations).toContainEqual(expect.objectContaining({ artefact_id: dst, relation: "child_of", dir: "out" }));
   });
 });
 

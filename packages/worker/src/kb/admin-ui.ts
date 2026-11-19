@@ -1,15 +1,11 @@
 /**
- * Admin page for the knowledge layer (human plane, password session):
- * mint/revoke agent auth tokens, see connected agents + sessions, project flags,
- * role playbooks. Server-rendered shell + fetch calls to /api/kb/admin/* — no build step.
+ * Admin page for the knowledge layer (human plane): exact parent-link
+ * maintenance, tokens, sessions, project flags and role playbooks.
  */
 import { DEFAULT_ROLE_PLAYBOOKS } from "./core.ts";
 
-/** Hub defaults inlined for display; escaped so they can sit inside the page's script. */
-const ROLE_DEFAULTS_JSON = JSON.stringify(DEFAULT_ROLE_PLAYBOOKS)
-  .replace(/\\/g, "\\\\")
-  .replace(/`/g, "\\`")
-  .replace(/\$\{/g, "\\${");
+/** Preserve JSON escape sequences and prevent HTML from closing the script. */
+const ROLE_DEFAULTS_JSON = JSON.stringify(DEFAULT_ROLE_PLAYBOOKS).replace(/</g, "\\u003c");
 
 export const ADMIN_HTML = `<!doctype html>
 <html lang="en">
@@ -196,7 +192,7 @@ async function loadSettings() {
   document.getElementById("s-bootstrap").value = s.bootstrap_md ?? "";
   const roles = s.roles || {};
   for (const r of ROLES) document.getElementById("s-role-" + r).value = typeof roles[r] === "string" ? roles[r] : "";
-  document.getElementById("s-role-defaults").textContent = ROLES.map(r => "role:" + r + "\n" + (ROLE_DEFAULTS[r] ?? "")).join("\n\n");
+  document.getElementById("s-role-defaults").textContent = ROLES.map(r => "role:" + r + "\\n" + (ROLE_DEFAULTS[r] ?? "")).join("\\n\\n");
   boardExtra();
 }
 function boardExtra() { document.getElementById("s-board-extra").style.display = document.getElementById("s-board-mode").value === "external" ? "block" : "none"; }

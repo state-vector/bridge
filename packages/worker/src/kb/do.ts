@@ -9216,21 +9216,27 @@ export class KnowledgeHub {
     const edge = { src, dst, relation };
     const edgeRow = () => this.one(`SELECT created_ts FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`, src, dst);
     const endpoints = () => {
-      const child = this.one(`SELECT type, updated_ts FROM artefacts WHERE id = ?`, src);
-      const parent = this.one(`SELECT type, updated_ts FROM artefacts WHERE id = ?`, dst);
+      const child = this.one(`SELECT type, updated_ts, roles FROM artefacts WHERE id = ?`, src);
+      const parent = this.one(`SELECT type, updated_ts, roles FROM artefacts WHERE id = ?`, dst);
+      const protectedDuty = (roles: unknown) => parseTags(roles).some(role => role === "review" || role === "unblock");
       return child?.type === "task" && parent?.type === "task"
-        ? { child_ts: Number(child.updated_ts), parent_ts: Number(parent.updated_ts) }
+        ? { child_ts: Number(child.updated_ts), parent_ts: Number(parent.updated_ts), protected: protectedDuty(child.roles) || protectedDuty(parent.roles) }
         : null;
     };
     type Fence = { edge_ts: number; child_ts: number; parent_ts: number };
     const missingEndpoint = { kind: "endpoint_missing", error: "both task cards must exist", edge };
     const missingEdge = { kind: "edge_missing", error: "no exact child_of edge exists", edge };
+    // A legacy review can be bound only by child_of; detaching it would let
+    // the delivery gate see an older verdict. Keep duty edges in their own
+    // lifecycle, even for a workspace owner.
+    const protectedEdge = { kind: "protected_duty", error: "review and unblock duty links require their existing lifecycle", edge };
     if (!remove) {
       const versions = endpoints();
       if (!versions) return this.json(missingEndpoint, 404);
+      if (versions.protected) return this.json(protectedEdge, 409);
       const storedEdge = edgeRow();
       return this.json(storedEdge
-        ? { kind: "present", edge, fence: { ...versions, edge_ts: Number(storedEdge.created_ts) } satisfies Fence }
+        ? { kind: "present", edge, fence: { child_ts: versions.child_ts, parent_ts: versions.parent_ts, edge_ts: Number(storedEdge.created_ts) } satisfies Fence }
         : missingEdge, storedEdge ? 200 : 404);
     }
     const expected = body.fence as Partial<Fence> | undefined;
@@ -9245,6 +9251,7 @@ export class KnowledgeHub {
     const result = this.state.storage.transactionSync(() => {
       const versions = endpoints();
       if (!versions) return { body: missingEndpoint, status: 404 };
+      if (versions.protected) return { body: protectedEdge, status: 409 };
       const storedEdge = edgeRow();
       const prior = this.one(`SELECT seq, data FROM ledger WHERE kind = 'mutation' AND action = ? AND artefact_id = ?
         AND actor = ? AND json_extract(data, '$.operation_id') = ? AND json_extract(data, '$.direction') = 'out'`,
@@ -9259,7 +9266,7 @@ export class KnowledgeHub {
         return { body: { kind: "already_removed", edge, source_audit_seq: Number(prior.seq), target_audit_seq: audit.target_audit_seq }, status: 200 };
       }
       if (!storedEdge) return { body: missingEdge, status: 404 };
-      const fence = { ...versions, edge_ts: Number(storedEdge.created_ts) };
+      const fence: Fence = { child_ts: versions.child_ts, parent_ts: versions.parent_ts, edge_ts: Number(storedEdge.created_ts) };
       if (fence.edge_ts !== expected.edge_ts || fence.child_ts !== expected.child_ts || fence.parent_ts !== expected.parent_ts) {
         return { body: changed, status: 409 };
       }

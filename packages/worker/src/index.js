@@ -3,6 +3,7 @@ import { logInfraError } from "./infra-error.ts";
 export { FlowsHub } from "./do.js";
 import { handleMcp, KnowledgeHub } from "./mcp.ts";
 import { DEFAULT_WS_SLUG, doWs, isWsSlug, tagsSayGateway } from "./kb/core.ts";
+import { ADMIN_HTML } from "./kb/admin-ui.ts";
 import { handleOAuth } from "./mcp-oauth.ts";
 export { McpOAuth } from "./mcp-oauth.ts";
 
