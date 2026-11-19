@@ -6114,6 +6114,31 @@ export class KnowledgeHub {
         c.backend === executor.backend && c.model === executor.model && c.config_revision === executor.config_revision);
   }
 
+  /** BR#17365 — true when the hub's own execution lifecycle has recorded a
+   *  COMPLETED execution on the host's CURRENT exact route after the latest
+   *  recorded provider-route failure on that route. The provider_route hold
+   *  asserts "this route cannot serve requests"; a later completion through
+   *  the same backend+model+config_revision falsifies it, so the hold decays
+   *  and the card dispatches fresh (failure budgets still apply). Holds
+   *  armed before the failed-mark existed (pre-deploy failures) decay on any
+   *  matching health stamp — their premise is falsified the same way. */
+  private routeRecoveredFor(host: string, capabilities: ExecutorCapabilities | null): boolean {
+    if (!capabilities) return false;
+    const read = (key: string): { backend: string; model: string; config_revision: string; at: number } | null => {
+      const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
+      if (!row) return null;
+      try { return JSON.parse(String(row.value)); } catch { return null; }
+    };
+    const health = read(`route.health:${host}`);
+    if (!health) return false;
+    if (health.backend !== capabilities.backend || health.model !== capabilities.model
+      || health.config_revision !== capabilities.config_revision) return false;
+    const failed = read(`route.failed:${host}`);
+    if (failed && failed.backend === health.backend && failed.model === health.model
+      && failed.config_revision === health.config_revision && failed.at >= health.at) return false;
+    return true;
+  }
+
   private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string },
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
@@ -6188,6 +6213,10 @@ export class KnowledgeHub {
     for (const r of this.state.storage.sql.exec(
       `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) startupRejections.add(`${String(r.tid)}\u0000${String(r.host)}\u0000${String(r.fp)}`);
+    // BR#17365: one probe per pass — a later COMPLETED execution on this
+    // host's CURRENT exact route falsifies any same-route provider_route
+    // hold (see routeRecoveredFor). Depends only on host+capabilities.
+    const routeRecoveredProbe = this.routeRecoveredFor(host, capabilities);
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
@@ -6233,7 +6262,12 @@ export class KnowledgeHub {
         // eligibility for a FRESH dispatch at the current route, and
         // repeated failures still land in the retry_budget guard.
         const routeGone = hold === "provider_route" && state?.terminal && this.routeGoneFor(state, capabilities);
-        reason = permit ? null : awaitingPermitHost ? "recovery_route" : routeGone ? null : hold;
+        // BR#17365: a later COMPLETED execution on the same exact route
+        // falsifies the hold's premise — decay to a fresh dispatch
+        // (routeRecoveredProbe computed ONCE per pass — the condition
+        // depends only on host+capabilities, never on the card)
+        const routeRecovered = hold === "provider_route" && state?.terminal && routeRecoveredProbe;
+        reason = permit ? null : awaitingPermitHost ? "recovery_route" : routeGone || routeRecovered ? null : hold;
       }
       if (!reason && capabilities) {
         const requirements = schedulingRequirements();
@@ -6637,7 +6671,7 @@ export class KnowledgeHub {
           meta.execution_scheduling_requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
           const execution = this.executionState(id);
           if (execution && executionNeedsRecoveryPermit(execution, String(meta.work_revision ?? "legacy"))) {
-            if (this.routeGoneFor(execution, capabilities)) {
+            if (this.routeGoneFor(execution, capabilities) || this.routeRecoveredFor(host, capabilities)) {
               // the recorded route exists on no live capability: the permit
               // requirement guards a recovery that can never be proven —
               // dispatch FRESH at the current route (selection dissolved the
@@ -7235,6 +7269,22 @@ export class KnowledgeHub {
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
     const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
+    // BR#17365 — route health is hub state, written by the authoritative
+    // observer (the execution lifecycle) and read by the scheduler: a
+    // provider-route failure marks the route failed; a COMPLETED execution
+    // on the same exact route marks it healthy. A provider_route hold whose
+    // route has a LATER success is a falsified premise — it must not hold.
+    const routeHost = String(next.attempt?.host ?? actor);
+    const routeExecutor = next.attempt?.executor ?? null;
+    if ((command.kind === "stopped" || command.kind === "finalize") && routeExecutor) {
+      if (providerRecoveryDiagnosis(command.outcome) === "provider_route_unavailable") {
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+          `route.failed:${routeHost}`, JSON.stringify({ backend: routeExecutor.backend, model: routeExecutor.model, config_revision: routeExecutor.config_revision, at: now }));
+      } else if (command.outcome.kind === "completed") {
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+          `route.health:${routeHost}`, JSON.stringify({ backend: routeExecutor.backend, model: routeExecutor.model, config_revision: routeExecutor.config_revision, at: now }));
+      }
+    }
     this.state.storage.transactionSync(() => {
       if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);

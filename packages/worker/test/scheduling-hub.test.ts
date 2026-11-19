@@ -476,6 +476,82 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(resumed.task?.meta.execution_recovery_selection).toBeUndefined();
   });
 
+  it("decays a provider_route hold when a completed execution falsifies the route-failure premise (BR#17365)", async () => {
+    // the structural half the missing producer caused: cards held on a route
+    // that has SINCE served a completed execution — the hub's own receipts
+    // prove the route works, so the hold must decay without any proof minter
+    const project = "provider-route-health", g = await gateway(project, 2);
+    const larger = { ...g.capabilities, tier: "large" };
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [larger] } });
+    const held = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    const outcome = { kind: "failed", exit_code: 1, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    for (let generation = 1; generation <= 3; generation++) {
+      const claim = await reserve(g);
+      if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+      const attempt_id = `health-fail-${generation}`;
+      expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,
+        selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, `health-fail-begin-${generation}`, held, claim.session)).error).toBeUndefined();
+      const stopped = { generation, attempt_id, writers: "process_group_empty",
+        outcome: generation < 3 ? { ...outcome, stderr_tail: "Task failed before delivery" } : outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, `health-fail-stop-${generation}`, held, claim.session)).error).toBeUndefined();
+      expect((await g.cmd({ kind: "finalize", ...stopped }, `health-fail-final-${generation}`, held, claim.session)).error).toBeUndefined();
+    }
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+
+    // an UNRELATED task completes on the SAME exact route (current config):
+    // the execution lifecycle stamps route health — the hold's premise
+    // ("this route cannot serve requests") is falsified by the hub's own
+    // receipts
+    const healthy = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    const cHealthy = await reserve(g);
+    if (cHealthy.kind !== "reserved" || cHealthy.task_id !== healthy) throw new Error(JSON.stringify(cHealthy));
+    expect((await g.cmd({ kind: "begin", attempt_id: "health-ok", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, "health-ok-begin", healthy, cHealthy.session)).error).toBeUndefined();
+    const ok = { generation: 1, attempt_id: "health-ok", writers: "process_group_empty", outcome: { kind: "completed", exit_code: 0, stdout_tail: "done", stderr_tail: "" } };
+    expect((await g.cmd({ kind: "stopped", ...ok }, "health-ok-stop", healthy, cHealthy.session)).error).toBeUndefined();
+    expect((await g.cmd({ kind: "finalize", ...ok }, "health-ok-final", healthy, cHealthy.session)).error).toBeUndefined();
+
+    const claim2 = await reserve(g);
+    if (claim2.kind !== "reserved") throw new Error(JSON.stringify(claim2));
+    expect(claim2.task_id).toBe(held); // held card must decay BEFORE the newer task reserves
+    expect(claim2.task?.meta.execution_recovery_selection).toBeUndefined(); // fresh dispatch, no recovery
+  });
+
+  it("a route failure AFTER a health stamp re-arms the provider_route hold (ordering guard)", async () => {
+    const project = "provider-route-rearm", g = await gateway(project, 2);
+    const larger = { ...g.capabilities, tier: "large" };
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [larger] } });
+    const healthy = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    // one completed execution first: route health stamped
+    const c1 = await reserve(g);
+    if (c1.kind !== "reserved" || c1.task_id !== healthy) throw new Error(JSON.stringify(c1));
+    expect((await g.cmd({ kind: "begin", attempt_id: "rearm-ok", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, "rearm-ok-begin", healthy, c1.session)).error).toBeUndefined();
+    // queue the victim while healthy is mid-attempt, so after healthy's
+    // completion+requeue the VICTIM is the older eligible card
+    const victim = await task(project, { execution_requirements: { tier: "large", tools: [], environment: [] } });
+    const ok = { generation: 1, attempt_id: "rearm-ok", writers: "process_group_empty", outcome: { kind: "completed", exit_code: 0, stdout_tail: "done", stderr_tail: "" } };
+    expect((await g.cmd({ kind: "stopped", ...ok }, "rearm-ok-stop", healthy, c1.session)).error).toBeUndefined();
+    expect((await g.cmd({ kind: "finalize", ...ok }, "rearm-ok-final", healthy, c1.session)).error).toBeUndefined();
+    // park the completed card on a far-future typed wait so the pool holds
+    // only the victim (its requeue keeps its original queue position)
+    expect((await post("transition", { id: healthy, to: "blocked", actor: "author", note: "fixture: retire from pool",
+      await_event: { event: "time", until_ts: Date.now() + 3_600_000 } })).error).toBeUndefined();
+    // then a provider-route failure on the same route: failed postdates
+    // health — the NEXT card on this route must hold, not decay
+    const c2 = await reserve(g);
+    if (c2.kind !== "reserved" || c2.task_id !== victim) throw new Error(JSON.stringify(c2));
+    expect((await g.cmd({ kind: "begin", attempt_id: "rearm-bad", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } }, "rearm-bad-begin", victim, c2.session)).error).toBeUndefined();
+    const bad = { generation: 1, attempt_id: "rearm-bad", writers: "process_group_empty", outcome: { kind: "failed", exit_code: 1, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" } };
+    expect((await g.cmd({ kind: "stopped", ...bad }, "rearm-bad-stop", victim, c2.session)).error).toBeUndefined();
+    expect((await g.cmd({ kind: "finalize", ...bad }, "rearm-bad-final", victim, c2.session)).error).toBeUndefined();
+    // the failure postdates the health stamp: the victim re-arms and holds
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+  });
+
   it("carries the effective reasoning tier from reservation through begin", async () => {
     const project = "reservation-model-tier", g = await gateway(project);
     const large = { ...g.capabilities, tier: "large", model: "test/large" };
