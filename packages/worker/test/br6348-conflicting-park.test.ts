@@ -329,6 +329,18 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     expect(recovery.meta.machine_duty).toMatchObject({ kind: "task-recovery", reason: "conflict", subject: id });
     expect((await kbJson("/get", { id })).body.meta?.merge_train?.conflicting_alarm?.at).toBeGreaterThan(0);
 
+    const baseState = { verdict: "green", tip_sha: "a".repeat(40), red: [], unsettled: [] };
+    const stamp = await kbJson("/train.queue_facts", { repo: REPO, actor: "gw-conflict-4", base_state: baseState,
+      scan: { phase: "complete" }, entries: [{ id, pr: 311, cls: "conflict" }] });
+    expect(stamp.body.error).toBeUndefined();
+    const lane = async () => (await kbJson("/train.status", { repo: REPO })).body.lanes[0];
+    const snapshot = await lane();
+    expect(snapshot.line).toMatchObject({ blocker: "candidate_conflict", remediation: { task: { id: recoveryId } } });
+    await kbJson("/train.queue_facts", { repo: REPO, actor: "gw-conflict-4", base_state: baseState });
+    expect((await lane()).queue_facts.candidates_observed).toEqual(snapshot.queue_facts.candidates_observed);
+    await kbJson("/train.queue_facts", { repo: REPO, actor: "gw-conflict-4", base_state: { ...baseState, tip_sha: "b".repeat(40) } });
+    expect((await lane()).line.blocker).not.toBe("candidate_conflict");
+
     // second sweep: deduped (24h) — still exactly one ask
     await kbJson("/admin.alarm_sweep");
     expect(await sinkQuestions(id)).toHaveLength(0);

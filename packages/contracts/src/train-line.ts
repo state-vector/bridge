@@ -2,6 +2,7 @@ import { z } from "zod";
 import { BaseRedResolutionSchema, DeployCoverageStateSchema, TrainFixCardSchema } from "./train.ts";
 import type { TrainFixCard } from "./train.ts";
 import { RecoveryEpisodeSchema, recoveryIsOpen, type RecoveryRepairScope } from "./train-recovery.ts";
+import { TrainQueueScanSchema } from "./train-scan.ts";
 
 /** Runner stream messages prove liveness, not a structured progress report.
  * Keep their raw output available in details, without advertising fragments
@@ -57,6 +58,7 @@ const lineErrorLabels = {
   merge_failed: "Queued PRs cannot merge",
   no_progress: "Merge machinery stalled",
   no_executor: "No executor is active",
+  candidate_conflict: "Queued PRs need a rebase",
 } as const;
 type LineError = keyof typeof lineErrorLabels;
 
@@ -104,8 +106,8 @@ export const TrainLineProjectionSchema = z.discriminatedUnion("phase", [
     "STOP THE LINE — main is failing", "Fix ready — your merge is needed",
     "Fix merged — verifying deployment", "Merge response received — checking GitHub",
   ]), blocker: z.literal("main_failed"), remediation: LineRemediationSchema }),
-  LineFields.extend({ phase: z.literal("error"), label: z.enum([lineErrorLabels.deploy_missing, lineErrorLabels.merge_failed, lineErrorLabels.no_progress, lineErrorLabels.no_executor]),
-    blocker: z.enum(["deploy_missing", "merge_failed", "no_progress", "no_executor"]), remediation: LineRemediationSchema }),
+  LineFields.extend({ phase: z.literal("error"), label: z.enum(Object.values(lineErrorLabels)),
+    blocker: z.enum(["deploy_missing", "merge_failed", "no_progress", "no_executor", "candidate_conflict"]), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("action_required"), label: z.literal("Your action is needed"),
     blocker: z.literal("human_action"), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("unknown"), label: z.enum([
@@ -148,7 +150,8 @@ export function withRecoveryEpisodes(line: TrainLineProjection, recoveries: NonN
  * projection; it never arbitrates between these independent observations. */
 export const TrainLineFactsSchema = z.object({
   retired: z.boolean().optional(),
-  queue: z.array(z.object({ id: z.string() })).default([]),
+  queue: z.array(z.object({ id: z.string(), pr: z.number().int().positive().nullish(), at: z.number().optional(),
+    conflict_park: z.boolean().optional() })).default([]),
   currently: z.object({ phase: z.string().optional(), pr: z.number().nullable().optional() }).nullable().optional(),
   stop: z.object({ kind: z.enum(["base_red", "checks_unconfirmed"]).optional(), reason: z.string().optional(), failing: z.array(EvidenceSchema).optional() }).nullable().optional(),
   verifying_base: z.object({ tip_sha: z.string().min(1), verdict: z.enum(["unsettled", "settling", "green"]) }).nullable().optional(),
@@ -156,10 +159,13 @@ export const TrainLineFactsSchema = z.object({
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
     at: z.number(),
-    entries: z.array(z.object({ id: z.string(), cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]) })).optional(),
+    entries: z.array(z.object({ id: z.string(), pr: z.number().int().positive().nullish(), cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]) })).optional(),
+    candidates_observed: z.object({ at: z.number(), base_sha: z.string().min(1) }).optional(),
+    scan: TrainQueueScanSchema.optional(),
     base_observed_at: z.number().optional(),
     base_state: z.object({
       verdict: z.enum(["green", "settling", "red", "unsettled", "empty"]),
+      tip_sha: z.string().optional(),
       red: z.array(EvidenceSchema).optional(),
       /** BR#14088: required checks in flight (queued/in_progress) or required
        *  names with no run yet — amber, never green. */
@@ -172,6 +178,7 @@ export const TrainLineFactsSchema = z.object({
   }).nullable().optional(),
   base_red_resolution: BaseRedResolutionSchema.nullable().optional(),
   diagnostic: TrainFixCardSchema.nullable().optional(),
+  conflict_repair: TrainFixCardSchema.nullable().optional(),
   diagnostic_ask: ActionSchema.nullable().optional(),
   merge_response: z.discriminatedUnion("phase", [
     z.object({ phase: z.literal("recorded"), pr: z.number().int().positive(), at: z.number() }),
@@ -291,9 +298,28 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
     "GitHub rejected the selected PR merges. The executor must reconcile branch policy and required checks before retrying.",
     ask ? { kind: "human", text: ask.question, action: ask }
       : { kind: "attention", text: "Bridge must repair the rejected merge. No bypass-merge request has been issued for this failure." });
+  const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
+    || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
+  const observation = q?.candidates_observed;
+  if (fresh && bs?.verdict === "green" && executorLive && !f.currently && q?.scan?.phase === "complete"
+    && observation && observation.base_sha === bs.tip_sha && now - observation.at < 15 * 60_000 && f.queue.length) {
+    const entries = new Map(q.entries?.map(entry => [entry.id, entry]));
+    const allConflicting = f.queue.every(car => {
+      const entry = entries.get(car.id);
+      return car.conflict_park === true && car.pr != null && car.at != null && car.at <= observation.at
+        && entry?.pr === car.pr && entry.cls === "conflict";
+    });
+    if (allConflicting) {
+      const numbers = f.queue.slice(0, 3).map(car => `#${car.pr}`).join(", ");
+      const prs = `${numbers}${f.queue.length > 3 ? ` and ${f.queue.length - 3} more` : ""}`;
+      const repair = f.conflict_repair;
+      return error("candidate_conflict", `Main's required checks are green. ${f.queue.length === 1 ? "PR" : "PRs"} ${prs} must be rebased before merging.`,
+        repair && !["done", "superseded"].includes(repair.status)
+          ? taskRemediation(repair)
+          : { kind: "machine", text: "Bridge owns conflict recovery: resolve and push a signed rebase, then verify the new head.", url: null });
+    }
+  }
   if (f.starved) {
-    const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
-      || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
     const mins = Math.max(1, Math.floor((now - f.starved.since) / 60_000));
     const ready = q?.entries?.filter(e => e.cls === "ready").length ?? 0;
     const reason = `Changes have waited ${mins} minutes without a merge. ${fresh && bs?.verdict === "green" ? "Main's required checks are green. " : ""}`
@@ -321,7 +347,6 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       "checks_running", [],
       { kind: "machine", text: "Watching required checks; changes resume automatically when they pass.", url: null });
   }
-  const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000) || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
   if (!f.queue.length) return make("idle", "idle", "No queued changes.", null, [], null);
   if (!executorLive) return error("no_executor",
     "Changes are waiting, but no machine is processing this line.", repair());

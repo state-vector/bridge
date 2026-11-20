@@ -98,6 +98,8 @@ reported separately. Use the live-tail wall/CPU measurements for end-to-end late
 An admitted PR with confirmed merge conflicts stays visible in the train queue
 while Bridge schedules its repair. Gateway retries do not add another bounce
 or extend the repair deadline, and independent candidates can still advance.
+When a fresh scan confirms every queued PR conflicts with green main, the
+lane shows **Queued PRs need a rebase**, not a merge machinery outage.
 
 From a registered checkout with dependencies installed and `wrangler whoami`
 authenticated, capture live traffic with:

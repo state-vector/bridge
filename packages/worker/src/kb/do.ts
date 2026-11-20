@@ -16287,6 +16287,12 @@ export class KnowledgeHub {
     const parsedCov = baseState?.deploy_coverage ? DeployCoverageStateSchema.safeParse(baseState.deploy_coverage) : null;
     const deployCov: DeployCoverageState | null = parsedCov?.success ? parsedCov.data : null;
     const prevDispatchedSha = String(meta.lane?.deploy_dispatched?.sha ?? "");
+    const queueObservedAt = Date.now();
+    // Only the completed candidate walk can re-date conflict evidence.
+    // A base refresh or a retry acknowledgement cannot re-certify old PRs.
+    const candidatesObserved = !entries ? preservedQf.candidates_observed
+      : body.scan?.phase === "complete" && typeof rawBaseState?.tip_sha === "string" && rawBaseState.tip_sha
+        ? { at: queueObservedAt, base_sha: rawBaseState.tip_sha } : undefined;
     const nextDeployDispatched =
       deployCov?.phase === "uncovered_dispatched"
         ? {
@@ -16299,13 +16305,14 @@ export class KnowledgeHub {
     meta.lane = {
       ...(meta.lane ?? {}),
       queue_facts: {
-        at: Date.now(),
+        at: queueObservedAt,
         // Freshness belongs to the main observation, not lease liveness,
         // queue entries, consumption acks, or the awaiting sweep. Migrate
         // legacy facts before changing their queue publication timestamp.
         base_observed_at: rawBaseState ? Date.now() : trainBaseObservedAt(meta.lane?.queue_facts),
         scan,
         entries: entriesArr,
+        ...(candidatesObserved ? { candidates_observed: candidatesObserved } : {}),
         ...(baseState ? { base_state: baseState } : preservedQf.base_state ? { base_state: preservedQf.base_state } : {}),
         ...(stalled ? { stalled } : preservedQf.stalled ? { stalled: preservedQf.stalled } : {}),
         ...(conflictPairs ? { conflict_pairs: conflictPairs } : preservedQf.conflict_pairs ? { conflict_pairs: preservedQf.conflict_pairs } : {}),
@@ -18680,6 +18687,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       return line;
     }
     if (line.phase === "idle" || line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
+    if (line.blocker === "candidate_conflict") return line; // sweepConflictingCars owns candidate repair
     const inactiveRepair = line.blocker === "main_failed" && line.remediation?.kind === "queued"
       && line.remediation.task.status === "in_progress" && !line.remediation.task.active_agent;
     if (line.remediation?.kind !== "attention" && !inactiveRepair) return line;
@@ -19501,6 +19509,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       // - "ready"     → green solid (.tb-ready): verified & ready to merge
       // - "verifying" → orange pulsing (.tb-verifying): actively being verified now
       // - "waiting"   → orange solid (.tb-wait): waiting to be verified
+      const confirmedConflicts = new Map<string, string | null>();
       const { prStats, batches } = (() => {
         const facts = meta.lane?.queue_facts?.entries ?? [];
         const factFor = (id: string, pr?: number) =>
@@ -19579,6 +19588,13 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           }
           const fact = factFor(q.id, q.pr);
           const cls = String(fact?.cls ?? "");
+          const conflict = qCardMeta.merge_train;
+          if (cls === "conflict" && mergePhaseOf(qCardMeta) === "conflicting"
+            && conflict.repo === lane.repo && Number(conflict.pr) === q.pr
+            && (conflict.conflicting_base ?? lane.base) === lane.base) {
+            const dutyId = conflict.conflicting_alarm?.duty_id;
+            confirmedConflicts.set(q.id, typeof dutyId === "string" ? dutyId : null);
+          }
           const readiness = TrainCarReadinessSchema.safeParse(fact?.readiness);
           const fresh = readiness.success && readiness.data.base_sha === observedBase?.tip_sha
             && readiness.data.observed_at >= now0 - TRAIN_READY_MS;
@@ -20002,12 +20018,15 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         WHERE repo=? AND pr=? AND kind='pr_merged' AND state='verified' AND ok=1`, lane.repo, responsePr) : null;
       const mergeResponse = mergeProbe ? { phase: "observed_merged", pr: responsePr, at: Number(mergeProbe.updated_ts), receipt: String(mergeProbe.receipt) }
         : pendingMerge && responsePr > 0 ? { phase: "recorded", pr: responsePr, at: Number(pendingMerge.at) } : null;
+      const conflictDutyId = queue.length === 1 ? confirmedConflicts.get(queue[0].id) : null;
       const lineFacts = TrainLineFactsSchema.safeParse({
-        queue, currently: meta.currently ?? null, verifying_base: verifyingBase,
+        queue: queue.map(car => ({ ...car, conflict_park: confirmedConflicts.has(car.id) })),
+        currently: meta.currently ?? null, verifying_base: verifyingBase,
         stop: meta.stop?.kind === undefined && meta.stop?.reason === `CI unknown past the fail-closed bound (~${TRAIN_CI_BOUND_MULTIPLIER}× typical)`
           ? { ...meta.stop, kind: "checks_unconfirmed" } : meta.stop ?? null,
         lease: meta.lease ?? null, capable, queue_facts: brQf,
-        base_red_resolution, diagnostic, merge_response: mergeResponse,
+        base_red_resolution, diagnostic, conflict_repair: conflictDutyId ? this.enrichFixCardRow(conflictDutyId, now0) : null,
+        merge_response: mergeResponse,
         diagnostic_ask: diagnosticAskRow ? { id: diagnosticAskRow.id, url: this.cardUrl(diagnosticAskRow.id), question: diagnosticAskRow.title, options: diagnosticAskMeta?.ask?.options ?? [] } : stalled_resolution?.ask ?? null,
         starved, bypass_wait: meta.bypass_wait ?? null,
         attempt: headHold ? { note: headHold.note, hold: headHold.class } : null,

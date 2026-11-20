@@ -52,6 +52,37 @@ describe("one line status and recovery contract", () => {
     const absent = projectTrainLine(facts({ queue: [{ id: "BR#1" }], starved: { since: 1 } }), now);
     expect(absent.reason).toContain("No live merge executor is confirmed");
   });
+  it("attributes a fresh conflict-only scan to its PR, not yesterday's lane diagnostic", () => {
+    const tip = "a".repeat(40);
+    const car = { id: "BR#9604", pr: 3482, at: now - 1000, conflict_park: true };
+    const observation = { at: now, base_sha: tip };
+    const entry = { id: car.id, pr: car.pr, cls: "conflict" };
+    const q = { at: now, scan: { phase: "complete" }, candidates_observed: observation, entries: [entry],
+      base_state: { tip_sha: tip, verdict: "green" } };
+    const repair = { ...task, id: "BR#10479", url: "https://hub.test/card/BR-10479", title: "Resolve merge conflict",
+      active_agent: false, status: "blocked", blocked_reason: "Retry budget exhausted." };
+    const input = { queue: [car], starved: { since: 1 }, lease: { holder: "gateway", heartbeat_ts: now },
+      diagnostic: task, conflict_repair: repair, queue_facts: q };
+    const line = projectTrainLine(facts(input), now);
+    expect(line).toMatchObject({ blocker: "candidate_conflict", label: "Queued PRs need a rebase",
+      remediation: { kind: "blocked", task: { id: repair.id }, text: "Retry budget exhausted." } });
+    expect(line.reason).toContain("PR #3482");
+    expect(JSON.stringify(line)).not.toContain(JSON.stringify(task.url));
+    for (const extra of [
+      { queue: [car, { id: "BR#2", pr: 2, at: now }] },
+      { queue: [{ ...car, at: now + 1 }] },
+      { queue: [{ ...car, conflict_park: false }] },
+      { queue_facts: { ...q, scan: { phase: "checking", after_id: car.id } } },
+      { queue_facts: { ...q, candidates_observed: { at: now - 16 * 60_000, base_sha: tip } } },
+      { queue_facts: { ...q, base_state: { verdict: "green", tip_sha: "b".repeat(40) } } },
+      { queue_facts: { ...q, entries: [{ ...entry, pr: 99 }] } },
+      { queue_facts: { ...q, entries: [{ ...entry, cls: "ready" }] } },
+      { queue_facts: { ...q, stalled: { last_error: "GitHub refused the merge" } } },
+      { currently: { phase: "awaiting-ci", pr: 99 } },
+      { stop: { kind: "base_red" } },
+      { lease: null },
+    ]) expect(projectTrainLine(facts({ ...input, ...extra }), now).blocker).not.toBe("candidate_conflict");
+  });
   it("shows the actual priority capacity handoff rather than passively waiting for an executor", () => {
     const repair = { ...task, status: "todo", active_agent: false, execution_blockers: [{ kind: "capacity_wait" as const, episode_id: "capacity", text: "Full" }],
       preemption: { phase: "stopping_verification" as const, recovery_id: task.id, victim_id: "BR#2", generation: 1, attempt_id: "one", session: "verify", requested_at: now, checkpoint_commit: "a".repeat(40) } };
