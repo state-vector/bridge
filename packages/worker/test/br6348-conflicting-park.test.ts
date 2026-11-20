@@ -241,6 +241,17 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
       note: `merge-train: queued — VERIFY ACCEPT (drill). PR ${REPO}#310 head ${head}.`,
       await_event: { event: "pr_merged", repo: REPO, n: 310 },
     })).status).toBe(200);
+    const beforeAdmission = await kbJson("/train.event", {
+      repo: REPO, kind: "bounced", actor: "gw-conflict-3",
+      pr: 310, task_id: id, head_sha: head, bounce_kind: "conflict", conflict_files: ["a.ts"],
+    });
+    expect(beforeAdmission.body).toMatchObject({ ignored: "not a train-owned, reviewed head" });
+    await completePrReview(kbJson, id, [{ repo: REPO, number: 310, head_sha_at_acceptance: head }]);
+    const stale = await kbJson("/train.event", {
+      repo: REPO, kind: "bounced", actor: "gw-conflict-3",
+      pr: 310, task_id: id, head_sha: "a".repeat(40), bounce_kind: "conflict", conflict_files: ["a.ts"],
+    });
+    expect(stale.body).toMatchObject({ ignored: "not a train-owned, reviewed head" });
     const ev1 = await kbJson("/train.event", {
       repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-3",
       pr: 310, task_id: id, head_sha: head, bounce_kind: "conflict",
@@ -250,11 +261,21 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     const parked = (await kbJson("/get", { id })).body;
     const clockAt = parked.meta.merge_train.conflicting_at;
     expect(clockAt).toBeGreaterThan(0);
+    const release = await kbJson("/train.lease", { repo: REPO, action: "release", actor: "gw-conflict-3" });
+    expect(release.body.error).toBeUndefined();
+    await healthyLane(REPO, "gw-conflict-3-replacement");
+    const replay = await kbJson("/train.event", {
+      repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-3-replacement",
+      pr: 310, task_id: id, head_sha: head, bounce_kind: "conflict",
+      conflict_files: ["a.ts"], reason: "Equivalent observation after gateway restart",
+    });
+    expect(replay.body).toMatchObject({ already_parked: true });
+    expect((await kbJson("/get", { id })).body).toMatchObject({ updated_ts: parked.updated_ts });
 
     // main moved; the re-verdict names a DIFFERENT file set — facts refresh,
     // the clock does not
     const ev2 = await kbJson("/train.event", {
-      repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-3",
+      repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-3-replacement",
       pr: 310, task_id: id, head_sha: head, bounce_kind: "conflict",
       conflict_files: ["b.ts", "c.ts"], reason: "PR #310 unmergeable — CONFLICTING against base (moved main)",
     });
@@ -262,8 +283,11 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     const cur = (await kbJson("/get", { id })).body;
     expect(cur.status).toBe("blocked"); // in place — no pool churn
     expect(cur.meta.merge_train.conflicting_at).toBe(clockAt);
+    expect(cur.meta.boosted).toBe(parked.meta.boosted);
     expect(cur.meta.merge_train.conflict_files).toEqual(["b.ts", "c.ts"]);
     expect(String(cur.meta.blocked?.reason ?? "").match(/BR#6348/g)?.length).toBe(1);
+    const ledger = (await kbJson("/train.history", { repo: REPO, pr: 310, kind: "bounced" })).body.events;
+    expect(ledger).toHaveLength(1);
   });
 
   it("leg 4 — past the budget Bridge schedules one conflict repair duty and no human ask", async () => {
@@ -277,6 +301,7 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
       note: `merge-train: queued — VERIFY ACCEPT (drill). PR ${REPO}#311 head ${head}.`,
       await_event: { event: "pr_merged", repo: REPO, n: 311 },
     })).status).toBe(200);
+    await completePrReview(kbJson, id, [{ repo: REPO, number: 311, head_sha_at_acceptance: head }]);
     const ev1 = await kbJson("/train.event", {
       repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-4",
       pr: 311, task_id: id, head_sha: head, bounce_kind: "conflict",
@@ -321,6 +346,7 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
       note: `merge-train: queued — VERIFY ACCEPT (drill). PR ${REPO}#312 head ${head}.`,
       await_event: { event: "pr_merged", repo: REPO, n: 312 },
     })).status).toBe(200);
+    await completePrReview(kbJson, id, [{ repo: REPO, number: 312, head_sha_at_acceptance: head }]);
     const ev1 = await kbJson("/train.event", {
       repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-5",
       pr: 312, task_id: id, head_sha: head, bounce_kind: "conflict",
@@ -336,6 +362,13 @@ describe("BR#6348 legs 2-4 — the bounce park, the clock, the alarm (integratio
     expect(cur.meta.merge_train.state).toBe("bounced");
     expect(cur.meta.merge_train.conflicting_at).toBeUndefined();
     expect(cur.meta.merge_train.conflicting_alarm).toBeUndefined();
+    expect(cur.meta.merge_train.conflicting_head).toBeUndefined();
+    const late = await kbJson("/train.event", {
+      repo: REPO, base: "main", kind: "bounced", actor: "gw-conflict-5",
+      pr: 312, task_id: id, head_sha: head, bounce_kind: "conflict", conflict_files: ["do.ts"],
+    });
+    expect(late.body).toMatchObject({ ignored: "not a train-owned, reviewed head" });
+    expect((await kbJson("/get", { id })).body.status).toBe("in_progress");
   });
 });
 import { completePrReview } from "./completion-fixture";

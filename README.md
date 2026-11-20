@@ -95,6 +95,10 @@ Slow hub requests also emit structured `bridge.request` stage timings to Cloudfl
 Processing-stage durations use the runtime's event clock; ingress/hop waits are
 reported separately. Use the live-tail wall/CPU measurements for end-to-end latency.
 
+An admitted PR with confirmed merge conflicts stays visible in the train queue
+while Bridge schedules its repair. Gateway retries do not add another bounce
+or extend the repair deadline, and independent candidates can still advance.
+
 From a registered checkout with dependencies installed and `wrangler whoami`
 authenticated, capture live traffic with:
 

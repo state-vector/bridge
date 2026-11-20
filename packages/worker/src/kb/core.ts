@@ -2259,6 +2259,8 @@ export function clearConflictingEpisode(mt: Record<string, unknown> | undefined)
   if (!mt) return;
   delete mt.conflicting_at;
   delete mt.conflicting_alarm;
+  delete mt.conflicting_base;
+  delete mt.conflicting_head;
 }
 // BR#6045: the queue-note matcher binds BOTH the canonical `merge-train:
 // queued` prefix AND the semantically-equivalent re-queue spelling

@@ -3670,7 +3670,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // establishes the typed park with the trial-merge file list.
         let gate = match gate {
             MergeAction::Bounce { bounce_kind: crate::train_gate::BounceKind::Conflict, defect }
-                if card_meta.pointer("/merge_train/state").and_then(|v| v.as_str()) == Some("conflicting") =>
+                if conflict_already_parked(&card_meta, repo, base, pr, &head_sha) =>
             {
                 log(Some(key), &format!("queue[{qi}] PR #{pr} ({head_id}) already parked TYPED conflicting — skip (the bounded clock + budget alarm own the exit, BR#6348)"));
                 MergeAction::Skip { reason: format!("parked conflicting (BR#6348) — the typed clock + budget alarm own the exit; {defect}") }
@@ -3984,7 +3984,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
                 }
                 stamp_canary(&mut ev, canary);
-                ctx.mcp("train_event", ev)?;
+                let reply = ctx.mcp("train_event", ev)?;
+                if reply.get("ignored").is_some() || reply["already_parked"] == true {
+                    log(Some(key), &format!("PR #{pr}: no new bounce; continuing the queue"));
+                    return Ok(());
+                }
                 ctx.note(&format!("bounced PR #{pr} [{}] — {}", event_kind, trunc(&defect, 120)));
                 let files_note = match event_kind {
                     "conflict" => format!("conflicts in {} file(s): {}{}", files.len(), files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if files.len() > 5 { ", …" } else { "" }),
@@ -4402,7 +4406,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         // trial-merge ground truth, same as the generic Bounce
                         // arm. BR#5252 (c): the raw gh refusal rides the
                         // event — diagnosis needs no archaeology.
-                        let conflict_reason = format!("base {base} advanced into the PR's files — rebase conflicts are human-resolved; the verdict does not carry");
+                        let conflict_reason = format!("base {base} advanced into the PR's files; mechanical conflict recovery must resolve them before fresh review");
                         let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, tm_files.len());
                         let mut ev = json!({
                             "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha,
@@ -4412,7 +4416,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                         if event_kind == "conflict" {
                             ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(tm_files));
                         }
-                        ctx.mcp("train_event", ev)?;
+                        let reply = ctx.mcp("train_event", ev)?;
+                        if reply.get("ignored").is_some() || reply["already_parked"] == true {
+                            log(Some(key), &format!("PR #{pr}: no new conflict bounce; continuing batch"));
+                            continue;
+                        }
                         ctx.note(&format!("bounced PR #{pr} [{event_kind}] — {}", trunc(&conflict_reason, 120)));
                         let files_note = format!("conflicts in {} file(s): {}{}", tm_files.len(), tm_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "), if tm_files.len() > 5 { ", …" } else { "" });
                         log(Some(key), &format!("PR #{pr} bounced ({event_kind}) — {files_note}; continuing batch"));
@@ -4594,6 +4602,15 @@ enum PreparationMode {
     Prepare,
 }
 
+fn conflict_already_parked(meta: &Value, repo: &str, base: &str, pr: i64, head: &str) -> bool {
+    let park = &meta["merge_train"];
+    vstr(park, "state") == Some("conflicting")
+        && vstr(park, "repo") == Some(repo)
+        && park["pr"].as_i64() == Some(pr)
+        && vstr(park, "conflicting_base").unwrap_or(base) == base
+        && vstr(park, "conflicting_head").unwrap_or(head) == head
+}
+
 /// Prepare the next batch during settlement. Dispatch confirmed conflicts
 /// and integrate one clean, reviewed worker branch per pass so its new checks
 /// can run alongside the current deployment.
@@ -4649,7 +4666,7 @@ fn prepare_next_batch(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &V
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_lowercase();
-        if head_sha.is_empty() {
+        if head_sha.is_empty() || conflict_already_parked(&card_meta, repo, base, pr, &head_sha) {
             continue;
         }
         // behind: base tip is NOT an ancestor of the head
@@ -4683,13 +4700,14 @@ fn prepare_next_batch(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &V
             }
             // BR#4066 refinement rides here too — one law, both implementations.
             let event_kind = crate::train_gate::bounce_event_kind(&crate::train_gate::BounceKind::Conflict, clean, files.len());
-            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files — rebase conflicts bounced to impl agent to resolve; the verdict does not carry");
+            let reason = format!("settle-window probe (BR#4934): base {base} advanced into the PR's files; mechanical conflict recovery must resolve them before fresh review");
             let mut ev = json!({ "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id, "head_sha": head_sha, "bounce_kind": event_kind, "reason": reason });
             if event_kind == "conflict" {
                 ev.as_object_mut().unwrap().insert("conflict_files".into(), json!(files));
             }
             match ctx.mcp("train_event", ev) {
-                Ok(_) => log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — bounced to impl agent to resolve", files.len())),
+                Ok(reply) if reply.get("ignored").is_some() => log(Some(key), &format!("settle-window probe: stale conflict observation ignored for PR #{pr}")),
+                Ok(_) => log(Some(key), &format!("settle-window probe: PR #{pr} conflicts ({} file(s)) — recorded for mechanical recovery", files.len())),
                 Err(error) => log(Some(key), &format!("Could not dispatch conflict repair for PR #{pr}: {}", trunc(&error, 120))),
             }
             continue;
@@ -8456,6 +8474,7 @@ mod tests {
         for (pr, head) in [(1, &conflict_one), (2, &clean), (3, &conflict_two)] {
             repo.git(&["push", "-q", "origin", &format!("{head}:refs/pull/{pr}/head")]);
         }
+        repo.git(&["push", "-q", "origin", &format!("{conflict_one}:refs/pull/5/head")]);
         repo.advance_main("base now conflicts");
         let heads = [conflict_one, clean, conflict_two];
         let cards = heads.clone();
@@ -8464,6 +8483,13 @@ mod tests {
                 let id = call_args(params)["id"].as_str().unwrap();
                 if id == "BR#4" { return Err("lookup unavailable".into()); }
                 let pr = id.strip_prefix("BR#").unwrap().parse::<usize>().unwrap();
+                if pr == 5 {
+                    return Ok(json!({ "status": "blocked", "meta": {
+                        "prs": [{ "repo": "o/r", "number": 5, "head_sha_at_acceptance": cards[0] }],
+                        "merge_train": { "state": "conflicting", "repo": "o/r", "pr": 5,
+                            "conflicting_base": "main", "conflicting_head": cards[0] }
+                    } }));
+                }
                 Ok(json!({ "status": "blocked", "meta": {
                     "prs": [{ "repo": "o/r", "number": pr, "head_sha_at_acceptance": cards[pr - 1] }],
                     "merge_train": { "state": "queued", "pr": pr }
@@ -8480,7 +8506,7 @@ mod tests {
             if cmd != "gh" { return None; }
             if args[0] == "pr" {
                 let pr = args[2].parse::<usize>().unwrap();
-                return Some(Ok(json!({"state":"OPEN", "baseRefName":"main", "headRefOid": heads[pr - 1]}).to_string()));
+                return Some(Ok(json!({"state":"OPEN", "baseRefName":"main", "headRefOid": heads[if pr == 5 { 0 } else { pr - 1 }]}).to_string()));
             }
             if args[1].ends_with("/commits") {
                 return Some(Ok(signature_fixture(args, json!([{ "sha": heads[1], "verified": true, "login": "detached-cody" }]))));
@@ -8491,7 +8517,7 @@ mod tests {
             Some(Ok("{}".into()))
         }));
         settle_window_rebase(&mut ctx, "o/r@main", "o/r", "main",
-            &json!({"queue":[{"id":"BR#1"},{"id":"BR#4"},{"id":"BR#2"},{"id":"BR#3"}]}), PreparationMode::Prepare).unwrap();
+            &json!({"queue":[{"id":"BR#5"},{"id":"BR#1"},{"id":"BR#4"},{"id":"BR#2"},{"id":"BR#3"}]}), PreparationMode::Prepare).unwrap();
         assert!(updated.load(Ordering::SeqCst));
         let calls = calls.lock().unwrap();
         let conflicts: Vec<_> = calls.iter().filter(|c| call_name(c) == "train_event")
