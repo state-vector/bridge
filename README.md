@@ -325,6 +325,13 @@ already-spawned round. The card view renders the criteria list (collapsed) with
 per-criterion verdicts once a review result carries them. Criteria-less parents
 render the exact generic duty template — adoption is incremental, no migration.
 
+Bridge binds a queued review to the submitted delivery reference. A replacement
+pull request or a changed frozen criterion creates a fresh duty. Unclaimed duties
+can be reused when their delivery reference and criteria match the submission.
+Claimed reviews keep their original subject, and acceptance must name the
+submitted pull request or direct-main commit. Include the full head SHA in the
+submission when the review must cover that exact revision.
+
 A merge observation or provenance row resumes independent delivery verification;
 it does not itself prove CI or mark a leg landed. A live canonical lane already
 settling that task retains its exit. Reconcile reports `reverse_verifying` and

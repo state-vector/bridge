@@ -7,7 +7,7 @@ import { initialExecution, type ReviewResult } from "@bridge/contracts";
 let mf: Miniflare;
 let stub: { fetch(url: string, init: RequestInit): Promise<Response> };
 interface Reply {
-  id: string; status: string; verify_task: string; error?: string; result_class?: string;
+  id: string; status: string; verify_task: string; body_md?: string; error?: string; result_class?: string;
   meta: { completion: { kind: string }; execution_result?: object; merge_train?: object; review_result?: object;
     work_revision: string; review_subject?: { task_id: string; revision: string } };
 }
@@ -387,5 +387,45 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect(second.body.verify_task).toBe(first.body.verify_task);
     await call("transition", { id: second.body.verify_task, to: "in_progress", actor: "new-reviewer", session: "unclaimed-review" });
     expect((await get(second.body.verify_task)).meta.review_subject?.revision).toBe((await get(id)).meta.work_revision);
+  });
+
+  it("offers the replacement PR without reusing a queued review of the previous PR", async () => {
+    const old = `https://github.com/${repo}/pull/3376`;
+    const replacement = `https://github.com/${repo}/pull/3494`;
+    const id = await task(["impl"], {
+      pr: { repo, number: 3376, head_sha_at_acceptance: "b".repeat(40) },
+      acceptance: {
+        authored_by: "analyst", basis: "BR#14118",
+        criteria: [{ id: "exact_ci", kind: "receipt", statement: "Verify full hosted CI for the submitted PR head." }],
+      },
+    });
+    const first = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note: old });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect((await get(first.body.verify_task)).body_md).toContain(old);
+    expect((await call("transition", { id, to: "in_progress", actor: "impl", session: "impl-session", note: "Replace reverted delivery" })).status).toBe(200);
+
+    const next = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note: replacement });
+    expect(next.status, JSON.stringify(next.body)).toBe(200);
+    expect(next.body.verify_task).not.toBe(first.body.verify_task);
+    const offered = await get(next.body.verify_task);
+    expect(offered.body_md).toContain(replacement);
+    expect(offered.body_md).toContain("Verify full hosted CI for the submitted PR head.");
+    expect(offered.body_md).not.toContain(old);
+
+    const requested = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(requested.status, JSON.stringify(requested.body)).toBe(200);
+    expect(requested.body.id).toBe(next.body.verify_task);
+    const retired = await get(first.body.verify_task);
+    expect(retired.status).toBe("superseded");
+    expect(retired.body_md).toContain(old);
+
+    const active = await call("transition", { id: next.body.verify_task, to: "in_progress", actor: "reviewer", session: "fresh-review" });
+    expect(active.status, JSON.stringify(active.body)).toBe(200);
+    const wrong = await call("transition", { id: next.body.verify_task, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(next.body.verify_task, { kind: "accepted_pr", task_id: id,
+        legs: [{ repo, number: 3376, head_sha_at_acceptance: "b".repeat(40) }],
+        criteria: [{ id: "exact_ci", verdict: "met", receipt: "Earlier PR CI was read." }] }) });
+    expect(wrong.status).toBe(400);
+    expect(wrong.body.error).toContain("exact submitted pull request legs");
   });
 });

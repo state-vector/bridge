@@ -235,7 +235,6 @@ import {
   replayStatus,
   BREACH_WINDOW_MS,
   UNBLOCK_FLOOD_MS,
-  isClonableRepoRef,
   prFromNote,
   prTargetsOf,
   prTargetMatch,
@@ -378,6 +377,58 @@ function parentAcceptanceCriteria(meta: unknown): AcceptanceCriteria | null {
   const acceptance = (meta as { acceptance?: unknown } | null | undefined)?.acceptance;
   const parsed = AcceptanceCriteriaSchema.safeParse(acceptance);
   return parsed.success ? parsed.data : null;
+}
+
+type OfferedPullRequest = { repo: string; number: number; head_sha_at_acceptance?: string };
+type ReviewTarget =
+  | { kind: "pull_request"; legs: OfferedPullRequest[] }
+  | { kind: "commit"; repo: string; sha: string }
+  | { kind: "execution" }
+  | { kind: "unspecified" };
+type ReviewOffer = { revision: string; target: ReviewTarget };
+
+function reviewTargetFromNote(note: string): ReviewTarget | null {
+  const legs = trainParseNoteLegs(note);
+  if (legs.length > 0) return { kind: "pull_request", legs };
+  const receipt = parseDirectCommitReceipt(note);
+  return receipt?.repo ? { kind: "commit", repo: receipt.repo, sha: receipt.sha } : null;
+}
+
+function taskReviewTarget(meta: Record<string, unknown>, submittedNote = ""): ReviewTarget {
+  if (!mergeCompletesTask(meta)) return { kind: "execution" };
+  const submitted = reviewTargetFromNote(submittedNote);
+  if (submitted) return submitted;
+  const bound = meta.review_target as ReviewTarget | undefined;
+  if (bound) return bound;
+  const legacyNote = reviewTargetFromNote(String(meta.review_note ?? ""));
+  const active = meta.review_pr as Partial<OfferedPullRequest> | undefined;
+  if (typeof active?.repo === "string" && active.repo && Number(active.number) > 0) {
+    if (legacyNote?.kind === "pull_request") {
+      const leg = legacyNote.legs[0];
+      if (leg?.repo === active.repo && leg.number === Number(active.number)) return legacyNote;
+    }
+    return { kind: "pull_request", legs: [{ repo: active.repo, number: Number(active.number) }] };
+  }
+  if (legacyNote) return legacyNote;
+  const stamp = meta.pr as Partial<OfferedPullRequest> | undefined;
+  if (typeof stamp?.repo === "string" && stamp.repo && Number(stamp.number) > 0) {
+    return { kind: "pull_request", legs: [{ repo: stamp.repo, number: Number(stamp.number),
+      ...(stamp.head_sha_at_acceptance ? { head_sha_at_acceptance: stamp.head_sha_at_acceptance } : {}) }] };
+  }
+  return { kind: "unspecified" };
+}
+
+function sameReviewTarget(a: ReviewTarget, b: ReviewTarget): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function offeredReviewBody(id: string, title: string, target: ReviewTarget, criteria: AcceptanceCriterion[], rootFix = false): string {
+  if (target.kind === "execution") return executionDutyBody(id, title, criteria);
+  const pr = target.kind === "pull_request" ? target.legs[0] : undefined;
+  const link = pr ? `https://github.com/${pr.repo}/pull/${pr.number}`
+    : target.kind === "commit" ? `https://github.com/${target.repo}/commit/${target.sha}` : "see note";
+  return verifyDutyBody(id, title, link, pr ? { repo: pr.repo, n: pr.number } : undefined,
+    pr && rootFix ? { repo: pr.repo, pr: pr.number } : undefined, criteria);
 }
 
 /** BR#14366: the criteria section spliced into a verify/outcome-review duty —
@@ -5095,7 +5146,7 @@ export class KnowledgeHub {
 
   // ---------- ops ----------
 
-  private async create(body: any, actor: string) {
+  private async create(body: any, actor: string, reviewOffer?: ReviewOffer) {
     let type = body.type as ArtefactType;
     if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
     // let: BR#5377 F3 mints the canonical verify-verdict title over the
@@ -5137,7 +5188,8 @@ export class KnowledgeHub {
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
-    if (["review_result", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
+    if (["review_result", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
+    if (reviewOffer) createMeta.review_offer = reviewOffer;
     // BR#14366 (ADR BR#14118): acceptance criteria are validated on write —
     // unknown kinds, duplicate ids and empty statements are malformed bars.
     if (createMeta.acceptance !== undefined) createMeta.acceptance = AcceptanceCriteriaSchema.parse(createMeta.acceptance);
@@ -5674,7 +5726,7 @@ export class KnowledgeHub {
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
     if (metaDel.includes(LANE_REVISION) || body.meta && Object.hasOwn(body.meta, LANE_REVISION)) throw new Error("gate: lane revisions are owned by canonical persistence");
-    if (["review_result", "execution_review_of", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
+    if (["review_result", "execution_review_of", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
       || (body.meta && Object.hasOwn(body.meta, k) && JSON.stringify(body.meta[k]) !== JSON.stringify(preMeta[k]))))
       throw new Error("gate: review results and subject bindings are owned by the review lifecycle, not metadata updates");
     if (row.type === "task" && !OWNER_RELEASE_EXEMPT.test(actor)) {
@@ -5854,7 +5906,7 @@ export class KnowledgeHub {
     for (const k of ["lane", "lease", "currently", "stop", "blocked"]) {
       if (oldMeta[k] !== undefined && stub[k] === undefined) { stub[k] = oldMeta[k]; infraPreserved.push(k); }
     }
-    for (const k of ["review_result", "review_subject", "work_revision", "human_delivery_approval", "wait_repair_result"]) {
+    for (const k of ["review_result", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"]) {
       if (oldMeta[k] !== undefined) stub[k] = oldMeta[k]; // lifecycle-owned keys ride verbatim
     }
     const newBytes = utf8Bytes(JSON.stringify(stub));
@@ -7968,6 +8020,25 @@ export class KnowledgeHub {
       || this.one(`SELECT 1 FROM dispatch_reservations WHERE task_id=?`, id));
   }
 
+  private unclaimedReview(id: string) {
+    const row = this.one(`SELECT * FROM artefacts WHERE id=? AND status='todo' AND (owner IS NULL OR owner='')`, id);
+    if (!row) return null;
+    const meta = JSON.parse(String(row.meta ?? "{}"));
+    if (meta.review_subject || this.staleReviewHasExecutionHold(id, meta)) return null;
+    return { row, meta };
+  }
+
+  private retireReplacedReview(current: CurrentTaskReview, replacement: string) {
+    if (current.phase !== "pending" || current.id === replacement) return;
+    const pending = this.unclaimedReview(current.id);
+    if (!pending) return;
+    try { this.conserveDelivery(pending.row, "", false); } catch { return; }
+    const now = Date.now();
+    this.state.storage.sql.exec(`UPDATE artefacts SET status='superseded', status_ts=?, updated_ts=? WHERE id=?`, now, now, current.id);
+    this.version(current.id, "system:review", "transition", `Review replaced by ${replacement} for the current submitted delivery`,
+      { from: "todo", to: "superseded", replacement });
+  }
+
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
   private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
@@ -8086,7 +8157,14 @@ export class KnowledgeHub {
       openVerifyChild: () => {
         const current = this.currentTaskReview(id);
         if (current.phase !== "pending") return null;
-        return this.one(`SELECT id FROM artefacts WHERE id=? AND json_type(meta,'$.review_subject') IS NULL`, current.id);
+        const pending = this.unclaimedReview(current.id);
+        if (!pending) return null;
+        const parentMeta = JSON.parse(String(row.meta ?? "{}"));
+        const target = taskReviewTarget(parentMeta, String(body.note ?? ""));
+        const offer = pending.meta.review_offer as ReviewOffer | undefined;
+        const sameTarget = offer ? sameReviewTarget(offer.target, target) : target.kind === "execution" || target.kind === "unspecified";
+        return sameTarget && JSON.stringify(pending.meta.acceptance_snapshot ?? null) === JSON.stringify(parentAcceptanceCriteria(parentMeta))
+          ? { id: current.id } : null;
       },
       // The canonical query above already includes detached rounds.
       openVerifyRound: () => null,
@@ -8352,6 +8430,17 @@ export class KnowledgeHub {
     // business definition. Origin is selected by the server call path, never
     // from an argument a client can forge. Every submission still advances.
     if (row.type === "task" && (body.to === "in_review" || origin === "client" && body.body_md !== undefined && String(body.body_md) !== row.body_md)) meta.work_revision = crypto.randomUUID();
+    if (row.type === "task" && body.to === "in_review" && effectiveRole(tRoles) !== "review") {
+      const note = String(body.note ?? "");
+      const target = taskReviewTarget(meta, note);
+      meta.review_target = target;
+      if (note) meta.review_note = note.slice(0, 600);
+      if (target.kind === "pull_request") {
+        const { repo, number } = target.legs[0];
+        meta.review_pr = { repo, number };
+      }
+      else delete meta.review_pr;
+    }
     if (row.type === "task" && body.to === "in_progress" && effectiveRole(tRoles) === "review" && !meta.review_subject) {
       const subjects = new Set(this.state.storage.sql.exec(`SELECT dst_id FROM relations WHERE src_id=? AND relation='child_of'`, id).toArray().map(r => String(r.dst_id)));
       if (typeof meta.execution_review_of === "string") subjects.add(meta.execution_review_of);
@@ -8365,9 +8454,15 @@ export class KnowledgeHub {
           // acceptance, so a criterion added to the parent after spawn never
           // appears in, and never binds, this review round.
           const snapshot = AcceptanceCriteriaSchema.safeParse(meta.acceptance_snapshot);
+          const parentMeta = JSON.parse(String(subjectRow.meta ?? "{}"));
+          const revision = parentMeta.work_revision ?? "legacy";
+          const offer = meta.review_offer as ReviewOffer | undefined;
+          if (offer && (offer.revision !== revision || !sameReviewTarget(offer.target, taskReviewTarget(parentMeta)))) {
+            throw new Error("gate: this unclaimed review belongs to a different submission; request the current independent review");
+          }
           meta.review_subject = ReviewSubjectSchema.parse({
             task_id: subjectId,
-            revision: JSON.parse(subjectRow.meta ?? "{}").work_revision ?? "legacy",
+            revision: offer?.revision ?? revision,
             ...(snapshot.success ? { criteria: snapshot.data.criteria } : {}),
           });
         }
@@ -8393,6 +8488,18 @@ export class KnowledgeHub {
         if (!captured.success || captured.data.task_id !== subject || reviewResult.subject_revision !== captured.data.revision
           || captured.data.revision !== (targetMeta.work_revision ?? "legacy")) throw new Error("gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round");
         if (!mergeCompletesTask(targetMeta) && reviewResult.kind !== "accepted_execution") throw new Error("gate: execution outcomes require accepted_execution; prerequisite or code delivery is not outcome acceptance");
+        const offer = meta.review_offer as ReviewOffer | undefined;
+        if (offer?.target.kind === "pull_request") {
+          const expected = offer.target.legs;
+          const [primary] = expected;
+          const matches = (a: OfferedPullRequest, b: OfferedPullRequest) => a.repo === b.repo && a.number === b.number
+            && (!b.head_sha_at_acceptance || a.head_sha_at_acceptance === b.head_sha_at_acceptance);
+          if (reviewResult.kind !== "accepted_pr" || !primary || !reviewResult.legs.some(leg => matches(leg, primary))
+            || !reviewResult.legs.every(leg => expected.some(pr => matches(leg, pr)))) throw new Error("gate: review acceptance must cover the exact submitted pull request legs");
+        }
+        if (offer?.target.kind === "commit" && (reviewResult.kind !== "accepted_direct_main"
+          || offer.target.repo !== reviewResult.repo || offer.target.sha !== reviewResult.commit))
+          throw new Error("gate: review acceptance must cover the exact submitted commit");
         if (reviewResult.kind === "accepted_pr") {
           const closed = reviewResult.legs.find(leg => this.closedPrReceipt(leg.repo, leg.number));
           if (closed) throw new Error(`gate: ${closed.repo}#${closed.number} closed without merging; record findings or independently verify the replacement delivery`);
@@ -9031,36 +9138,11 @@ export class KnowledgeHub {
           // checks receipts, completes it, then closes the parent (done) or
           // bounces it (in_progress with findings).
           const rootTitle = row.title.replace(/^(?:Verify:\s*)+/, "");
-          // Receipt URL for the verify body. The authoritative meta.pr stamp
-          // (repo+number → canonical URL) wins; a scraped fx.pr must still
-          // parse as a clonable reference — a wrapped-prefix fragment
-          // ("…/state-vector/super") once dispatched a ghost clone and
-          // churned the card (BR#3845). Nothing resolvable → "see note": a
-          // repo-less dispatch, never a ghost clone.
-          const stamp = (meta?.pr ?? {}) as { repo?: unknown; number?: unknown };
-          const reviewNote = String(body.note ?? "");
-          const notePrLegs = trainParseNoteLegs(reviewNote);
-          if (reviewNote) meta.review_note = reviewNote.slice(0, 600);
-          if (notePrLegs.length > 0) {
-            meta.review_pr = { repo: notePrLegs[0].repo, number: notePrLegs[0].number };
-          }
-          if (reviewNote || notePrLegs.length > 0) {
-            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
-          }
-          const directReceipt = parseDirectCommitReceipt(reviewNote);
-          const prLink: string = directReceipt?.repo
-            ? `https://github.com/${directReceipt.repo}/commit/${directReceipt.sha}`
-            : typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
-              ? `https://github.com/${stamp.repo}/pull/${Number(stamp.number)}`
-              : fx.pr && isClonableRepoRef(fx.pr)
-                ? fx.pr
-                : "see note";
-          // BR#5190: the fast-lane note rides the duty only for a QUALIFIED
-          // root-fix parent (tags + binding) with a PR stamp — no stamp, no
-          // fast lane to name.
-          const parentIsRootFix =
-            isRootFixCard({ tags: parseTags(row.tags), meta }) &&
-            typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0;
+          const current = this.currentTaskReview(id);
+          const target = taskReviewTarget(meta);
+          const pr = target.kind === "pull_request" ? target.legs[0] : undefined;
+          const parentIsRootFix = !!pr && isRootFixCard({ tags: parseTags(row.tags), meta })
+            && meta.pr?.repo === pr.repo && Number(meta.pr?.number) === pr.number;
           // BR#14366: the parent's acceptance criteria ride the duty — rendered
           // into the body AND spawn-frozen via acceptance_snapshot (the claim
           // folds the snapshot into review_subject; later parent edits never
@@ -9071,21 +9153,12 @@ export class KnowledgeHub {
             {
               type: "task",
               title: `Verify: ${rootTitle.slice(0, 200)}`,
-              body_md: !mergeCompletesTask(meta) ? executionDutyBody(id, rootTitle, acceptance) : verifyDutyBody(
-                id,
-                rootTitle,
-                prLink,
-                !directReceipt && typeof stamp.repo === "string" && stamp.repo && Number(stamp.number) > 0
-                  ? { repo: stamp.repo, n: Number(stamp.number) }
-                  : undefined,
-                parentIsRootFix ? { repo: String(stamp.repo), pr: Number(stamp.number) } : undefined,
-                acceptance,
-              ),
+              body_md: offeredReviewBody(id, rootTitle, target, acceptance, parentIsRootFix),
               roles: ["review"],
               meta: { ...recoveryReviewMeta(id, meta, parseTags(row.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) },
               project: row.project,
             },
-            actor,
+            actor, { target, revision: String(meta.work_revision ?? "legacy") },
           );
           verifyTaskId = created.id;
           registerReview = true;
@@ -9105,10 +9178,16 @@ export class KnowledgeHub {
             );
             this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
           }
+          this.retireReplacedReview(current, created.id);
           break;
         }
         case "reuse_verify": {
           verifyTaskId = fx.verify;
+          const pending = this.unclaimedReview(fx.verify);
+          if (pending) {
+            pending.meta.review_offer = { target: taskReviewTarget(meta), revision: String(meta.work_revision ?? "legacy") };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(pending.meta), fx.verify);
+          }
           registerReview = !!this.one(`SELECT 1 FROM ledger WHERE artefact_id=? AND kind='mutation'
             AND action='review_registered' AND json_extract(data,'$.task_id')=? LIMIT 1`, fx.verify, id);
           this.audit("system:separation", "verify_reused", id, { verify: fx.verify });
@@ -10831,22 +10910,29 @@ export class KnowledgeHub {
     if (parent.status !== "in_review") throw new Error("submit the implementation to in_review with delivery receipts first; Bridge automatically assigns an independent review");
     const meta = JSON.parse(parent.meta ?? "{}");
     const current = this.currentTaskReview(taskId);
+    const target = taskReviewTarget(meta);
+    const revision = String(meta.work_revision ?? "legacy");
     if (current.phase === "pending") {
-      const duty = this.one(`SELECT meta FROM artefacts WHERE id=?`, current.id);
-      const captured = ReviewSubjectSchema.safeParse(JSON.parse(String(duty?.meta ?? "{}")).review_subject);
-      if (!captured.success || captured.data.revision === (meta.work_revision ?? "legacy"))
+      const duty = this.one(`SELECT meta,body_md FROM artefacts WHERE id=?`, current.id);
+      const dutyMeta = JSON.parse(String(duty?.meta ?? "{}"));
+      const captured = ReviewSubjectSchema.safeParse(dutyMeta.review_subject);
+      const offer = dutyMeta.review_offer as ReviewOffer | undefined;
+      const legacyTarget = reviewTargetFromNote(String(duty?.body_md ?? ""));
+      const matchesOffer = offer ? offer.revision === revision && sameReviewTarget(offer.target, target)
+        : target.kind === "unspecified" || target.kind === "execution"
+          || (captured.success && legacyTarget !== null && sameReviewTarget(legacyTarget, target));
+      if (matchesOffer && (!captured.success || captured.data.revision === revision))
         return { kind: "independent_review", task_id: taskId, id: current.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
     }
     if (current.phase === "accepted" && current.subject.revision === (meta.work_revision ?? "legacy"))
       return { kind: "independent_review", task_id: taskId, id: current.id, status: "awaiting_dependencies", message: "The independent review is accepted. Bridge is resolving the remaining completion conditions." };
-    const receipt = parseDirectCommitReceipt(String(meta.review_note ?? ""));
-    const link = receipt?.repo ? `https://github.com/${receipt.repo}/commit/${receipt.sha}` : meta.review_pr?.repo ? `https://github.com/${meta.review_pr.repo}/pull/${meta.review_pr.number}` : "see delivery receipts on the parent";
     // BR#14366: criteria render into the duty and spawn-freeze into the snapshot
     // (claim folds it into review_subject) — same fencing as the in_review spawn.
     const acc = parentAcceptanceCriteria(meta);
     const acceptance = acc?.criteria ?? [];
-    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: mergeCompletesTask(meta) ? verifyDutyBody(taskId, parent.title, link, undefined, undefined, acceptance) : executionDutyBody(taskId, parent.title, acceptance), roles: ["review"], project: parent.project, meta: { ...recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) }, session: "" }, actor);
+    const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: offeredReviewBody(taskId, parent.title, target, acceptance), roles: ["review"], project: parent.project, meta: { ...recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) }, session: "" }, actor, { target, revision });
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
+    this.retireReplacedReview(current, review.id);
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
   }
