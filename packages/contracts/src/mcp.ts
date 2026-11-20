@@ -219,6 +219,11 @@ export const TOOL_ARG_SCHEMAS = {
     details: z.string().optional(),
     // 2–8 one-click answers; recommended option FIRST, prefixed "(Recommended)"
     options: z.array(z.string()).min(2).max(8).optional(),
+    // ask urgency — the contract v2 ask vocabulary (BR#3008: "time-sensitive"
+    // renders the NOW chip and schedules interrupt priority). BR#18305: the
+    // adapter dropped this field, so every MCP ask collapsed to "normal";
+    // omitted stays "normal" (the native ask.create default).
+    urgency: z.enum(["normal", "time-sensitive"]).optional().describe('Ask urgency: "time-sensitive" surfaces the human-facing NOW chip and interrupt priority; omit for "normal".'),
     artefact_id: z.string().optional(),
     session: z.string().optional(),
   }),

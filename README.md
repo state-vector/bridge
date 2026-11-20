@@ -1985,6 +1985,10 @@ your pointer.
 `urgency` is an ask vocabulary, not a
 sentiment: `"time-sensitive"` renders the urgent NOW chip in the ask band; anything else is
 normal — agents can no longer file an "urgent" ask that renders as a quiet one.
+The MCP `ask_agent` tool accepts the same words (`urgency: "normal" | "time-sensitive"`,
+default `normal`) and forwards them to the hub, so an ask filed over MCP keeps the urgency
+it was filed with (BR#18305 — the connector previously dropped the field, and time-sensitive
+human escalations persisted as `normal`).
 
 **Offline agents are a delivery problem, not a human decision.** After
 `ask_escalation_minutes` (default 30, clamped 5–240), unanswered requests to unavailable
