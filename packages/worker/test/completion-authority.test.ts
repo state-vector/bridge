@@ -480,6 +480,21 @@ describe("positive completion authority on the real SQLite hub", () => {
     expect((await get(current.body.id)).body_md).toContain("all seven scenarios");
   });
 
+  it("returns the submitted review without retiring a newer disposition for another pull request", async () => {
+    const id = await task();
+    const current = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session",
+      note: `https://github.com/${repo}/pull/3494` });
+    expect(current.status).toBe(200);
+    const side = await call("create", { type: "task", title: "Review a separate delivery", roles: ["review"],
+      body_md: `Check https://github.com/${repo}/pull/2999` });
+    expect((await call("link", { src: side.body.id, dst: id, relation: "child_of" })).status).toBe(200);
+
+    const requested = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(requested.status).toBe(200);
+    expect(requested.body.id).toBe(current.body.verify_task);
+    expect((await get(side.body.id)).status).toBe("todo");
+  });
+
   it.each(["commit", "pull request"])("requires a resolved full SHA for an abbreviated %s submission", async kind => {
     const id = await task();
     const note = kind === "commit" ? `https://github.com/${repo}/commit/${commit.slice(0, 7)}`

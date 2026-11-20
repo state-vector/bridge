@@ -24,7 +24,7 @@ export const REVIEW_BACKFILL_BATCH_SQL = `SELECT rowid AS cursor,id,meta,status_
 // a correlated relation subquery scanned every retained review for EACH task
 // in train/watchdog projections. Both branches keep exactly the same authority
 // predicates; newest round (including pending/findings) wins, never a cache.
-export const CURRENT_REVIEW_SQL = `
+export const CURRENT_REVIEW_CANDIDATES_SQL = `
   SELECT c.id,c.status,c.meta,c.created_ts,c.status_ts,c.rowid AS review_order
   FROM artefacts c INDEXED BY idx_task_review_subject
   WHERE c.type='task' AND c.roles LIKE '%"review"%' AND c.status!='superseded' AND ${subject}=?
@@ -37,8 +37,9 @@ export const CURRENT_REVIEW_SQL = `
     AND ${subject} IS NULL
     AND (SELECT COUNT(*) FROM relations parents CROSS JOIN artefacts p ON p.id=parents.dst_id
       WHERE parents.src_id=c.id AND parents.relation='child_of' AND p.type='task')=1
-  ORDER BY created_ts DESC,review_order DESC LIMIT 1
+  ORDER BY created_ts DESC,review_order DESC
 `;
+export const CURRENT_REVIEW_SQL = `${CURRENT_REVIEW_CANDIDATES_SQL} LIMIT 1`;
 
 export const WATCHDOG_REVIEW_LOOKUP_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_delivery_admission_phase

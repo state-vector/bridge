@@ -594,7 +594,7 @@ import {
 } from "./rollup.ts";
 
 import { RequestDiagnostics, type RequestTrace } from "./request-diagnostics";
-import { CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
+import { CURRENT_REVIEW_CANDIDATES_SQL, CURRENT_REVIEW_SQL, REVIEW_LOOKUP_SCHEMA, REVIEW_RECONCILE_BATCH_SIZE, REVIEW_RECONCILE_BATCH_SQL, REVIEW_BACKFILL_BATCH_SQL, WATCHDOG_REVIEW_LOOKUP_SCHEMA, HELD_MERGE_ADMISSIONS_SQL, RETIRE_COORDINATION_SWEEP_SQL, RETIRE_COORDINATION_FOR_TASK_SQL, DELIVERY_ADMISSION_REPLAY_SQL, LATEST_PR_MERGE_SQL } from "./review-query";
 import { STALL_SWEEP_PAGE_SIZE, STALL_SWEEP_PAGE_SQL, STALL_SESSION_PINGS_SQL, STALL_SESSION_LOOKUP_SCHEMA, BREACH_EVENTS_SQL, BREACH_CARDS_SQL, BREACH_CARD_LOOKUP_SCHEMA, LEDGER_LOOKUP_SCHEMA, RECENT_TASK_MUTATIONS_SQL, TASK_HISTORY_SQL, LAST_ACTOR_SIGNAL_SQL, LAST_NUDGE_SQL, RECENT_PROGRESS_SQL } from "./ledger-query";
 import { ARTEFACT_SEARCH_SCHEMA, ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL, ARTEFACT_SEARCH_MIGRATION_SQL } from "./artefact-search-schema";
 import { BOARD_INDEX_SCHEMA, BOARD_RECENT_IDS_SQL } from "./board-query";
@@ -8026,7 +8026,25 @@ export class KnowledgeHub {
   /** One current review round, including detached duties. Closed old rounds
    * cannot outrank a newer pending round or a newer explicit non-acceptance. */
   private currentTaskReview(id: string): CurrentTaskReview {
-    const row = this.one(CURRENT_REVIEW_SQL, id, id);
+    let row = this.one(CURRENT_REVIEW_SQL, id, id);
+    if (row) {
+      const parent = this.one(`SELECT meta FROM artefacts WHERE id=?`, id);
+      const target = taskReviewTarget(JSON.parse(String(parent?.meta ?? "{}")));
+      if (target.kind === "pull_request" && !target.historical) {
+        const belongsToSubmission = (candidate: typeof row) => {
+          const meta = JSON.parse(String(candidate.meta ?? "{}"));
+          if (meta.review_offer) return true;
+          const content = this.one(`SELECT body_md,title FROM artefacts WHERE id=?`, candidate.id);
+          const targets = prTargetsOf({ ...content, meta });
+          return targets.length === 0
+            || targets.some(side => target.legs.some(leg => prTargetMatch(side, leg)))
+            || this.firstReviewRegistration(candidate.id, id);
+        };
+        if (!belongsToSubmission(row)) {
+          row = this.state.storage.sql.exec(CURRENT_REVIEW_CANDIDATES_SQL, id, id).toArray().find(belongsToSubmission);
+        }
+      }
+    }
     if (!row) return { phase: "none" };
     const base = { id: String(row.id), at: Math.max(Number(row.created_ts), Number(row.status_ts)) };
     if (row.status !== "done") return { phase: "pending", ...base };
@@ -8062,9 +8080,7 @@ export class KnowledgeHub {
   ): boolean {
     const rendered = reviewTargetFromNote(String(duty.body_md ?? ""));
     if (!matchesLegacyReviewTarget(rendered, target)) return false;
-    const registered = this.one(`SELECT json_extract(data,'$.subject_revision') AS revision FROM ledger
-      WHERE artefact_id=? AND kind='mutation' AND action='review_registered' AND json_extract(data,'$.task_id')=?
-      ORDER BY seq ASC LIMIT 1`, duty.id, taskId);
+    const registered = this.firstReviewRegistration(duty.id, taskId);
     // Earlier hubs could register the same unclaimed duty twice. Only the
     // first registration identifies the submission that froze its criteria.
     if (registered?.revision === (parentMeta.work_revision ?? "legacy")) return true;
@@ -8072,10 +8088,16 @@ export class KnowledgeHub {
     return sameAcceptanceScope(dutyMeta.acceptance_snapshot, parentAcceptanceCriteria(parentMeta));
   }
 
-  private retireReplacedReview(current: CurrentTaskReview, replacement: string) {
+  private firstReviewRegistration(reviewId: string, taskId: string) {
+    return this.one(`SELECT json_extract(data,'$.subject_revision') AS revision FROM ledger
+      WHERE artefact_id=? AND kind='mutation' AND action='review_registered' AND json_extract(data,'$.task_id')=?
+      ORDER BY seq ASC LIMIT 1`, reviewId, taskId);
+  }
+
+  private retireReplacedReview(taskId: string, current: CurrentTaskReview, replacement: string) {
     if (current.phase !== "pending" || current.id === replacement) return;
     const pending = this.unclaimedReview(current.id);
-    if (!pending) return;
+    if (!pending || (!pending.meta.review_offer && !this.firstReviewRegistration(current.id, taskId))) return;
     try { this.conserveDelivery(pending.row, "", false); } catch { return; }
     const now = Date.now();
     this.state.storage.sql.exec(`UPDATE artefacts SET status='superseded', status_ts=?, updated_ts=? WHERE id=?`, now, now, current.id);
@@ -9234,7 +9256,7 @@ export class KnowledgeHub {
             );
             this.audit(actor, "create", created.id, { type: "task", auto: "verification", parent: id });
           }
-          this.retireReplacedReview(current, created.id);
+          this.retireReplacedReview(id, current, created.id);
           break;
         }
         case "reuse_verify": {
@@ -10986,7 +11008,7 @@ export class KnowledgeHub {
     const acceptance = acc?.criteria ?? [];
     const review = await this.create({ type: "task", title: `Verify: ${parent.title}`, body_md: offeredReviewBody(taskId, parent.title, target, acceptance), roles: ["review"], project: parent.project, meta: { ...recoveryReviewMeta(taskId, meta, parseTags(parent.tags)), ...(acc ? { acceptance_snapshot: acc } : {}) }, session: "" }, actor, { target, revision });
     this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, review.id, taskId, Date.now());
-    this.retireReplacedReview(current, review.id);
+    this.retireReplacedReview(taskId, current, review.id);
     this.audit(actor, "review_requested", taskId, { verify: review.id });
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
   }
