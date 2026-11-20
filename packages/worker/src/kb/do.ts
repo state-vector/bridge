@@ -388,7 +388,7 @@ function sameAcceptanceScope(snapshot: unknown, current: AcceptanceCriteria | nu
 
 type OfferedPullRequest = { repo: string; number: number; head_sha_at_acceptance?: string };
 type ReviewTarget =
-  | { kind: "pull_request"; legs: OfferedPullRequest[] }
+  | { kind: "pull_request"; legs: OfferedPullRequest[]; historical?: true; landed_commit?: string }
   | { kind: "commit"; repo: string; sha: string }
   | { kind: "execution" }
   | { kind: "unspecified" };
@@ -417,11 +417,10 @@ function taskReviewTarget(meta: Record<string, unknown>, submittedNote = ""): Re
     return { kind: "pull_request", legs: [{ repo: active.repo, number: Number(active.number) }] };
   }
   if (legacyNote) return legacyNote;
-  const stamp = meta.pr as Partial<OfferedPullRequest> | undefined;
-  if (typeof stamp?.repo === "string" && stamp.repo && Number(stamp.number) > 0) {
-    return { kind: "pull_request", legs: [{ repo: stamp.repo, number: Number(stamp.number),
-      ...(stamp.head_sha_at_acceptance ? { head_sha_at_acceptance: stamp.head_sha_at_acceptance } : {}) }] };
-  }
+  // The train retains prior accepted heads, including through repair bounces.
+  // Only a current submission pins the head a new reviewer must accept.
+  const legs = trainLegs(meta).filter(leg => leg.repo && leg.number > 0).map(({ repo, number }) => ({ repo, number }));
+  if (legs.length) return { kind: "pull_request", legs, historical: true };
   return { kind: "unspecified" };
 }
 
@@ -429,13 +428,17 @@ function sameReviewTarget(a: ReviewTarget, b: ReviewTarget): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function matchesLegacyReviewTarget(body: string, target: ReviewTarget): boolean {
+function matchesLegacyReviewTarget(rendered: ReviewTarget | null, target: ReviewTarget): boolean {
   if (target.kind === "execution" || target.kind === "unspecified") return true;
-  const rendered = reviewTargetFromNote(body);
   if (target.kind === "commit") return rendered?.kind === "commit" && sameReviewTarget(rendered, target);
-  const offered = rendered?.kind === "pull_request" ? rendered.legs[0] : undefined;
+  // Historical caller-linked and recovery duties can leave the PR in the parent.
+  if (!rendered) return true;
+  const offered = rendered.kind === "pull_request" ? rendered.legs[0] : undefined;
   const submitted = target.legs[0];
-  return !!offered && !!submitted && offered.repo === submitted.repo && offered.number === submitted.number;
+  return !!offered && !!submitted && offered.repo === submitted.repo && offered.number === submitted.number
+    && (!offered.head_sha_at_acceptance || !submitted.head_sha_at_acceptance
+      || matchesSubmittedSha(offered.head_sha_at_acceptance, submitted.head_sha_at_acceptance)
+      || matchesSubmittedSha(submitted.head_sha_at_acceptance, offered.head_sha_at_acceptance));
 }
 
 function matchesSubmittedSha(resolved: string, submitted: string): boolean {
@@ -3139,7 +3142,12 @@ export class KnowledgeHub {
         delete meta.prs;
         delete meta.pr;
       }
-      if (meta.review_pr && isClosed(meta.review_pr)) delete meta.review_pr;
+      const submitted = taskReviewTarget(meta);
+      if (submitted.kind === "pull_request" && submitted.legs.some(isClosed)) {
+        delete meta.review_pr;
+        delete meta.review_target;
+        delete meta.review_note;
+      }
       if (meta.merge_train) meta.merge_train = { state: "unbound", legs: meta.merge_train.legs };
       delete meta.bounce_released;
       // Changing the active delivery scope invalidates prior admissions, not
@@ -5746,7 +5754,7 @@ export class KnowledgeHub {
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
     if (metaDel.includes(LANE_REVISION) || body.meta && Object.hasOwn(body.meta, LANE_REVISION)) throw new Error("gate: lane revisions are owned by canonical persistence");
-    if (["review_result", "execution_review_of", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
+    if (["review_result", "execution_review_of", "review_subject", "review_target", "review_offer", "acceptance_snapshot", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
       || (body.meta && Object.hasOwn(body.meta, k) && JSON.stringify(body.meta[k]) !== JSON.stringify(preMeta[k]))))
       throw new Error("gate: review results and subject bindings are owned by the review lifecycle, not metadata updates");
     if (row.type === "task" && !OWNER_RELEASE_EXEMPT.test(actor)) {
@@ -5926,7 +5934,7 @@ export class KnowledgeHub {
     for (const k of ["lane", "lease", "currently", "stop", "blocked"]) {
       if (oldMeta[k] !== undefined && stub[k] === undefined) { stub[k] = oldMeta[k]; infraPreserved.push(k); }
     }
-    for (const k of ["review_result", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"]) {
+    for (const k of ["review_result", "review_subject", "review_target", "review_offer", "acceptance_snapshot", "work_revision", "human_delivery_approval", "wait_repair_result"]) {
       if (oldMeta[k] !== undefined) stub[k] = oldMeta[k]; // lifecycle-owned keys ride verbatim
     }
     const newBytes = utf8Bytes(JSON.stringify(stub));
@@ -7502,13 +7510,13 @@ export class KnowledgeHub {
     return response;
   }
 
-  private async transition(body: any, actor: string, origin: "client" | "machine" = "machine", beforeWrite?: () => void) {
+  private async transition(body: any, actor: string, origin: "client" | "machine" = "machine", beforeWrite?: () => void, reviewTarget?: ReviewTarget) {
     if (body.to === "in_progress" || body.to === "todo") {
       const wait = this.startupWait(String(body.id ?? ""));
       if (wait && !(body.to === "in_progress" && this.executionWork().isInteractive(String(body.token_id ?? "")))) throw new Error(`gate: ${startupWaitReason(wait)}`);
     }
     try {
-      return await this.doTransition(body, actor, origin, beforeWrite);
+      return await this.doTransition(body, actor, origin, beforeWrite, reviewTarget);
     } catch (e) {
       const id = String(body?.id ?? "");
       const to = String(body?.to ?? "");
@@ -8052,13 +8060,15 @@ export class KnowledgeHub {
     duty: { id: string; body_md: string }, dutyMeta: Record<string, unknown>,
     taskId: string, parentMeta: Record<string, unknown>, target: ReviewTarget,
   ): boolean {
-    if (!matchesLegacyReviewTarget(String(duty.body_md ?? ""), target)) return false;
+    const rendered = reviewTargetFromNote(String(duty.body_md ?? ""));
+    if (!matchesLegacyReviewTarget(rendered, target)) return false;
     const registered = this.one(`SELECT json_extract(data,'$.subject_revision') AS revision FROM ledger
       WHERE artefact_id=? AND kind='mutation' AND action='review_registered' AND json_extract(data,'$.task_id')=?
       ORDER BY seq ASC LIMIT 1`, duty.id, taskId);
     // Earlier hubs could register the same unclaimed duty twice. Only the
     // first registration identifies the submission that froze its criteria.
     if (registered?.revision === (parentMeta.work_revision ?? "legacy")) return true;
+    if (registered && !rendered && target.kind === "pull_request") return false;
     return sameAcceptanceScope(dutyMeta.acceptance_snapshot, parentAcceptanceCriteria(parentMeta));
   }
 
@@ -8075,7 +8085,7 @@ export class KnowledgeHub {
 
   /** Lazy SQL-backed context for the machine rules — a guard only queries
    *  what it actually reads, so cheap transitions stay cheap. */
-  private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string): RuleCtx {
+  private ruleCtx(row: any, body: any, id: string, tTags: string[], actor: string, reviewTarget?: ReviewTarget): RuleCtx {
     const blockingChildren = () => this.state.storage.sql.exec(`SELECT c.id, c.type, c.status, c.owner, c.roles, c.meta, c.title, c.body_md FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status NOT IN ('done','superseded') AND r.src_id != r.dst_id ORDER BY c.id`, id).toArray().filter((child) => {
       const meta = JSON.parse(String(child.meta ?? "{}"));
       if (meta.machine_duty || meta.ask?.review_leg) return false;
@@ -8194,9 +8204,10 @@ export class KnowledgeHub {
         const pending = this.unclaimedReview(current.id);
         if (!pending) return null;
         const parentMeta = JSON.parse(String(row.meta ?? "{}"));
-        const target = taskReviewTarget(parentMeta, String(body.note ?? ""));
+        const target = reviewTarget ?? taskReviewTarget(parentMeta, String(body.note ?? ""));
         const offer = pending.meta.review_offer as ReviewOffer | undefined;
-        const sameTarget = offer ? sameReviewTarget(offer.target, target) : target.kind === "execution" || target.kind === "unspecified";
+        const sameTarget = offer ? sameReviewTarget(offer.target, target)
+          : this.legacyReviewMatchesSubmission(pending.row, pending.meta, id, parentMeta, target);
         return sameTarget && sameAcceptanceScope(pending.meta.acceptance_snapshot, parentAcceptanceCriteria(parentMeta))
           ? { id: current.id } : null;
       },
@@ -8374,7 +8385,7 @@ export class KnowledgeHub {
     return { id, status: "superseded", batch_auth: { ask: askId, answered_by: answeredBy, authorized_scope: authorized.length } };
   }
 
-  private async doTransition(body: any, actor: string, origin: "client" | "machine", beforeWrite?: () => void) {
+  private async doTransition(body: any, actor: string, origin: "client" | "machine", beforeWrite?: () => void, reviewTarget?: ReviewTarget) {
     const id = String(body.id ?? "");
     const to = String(body.to ?? "");
     const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
@@ -8422,7 +8433,7 @@ export class KnowledgeHub {
     const ts0 = Date.now();
     const verdict = await decide(
       { id, type: row.type, status: row.status, to, roles: tRoles, tags: tTags, meta: JSON.parse(row.meta ?? "{}"), actor, body, owner: row.owner, now: ts0 },
-      this.ruleCtx(row, body, id, tTags, actor),
+      this.ruleCtx(row, body, id, tTags, actor, reviewTarget),
     );
     const freshClaim = this.one(`SELECT id,status,owner,meta FROM artefacts WHERE id=?`, id);
     if (freshClaim.status !== row.status || freshClaim.owner !== row.owner || JSON.parse(freshClaim.meta ?? "{}").session !== JSON.parse(row.meta ?? "{}").session
@@ -8466,7 +8477,7 @@ export class KnowledgeHub {
     if (row.type === "task" && (body.to === "in_review" || origin === "client" && body.body_md !== undefined && String(body.body_md) !== row.body_md)) meta.work_revision = crypto.randomUUID();
     if (row.type === "task" && body.to === "in_review" && effectiveRole(tRoles) !== "review") {
       const note = String(body.note ?? "");
-      const target = taskReviewTarget(meta, note);
+      const target = reviewTarget ?? taskReviewTarget(meta, note);
       meta.review_target = target;
       if (note) meta.review_note = note.slice(0, 600);
       if (target.kind === "pull_request") {
@@ -8531,13 +8542,16 @@ export class KnowledgeHub {
         const submitted = taskReviewTarget(targetMeta);
         if (offer ? offer.revision !== captured.data.revision || !sameReviewTarget(offer.target, submitted)
           : !this.legacyReviewMatchesSubmission(row, meta, subject, targetMeta, submitted)) throw new Error("gate: this review belongs to a different submitted delivery");
-        if (submitted.kind === "pull_request") {
+        if (submitted.kind === "pull_request" && !submitted.historical) {
           const expected = submitted.legs;
           const [primary] = expected;
           const matches = (a: OfferedPullRequest, b: OfferedPullRequest) => a.repo === b.repo && a.number === b.number
             && (!b.head_sha_at_acceptance || (!!a.head_sha_at_acceptance && matchesSubmittedSha(a.head_sha_at_acceptance, b.head_sha_at_acceptance)));
-          if (reviewResult.kind !== "accepted_pr" || !primary || !reviewResult.legs.some(leg => matches(leg, primary))
-            || !reviewResult.legs.every(leg => expected.some(pr => matches(leg, pr)))) throw new Error("gate: review acceptance must cover the exact submitted pull request legs");
+          const matchesPr = reviewResult.kind === "accepted_pr" && primary && reviewResult.legs.some(leg => matches(leg, primary))
+            && reviewResult.legs.every(leg => expected.some(pr => matches(leg, pr)));
+          const matchesLanded = reviewResult.kind === "accepted_direct_main" && submitted.landed_commit
+            && primary?.repo === reviewResult.repo && submitted.landed_commit === reviewResult.commit;
+          if (!matchesPr && !matchesLanded) throw new Error("gate: review acceptance must cover the exact submitted pull request legs or recorded landing commit");
         }
         if (submitted.kind === "commit" && (reviewResult.kind !== "accepted_direct_main"
           || submitted.repo !== reviewResult.repo || !matchesSubmittedSha(reviewResult.commit, submitted.sha)))
@@ -15324,7 +15338,12 @@ export class KnowledgeHub {
     }
     const note = `Observed MERGED ${repo}#${pr}: https://github.com/${repo}/commit/${mergeSha}. Verify actual main ancestry, signature, decisive required CI and every task outcome. A merge observation is not delivery acceptance.`;
     if (row.status !== "in_progress") await this.transition({ id, to: "in_progress", session: "", note, merge_train: true }, actor, "machine", beforeWrite);
-    const submitted = await this.transition({ id, to: "in_review", session: "", note }, actor, "machine", beforeWrite);
+    const landed = this.one(`SELECT head_sha FROM train_events WHERE repo=? AND pr=? AND merge_sha=?
+      AND kind='merged' ORDER BY seq DESC LIMIT 1`, repo, pr, mergeSha);
+    const head = String(landed?.head_sha ?? "");
+    const leg = { repo, number: pr, ...(/^[0-9a-f]{40}$/i.test(head) ? { head_sha_at_acceptance: head } : {}) };
+    const observedTarget: ReviewTarget = { kind: "pull_request", legs: [leg], landed_commit: mergeSha };
+    const submitted = await this.transition({ id, to: "in_review", session: "", note }, actor, "machine", beforeWrite, observedTarget);
     if (!("verify_task" in submitted) || typeof submitted.verify_task !== "string") return { kind: "retained", reason: "Delivery was submitted but no new review duty was returned; existing lifecycle owns its continuation." };
     this.audit(actor, "observed_merge_review_submitted", id, { repo, pr, merge_sha: mergeSha, review: submitted.verify_task });
     return { kind: "submitted", review_id: String(submitted.verify_task) };
