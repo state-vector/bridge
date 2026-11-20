@@ -1358,8 +1358,10 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // still needs a continuation — reconcile the effect, record an admissible
   // retry, or bind a real repair dependency or a decision to that task"
   // while the subject's live execution diagnosis has no actionable
-  // continuation (a valid recovery permit, a startup ask, or a real typed
-  // repair wait). The refusal IS the recovery-disposition contract working:
+  // continuation (a valid recovery permit, a startup ask, a real typed
+  // repair wait, a live board-side binding — a depends_on edge or bound
+  // decision — plus the duty's own receipt-backed result, or a demonstrably
+  // cleared dispatch gate on the subject, BR#17881). The refusal IS the recovery-disposition contract working:
   // zero state destroyed, the subject's admission hold stays bound, and the
   // message names its own cure (the BR#17396 test parks the subject on a
   // br_done repair wait and resubmits successfully) — the BR#4562/BR#6654/
@@ -1733,7 +1735,10 @@ export function breachClass(reason: string): string {
   // effect, record an admissible retry, or bind a real repair dependency or
   // a decision to that task" while the subject's execution_diagnosis is live
   // (matching generation+hold) and has no actionable continuation — a valid
-  // recovery permit, a startup ask, or a real typed repair wait (BR#17396).
+  // recovery permit, a startup ask, a real typed repair wait, a live
+  // board-side binding (depends_on edge or bound decision) plus the duty's
+  // own receipt-backed result, or a demonstrably cleared dispatch gate on
+  // the subject (BR#17396, exits BR#17881).
   // The refusal IS the recovery-disposition contract working: zero state is
   // destroyed, the subject's admission hold stays bound, and the message
   // names its own cure (the BR#17396 test parks the subject on a br_done

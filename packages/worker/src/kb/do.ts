@@ -8918,7 +8918,7 @@ export class KnowledgeHub {
     this.atomicLaneMutation(() => {
       beforeWrite?.();
       if (verdict.status === "in_review" || verdict.status === "done") {
-        this.requireAttemptDiagnosisContinuation(id, meta.machine_duty);
+        this.requireAttemptDiagnosisContinuation(id, meta.machine_duty, meta.execution_result);
       }
       if (verdict.status === "blocked") this.assertCompletionWait(id, meta.blocked?.await_event);
       if (rebound) {
@@ -18035,9 +18035,9 @@ export class KnowledgeHub {
   }
 
   /** A diagnostic result is evidence, not a new retry or a continuation by itself. */
-  private requireAttemptDiagnosisContinuation(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }): void {
+  private requireAttemptDiagnosisContinuation(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }, dutyResult?: unknown): void {
     if (duty?.kind !== "task-recovery" || duty.reason !== "execution_environment" || !duty.subject) return;
-    const parent = this.one(`SELECT status,meta FROM artefacts WHERE id=?`, duty.subject);
+    const parent = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, duty.subject);
     if (!parent || !["todo", "blocked"].includes(String(parent.status))) return;
     const meta = JSON.parse(String(parent.meta ?? "{}"));
     if (meta.execution_diagnosis?.duty !== dutyId) return;
@@ -18053,7 +18053,69 @@ export class KnowledgeHub {
       const target = this.dependencyOutcome(wait.id, [duty.subject, dutyId]);
       if (!target.ok && target.probeState !== "negative") return;
     }
+    // BR#17881 — a dispatched gateway-runner diagnostic can never author the
+    // execution-side continuations this fence otherwise accepts: gateway
+    // runners are excluded from full-agent (BR#6436), so reconcile_operation
+    // and writer_receipt demand a session class the dispatched duty cannot
+    // hold, request_capacity an authenticated gateway, and
+    // train_recovery_event the bound repair owner or the lease holder. The
+    // board-side forms this message itself names are exactly what such a
+    // duty CAN author, so they are legal exits too: a live repair dependency
+    // or decision bound to the subject, plus the duty's own receipt-backed
+    // result on its card (five first-hand refusals on BR#17814, the
+    // execution-environment recovery of BR#17785, with every typed
+    // execution-side mechanism refused and the board-side binding already
+    // in place).
+    if (this.diagnosisContinuationAuthored(duty.subject, dutyId, dutyResult)) return;
+    // And when the subject's dispatch gate has demonstrably cleared while
+    // the diagnosis stood — todo, unowned, past every claimability fence the
+    // diagnosis sweep itself applies, no live dispatch blockers — the honest
+    // receipt-backed close is itself the admissible continuation: the
+    // scheduler's next reservation (a fresh diagnostic, or the subject's own
+    // re-dispatch once its hold clears) owns the retry.
+    if (this.dispatchGateCleared(duty.subject, parent, meta, dutyId, dutyResult)) return;
     throw new Error(`gate: diagnosis of ${duty.subject} still needs a continuation — reconcile the effect, record an admissible retry, or bind a real repair dependency or a decision to that task`);
+  }
+
+  /** BR#17881 — the board-side continuations this fence's message names: a
+   * live depends_on edge from the subject to a task or decision, or a
+   * decision bound to the subject (derived_from), always paired with the
+   * closing duty's own receipt-backed execution_result. The relations table
+   * carries no author, so binding + receipt is the verifiable contract —
+   * never session attribution — and the receipt is what keeps the exit
+   * auditable: an honest close states what continues and cites its evidence.
+   * Dead targets (done/superseded tasks, draft decisions) are not
+   * continuations, and neither is an edge to this duty itself (the
+   * closed-diagnosis churn the fence exists to stop). */
+  private diagnosisContinuationAuthored(subjectId: string, dutyId: string, dutyResult: unknown): boolean {
+    if (!ExecutionResultSchema.safeParse(dutyResult).success) return false;
+    return !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.dst_id
+        WHERE r.src_id = ? AND r.relation = 'depends_on' AND c.id NOT IN (?, ?)
+          AND ((c.type = 'task' AND c.status IN ('todo','in_progress','in_review','blocked'))
+            OR (c.type = 'decision' AND c.status IN ('proposed','accepted')))
+        LIMIT 1`, subjectId, subjectId, dutyId)
+      || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id
+        WHERE r.relation = 'derived_from' AND r.dst_id = ? AND c.type = 'decision'
+          AND c.status IN ('proposed','accepted')
+        LIMIT 1`, subjectId);
+  }
+
+  /** BR#17881 — the subject's dispatch gate demonstrably cleared while the
+   * diagnosis stood: todo, unowned, past the claimability fences the
+   * diagnosis sweep itself applies (BR#17649 selection law's skips), and
+   * carrying no live dispatch blockers, so the scheduler's next reservation
+   * is real. The receipt-backed result still rides the close — an empty
+   * receipt list is exactly the bare close this fence refuses. */
+  private dispatchGateCleared(subjectId: string, parent: { status: string; owner?: string }, parentMeta: Record<string, unknown>, dutyId: string, dutyResult: unknown): boolean {
+    if (!ExecutionResultSchema.safeParse(dutyResult).success) return false;
+    if (String(parent.status) !== "todo" || String(parent.owner ?? "") !== "") return false;
+    if (parentMeta.operator_gated || parentMeta.subprocess || todoDispatchHold(parentMeta)) return false;
+    if ((parentMeta.recovery as { task_id?: unknown } | undefined)?.task_id
+      && String((parentMeta.recovery as { task_id?: unknown }).task_id) !== dutyId) return false;
+    if (this.isUnclaimableAnchor({ id: subjectId }, parentMeta) || this.protectedExecution(subjectId, parentMeta) || this.todoLifecycleHold(subjectId, parentMeta)) return false;
+    const row = this.one(`SELECT id,title,project,status,owner,meta,updated_ts FROM artefacts WHERE id=?`, subjectId);
+    if (!row) return false;
+    return this.executionWork().blockers(row, Date.now()).length === 0;
   }
 
   /** Assign evidence-gathering for exhausted budgets and unknown effects.

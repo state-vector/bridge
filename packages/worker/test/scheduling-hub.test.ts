@@ -770,6 +770,60 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await post("transition", submission)).status).toBe("in_review");
     expect((await post("get", { id })).meta.blocked.await_event).toEqual({ event: "br_done", id: repair });
   });
+  it("lets a gateway-runner diagnostic exit through the board-side continuation its refusal names (BR#17881)", async () => {
+    const project = "diagnosis-board-continuation", g = await gateway(project);
+    const id = await task(project);
+    expect(await post("fixture/budget-pile", { ids: [id] })).toEqual({ ok: true, stamped: 1 });
+    await post("fixture/attempt-diagnosis", {});
+    const original = (await post("get", { id })).meta.execution_diagnosis;
+    expect(original).toMatchObject({ hold: "retry_budget" });
+    const reservation = await reserve(g);
+    if (reservation.kind !== "reserved" || reservation.task_id !== original.duty) throw new Error(JSON.stringify(reservation));
+    const attempt_id = "diagnostic";
+    expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 },
+      undefined, original.duty, reservation.session)).error).toBeUndefined();
+    const submission = { ...g.worker, id: original.duty, to: "in_review", session: reservation.session,
+      execution_scope: { id: original.duty, generation: 1, attempt_id },
+      execution_result: { outcome: "Diagnosed the stranded attempt; continuation scope bound on the subject", receipts: ["availability-probe-series-001"] } };
+    // Receipts alone are not a continuation: the single-host gateway holds its
+    // only slot for this attempt, so the subject's dispatch gate is not clear
+    // either — the refusal stands until a named exit exists.
+    expect((await post("transition", submission)).error).toMatch(/still needs a continuation/);
+    // The board-side binding such a duty CAN author: a decision bound to the
+    // subject (the BR#17814 shape). The message names it; the gate must
+    // honour it once the receipt-backed close rides the same submission.
+    const decision = await post("create", { actor: "author", type: "decision",
+      title: `Continuation scope for ${id}`, body_md: "Durable receipts stand; the fresh diagnostic re-verifies mechanically." });
+    expect(decision.error).toBeUndefined();
+    expect((await post("link", { src: decision.id, relation: "derived_from", dst: id, actor: "author" })).error).toBeUndefined();
+    expect((await post("transition", submission)).status).toBe("in_review");
+    expect((await post("get", { id: original.duty })).meta.execution_result).toMatchObject({ outcome: submission.execution_result.outcome });
+  });
+  it("accepts the honest diagnostic close once the subject's dispatch gate demonstrably clears (BR#17881)", async () => {
+    const project = "diagnosis-dispatch-cleared", g = await gateway(project, 2);
+    const id = await task(project);
+    expect(await post("fixture/budget-pile", { ids: [id] })).toEqual({ ok: true, stamped: 1 });
+    await post("fixture/attempt-diagnosis", {});
+    const original = (await post("get", { id })).meta.execution_diagnosis;
+    expect(original).toMatchObject({ hold: "retry_budget" });
+    const reservation = await reserve(g);
+    if (reservation.kind !== "reserved" || reservation.task_id !== original.duty) throw new Error(JSON.stringify(reservation));
+    const attempt_id = "diagnostic";
+    expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 },
+      undefined, original.duty, reservation.session)).error).toBeUndefined();
+    const submission = { ...g.worker, id: original.duty, to: "in_review", session: reservation.session,
+      execution_scope: { id: original.duty, generation: 1, attempt_id } };
+    // A bare close stays refused even with the gate cleared — the receipts
+    // contract owns the evidence leg first, and the diagnosis gate still
+    // requires the receipt-backed result on the exit itself.
+    expect((await post("transition", submission)).error).toMatch(/requires execution_result/);
+    // Subject is todo, unowned, and the spare host slot keeps its live
+    // dispatch blockers empty: the receipt-backed close is itself the
+    // admissible continuation, the scheduler's next reservation owning the retry.
+    const cleared = { ...submission, execution_result: { outcome: "Subject dispatch gate cleared (capacity free); the scheduler owns the next reservation", receipts: ["availability-probe-series-001", "availability-probe-series-002"] } };
+    expect((await post("transition", cleared)).status).toBe("in_review");
+    expect((await post("get", { id })).meta.execution_diagnosis?.duty).toBe(original.duty);
+  });
   it("routes stopped attempts to diagnosis by the dispatch priority law, not age alone (BR#17649)", async () => {
     const project = "diagnosis-order", g = await gateway(project);
     const ordinary = await task(project);
