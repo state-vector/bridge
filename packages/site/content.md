@@ -163,6 +163,11 @@ retries reuse immutable command receipts. Unverifiable writers remain held.
 Normal coordination does not interrupt execution. Explicit interrupts and expired
 leases stop safely, preserving WIP. Process exit never manufactures task completion
 or review acceptance; unfinished results reconcile through the same hub scheduler.
+The same law covers review bounces: when an independent findings bounce re-opens
+a card whose managed writer is already physically stopped, the hub itself returns
+the card to the claimable pool in the same tick — PR binding, review receipts and
+the captured result retained — instead of stranding it behind a dead claim, and
+the fresh dispatch reconciles that result rather than repeating effects.
 New controllers require serving lifecycle protocol 2 before claiming work.
 Hygiene waits for an idle workspace and rechecks terminal status and stopped
 writers before removing a tree; age alone cannot revoke retained execution work.

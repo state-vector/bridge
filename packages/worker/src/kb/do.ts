@@ -190,6 +190,7 @@ import {
   type AdmissionLegCoverage,
   releaseHold,
   todoDispatchHold,
+  stoppedManagedWriterProof,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
   decideProseDisposition,
@@ -1614,6 +1615,33 @@ export class KnowledgeHub {
           result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
           note: "train repair handoff: no recorded executor or live worker signal — returned to the claimable pool; PR binding and repair brief preserved" }, "system:merge-train");
         continue;
+      }
+      // BR#474 — pre-queue review-bounce repair handoff (the train leg's
+      // sibling): a findings bounce re-opened this card in_progress while its
+      // managed writer was already PHYSICALLY STOPPED — quiesced attempt +
+      // runner terminal writers proof + zero unresolved operations (the
+      // BR-18119/BR-18105 shape the train-bounce predicate never saw, because
+      // a pre-queue bounce carries no merge_train stamp at all). The retained
+      // meta.review_bounce_repair request and the runner's own record decide —
+      // never a timestamp or a lease. Release claimable with the PR binding,
+      // receipts and findings intact: one fresh dispatch, no duplicate
+      // effects. A live queue slot, typed wait, declared recovery owner,
+      // operator gate or interactive claim keeps the existing exit.
+      if (meta.review_bounce_repair && !meta.interactive_execution && now - workerSignal > staleMs) {
+        const proof = stoppedManagedWriterProof(this.executionState(String(r.id)), meta);
+        if (proof.stopped) {
+          const mtBackstop = String(((meta.merge_train ?? {}) as Record<string, unknown>).state ?? "");
+          const demoteBackstop = ["bounced", "awaiting", "stopped"].includes(mtBackstop);
+          if (!demoteBackstop && releaseHold(meta)) continue; // a live queue slot or typed wait owns the exit
+          await this.transition({
+            id: r.id, to: "todo", session: "",
+            ...(demoteBackstop
+              ? { demote_bounced_reentry: true, result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS }
+              : { result_class: "review_bounce_repair_release" }),
+            note: `review-bounce repair handoff (watchdog, BR#474): the physically stopped managed writer never resumed — quiesced generation ${proof.generation}/${proof.attempt_id}, ${proof.writers} writers proof, zero unresolved operations. Released claimable with the PR binding, receipts and findings intact; one fresh dispatch, no duplicate effects`,
+          }, "system:watchdog");
+          continue;
+        }
       }
       // BR#14696 (W1) — launch-health fence: a dispatched session that has
       // NEVER signaled since claim (no alive stamp, no session ping, no
@@ -8743,19 +8771,76 @@ export class KnowledgeHub {
     // owner cleared, reason stamped, the card is dispatchable immediately.
     // The reaper stays as backstop for the non-bounce stall cases.
     let ghostBounce = false;
+    // BR#474 — the stopped-writer findings handoff, decided from the runner's
+    // OWN durable record BEFORE any timestamp read: a quiesced attempt whose
+    // captured terminal receipt carries a writers proof and whose external
+    // operations are all resolved is PHYSICALLY STOPPED — the bounce returns
+    // the card to the managed pool in this same tick (the atomic release
+    // below). A live writer keeps the claim (resume law — silence never
+    // outranks the record); unknown external effects keep it for
+    // reconciliation; an independent wait, a declared grace/subprocess window,
+    // an operator gate or a declared recovery owner keep the existing exit.
+    // Legacy sessions without an execution record fall through to the
+    // dead-owner stamp below (unchanged).
+    let stoppedWriterRelease: { generation: number; attempt_id: string; writers: string; demoteReentry: boolean } | null = null;
     if (row.type === "task" && bounceFromReview && owner && owner !== actor && !/^(web|system:)/.test(owner)) {
+      const preBounceMeta = JSON.parse(row.meta ?? "{}");
+      const mtState = String(((preBounceMeta.merge_train ?? {}) as Record<string, unknown>).state ?? "");
+      const queueSlot = ["queued", "awaiting-ci", "conflicting"].includes(mtState);
+      const independentWait = !!preBounceMeta.awaiting_ask || !!preBounceMeta.blocked?.await_event;
+      const declaredWindow = (typeof preBounceMeta.grace_until === "number" && preBounceMeta.grace_until > Date.now())
+        || (preBounceMeta.subprocess && typeof preBounceMeta.subprocess.deadline_ts === "number" && preBounceMeta.subprocess.deadline_ts > Date.now());
+      const ownedExit = queueSlot || independentWait || declaredWindow || !!preBounceMeta.operator_gated || !!preBounceMeta.recovery?.task_id;
+      const proof = stoppedManagedWriterProof(this.executionState(id), preBounceMeta);
+      if (proof.stopped && !ownedExit) {
+        ghostBounce = true;
+        stoppedWriterRelease = {
+          generation: proof.generation, attempt_id: proof.attempt_id, writers: proof.writers,
+          demoteReentry: ["bounced", "awaiting", "stopped"].includes(mtState),
+        };
+        owner = "";
+        delete meta.session_alive_ts; delete meta.grace_until; // the dead writer's liveness stamps
+        meta.bounce_released = {
+          reason: "physically stopped managed writer at the review bounce — returned to the managed pool (BR#474)",
+          at: Date.now(), generation: proof.generation, attempt_id: proof.attempt_id, writers: proof.writers,
+        };
+        // BR#6163 — strand evidence (same law as the dead-owner release).
+        const strandAwait = trainOnlyAwait(preBounceMeta);
+        if (strandAwait) meta.bounce_released.train_only_await = strandAwait;
+        // The distinct typed repair request: pre-queue bounces carry no
+        // merge_train stamp, so the train-bounce repair predicate never sees
+        // them — retain the request (PR binding + exact stopped fence) so the
+        // sweep backstop, fresh claims and auditors all key the same record.
+        meta.review_bounce_repair = {
+          ...(meta.review_bounce_repair ?? {}), kind: "pre_queue",
+          released_at: Date.now(), generation: proof.generation, attempt_id: proof.attempt_id,
+          pr: preBounceMeta.pr ?? null, writers: proof.writers,
+        };
+        // The finalize path's reconciliation primitive, reused (L7496): the
+        // captured outcome stays in execution_state and the fresh session
+        // reconciles it instead of guessing completion.
+        meta.execution_resume = { kind: "terminal_result", generation: proof.generation, attempt_id: proof.attempt_id };
+      }
+    }
+    if (!ghostBounce && row.type === "task" && bounceFromReview && owner && owner !== actor && !/^(web|system:)/.test(owner)) {
       // dead-by-construction: no auth_token for the owner label → it can never
       // heartbeat again (revoked/never-provisioned). Otherwise liveness = the
-      // owner token's freshest session.
+      // freshest session across the owner's candidate tokens. BR#474/BR#899:
+      // a gateway-attributed owner is the provisioned worker label
+      // (`<token-label>/<worker>`) — both the worker credential and the
+      // dispatching gateway token are the SAME writer's infrastructure, and
+      // only the gateway's sessions carry the heartbeat the incident's
+      // false-alive read came from. Rank candidates by their freshest session
+      // so the lookup cannot dead-verdict a live owner by matching the
+      // session-less worker row first.
       const ownerToken = this.one(
-        `SELECT id FROM auth_tokens WHERE label = ? OR principal = ? LIMIT 1`, owner, owner,
+        `SELECT t.id, MAX(s.last_seen_ts) AS last_seen FROM auth_tokens t
+         LEFT JOIN sessions s ON s.token_id = t.id
+         WHERE t.label = ? OR t.principal = ? OR ? LIKE t.label || '/%'
+         GROUP BY t.id ORDER BY COALESCE(MAX(s.last_seen_ts), 0) DESC, (t.label = ?) DESC LIMIT 1`,
+        owner, owner, owner, owner,
       );
-      const ownerSession = ownerToken
-        ? this.one(
-            `SELECT last_seen_ts FROM sessions WHERE token_id = ? ORDER BY last_seen_ts DESC LIMIT 1`,
-            ownerToken.id,
-          )
-        : null;
+      const ownerSession = ownerToken ? { last_seen_ts: ownerToken.last_seen } : null;
       const staleMin = (() => {
         const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
         return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
@@ -8764,9 +8849,18 @@ export class KnowledgeHub {
       // task's own heartbeat (meta.last_progress.ts — what log_progress writes).
       // A live owner does at least one of these within the stall window.
       const rowMeta = JSON.parse(row.meta ?? "{}");
+      // BR#474 — the runner's own record outranks the timestamp verdict in
+      // BOTH directions: a RUNNING attempt or an attempt with unresolved
+      // external operations is a live/pending writer no matter how stale the
+      // session pings look (the incident's gateway sessions pinged constantly,
+      // but the inverse — silence while the attempt record says running — is
+      // equally a lie). Only a record with no stop evidence at all (legacy
+      // cards) leaves the timestamp verdict standing.
+      const recordProof = stoppedManagedWriterProof(this.executionState(id), rowMeta);
+      const recordSaysBusy = recordProof.stopped === false && (recordProof.why === "live_writer" || recordProof.why === "unknown_operations");
       const lastProgressTs = Number(rowMeta.last_progress?.ts ?? 0);
       const lastSignal = Math.max(Number(ownerSession?.last_seen_ts ?? 0), lastProgressTs);
-      const dead = !ownerToken || !lastSignal || (Date.now() - lastSignal > staleMin * 60_000);
+      const dead = !recordSaysBusy && (!ownerToken || !lastSignal || (Date.now() - lastSignal > staleMin * 60_000));
       if (dead) {
         ghostBounce = true;
         owner = "";
@@ -8821,6 +8915,10 @@ export class KnowledgeHub {
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta.session = String(sess).slice(0, 120);
         }
+        // BR#474 — the fresh dispatch CONSUMES the retained repair request: a
+        // legitimately re-claimed card is a live writer again, and the sweep
+        // backstop must never see a stale stopped-writer stamp on it.
+        if (freshClaim) delete meta.review_bounce_repair;
         if (freshClaim && meta.interactive_execution?.session !== meta.session) delete meta.interactive_execution;
       }
     }
@@ -9071,6 +9169,30 @@ export class KnowledgeHub {
     }
     if (row.type === "task" && verdict.status === "in_progress" && row.status !== "in_progress") {
       this.recordTaskRecovery(id, { kind: "executor_assigned", task_id: id }, actor);
+    }
+    // BR#474 — atomic return of the physically stopped writer to the managed
+    // pool: the bounce write above already cleared the ghost claim; this
+    // completes it to a claimable todo in the same tick. The captured outcome
+    // stays in execution_state and meta.execution_resume routes the fresh
+    // session to reconcile it instead of guessing completion — exactly the
+    // finalize path's release law. A refused release (a wait raced in) is
+    // audited and left to the sweep backstop — never a silent strand.
+    if (stoppedWriterRelease) {
+      try {
+        await this.transition({
+          id,
+          to: "todo",
+          ...(stoppedWriterRelease.demoteReentry
+            ? { demote_bounced_reentry: true, result_class: BOUNCE_REENTRY_DEMOTE_RESULT_CLASS }
+            : { result_class: "review_bounce_repair_release" }),
+          note: `review-bounce repair handoff (BR#474): the bounced card's managed writer is physically stopped — quiesced generation ${stoppedWriterRelease.generation}/${stoppedWriterRelease.attempt_id} with a ${stoppedWriterRelease.writers} writers proof and zero unresolved operations. PR binding, review receipts and the findings brief are retained on the card; returned to the managed pool for exactly one fresh dispatch.`,
+        }, "system:watchdog");
+        this.audit("system:watchdog", "review_bounce_repair_release", id, {
+          generation: stoppedWriterRelease.generation, attempt_id: stoppedWriterRelease.attempt_id, writers: stoppedWriterRelease.writers,
+        });
+      } catch (e) {
+        this.audit("system:watchdog", "review_bounce_release_refused", id, { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
     }
     if (row.type === "task" && (verdict.status === "done" || verdict.status === "superseded")) this.retireCompletedCoordination(id);
     // SERIALIZED MERGE TRAIN (BR#3516): a verify duty closing done on an impl

@@ -4168,6 +4168,24 @@ fabricates review acceptance. Unfinished claims return through the same schedule
 with their prior result attached; independent waits, local handoffs, unknown
 operations, host affinity and the persistent retry budget remain enforced.
 
+A pre-queue independent-review bounce can no longer strand a stopped writer's
+card (BR#474). When a findings bounce re-opens a card whose managed writer is
+already physically stopped — the runner's own record proves it: quiesced
+attempt, terminal writers proof (`process_group_empty` or
+`no_live_group_members`), and no prepared or outcome-unknown operation — the
+hub releases the claim itself in the same tick and returns the card to the
+claimable pool, retaining the PR binding, review receipts, findings brief and
+the captured terminal result for reconciliation. A fresh claim consumes the
+retained repair request, so exactly one release happens however often the
+sweeps re-run or the hub restarts. The record outranks silence in both
+directions: a live writer keeps its claim (owner liveness reads the freshest
+session across the owner's candidate tokens — gateway and provisioned worker
+alike — and a running attempt or unresolved operation blocks the dead-verdict
+no matter how stale the pings look), an unresolved external effect keeps the
+claim for reconciliation, and a live queue slot, typed wait, declared recovery
+window, operator gate or interactive claim keeps the existing exit.
+Train-bound bounces demote through the existing bounce-re-entry carve-out.
+
 Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
 
 Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.

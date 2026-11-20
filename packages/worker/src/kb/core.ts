@@ -2597,6 +2597,37 @@ export function parseCardIdRefs(text: string): string[] {
   return ids;
 }
 
+/** BR#474 — authoritative physically-stopped managed-writer proof. A timestamp,
+ *  a lease expiry or an owner/session read is NEVER stop evidence (the
+ *  reconcileStartupWaits law: an expiry proves nothing — the gateway may have
+ *  died since). The runner's OWN durable record is the only witness: the
+ *  attempt quiesced, the captured terminal receipt carries a writers proof
+ *  (process_group_empty / no_live_group_members), and no external operation is
+ *  left prepared or outcome_unknown. A live writer keeps its claim (resume
+ *  law); unresolved effects keep it for reconciliation; an interactive claim
+ *  owns the card outright. Returns the exact fence evidence on success so the
+ *  release stamps name the same attempt the runner captured. */
+export function stoppedManagedWriterProof(
+  state: {
+    attempt?: { phase: string; generation: number; attempt_id: string } | null;
+    terminal?: { writers?: string } | null;
+    operations?: Array<{ state: string }> | null;
+  } | null | undefined,
+  meta: { interactive_execution?: unknown } | null | undefined,
+): { stopped: true; generation: number; attempt_id: string; writers: string }
+  | { stopped: false; why: "live_writer" | "unknown_operations" | "interactive_claim" | "no_stop_proof" } {
+  if (meta?.interactive_execution) return { stopped: false, why: "interactive_claim" };
+  const attempt = state?.attempt ?? null;
+  if (!attempt) return { stopped: false, why: "no_stop_proof" };
+  if (attempt.phase !== "quiesced") return { stopped: false, why: "live_writer" };
+  if ((state?.operations ?? []).some(op => op.state === "prepared" || op.state === "outcome_unknown"))
+    return { stopped: false, why: "unknown_operations" };
+  const writers = String(state?.terminal?.writers ?? "");
+  if (writers !== "process_group_empty" && writers !== "no_live_group_members")
+    return { stopped: false, why: "no_stop_proof" };
+  return { stopped: true, generation: attempt.generation, attempt_id: attempt.attempt_id, writers };
+}
+
 /** BR#4067 — does a release path need to HOLD? Returns the hold description
  *  when the card carries machine-wait state — a merge-train queue slot
  *  (queued/awaiting-ci/bounced/awaiting on a live PR leg), a typed
