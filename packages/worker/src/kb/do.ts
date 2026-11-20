@@ -20630,13 +20630,23 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const recovery = meta.recovery?.task_id ? this.one(`SELECT status,meta,owner,updated_ts FROM artefacts WHERE id=?`, String(meta.recovery.task_id)) : null;
         const rm = JSON.parse(String(recovery?.meta ?? "{}"));
         const recoveryLive = recovery && !rm.execution_blockers?.length && (recovery.status === "in_progress" ? this.strandOwnerLive(recovery.owner, rm, 10) : ["todo", "in_review"].includes(String(recovery.status)) && now - Number(recovery.updated_ts) < cfg.disposition_age_h * 3_600_000);
+        // BR#17935: a recovery duty that closed done but whose independent
+        // outcome review is still pending leaves repairAccepted false, so the
+        // parked card reads stranded and repair_binding re-fires a fresh duty
+        // every cycle (the close→acceptance window). The pending review IS a
+        // repair in flight: read repairing — freshness-bounded so a dead
+        // review cannot mask a real stranding forever; once the acceptance
+        // lands, the join's bounded-hold leg takes over.
+        const recoveryReviewPending = !!recovery && String(recovery.status) === "done"
+          && now - Number(recovery.updated_ts) < cfg.disposition_age_h * 3_600_000
+          && this.currentTaskReview(String(meta.recovery.task_id)).phase === "pending";
         const hold = meta.delivery_disposition as DeliveryDisposition | undefined;
         const held = hold?.kind === "hold" && !!hold.owner && !!hold.next && hold.deadline > now;
         const needsImplementation = row.status === "todo" && !verifying && !recoveryLive &&
           meta.merge_train?.repo === repo && Number(meta.merge_train?.pr) === leg.number && !!this.recoveredPrFindings(String(row.id), meta);
         bindings.push({
           repairAccepted: !queued && !verifying && !recoveryLive && !needsImplementation && this.acceptedQueueRepair(row, repo, leg.number),
-          progress: queued ? "queued" : verifying ? "verifying" : needsImplementation || recoveryLive || (row.status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10)) ? "repairing" : held ? "held" : "stranded",
+          progress: queued ? "queued" : verifying ? "verifying" : needsImplementation || recoveryLive || recoveryReviewPending || (row.status === "in_progress" && this.strandOwnerLive(row.owner, meta, 10)) ? "repairing" : held ? "held" : "stranded",
           card: String(row.id),
           status: String(row.status),
           pr: leg.number,

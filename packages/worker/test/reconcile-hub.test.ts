@@ -206,6 +206,61 @@ describe("reconcile DO drill (real bundled worker, BR#4170)", () => {
     expect((await kbJson("/get", { id: parent })).body.meta.pr.head_sha_at_acceptance).toBe(repairedHead);
   });
 
+  it("an accepted repair disposition is the bounded hold: repair_binding never re-fires at a parked typed wait (BR#17935)", async () => {
+    const repo = "state-vector/bounded-hold-park";
+    const number = 3519;
+    const parent = (await kbJson("/create", {
+      actor: "author", type: "task", title: "Restore the parked delivery after conflict", qualified: true,
+      meta: { pr: { repo, number } },
+    })).body.id;
+    expect((await kbJson("/transition", { id: parent, to: "in_progress", actor: "author" })).status).toBe(200);
+    expect((await kbJson("/transition", { id: parent, to: "blocked", actor: "author",
+      note: "Bounded hold: the accepted disposition parks this card until the delivery PR merges",
+      await_event: { event: "pr_merged", repo, n: number },
+    })).status).toBe(200);
+
+    // cycle 1: the conflicting park owes exactly ONE conflict repair —
+    // the BR#17713 spawn sequence starts here and must stop after acceptance
+    const conflicted = () => prRow(number, { reviewDecision: null, mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(90) });
+    const first = await report(repo, [conflicted()]);
+    const repair = first.body.spawned.find((x: { card: string }) => x.card === parent)?.duty;
+    expect(repair, JSON.stringify(first.body)).toBeTruthy();
+
+    // the repairer delivers no_repair_needed and the independent outcome
+    // review ACCEPTS — the disposition is now review-accepted on-card
+    const transition = (id: string, to: string, actor: string, fields: object = {}) => kbJson("/transition", { id, to, actor, session: actor, ...fields });
+    expect((await transition(repair, "in_progress", "repairer")).status).toBe(200);
+    const submitted = await transition(repair, "in_review", "repairer", { execution_result: { outcome: "no_repair_needed — the typed park STANDS", receipts: ["PR head readback: conflicting by design, park is lifecycle-legal"] } });
+    expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+    const repairReview = submitted.body.verify_task;
+    expect(repairReview).toBeTruthy();
+    const repairClaim = await transition(repairReview, "in_progress", "outcome-reviewer");
+    const outcome = await transition(repairReview, "done", "outcome-reviewer", { review_result: {
+      kind: "accepted_execution", task_id: repair, subject_revision: repairClaim.body.review_subject.revision, receipts: ["Verified the accepted disposition receipts"],
+    } });
+    expect(outcome.status, JSON.stringify(outcome.body)).toBe(200);
+    expect((await kbJson("/get", { id: repair })).body.status).toBe("done");
+
+    // the production strand sweep runs between GitHub reports and must
+    // preserve the accepted recovery on the parked parent
+    const swept = await kbJson("/admin.strand_disposition_sweep", { now: NOW + 4 * 3_600_000 });
+    expect(swept.status).toBe(200);
+    expect((await kbJson("/get", { id: parent })).body.meta.recovery.task_id).toBe(repair);
+
+    // cycles 2..n: the accepted disposition IS the bounded hold — repeated
+    // conflicting reports spawn NOTHING and the typed park stands untouched
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const again = await report(repo, [conflicted()]);
+      expect(again.body.ok, JSON.stringify(again.body)).toBe(true);
+      expect(again.body.spawned, `cycle ${cycle + 2}`).toHaveLength(0);
+      expect(again.body.accounting).toMatchObject({ bound: 1, spawned: 0, unaccounted: 0 });
+    }
+    const after = (await kbJson("/get", { id: parent })).body;
+    expect(after.status).toBe("blocked");
+    expect(after.meta.blocked.await_event).toMatchObject({ event: "pr_merged", repo, n: number });
+    expect(after.meta.recovery.task_id).toBe(repair);
+  });
+
   it("keeps merged delivery reviews out of the next-batch review count", async () => {
     const repo = "state-vector/terminal-review-drill";
     const number = 2472;

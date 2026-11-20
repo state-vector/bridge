@@ -137,6 +137,24 @@ describe("all-open delivery progress", () => {
     expect(join({ prs: [observed], bindings: [{ ...repaired, open_verify_children: 1 }] }).judgements[0].decision.action).not.toBe("verify_repaired");
   });
 
+  it("an accepted repair disposition is the bounded hold: repair_binding never re-fires at a PR that cannot enter review (BR#17935)", () => {
+    const parked = binding(3519, { status: "blocked", progress: "stranded", repairAccepted: true });
+    const conflicting = pr(3519, { reviewDecision: null, mergeable: "CONFLICTING", mergeStateStatus: "DIRTY", updatedAt: iso(50) });
+    const r = join({ prs: [conflicting], bindings: [parked] });
+    expect(r.judgements[0].decision).toEqual({ action: "bound", card: parked.card });
+    expect(r.accounting).toMatchObject({ bound: 1, accounted: 1, stranded: 1, spawned: 0, unaccounted: 0 });
+    expect(r.judgements.some((j) => j.decision.action === "repair_binding")).toBe(false);
+    // changes-requested reads the same bounded hold
+    const changes = join({ prs: [pr(3519, { reviewDecision: "CHANGES_REQUESTED", updatedAt: iso(50) })], bindings: [parked] });
+    expect(changes.judgements[0].decision.action).toBe("bound");
+    expect(changes.judgements.some((j) => j.decision.action === "repair_binding")).toBe(false);
+    // fresh-repair control: without the accepted disposition, the same
+    // conflicting park still owes exactly the repair_binding judgement
+    const unaccepted = join({ prs: [conflicting], bindings: [binding(3519, { status: "blocked", progress: "stranded" })] });
+    expect(unaccepted.judgements[0].decision).toMatchObject({ action: "repair_binding", reason: "conflict" });
+    expect(unaccepted.accounting.unaccounted).toBe(1);
+  });
+
   it("keeps a live review ahead of a stranded duplicate in either binding order", () => {
     const observed = pr(3057, { reviewDecision: null, updatedAt: iso(50) });
     const current = binding(3057, { card: "BR#14047", status: "in_review", progress: "verifying", open_verify_children: 1 });

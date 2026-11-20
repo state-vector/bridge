@@ -440,8 +440,20 @@ export function reconcileJoin(args: {
       if (b.progress) acc[b.progress]++;
       // A verified recovery owes the bound PR a fresh review at its live head.
       // GitHub may have dismissed the old approval when the branch changed.
-      if (b.repairAccepted && b.progress === "stranded" && !b.lane && !b.queued && b.open_verify_children === 0
-        && !changesRequested && !conflicting) {
+      if (b.repairAccepted && b.progress === "stranded" && !b.lane && !b.queued && b.open_verify_children === 0) {
+        // BR#17935: an independently accepted repair disposition IS the
+        // bounded hold. The card's parked state (blocked + typed await_event)
+        // is the lifecycle-legal hold per the transition grammar; while the
+        // PR cannot enter review (conflicting/dirty or changes requested),
+        // the accepted disposition owns that wait — account bound and never
+        // re-fire repair_binding at it (the BR#17713/BR#10093 class burned
+        // generations re-firing at parks that stand by review acceptance).
+        if (changesRequested || conflicting) {
+          acc.bound++;
+          acc.accounted++;
+          judgements.push({ pr: p.number, decision: { action: "bound", card: b.card }, reason: "accepted repair disposition is the bounded hold — the typed park stands; repair_binding never re-fires at a PR that cannot enter review" });
+          continue;
+        }
         acc.accounted++;
         // The bulk GitHub feed can return UNKNOWN indefinitely. An
         // independent verifier checks the exact head directly before it

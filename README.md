@@ -232,6 +232,14 @@ verifying, held and stranded counts. A binding without executable progress is
 stranded, not healthy accounting. Completed reconcile duties cover their observed
 head rather than the lifetime of a PR.
 
+An accepted repair disposition on a parked card is the bounded hold (BR#17935):
+a recovery duty that closed done but whose independent outcome review is still
+pending reads `repairing` (freshness-bounded), and once the disposition is
+accepted, a PR that cannot enter review — conflicting/dirty or changes
+requested — accounts as `bound` behind its typed park forever: `repair_binding`
+never re-fires a fresh recovery generation at a hold that review acceptance has
+already ruled stands.
+
 Independent PR acceptance must use `review_result: {kind:"accepted_pr", task_id, subject_revision,
 legs:[{repo, number, head_sha_at_acceptance}]}`. Review completion and pending
 queue admission are committed together; the existing repair passes replay the
