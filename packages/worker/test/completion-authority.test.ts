@@ -30,8 +30,13 @@ beforeAll(async () => {
       async fetch(request) {
         const path = new URL(request.url).pathname;
         if (path === "/fixture/legacy-review") {
-          const {id, body} = await request.json();
+          const {id, body, acceptance, priorRevision, taskId, revision} = await request.json();
           this.state.storage.sql.exec("UPDATE artefacts SET body_md=?, meta=json_remove(meta, '$.review_offer') WHERE id=?", body, id);
+          if (acceptance) this.state.storage.sql.exec("UPDATE artefacts SET meta=json_set(meta, '$.acceptance_snapshot', json(?)) WHERE id=?", JSON.stringify(acceptance), id);
+          if (priorRevision) {
+            this.state.storage.sql.exec("UPDATE ledger SET data=json_set(data, '$.subject_revision', ?) WHERE artefact_id=? AND action='review_registered'", priorRevision, id);
+            this.version(id, "system:review", "review_registered", "Repeated registration from an older hub", {task_id:taskId,subject_revision:revision});
+          }
           return Response.json({ok:true});
         }
         if (path !== "/fixture/execution") return super.fetch(request);
@@ -450,6 +455,29 @@ describe("positive completion authority on the real SQLite hub", () => {
     const current = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
     expect(current.status).toBe(200);
     expect((await get(current.body.id)).body_md).toContain(replacement);
+  });
+
+  it("replaces a legacy queued duty which carried earlier criteria onto a new submission of the same PR", async () => {
+    const acceptance = {
+      authored_by: "analyst", basis: "BR#14118",
+      criteria: [{ id: "exact_ci", kind: "receipt", statement: "Verify the replacement run and all seven scenarios." }],
+    };
+    const id = await task(["impl"], { acceptance });
+    const pr = `https://github.com/${repo}/pull/3494`;
+    const submitted = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note: pr });
+    expect(submitted.status).toBe(200);
+    const legacy = submitted.body.verify_task;
+    await call("fixture/legacy-review", { id: legacy, body: `Verify ${pr}`, taskId: id,
+      priorRevision: "earlier-submission", revision: (await get(id)).meta.work_revision,
+      acceptance: { ...acceptance, criteria: [{ ...acceptance.criteria[0], statement: "Check the initial smoke run." }] },
+    });
+
+    const attempt = await call("transition", { id: legacy, to: "in_progress", actor: "reviewer", session: "fresh-review" });
+    expect(attempt.status).toBe(400);
+    expect(attempt.body.error).toContain("different submission");
+    const current = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(current.body.id).not.toBe(legacy);
+    expect((await get(current.body.id)).body_md).toContain("all seven scenarios");
   });
 
   it.each(["commit", "pull request"])("requires a resolved full SHA for an abbreviated %s submission", async kind => {

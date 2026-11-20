@@ -379,6 +379,13 @@ function parentAcceptanceCriteria(meta: unknown): AcceptanceCriteria | null {
   return parsed.success ? parsed.data : null;
 }
 
+function sameAcceptanceScope(snapshot: unknown, current: AcceptanceCriteria | null): boolean {
+  const prior = AcceptanceCriteriaSchema.safeParse(snapshot);
+  if (snapshot && !prior.success) return false;
+  const criteria = (acceptance: AcceptanceCriteria | null) => acceptance?.criteria.map(({ id, kind, statement, check }) => ({ id, kind, statement, check })) ?? [];
+  return JSON.stringify(criteria(prior.success ? prior.data : null)) === JSON.stringify(criteria(current));
+}
+
 type OfferedPullRequest = { repo: string; number: number; head_sha_at_acceptance?: string };
 type ReviewTarget =
   | { kind: "pull_request"; legs: OfferedPullRequest[] }
@@ -8041,6 +8048,20 @@ export class KnowledgeHub {
     return { row, meta };
   }
 
+  private legacyReviewMatchesSubmission(
+    duty: { id: string; body_md: string }, dutyMeta: Record<string, unknown>,
+    taskId: string, parentMeta: Record<string, unknown>, target: ReviewTarget,
+  ): boolean {
+    if (!matchesLegacyReviewTarget(String(duty.body_md ?? ""), target)) return false;
+    const registered = this.one(`SELECT json_extract(data,'$.subject_revision') AS revision FROM ledger
+      WHERE artefact_id=? AND kind='mutation' AND action='review_registered' AND json_extract(data,'$.task_id')=?
+      ORDER BY seq ASC LIMIT 1`, duty.id, taskId);
+    // Earlier hubs could register the same unclaimed duty twice. Only the
+    // first registration identifies the submission that froze its criteria.
+    if (registered?.revision === (parentMeta.work_revision ?? "legacy")) return true;
+    return sameAcceptanceScope(dutyMeta.acceptance_snapshot, parentAcceptanceCriteria(parentMeta));
+  }
+
   private retireReplacedReview(current: CurrentTaskReview, replacement: string) {
     if (current.phase !== "pending" || current.id === replacement) return;
     const pending = this.unclaimedReview(current.id);
@@ -8176,7 +8197,7 @@ export class KnowledgeHub {
         const target = taskReviewTarget(parentMeta, String(body.note ?? ""));
         const offer = pending.meta.review_offer as ReviewOffer | undefined;
         const sameTarget = offer ? sameReviewTarget(offer.target, target) : target.kind === "execution" || target.kind === "unspecified";
-        return sameTarget && JSON.stringify(pending.meta.acceptance_snapshot ?? null) === JSON.stringify(parentAcceptanceCriteria(parentMeta))
+        return sameTarget && sameAcceptanceScope(pending.meta.acceptance_snapshot, parentAcceptanceCriteria(parentMeta))
           ? { id: current.id } : null;
       },
       // The canonical query above already includes detached rounds.
@@ -8472,7 +8493,7 @@ export class KnowledgeHub {
           const target = taskReviewTarget(parentMeta);
           const offer = meta.review_offer as ReviewOffer | undefined;
           const staleOffer = offer ? offer.revision !== revision || !sameReviewTarget(offer.target, target)
-            : !matchesLegacyReviewTarget(String(row.body_md ?? ""), target);
+            : !this.legacyReviewMatchesSubmission(row, meta, subjectId, parentMeta, target);
           if (staleOffer) {
             if (subjectRow.status === "in_review") await this.createIndependentReview(subjectId, "system:review");
             throw new Error("gate: this unclaimed review belongs to a different submission; request the current independent review");
@@ -8509,7 +8530,7 @@ export class KnowledgeHub {
         const offer = meta.review_offer as ReviewOffer | undefined;
         const submitted = taskReviewTarget(targetMeta);
         if (offer ? offer.revision !== captured.data.revision || !sameReviewTarget(offer.target, submitted)
-          : !matchesLegacyReviewTarget(String(row.body_md ?? ""), submitted)) throw new Error("gate: this review belongs to a different submitted delivery");
+          : !this.legacyReviewMatchesSubmission(row, meta, subject, targetMeta, submitted)) throw new Error("gate: this review belongs to a different submitted delivery");
         if (submitted.kind === "pull_request") {
           const expected = submitted.legs;
           const [primary] = expected;
@@ -10934,13 +10955,12 @@ export class KnowledgeHub {
     const target = taskReviewTarget(meta);
     const revision = String(meta.work_revision ?? "legacy");
     if (current.phase === "pending") {
-      const duty = this.one(`SELECT meta,body_md FROM artefacts WHERE id=?`, current.id);
+      const duty = this.one(`SELECT id,meta,body_md FROM artefacts WHERE id=?`, current.id);
       const dutyMeta = JSON.parse(String(duty?.meta ?? "{}"));
       const captured = ReviewSubjectSchema.safeParse(dutyMeta.review_subject);
       const offer = dutyMeta.review_offer as ReviewOffer | undefined;
       const matchesOffer = offer ? offer.revision === revision && sameReviewTarget(offer.target, target)
-        : target.kind === "unspecified" || target.kind === "execution"
-          || (captured.success && matchesLegacyReviewTarget(String(duty?.body_md ?? ""), target));
+        : !!duty && this.legacyReviewMatchesSubmission(duty, dutyMeta, taskId, meta, target);
       if (matchesOffer && (!captured.success || captured.data.revision === revision))
         return { kind: "independent_review", task_id: taskId, id: current.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
     }
