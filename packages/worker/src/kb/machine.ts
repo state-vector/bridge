@@ -1229,6 +1229,29 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // this fix) coalesced the same way while this class awaited its merge.
   // Named so the Log says WHAT fenced; priced never-a-breach.
   review_fence: Number.POSITIVE_INFINITY,
+  // BR#17878 — the unclaimed-review submission fence (do.ts claim-time
+  // binding guard, reached from the doTransition in_progress path): claiming
+  // a review-role duty that has no captured review_subject yet re-reads the
+  // subject's LIVE work_revision and compares it to the duty's spawn-time
+  // review_offer; a rotated submission (every parent in_review resubmission
+  // spins a new revision) is refused with "gate: this unclaimed review
+  // belongs to a different submission; request the current independent
+  // review". The fence refusing a stale claim binding IS the system working
+  // — the BR#4562/BR#6654/BR#7008/BR#7684 never-a-breach pricing family
+  // again: zero state destroyed, the duty stays fenced to the submission it
+  // was spawned for, and the refusal's own instruction is the cure (request
+  // the current independent review — the same guard auto-spawns it when the
+  // subject is resting in_review). The specimen complied: 3 claim attempts
+  // on BR#17846 (the verify duty for BR#17812 / superpositional PR #3583,
+  // spawned 2026-11-20 11:42:50Z with review_offer revision 3530bc46 /
+  // PR head 4912a279) hit the fence 12:53:23–12:53:26Z after the parent
+  // re-submitted twice — folded "unclassified" (default threshold 3) and
+  // raised breach card BR#17878; the parent's delivery completed through its
+  // user-authorized separate-review path (PR #3583 merged 13:00:52Z). The
+  // throw is bare — no [rule:] tag — so the rule-tag table can't own it.
+  // Named so the Log says WHAT held: a claim, held by a stale review
+  // submission; priced never-a-breach.
+  "claim:held-stale-review": Number.POSITIVE_INFINITY,
   // BR#9703 — the recovery review's replacement-binding gate (do.ts:7387,
   // the doTransition unblock_result path): a task-recovery duty submitting
   // unblock_result {kind:"reblocked"} whose binding does not match the
@@ -1592,6 +1615,24 @@ export function breachClass(reason: string): string {
   // BR#7684; second specimen BR#7761 (3 events 2026-11-07 16:44–17:09Z,
   // breach card BR#8034) coalesced identically; priced never-a-breach above.
   if (r.includes("stale or missing review subject_revision")) return "review_fence";
+  // BR#17878: the unclaimed-review submission fence's tag-cut/bare backstop
+  // (do.ts claim-time binding guard): claiming a review duty whose spawn-time
+  // review_offer no longer matches the subject's live work_revision is
+  // refused with "gate: this unclaimed review belongs to a different
+  // submission; request the current independent review" — the fence refusing
+  // a stale claim binding is the system working (the duty stays fenced to
+  // the submission it was spawned for; the refusal's own instruction names
+  // the cure, and the same guard auto-spawns the fresh round when the
+  // subject rests in_review), priced never-a-breach above. The throw is
+  // bare — no [rule:] tag — so the rule-tag table can't own it; match the
+  // structural fragment "unclaimed review belongs to a different
+  // submission", not the whole sentence (BR#3611/BR#3612 wording-drift
+  // lesson); it sits ~11 chars in, far inside the 300-char audit slice, so
+  // the classification survives any tail. Specimen: BR#17846, 3 claim
+  // refusals 2026-11-20 12:53:23–12:53:26Z after the parent re-submitted
+  // twice past the duty's spawn offer (breach card BR#17878).
+  if (r.includes("unclaimed review belongs to a different submission"))
+    return "claim:held-stale-review";
   // BR#9703: the recovery review's replacement-binding gate (do.ts:7387, the
   // doTransition unblock_result path): a task-recovery duty closing in_review
   // with unblock_result {kind:"reblocked"} is refused with "gate: recovery
