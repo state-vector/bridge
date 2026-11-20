@@ -2074,6 +2074,30 @@ describe("breachClass: review_fence (BR#7684)", () => {
   });
 });
 
+describe("breachClass: claim:held-stale-review (BR#17878)", () => {
+  // the exact audited reason shape (do.ts claim-time binding guard, bare
+  // throw — no [rule:] tag)
+  const FENCE = "gate: this unclaimed review belongs to a different submission; request the current independent review";
+
+  it("the fence refusal classifies claim:held-stale-review from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("claim:held-stale-review");
+    // the stem sits ~11 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("claim:held-stale-review");
+  });
+
+  it("a fence-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#17846", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["claim:held-stale-review"]).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // BR#6740 — the doTransition exit gate for typed execution waits (do.ts
 // ~6549: isExecutionWait / local handoff preparing|waiting): ANY ordinary
