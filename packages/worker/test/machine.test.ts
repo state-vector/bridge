@@ -2474,6 +2474,60 @@ describe("breachClass: claim:held-publisher-bars (BR#15643)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BR#17493 — the recovery-disposition close gate (BR#17396,
+// requireAttemptDiagnosisContinuation do.ts:17738, reached from the
+// doTransition write boundary do.ts:8570): a task-recovery duty closing
+// in_review/done is refused with "gate: diagnosis of <subject> still needs a
+// continuation — reconcile the effect, record an admissible retry, or bind a
+// real repair dependency or a decision to that task" while the subject's
+// execution_diagnosis is live (matching generation+hold) and has no
+// actionable continuation — a valid recovery permit, a startup ask, or a
+// real typed repair wait (the BR#17396 test parks the subject on a br_done
+// repair wait and the same submission then passes). The refusal IS the
+// recovery-disposition contract working: zero state destroyed, the subject's
+// admission hold stays bound, and the message names its own cure. The throw
+// carries no [rule:] tag, so the ladder stem owns it ("still needs a
+// continuation" — unique to this throw). Priced never-a-breach — the
+// BR#4562/BR#6654/BR#7008/BR#7684/BR#14689 family; pricing it FINITE would
+// re-arm breach cards on exactly the disposition the recovery law
+// prescribes. Specimen: BR#17432 (system:recovery duty for BR#16941's gen-9
+// stopped attempt, hold retry_budget), 3 close-leg refusals 2026-11-20
+// 00:09:29–00:13:22Z — the gate's FIRST live firings, 49 minutes after
+// BR#17396 landed it; folded "unclassified" (default threshold 3) and
+// raised breach card BR#17493.
+// ---------------------------------------------------------------------------
+describe("breachClass: recovery:held-diagnosis (BR#17493)", () => {
+  // the exact audited reason shape (do.ts:17738, thrown message, no [rule:] tag)
+  const FENCE = "gate: diagnosis of BR#16941 still needs a continuation — reconcile the effect, record an admissible retry, or bind a real repair dependency or a decision to that task";
+
+  it("the diagnosis-continuation refusal classifies recovery:held-diagnosis from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("recovery:held-diagnosis");
+    // the stem sits ~28 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("recovery:held-diagnosis");
+  });
+
+  it("a diagnosis-continuation refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#17432", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["recovery:held-diagnosis"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("sister fences keep their own classes (stem uniqueness)", () => {
+    // "still needs a continuation" is unique to the BR#17396 close gate —
+    // the interactive-claim human-decision fence (BR#14689) and the recovery
+    // rebind fence (BR#9703) must not be captured by it
+    expect(breachClass("gate: an open human decision owns this exit; answer it before claiming")).toBe("claim:held-human-decision");
+    expect(breachClass("gate: recovery review requires a different observable condition bound to this blocked task")).toBe("rebind_fence");
+  });
+});
+
 
 // BR#14071 — the analysis-done receipts gate (machine.ts
 // analysis-done-needs-outcome rule) refusing a done whose body carries no

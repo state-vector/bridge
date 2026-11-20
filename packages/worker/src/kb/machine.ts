@@ -1352,6 +1352,26 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // events folded "unclassified" (default threshold 3) and raised breach
   // card BR#15643.
   "claim:held-publisher-bars": Number.POSITIVE_INFINITY,
+  // BR#17493 — the recovery-disposition close gate (BR#17396,
+  // requireAttemptDiagnosisContinuation, do.ts): a task-recovery duty's
+  // in_review/done submission is refused with "gate: diagnosis of <subject>
+  // still needs a continuation — reconcile the effect, record an admissible
+  // retry, or bind a real repair dependency or a decision to that task"
+  // while the subject's live execution diagnosis has no actionable
+  // continuation (a valid recovery permit, a startup ask, or a real typed
+  // repair wait). The refusal IS the recovery-disposition contract working:
+  // zero state destroyed, the subject's admission hold stays bound, and the
+  // message names its own cure (the BR#17396 test parks the subject on a
+  // br_done repair wait and resubmits successfully) — the BR#4562/BR#6654/
+  // BR#7008/BR#7684/BR#14689 never-a-breach pricing family (pricing it
+  // FINITE would re-arm breach cards on exactly the disposition the
+  // recovery law prescribes). Named so the Log says WHAT held: a recovery
+  // duty's close, held for its subject's unresolved diagnosis. Specimen:
+  // BR#17432 (system:recovery duty for BR#16941's gen-9 stopped attempt,
+  // hold retry_budget) — 3 close-leg refusals 2026-11-20 00:09:29–00:13:22Z,
+  // the gate's FIRST live firings 49 minutes after BR#17396 landed it
+  // (breach card BR#17493).
+  "recovery:held-diagnosis": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1705,6 +1725,31 @@ export function breachClass(reason: string): string {
   // Fragment uniqueness: the only generator of this text is the
   // human-signoff-done guard, so no sister gate can be captured.
   if (r.includes("human sign-off task")) return "close:held-human-signoff";
+  // BR#17493: the recovery-disposition close gate (do.ts:17738,
+  // requireAttemptDiagnosisContinuation, reached from the doTransition write
+  // boundary do.ts:8570 for an in_review/done submission by a task-recovery
+  // duty): closing an execution-environment recovery duty is refused with
+  // "gate: diagnosis of <subject> still needs a continuation — reconcile the
+  // effect, record an admissible retry, or bind a real repair dependency or
+  // a decision to that task" while the subject's execution_diagnosis is live
+  // (matching generation+hold) and has no actionable continuation — a valid
+  // recovery permit, a startup ask, or a real typed repair wait (BR#17396).
+  // The refusal IS the recovery-disposition contract working: zero state is
+  // destroyed, the subject's admission hold stays bound, and the message
+  // names its own cure (the BR#17396 test parks the subject on a br_done
+  // repair wait and the same submission then passes). The throw carries no
+  // [rule:] tag, so the table above can't own it; match the structural
+  // fragment "still needs a continuation", not the whole sentence
+  // (BR#3611/BR#3612 wording-drift lesson); it sits ~28 chars in, far inside
+  // the 300-char audit slice, so the classification survives any tail, and
+  // it is unique to this throw (no sister gate generates the phrase).
+  // Specimen: BR#17432 (system:recovery duty for BR#16941's gen-9 stopped
+  // attempt, hold retry_budget), 3 close-leg refusals 2026-11-20
+  // 00:09:29–00:13:22Z while the duty's reconciled-delivered close legs
+  // fired before the bound disposition existed (decision BR#17489 proposed
+  // mid-window) — the gate's FIRST live firings, 49 minutes after BR#17396
+  // landed it; folded "unclassified" and raised breach card BR#17493.
+  if (r.includes("still needs a continuation")) return "recovery:held-diagnosis";
   return "unclassified";
 }
 
