@@ -1837,6 +1837,9 @@ authorisation gate and recheck the target; neither grants an agent human authori
 The alarm also consumes persisted disposition requests, so a crash between request
 and application cannot skip the cleanup. Semantic refusals become terminal receipts;
 storage faults leave the command pending for retry.
+Single and batch retirements use the same atomic writer. A recorded decision
+can retire an unstarted capability park, but not a rebound batch target, a
+protected local pickup, a live writer, or a task with unreconciled effects.
 Recorded **per-card** human retirement decisions are replayable through that same
 gate: an explicit `SUPERSEDE` answer, or a `retire BR#N` clause naming the ask's
 bound task, can retire its still-unclaimed `todo`/`blocked` card. KEEP/NO answers,

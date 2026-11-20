@@ -7762,12 +7762,16 @@ export class KnowledgeHub {
     const execution = this.executionState(id);
     const retirementMeta = JSON.parse(String(row.meta ?? "{}"));
     const wait = validateAwaitEvent(retirementMeta.blocked?.await_event);
-    const authorisedUnstartedCancellation = !!authorization && !retirementMeta.interactive_execution
+    const authorisedUnstartedCancellation = !!authorization && !retirementMeta.interactive_execution && !this.startupWait(id)
       && wait?.event === "executor_capability" && wait.id === id
       && (!execution || ["none", "returned"].includes(execution.handoff.phase))
       && !execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
     if (this.protectedExecution(id, retirementMeta) && !authorisedUnstartedCancellation
-      || execution?.attempt && execution.attempt.phase !== "quiesced") throw new Error("gate: explicit execution wait or unquiesced writer owns this disposition exit");
+      || execution?.attempt && execution.attempt.phase !== "quiesced"
+      || execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      || this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, id)) {
+      throw Object.assign(new Error("gate: an explicit execution wait, unquiesced writer, or unreconciled effect owns this disposition exit"), { result_class: "gate_rejected" });
+    }
     // leg 2 — todo → superseded by direct write, exactly how the machine's
     // own supersede_children effect terminates duty children (do.ts): there
     // is no lifecycle edge by design (agents can never supersede), so the
@@ -7777,6 +7781,7 @@ export class KnowledgeHub {
     meta.superseded_reason = note;
     if (replacementId) meta.superseded_by = replacementId;
     delete meta.blocked; // terminal — the parked-reason box must not resurrect ("Unblock now" on a dead card)
+    delete meta.execution_wait;
     delete meta.subprocess;
     delete meta.attempt;
     this.state.storage.transactionSync(() => {
@@ -7799,7 +7804,39 @@ export class KnowledgeHub {
     });
     this.audit(actor, "transition", id, { from: row.status, to: "superseded", note, ...(replacementId ? { replacement_id: replacementId } : {}) });
     this.version(id, actor, "transition", `${row.status} → superseded — ${note}`, { from: row.status, to: "superseded", note });
+    for (const tag of ["unblock", "review"] as const) {
+      this.retireDutyRounds(id, meta, { tag, keep_newest: false, cause: `${id} superseded — ${tag} round closed` }, ts);
+    }
     return { id, status: "superseded", ...(replacementId ? { replacement_id: replacementId } : {}) };
+  }
+
+  private retireDutyRounds(id: string, meta: any, fx: { tag: string; keep_newest: boolean; cause: string }, ts: number): void {
+    const parentTargets = fx.keep_newest ? prTargetsOf(this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id)) : [];
+    const kids = this.state.storage.sql.exec(
+      `SELECT c.id, c.status, c.owner, c.meta, c.body_md, c.title FROM relations r JOIN artefacts c ON c.id = r.src_id
+       WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
+      id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
+    ).toArray() as any[];
+    let keptNewestRound = false;
+    for (const v of kids) {
+      try { this.conserveDelivery(v, "", false); } catch {
+        this.audit("system:delivery", "duty_retirement_retained", String(v.id), { reason: "duty has outstanding PR bindings" });
+        continue;
+      }
+      if (fx.keep_newest) {
+        const t = prTargetsOf(v);
+        if (t.length && parentTargets.length && !t.some(x => parentTargets.some(p => prTargetMatch(x, p)))) continue;
+        if (!keptNewestRound) { keptNewestRound = true; continue; }
+      }
+      const vm = JSON.parse(v.meta ?? "{}");
+      const subject = ReviewSubjectSchema.safeParse(vm.review_subject);
+      if (subject.success && subject.data.task_id === id && subject.data.revision !== (meta.work_revision ?? "legacy")
+        && (v.status !== "todo" || v.owner || this.staleReviewHasExecutionHold(String(v.id), vm))) continue;
+      vm.superseded_reason = fx.cause;
+      this.state.storage.sql.exec(`UPDATE artefacts SET status='superseded', meta=?, status_ts=?, updated_ts=? WHERE id=?`, JSON.stringify(vm), ts, ts, v.id);
+      this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: fx.cause });
+      this.version(v.id, "system:separation", "transition", fx.cause, { from: v.status, to: "superseded" });
+    }
   }
 
   /** No terminal path may silently erase a PR's delivery owner. Historical
@@ -7817,7 +7854,7 @@ export class KnowledgeHub {
     if (!legs.length) return;
     const disposition = meta.delivery_disposition as DeliveryDisposition | undefined;
     if (disposition?.kind === "abandon" && disposition.closure.phase === "closed" && disposition.closure.receipts.length) return;
-    if (!successorId || successorId === String(row.id)) throw new Error("gate: delivery responsibility requires a live replacement, authorised pending closure, or bounded hold; supersede alone cannot abandon PRs");
+    if (!successorId || successorId === String(row.id)) throw Object.assign(new Error("gate: delivery responsibility requires a live replacement, authorised pending closure, or bounded hold; supersede alone cannot abandon PRs"), { result_class: "gate_rejected" });
     const successor = this.one(`SELECT * FROM artefacts WHERE id=?`, successorId);
     if (!successor || successor.type !== "task" || ["done", "superseded"].includes(String(successor.status))) throw new Error("gate: delivery replacement must be a live task");
     if (!transfer) return;
@@ -8322,6 +8359,9 @@ export class KnowledgeHub {
       refuse("batch-auth-not-human", `ask ${askId}'s answer was recorded by '${answeredBy}' — batch drop authority requires a human principal (web:/human:)`);
     }
     const stripped = answer.trim().replace(/^\(recommended\)\s*/i, "").trim();
+    const prior = JSON.parse(String(row.meta ?? "{}"));
+    const authorization = { ask: askId, answered_by: answeredBy, answered_ts: Number(am.ask.answered_ts), answer: answer.slice(0, 300), applied_by: actor, applied_session: body.session as string | undefined, applied_ts: ts };
+    const asActor = `system:question(${answeredBy})`;
     // Legacy per-card human decisions could record "retire BR#N" without
     // executing it. Replay ONLY an explicit retirement of this ask's bound
     // subject, using the same conservation/quiescence checks as the web verb.
@@ -8334,13 +8374,11 @@ export class KnowledgeHub {
     const single = subject === id && !am.ask?.decision && (!namedSupersede || namedSupersede === id)
       && (/^SUPERSEDE\b(?!\s+(?:all|only|\d+)\b)/i.test(stripped) || explicitRetire || recordedWebRetirement);
     if (single) {
-      const prior = JSON.parse(String(row.meta ?? "{}"));
       if (row.status === "superseded" && prior.batch_auth?.ask === askId) return { id, status: "superseded", batch_auth: prior.batch_auth };
       if (!["blocked", "todo"].includes(String(row.status))) refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}'; recorded retirement cannot interrupt active work`);
       if (prior.lane || this.isUnclaimableAnchor(row, prior) || parseTags(row.tags).includes("infrastructure")) refuse("batch-auth-target-protected", `target ${id} is standing infrastructure, outside recorded retirement scope`);
-      const authorization = { ask: askId, answered_by: answeredBy, answered_ts: Number(am.ask.answered_ts), answer: answer.slice(0, 300), applied_by: actor, applied_session: body.session as string | undefined, applied_ts: ts };
       const replacement = /\b(?:replacement|superseded\s+by)\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
-      const result = await this.supersedeTask({ id, replacement_id: replacement, note: `Recorded human disposition ${askId}: ${stripped}` }, `system:question(${answeredBy})`, authorization);
+      const result = await this.supersedeTask({ id, replacement_id: replacement, note: `Recorded human disposition ${askId}: ${stripped}` }, asActor, authorization);
       this.version(id, actor, "update", `Recorded per-card retirement applied from ${askId}; no new human decision`, { ask: askId, answered_by: answeredBy });
       return { ...result, batch_auth: authorization };
     }
@@ -8364,12 +8402,16 @@ export class KnowledgeHub {
     // State recheck: the ruling applies to open parks only. A card that went
     // terminal, was claimed, or was rebound since the authorization must NOT
     // take the old ruling — skip it and say why.
+    if (row.status === "superseded" && prior.batch_auth?.ask === askId) {
+      return { id, status: "superseded", batch_auth: { ...prior.batch_auth, authorized_scope: authorized.length } };
+    }
     if (row.status !== "blocked") {
       refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}', not an open park — recheck its current state before applying the ruling (the drop edge is blocked → superseded, BR#3913)`);
     }
-    const meta = JSON.parse(row.meta ?? "{}");
-    const tags: string[] = parseTags(row.tags);
-    if (meta.lane || tags.includes("infrastructure")) {
+    if (Number(prior.blocked?.ts ?? row.status_ts) > authorization.answered_ts) {
+      refuse("batch-auth-target-rebound", `target ${id} was parked again after the answer; the prior authorization cannot retire its new wait`);
+    }
+    if (prior.lane || this.isUnclaimableAnchor(row, prior) || parseTags(row.tags).includes("infrastructure")) {
       refuse("batch-auth-target-protected", `target ${id} is a standing lane/infrastructure card — closing it retires a live subsystem (BR#5061); outside batch disposition scope`);
     }
     this.audit(actor, "batch_auth_apply", id, {
@@ -8378,33 +8420,11 @@ export class KnowledgeHub {
       answered_ts: am.ask.answered_ts,
       session: String(body.session ?? "") || undefined,
     });
-    const asActor = `system:question(${answeredBy})`;
-    await this.transition(
-      {
-        id,
-        to: "superseded",
-        human_verdict: true,
-        note: `batch authorization ask ${askId} answered by ${answeredBy} — dropped: ${stripped.slice(0, 80)} (applied via batch_auth by ${actor}${body.session ? `/${String(body.session).slice(0, 60)}` : ""})`,
-      },
-      asActor,
-    );
-    // Durable provenance on the dropped card: who authorized, which ask, who
-    // carried it. get_history keeps the act row; this keeps it machine-readable.
-    const cur = this.one(`SELECT meta FROM artefacts WHERE id = ?`, id);
-    const cm = JSON.parse(cur?.meta ?? "{}");
-    delete cm.disposition_request;
-    cm.batch_auth = {
-      ask: askId,
-      answered_by: answeredBy,
-      answered_ts: am.ask.answered_ts,
-      answer: answer.slice(0, 300),
-      applied_by: actor,
-      applied_session: String(body.session ?? "") || undefined,
-      applied_ts: ts,
-    };
-    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(cm), id);
-    this.version(id, actor, "update", `batch_auth provenance stamped — authorization ask ${askId} answered by ${answeredBy}`, {});
-    return { id, status: "superseded", batch_auth: { ask: askId, answered_by: answeredBy, authorized_scope: authorized.length } };
+    const result = await this.supersedeTask({
+      id,
+      note: `Recorded human batch disposition ${askId}: ${stripped.slice(0, 300)}`,
+    }, asActor, authorization);
+    return { ...result, batch_auth: { ...authorization, authorized_scope: authorized.length } };
   }
 
   private async doTransition(body: any, actor: string, origin: "client" | "machine", beforeWrite?: () => void, reviewTarget?: ReviewTarget) {
@@ -9345,51 +9365,7 @@ export class KnowledgeHub {
           break;
         }
         case "supersede_children": {
-          // children are ephemeral: when the parent moves on, their round
-          // closes. keep_newest keeps the newest verify child alive across a
-          // bounce — the bounce re-enters the SAME round (the churn that
-          // drowned the pool was 3-6 cards per parent).
-          // BR#5874: the kept child must be THE ROUND — a duty for the
-          // parent's own deliverable. A disposition verify child covering a
-          // DIFFERENT PR (spawned after the handoff) is neither kept as the
-          // round nor superseded: it verifies its own PR and coexists.
-          // Target-blind keep_newest handed the round to whichever child
-          // happened to be newest; a cross-PR child won the keep and the
-          // parent's round died (BR#4678: ~6h with no verifier on a boosted
-          // card). Parent targets resolve from meta.pr / body / title; a
-          // duty with no PR signal counts as a (legacy) round; with no
-          // parent binding at all the legacy newest-wins keep applies.
-          const parentRow = fx.keep_newest ? this.one(`SELECT meta, body_md, title FROM artefacts WHERE id = ?`, id) : null;
-          const parentTargets = fx.keep_newest ? prTargetsOf(parentRow) : [];
-          const kids = this.state.storage.sql.exec(
-            `SELECT c.id AS id, c.status AS status, c.owner AS owner, c.meta AS meta, c.body_md AS body_md, c.title AS title, c.updated_ts AS uts FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.status IN ('todo','in_progress','blocked') AND (c.roles LIKE ? OR c.tags LIKE ?) ORDER BY c.updated_ts DESC`,
-            id, `%"${fx.tag}"%`, `%"${fx.tag}"%`,
-          ).toArray() as any[];
-          let keptNewestRound = false;
-          kids.forEach((v) => {
-            try { this.conserveDelivery(v, "", false); } catch {
-              this.audit("system:delivery", "duty_retirement_retained", String(v.id), { reason: "duty has outstanding PR bindings" });
-              return;
-            }
-            if (fx.keep_newest) {
-              const t = prTargetsOf(v);
-              const isRound = t.length === 0 || parentTargets.length === 0 || t.some((x) => parentTargets.some((p) => prTargetMatch(x, p)));
-              if (!isRound) return; // cross-PR disposition duty — untouched, it is not the round
-              if (!keptNewestRound) { keptNewestRound = true; return; } // newest round survives for re-entry
-            }
-            const vm = JSON.parse(v.meta ?? "{}");
-            const subject = ReviewSubjectSchema.safeParse(vm.review_subject);
-            if (subject.success && subject.data.task_id === id && subject.data.revision !== (meta.work_revision ?? "legacy")
-              && (v.status !== "todo" || v.owner || this.staleReviewHasExecutionHold(String(v.id), vm))) return;
-            vm.superseded_reason = fx.cause;
-            this.state.storage.sql.exec(
-              `UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`,
-              JSON.stringify(vm), ts, ts, v.id,
-            );
-            this.audit("system:separation", "transition", v.id, { from: v.status, to: "superseded", note: fx.cause });
-            this.version(v.id, "system:separation", "transition", fx.cause, { from: v.status, to: "superseded" });
-          });
+          this.retireDutyRounds(id, meta, fx, ts);
           break;
         }
         case "escalate": {

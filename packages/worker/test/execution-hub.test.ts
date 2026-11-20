@@ -415,6 +415,43 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("update", { id: task.id, meta: { execution_requirements: { tier: "small", tools: [], environment: [] } } })).data.error).toMatch(/cannot silently weaken/);
     expect((await post("update", { id: task.id, meta_delete: ["execution_requirements"] })).data.error).toMatch(/cannot be deleted/);
   });
+
+  it("the alarm retires an authorized capability park once without releasing a protected pickup", async () => {
+    const shared = stub;
+    stub = await hub("retirement-alarm");
+    try {
+      const protectedTask = await runtimeTask();
+      const target = (await post<{ id: string; status: string }>("create", {
+        actor: "test", type: "task", title: "Never started on a retired host", qualified: true,
+        meta: { execution_requirements: { tier: "large", environment: ["retired-environment"] } },
+      })).data;
+      expect(target.status).toBe("blocked");
+      const subject = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Batch operator" })).data;
+      const options = ["SUPERSEDE all 2", "KEEP both"];
+      const ask = await post<{ id: string }>("ask.create", {
+        actor: "test", to: "human", artefact_id: subject.id, question: "Retire these two parked tasks?",
+        details: `Census: ${target.id} no longer has a host; ${protectedTask.id} still has its own local pickup.`,
+        reason: "The operator owns retirement authority.", decision: decisionFixture(subject.id, options), options,
+      });
+      expect(ask.data.id).toBeTruthy();
+      await post("ask.answer", { id: ask.data.id, answer: options[0], actor: "web:rayh" });
+      for (const id of [target.id, protectedTask.id]) {
+        const request = await post("update", { id, meta: { disposition_request: { kind: "apply_authorized_supersede", ask: ask.data.id } } });
+        expect(request.data.error).toBeUndefined();
+      }
+      await post("admin.alarm_sweep", {});
+      const retired = (await post<any>("get", { id: target.id })).data;
+      expect(retired).toMatchObject({ status: "superseded", meta: { batch_auth: { ask: ask.data.id, answered_by: "web:rayh" } } });
+      expect(retired.meta.execution_wait).toBeUndefined();
+      const protectedAfter = (await post<any>("get", { id: protectedTask.id })).data;
+      expect(protectedAfter).toMatchObject({ status: "blocked", meta: { disposition_result: { kind: "refused" } } });
+      expect(protectedAfter.meta.disposition_request).toBeUndefined();
+      const replay = await post<{ batch_auth: { applied_ts: number } }>("transition", { id: target.id, actor: "test", to: "superseded", batch_auth: { ask: ask.data.id } });
+      expect(replay.data.batch_auth.applied_ts).toBe(retired.meta.batch_auth.applied_ts);
+    } finally {
+      stub = shared;
+    }
+  });
 });
 afterAll(async () => { await mf?.dispose(); });
 

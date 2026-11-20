@@ -174,6 +174,10 @@ live successor, or explicitly abandoned with independently accepted GitHub-close
 receipts. Replacement transfers bindings and ownership atomically. A bounded
 hold records its owner, reason, next observation and deadline. Failed repair
 rounds escalate existing recovery; they never silently cancel product work.
+Once recorded, a human-authorized retirement can be applied by the watchdog
+without the requesting session. Batch and single retirements share one atomic
+path, including for unstarted capability parks. A prior batch decision cannot
+retire a newly rebound wait, and local pickups and unknown effects stay protected.
 
 Reconciliation includes old undecided-review and draft PRs and distinguishes
 queued, repairing, verifying, held and stranded work. A historical card link is
