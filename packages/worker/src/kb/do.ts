@@ -261,7 +261,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
-import { RecoveryCapacity, schedulingRank, schedulingBoost, taskSchedulingRank, priorityTask, recoveryReviewMeta, trainReviewParentJoin } from "./recovery-capacity.ts";
+import { RecoveryCapacity, schedulingRank, schedulingBoost, priorityTask, recoveryReviewMeta, trainReviewParentJoin, selectionOrder, selectionEntry, bypassesWaiter, type SelectionEntry } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
@@ -3767,6 +3767,17 @@ export class KnowledgeHub {
         task_id TEXT PRIMARY KEY,
         last_reserved_at INTEGER NOT NULL
       );
+      -- BR#17649 — bounded bypass accounting for the ONE selection policy:
+      -- how many compatible selection opportunities a continuously eligible
+      -- task has lost to priority work (better band/class or stronger boost,
+      -- never protected line recovery). At SELECTION_BYPASS_BOUND the policy
+      -- gives the task its turn ahead of the bypassing stream; the counter
+      -- clears when a claim or a diagnosis consumes that turn.
+      CREATE TABLE IF NOT EXISTS dispatch_selection_bypasses (
+        task_id TEXT PRIMARY KEY,
+        bypasses INTEGER NOT NULL,
+        since INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS dispatch_reservations (
         task_id TEXT PRIMARY KEY, token_id TEXT NOT NULL, session TEXT NOT NULL,
         generation INTEGER NOT NULL, expires_at INTEGER NOT NULL
@@ -6138,8 +6149,10 @@ export class KnowledgeHub {
             COALESCE(q.last_reserved_at, 0)) AS queue_ts,
         COALESCE(repair.id, delivery.id, a.id) AS queue_id,
         delivery.id IS NOT NULL AS train_review, delivery.meta AS train_parent_meta,
-        q.task_id IS NOT NULL AS reserved_before
+        q.task_id IS NOT NULL AS reserved_before,
+        COALESCE(bypass.bypasses, 0) AS bypassed
         FROM artefacts a LEFT JOIN dispatch_queue_turns q ON q.task_id=a.id
+        LEFT JOIN dispatch_selection_bypasses bypass ON bypass.task_id=a.id
         LEFT JOIN artefacts repair ON repair.id=json_extract(a.meta,'$.execution_review_of')
           AND repair.status='in_review'
           AND json_extract(a.meta,'$.machine_duty.by')='recovery-review'
@@ -6269,14 +6282,15 @@ export class KnowledgeHub {
       if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
     }));
-    const rank = (row: (typeof rows)[number]) => taskSchedulingRank(priorityTask(row));
-    const boost = (row: (typeof rows)[number]) => Math.max(schedulingBoost(JSON.parse(String(row.meta ?? "{}"))),
-      row.reserved_before ? 0 : schedulingBoost(JSON.parse(String(row.train_parent_meta ?? "{}"))));
-    eligible.sort((a, b) => rank(a) - rank(b)
-      || boost(b) - boost(a)
+    // BR#17649 — ONE selection law for both stages (recovery-capacity.ts):
+    // protected line recovery first, then a starved task's bounded turn, then
+    // priority class, explicit boost, queue position. The recorded bypass
+    // count only ever promotes; with no counter at bound this is the exact
+    // dispatch order that precedence always had.
+    eligible.sort((a, b) => selectionOrder(selectionEntry(a), selectionEntry(b))
       // Independent recovery review continues the repair's queue position.
       // A failed reservation moves the review itself to the back of its class.
-      || Number(a.queue_ts) - Number(b.queue_ts) || Number(a.reserved_before) - Number(b.reserved_before)
+      || Number(a.reserved_before) - Number(b.reserved_before)
       || Number(String(a.queue_id).slice(3)) - Number(String(b.queue_id).slice(3))
       || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
@@ -6553,6 +6567,29 @@ export class KnowledgeHub {
       (id, meta) => !!this.protectedExecution(id, meta) || releaseHold(meta) !== null || this.startupHasAsk(id),
       (actor, op, id, data) => this.audit(actor, op, id, data));
   }
+  /** BR#17649 — one consumed compatible opportunity per priority reserve.
+   * Every other still-eligible candidate that the selection outranked by
+   * band, class or explicit boost (never protected line recovery) loses one
+   * tick of its bounded bypass budget; the winner's own counter clears — its
+   * turn arrived and was consumed. Waiters that left the queue meanwhile do
+   * not accumulate budget for work that was not continuously eligible. */
+  private recordSelectionBypasses(winner: SelectionEntry, eligible: Record<string, unknown>[], gated: Set<string>): void {
+    const waited = eligible
+      .filter(row => String(row.id) !== winner.id && !gated.has(String(row.id))
+        && bypassesWaiter(winner, selectionEntry(row)))
+      .map(row => String(row.id));
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(`DELETE FROM dispatch_selection_bypasses WHERE task_id=?`, winner.id);
+      if (!waited.length) return;
+      this.state.storage.sql.exec(
+        `INSERT INTO dispatch_selection_bypasses(task_id,bypasses,since)
+           SELECT value, 1, ? FROM json_each(?)
+           WHERE EXISTS (SELECT 1 FROM artefacts a WHERE a.id=value AND a.status='todo' AND a.owner='')
+         ON CONFLICT(task_id) DO UPDATE SET bypasses=bypasses+1
+           WHERE EXISTS (SELECT 1 FROM artefacts a WHERE a.id=dispatch_selection_bypasses.task_id AND a.status='todo' AND a.owner='')`,
+        Date.now(), JSON.stringify(waited));
+    });
+  }
   private async scheduleGateway(body: Record<string, unknown>, tokenId: string, host: string, mode: "inspect" | "reserve" | "request_capacity", commandId: string): Promise<SchedulingOutcome> {
     this.reconcileDispatchReservations();
     const key = `schedule:${tokenId}`, encoded = JSON.stringify({ mode, host, session: body.session });
@@ -6624,6 +6661,10 @@ export class KnowledgeHub {
     const dispatchSession = (id: string) => `dispatch-${id.replace('#', '-')}-${crypto.randomUUID().slice(0, 8)}`;
     this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`, key, commandId, encoded, JSON.stringify({ kind: "reservation_pending", ...facts, task_id: firstId, session: dispatchSession(firstId) }));
     let result: SchedulingOutcome = { kind: "no_eligible_work", ...facts };
+    // BR#17649 — bounded bypass accounting: a gate-rejected candidate was not
+    // dispatchable at this opportunity, so losing to another task is not a
+    // bypass of it. Only still-eligible waiters lose budget.
+    const gated = new Set<string>();
     try {
       for (const task of selection.eligible) {
         const id = String(task.id), session = dispatchSession(id);
@@ -6646,10 +6687,12 @@ export class KnowledgeHub {
             task: { id, title: String(assigned.title), body_md: String(assigned.body_md), project: String(assigned.project ?? ""),
               meta, roles: parseTags(assigned.roles), tags: parseTags(assigned.tags) } };
           recoveryCapacity.consume(tokenId, id);
+          this.recordSelectionBypasses(selectionEntry(task), selection.eligible, gated);
           break;
         } catch (error) {
           const message = String(error);
           if (!message.includes("gate:") && !message.includes("[rule:")) throw error;
+          gated.add(id);
           facts.reasons.lifecycle_gate = (facts.reasons.lifecycle_gate ?? 0) + 1;
           this.audit(host, "dispatch_candidate_rejected", id, { reason: message.slice(0, 500) });
           const n = gatewayOccupancy(this.state.storage.sql, tokenId, host);
@@ -8657,6 +8700,8 @@ export class KnowledgeHub {
             this.state.storage.sql.exec(`INSERT INTO dispatch_reservations(task_id,token_id,session,generation,expires_at) VALUES(?,?,?,?,?)`, id, body.token_id, String(meta.session ?? ""), this.executionState(id)?.generation ?? 0, reservedAt + DISPATCH_RESERVATION_MS);
             this.state.storage.sql.exec(`INSERT INTO dispatch_queue_turns(task_id,last_reserved_at) VALUES(?,?)
               ON CONFLICT(task_id) DO UPDATE SET last_reserved_at=MAX(excluded.last_reserved_at, dispatch_queue_turns.last_reserved_at+1)`, id, reservedAt);
+            // The claim consumed the task's bounded-bypass turn (BR#17649).
+            this.state.storage.sql.exec(`DELETE FROM dispatch_selection_bypasses WHERE task_id=?`, id);
             this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, body.token_id);
           }
         }
@@ -17739,12 +17784,19 @@ export class KnowledgeHub {
   }
 
   /** Assign evidence-gathering for exhausted budgets and unknown effects.
-   * The subject's admission fence continues to own its exit. */
+   * The subject's admission fence continues to own its exit. BR#17649 —
+   * candidates are ordered by the ONE selection law both stages share
+   * (protected line recovery first, a starved task's bounded turn, then
+   * priority class and explicit boost) with creation age as this stage's
+   * queue position — no longer age alone. Every evidence fence below stays
+   * first-hand per candidate. */
   private async scheduleAttemptDiagnosis(): Promise<void> {
     const candidates = this.state.storage.sql.exec(`
-      SELECT a.id, a.meta, e.state, duty.status AS diagnosis_status
+      SELECT a.id, a.created_ts, a.meta, e.state, duty.status AS diagnosis_status,
+        COALESCE(bypass.bypasses, 0) AS bypassed
       FROM artefacts a CROSS JOIN execution_state e ON e.task_id=a.id
       LEFT JOIN artefacts duty ON duty.id=json_extract(a.meta,'$.execution_diagnosis.duty')
+      LEFT JOIN dispatch_selection_bypasses bypass ON bypass.task_id=a.id
       WHERE a.type='task' AND a.status='todo' AND a.owner=''
         -- A repair duty can itself need diagnosis. An execution-environment
         -- duty is the leaf, so the same fault cannot spawn an unbounded chain.
@@ -17754,11 +17806,18 @@ export class KnowledgeHub {
           OR EXISTS (SELECT 1 FROM json_each(e.state,'$.operations') op
             WHERE json_extract(op.value,'$.state') IN ('prepared','outcome_unknown')))
       ORDER BY a.created_ts, a.id`).toArray();
+    const rows = new Map(candidates.map(row => [String(row.id), row]));
+    // Stable sort over the age-ordered fetch: the shared law decides, age and
+    // then id stay the tiebreak — for blocked work, age still drives diagnosis.
+    const ordered = candidates.map(row => selectionEntry(row)).sort(selectionOrder);
     let scheduled = 0;
-    for (const row of candidates) {
-      if (scheduled >= 4) break;
-      const id = String(row.id);
+    const scheduledIds: string[] = [];
+    const winners: SelectionEntry[] = [];
+    const waited: SelectionEntry[] = [];
+    for (const entry of ordered) {
+      const id = entry.id;
       try {
+        const row = rows.get(id)!;
         const meta = JSON.parse(String(row.meta ?? "{}"));
         const state = ExecutionStateSchema.parse(JSON.parse(String(row.state)));
         const revision = String(meta.work_revision ?? "legacy");
@@ -17769,6 +17828,7 @@ export class KnowledgeHub {
           || (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now()))
           || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
           || this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta)) continue;
+        if (scheduled >= 4) { waited.push(entry); continue; }
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
         const fresh = this.executionState(id);
         if (fresh?.generation !== state.generation || executionAdmissionHold(fresh, String(meta.work_revision ?? "legacy")) !== hold
@@ -17780,10 +17840,25 @@ export class KnowledgeHub {
           this.version(id, "system:recovery", "execution_diagnosis_scheduled", "Assigned diagnosis of a stopped execution attempt",
             { ...diagnosis, attempt_id: state.attempt?.attempt_id });
         });
+        scheduledIds.push(id);
+        winners.push(entry);
         scheduled++;
       } catch (e) {
         this.audit("system:recovery", "execution_diagnosis_failed", id, { error: String(e).slice(0, 240) });
       }
+    }
+    // Bounded bypass accounting for this stage (BR#17649): a still-eligible
+    // candidate the sweep's capacity passed over for priority work loses one
+    // opportunity; a diagnosed candidate's counter clears — its turn arrived.
+    if (scheduledIds.length) {
+      this.state.storage.transactionSync(() => {
+        for (const id of scheduledIds) this.state.storage.sql.exec(`DELETE FROM dispatch_selection_bypasses WHERE task_id=?`, id);
+        for (const waiter of waited) {
+          if (!winners.some(winner => bypassesWaiter(winner, waiter))) continue;
+          this.state.storage.sql.exec(`INSERT INTO dispatch_selection_bypasses(task_id,bypasses,since) VALUES(?,1,?)
+            ON CONFLICT(task_id) DO UPDATE SET bypasses=bypasses+1`, waiter.id, Date.now());
+        }
+      });
     }
   }
 

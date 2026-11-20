@@ -36,6 +36,11 @@ beforeEach(async () => {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
         }
+        if (path === "/fixture/bypass-budget") {
+          const { id } = await request.json();
+          const row = this.state.storage.sql.exec("SELECT bypasses FROM dispatch_selection_bypasses WHERE task_id=?", id).toArray()[0];
+          return Response.json({ bypasses: row ? Number(row.bypasses) : 0 });
+        }
         if (path === "/fixture/equal-queue-timestamps") {
           const { first, second } = await request.json();
           this.state.storage.sql.exec(
@@ -765,6 +770,40 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await post("transition", submission)).status).toBe("in_review");
     expect((await post("get", { id })).meta.blocked.await_event).toEqual({ event: "br_done", id: repair });
   });
+  it("routes stopped attempts to diagnosis by the dispatch priority law, not age alone (BR#17649)", async () => {
+    const project = "diagnosis-order", g = await gateway(project);
+    const ordinary = await task(project);
+    // A concrete repair duty that itself stopped: rank 0, despite being the
+    // youngest candidate here.
+    const repair = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    const boosted = await task(project, { boosted: Date.now() });
+    expect(await post("fixture/budget-pile", { ids: [ordinary, repair, boosted] })).toEqual({ ok: true, stamped: 3 });
+    await post("fixture/attempt-diagnosis", {});
+    const duty = async (id: string) => String((await post("get", { id })).meta.execution_diagnosis.duty);
+    // Diagnosis duties are created in the shared law's order: line-repair
+    // class first, then the explicit boost, then the oldest ordinary work.
+    const serial = (dutyId: string) => Number(dutyId.slice(3));
+    expect(serial(await duty(repair))).toBeLessThan(serial(await duty(boosted)));
+    expect(serial(await duty(boosted))).toBeLessThan(serial(await duty(ordinary)));
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: await duty(repair) });
+  });
+  it("bounds diagnosis bypasses: continuously eligible stopped work is diagnosed within the tested bound (BR#17649)", async () => {
+    const project = "diagnosis-bound", g = await gateway(project);
+    const ordinary = await task(project);
+    expect(await post("fixture/budget-pile", { ids: [ordinary] })).toEqual({ ok: true, stamped: 1 });
+    // Each sweep tick diagnoses at most four candidates; a sustained stream of
+    // boosted stopped attempts keeps consuming that capacity — until the bound.
+    for (let i = 0; i < 10; i++) {
+      const batch = [];
+      for (let j = 0; j < 4; j++) batch.push(await task(project, { boosted: Date.now() + i * 4 + j }));
+      expect(await post("fixture/budget-pile", { ids: batch })).toEqual({ ok: true, stamped: 4 });
+      await post("fixture/attempt-diagnosis", {});
+      expect((await post("get", { id: ordinary })).meta.execution_diagnosis).toBeUndefined();
+    }
+    // The tested bound: the next sweep tick is the ordinary work's turn.
+    await post("fixture/attempt-diagnosis", {});
+    expect((await post("get", { id: ordinary })).meta.execution_diagnosis).toBeDefined();
+  });
   it("rejects a well-typed completion wait when its target is missing or would close a cycle", async () => {
     const [first, second, third] = [await task("waits"), await task("waits"), await task("waits")];
     const park = (id: string, target: string) => post("transition", { id, to: "blocked", actor: "author", note: "Upstream repair",
@@ -1025,6 +1064,48 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await ec2.cmd({ kind: "schedule_status", refresh: true, host: ec2.host });
     expect(status.hosts).toHaveLength(1);
     expect(status.hosts[0]).toMatchObject({ host: ec2.host, capacity: 12, active: 0, reserved: 1, eligible: 0, last_dispatch: { kind: "reserved", task_id: runnable } });
+  });
+  it("gives continuously eligible ordinary work its turn within the tested boost bypass bound, below protected recovery (BR#17649)", async () => {
+    const project = "bounded-bypass", g = await gateway(project, 2);
+    const ordinary = await task(project);
+    const release = async (r: { kind: string; task_id?: string; session?: string }) => {
+      if (r.kind !== "reserved" || !r.task_id) throw new Error(JSON.stringify(r));
+      expect(await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true }, undefined, r.task_id, r.session)).toMatchObject({ kind: "released" });
+    };
+    // A sustained stream of boosted work: every compatible opportunity takes
+    // boosted work while the continuously eligible ordinary task loses one
+    // bypass tick — never more than the tested bound.
+    for (let i = 0; i < 10; i++) {
+      await task(project, { boosted: Date.now() + i });
+      const bypassed = await reserve(g);
+      if (bypassed.kind !== "reserved" || bypassed.task_id === ordinary) throw new Error(`expected a boosted bypass, got ${JSON.stringify(bypassed)}`);
+      await release(bypassed);
+    }
+    // Protected line recovery still outranks a starved task's pending turn,
+    // and bypassing around it spends none of the ordinary task's budget.
+    const repair = await task(project, { machine_duty: { kind: "task-recovery", reason: "head_checks" } });
+    expect(await post("fixture/bypass-budget", { id: ordinary })).toEqual({ bypasses: 10 });
+    const preempted = await reserve(g);
+    expect(preempted).toMatchObject({ kind: "reserved", task_id: repair });
+    expect(await post("fixture/bypass-budget", { id: ordinary })).toEqual({ bypasses: 10 });
+    // The tested bound: the next compatible opportunity is ordinary's turn.
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: ordinary });
+    expect((await post("get", { id: ordinary })).status).toBe("in_progress");
+  });
+  it("counts only compatible bypass opportunities: a same-class queue tick and ineligible boosted work spend nothing (BR#17649)", async () => {
+    const project = "compatible-only", mac = await gateway(project, 32), ec2 = await gateway(project, 12);
+    const pinned = await task(project, { boosted: Date.now(), execution_requirements: { host: mac.host } });
+    const olderOrdinary = await task(project);
+    const waiter = await task(project);
+    // mac's opportunity: the boosted pinned winner bypasses each compatible
+    // ordinary waiter exactly once — one class bypass, one tick.
+    expect(await reserve(mac)).toMatchObject({ kind: "reserved", task_id: pinned });
+    expect(await post("fixture/bypass-budget", { id: waiter })).toEqual({ bypasses: 1 });
+    // ec2's opportunity: the pinned boosted work is NOT eligible there, so it
+    // bypasses nothing; the ordinary winner is a same-class queue tick, not a
+    // bypass — the waiter's budget stays where it was.
+    expect(await reserve(ec2)).toMatchObject({ kind: "reserved", task_id: olderOrdinary });
+    expect(await post("fixture/bypass-budget", { id: waiter })).toEqual({ bypasses: 1 });
   });
   it("atomically limits concurrent reservations, replays exactly, and counts stopped-but-unquiesced writers", async () => {
     const project = "concurrent", g = await gateway(project);

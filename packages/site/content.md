@@ -336,7 +336,14 @@ Lease expiry, time and titles are never quiescence evidence.
 
 Use `bridge execution schedule-status [hostname]` to see occupied slots,
 reservations, capacity, eligible work, exclusion reasons and the last scheduling
-outcome. Within the same priority and boost, the oldest-created eligible task goes first. Idle capacity with eligible work for two minutes produces a
+outcome. Dispatch and the stopped-attempt diagnosis sweep share one priority
+law: protected line recovery first, then a starved task's bounded turn, then
+priority class, explicit boost, and queue position — the oldest-created
+eligible task first within the same priority and boost. A continuously
+eligible task that keeps losing compatible opportunities to strictly
+higher-priority work gets its turn within ten such bypasses; protected line
+recovery sits outside the bound, and for blocked work creation age still
+drives diagnosis. Idle capacity with eligible work for two minutes produces a
 `dispatch_starved` incident, and the alarm repeats every 30 minutes while the
 scheduler stays starved. The `stats` surface carries `starved_1h` (starvation
 alarms in the trailing hour), per-host `starved_since` and held counts by

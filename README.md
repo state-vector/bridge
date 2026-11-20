@@ -615,8 +615,23 @@ npx wrangler secret put GITHUB_ALLOWED_USERS   # comma-separated GitHub logins (
 
 The hub selects work for the requesting gateway **before** applying a candidate
 limit. Host-affine or unavailable work cannot hide runnable work behind a global
-top-ten queue. Within the same priority and boost, the oldest-created eligible
-task goes first, even when its card has been edited.
+top-ten queue. Both selection stages — dispatch reservation and the
+stopped-attempt diagnosis sweep — share one priority law (BR#17649): protected
+line recovery first, then a starved task's bounded turn, then priority class,
+explicit boost, and queue position. Within the same priority and boost, the
+oldest-created eligible task goes first, even when its card has been edited.
+A continuously eligible task that keeps losing compatible selection
+opportunities to strictly higher-priority work (better class or stronger
+explicit boost) accrues a bounded bypass count — ten — and at that bound the
+law gives it its turn ahead of the bypassing stream. Protected line recovery
+sits outside the bound: stop-the-line repairs, their actual prerequisites and
+their verification never wait behind it, and bypassing around them spends none
+of the budget. Gate-rejected candidates and work that is not eligible on the
+selecting host spend nothing, and a claim or a diagnosis consumes (clears) the
+winner's own counter. The diagnosis sweep orders candidates by the same law
+with creation age as its queue anchor, so for blocked work age still drives
+diagnosis — and where diagnosis finds a genuine human choice, that choice
+routes to a bound ask and reframing, never straight back to dispatch.
 `execution {id:"gateway", command:{kind:"schedule",mode:"reserve"},
 command_id:"<unique request>"}` reserves one eligible task and its gateway slot
 through the normal lifecycle gates. Replaying a request returns its original
@@ -761,7 +776,10 @@ removing or changing the scope does not restore legacy write access.
   task action budget (at most one hour) is independent of
   narration. Three exhausted action budgets stop automatic restarts and require
   diagnosis. Recorded exhausted budgets do not expire into retries. The hub
-  assigns the oldest actionable diagnoses first and reconciles a closed diagnosis
+  assigns actionable diagnoses by the same selection law dispatch uses
+  (BR#17649) — protected line recovery first, a starved candidate's bounded
+  turn, then priority class, explicit boost, and creation age as the queue
+  anchor — and reconciles a closed diagnosis
   whose stopped subject still has no continuation. A diagnosis needs a usable
   retry authorization, a reachable repair dependency, or a bound decision before
   submission if its subject still holds the same unresolved attempt. Provider

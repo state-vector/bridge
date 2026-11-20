@@ -56,6 +56,62 @@ export function schedulingBoost(meta: Meta): number {
   return typeof meta.boosted === "number" && Number.isFinite(meta.boosted) ? meta.boosted : meta.boosted ? 1 : 0;
 }
 
+/** BR#17649 — the bounded bypass law inside the ONE selection policy both
+ * stages (dispatch reservation and stopped-attempt diagnosis) share. A
+ * continuously eligible task may lose at most this many compatible selection
+ * opportunities to priority work — a better band or class, or a stronger
+ * explicit boost — before the policy gives it its turn ahead of the
+ * bypassing stream. Protected line recovery (rank <= 1) is outside the
+ * bound: stop-the-line repairs, their actual prerequisites and their
+ * verification never wait behind it. */
+export const SELECTION_BYPASS_BOUND = 10;
+
+export interface SelectionEntry {
+  id: string;
+  /** taskSchedulingRank: 0 root-fix/task-recovery, 1 line_recovery,
+   *  2 diagnostic, 3 boosted, 4 review/unblock, 5 normal. */
+  rank: number;
+  /** schedulingBoost: explicit urgency stamp; newer wins within a class. */
+  boost: number;
+  /** Queue position anchor: the dispatch queue_ts, or creation age for the
+   *  diagnosis sweep. */
+  queue_ts: number;
+  /** Compatible opportunities already lost to priority work. */
+  bypassed: number;
+}
+
+/** The one ordering both stages share: protected line recovery first, then a
+ * starved task's bounded turn, then the dispatch law itself (priority class,
+ * explicit boost, queue position). Callers append their own final identity
+ * tiebreakers. With no bypass counter at bound this is the dispatch order
+ * exactly — the bound only ever promotes, never reorders the policy. */
+export function selectionOrder(a: SelectionEntry, b: SelectionEntry): number {
+  const band = (e: SelectionEntry) => e.rank <= 1 ? 0 : e.bypassed >= SELECTION_BYPASS_BOUND ? 1 : 2;
+  return band(a) - band(b) || a.rank - b.rank || b.boost - a.boost || a.queue_ts - b.queue_ts;
+}
+
+/** The row -> SelectionEntry mapping every selection stage uses, so dispatch
+ * and diagnosis cannot drift apart. Rows without dispatch enrichment (the
+ * diagnosis sweep) fall back to their own columns. */
+export const selectionEntry = (row: Record<string, unknown>): SelectionEntry => ({
+  id: String(row.id),
+  rank: taskSchedulingRank(priorityTask(row)),
+  boost: Math.max(schedulingBoost(JSON.parse(String(row.meta ?? "{}"))),
+    row.reserved_before ? 0 : schedulingBoost(JSON.parse(String(row.train_parent_meta ?? "{}")))),
+  queue_ts: Number(row.queue_ts ?? row.created_ts ?? 0),
+  bypassed: Number(row.bypassed ?? 0),
+});
+
+/** True when selecting `winner` while `waiter` stayed eligible is a priority
+ * bypass — a better band or class, or a stronger explicit boost — rather
+ * than a plain queue-position tick within the same priority. Protected line
+ * recovery never counts: the bound sits outside it by definition. */
+export function bypassesWaiter(winner: SelectionEntry, waiter: SelectionEntry): boolean {
+  if (winner.rank <= 1) return false;
+  if (winner.rank === waiter.rank && winner.boost <= waiter.boost) return false;
+  return true;
+}
+
 /** Review is part of the repair's critical path, not routine verification.
  * Preserve the existing typed duty class/urgency on its independent duty. */
 export function recoveryReviewMeta(taskId: string, meta: Meta, tags: string[]): Meta {
