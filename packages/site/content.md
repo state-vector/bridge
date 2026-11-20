@@ -743,6 +743,8 @@ Tasks can also carry **acceptance criteria as data** (BR#14118): `meta.acceptanc
 
 Backlog distinguishes a passive **PR dependency** (the PR owner delivers it; the hub needs a merge receipt) from **agent repair or queue binding** (`unbound`/`bounced`) and **train-owned delivery** (`queued`/`awaiting-ci`). A review-PR reference alone does not prove train admission. The unblocker label names the next actor or observed event; a machine event can schedule continuation rather than immediately complete the task.
 
+Each queued review carries the submitted delivery reference and its frozen criteria. Bridge opens a fresh duty when the implementation submits a replacement pull request. Claimed reviews retain their original subject. A verifier resolves abbreviated source references to the full GitHub commit SHA before accepting a delivery.
+
 ### One authoritative line-health state
 
 Recovery is tracked per typed failure cause and commit, not merely per failing

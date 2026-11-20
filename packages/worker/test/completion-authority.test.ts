@@ -28,7 +28,13 @@ beforeAll(async () => {
   const rig = `import { KnowledgeHub } from "./index.js";
     export class CompletionRig extends KnowledgeHub {
       async fetch(request) {
-        if (new URL(request.url).pathname !== "/fixture/execution") return super.fetch(request);
+        const path = new URL(request.url).pathname;
+        if (path === "/fixture/legacy-review") {
+          const {id, body} = await request.json();
+          this.state.storage.sql.exec("UPDATE artefacts SET body_md=?, meta=json_remove(meta, '$.review_offer') WHERE id=?", body, id);
+          return Response.json({ok:true});
+        }
+        if (path !== "/fixture/execution") return super.fetch(request);
         const {id, execution} = await request.json();
         this.state.storage.sql.exec("INSERT INTO execution_state(task_id,state,worker_token_id) VALUES(?,?,'')", id, JSON.stringify(execution));
         return Response.json({ok:true});
@@ -427,5 +433,38 @@ describe("positive completion authority on the real SQLite hub", () => {
         criteria: [{ id: "exact_ci", verdict: "met", receipt: "Earlier PR CI was read." }] }) });
     expect(wrong.status).toBe(400);
     expect(wrong.body.error).toContain("exact submitted pull request legs");
+  });
+
+  it("redirects a direct claim of a stale legacy queued review to the submitted replacement", async () => {
+    const id = await task();
+    const replacement = `https://github.com/${repo}/pull/3494`;
+    const submitted = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note: replacement });
+    expect(submitted.status).toBe(200);
+    const legacy = submitted.body.verify_task;
+    await call("fixture/legacy-review", { id: legacy, body: `Verify https://github.com/${repo}/pull/3376` });
+
+    const attempt = await call("transition", { id: legacy, to: "in_progress", actor: "reviewer", session: "fresh-review" });
+    expect(attempt.status).toBe(400);
+    expect(attempt.body.error).toContain("different submission");
+    expect((await get(legacy)).status).toBe("superseded");
+    const current = await call("ask.create", { route: { kind: "independent_review", task_id: id } });
+    expect(current.status).toBe(200);
+    expect((await get(current.body.id)).body_md).toContain(replacement);
+  });
+
+  it.each(["commit", "pull request"])("requires a resolved full SHA for an abbreviated %s submission", async kind => {
+    const id = await task();
+    const note = kind === "commit" ? `https://github.com/${repo}/commit/${commit.slice(0, 7)}`
+      : `https://github.com/${repo}/pull/3494 head ${commit.slice(0, 7)}`;
+    const submitted = await call("transition", { id, to: "in_review", actor: "impl", session: "impl-session", note });
+    expect(submitted.status).toBe(200);
+    const review = submitted.body.verify_task;
+    expect((await call("transition", { id: review, to: "in_progress", actor: "reviewer", session: "fresh-review" })).status).toBe(200);
+    const verdict: ReviewResult = kind === "commit"
+      ? { kind: "accepted_direct_main", repo, commit, ci_run_url: `https://github.com/${repo}/actions/runs/1234` }
+      : { kind: "accepted_pr", task_id: id, legs: [{ repo, number: 3494, head_sha_at_acceptance: commit }] };
+    const result = await call("transition", { id: review, to: "done", actor: "reviewer", session: "fresh-review",
+      review_result: await resultFor(review, verdict) });
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
   });
 });

@@ -422,6 +422,19 @@ function sameReviewTarget(a: ReviewTarget, b: ReviewTarget): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function matchesLegacyReviewTarget(body: string, target: ReviewTarget): boolean {
+  if (target.kind === "execution" || target.kind === "unspecified") return true;
+  const rendered = reviewTargetFromNote(body);
+  if (target.kind === "commit") return rendered?.kind === "commit" && sameReviewTarget(rendered, target);
+  const offered = rendered?.kind === "pull_request" ? rendered.legs[0] : undefined;
+  const submitted = target.legs[0];
+  return !!offered && !!submitted && offered.repo === submitted.repo && offered.number === submitted.number;
+}
+
+function matchesSubmittedSha(resolved: string, submitted: string): boolean {
+  return resolved.toLowerCase().startsWith(submitted.toLowerCase());
+}
+
 function offeredReviewBody(id: string, title: string, target: ReviewTarget, criteria: AcceptanceCriterion[], rootFix = false): string {
   if (target.kind === "execution") return executionDutyBody(id, title, criteria);
   const pr = target.kind === "pull_request" ? target.legs[0] : undefined;
@@ -8446,7 +8459,7 @@ export class KnowledgeHub {
       if (typeof meta.execution_review_of === "string") subjects.add(meta.execution_review_of);
       if (subjects.size === 1) {
         const subjectId = [...subjects][0];
-        const subjectRow = this.one(`SELECT meta FROM artefacts WHERE id=? AND type='task'`, subjectId);
+        const subjectRow = this.one(`SELECT status,meta FROM artefacts WHERE id=? AND type='task'`, subjectId);
         if (subjectRow) {
           // BR#14366: acceptance criteria bind from the SPAWN snapshot only
           // (acceptance_snapshot, frozen when the duty was created) — the
@@ -8456,10 +8469,15 @@ export class KnowledgeHub {
           const snapshot = AcceptanceCriteriaSchema.safeParse(meta.acceptance_snapshot);
           const parentMeta = JSON.parse(String(subjectRow.meta ?? "{}"));
           const revision = parentMeta.work_revision ?? "legacy";
+          const target = taskReviewTarget(parentMeta);
           const offer = meta.review_offer as ReviewOffer | undefined;
-          if (offer && (offer.revision !== revision || !sameReviewTarget(offer.target, taskReviewTarget(parentMeta)))) {
+          const staleOffer = offer ? offer.revision !== revision || !sameReviewTarget(offer.target, target)
+            : !matchesLegacyReviewTarget(String(row.body_md ?? ""), target);
+          if (staleOffer) {
+            if (subjectRow.status === "in_review") await this.createIndependentReview(subjectId, "system:review");
             throw new Error("gate: this unclaimed review belongs to a different submission; request the current independent review");
           }
+          if (!offer) meta.review_offer = { revision, target };
           meta.review_subject = ReviewSubjectSchema.parse({
             task_id: subjectId,
             revision: offer?.revision ?? revision,
@@ -8489,16 +8507,19 @@ export class KnowledgeHub {
           || captured.data.revision !== (targetMeta.work_revision ?? "legacy")) throw new Error("gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round");
         if (!mergeCompletesTask(targetMeta) && reviewResult.kind !== "accepted_execution") throw new Error("gate: execution outcomes require accepted_execution; prerequisite or code delivery is not outcome acceptance");
         const offer = meta.review_offer as ReviewOffer | undefined;
-        if (offer?.target.kind === "pull_request") {
-          const expected = offer.target.legs;
+        const submitted = taskReviewTarget(targetMeta);
+        if (offer ? offer.revision !== captured.data.revision || !sameReviewTarget(offer.target, submitted)
+          : !matchesLegacyReviewTarget(String(row.body_md ?? ""), submitted)) throw new Error("gate: this review belongs to a different submitted delivery");
+        if (submitted.kind === "pull_request") {
+          const expected = submitted.legs;
           const [primary] = expected;
           const matches = (a: OfferedPullRequest, b: OfferedPullRequest) => a.repo === b.repo && a.number === b.number
-            && (!b.head_sha_at_acceptance || a.head_sha_at_acceptance === b.head_sha_at_acceptance);
+            && (!b.head_sha_at_acceptance || (!!a.head_sha_at_acceptance && matchesSubmittedSha(a.head_sha_at_acceptance, b.head_sha_at_acceptance)));
           if (reviewResult.kind !== "accepted_pr" || !primary || !reviewResult.legs.some(leg => matches(leg, primary))
             || !reviewResult.legs.every(leg => expected.some(pr => matches(leg, pr)))) throw new Error("gate: review acceptance must cover the exact submitted pull request legs");
         }
-        if (offer?.target.kind === "commit" && (reviewResult.kind !== "accepted_direct_main"
-          || offer.target.repo !== reviewResult.repo || offer.target.sha !== reviewResult.commit))
+        if (submitted.kind === "commit" && (reviewResult.kind !== "accepted_direct_main"
+          || submitted.repo !== reviewResult.repo || !matchesSubmittedSha(reviewResult.commit, submitted.sha)))
           throw new Error("gate: review acceptance must cover the exact submitted commit");
         if (reviewResult.kind === "accepted_pr") {
           const closed = reviewResult.legs.find(leg => this.closedPrReceipt(leg.repo, leg.number));
@@ -10917,10 +10938,9 @@ export class KnowledgeHub {
       const dutyMeta = JSON.parse(String(duty?.meta ?? "{}"));
       const captured = ReviewSubjectSchema.safeParse(dutyMeta.review_subject);
       const offer = dutyMeta.review_offer as ReviewOffer | undefined;
-      const legacyTarget = reviewTargetFromNote(String(duty?.body_md ?? ""));
       const matchesOffer = offer ? offer.revision === revision && sameReviewTarget(offer.target, target)
         : target.kind === "unspecified" || target.kind === "execution"
-          || (captured.success && legacyTarget !== null && sameReviewTarget(legacyTarget, target));
+          || (captured.success && matchesLegacyReviewTarget(String(duty?.body_md ?? ""), target));
       if (matchesOffer && (!captured.success || captured.data.revision === revision))
         return { kind: "independent_review", task_id: taskId, id: current.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
     }
