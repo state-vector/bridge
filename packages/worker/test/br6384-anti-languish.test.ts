@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { completePrReview } from "./completion-fixture";
 
 /**
  * BR#6384 — the anti-languish law (real DO drills against the bundled worker).
@@ -439,5 +440,109 @@ describe("BR#6384 Leg 3 — pr_merged proxy probes (real DO)", () => {
     expect(card.status).toBe("blocked");
     expect(card.meta.blocked.reason).toContain("CLOSED");
     expect(card.meta.blocked.await_event).toEqual({ event: "br_done", id: card.meta.recovery.task_id });
+  });
+});
+
+describe("BR#17771 — closed delivery legs", () => {
+  const repo = "state-vector/br17771-delivery";
+  const leg = (number: number) => ({ repo, number, head_sha_at_acceptance: "c".repeat(40) });
+  const probeKey = (number: number) => `merged:${repo}#${number}`;
+  const receipt = (number: number) => `https://github.com/${repo}/pull/${number}`;
+  async function queued(number: number, also: number[] = []) {
+    const id = await parkedCard(`Train delivery ${number}`, { event: "pr_merged", repo, n: number }, `PR ${repo}#${number} merged (mergeCommit non-null)`);
+    const legs = [number, ...also].map(leg);
+    const wrote = await kbJson("/update", { id, meta: { pr: legs[0], prs: legs } });
+    expect(wrote.status).toBe(200);
+    await completePrReview(kbJson, id, legs);
+    return id;
+  }
+  async function queue() {
+    const reply = await kbJson("/train.status", { repo });
+    return reply.body.lanes.find((lane: any) => lane.lane === `${repo}@main`).queue;
+  }
+  const closedProbe = (number: number) => ({ key: probeKey(number), ok: false, conclusive: true, conclusion: "closed", receipt: receipt(number) });
+
+  it("keeps polling a genuinely OPEN delivery past the error cap; exact CLOSED evidence releases the slot and allows a fresh replacement", async () => {
+    await healthyLane(repo, "gw-br17771");
+    const id = await queued(3243, [3248]);
+    const before = await taskById(id);
+    expect(await queue()).toEqual(expect.arrayContaining([expect.objectContaining({ id, pr: 3243 })]));
+
+    for (let i = 0; i < 13; i++) {
+      await sweep();
+      const pending = (await kbJson("/proxy.probes", { limit: 25 })).body.probes;
+      expect(pending).toEqual(expect.arrayContaining([expect.objectContaining({ key: probeKey(3243) })]));
+      const observation = i === 0 ? { error: 'PR state "OPEN" — not merged yet' } : { conclusion: "OPEN", receipt: receipt(3243) };
+      const open = await kbJson("/proxy.verify", { key: probeKey(3243), ok: false, ...observation });
+      expect(open.body).toMatchObject({ verdict: "waiting", attempts: 0 });
+    }
+
+    await sweep();
+    expect((await kbJson("/proxy.verify", { ...closedProbe(3243), receipt: receipt(3247) })).body.error).toContain("exact GitHub PR URL");
+    await sweep();
+    expect((await taskById(id)).status).toBe("blocked");
+    expect((await kbJson("/proxy.verify", closedProbe(3243))).body.verdict).toBe("negative");
+    // Duplicate/lost acknowledgement cannot erase the durable closure.
+    expect((await kbJson("/proxy.verify", closedProbe(3243))).body.error).toContain("already verified");
+    await sweep();
+    const repaired = await taskById(id);
+    expect(repaired.status).toBe("todo");
+    expect(repaired.meta.work_revision).not.toBe(before.meta.work_revision);
+    expect(repaired.meta.blocked).toBeUndefined();
+    expect(repaired.meta.prs).toEqual([leg(3248)]);
+    expect(repaired.meta.proxy_check).toMatchObject({ verdict: "false", receipts: [receipt(3243)] });
+    expect(await queue()).not.toEqual(expect.arrayContaining([expect.objectContaining({ id })]));
+    await sweep();
+    expect((await taskById(id)).meta.work_revision).toBe(repaired.meta.work_revision);
+    expect(((await kbJson("/get_history", { id })).body.versions ?? []).filter((v: any) => v.action === "closed_delivery_released")).toHaveLength(1);
+
+    // A fresh, exact acceptance may name a successor. The other live leg
+    // is still required and the previous review never comes back into force.
+    await completePrReview(kbJson, id, [leg(3247), leg(3248)]);
+    const tracked = await taskById(id);
+    expect(tracked.status).toBe("blocked");
+    expect(tracked.meta.prs).toEqual([leg(3248), leg(3247)]);
+    expect(await queue()).toEqual(expect.arrayContaining([expect.objectContaining({ id, pr: 3248 })]));
+  });
+
+  it("does not treat absence as closure, and a later OPEN report supersedes a CLOSED observation", async () => {
+    const id = await queued(3250);
+    expect((await kbJson("/reconcile.report", { repo, prs: [] })).status).toBe(200);
+    await sweep();
+    expect((await taskById(id)).status).toBe("blocked");
+    expect((await kbJson("/proxy.verify", closedProbe(3250))).body.verdict).toBe("negative");
+    const reopened = await kbJson("/reconcile.report", { repo, prs: [{ number: 3250, state: "OPEN", headRefOid: leg(3250).head_sha_at_acceptance }] });
+    expect(reopened.status).toBe(200);
+    await sweep();
+    const card = await taskById(id);
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.await_event).toEqual({ event: "pr_merged", repo, n: 3250 });
+    expect(card.meta.proxy_check.verdict).toBe("probe_pending");
+    expect(await queue()).toEqual(expect.arrayContaining([expect.objectContaining({ id, pr: 3250 })]));
+  });
+
+  it("preserves an independent typed wait even if one of the card's old delivery PRs is confirmed closed", async () => {
+    const id = await parkedCard("Independent upstream wait", { event: "pr_merged", repo, n: 3261 }, `PR ${repo}#3261 merged (mergeCommit non-null)`);
+    expect((await kbJson("/update", { id, meta: { pr: leg(3260), prs: [leg(3260)] } })).status).toBe(200);
+    expect((await kbJson("/reconcile.report", { repo, prs: [{ number: 3260, state: "CLOSED" }] })).status).toBe(200);
+    await sweep();
+    const card = await taskById(id);
+    expect(card.status).toBe("blocked");
+    expect(card.meta.prs).toEqual([leg(3260)]);
+    expect(card.meta.blocked.await_event).toEqual({ event: "pr_merged", repo, n: 3261 });
+  });
+
+  it("still caps failed GitHub reads without retiring the delivery or consuming its wait", async () => {
+    const id = await queued(3262);
+    for (let i = 1; i <= 12; i++) {
+      await sweep();
+      const failure = await kbJson("/proxy.verify", { key: probeKey(3262), ok: false, error: "GitHub unavailable" });
+      expect(failure.body).toMatchObject({ verdict: i < 12 ? "retry" : "exhausted", attempts: i });
+    }
+    await sweep();
+    expect((await kbJson("/proxy.probes", { limit: 25 })).body.probes).not.toEqual(expect.arrayContaining([expect.objectContaining({ key: probeKey(3262) })]));
+    const card = await taskById(id);
+    expect(card.status).toBe("blocked");
+    expect(card.meta.blocked.await_event).toEqual({ event: "pr_merged", repo, n: 3262 });
   });
 });

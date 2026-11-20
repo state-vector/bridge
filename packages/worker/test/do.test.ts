@@ -1,7 +1,8 @@
 import { Miniflare } from "miniflare";
-import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readyGateway, executorRequest } from "./executor-fixture";
 import { decisionFixture } from "./ask-fixture";
@@ -61,8 +62,9 @@ async function bootKb(persist?: string) {
     }],
   });
   const ns = await instance.getDurableObjectNamespace("KB");
-  const stub = await ns.get(ns.idFromName("global"));
-  return { instance, kb: (path: string, init?: RequestInit) => stub.fetch(`https://kb${path}`, init) };
+  const objectId = ns.idFromName("global");
+  const stub = await ns.get(objectId);
+  return { instance, objectId: objectId.toString(), kb: (path: string, init?: RequestInit) => stub.fetch(`https://kb${path}`, init) };
 }
 
 beforeAll(async () => {
@@ -86,6 +88,52 @@ async function kbJson(path: string, body: unknown): Promise<{ status: number; bo
   });
   return { status: r.status, body: await r.json().catch(() => ({})) };
 }
+
+it("recovers a previously exhausted OPEN probe across a deployed-isolate restart (BR#17771)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "br17771-probe-upgrade-"));
+  let boot = await bootKb(dir);
+  const repo = "state-vector/br17771-upgrade", n = 3243;
+  const key = `merged:${repo}#${n}`, receipt = `https://github.com/${repo}/pull/${n}`;
+  let now = Date.now();
+  const call = async (op: string, body: object = {}) => {
+    const r = await boot.kb(`/${op}`, { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body) });
+    const result = await r.json() as any;
+    expect(r.status, JSON.stringify(result)).toBe(200);
+    return result;
+  };
+  const sweep = () => call("admin.unblock_proxy_sweep", { now: now += 20 * 60_000 });
+  try {
+    const { id } = await call("create", { type: "task", title: "Legacy closed delivery wait", meta: { pr: { repo, number: n } } });
+    await call("transition", { id, to: "blocked", note: "Waiting for the delivery PR", await_event: { event: "pr_merged", repo, n } });
+    await sweep();
+    await boot.instance.dispose();
+
+    // Old code persisted OPEN as a failed read, including after attempt 12.
+    // Seed that on-disk shape with no workerd writing, then boot the new bundle.
+    const dbFile = readdirSync(dir, { recursive: true }).find(f => f.endsWith(`${boot.objectId}.sqlite`));
+    expect(dbFile).toBeDefined();
+    const db = new DatabaseSync(join(dir, dbFile!));
+    try {
+      const write = db.prepare("UPDATE proxy_probes SET state='failed', attempts=12, error=? WHERE key=?").run('PR state "OPEN" — not merged yet', key);
+      expect(write.changes).toBe(1);
+    } finally { db.close(); }
+
+    boot = await bootKb(dir);
+    await sweep();
+    expect((await call("proxy.probes")).probes).toEqual(expect.arrayContaining([expect.objectContaining({ key, attempts: 0 })]));
+    expect(await call("proxy.verify", { key, ok: false, conclusive: true, conclusion: "CLOSED", receipt })).toMatchObject({ verdict: "negative" });
+    await boot.instance.dispose();
+
+    boot = await bootKb(dir);
+    await sweep();
+    const task = await call("get", { id });
+    expect(task.status).toBe("todo");
+    expect(task.meta.proxy_check.receipts).toEqual([receipt]);
+  } finally {
+    await boot.instance.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 
 // /get returns meta as a parsed object on recent rows and as a JSON string on

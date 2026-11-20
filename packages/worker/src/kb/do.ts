@@ -321,6 +321,11 @@ const TRAIN_READY_MS = 15 * 60_000;
 /** A failed probe re-arms after this backoff (the executor re-polls pending
  *  probes each tick; the sweep re-enqueues failed rows past the backoff). */
 const PROBE_RETRY_MS = 10 * 60_000;
+// Compatibility with the deployed gateway and rows it left exhausted.
+// New gateways report an exact PR URL with the explicit OPEN conclusion.
+const LEGACY_MERGE_PROBE_OPEN = 'PR state "OPEN" — not merged yet';
+const mergeProbeWaiting = (probe: { conclusion?: unknown; error?: unknown }) =>
+  probe.conclusion === "OPEN" || probe.error === LEGACY_MERGE_PROBE_OPEN;
 
 type RecoveredPrMeta = Record<string, unknown> & {
   merge_train?: { state?: unknown; repo?: unknown; pr?: unknown };
@@ -1822,6 +1827,8 @@ export class KnowledgeHub {
         // a fact the hub OWNS, unlike a GitHub read it cannot make.
         const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, atom.repo, atom.number);
         if (pv) return { ok: true, receipt: `provenance: ${atom.repo}#${atom.number} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        const closed = this.closedPrReceipt(atom.repo, Number(atom.number));
+        if (closed) return { ok: false, receipt: `GitHub observed CLOSED without a merge: ${closed}`, probeState: "negative" };
         // BR#6384 Leg 3: probe-backed next (the BR#4658 grammar applied to
         // the merge atom) — "unresolvable from the hub" stops being the
         // terminal parking reason for the most common atom class. A worker-
@@ -1840,6 +1847,7 @@ export class KnowledgeHub {
           return { ok: false, receipt: `executor-verified negative (BR#4658/BR#6384): ${v.error || "conclusive negative"} — ${v.receipt}`, probeState: "negative" };
         }
         if (v?.state === "failed") {
+          if (mergeProbeWaiting(v)) return { ok: false, receipt: "GitHub reports the PR is open; waiting for a merge or closure", probeState: "pending" };
           const exhausted = Number(v.attempts ?? 0) >= PROBE_ATTEMPT_CAP;
           return {
             ok: false,
@@ -1987,7 +1995,7 @@ export class KnowledgeHub {
   private enqueueProxyProbe(atom: ProxyAtom, cardId: string, now: number): void {
     const key = proxyProbeKey(atom);
     if (!key) return;
-    const existing = this.one(`SELECT state, ok, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key);
+    const existing = this.one(`SELECT state, ok, attempts, updated_ts, conclusion, error FROM proxy_probes WHERE key = ?`, key);
     if (existing) {
       if (existing.state === "verified" && atom.kind === "pr_checks_green") {
         // This gate follows a PR's current head. A failed head may be repaired
@@ -2001,13 +2009,14 @@ export class KnowledgeHub {
       }
       if (existing.state === "pending" || existing.state === "verified") return; // in flight / done
       // failed: retry on backoff until the cap
-      if (Number(existing.attempts ?? 0) >= PROBE_ATTEMPT_CAP) return; // exhausted — loud unresolvable
+      const wasOpen = atom.kind === "pr_merged" && mergeProbeWaiting(existing);
+      if (!wasOpen && Number(existing.attempts ?? 0) >= PROBE_ATTEMPT_CAP) return; // exhausted — loud unresolvable
       if (now - Number(existing.updated_ts ?? 0) < PROBE_RETRY_MS) return; // backoff
       this.state.storage.sql.exec(
-        `UPDATE proxy_probes SET state = 'pending', card_id = ?, updated_ts = ? WHERE key = ?`,
-        cardId, now, key,
+        `UPDATE proxy_probes SET state = 'pending', card_id = ?, updated_ts = ?, attempts = CASE WHEN ? THEN 0 ELSE attempts END WHERE key = ?`,
+        cardId, now, wasOpen ? 1 : 0, key,
       );
-      this.audit("hub:proxy-watch", "proxy_probe_retry", key, { attempts: Number(existing.attempts ?? 0) + 1, card: cardId });
+      if (!wasOpen) this.audit("hub:proxy-watch", "proxy_probe_retry", key, { attempts: Number(existing.attempts ?? 0) + 1, card: cardId });
       return;
     }
     this.state.storage.sql.exec(
@@ -2059,6 +2068,10 @@ export class KnowledgeHub {
     const receipt = String(body?.receipt ?? "").trim();
     const conclusion = typeof body?.conclusion === "string" ? body.conclusion.toUpperCase() : "";
     const expected = String(probe.expected_head ?? "").toLowerCase();
+    const prClosed = probe.kind === "pr_merged" && body?.ok === false && body?.conclusive === true && conclusion === "CLOSED";
+    const prOpen = probe.kind === "pr_merged" && body?.ok === false && body?.conclusive !== true && conclusion === "OPEN";
+    if ((prClosed || prOpen) && receipt !== `https://github.com/${probe.repo}/pull/${probe.pr}`)
+      return { ok: false, error: "PR observation must cite the exact GitHub PR URL" };
 
     // HUB-side head law (BR#3409): the executor reports what it saw; the hub
     // compares against the awaited head — a mismatch is a conclusive NO
@@ -2099,11 +2112,14 @@ export class KnowledgeHub {
         ? `head mismatch — run concluded at ${headSha.slice(0, 9) || "?"}, the park awaits ${expected.slice(0, 9)} (BR#3409 fail-closed)`
         : String(body?.error ?? body?.reason ?? "conclusive negative from the executor").slice(0, 300);
       const ev = receipt && /https:\/\/github\.com\//.test(receipt) ? receipt : `https://github.com/${probe.repo}/actions`;
-      this.state.storage.sql.exec(
-        `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
-        ev.slice(0, 500), headSha || null, conclusion || null, why, now, key,
-      );
-      const note = `proxy_verified: ${probe.kind} NOT satisfied — ${why} (worker-executor ${actor}, BR#4658); the park stands (fail-closed)`;
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(
+          `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+          ev.slice(0, 500), headSha || null, conclusion || null, why, now, key,
+        );
+        if (prClosed) this.recordDeliveryPrOutcome(String(probe.repo), Number(probe.pr), "CLOSED", null, null, now);
+      });
+      const note = `proxy_verified: ${probe.kind} NOT satisfied — ${why} (worker-executor ${actor}, BR#4658); ${prClosed ? "closure recorded for delivery reconciliation" : "the park stands (fail-closed)"}`;
       this.version(probe.card_id, "hub:proxy-watch", "proxy_verified", note, { key, ok: 0, receipt: ev.slice(0, 300), head_sha: headSha || null });
       this.audit("hub:proxy-watch", "proxy_probe_negative", key, { card: probe.card_id, why });
       return { ok: true, verdict: "negative", note };
@@ -2112,12 +2128,14 @@ export class KnowledgeHub {
     // transient: gh broken / run still in flight — backoff, cap, no event
     // stamp (a pending run re-probing every few minutes must not churn the
     // card's version log).
-    const attempts = Number(probe.attempts ?? 0) + 1;
     const err = String(body?.error ?? "gh failed (no detail)").slice(0, 300);
+    const stillOpen = prOpen || (probe.kind === "pr_merged" && !conclusion && err === LEGACY_MERGE_PROBE_OPEN);
+    const attempts = stillOpen ? 0 : Number(probe.attempts ?? 0) + 1;
     this.state.storage.sql.exec(
-      `UPDATE proxy_probes SET state = 'failed', error = ?, attempts = ?, updated_ts = ? WHERE key = ?`,
-      err, attempts, now, key,
+      `UPDATE proxy_probes SET state = 'failed', conclusion = ?, error = ?, attempts = ?, updated_ts = ? WHERE key = ?`,
+      stillOpen ? "OPEN" : null, stillOpen ? null : err, attempts, now, key,
     );
+    if (stillOpen) return { ok: true, verdict: "waiting", attempts };
     this.audit("hub:proxy-watch", "proxy_probe_transient", key, { attempts, error: err.slice(0, 200) });
     return { ok: true, verdict: attempts >= PROBE_ATTEMPT_CAP ? "exhausted" : "retry", attempts };
   }
@@ -2149,6 +2167,7 @@ export class KnowledgeHub {
         const meta = JSON.parse(r.meta ?? "{}");
         const bmeta = meta.blocked ?? {};
         if (this.startupWait(r.id) || this.protectedExecution(String(r.id), meta)) continue;
+        if (this.closedDeliveryLegs(meta).length && this.continueBlockedWork(String(r.id), meta, { kind: "closed_delivery" })) continue;
         // BR#3578: the typed await (validated at the door) is trusted and
         // evaluated FIRST; the free text is annotation + legacy fallback.
         let aw = validateAwaitEvent(bmeta.await_event);
@@ -2962,18 +2981,40 @@ export class KnowledgeHub {
     this.audit("hub:proxy-watch", "consumed_wait_fallback_annotated", parentId, { child: childId, reason: resume.reason });
   }
 
-  /** Return the same task to dispatch when its typed prerequisite was
-   * verified, its own obsolete recovery request was cancelled, or (BR#14544)
-   * the consumed-wait auto-resume won the decision table. */
+  /** A train-owned delivery park can be released on positive evidence that
+   * one of its remaining PRs closed without merging. An independent wait
+   * (including an explicit prerequisite PR on execution work) stays in charge. */
+  private closedDeliveryLegs(meta: {
+    completion?: unknown;
+    merge_train?: { state?: string; legs?: Record<string, { state?: string }> };
+    blocked?: { await_event?: unknown };
+  }) {
+    if (!mergeCompletesTask(meta) || meta.merge_train?.state === "awaiting-ci"
+      || Object.values(meta.merge_train?.legs ?? {}).some(leg => leg?.state === "awaiting-ci")) return [];
+    const legs = trainLegsRemaining(meta);
+    const held = validateAwaitEvent(meta.blocked?.await_event);
+    const trainPark = ["queued", "conflicting"].includes(String(meta.merge_train?.state));
+    const exact = held?.event === "pr_merged" && legs.find(leg => leg.repo === held.repo && leg.number === held.n);
+    if (meta.blocked?.await_event ? !exact : !trainPark) return [];
+    return (trainPark ? legs : exact ? [exact] : []).flatMap(leg => {
+      const receipt = this.closedPrReceipt(leg.repo, leg.number);
+      return receipt ? [{ repo: leg.repo, number: leg.number, receipt }] : [];
+    });
+  }
+
+  /** Return the same task to dispatch when the existing wait is resolved or
+   * disproved. A closed delivery releases work for repair, never completion. */
   private continueBlockedWork(id: string, evaluated: any, continuation:
     | { kind: "satisfied"; receipts: string[] }
     | { kind: "expired_coordination"; ask_id: string }
-    | { kind: "auto_resume"; receipts: string[] }): boolean {
+    | { kind: "auto_resume"; receipts: string[] }
+    | { kind: "closed_delivery" }): boolean {
     const expiredAsk = continuation.kind === "expired_coordination" ? continuation.ask_id : undefined;
     const autoResume = continuation.kind === "auto_resume";
+    const closedDelivery = continuation.kind === "closed_delivery";
     const expected = validateAwaitEvent(evaluated.blocked?.await_event);
-    if (!expected || (continuation.kind !== "expired_coordination" && !continuation.receipts.length)
-      || (expiredAsk && (expected.event !== "ask" || expected.ask_id !== expiredAsk))) return false;
+    if ((!expected && !closedDelivery) || ("receipts" in continuation && !continuation.receipts.length)
+      || (expiredAsk && (expected?.event !== "ask" || expected.ask_id !== expiredAsk))) return false;
     const row = this.one(`SELECT * FROM artefacts WHERE id=?`, id);
     if (!row || row.status !== "blocked") return false;
     const meta = JSON.parse(String(row.meta ?? "{}"));
@@ -2981,7 +3022,7 @@ export class KnowledgeHub {
       || meta.blocked?.ts !== evaluated.blocked?.ts) return false;
     if (this.isUnclaimableAnchor(row, meta) || meta.lane || meta.operator_gated || meta.delivery_disposition
       || meta.interactive_execution || this.protectedExecution(id, meta) || this.startupWait(id) || this.startupHasAsk(id, expiredAsk)) return false;
-    if (["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))) return false;
+    if (!closedDelivery && ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(meta.merge_train?.state))) return false;
     if (String(meta.merge_train?.state) === "landed" && meta.merge_train?.close_held === "human-signoff") return false; // BR#15722: the close is held for the human sign-off — the exit is human-owned, never machine-resumed
     const execution = this.executionState(id);
     if (execution?.attempt && execution.attempt.phase !== "quiesced"
@@ -2991,6 +3032,10 @@ export class KnowledgeHub {
       const ask = this.one(`SELECT status FROM artefacts WHERE id=?`, meta.awaiting_ask.ask_id);
       if (!ask || !["done", "superseded"].includes(String(ask.status))) return false;
     }
+    const closedLegs = closedDelivery ? this.closedDeliveryLegs(meta) : [];
+    if (closedDelivery && (!closedLegs.length || isStandingCard(meta, parseTags(row.tags))
+      || this.one(`SELECT task_id FROM dispatch_reservations WHERE task_id=?`, id)
+      || this.openVerifyChildren(id) > 0 || this.currentTaskReview(id).phase === "pending")) return false;
     const now = Date.now();
     const predicate = meta.blocked;
     delete meta.blocked; delete meta.awaiting_ask; delete meta.last_unblock_spawn;
@@ -3005,23 +3050,40 @@ export class KnowledgeHub {
       // provenance).
       meta.provenance = {
         kind: "system_auto_resume", via: "consumed_wait",
-        ask_id: expected.event === "ask" ? expected.ask_id : null, ts: now,
+        ask_id: expected?.event === "ask" ? expected.ask_id : null, ts: now,
       };
     }
     delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
     // A historical bounce is repair work, not an active train slot. Keeping
     // its releaseHold after consuming the prerequisite would strand todo too.
     if (meta.merge_train?.state === "bounced") meta.merge_train = { ...meta.merge_train, state: "unbound" };
-    if (expected.event === "time" && String(predicate.reason ?? "").startsWith("churn guard:")) delete meta.attempt;
+    if (expected?.event === "time" && String(predicate.reason ?? "").startsWith("churn guard:")) delete meta.attempt;
+    if (closedDelivery) {
+      const isClosed = (leg: { repo?: string; number?: number }) => closedLegs.some(c => c.repo === leg.repo && c.number === leg.number);
+      const remaining = trainLegs(meta).filter(leg => !isClosed(leg));
+      if (remaining.length) {
+        meta.prs = remaining;
+        meta.pr = remaining[0];
+      } else {
+        delete meta.prs;
+        delete meta.pr;
+      }
+      if (meta.review_pr && isClosed(meta.review_pr)) delete meta.review_pr;
+      if (meta.merge_train) meta.merge_train = { state: "unbound", legs: meta.merge_train.legs };
+      delete meta.bounce_released;
+      // Changing the active delivery scope invalidates prior admissions, not
+      // their history. No successor or acceptance can be inferred from closure.
+      meta.work_revision = crypto.randomUUID();
+      meta.proxy_check = { at: now, verdict: "false", detail: "Delivery PR closed unmerged; return for repair and fresh review.", receipts: closedLegs.map(leg => leg.receipt) };
+    }
     this.state.storage.transactionSync(() => {
       const current = this.one(`SELECT status,meta,owner FROM artefacts WHERE id=?`, id);
       if (current.status !== row.status || current.meta !== row.meta || current.owner !== row.owner) throw new Error("wait continuation changed before commit");
       if (expiredAsk) this.cancelRequest(expiredAsk, "The recovery coordination request expired. Bridge will retry the same recovery duty.", "system:coordination");
       this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
-      if (autoResume) {
+      if (autoResume || closedDelivery) {
         // the machine's resume effect, mirrored for this direct-SQL edge
-        // (machine.ts on blocked → in_progress): "resumed from blocked —
-        // unblock confirmed, child superseded" — the stale park-time round
+        // (machine.ts on blocked → in_progress): the stale park-time round
         // must not outlive the wait it was issued for. conserveDelivery
         // retains any round with outstanding PR bindings, same as the
         // transition-path executor.
@@ -3036,10 +3098,13 @@ export class KnowledgeHub {
             continue;
           }
           const vm = JSON.parse(String(v.meta ?? "{}"));
-          vm.superseded_reason = `${id} resumed from blocked (BR#14544 consumed-wait auto-resume) — unblock round superseded`;
+          vm.superseded_reason = `${id} resumed from blocked (${closedDelivery ? "delivery PR closed unmerged" : "BR#14544 consumed-wait auto-resume"}) — unblock round superseded`;
+          // The closed-PR repair cannot retire another live executor. Only
+          // its obsolete unowned park-time round belongs to this edge.
+          if (closedDelivery && (v.owner || v.status !== "todo" || this.staleReviewHasExecutionHold(String(v.id), vm))) continue;
           this.state.storage.sql.exec(`UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(vm), now, now, String(v.id));
-          this.audit("system:proxy-watch", "transition", String(v.id), { from: v.status, to: "superseded", note: "consumed-wait auto-resume superseded the round" });
-          this.version(String(v.id), "system:proxy-watch", "transition", `${id} resumed from blocked (BR#14544 consumed-wait auto-resume) — unblock round superseded`, { from: v.status, to: "superseded" });
+          this.audit("system:proxy-watch", "transition", String(v.id), { from: v.status, to: "superseded", note: vm.superseded_reason });
+          this.version(String(v.id), "system:proxy-watch", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
         }
       }
       if (continuation.kind === "expired_coordination") {
@@ -3060,6 +3125,10 @@ export class KnowledgeHub {
           { from: "blocked", to: "todo", receipts, provenance: meta.provenance });
         this.version(id, "system:proxy-watch", "wait_continued", "Consumed-wait resume receipt: the fired wait was machine-verified and the card returned to the dispatch pool (BR#14544 system auto-resume)", { await_event: expected, receipts, provenance: meta.provenance });
         this.audit("system:proxy-watch", "auto_resume", id, { ask_id: (meta.provenance as { ask_id?: string | null }).ask_id, await_event: expected, receipts });
+      } else if (closedDelivery) {
+        const note = `blocked → todo — ${closedLegs.map(leg => leg.receipt).join(", ")} closed unmerged; delivery still required. Restore the delivery path and submit for fresh independent review.`;
+        this.version(id, "system:proxy-watch", "closed_delivery_released", note, { from: "blocked", to: "todo", legs: closedLegs });
+        this.audit("system:proxy-watch", "closed_delivery_released", id, { legs: closedLegs });
       } else {
         const { receipts } = continuation;
         this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
@@ -8231,6 +8300,10 @@ export class KnowledgeHub {
         if (!captured.success || captured.data.task_id !== subject || reviewResult.subject_revision !== captured.data.revision
           || captured.data.revision !== (targetMeta.work_revision ?? "legacy")) throw new Error("gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round");
         if (!mergeCompletesTask(targetMeta) && reviewResult.kind !== "accepted_execution") throw new Error("gate: execution outcomes require accepted_execution; prerequisite or code delivery is not outcome acceptance");
+        if (reviewResult.kind === "accepted_pr") {
+          const closed = reviewResult.legs.find(leg => this.closedPrReceipt(leg.repo, leg.number));
+          if (closed) throw new Error(`gate: ${closed.repo}#${closed.number} closed without merging; record findings or independently verify the replacement delivery`);
+        }
         if (reviewResult.kind === "accepted_execution" && (mergeCompletesTask(targetMeta) || !ExecutionResultSchema.safeParse(targetMeta.execution_result).success)) throw new Error("gate: execution acceptance requires an execution contract and the subject's submitted execution_result");
         // BR#14366 (ADR BR#14118): per-criterion disposition gate. The bar is
         // this duty's spawn-frozen review_subject.criteria — every criterion
@@ -10174,6 +10247,11 @@ export class KnowledgeHub {
           parent = this.one(`SELECT * FROM artefacts WHERE id=?`, successor);
         }
         const target = String(parent.id);
+        const closed = a.legs.find(leg => this.closedPrReceipt(leg.repo, leg.number));
+        if (closed) {
+          a.state = { phase: "held", reason: `${closed.repo}#${closed.number} closed unmerged; repair and fresh independent review are required.` };
+          save(); continue;
+        }
         await this.queueAcceptedPrLegs(target, a.legs, a.actor);
         const queued = this.one(`SELECT status,meta,roles FROM artefacts WHERE id=?`, target);
         const qm = JSON.parse(queued?.meta ?? "{}");
@@ -16620,7 +16698,10 @@ export class KnowledgeHub {
     if (ghostLegs.length) {
       this.audit(actor, "queue_ghost_leg_dropped", parentId, { dropped: ghostLegs.map((l) => `${l.repo}#${l.number}`), reason: "stamped legs with non-repo repo tokens (BR#5329 ghost-row class) — dropped before the re-stamp" });
     }
-    const legs = Array.isArray(meta.prs) ? stampLegs.map(l => ({ ...l })) : [];
+    // A fresh exact-subject verdict may replace an old CLOSED binding; the
+    // closure receipt is the authority to stop carrying that PR forward.
+    // Non-closed legs, including already landed legs, are still conserved.
+    const legs = Array.isArray(meta.prs) ? stampLegs.filter(leg => !this.closedPrReceipt(leg.repo, leg.number)).map(l => ({ ...l })) : [];
     for (const accepted of acceptedLegs) {
       const i = legs.findIndex(l => l.number === accepted.number && l.repo === accepted.repo);
       if (i >= 0) legs[i] = { ...legs[i], ...accepted };
@@ -20121,19 +20202,21 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     }
   }
 
-  /** BR#15528: the outcome row is the hub's durable observation of a PR's
-   *  GitHub state — for MERGED rows it now carries the merge commit sha too
-   *  (previously DROPPED at the door, which made every later merge-ledger
-   *  stamp impossible from recorded evidence: the BR#9510 land flow could
-   *  never admit an observed merge). mergeSha is the 40-hex merge commit
-   *  when the observation carries one, else null. */
+  private closedPrReceipt(repo: string, pr: number): string | null {
+    const outcome = this.one(`SELECT receipt FROM delivery_pr_outcomes WHERE repo=? AND pr=? AND state='CLOSED'
+      AND NOT EXISTS (SELECT 1 FROM provenance WHERE repo=? AND pr=? AND merge_sha<>'')`, repo, pr, repo, pr);
+    return typeof outcome?.receipt === "string" ? outcome.receipt : null;
+  }
+
+  /** Durable GitHub facts from reconciliation and exact probes. A merge is
+   * immutable, while a PR can reopen after a closed-unmerged observation. */
   private recordDeliveryPrOutcome(repo: string, pr: number, state: "OPEN" | "CLOSED" | "MERGED", head: string | null, mergeSha: string | null, now: number): void {
     this.state.storage.sql.exec(`
       INSERT INTO delivery_pr_outcomes(repo,pr,state,head,receipt,observed_at,merge_sha) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(repo,pr) DO UPDATE SET state=excluded.state, head=coalesce(excluded.head, delivery_pr_outcomes.head),
         receipt=excluded.receipt, observed_at=excluded.observed_at,
         merge_sha=coalesce(excluded.merge_sha, delivery_pr_outcomes.merge_sha)
-      WHERE delivery_pr_outcomes.state <> 'MERGED' OR excluded.state = 'MERGED'`,
+      WHERE excluded.state = 'MERGED' OR (delivery_pr_outcomes.state <> 'MERGED' AND excluded.observed_at >= delivery_pr_outcomes.observed_at)`,
       repo, pr, state, head, `https://github.com/${repo}/pull/${pr}`, now, mergeSha);
   }
 
@@ -20151,12 +20234,24 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     for (const p of prs) {
       const state = String(p.state ?? "OPEN").toUpperCase();
       if (state !== "OPEN" && state !== "CLOSED" && state !== "MERGED") continue;
-      if (state === "MERGED" && !/^[0-9a-f]{40}$/i.test(p.mergeCommit ?? "")) continue;
+      if ((state === "MERGED" && !/^[0-9a-f]{40}$/i.test(p.mergeCommit ?? "")) || (state === "CLOSED" && p.mergeCommit)) continue;
       // BR#15528: keep the merge commit — an outcome row that records the
       // merge sha is the evidence the land flow stamps the provenance
       // ledger from (head + merge sha = a complete hub-owned merge receipt).
       this.recordDeliveryPrOutcome(repo, p.number, state, p.headRefOid, state === "MERGED" ? String(p.mergeCommit) : null, now);
     }
+    // Promote exact historic negative receipts that predate canonical CLOSED
+    // recording. A later OPEN observation wins, including after reopening.
+    const historicClosures = this.state.storage.sql.exec(`SELECT p.pr, p.updated_ts FROM proxy_probes p
+      LEFT JOIN delivery_pr_outcomes o ON o.repo=p.repo AND o.pr=p.pr
+      WHERE p.repo=? AND p.kind='pr_merged' AND p.state='verified' AND p.ok=0 AND p.conclusion='CLOSED'
+      AND p.receipt='https://github.com/' || p.repo || '/pull/' || p.pr
+      AND (o.pr IS NULL OR (o.state='OPEN' AND o.observed_at<p.updated_ts))`, repo).toArray();
+    for (const p of historicClosures) this.recordDeliveryPrOutcome(repo, Number(p.pr), "CLOSED", null, null, Number(p.updated_ts));
+    this.state.storage.sql.exec(`DELETE FROM proxy_probes AS p
+      WHERE p.repo=? AND p.kind='pr_merged' AND p.state='verified' AND p.ok=0 AND p.conclusion='CLOSED'
+        AND EXISTS (SELECT 1 FROM delivery_pr_outcomes o WHERE o.repo=p.repo AND o.pr=p.pr
+          AND o.state='OPEN' AND o.observed_at>=p.updated_ts)`, repo);
     // Comments/head updates cannot renew review/draft grace forever. The
     // hub's own first-observation clock bounds even malformed timestamps.
     for (const p of prs.filter(prRowIsOpen)) {

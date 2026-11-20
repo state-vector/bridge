@@ -5876,10 +5876,9 @@ fn pr_payload(rows: &Value) -> Value {
 /// unit-testable). MERGED with a citable mergeCommit is Satisfied (the
 /// mergeCommit rides head_sha — for the merge atom the merge IS the awaited
 /// fact, so the hub's expected-head law is inert: pr_merged probes carry
-/// expected_head NULL by construction); CLOSED is the conclusive no (the
-/// wait can provably never fire — the hub stamps an honest negative,
-/// fail-closed BR#3409); OPEN — and a "MERGED" row with a junk sha, which
-/// names no citable receipt — stays transient.
+/// expected_head NULL by construction); CLOSED without a merge is a
+/// negative observation, OPEN still awaits delivery, and inconsistent or
+/// unreadable rows remain transient.
 fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeVerdict {
     match state.to_ascii_uppercase().as_str() {
         "MERGED" => {
@@ -5897,11 +5896,12 @@ fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeV
                 }
             }
         }
-        "CLOSED" => ProbeVerdict::Conclusive {
-            error: "PR state CLOSED — unmerged; the wait can provably never fire".into(),
+        "CLOSED" if merge_commit.is_empty() => ProbeVerdict::Conclusive {
+            error: "PR state CLOSED — unmerged".into(),
             receipt: url.to_string(),
             conclusion: "closed".into(),
         },
+        "OPEN" => ProbeVerdict::OpenPr { receipt: url.to_string() },
         _ => ProbeVerdict::Transient { error: format!("PR state {state:?} — not merged yet") },
     }
 }
@@ -6148,6 +6148,9 @@ enum ProbeVerdict {
     /// — feed ok=false conclusive=true; the hub stamps a negative
     /// proxy_verified and the park stands (BR#3409 fail-closed).
     Conclusive { error: String, receipt: String, conclusion: String },
+    /// A successful PR read with no terminal outcome. The hub paces another
+    /// read without spending the transient failure budget.
+    OpenPr { receipt: String },
     /// Nothing decidable yet (gh error, run in flight, checks pending) —
     /// feed ok=false transient; the hub backs off, attempt-capped.
     Transient { error: String },
@@ -6319,6 +6322,13 @@ fn probe_report_body(key: &str, observed: Result<ProbeVerdict, String>) -> Value
             body["error"] = json!(error);
             body["receipt"] = json!(receipt);
             body["conclusion"] = json!(conclusion);
+        }
+        Ok(ProbeVerdict::OpenPr { receipt }) => {
+            body["ok"] = json!(false);
+            body["receipt"] = json!(receipt);
+            body["conclusion"] = json!("open");
+            // A hub from before BR#17771 understands the old error shape.
+            body["error"] = json!("PR state \"OPEN\" — not merged yet");
         }
         Ok(ProbeVerdict::Transient { error }) => {
             body["ok"] = json!(false);
@@ -7001,12 +7011,16 @@ mod tests {
     }
 
     #[test]
-    fn pr_merged_open_and_sha_drift_stay_transient_br6384() {
-        // OPEN: a future merge can still satisfy — transient
-        match classify_pr_merge_state("OPEN", "", "") {
-            ProbeVerdict::Transient { .. } => {}
-            other => panic!("expected Transient for OPEN, got {other:?}"),
-        }
+    fn pr_merged_distinguishes_open_from_an_unreadable_outcome_br17771() {
+        let url = "https://github.com/o/r/pull/10";
+        let open = classify_pr_merge_state("OPEN", "", url);
+        assert_eq!(open, ProbeVerdict::OpenPr { receipt: url.into() });
+        let body = probe_report_body("merged:o/r#10", Ok(open));
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["conclusion"], json!("open"));
+        assert_eq!(body["receipt"], json!(url));
+        assert!(body.get("conclusive").is_none());
+        assert!(matches!(classify_pr_merge_state("CLOSED", "unexpected", url), ProbeVerdict::Transient { .. }));
         // junk sha on a MERGED row: no citable receipt — transient, never satisfied
         match classify_pr_merge_state("MERGED", "nope", "") {
             ProbeVerdict::Transient { .. } => {}

@@ -3458,62 +3458,31 @@ Pinned in `packages/worker/test/br6348-conflicting-park.test.ts`.
 
 ### The anti-languish law (BR#6384)
 
-Three ways a card could sit forever past its own evidence, all closed.
+**Observed merges.** Reconciliation appends recent merged PRs alongside the
+open feed. A merge with a citable commit is evidence for independent delivery
+verification; a current acceptance can settle through the normal exact-head
+and required-check rules. Standing lane cards do not participate.
 
-**Observed-merge close.** The reconcile feed used to see only OPEN PRs: a
-bound card whose PR merged out-of-band (a missed train event, a feed gap)
-could never close — reconcile had no merged state to observe, so the card
-languished blocked while the PR sat green on GitHub. The daemon now
-concatenates the merged feed beside the open feed (`concat_pr_rows`,
-additive — a gh failure on the merged leg degrades to the open feed alone),
-non-object rows are dropped daemon-side (the hub's `normalizePr` still owns
-number-level junk — the additive contract is pinned, not assumed), and each
-`ReconcilePr` row carries `state` + `mergeCommit` (null on open rows and
-legacy feeds — an open-only feed behaves exactly as before). The observation
-loop in `reconcileJoin`, partitioned by `prRowIsOpen`, closes the bound card
-of any PR observed MERGED with a citable merge commit — no provenance row
-and no ruling duty needed (lane cards stay exempt per BR#5151; the reverse
-loop skips observation-owned bindings, and a PR is judged once per pass).
-The DO apply unparks first (blocked → in_progress under `merge_train: true`,
-then done — blocked→done is lifecycle-illegal), and the close note leads
-with the fact: `reconcile: observed MERGED (BR#6384) — <repo>#<n> merged
-out-of-band, mergeCommit <sha9>…` (version summaries truncate ~140 chars, so
-the law tag and the sha come early). The accounting line grows a segment —
-`[observed-merge: N observed-merged closed]` — and the accounted recompute
-runs after the observation loop so its closes are counted, not alarmed as
-missing bindings.
-
-**The disposition ladder.** What the strand sweep (BR#6163) can only
-re-board once, the ladder disposes on a bounded verdict path.
-`dispositionStrandedTrainWaits` runs in the alarm sweep right after
-`sweepStrandedTrainCards`: eligible = blocked + a train-only wait
-(`pr_merged` / `pr_checks_green`) + strand class `out_of_queue_await` + a
-HEALTHY lane (a merged event newer than the park — a stalled train is the
-starvation sweep's problem) + park age past `train_strand_disposition_h`
-(default 24, clamped 4–168; underscore keys — `admin.settings_set` validates
-`^[a-z0-9_]{1,40}$`, dotted keys are unsettable). Four rungs, bounded by
-`train_strand_ladder_rounds` (default 2, clamped 1–8): (a) provenance
-receipt or a verified-ok probe → unpark-then-done citing the sha (the same
-lifecycle law as the observed-merge close — the done rides in_progress);
-(b) a conclusive merged-probe negative (the PR reads CLOSED unmerged) →
-superseded with findings — the one legal exit from blocked; probe-first
-grace via `meta.strand_probe_grace` so the first pass probes before any
-duty spawns; (c) ONE re-verify-or-drop duty per round (`meta.strand_ladder`
-pinning `{rounds, last_duty_id}`, relates-linked, title `Strand disposition
-round N — verify-or-drop <card>`); (d) rounds exhausted → superseded
-`ladder exhausted`. No rung loops: a stranded car ends closed, superseded,
-or carrying a fresh verify-or-drop duty — never parked indefinitely.
+**Stranded waits.** A train-only wait outside the queue can enter the
+disposition ladder once the lane has moved and the wait exceeds
+`train_strand_disposition_h` (24 hours by default, range 4–168). After a probe
+grace pass, the hub allows one review duty per round up to
+`train_strand_ladder_rounds` (default 2, range 1–8). Exhausted rounds escalate
+to recovery with the delivery obligation intact.
 
 **pr_merged proxy probes.** The BR#4658 probe grammar grows the atom trains
 wait on: a `pr_merged` park probes under key `merged:repo#N`, the probe row
 joins the queue with the PR bound (the executor answers first-hand with
 `gh`), and `evalProxyAtom` consults provenance FIRST (BR#3620 — a
 train-stamped merge is a hub-owned fact) then the probe verdict: MERGED with
-a citable merge commit = satisfied citing the sha as head_sha; CLOSED
-unmerged = conclusive negative (fail-closed, BR#3409 — the park goes loud
-instead of waiting forever); OPEN or junk = transient, the probe re-arms.
-The Rust executor's `observe_probe` arm classifies through the same pure law
-(`classify_pr_merge_state`) — one classifier, pinned both sides.
+a citable merge commit satisfies the merge wait; an OPEN observation is paced
+without consuming the read-error budget. Unreadable responses still back off
+with a cap. A confirmed CLOSED-without-merge receipt for the exact PR is
+recorded in the PR outcome ledger. On the next wait sweep an affected delivery
+leaves the train for repair, retaining its other legs and requiring a fresh
+independent review of its new delivery path. Closure does not complete the
+task. Unrelated waits, live execution and human decisions retain custody;
+a later OPEN report supersedes an older CLOSED observation.
 
 Pinned in `packages/worker/test/reconcile.test.ts` (feed partition +
 accounting + projections), `packages/worker/test/br6384-anti-languish.test.ts`
