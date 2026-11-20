@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -301,5 +301,78 @@ describe("legacy timeout accounting migration", () => {
     legacy.failure_charged_generation=legacyTimeoutChargeGeneration(legacy,begun,[polled]);
     chargeExecutionFailure(legacy,1);
     expect(legacy.budget_exhaustions).toBe(3);
+  });
+});
+
+describe("accepted recovery diagnosis stamps (BR#18198)", () => {
+  /** A stopped, budget-exhausted attempt with resolved operations — the
+   *  BR#17785 shape the recovery sweep keeps re-fencing. */
+  function exhausted() {
+    const receipt = { ...fence, writers: "process_group_empty" as const, outcome: { kind: "failed" as const, exit_code: 1, stdout_tail: "", stderr_tail: "runner stopped" } };
+    let s = step(step(started(), { kind: "stopped", ...receipt }), { kind: "finalize", ...receipt }, 1_000);
+    s.budget_exhaustions = 3;
+    s.budget_exhausted_at = 1_000;
+    return s;
+  }
+  const stamp = { kind: "diagnosis_accepted", ...fence, hold: "retry_budget", duty: "BR#17814", accepted_by: "reviewer" } as const;
+
+  it("stamps the accepted reconciliation and clears the retry_budget hold for the covered attempt", () => {
+    const s = exhausted();
+    expect(executionAdmissionHold(s, "revision")).toBe("retry_budget");
+    expect(attemptDiagnosisCoversAttempt(s)).toBe(false);
+    const next = reduceExecution(s, stamp, "system:recovery", "", 2_000, "revision");
+    expect(next.attempt_diagnosis).toMatchObject({ generation: 1, attempt_id: "one", hold: "retry_budget", duty: "BR#17814" });
+    expect(attemptDiagnosisCoversAttempt(next)).toBe(true);
+    // The scheduler's own reservation is now the admissible retry: begin
+    // needs no recovery permit (the begin gate reads the same hold).
+    expect(executionAdmissionHold(next, "revision")).toBeNull();
+    expect(executionNeedsRecoveryPermit(next, "revision")).toBe(false);
+    const resumed = reduceExecution(next, { ...begin, attempt_id: "fresh-generation" }, "mac", "dispatch-BR-2", 3_000, "revision");
+    expect(resumed.generation).toBe(2);
+    expect(resumed.attempt?.phase).toBe("running");
+    expect(resumed.recovery_permit).toBeNull();
+  });
+  it("keeps the fencing hold when the stamp is missing or the attempt moved on", () => {
+    const unstamped = exhausted();
+    expect(executionAdmissionHold(unstamped, "revision")).toBe("retry_budget");
+    // A newer generation invalidates the stamp: coverage follows the attempt.
+    let moved = reduceExecution(unstamped, stamp, "system:recovery", "", 2_000, "revision");
+    moved = step(moved, { ...begin, attempt_id: "next" }, 3_000);
+    const stoppedNext = { generation: 2, attempt_id: "next", writers: "process_group_empty" as const, outcome: { kind: "failed" as const, exit_code: 1, stdout_tail: "", stderr_tail: "stopped again" } };
+    moved = step(moved, { kind: "stopped", ...stoppedNext }, 4_000);
+    moved = step(moved, { kind: "finalize", ...stoppedNext }, 4_000);
+    expect(attemptDiagnosisCoversAttempt(moved)).toBe(false);
+    moved.budget_exhaustions = 4;
+    moved.budget_exhausted_at = 4_000;
+    expect(executionAdmissionHold(moved, "revision")).toBe("retry_budget");
+  });
+  it("refuses every session command and stamps only from the hub's internal write", () => {
+    const running = started();
+    expect(() => reduceExecution(running, stamp, "mac", "dispatch-BR-1", 2_000, "revision")).toThrow(/hub-authoritative/);
+    // Even on an otherwise stampable stopped attempt, a non-empty session
+    // (gateway, worker, or any authenticated caller) is refused outright.
+    expect(() => reduceExecution(exhausted(), stamp, "other-host", "other-session", 2_000, "revision")).toThrow(/hub-authoritative/);
+    const wrongAttempt = { ...stamp, attempt_id: "other" };
+    expect(() => reduceExecution(exhausted(), wrongAttempt, "system:recovery", "", 2_000, "revision")).toThrow(/exact quiesced stopped attempt/);
+  });
+  it("refuses to stamp unresolved external operations", () => {
+    const s = exhausted();
+    s.operations = [{ id: "publish", action: "Push exact ref", input_revision: "old-head", deadline: 2_000, state: "outcome_unknown", receipts: [] }];
+    expect(() => reduceExecution(s, stamp, "system:recovery", "", 2_000, "revision")).toThrow(/reconciled external operations/);
+    expect(attemptDiagnosisCoversAttempt(s)).toBe(false);
+    expect(executionAdmissionHold(s, "revision")).toBe("unknown_operations");
+  });
+  it("acknowledges an identical replay without a second write", () => {
+    const stamped = reduceExecution(exhausted(), stamp, "system:recovery", "", 2_000, "revision");
+    const replay = reduceExecution(stamped, stamp, "system:recovery", "", 3_000, "revision");
+    expect(replay.attempt_diagnosis).toEqual(stamped.attempt_diagnosis);
+    expect(replay.revision).toBe(stamped.revision);
+  });
+  it("parses legacy journals without the stamp field (additive default, no policy bump)", () => {
+    const legacy = JSON.parse(JSON.stringify(exhausted()));
+    delete legacy.attempt_diagnosis;
+    const parsed = ExecutionStateSchema.parse(legacy);
+    expect(parsed.attempt_diagnosis).toBeNull();
+    expect(parsed.policy_version).toBe(1);
   });
 });

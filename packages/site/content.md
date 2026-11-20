@@ -465,6 +465,11 @@ human to staff another agent.
 
 Unresolved recovery causes retain their history and retry budget across new
 commits, while each new exact revision must earn its own deployment verification.
+When an independent reviewer accepts a task-recovery duty's diagnosis of a
+stopped attempt, the reconciliation is stamped into the subject's durable
+execution record — the recovery sweep reads that stamp, not board history, so
+an accepted chain never re-arms the same stopped attempt: the budget hold
+clears and the scheduler's own reservation is the admissible retry (BR#18198).
 Repair/review/deployment-verification tasks sort first; diagnostics leave the
 last slot available on multi-slot gateways.
 **Local pickup is explicit.** A forced handoff stops/checkpoints the old writer,

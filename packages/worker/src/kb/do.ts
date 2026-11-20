@@ -251,7 +251,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -7029,6 +7029,13 @@ export class KnowledgeHub {
     if (!token) throw new Error("gate: durable execution requires a live authenticated credential");
     const gateway = tagsSayGateway(parseTags(token.tags));
     const command = req.command;
+    if (command.kind === "diagnosis_accepted") {
+      // BR#18198 — the reconciliation stamp is hub infrastructure. The
+      // accepted task-recovery duty's own done write and the diagnosis
+      // sweep apply it; a session command (gateway or worker credential)
+      // can never fabricate an acceptance into the durable record.
+      throw new Error("gate: diagnosis acceptance is hub-authoritative — the accepted recovery duty's done write stamps it, never a session command");
+    }
     trace?.operation(`execution.${command.kind.replaceAll("_", ".")}`);
     const now = Date.now();
     const effectKey = `gateway:${tokenId}`, effectRequest = JSON.stringify({ command, actor });
@@ -16618,6 +16625,12 @@ export class KnowledgeHub {
       if (parent.status === "in_review" && result.kind === "accepted_execution" && result.task_id === parentId && ExecutionResultSchema.safeParse(meta.execution_result).success) {
         await this.transition({ id: parentId, to: "done", session: "", execution_result: meta.execution_result, note: `Independent execution acceptance: ${result.receipts.join("; ")}` }, actor);
         this.completeDeliveryClosure(parentId, result.receipts);
+        // BR#18198 — inside the accepted task-recovery duty's own done
+        // write: stamp the reconciliation into the subject's durable
+        // execution record. Without it the sweep re-reads the same stopped
+        // attempt as unreconciled and re-fences the subject seconds after
+        // the acceptance (BR#17785 x8).
+        this.stampAcceptedRecoveryDiagnosis(parentId, meta, actor);
         return;
       }
       this.audit("system:completion", "prerequisite_not_delivery", parentId, { completion: completionContract(meta) });
@@ -16658,6 +16671,28 @@ export class KnowledgeHub {
       this.audit("system:coordination", "direct_main_closed_on_accept", parentId, { sha: result.commit });
       return;
     }
+  }
+
+  /** BR#18198 — inside an accepted task-recovery duty's done write: stamp
+   *  the reconciliation into the subject's durable execution record so the
+   *  recovery sweep stops re-arming the same stopped attempt and the
+   *  scheduler's next reservation owns the retry (BR#17785 x8). Best-effort:
+   *  a subject whose state moved on (new attempt, granted permit) needs no
+   *  stamp; a refused stamp is audited and the sweep's self-heal retries. */
+  private stampAcceptedRecoveryDiagnosis(dutyId: string, dutyMeta: Record<string, unknown>, actor: string): void {
+    const duty = (dutyMeta.machine_duty ?? {}) as { kind?: string; reason?: string; subject?: string };
+    if (duty.kind !== "task-recovery" || duty.reason !== "execution_environment" || !duty.subject) return;
+    const subjectId = String(duty.subject);
+    const row = this.one(`SELECT meta FROM artefacts WHERE id=?`, subjectId);
+    if (!row) return;
+    const subjectMeta = JSON.parse(String(row.meta ?? "{}"));
+    const diagnosis = subjectMeta.execution_diagnosis as { generation?: unknown; hold?: unknown; duty?: unknown } | undefined;
+    if (!diagnosis || String(diagnosis.duty ?? "") !== dutyId) return;
+    const state = this.executionState(subjectId);
+    if (!state || state.generation !== Number(diagnosis.generation)) return;
+    const hold = diagnosis.hold === "retry_budget" || diagnosis.hold === "unknown_operations" ? diagnosis.hold : null;
+    if (!hold) return;
+    this.acceptAttemptDiagnosis(subjectId, state, hold, dutyId, actor);
   }
 
   /** BR#9510 — fetch the hub merge receipts for an admission's legs and run
@@ -18101,6 +18136,50 @@ export class KnowledgeHub {
     return this.executionWork().blockers(row, Date.now()).length === 0;
   }
 
+  /** BR#18198 — write an accepted task-recovery duty's reconciliation into
+   * the subject's durable execution record: the recovery sweep's source of
+   * truth. Hub-only by construction — this runs inside the accepted duty's
+   * own done write and from the diagnosis sweep's self-heal; the execution
+   * wire refuses the diagnosis_accepted kind outright, so no session can
+   * fabricate a stamp. Idempotent: an identical stamp for the same stopped
+   * attempt (BR#17785's eight duties share one attempt) is an acknowledged
+   * replay through the reducer's identical-stamp gate. */
+  private acceptAttemptDiagnosis(taskId: string, state: ExecutionState, hold: "retry_budget" | "unknown_operations", dutyId: string, acceptedBy: string): boolean {
+    const attempt = state.attempt;
+    if (!attempt || attempt.phase !== "quiesced"
+      || !state.terminal || state.terminal.generation !== attempt.generation || state.terminal.attempt_id !== attempt.attempt_id
+      || state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return false;
+    const prior = state.attempt_diagnosis;
+    if (prior && prior.generation === attempt.generation && prior.attempt_id === attempt.attempt_id) return true;
+    const current = this.executionState(taskId);
+    if (!current) return false;
+    try {
+      const next = reduceExecution(current, { kind: "diagnosis_accepted", generation: attempt.generation,
+        attempt_id: attempt.attempt_id, hold, duty: dutyId, accepted_by: acceptedBy }, "system:recovery", "", Date.now(), "legacy");
+      this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(next), taskId);
+      this.version(taskId, "system:recovery", "diagnosis_accepted",
+        `Accepted recovery diagnosis ${dutyId} stamped into the durable execution record — the scheduler's reservation owns the retry`,
+        { generation: attempt.generation, attempt_id: attempt.attempt_id, hold, duty: dutyId });
+      this.audit("system:recovery", "diagnosis_accepted", taskId,
+        { generation: attempt.generation, attempt_id: attempt.attempt_id, hold, duty: dutyId, accepted_by: acceptedBy });
+      return true;
+    } catch (e) {
+      this.audit("system:recovery", "diagnosis_stamp_refused", taskId, { duty: dutyId, error: String(e).slice(0, 240) });
+      return false;
+    }
+  }
+
+  /** BR#18198 — a covered attempt stays in the pool as schedulable work; the
+   * sweep would otherwise re-log the same skip every tick. One throttled
+   * receipt per hour per task keeps the surface visible without an audit
+   * pile (the BR#14703 stats pattern). */
+  private diagnosisAcceptedSkip(taskId: string, state: ExecutionState): void {
+    const d = state.attempt_diagnosis;
+    if (this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='diagnosis_accepted_skip' AND artefact_id=? AND ts>? LIMIT 1`, taskId, Date.now() - 3_600_000)) return;
+    this.audit("system:recovery", "diagnosis_accepted_skip", taskId,
+      { generation: d?.generation ?? null, attempt_id: d?.attempt_id ?? null, duty: d?.duty ?? null, hold: d?.hold ?? null });
+  }
+
   /** Assign evidence-gathering for exhausted budgets and unknown effects.
    * The subject's admission fence continues to own its exit. BR#17649 —
    * candidates are ordered by the ONE selection law both stages share
@@ -18144,11 +18223,34 @@ export class KnowledgeHub {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state, revision);
         if ((hold !== "retry_budget" && hold !== "unknown_operations")
-          || (meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis.hold === hold
-            && ["todo", "in_progress", "in_review", "blocked"].includes(String(row.diagnosis_status)))
           || (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now()))
           || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
           || this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta)) continue;
+        const diagnosedSameAttempt = meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis?.hold === hold;
+        if (diagnosedSameAttempt && attemptDiagnosisCoversAttempt(state)) {
+          // BR#18198 — the accepted duty's stamp already covers this stopped
+          // attempt; the scheduler's reservation owns the retry. Throttled
+          // skip receipt instead of a re-arm.
+          this.diagnosisAcceptedSkip(id, state);
+          continue;
+        }
+        if (diagnosedSameAttempt && ["todo", "in_progress", "in_review", "blocked"].includes(String(row.diagnosis_status))) continue;
+        // BR#18198 — the referenced duty closed done. If its verdict was an
+        // accepted execution, the reconciliation belongs in the durable
+        // record: stamp it (self-heal for a stamp the done write missed) and
+        // log the skip instead of re-fencing the same stopped attempt —
+        // re-arming here loops recovery duties forever (BR#17785 x8). A done
+        // duty without an accepted verdict is genuinely unreconciled work:
+        // the re-arm below is legitimate.
+        if (diagnosedSameAttempt && String(row.diagnosis_status) === "done") {
+          const dutyId = String(meta.execution_diagnosis.duty ?? "");
+          const review = this.currentTaskReview(dutyId);
+          if (review.phase === "accepted" && review.result.kind === "accepted_execution"
+            && this.acceptAttemptDiagnosis(id, state, hold, dutyId, "system:recovery")) {
+            this.diagnosisAcceptedSkip(id, state);
+            continue;
+          }
+        }
         if (scheduled >= 4) { waited.push(entry); continue; }
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
         const fresh = this.executionState(id);

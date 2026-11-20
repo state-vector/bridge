@@ -824,6 +824,66 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await post("transition", cleared)).status).toBe("in_review");
     expect((await post("get", { id })).meta.execution_diagnosis?.duty).toBe(original.duty);
   });
+  it("stamps an accepted recovery diagnosis into the durable record: no re-arm, the scheduler owns the retry (BR#18198)", async () => {
+    const project = "diagnosis-stamp", g = await gateway(project, 2);
+    const id = await task(project);
+    // A real stopped attempt: begin, stop, finalize — the BR#17785 shape.
+    const first = await reserve(g);
+    if (first.kind !== "reserved" || first.task_id !== id) throw new Error(JSON.stringify(first));
+    const fence = { generation: 1, attempt_id: "subject-attempt" };
+    await g.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-subject", id, first.session);
+    const stopped = { ...fence, writers: "process_group_empty", outcome: { kind: "failed", exit_code: 1, stdout_tail: "", stderr_tail: "writer stopped" } };
+    await g.cmd({ kind: "stopped", ...stopped }, "stopped-subject", id, first.session);
+    await g.cmd({ kind: "finalize", ...stopped }, "finalize-subject", id, first.session);
+    await post("fixture/watchdog-release", { id });
+    // Budget exhausted on the SAME stopped attempt (the fixture preserves it).
+    expect(await post("fixture/budget-pile", { ids: [id] })).toEqual({ ok: true, stamped: 1 });
+    await post("fixture/attempt-diagnosis", {});
+    const original = (await post("get", { id })).meta.execution_diagnosis;
+    expect(original).toMatchObject({ generation: 1, hold: "retry_budget" });
+    const reservation = await reserve(g);
+    if (reservation.kind !== "reserved" || reservation.task_id !== original.duty) throw new Error(JSON.stringify(reservation));
+    expect((await g.cmd({ kind: "begin", attempt_id: "diagnostic", worker: g.auth.agent, action_budget_ms: 60_000 },
+      undefined, original.duty, reservation.session)).error).toBeUndefined();
+    // The receipt-backed close exits through the dispatch-gate exit (BR#17881),
+    // then an independent reviewer accepts the execution — the done write.
+    const submission = { ...g.worker, id: original.duty, to: "in_review", session: reservation.session,
+      execution_scope: { id: original.duty, generation: 1, attempt_id: "diagnostic" },
+      execution_result: { outcome: "Environment verified usable; the scheduler owns the next reservation", receipts: ["availability-probe-series-001", "availability-probe-series-002"] } };
+    const submitted = await post("transition", submission);
+    expect(submitted.status).toBe("in_review");
+    const terminal = { generation: 1, attempt_id: "diagnostic", writers: "process_group_empty", outcome: { kind: "completed", exit_code: 0, stdout_tail: "diagnosis submitted", stderr_tail: "" } };
+    await g.cmd({ kind: "stopped", ...terminal }, "stopped-diagnostic", original.duty, reservation.session);
+    await g.cmd({ kind: "finalize", ...terminal }, "finalize-diagnostic", original.duty, reservation.session);
+    const verify = String(submitted.verify_task);
+    const reviewClaim = await post("transition", { id: verify, to: "in_progress", actor: "diagnosis-reviewer", session: "diagnosis-reviewer" });
+    expect((await post("transition", { id: verify, to: "done", actor: "diagnosis-reviewer", session: "diagnosis-reviewer", review_result: {
+      kind: "accepted_execution", task_id: original.duty, subject_revision: reviewClaim.review_subject.revision,
+      receipts: ["Verified the availability probes recorded on the duty card"] } })).error).toBeUndefined();
+    // The stamp: the subject's durable execution record carries the accepted
+    // reconciliation, visible to the sweep.
+    const probe = await post("execution", { ...g.worker, id, command_id: "inspect-stamp-0001", command: { kind: "inspect" } });
+    expect(probe.attempt_diagnosis).toMatchObject({ generation: 1, attempt_id: fence.attempt_id, hold: "retry_budget", duty: original.duty });
+    expect(probe.recovery_permit).toBeNull();
+    // No session can self-stamp: the wire refuses the hub-authoritative kind.
+    expect((await post("execution", { ...g.worker, id, session: "attacker-session", command_id: "self-stamp-refused",
+      command: { kind: "diagnosis_accepted", generation: 1, attempt_id: fence.attempt_id, hold: "retry_budget", duty: original.duty, accepted_by: "attacker" } })).error)
+      .toMatch(/hub-authoritative/);
+    // The next sweep tick re-reads the SAME stopped attempt and must NOT
+    // re-arm: no new duty, the hold is not re-keyed.
+    await post("fixture/attempt-diagnosis", {});
+    const after = (await post("get", { id })).meta;
+    expect(after.execution_diagnosis).toEqual(original);
+    expect(after.recovery.task_id).toBe(original.duty);
+    // The scheduler wins the race it always lost: the subject is reserved
+    // within the tick and a fresh generation begins with no permit.
+    const resumed = await reserve(g);
+    expect(resumed).toMatchObject({ kind: "reserved", task_id: id });
+    expect(await g.cmd({ kind: "begin", attempt_id: "fresh-generation", worker: g.auth.agent, action_budget_ms: 60_000 },
+      "begin-resumed", id, (resumed as { session: string }).session)).toMatchObject({
+      generation: 2, attempt: { phase: "running" }, recovery_permit: null, attempt_diagnosis: { duty: original.duty },
+    });
+  });
   it("routes stopped attempts to diagnosis by the dispatch priority law, not age alone (BR#17649)", async () => {
     const project = "diagnosis-order", g = await gateway(project);
     const ordinary = await task(project);

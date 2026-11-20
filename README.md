@@ -838,7 +838,13 @@ removing or changing the scope does not restore legacy write access.
 - **Recovery continuity:** a still-open cause carries its attempt history and
   consumed retry budget across revisions. The new revision receives no inherited
   green verification credit. Code delivery, accepted review and live deployment
-  evidence remain separate facts.
+  evidence remain separate facts. When an independent reviewer accepts a
+  task-recovery duty's diagnosis of a stopped attempt, the reconciliation is
+  stamped into the subject's durable execution record (`attempt_diagnosis`,
+  naming the accepted duty) — the recovery sweep reads that stamp, not board
+  history, so an accepted chain never re-arms the same stopped attempt: the
+  budget hold clears and the scheduler's own reservation is the admissible
+  retry (BR#18198).
 - **Critical-path capacity:** repair, review and deployment-verification work
   sorts ahead of diagnostics. Diagnostics cannot take the last slot on a
   multi-slot gateway; single-slot gateways still execute serially.

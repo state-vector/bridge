@@ -299,6 +299,23 @@ export const ExecutionRetryStrategySchema = z.object({
   reason: text, source: z.enum(["executor", "independent_review"]),
 });
 
+/** BR#18198 — the durable reconciliation stamp an accepted task-recovery
+ * duty leaves on the subject's execution record. The recovery sweep's
+ * source of truth is THIS ledger field: an accepted duty chain that never
+ * reached the record re-arms forever (BR#17785 x8 — the same stopped
+ * attempt re-fenced seconds after every accepted diagnosis closed, while
+ * board history alone read as reconciled). Additive and defaulted: old
+ * journals parse unchanged, no policy-version bump. */
+export const AttemptDiagnosisSchema = z.object({
+  generation: z.number().int().positive(),
+  attempt_id: text,
+  hold: z.enum(["retry_budget", "unknown_operations"]),
+  duty: text,
+  accepted_by: text,
+  accepted_at: z.number().int().positive(),
+});
+export type AttemptDiagnosis = z.infer<typeof AttemptDiagnosisSchema>;
+
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -313,6 +330,7 @@ export const ExecutionStateSchema = z.object({
   budget_exhausted_at: z.number().int().nonnegative().default(0),
   failure_charged_generation: z.number().int().nonnegative().nullable().default(null),
   retry_strategy: ExecutionRetryStrategySchema.nullable().default(null),
+  attempt_diagnosis: AttemptDiagnosisSchema.nullable().default(null),
   recovery_permit: ExecutionRecoveryPermitSchema.nullable().default(null),
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
@@ -320,7 +338,7 @@ export const ExecutionStateSchema = z.object({
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -334,6 +352,8 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("recover_provider_failure"), terminal: TerminalReceiptSchema,
     proof: ProviderRecoveryProofSchema, diagnosis: recoveryPermitFields.diagnosis,
     continuation: text, evidence: z.array(text).min(1) }),
+  z.object({ kind: z.literal("diagnosis_accepted"), generation: z.number().int().positive(), attempt_id: text,
+    hold: AttemptDiagnosisSchema.shape.hold, duty: text, accepted_by: text }),
   z.object({ kind: z.literal("gateway_control"), host: text, mode: z.enum(["enabled", "draining"]), reason: text }),
   z.object({ kind: z.literal("gateway_failure"), reason: text, cooldown_ms: z.number().int().min(10_000).max(300_000) }),
   z.object({ kind: z.literal("pause_claims"), reason: text, budget_ms: z.number().int().min(10_000).max(300_000) }),
@@ -388,6 +408,32 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
   };
   switch (command.kind) {
     case "schedule": case "schedule_status": case "recover_provider_failure": case "provider_route_verified": case "gateway_control": case "gateway_failure": case "inspect": case "receipt": case "writer_receipt": case "availability": case "advertise": case "pause_claims": case "resume_claims": return s;
+    case "diagnosis_accepted": {
+      // BR#18198 — the hub-only reconciliation stamp. The execution wire
+      // refuses this kind outright, and the reducer accepts it only from
+      // the hub's internal write (session "") — a session command, gateway
+      // or writer, can never fabricate an acceptance into the durable
+      // record. The hub applies it inside an accepted task-recovery duty's
+      // own done write and from the diagnosis sweep's self-heal.
+      if (session)
+        throw new Error("gate: diagnosis acceptance is hub-authoritative — a session command can never self-stamp; the hub's own done write applies it");
+      // Gate 2 — the exact quiesced stopped attempt with matching terminal
+      // evidence: the same preconditions the accepted review verified.
+      if (!a || a.phase !== "quiesced" || a.generation !== command.generation || a.attempt_id !== command.attempt_id)
+        throw new Error("gate: diagnosis acceptance requires the exact quiesced stopped attempt");
+      if (!s.terminal || s.terminal.generation !== command.generation || s.terminal.attempt_id !== command.attempt_id)
+        throw new Error("gate: diagnosis acceptance requires matching terminal evidence for the stopped attempt");
+      // Gate 3 — resolved external operations.
+      if (s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown"))
+        throw new Error("gate: diagnosis acceptance requires reconciled external operations");
+      // Gate 4 — idempotence: an identical stamp is an acknowledged replay,
+      // not a second acceptance (BR#17785's eight duties share one attempt).
+      const prior = s.attempt_diagnosis;
+      if (prior && prior.generation === command.generation && prior.attempt_id === command.attempt_id) return s;
+      s.attempt_diagnosis = { generation: command.generation, attempt_id: command.attempt_id,
+        hold: command.hold, duty: command.duty, accepted_by: command.accepted_by, accepted_at: now };
+      break;
+    }
     case "start_failed": {
       if (a && a.phase !== "quiesced") throw new Error("gate: failed start cannot release an unquiesced writer");
       return s; // the authenticated coordinator owns the atomic task release
@@ -607,6 +653,18 @@ export function recoveryPermitCoversAttempt(state: ExecutionState, now: number):
     && !state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
 }
 
+/** BR#18198 — does an accepted durable diagnosis cover THIS stopped attempt?
+ * Coverage demands the same preconditions the acceptance itself verified:
+ * the exact quiesced attempt, its matching terminal receipt, and no
+ * unresolved external operations. A newer attempt invalidates the stamp. */
+export function attemptDiagnosisCoversAttempt(state: ExecutionState): boolean {
+  const d = state.attempt_diagnosis, a = state.attempt, t = state.terminal;
+  return !!d && !!a && a.phase === "quiesced"
+    && d.generation === a.generation && d.attempt_id === a.attempt_id
+    && !!t && t.generation === a.generation && t.attempt_id === a.attempt_id
+    && !state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
+}
+
 export function recoveryPermitMatches(state: ExecutionState, capability: Pick<ExecutorCapabilities,"backend"|"model"|"config_revision">, host: string, revision: string, now: number): boolean {
   const p = state.recovery_permit;
   return recoveryPermitCoversAttempt(state, now) && !!p && p.task_revision === revision
@@ -648,7 +706,14 @@ export function executionAdmissionHold(state: ExecutionState | undefined, revisi
   if (attempt && terminal && terminal.generation === attempt.generation && terminal.attempt_id === attempt.attempt_id
     && !(state.retry_strategy?.task_revision === revision && attempt.generation < state.retry_strategy.first_generation)
     && providerRecoveryDiagnosis(terminal.outcome) === "provider_route_unavailable") return "provider_route";
-  if (executionAttemptBudgetExhausted(state, revision)) return "retry_budget";
+  if (executionAttemptBudgetExhausted(state, revision)) {
+    // BR#18198 — a durable accepted diagnosis of THIS stopped attempt clears
+    // the budget hold: the scheduler's own reservation is the admissible
+    // retry, and re-fencing the same attempt loops recovery duties forever
+    // (BR#17785 x8, BR#17190 twin).
+    if (attemptDiagnosisCoversAttempt(state)) return null;
+    return "retry_budget";
+  }
   return null;
 }
 
