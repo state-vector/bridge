@@ -1336,16 +1336,11 @@ fn service_install() -> Result<(), String> {
     Ok(())
 }
 
-/// The jitter line, verbatim. Its quoting is load-bearing: BR#4899 shipped
-/// `awk 'BEGIN{srand();printf %.1f, rand()*7}'` — the UNQUOTED format string
-/// is an awk syntax error, `sleep` got no operand, and every start attempt
-/// died before the daemon launched (the fleet executor host crash-looped for
-/// hours). Three independent guards here:
-///   1. the awk format string is quoted ("%.1f");
-///   2. jitter failure degrades to no sleep (`|| true` on the whole line
-///      body), never a failed ExecStartPre;
-///   3. the systemd `-` prefix makes even that non-fatal.
-const EXEC_START_PRE_JITTER: &str = r#"ExecStartPre=-/bin/sh -c 'sleep "$(awk "BEGIN { srand(); printf \"%.1f\", rand()*7 }" 2>/dev/null)" || true'"#;
+/// Systemd unescapes the command before the shell sees it. Use integer jitter
+/// so there is no printf format string to quote or percent specifier to escape.
+/// The `:` prefix leaves variable expansion to the shell; `-` keeps this
+/// optional delay non-fatal. Never invoke sleep with a missing/invalid delay.
+const EXEC_START_PRE_JITTER: &str = r#"ExecStartPre=-:/bin/sh -c 'if delay=$(awk "BEGIN { srand(); print int(rand()*7) }" 2>/dev/null); then case "$delay" in [0-6]) exec sleep "$delay";; esac; fi'"#;
 
 /// The systemd user unit (BR#4682): Restart=always (clean exits are the
 /// silent-death class — the daemon quitting quietly froze the merge lane,
@@ -1536,12 +1531,10 @@ mod tests {
     }
 
     #[test]
-    fn unit_pins_restart_always_backoff_and_a_quoted_failsafe_jitter_br4682() {
+    fn unit_pins_restart_always_backoff_and_optional_jitter_br4682() {
         // BR#4682 / BR#4899: the supervisor must auto-restart on ANY exit
         // (clean exits are the BR#4431 silent-death class) with exponential
-        // backoff; the start jitter's awk format string MUST be quoted — the
-        // unquoted `printf %.1f` was an awk syntax error whose failed
-        // ExecStartPre killed every start attempt (host crash-looped hours).
+        // backoff and optional start jitter.
         let unit = render_unit(
             Path::new("/home/u/.local/bin/bridge"),
             "/home/u",
@@ -1563,25 +1556,7 @@ mod tests {
         ] {
             assert!(unit.contains(pin), "unit lost the pin `{pin}`:\n{unit}");
         }
-        // the jitter line: quoted format string + whole-line fail-safety +
-        // the systemd `-` prefix (three independent guards — jitter may
-        // skip, never block a start)
-        assert!(
-            EXEC_START_PRE_JITTER.starts_with("ExecStartPre=-"),
-            "jitter line must carry the non-fatal `-` prefix: {EXEC_START_PRE_JITTER}"
-        );
-        assert!(
-            EXEC_START_PRE_JITTER.contains("printf \\\"%.1f\\\""),
-            "awk format string must be quoted (BR#4899 root cause): {EXEC_START_PRE_JITTER}"
-        );
-        assert!(
-            !EXEC_START_PRE_JITTER.contains("printf %.1f"),
-            "UNQUOTED awk format string — the BR#4899 crash-loop defect is back: {EXEC_START_PRE_JITTER}"
-        );
-        assert!(
-            EXEC_START_PRE_JITTER.contains("|| true"),
-            "jitter must degrade to no sleep, never a failed ExecStartPre: {EXEC_START_PRE_JITTER}"
-        );
+        assert!(unit.lines().any(|line| line == EXEC_START_PRE_JITTER));
         // WorkingDirectory is the home specifier — NEVER the installer's cwd
         // (BR#4899: a scratch-dir install baked a soon-to-be-deleted path in)
         assert!(unit.contains("WorkingDirectory=%h"), "unit:\n{unit}");
@@ -1589,6 +1564,56 @@ mod tests {
             !unit.contains("WorkingDirectory=/"),
             "WorkingDirectory must not be an absolute baked path: \n{unit}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rendered_start_jitter_only_sleeps_with_a_valid_delay() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let unit = render_unit(
+            Path::new("/home/u/.local/bin/bridge"),
+            "/home/u",
+            "/usr/local/bin:/usr/bin",
+            Path::new("/home/u/bridge.log"),
+            Path::new("/home/u/.bridge/bridge-death-hook"),
+        );
+        let command = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStartPre=-:/bin/sh -c '"))
+            .and_then(|line| line.strip_suffix('\''))
+            .expect("non-fatal pre-start command with systemd variable expansion disabled");
+        // The single-quoted systemd argument must reach sh verbatim.
+        assert!(!command.contains(['\'', '\\', '%']));
+        let dir = tempfile::tempdir().unwrap();
+        let write_executable = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_executable("sleep", "#!/bin/sh\nprintf '<%s>' \"$@\"\n");
+        let run = |path| {
+            Command::new("/bin/sh")
+                .args(["-c", command])
+                .env("PATH", path)
+                .output()
+                .unwrap()
+        };
+        let real_path =
+            std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let output = run(real_path);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(matches!(output.stdout.as_slice(), [b'<', b'0'..=b'6', b'>']));
+
+        for awk in ["exit 0", "printf '7\\n'", "printf '2\\n'; exit 1"] {
+            write_executable("awk", format!("#!/bin/sh\n{awk}\n").as_str());
+            let output = run(dir.path().as_os_str().to_owned());
+            assert!(output.status.success(), "{awk}");
+            assert!(output.stdout.is_empty(), "sleep ran after: {awk}");
+            assert!(output.stderr.is_empty(), "{awk}");
+        }
     }
 
     #[test]

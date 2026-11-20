@@ -248,6 +248,11 @@ stop hook uses systemd's exit-code/status fields; its receipt alone does not
 identify the restart initiator. Existing hosts refresh the installed hook with
 `bridge service install` from a corrected binary; no service restart is required.
 
+Linux service startup jitter skips sleep if it can't compute a valid delay.
+If an older unit logs `sleep: invalid time interval ''`, run `bridge service
+install` from the updated binary and `systemctl --user daemon-reload`. No
+immediate restart is needed; a binary auto-update alone does not rewrite the unit.
+
 Linux runners can explicitly opt into automatic updates in config:
 `"auto_update": { "enabled": true, "channel": "main" }`. Absent/null config,
 `enabled: false`, and `pinned` leave automatic downloads and replacement off.
