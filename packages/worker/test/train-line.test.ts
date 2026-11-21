@@ -123,9 +123,22 @@ describe("one line status and recovery contract", () => {
     const line = projectTrainLine(facts({ queue: [{ id: "BR#3974" }], diagnostic: { ...task, id: "BR#6442" },
       queue_facts: { at: now, base_state: { verdict: "green" }, stalled: { last_error: "gh pr merge 2513 --merge: base branch policy prohibits the merge" } },
     }), now);
-    expect(line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge", remediation: { kind: "attention" } });
+    expect(line).toMatchObject({ blocker: "merge_failed", label: "Train could not complete a merge", remediation: { kind: "attention" } });
     expect(JSON.stringify(line)).not.toContain("BR#6442");
     expect(line.reason).not.toContain("gh pr merge");
+  });
+  it("names draft and review holds on a green live lane without masking independent work", () => {
+    const tip = "a".repeat(40);
+    const queue = [{ id: "BR#1", pr: 3665, at: now - 1 }, { id: "BR#2", pr: 3587, at: now - 1 }];
+    const q = { at: now, scan: { phase: "complete" }, candidates_observed: { at: now, base_sha: tip },
+      base_state: { verdict: "green", tip_sha: tip },
+      entries: [{ ...queue[0], cls: "waiting", pr_hold: "draft" }, { ...queue[1], cls: "waiting", pr_hold: "changes_requested" }] };
+    const input = { queue, starved: { since: 1 }, lease: { holder: "gateway", heartbeat_ts: now }, queue_facts: q };
+    expect(projectTrainLine(facts(input), now)).toMatchObject({ phase: "candidate_wait", health: "green",
+      blocker: "candidate_not_ready", reason: expect.stringContaining("PR #3665 is a draft; PR #3587 has changes requested") });
+    expect(projectTrainLine(facts({ ...input, queue: [...queue, { id: "BR#3", pr: 3, at: now }] }), now).blocker).toBe("no_progress");
+    expect(projectTrainLine(facts({ ...input, queue_facts: { ...q, stalled: { last_error: "True merge failure" } } }), now).blocker).toBe("merge_failed");
+    expect(projectTrainLine(facts({ ...input, stop: { kind: "base_red" } }), now).blocker).toBe("main_failed");
   });
   it("a scoped-green base waiting only for the drift check is pending, not a failing main", () => {
     const q = { at: now, base_state: { verdict: "green", red: [], unsettled: [], gate_blocked: true, gate_red: [], gate_unsettled: ["Deploy drift alarm"] } };

@@ -264,6 +264,7 @@ import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, priorityTask, recoveryReviewMeta, trainReviewParentJoin, selectionOrder, selectionEntry, bypassesWaiter, SELECTION_BYPASS_BOUND, type SelectionEntry } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
+import { currentTrainCandidateWaits, TrainPrHoldSchema } from "@bridge/contracts";
 import { TrainCheckRecovery } from "./train-check-recovery.ts";
 import {
   parseProxyCondition,
@@ -16582,6 +16583,7 @@ export class KnowledgeHub {
     // ones (the absent-entries preservation above).
     const entriesArr: any[] = entries ?? (Array.isArray(meta.lane?.queue_facts?.entries) ? meta.lane.queue_facts.entries : []);
     for (const entry of entriesArr) {
+      if (entry.pr_hold !== undefined) TrainPrHoldSchema.parse(entry.pr_hold);
       if (entry.bypass !== undefined) entry.bypass = RecoveryMergeGateSchema.parse(entry.bypass);
       if (entry.readiness !== undefined) entry.readiness = TrainCarReadinessSchema.parse(entry.readiness);
     }
@@ -18085,7 +18087,14 @@ export class KnowledgeHub {
     // waiting on this lane counts toward a machinery stall.
     const mergeRefTs = Math.max(oldestCarAt, lastMergeTs ?? 0);
     const mergeAge = now0 - mergeRefTs;
-    const mergeStarved = !meta.stop && mergeAge > TRAIN_MERGE_STARVE_MS;
+    const qf = meta.lane?.queue_facts;
+    const capableAt = Number(meta.lane?.last_capable_lease_ts ?? 0);
+    const executorLive = (capableAt > 0 && now0 - capableAt < TRAIN_READY_MS)
+      || (typeof meta.lease?.heartbeat_ts === "number" && now0 - meta.lease.heartbeat_ts < 5 * 60_000);
+    const knownWaits = executorLive && !awaiting.length && !meta.currently && !qf?.stalled
+      ? currentTrainCandidateWaits(queue, qf, now0) : null;
+    const onlyCandidateHolds = knownWaits?.every(reason => reason === "draft" || reason === "changes_requested");
+    const mergeStarved = !meta.stop && !onlyCandidateHolds && mergeAge > TRAIN_MERGE_STARVE_MS;
 
     if (mergeStarved) {
       const existingEp = meta.lane?.starvation ?? meta.starvation ?? null;
@@ -19135,7 +19144,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       return line;
     }
     if (line.phase === "idle" || line.phase === "ready" || line.phase === "retired" || line.phase === "working") return line;
-    if (line.blocker === "candidate_conflict") return line; // sweepConflictingCars owns candidate repair
+    if (line.phase === "candidate_wait") return line; // expected PR gate, not an executor incident
     const inactiveRepair = line.blocker === "main_failed" && line.remediation?.kind === "queued"
       && line.remediation.task.status === "in_progress" && !line.remediation.task.active_agent;
     if (line.remediation?.kind !== "attention" && !inactiveRepair) return line;
@@ -20052,14 +20061,16 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
           const skippedByWalk = walkCompletedWithoutBounce && cls === "" && (!qCardRow || Number(qCardRow.status_ts ?? 0) <= qfAt);
           if (cls === "conflict" || cls === "blocked" || skippedByWalk) {
             inProgress++;
-          } else if (cls === "needs-review") {
+          } else if (cls === "needs-review" || fact?.pr_hold === "draft" || fact?.pr_hold === "changes_requested") {
             batchCandidates.push({
               id: q.id,
               ...(q.pr ? { pr: q.pr } : {}),
               ...(q.bounces != null ? { bounces: q.bounces } : {}),
               ...(q.over_budget ? { over_budget: true } : {}),
               state: "waiting",
-              detail: "waiting to be verified — needs a fresh review",
+              detail: fact?.pr_hold === "draft" ? "Draft — not eligible to merge"
+                : fact?.pr_hold === "changes_requested" ? "Changes requested — resolve and obtain review"
+                : "waiting to be verified — needs a fresh review",
             });
           } else {
             // Keep accepted cars in the backlog; only a fresh executor

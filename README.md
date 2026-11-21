@@ -100,6 +100,9 @@ while Bridge schedules its repair. Gateway retries do not add another bounce
 or extend the repair deadline, and independent candidates can still advance.
 When a fresh scan confirms every queued PR conflicts with green main, the
 lane shows **Queued PRs need a rebase**, not a merge machinery outage.
+Draft PRs and PRs with changes requested don’t block other eligible work.
+If no queued PR is eligible for these reasons, the train names the blocked PRs
+and keeps checking, without declaring a line failure.
 
 From a registered checkout with dependencies installed and `wrangler whoami`
 authenticated, capture live traffic with:

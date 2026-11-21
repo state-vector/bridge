@@ -2,7 +2,7 @@ import { z } from "zod";
 import { BaseRedResolutionSchema, DeployCoverageStateSchema, TrainFixCardSchema } from "./train.ts";
 import type { TrainFixCard } from "./train.ts";
 import { RecoveryEpisodeSchema, recoveryIsOpen, type RecoveryRepairScope } from "./train-recovery.ts";
-import { TrainQueueScanSchema } from "./train-scan.ts";
+import { TrainPrHoldSchema, TrainQueueScanSchema } from "./train-scan.ts";
 
 /** Runner stream messages prove liveness, not a structured progress report.
  * Keep their raw output available in details, without advertising fragments
@@ -55,10 +55,9 @@ export function taskRemediation(task: TrainFixCard): LineRemediation {
 }
 const lineErrorLabels = {
   deploy_missing: "Deployment has not started",
-  merge_failed: "Queued PRs cannot merge",
+  merge_failed: "Train could not complete a merge",
   no_progress: "Merge machinery stalled",
   no_executor: "No executor is active",
-  candidate_conflict: "Queued PRs need a rebase",
 } as const;
 type LineError = keyof typeof lineErrorLabels;
 
@@ -96,6 +95,8 @@ export const TrainLineProjectionSchema = z.discriminatedUnion("phase", [
   LineFields.extend({ phase: z.literal("idle"), label: z.literal("idle"), blocker: z.null(), remediation: z.null() }),
   LineFields.extend({ phase: z.literal("ready"), label: z.literal("ready"), blocker: z.null(), remediation: z.null() }),
   LineFields.extend({ phase: z.literal("retired"), label: z.literal("retired"), blocker: z.null(), remediation: z.null() }),
+  LineFields.extend({ phase: z.literal("candidate_wait"), label: z.enum(["Waiting on queued PRs", "Queued PRs need a rebase"]),
+    blocker: z.enum(["candidate_not_ready", "candidate_conflict"]), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("working"), label: z.enum(["Merging changes", "Checking queued changes"]), blocker: z.null(), remediation: LineRemediationSchema.nullable() }),
   LineFields.extend({ phase: z.literal("waiting"), label: z.enum([
     "Verifying current main", "Waiting for required checks", "Build and deployment running",
@@ -107,7 +108,7 @@ export const TrainLineProjectionSchema = z.discriminatedUnion("phase", [
     "Fix merged — verifying deployment", "Merge response received — checking GitHub",
   ]), blocker: z.literal("main_failed"), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("error"), label: z.enum(Object.values(lineErrorLabels)),
-    blocker: z.enum(["deploy_missing", "merge_failed", "no_progress", "no_executor", "candidate_conflict"]), remediation: LineRemediationSchema }),
+    blocker: z.enum(["deploy_missing", "merge_failed", "no_progress", "no_executor"]), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("action_required"), label: z.literal("Your action is needed"),
     blocker: z.literal("human_action"), remediation: LineRemediationSchema }),
   LineFields.extend({ phase: z.literal("unknown"), label: z.enum([
@@ -159,7 +160,8 @@ export const TrainLineFactsSchema = z.object({
   capable: z.object({ holder: z.string(), at: z.number(), ready: z.boolean() }).nullable().optional(),
   queue_facts: z.object({
     at: z.number(),
-    entries: z.array(z.object({ id: z.string(), pr: z.number().int().positive().nullish(), cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]) })).optional(),
+    entries: z.array(z.object({ id: z.string(), pr: z.number().int().positive().nullish(),
+      cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]), pr_hold: TrainPrHoldSchema.optional() })).optional(),
     candidates_observed: z.object({ at: z.number(), base_sha: z.string().min(1) }).optional(),
     scan: TrainQueueScanSchema.optional(),
     base_observed_at: z.number().optional(),
@@ -194,6 +196,21 @@ export type TrainLineFacts = z.infer<typeof TrainLineFactsSchema>;
  * use their original publication time until the next hub mutation migrates it. */
 export function trainBaseObservedAt(q: { at?: number; base_observed_at?: number } | null | undefined): number {
   return q?.base_observed_at ?? q?.at ?? 0;
+}
+
+/** A lease or a base-only heartbeat cannot refresh evidence about a PR. */
+export function currentTrainCandidateWaits(queue: TrainLineFacts["queue"], q: TrainLineFacts["queue_facts"], now: number) {
+  const observation = q?.candidates_observed;
+  if (!queue.length || q?.scan?.phase !== "complete" || q.base_state?.verdict !== "green"
+    || !observation || observation.base_sha !== q.base_state.tip_sha || now - observation.at >= 15 * 60_000
+    || trainBaseObservedAt(q) <= 0 || now - trainBaseObservedAt(q) >= 15 * 60_000) return null;
+  const entries = new Map(q.entries?.map(entry => [entry.id, entry]));
+  return queue.map(car => {
+    const entry = entries.get(car.id);
+    if (car.pr == null || car.at == null || car.at > observation.at || entry?.pr !== car.pr) return null;
+    if (car.conflict_park === true && entry.cls === "conflict") return "conflict" as const;
+    return entry.cls === "waiting" ? entry.pr_hold ?? null : null;
+  });
 }
 
 /** Total, pure presentation reducer. This is the only precedence law for the
@@ -300,23 +317,28 @@ export function projectTrainLine(f: TrainLineFacts, now: number): TrainLineProje
       : { kind: "attention", text: "Bridge must repair the rejected merge. No bypass-merge request has been issued for this failure." });
   const executorLive = !!(f.lease && now - f.lease.heartbeat_ts < 5 * 60_000)
     || !!(f.capable?.ready && now - f.capable.at < 15 * 60_000);
-  const observation = q?.candidates_observed;
-  if (fresh && bs?.verdict === "green" && executorLive && !f.currently && q?.scan?.phase === "complete"
-    && observation && observation.base_sha === bs.tip_sha && now - observation.at < 15 * 60_000 && f.queue.length) {
-    const entries = new Map(q.entries?.map(entry => [entry.id, entry]));
-    const allConflicting = f.queue.every(car => {
-      const entry = entries.get(car.id);
-      return car.conflict_park === true && car.pr != null && car.at != null && car.at <= observation.at
-        && entry?.pr === car.pr && entry.cls === "conflict";
-    });
-    if (allConflicting) {
+  const blockers = executorLive && !f.currently ? currentTrainCandidateWaits(f.queue, q, now) : null;
+  if (blockers) {
+    if (blockers.every(reason => reason === "conflict")) {
       const numbers = f.queue.slice(0, 3).map(car => `#${car.pr}`).join(", ");
       const prs = `${numbers}${f.queue.length > 3 ? ` and ${f.queue.length - 3} more` : ""}`;
       const repair = f.conflict_repair;
-      return error("candidate_conflict", `Main's required checks are green. ${f.queue.length === 1 ? "PR" : "PRs"} ${prs} must be rebased before merging.`,
+      return make("candidate_wait", "Queued PRs need a rebase",
+        `Main's required checks are green. ${f.queue.length === 1 ? "PR" : "PRs"} ${prs} must be rebased before merging.`,
+        "candidate_conflict", [],
         repair && !["done", "superseded"].includes(repair.status)
           ? taskRemediation(repair)
           : { kind: "machine", text: "Bridge owns conflict recovery: resolve and push a signed rebase, then verify the new head.", url: null });
+    }
+    if (blockers.every(reason => reason !== null)) {
+      const details = f.queue.slice(0, 3).map((car, i) => `PR #${car.pr} ${
+        blockers[i] === "draft" ? "is a draft" : blockers[i] === "changes_requested" ? "has changes requested" : "needs a rebase"}`);
+      if (f.queue.length > 3) details.push(`${f.queue.length - 3} more ${f.queue.length === 4 ? "PR is" : "PRs are"} not ready`);
+      return make("candidate_wait", "Waiting on queued PRs",
+        `Main is green. No queued PR is eligible: ${details.join("; ")}.`,
+        "candidate_not_ready", [], { kind: "machine",
+          text: "Bridge keeps checking for eligible work. Drafts need to be marked ready when the work is ready; requested changes need to be resolved and reviewed.",
+          url: null });
     }
   }
   if (f.starved) {

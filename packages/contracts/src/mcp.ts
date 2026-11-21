@@ -19,7 +19,7 @@ import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema, UnblockResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
-import { TrainQueueScanSchema } from "./train-scan.ts";
+import { TrainPrHoldSchema, TrainQueueScanSchema } from "./train-scan.ts";
 import { RecoveryCommandSchema } from "./train-recovery.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema, CandidateIntegrationSchema } from "./train-checks.ts";
 import { ExecutionRequestSchema, HandoffReadSchema, HandoffAcceptSchema, HandoffCheckpointSchema } from "./execution.ts";
@@ -364,6 +364,7 @@ export const TOOL_ARG_SCHEMAS = {
       id: z.string(),
       pr: z.number().int().optional(),
       cls: z.enum(["ready", "waiting", "conflict", "needs-review", "blocked"]),
+      pr_hold: TrainPrHoldSchema.optional(),
       repair: CandidateRepairSchema.optional(),
       integration: CandidateIntegrationSchema.optional(),
     })).optional(),

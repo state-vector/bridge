@@ -742,7 +742,7 @@ impl Ctx {
             "--repo",
             repo,
             "--json",
-            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,mergedAt,baseRefName,isDraft",
+            "number,headRefOid,mergeable,mergeStateStatus,state,mergeCommit,mergedAt,baseRefName,isDraft,reviewDecision",
         ])?;
         let norm_mergeable = normalize_gh_mergeable(raw.get("mergeable").unwrap_or(&Value::Null));
         let norm_state = normalize_gh_merge_state(raw.get("mergeStateStatus").unwrap_or(&Value::Null));
@@ -2049,12 +2049,27 @@ struct BatchCandidate {
 enum MergeCommandResult {
     ObservedMerged,
     KnownRefusal(String),
+    Held(PrHold),
 }
 
-impl MergeCommandResult {
-    fn into_result(self) -> Result<String, String> {
-        match self { Self::ObservedMerged => Ok(String::new()), Self::KnownRefusal(reason) => Err(reason) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrHold { Draft, ChangesRequested }
+
+impl PrHold {
+    fn as_str(self) -> &'static str {
+        match self { Self::Draft => "draft", Self::ChangesRequested => "changes_requested" }
     }
+}
+
+fn pr_hold(facts: &Value) -> Option<PrHold> {
+    if vstr(facts, "state") != Some("OPEN") { return None; }
+    if facts["isDraft"].as_bool() == Some(true) { return Some(PrHold::Draft); }
+    if vstr(facts, "reviewDecision") == Some("CHANGES_REQUESTED") { return Some(PrHold::ChangesRequested); }
+    None
+}
+
+fn pr_hold_fact(id: &str, pr: i64, hold: PrHold) -> Value {
+    json!({ "id": id, "pr": pr, "cls": "waiting", "pr_hold": hold.as_str() })
 }
 
 fn reconcile_merge_command(ctx: &Ctx, repo: &str, pr: i64, head: &str,
@@ -2068,7 +2083,8 @@ fn reconcile_merge_command(ctx: &Ctx, repo: &str, pr: i64, head: &str,
         return Ok(MergeCommandResult::ObservedMerged);
     }
     match attempted {
-        Err(reason) if vstr(&facts, "state") == Some("OPEN") => Ok(MergeCommandResult::KnownRefusal(reason)),
+        Err(reason) if vstr(&facts, "state") == Some("OPEN") => Ok(pr_hold(&facts)
+            .map(MergeCommandResult::Held).unwrap_or(MergeCommandResult::KnownRefusal(reason))),
         _ => Err(format!("PR #{pr} has no confirmed merge result; no more writes this pass")),
     }
 }
@@ -2099,7 +2115,7 @@ fn request_branch_update(ctx: &mut Ctx, repo: &str, base: &str, pr: i64, head: &
     }
     let live = ctx.pr_facts(repo, pr)?;
     if vstr(&live, "state") != Some("OPEN") || vstr(&live, "baseRefName") != Some(base)
-        || vstr(&live, "headRefOid") != Some(head) || live["isDraft"].as_bool() == Some(true) {
+        || vstr(&live, "headRefOid") != Some(head) || pr_hold(&live).is_some() {
         return Err(format!("PR #{pr} changed before branch preparation"));
     }
     ctx.note(&format!("Preparing PR #{pr} for the next batch — updating against {base}"));
@@ -2139,6 +2155,7 @@ fn integrate_after_strict_refusal(ctx: &mut Ctx, repo: &str, base: &str, cand: &
 
 enum BatchCandidateReadiness {
     Ready,
+    Held(PrHold),
     Recomputing(String),
     Deferred(String),
 }
@@ -2197,6 +2214,9 @@ fn candidate_ready_to_land(ctx: &mut Ctx, repo: &str, base: &str, cand: &BatchCa
     }
     if vstr(&facts, "baseRefName").is_some_and(|current| current != base) {
         return Ok(Deferred("the PR now targets a different base branch".into()));
+    }
+    if let Some(hold) = pr_hold(&facts) {
+        return Ok(BatchCandidateReadiness::Held(hold));
     }
     let CheckRunRead::Complete(mut checks) = ctx.read_check_runs(repo, &cand.head_sha) else {
         return Err("GitHub did not return complete candidate check and workflow evidence".into());
@@ -2870,6 +2890,9 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 ctx.note(&format!("PR #{bpr}: waiting to observe the owner's exact-head merge; DONE grants no automatic bypass"));
                 return Ok(());
             }
+            Ok((_, _, _)) if facts.as_ref().ok().and_then(pr_hold).is_some() => {
+                log(Some(key), &format!("bypass: PR #{bpr} is not ready for review/merge; leaving it untouched"));
+            }
             Ok((_, _, head_sha)) => {
                 // BR#6390 DONE grace: the human clicked DONE ("I merged it") —
                 // GitHub may lag the click by seconds, or the click landed a
@@ -3539,6 +3562,11 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             log(Some(key), &format!("reconcile: PR #{pr} was already merged — stamped, continuing walk"));
             return Ok(());
         }
+        if let Some(hold) = pr_hold(&facts) {
+            qfacts.push(pr_hold_fact(&head_id, pr, hold));
+            log(Some(key), &format!("PR #{pr}: {}; checking other changes", hold.as_str()));
+            return Ok(());
+        }
         // An unanswered mergeability check is a wait, never a conflict.
         // Leave it until the next pass instead of sleeping ahead of ready work.
         if vstr(&facts, "state") == Some("OPEN") && !mergeability_definitive(&facts) {
@@ -4142,6 +4170,10 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         if !conflict_pairs_prs.is_empty() {
             qf.as_object_mut().unwrap().insert("conflict_pairs".into(), json!(conflict_pairs_prs));
         }
+        if ctx.stall.get(key).is_some_and(|st| !st.members.is_empty() && st.members.iter().all(|pr|
+            qfacts.iter().any(|entry| entry["pr"].as_i64() == Some(*pr) && entry.get("pr_hold").is_some()))) {
+            ctx.stall.remove(key);
+        }
         if let Some(st) = ctx.stall.get(key) {
             qf.as_object_mut().unwrap().insert(
                 "stalled".into(),
@@ -4280,8 +4312,29 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             }
         }
         ctx.operation_deadline = None;
+        let publish_hold = |ctx: &mut Ctx, qfacts: &mut Vec<Value>, hold: PrHold| -> Result<(), String> {
+            if let Some(entry) = qfacts.iter_mut().find(|entry| entry["id"].as_str() == Some(head_id)) {
+                *entry = pr_hold_fact(head_id, pr, hold);
+            }
+            log(Some(key), &format!("PR #{pr}: {}; continuing batch", hold.as_str()));
+            // Keep the prior scan's base and completeness fence; the late
+            // observation refines this member, not the whole batch.
+            let mut update = json!({ "repo": repo, "base": base,
+                "entries": qfacts, "base_state": base_state, "scan": scan });
+            if let Some(st) = ctx.stall.get(key).filter(|st| st.members.iter().any(|member|
+                !qfacts.iter().any(|entry| entry["pr"].as_i64() == Some(*member) && entry.get("pr_hold").is_some()))) {
+                update["stalled"] = json!({ "batch": st.members, "ticks": st.ticks, "since": st.since_ms,
+                    "for_ms": now_ms().saturating_sub(st.since_ms), "last_error": st.last_error });
+            }
+            ctx.mcp("train_queue_facts", update)?;
+            Ok(())
+        };
         match ready {
             Ok(BatchCandidateReadiness::Ready) => {},
+            Ok(BatchCandidateReadiness::Held(hold)) => {
+                publish_hold(ctx, &mut qfacts, hold)?;
+                continue;
+            }
             Ok(BatchCandidateReadiness::Deferred(reason) | BatchCandidateReadiness::Recomputing(reason)) => {
                 log(Some(key), &format!("PR #{pr}: {} — leaving it for a fresh check and continuing other changes", trunc(&reason, 240)));
                 continue;
@@ -4329,12 +4382,26 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             Some(m) => method_flag_for(m),
             None => method_flag_for(&ctx.method),
         };
+        let prior_attempted = ctx.tick_attempted;
         ctx.tick_attempted = true;
+        macro_rules! merge_result {
+            ($attempt:expr) => {
+                match reconcile_merge_command(ctx, repo, pr, head_sha, $attempt)? {
+                    MergeCommandResult::ObservedMerged => Ok(()),
+                    MergeCommandResult::KnownRefusal(reason) => Err(reason),
+                    MergeCommandResult::Held(hold) => {
+                        ctx.tick_attempted = prior_attempted;
+                        publish_hold(ctx, &mut qfacts, hold)?;
+                        continue 'batch;
+                    }
+                }
+            };
+        }
         let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
-        let mut merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
+        let mut merge_res = merge_result!(attempted);
         if merge_res.is_err() && cand.root_fix {
             let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--admin", "--match-head-commit", head_sha]);
-            merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
+            merge_res = merge_result!(attempted);
         }
         if pass_merged > 0 {
             for wait_secs in [3u64, 5, 8] {
@@ -4354,7 +4421,7 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                 std::thread::sleep(Duration::from_secs(wait_secs));
                 renew_lease(ctx, repo, base);
                 let attempted = ctx.sh("gh", &["pr", "merge", &pr.to_string(), "--repo", repo, method_flag, "--match-head-commit", head_sha]);
-                merge_res = reconcile_merge_command(ctx, repo, pr, head_sha, attempted)?.into_result();
+                merge_res = merge_result!(attempted);
             }
         }
         if let Err(err) = merge_res {
@@ -4662,7 +4729,7 @@ fn prepare_next_batch(ctx: &mut Ctx, key: &str, repo: &str, base: &str, lane: &V
             continue;
         };
         if vstr(&facts, "state") != Some("OPEN") || vstr(&facts, "baseRefName") != Some(base)
-            || facts["isDraft"].as_bool() == Some(true) {
+            || pr_hold(&facts).is_some() {
             continue;
         }
         let head_sha = vstr(&facts, "headRefOid").unwrap_or("").to_lowercase();
@@ -8423,7 +8490,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_candidate_survives_an_unrelated_task_lookup_failure_br7736() {
+    fn ready_candidate_survives_draft_review_hold_and_unrelated_lookup_failure() {
         let repo = Repo::new("unrelated-read-failure");
         let current = repo.side_commit("ready", "reviewed change");
         repo.git(&["push", "-q", "origin", "HEAD:refs/pull/2/head"]);
@@ -8434,6 +8501,10 @@ mod tests {
         } });
         let (hub, calls) = mock_hub_with(move |params| match call_name(params).as_str() {
             "get_artefact" if call_args(params)["id"] == "BR#2" => Ok(card.clone()),
+            "get_artefact" if matches!(call_args(params)["id"].as_str(), Some("BR#4" | "BR#5")) => {
+                let pr = if call_args(params)["id"] == "BR#4" { 4 } else { 5 };
+                Ok(json!({ "status": "blocked", "meta": { "prs": [{"repo":"o/r", "number":pr}] } }))
+            }
             "get_artefact" => Err("unrelated task lookup timed out".into()),
             "train_history" => Ok(json!({"events":[]})),
             "train_ci" => Ok(json!({"decided":"pending"})),
@@ -8453,6 +8524,11 @@ mod tests {
                     merged_c.store(true, Ordering::SeqCst);
                     return Some(Ok(String::new()));
                 }
+                if matches!(args[2], "4" | "5") {
+                    return Some(Ok(json!({"state":"OPEN", "headRefOid":current, "mergeable":"MERGEABLE",
+                        "mergeStateStatus":"CLEAN", "isDraft":args[2] == "4",
+                        "reviewDecision":if args[2] == "5" { "CHANGES_REQUESTED" } else { "" }}).to_string()));
+                }
                 let done = merged_c.load(Ordering::SeqCst);
                 return Some(Ok(json!({ "state": if done { "MERGED" } else { "OPEN" },
                     "headRefOid": current, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
@@ -8469,13 +8545,35 @@ mod tests {
             panic!("unexpected gh command {args:?}");
         }));
         let result = drive_lane_inner(&mut ctx,
-            &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#2" }, { "id": "BR#3" }] }),
+            &json!({ "required_workflows": ["Test"], "queue": [{ "id": "BR#4" }, { "id": "BR#5" }, { "id": "BR#2" }, { "id": "BR#3" }] }),
             "o/r@main", "o/r", "main", 60_000, 10);
         assert!(result.is_ok(), "unrelated task read discarded a ready PR: {result:?}");
         assert!(merged.load(Ordering::SeqCst), "ready PR must merge despite a later lookup failure");
         let calls = calls.lock().unwrap();
         assert!(calls.iter().any(|c| call_name(c) == "train_event" && call_args(c)["kind"] == "merged"));
         assert!(calls.iter().any(|c| call_name(c) == "train_ci"), "the merged batch still owes its deployment checks");
+        assert!(calls.iter().filter(|c| call_name(c) == "train_queue_facts").any(|c| {
+            let facts = call_args(c);
+            facts["entries"].as_array().is_some_and(|entries|
+                entries.contains(&pr_hold_fact("BR#4", 4, PrHold::Draft)) &&
+                entries.contains(&pr_hold_fact("BR#5", 5, PrHold::ChangesRequested)))
+        }));
+    }
+
+    #[test]
+    fn draft_race_after_write_gate_is_not_a_merge_failure() {
+        let head = "a".repeat(40);
+        let mut ctx = test_ctx("http://unused");
+        let reported_head = head.clone();
+        ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+            assert_eq!(cmd, "gh");
+            assert_eq!(&args[..2], &["pr", "view"]);
+            Some(Ok(json!({"state":"OPEN", "headRefOid":reported_head, "isDraft":true}).to_string()))
+        }));
+        assert!(matches!(reconcile_merge_command(&ctx, "o/r", 4, &head, Err("merge refused".into())),
+            Ok(MergeCommandResult::Held(PrHold::Draft))));
+        assert!(reconcile_merge_command(&ctx, "o/r", 4, &"b".repeat(40), Err("merge refused".into())).is_err(),
+            "a readback for another head cannot clear an ambiguous merge attempt");
     }
 
     #[test]

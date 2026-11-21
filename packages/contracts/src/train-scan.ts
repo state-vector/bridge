@@ -7,3 +7,6 @@ export const TrainQueueScanSchema = z.discriminatedUnion("phase", [
   z.object({ phase: z.literal("checking"), after_id: z.string().min(1) }),
 ]);
 export type TrainQueueScan = z.infer<typeof TrainQueueScanSchema>;
+
+export const TrainPrHoldSchema = z.enum(["draft", "changes_requested"]);
+export type TrainPrHold = z.infer<typeof TrainPrHoldSchema>;

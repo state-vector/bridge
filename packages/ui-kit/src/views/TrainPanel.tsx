@@ -14,7 +14,7 @@ function age(ts: number | undefined, now: number): string {
 
 export const trainLineTones: Record<TrainLineProjection["phase"], ChipTone> = {
   idle: "muted", ready: "ok", working: "live", waiting: "warn", base_red: "err",
-  error: "err", unknown: "warn", action_required: "warn", retired: "muted",
+  error: "err", unknown: "warn", action_required: "warn", candidate_wait: "warn", retired: "muted",
 };
 const unavailable: TrainLineProjection = {
   phase: "unknown", label: "Status unavailable", reason: "The server has not supplied a current line status.",
@@ -344,7 +344,7 @@ export function TrainPanelView({ lanes, error, now, openTask }: {
           {l.currently?.pr && <a className="train-pr" href={`https://github.com/${repo}/pull/${l.currently.pr}`} target="_blank" rel="noreferrer">#{l.currently.pr}</a>}
         </span>
         <span className="trainc-prog top-num">{progress}</span>
-        <span className="trainc-msg">{line.remediation?.text ?? line.reason}
+        <span className="trainc-msg">{line.phase === "candidate_wait" ? line.reason : line.remediation?.text ?? line.reason}
           {(l.execution_holds ?? []).map(hold => <span key={`${hold.task_id}-${hold.pr}`} title={hold.reason}>
             <TaskLink id={hold.task_id} url={hold.task_url} openTask={openTask}>
               PR #{hold.pr} {hold.kind === "local_handoff" ? "waiting for local handoff" : "waiting for executor capability"}

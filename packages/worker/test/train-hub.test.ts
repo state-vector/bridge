@@ -4186,7 +4186,7 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN STALLED: ") && String(x.title).includes(`${repo}@main`));
     expect(ask).toBeUndefined();
     expect(sr.ask ?? null).toBeNull();
-    expect(lane.line).toMatchObject({ blocker: "merge_failed", label: "Queued PRs cannot merge" });
+    expect(lane.line).toMatchObject({ blocker: "merge_failed", label: "Train could not complete a merge" });
     expect(lane.line.remediation.task.id).not.toBe(staleDiagnostic.body.id);
     const repair = lane.line.remediation.task.id;
     expect((await kbJson("/get", { id: repair })).body.meta.machine_duty).toMatchObject({
@@ -4445,6 +4445,33 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     const lane3 = await laneSnap(repo);
     expect(lane3.reason).toContain("carries none of the lane's required workflow runs (config?)");
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-p1" });
+  });
+
+  it("does not start lane recovery for a long queue containing only individually held PRs", async () => {
+    const repo = "state-vector/lane-pr-holds", actor = "gw-pr-holds";
+    await acquire(repo, actor, { merge_capable: true, required_workflows: ["Test"] });
+    const entries = [];
+    for (const [pr, pr_hold] of [[3665, "draft"], [3587, "changes_requested"]] as const) {
+      const id = await queueViaAccept({ repo, pr, head: "a".repeat(40) });
+      const card = (await kbJson("/get", { id })).body;
+      expect((await kbJson("/update", { id, meta: { merge_train: {
+        ...card.meta.merge_train, at: Date.now() - 2 * 3_600_000,
+      } } })).body.error).toBeUndefined();
+      entries.push({ id, pr, cls: "waiting", pr_hold });
+    }
+    const stamp = { repo, actor, scan: { phase: "complete" },
+      base_state: { verdict: "green", tip_sha: "b".repeat(40), red: [], unsettled: [] } };
+    expect((await kbJson("/train.queue_facts", { ...stamp, entries })).body.error).toBeUndefined();
+    const held = await laneSnap(repo);
+    expect(held.starved).toBeNull();
+    expect(held.line).toMatchObject({ phase: "candidate_wait", health: "green",
+      reason: expect.stringContaining("#3665 is a draft; PR #3587 has changes requested") });
+    expect(held.pr_stats.ready).toBe(0);
+    expect(held.pr_stats.waiting).toBe(2);
+    expect((await kbJson("/train.queue_facts", { ...stamp, entries: [entries[0], {
+      id: entries[1].id, pr: entries[1].pr, cls: "ready",
+    }] })).body.error).toBeUndefined();
+    expect((await laneSnap(repo)).line.blocker).toBe("no_progress");
   });
 
   it("P4 merge-starvation alarm: non-empty queue (or awaiting) + now-last_merge_ts > 1h + no stop-the-line fires ONE ask with full diagnosis (incl. P1 alarm) + spawns ONE diagnostic duty (tags merge-train/diagnostic, ranked #1 in orient), stamps starvation={since,fired_at,ask_id,duty_id}, and clears on any merge", async () => {
