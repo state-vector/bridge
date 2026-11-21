@@ -252,7 +252,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -7232,6 +7232,59 @@ export class KnowledgeHub {
       LIMIT 1`, "schedule:" + tokenId, session, taskId, project, revision);
   }
 
+  /** The caller owns the same transaction as the transport receipt or review verdict.
+   * Both sources use the attempt's identity so a later finalization cannot spend
+   * a second observation from a review that has already supplied one. */
+  private recordManagedReviewObservation(id: string, attempt: ExecutionAttempt, project: string, observed: number,
+    now: number, source: "execution" | "review-verdict") {
+    const executor = attempt.executor;
+    if (executor?.backend !== "opencode") return;
+    const fence = `${id}:${attempt.generation}:${attempt.attempt_id}`;
+    const responseReceipt = `${source}:${fence}`;
+    const parsed = ManagedReviewRouteProofSchema.safeParse({
+      id: `execution:${fence}`, host: attempt.host, backend: executor.backend, model: executor.model,
+      config_revision: executor.config_revision, observed_at: observed,
+      result: { kind: "succeeded", response_receipt: responseReceipt }, receipts: [responseReceipt],
+      witness: { kind: "managed_review_prompt", project, tier: executor.tier, assignment: "reserved_review_v1" },
+    });
+    if (!parsed.success) return;
+    const proof = parsed.data;
+    this.state.storage.sql.exec(`DELETE FROM managed_review_route_success WHERE host=? AND observed_at<=?`, proof.host, now - 300_000);
+    this.state.storage.sql.exec(
+      `INSERT INTO managed_review_route_success(host,model,config_revision,project,tier,observed_at,proof) VALUES(?,?,?,?,?,?,?)
+       ON CONFLICT(host,model,config_revision,project,tier) DO UPDATE SET observed_at=excluded.observed_at, proof=excluded.proof
+       WHERE json_extract(managed_review_route_success.proof,'$.witness.assignment') IS NOT 'reserved_review_v1'
+          OR excluded.observed_at > managed_review_route_success.observed_at`,
+      proof.host, proof.model, proof.config_revision, proof.witness.project, proof.witness.tier, observed, JSON.stringify(proof),
+    );
+  }
+
+  /** Receipt for a typed verdict from the still-live worker. This alone
+   * says nothing about the provider's response time. The originating runner
+   * must also preserve a genuine parent ACP observation at teardown. */
+  private observeManagedReviewVerdict(id: string, revision: string, body: Record<string, unknown>) {
+    const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | undefined;
+    if (scope?.id !== id || !body.token_id) return;
+    const binding = this.one(`SELECT e.state,a.meta,a.project
+      FROM execution_state e JOIN artefacts a ON a.id=e.task_id
+      WHERE e.task_id=? AND e.worker_token_id=? AND a.status='in_progress'`, id, body.token_id);
+    if (!binding) return;
+    const state = ExecutionStateSchema.parse(JSON.parse(String(binding.state)));
+    const attempt = state.attempt;
+    const claim = JSON.parse(String(binding.meta ?? "{}"));
+    const now = Date.now();
+    if (!attempt || attempt.phase !== "running" || attempt.executor?.backend !== "opencode"
+      || claim.session !== attempt.session || String(claim.work_revision ?? "legacy") !== revision
+      || scope.generation !== attempt.generation || scope.attempt_id !== attempt.attempt_id
+      || attempt.lease_until <= now || attempt.action_deadline <= now
+      || state.messages.some(message => message.priority === "interrupt" && message.state !== "acted")) return;
+    const gateway = this.one(`SELECT id,tags FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, attempt.host);
+    if (!gateway || !tagsSayGateway(parseTags(gateway.tags))
+      || !this.hasManagedReviewAssignment(String(gateway.id), id, attempt.session, String(binding.project ?? ""), revision)) return;
+    this.version(id, "system:executor", "managed_review_verdict", "Captured a verdict from the active managed review attempt",
+      { generation: attempt.generation, attempt_id: attempt.attempt_id, session: attempt.session, revision });
+  }
+
   private recoverManagedReviewRoute(body: Record<string, unknown>, tokenId: string, host: string,
     capabilities: ExecutorCapabilities, now: number): boolean {
     const observations = this.state.storage.sql.exec(
@@ -7749,13 +7802,21 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
       const reviewExecutor = current.attempt?.executor;
       const reviewHost = current.attempt?.host;
-      if (command.kind === "finalize" && command.outcome.kind === "completed"
-        && current.attempt && reviewExecutor?.backend === "opencode" && reviewHost && typeof row.project === "string" && row.project.length
+      if (command.kind === "finalize" && current.attempt && reviewExecutor?.backend === "opencode" && reviewHost && typeof row.project === "string" && row.project.length
         && parseTags(row.roles).includes("review")) {
-        const observed = command.outcome.acp_parent_prompt_observed_at;
+        const observed = command.outcome.kind === "interrupted"
+          ? command.outcome.acp_parent_teardown_observed_at : command.outcome.acp_parent_prompt_observed_at;
+        const revision = String(meta.work_revision ?? "legacy");
+        const source = command.outcome.kind === "completed" ? "execution"
+          : command.outcome.kind === "interrupted" && observed && this.one(
+            `SELECT 1 FROM ledger WHERE artefact_id=? AND action='managed_review_verdict'
+             AND json_extract(data,'$.generation')=? AND json_extract(data,'$.attempt_id')=?
+             AND json_extract(data,'$.session')=? AND json_extract(data,'$.revision')=? LIMIT 1`,
+            req.id, current.attempt.generation, current.attempt.attempt_id, current.attempt.session, revision,
+          ) ? "review-verdict" : null;
         // Bind the gateway timestamp to this exact source attempt's immutable
         // begin receipt. The original deadline embeds the hub's begin time.
-        const begin = observed && this.one(
+        const begin = observed && source && this.one(
           `SELECT json_extract(result,'$.attempt.action_deadline')
                     - json_extract(request,'$.command.action_budget_ms') AS began_at
            FROM execution_commands WHERE task_id=?
@@ -7764,25 +7825,11 @@ export class KnowledgeHub {
              AND json_extract(result,'$.attempt.attempt_id')=? LIMIT 1`,
           req.id, current.attempt.generation, current.attempt.attempt_id,
         );
-        if (observed && begin && typeof begin.began_at === "number" && begin.began_at > 0
+        if (source && observed && begin && typeof begin.began_at === "number" && begin.began_at > 0
           && observed >= begin.began_at && observed <= now && now - observed < 300_000
           && this.hasManagedReviewAssignment(tokenId, req.id, current.attempt.session,
-            row.project, String(meta.work_revision ?? "legacy"))) {
-          const responseReceipt = `execution:${req.id}:${current.attempt.generation}:${current.attempt.attempt_id}`;
-          const proof = ManagedReviewRouteProofSchema.parse({
-            id: responseReceipt, host: reviewHost, backend: "opencode", model: reviewExecutor.model,
-            config_revision: reviewExecutor.config_revision, observed_at: observed,
-            result: { kind: "succeeded", response_receipt: responseReceipt }, receipts: [responseReceipt],
-            witness: { kind: "managed_review_prompt", project: row.project, tier: reviewExecutor.tier, assignment: "reserved_review_v1" },
-          });
-          this.state.storage.sql.exec(`DELETE FROM managed_review_route_success WHERE host=? AND observed_at<=?`, reviewHost, now - 300_000);
-          this.state.storage.sql.exec(
-            `INSERT INTO managed_review_route_success(host,model,config_revision,project,tier,observed_at,proof) VALUES(?,?,?,?,?,?,?)
-             ON CONFLICT(host,model,config_revision,project,tier) DO UPDATE SET observed_at=excluded.observed_at, proof=excluded.proof
-             WHERE json_extract(managed_review_route_success.proof,'$.witness.assignment') IS NOT 'reserved_review_v1'
-                OR excluded.observed_at > managed_review_route_success.observed_at`,
-            reviewHost, proof.model, proof.config_revision, proof.witness.project, proof.witness.tier, observed, JSON.stringify(proof),
-          );
+            row.project, revision)) {
+          this.recordManagedReviewObservation(req.id, current.attempt, row.project, observed, now, source);
         }
       }
       // Control polls do not authorise external effects. Keep a bounded replay
@@ -9385,6 +9432,9 @@ export class KnowledgeHub {
           if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
           if (n.active + n.reserved + n.finalizing >= capacity + Math.min(capacity, 4)) throw new Error("gate: gateway finalization backlog is full; deliver retained outcomes before claiming more work");
         }
+      }
+      if (row.status === "in_progress" && verdict.status === "done" && reviewResult) {
+        this.observeManagedReviewVerdict(id, String(meta.work_revision ?? "legacy"), body);
       }
       if (directInteractiveClaim) this.executionWork().claimInteractive(id, String(body.token_id), String(meta.session), meta);
       if (row.type === "task" && (verdict.status === "todo" || terminalStartup)) delete meta.interactive_execution;

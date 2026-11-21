@@ -251,6 +251,7 @@ export const TerminalOutcomeSchema = z.object({
   // field certifies a parent prompt for managed review recovery.
   acp_prompt_observed_at: z.number().int().positive().optional(),
   acp_parent_prompt_observed_at: z.number().int().positive().optional(),
+  acp_parent_teardown_observed_at: z.number().int().positive().optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 

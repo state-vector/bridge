@@ -532,6 +532,73 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
   });
 
+  it("learns from a fenced review verdict even when normal worker teardown interrupts ACP", async () => {
+    const project = "managed-verdict-recovery", g = await gateway(project, 2);
+    const failed = { kind: "failed", exit_code: null, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    const interrupted = { kind: "interrupted", exit_code: null, stdout_tail: "Reviewed the change",
+      stderr_tail: "acp interrupted — stop for a fresh attempt" };
+
+    async function startReview() {
+      const id = await task(project);
+      expect((await post("update", { id, roles: ["review"] })).error).toBeUndefined();
+      const reservation = await reserve(g);
+      if (reservation.kind !== "reserved" || reservation.task_id !== id) throw new Error(JSON.stringify(reservation));
+      const attempt_id = `${id}-attempt`, session = reservation.session;
+      expect((await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 },
+        undefined, id, session)).error).toBeUndefined();
+      return { id, session, scope: { id, generation: 1, attempt_id } };
+    }
+    async function finalize(source: Awaited<ReturnType<typeof startReview>>, outcome: object) {
+      const { id, session, scope: { generation, attempt_id } } = source;
+      const stopped = { generation, attempt_id, writers: "process_group_empty", outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, undefined, id, session)).error).toBeUndefined();
+      const cmd = { kind: "finalize", ...stopped }, commandId = `${attempt_id}-finalize`;
+      const receipt = await g.cmd(cmd, commandId, id, session);
+      expect(receipt.error).toBeUndefined();
+      expect(await g.cmd(cmd, commandId, id, session)).toEqual(receipt);
+    }
+    const target = await startReview();
+    await finalize(target, failed);
+    const sibling = await startReview();
+    await finalize(sibling, failed);
+    const reviewResult = { kind: "findings", summary: "Checked the exact review subject and found a fix to request." };
+    const verdict = (source: Awaited<ReturnType<typeof startReview>>) => ({
+      ...g.worker, id: source.id, session: source.session, to: "done",
+      note: "Reviewed the submitted revision and recorded a finding.", review_result: reviewResult,
+    });
+
+    const unobserved = await startReview();
+    expect((await post("transition", { ...verdict(unobserved), execution_scope: unobserved.scope })).error).toBeUndefined();
+    // An older runner may retain a natural-prompt marker on interruption.
+    // It did not attest teardown through the new no-work filter.
+    await finalize(unobserved, { ...interrupted, acp_parent_prompt_observed_at: Date.now() });
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
+
+    const noVerdict = await startReview();
+    await finalize(noVerdict, { ...interrupted, acp_parent_teardown_observed_at: Date.now() });
+    expect((await post("update", { id: noVerdict.id, meta: { operator_gated: true } })).error).toBeUndefined();
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
+
+    const source = await startReview();
+    const observedAt = Date.now();
+    expect((await post("transition", { ...verdict(source), execution_scope: { ...source.scope, generation: 2 } })).error).toMatch(/execution mutation fenced/);
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
+    expect((await post("transition", { ...verdict(source), execution_scope: source.scope })).error).toBeUndefined();
+    await finalize(source, { ...interrupted, acp_parent_teardown_observed_at: observedAt });
+
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(target.id);
+    const begun = await g.cmd({ kind: "begin", attempt_id: "verdict-retry", worker: g.auth.agent, action_budget_ms: 60_000 },
+      undefined, target.id, resumed.session);
+    expect(begun).toMatchObject({ generation: 2, recovery_permit: {
+      phase: "consumed", proof: { observed_at: observedAt,
+        result: { response_receipt: `review-verdict:${source.id}:1:${source.scope.attempt_id}` } },
+    } });
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+  });
+
   it("requires a witnessed request on a replacement route before reservation and begin", async () => {
     const project = "replacement-route", g = await gateway(project);
     const held = await task(project);
