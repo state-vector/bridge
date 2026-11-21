@@ -29,6 +29,8 @@ impl WriterProof {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Outcome { pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdout_tail: String, pub stderr_tail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_prompt_observed_at: Option<u64>,
     /// Typed provider provenance (BR#8821). Serialized only when present so
     /// older hubs/recovery paths parse unchanged records identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]

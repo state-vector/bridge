@@ -183,7 +183,7 @@ fn attach_with_stop(spec: Spec, cancelled: Option<Arc<AtomicBool>>) -> Result<In
                 let mut record = request.record();
                 record.process = launch.and_then(|r| r.process);
                 if record.process.is_some() {
-                    record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into(), cause: None }, worktree: request.worktree.clone() };
+                    record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Independent worker exited without a durable result; preserve/check kernel identity before continuation".into(), acp_prompt_observed_at: None, cause: None }, worktree: request.worktree.clone() };
                 } else if ["started.json", "state.json"].iter().all(|name| {
                     matches!(fs::symlink_metadata(root.join(name)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
                 }) {
@@ -433,7 +433,7 @@ fn unlaunched(spec: &Spec, reason: String) -> Result<(), String> {
 }
 
 fn unlaunched_work(spec: &Spec, reason: String) -> Work {
-    Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, cause: None },
+    Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, acp_prompt_observed_at: None, cause: None },
         writers: WriterProof::ProcessGroupEmpty, worktree: spec.worktree.clone(), step: Step::Stop }
 }
 

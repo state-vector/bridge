@@ -247,6 +247,7 @@ export const TerminalOutcomeSchema = z.object({
    * `default` keeps old records parseable, and the authenticated failure
    * provenance + raw sanitized evidence ride ONLY on this field (BR#8821). */
   cause: ProviderCauseSchema.optional(),
+  acp_prompt_observed_at: z.number().int().positive().optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 
@@ -311,12 +312,15 @@ export function externalWaitCoveredBy(wait: ExternalChecksWait, observed: { repo
 }
 /** A bounded, witnessed request on the configured route. A model catalog,
  * CLI version, answered billing question or timestamp alone is not evidence. */
-export const ProviderRecoveryProofSchema = z.object({
+const ProviderRecoveryRouteSchema = z.object({
   id: text, host: text, backend: text, model: text, config_revision: text,
   result: z.object({ kind: z.literal("succeeded"), response_receipt: text }),
   observed_at: z.number().int().positive(),
+  receipts: z.array(text).min(1),
+});
+const ProviderRequestProofSchema = ProviderRecoveryRouteSchema.extend({
   request: z.object({ kind: z.literal("configured_model_request"), max_output_tokens: z.number().int().positive(), tools: z.literal("none") }),
-  actual_model: text, configuration_receipt: text, receipts: z.array(text).min(1),
+  actual_model: text, configuration_receipt: text,
   witness: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("configured_route_observed"), configured_model: text,
       allowed_actual_models: z.array(text).min(1), configured_max_output_tokens: z.number().int().positive(),
@@ -326,10 +330,16 @@ export const ProviderRecoveryProofSchema = z.object({
       configuration_receipt: text }),
   ]),
 });
+export const ManagedReviewRouteProofSchema = ProviderRecoveryRouteSchema.extend({
+  backend: z.literal("opencode"),
+  witness: z.object({ kind: z.literal("managed_review_prompt"), project: text, tier: ReasoningTierSchema }),
+});
+export const ProviderRecoveryProofSchema = z.union([ProviderRequestProofSchema, ManagedReviewRouteProofSchema]);
 export function validRecoveryRequestProof(
   proof: z.infer<typeof ProviderRecoveryProofSchema>,
   diagnosis: "provider_authentication" | "provider_quota" | "provider_route_unavailable",
 ): boolean {
+  if (!("request" in proof)) return diagnosis === "provider_route_unavailable";
   const witness = proof.witness;
   return witness.configured_model === proof.model
     && witness.allowed_actual_models.includes(proof.actual_model)
@@ -773,11 +783,12 @@ export function attemptDiagnosisCoversAttempt(state: ExecutionState): boolean {
     && !state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
 }
 
-export function recoveryPermitMatches(state: ExecutionState, capability: Pick<ExecutorCapabilities,"backend"|"model"|"config_revision">, host: string, revision: string, now: number): boolean {
+export function recoveryPermitMatches(state: ExecutionState, capability: Pick<ExecutorCapabilities,"backend"|"model"|"config_revision"> & Partial<Pick<ExecutorCapabilities,"tier">>, host: string, revision: string, now: number): boolean {
   const p = state.recovery_permit;
   return recoveryPermitCoversAttempt(state, now) && !!p && p.task_revision === revision
     && p.proof.host === host && p.proof.backend === capability.backend
-    && p.proof.model === capability.model && p.proof.config_revision === capability.config_revision;
+    && p.proof.model === capability.model && p.proof.config_revision === capability.config_revision
+    && (p.proof.witness.kind !== "managed_review_prompt" || p.proof.witness.tier === capability.tier);
 }
 
 /** Cumulative history is immutable; admission is bounded within an explicit

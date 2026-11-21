@@ -443,6 +443,59 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
   });
 
+  it("uses a fresh managed review prompt once for an exact-route retry", async () => {
+    const project = "managed-review-recovery", g = await gateway(project, 2);
+    const otherModel = { ...g.capabilities, model: "test/different" };
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [otherModel] } });
+    const failed = { kind: "failed", exit_code: null, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    const completed = { kind: "completed", exit_code: 0, stdout_tail: "Checked the change", stderr_tail: "" };
+    async function review() {
+      const id = await task(project);
+      expect((await post("update", { id, roles: ["review"] })).error).toBeUndefined();
+      return id;
+    }
+    async function begin(id: string, model = g.capabilities.model, generation = 1) {
+      const reservation = await reserve(g);
+      if (reservation.kind !== "reserved" || reservation.task_id !== id) throw new Error(JSON.stringify(reservation));
+      const attempt_id = `${id}-${generation}`, session = reservation.session;
+      const result = await g.cmd({ kind: "begin", worker: g.auth.agent, action_budget_ms: 60_000,
+        attempt_id, selection: { backend: "opencode", model, tier: "small" } }, undefined, id, session);
+      expect(result.error).toBeUndefined();
+      return { id, session, generation, attempt_id, result };
+    }
+    async function finalize(attempt: Awaited<ReturnType<typeof begin>>, outcome: object) {
+      const { id, session, generation, attempt_id } = attempt;
+      const stopped = { generation, attempt_id, writers: "process_group_empty", outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, undefined, id, session)).error).toBeUndefined();
+      const finalize = { kind: "finalize", ...stopped }, commandId = `finish-${attempt_id}`;
+      const result = await g.cmd(finalize, commandId, id, session);
+      expect(result.error).toBeUndefined();
+      expect(await g.cmd(finalize, commandId, id, session)).toEqual(result);
+    }
+    async function observation(model: string, observed?: number) {
+      const id = await review();
+      await finalize(await begin(id, model), { ...completed, acp_prompt_observed_at: observed });
+      expect((await post("update", { id, meta: { operator_gated: true } })).error).toBeUndefined();
+    }
+    const id = await review();
+    await finalize(await begin(id), failed);
+    await observation(g.capabilities.model); // An older runner provides only exit status.
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    await observation(otherModel.model, Date.now());
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    await observation(g.capabilities.model, Date.now() - 301_000);
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    await observation(g.capabilities.model, Date.now());
+    const retry = await begin(id, g.capabilities.model, 2);
+    expect(retry.result).toMatchObject({ generation: 2, budget_exhaustions: 0, recovery_permit: {
+      phase: "consumed", proof: { witness: { kind: "managed_review_prompt", project, tier: "small" } },
+    } });
+    await finalize(retry, failed);
+    await observation(g.capabilities.model, Date.now());
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+  });
+
   it("requires a witnessed request on a replacement route before reservation and begin", async () => {
     const project = "replacement-route", g = await gateway(project);
     const held = await task(project);
