@@ -1397,6 +1397,32 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // the gate's FIRST live firings 49 minutes after BR#17396 landed it
   // (breach card BR#17493).
   "recovery:held-diagnosis": Number.POSITIVE_INFINITY,
+  // BR#18402 — the review-acceptance legs-coverage fence (do.ts:8801, the
+  // doTransition review_result path): a verify duty closing done with
+  // review_result {kind:"accepted_pr"} whose legs do not cover the exact
+  // submitted pull request legs (or an accepted_direct_main that is not the
+  // recorded landing commit) is refused with "gate: review acceptance must
+  // cover the exact submitted pull request legs or recorded landing
+  // commit". The refusal IS the acceptance-coverage law working (the
+  // BR#6740 coverage rule: a verdict is fenced to the exact submitted legs;
+  // matchesSubmittedSha binds every schema-legal acceptance — full 40-hex —
+  // as a prefix-match against the submitted leg), zero state destroyed, and
+  // the duty's legal exit — review_result {kind:"findings"} plus a bounce
+  // naming the exact repair — stays open, so it joins the BR#4562/BR#6654/
+  // BR#7008/BR#7684 never-a-breach pricing family (pricing it FINITE would
+  // re-arm breach cards on exactly the coverage fence the acceptance law
+  // prescribes). The stem below also owns the sibling direct-main arm
+  // (do.ts:8805, "…must cover the exact submitted commit") — the same
+  // coverage fence for commit-kind submissions. Named so the Log says WHAT
+  // held: an acceptance, held by the submitted legs. Specimen: BR#18399
+  // (verify duty for BR#18391 / superpositional cure PR #3644) — the
+  // parent's review_target pinned #3644 to head_sha_at_acceptance
+  // "93cdc3732", the bound RED BASE head abbreviated, not a prefix of the
+  // PR's real head 3794d0eb…, so NO schema-legal acceptance could ever
+  // match it; 3 gate refusals 2026-11-21 02:28:42–02:31:26Z, then the duty
+  // lawfully closed done on findings with the leg-sha-rebind bounce
+  // (breach card BR#18402).
+  "review:held-submitted-legs": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1633,6 +1659,31 @@ export function breachClass(reason: string): string {
   // twice past the duty's spawn offer (breach card BR#17878).
   if (r.includes("unclaimed review belongs to a different submission"))
     return "claim:held-stale-review";
+  // BR#18402: the review-acceptance legs-coverage fence (do.ts:8801, the
+  // doTransition review_result path): an accepted_pr verdict whose legs do
+  // not cover the exact submitted pull request legs — or an
+  // accepted_direct_main that is not the recorded landing commit — is
+  // refused with "gate: review acceptance must cover the exact submitted
+  // pull request legs or recorded landing commit". The refusal IS the
+  // acceptance-coverage law working: the verdict stays fenced to the exact
+  // submitted legs (BR#6740), zero state destroyed, and the duty's legal
+  // exit — a findings verdict plus a bounce naming the exact repair —
+  // stays open, so it joins the never-a-breach family (thresholds above).
+  // The throw is bare — no [rule:] tag — so the rule-tag table can't own
+  // it; match the structural fragment "review acceptance must cover the
+  // exact submitted", not the whole sentence (BR#3611/BR#3612
+  // wording-drift lesson); it sits ~6 chars in (after "gate: "), far
+  // inside the 300-char audit slice, so the classification survives any
+  // tail. The shared stem also owns the sibling direct-main arm (do.ts:8805,
+  // "…must cover the exact submitted commit") — the same fence for
+  // commit-kind submissions. Specimen: BR#18399 (verify duty for BR#18391 /
+  // superpositional cure PR #3644): the parent's submitted leg pinned
+  // #3644 to "93cdc3732" — the bound red base head, abbreviated, not a
+  // prefix of the PR's real head 3794d0eb… — so no legal acceptance could
+  // ever cover it; 3 refusals 2026-11-21 02:28:42–02:31:26Z, then a lawful
+  // findings close with the leg-sha-rebind bounce (breach card BR#18402).
+  if (r.includes("review acceptance must cover the exact submitted"))
+    return "review:held-submitted-legs";
   // BR#9703: the recovery review's replacement-binding gate (do.ts:7387, the
   // doTransition unblock_result path): a task-recovery duty closing in_review
   // with unblock_result {kind:"reblocked"} is refused with "gate: recovery

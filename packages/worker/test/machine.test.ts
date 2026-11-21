@@ -2098,6 +2098,43 @@ describe("breachClass: claim:held-stale-review (BR#17878)", () => {
   });
 });
 
+describe("breachClass: review:held-submitted-legs (BR#18402)", () => {
+  // the exact audited reason shape (do.ts:8801 review_result legs-coverage
+  // gate, bare throw — no [rule:] tag)
+  const FENCE = "gate: review acceptance must cover the exact submitted pull request legs or recorded landing commit";
+  // the sibling direct-main arm (do.ts:8805) — the same coverage fence for
+  // commit-kind submissions
+  const SIBLING = "gate: review acceptance must cover the exact submitted commit";
+
+  it("the fence refusal classifies review:held-submitted-legs from its message stem", () => {
+    expect(breachClass(FENCE)).toBe("review:held-submitted-legs");
+    // the stem sits ~6 chars in — far inside the audit trail's 300-char
+    // reason slice; classification survives any tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("review:held-submitted-legs");
+  });
+
+  it("the sibling direct-main coverage arm classifies into the same fence class", () => {
+    expect(breachClass(SIBLING)).toBe("review:held-submitted-legs");
+  });
+
+  it("a fence-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#18399", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["review:held-submitted-legs"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("sister review-binding fences keep their own classes", () => {
+    expect(breachClass("gate: this unclaimed review belongs to a different submission; request the current independent review")).toBe("claim:held-stale-review");
+    expect(breachClass("gate: stale or missing review subject_revision — echo this duty's captured review_subject revision and re-verify changed work in a fresh review round")).toBe("review_fence");
+    expect(breachClass("gate: execution acceptance requires an execution contract and the subject's submitted execution_result")).toBe("execution_acceptance_fence");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // BR#6740 — the doTransition exit gate for typed execution waits (do.ts
 // ~6549: isExecutionWait / local handoff preparing|waiting): ANY ordinary
