@@ -344,15 +344,19 @@ pub fn classify_provider_error(backend: &str, model: Option<&str>, code: Option<
 /// https://opencode.ai/docs/cli/acp/#retry-status
 #[derive(Debug, PartialEq)]
 enum ProviderRetryUpdate { Unchanged, Cleared, Failed(ProviderCause) }
-fn provider_retry_update(frame: &serde_json::Value, session: &str, model: Option<&str>, now: u64) -> ProviderRetryUpdate {
+fn parent_session_update<'a>(frame: &'a serde_json::Value, session: &str) -> Option<&'a serde_json::Value> {
     if frame.get("method").and_then(|v|v.as_str()) != Some("session/update")
-        || frame.pointer("/params/sessionId").or_else(||frame.get("sessionId")).and_then(|v|v.as_str()) != Some(session) {
-        return ProviderRetryUpdate::Unchanged;
+        || frame.pointer("/params/sessionId").or_else(|| frame.get("sessionId")).and_then(|v|v.as_str()) != Some(session)
+        || frame.pointer("/params/_meta/opencode~1child-session").is_some()
+    {
+        return None;
     }
-    let Some(update) = update_payload(frame) else { return ProviderRetryUpdate::Unchanged; };
-    if update.get("sessionUpdate").and_then(|v|v.as_str()) != Some("session_info_update")
-        || update.pointer("/_meta/opencode~1child-session").is_some()
-        || frame.pointer("/params/_meta/opencode~1child-session").is_some() {
+    update_payload(frame).filter(|update| update.pointer("/_meta/opencode~1child-session").is_none())
+}
+
+fn provider_retry_update(frame: &serde_json::Value, session: &str, model: Option<&str>, now: u64) -> ProviderRetryUpdate {
+    let Some(update) = parent_session_update(frame, session) else { return ProviderRetryUpdate::Unchanged; };
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("session_info_update") {
         return ProviderRetryUpdate::Unchanged;
     }
     let Some(retry) = update.pointer("/_meta/opencode~1retry") else { return ProviderRetryUpdate::Unchanged; };
@@ -927,19 +931,19 @@ impl AgentTransport for OpencodeAcp {
         let mut on_prompt = |line: &str| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(session) = session_id.as_deref() {
-                    let parent_update = v.pointer("/params/sessionId").and_then(|id| id.as_str()) == Some(session)
-                        && v.pointer("/params/_meta/opencode~1child-session").is_none();
-                    if parent_update && update_payload(&v).is_some_and(|update|
-                        update.pointer("/_meta/opencode~1child-session").is_none()
-                        && matches!(update.get("sessionUpdate").and_then(|kind| kind.as_str()),
-                            Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call")))
-                    {
-                        first_model_response_at.get_or_insert_with(ms_now);
-                    }
                     match provider_retry_update(&v, session, req.model, ms_now()) {
                         ProviderRetryUpdate::Unchanged => {},
                         ProviderRetryUpdate::Cleared => retry_cause = None,
-                        ProviderRetryUpdate::Failed(cause) => retry_cause = Some(cause),
+                        ProviderRetryUpdate::Failed(cause) => {
+                            retry_cause = Some(cause);
+                            first_model_response_at = None;
+                        }
+                    }
+                    if retry_cause.is_none() && parent_session_update(&v, session).is_some_and(|update|
+                        matches!(update.get("sessionUpdate").and_then(|kind| kind.as_str()),
+                            Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call")))
+                    {
+                        first_model_response_at.get_or_insert_with(ms_now);
                     }
                 }
                 if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
@@ -1431,16 +1435,28 @@ mod provider_cause_tests {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("bridge-acp-retry-{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
-        for mode in ["lost", "cleared", "success", "task_error", "observed", "child_only"] {
+        for mode in ["lost", "cleared", "success", "task_error", "observed", "flat", "child_only", "child_marker", "lookalike", "stale_output"] {
             let mut frames = vec![retry_frame("parent", json!({"error":{"type":"provider.quota","message":"Credit exhausted","status":402}}))];
             match mode {
                 "cleared" => frames.push(retry_frame("parent", serde_json::Value::Null)),
                 "success" => frames.push(json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})),
-                "observed" | "child_only" => {
+                "observed" | "flat" | "child_only" | "child_marker" | "lookalike" | "stale_output" => {
                     frames.push(retry_frame("parent", serde_json::Value::Null));
-                    let session = if mode == "observed" { "parent" } else { "child" };
-                    frames.push(json!({"method":"session/update","params":{"sessionId":session,
-                        "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"checked the change"}}}}));
+                    let update = json!({"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"checked the change"}});
+                    let frame = match mode {
+                        "flat" => json!({"method":"session/update","sessionId":"parent","update":update}),
+                        "child_only" => json!({"method":"session/update","params":{"sessionId":"child","update":update}}),
+                        "child_marker" => json!({"method":"session/update","params":{"sessionId":"parent",
+                            "_meta":{"opencode/child-session":"child"},"update":update}}),
+                        "lookalike" => json!({"method":"session/other","params":{"sessionId":"parent","update":update}}),
+                        _ => json!({"method":"session/update","params":{"sessionId":"parent","update":update}}),
+                    };
+                    frames.push(frame);
+                    if mode == "stale_output" {
+                        frames.push(retry_frame("parent", json!({"error":{"type":"provider.rate-limit","message":"Busy"}})));
+                        frames.push(retry_frame("parent", serde_json::Value::Null));
+                    }
                     frames.push(json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}));
                 }
                 "task_error" => frames.push(json!({"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Tool rejected","data":{"service":"session","errorName":"tool.execution"}}})),
@@ -1456,8 +1472,8 @@ mod provider_cause_tests {
             std::fs::write(&script,body).unwrap();
             let out = OpencodeAcp.dispatch(&RunRequest {workdir:workdir.to_str().unwrap(),bin:"/bin/sh",agent:None,model:Some("llmgw/glm-5.3"),prompt:"test",title:None,resume:None,extra_config:None,control:None},Duration::from_secs(5),None);
             assert_eq!(out.session_id.as_deref(), Some("parent"), "{mode}: {}", out.stderr_tail);
-            assert_eq!(out.ok, matches!(mode, "success" | "observed" | "child_only"), "{mode}");
-            assert_eq!(out.acp_prompt_observed_at.is_some(), mode == "observed", "{mode}");
+            assert_eq!(out.ok, !matches!(mode, "lost" | "cleared" | "task_error"), "{mode}");
+            assert_eq!(out.acp_prompt_observed_at.is_some(), matches!(mode, "observed" | "flat"), "{mode}");
             if mode=="lost" {
                 assert_eq!(out.cause.unwrap().error_name.as_deref(),Some("provider.quota"));
             } else {assert!(out.cause.is_none(),"{mode}: stale provider cause");}
