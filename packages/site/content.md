@@ -1152,7 +1152,9 @@ An unowned review of an older task revision no longer blocks closure after the c
 
 Given a fresh configured proxy receipt, run `python3 scripts/recover-provider-batch.py receipt.json` to preview up to four matching retry holds from the first 32 reported by the gateway. Set `BRIDGE_MCP_URL` and a full-agent `BRIDGE_TOKEN` using your existing connection, then add `--apply` to grant the selected trials. The hub permits at most four grants per proxy receipt. Normal admission and one-use task guards still apply.
 
-Submitting a fresh `provider_route_verified` receipt now triggers bounded recovery in the hub. The hub selects matching held work against current spare capacity and stores the grants and receipt together. Replaying the receipt returns the original batch. The batch helper uses this path with `--apply`; a trusted verifier still supplies the route receipt.
+Submitting a fresh `provider_route_verified` receipt now triggers bounded recovery in the hub. The hub selects matching held work against current spare capacity and stores the grants and receipt together. Replaying the receipt returns the original batch. The batch helper uses this path with `--apply`; a trusted verifier supplies its proxy receipt.
+
+For managed OpenCode reviews, Bridge also records an explicit successful ACP prompt from a real review. While the observation is fresh, the scheduler can use it once to issue one retry on the same gateway, project, model, tier and configuration. The observed prompt must postdate the failed attempt. A second automatic retry for the same review revision requires a separately reviewed recovery decision. The receipt attests to the worker's successful request profile. Upstream deployment and capacity diagnostics still come from the proxy.
 
 The backlog shows **Ready for gateway** only for tasks eligible on a ready gateway. Tasks held by the scheduler appear separately with their current reasons, such as an exhausted retry budget or an operation that needs reconciliation. Eligibility still depends on a free slot before launch.
 

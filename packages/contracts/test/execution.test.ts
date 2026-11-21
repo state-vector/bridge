@@ -179,6 +179,7 @@ describe("witnessed legacy recovery fences", () => {
   });
   it("accepts a configured proxy receipt only for route recovery, with the observed request ceiling", () => {
     const proof = held().recovery_permit!.proof;
+    if (!("request" in proof)) throw new Error("fixture needs a configured request");
     const witness = { ...proof.witness, kind: "configured_proxy_request" as const };
     expect(validRecoveryRequestProof({ ...proof, witness }, "provider_route_unavailable")).toBe(true);
     expect(validRecoveryRequestProof({ ...proof, witness }, "provider_quota")).toBe(false);
@@ -212,6 +213,7 @@ describe("witnessed legacy recovery fences", () => {
     const permit = state.recovery_permit!;
     permit.terminal = structuredClone(terminal);
     permit.diagnosis = "provider_route_unavailable";
+    if (!("request" in permit.proof)) throw new Error("fixture needs a configured request");
     permit.proof.witness = { ...permit.proof.witness, kind: "configured_proxy_request" };
     expect(recoveryPermitMatches(state, capability, "mac", "revision", 200)).toBe(true);
     openLargerModelStrategy(state, "medium", "Reviewed different model", "independent_review", "revision");

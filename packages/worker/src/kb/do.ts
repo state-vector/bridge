@@ -252,7 +252,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -4040,6 +4040,13 @@ export class KnowledgeHub {
         task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
         json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
       ) WHERE json_extract(request, '$.command.kind') IN ('quiesce','stopped','finalize');
+      CREATE TABLE IF NOT EXISTS managed_review_route_success (
+        host TEXT NOT NULL, model TEXT NOT NULL, config_revision TEXT NOT NULL,
+        project TEXT NOT NULL, tier TEXT NOT NULL, observed_at INTEGER NOT NULL,
+        proof TEXT NOT NULL,
+        PRIMARY KEY (host, model, config_revision, project, tier)
+      );
+      CREATE INDEX IF NOT EXISTS managed_review_route_freshness ON managed_review_route_success(host, observed_at);
       CREATE TABLE IF NOT EXISTS execution_hosts (
         token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
       );
@@ -6441,11 +6448,11 @@ export class KnowledgeHub {
       || !!this.one(`SELECT c.id FROM relations r JOIN artefacts c ON c.id = r.src_id WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'question' AND c.status IN ('todo','in_progress','blocked') AND json_extract(c.meta, '$.ask') IS NOT NULL AND c.id != ?`, id, except);
   }
 
-  private proxyTrialConsumed(id: string, revision: string): boolean {
+  private providerTrialConsumed(id: string, revision: string, kind = "configured_proxy_request"): boolean {
     return !!this.one(`SELECT 1 FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
       AND json_extract(result,'$.recovery_permit.phase')='consumed'
       AND json_extract(result,'$.recovery_permit.task_revision')=?
-      AND json_extract(result,'$.recovery_permit.proof.witness.kind')='configured_proxy_request' LIMIT 1`, id, revision);
+      AND json_extract(result,'$.recovery_permit.proof.witness.kind')=? LIMIT 1`, id, revision, kind);
   }
 
   /** The scheduling exemption comes from the canonical, current lane episode,
@@ -6505,7 +6512,7 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string },
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string; review?: { project: string; tier: string } },
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
      *  host-inventory/readiness/policy read across the reopen + selection. */
@@ -6640,13 +6647,17 @@ export class KnowledgeHub {
       if (retryRoute && reason === "provider_route" && state?.terminal && state.attempt?.host === host
         && state.attempt.executor?.backend === retryRoute.backend && state.attempt.executor.model === retryRoute.model
         && state.attempt.executor.config_revision === retryRoute.config_revision
+        && (!retryRoute.review || (row.project === retryRoute.review.project
+          && state.attempt.executor.tier === retryRoute.review.tier && parseTags(row.roles).includes("review")))
         && capabilities && [capabilities, ...capabilities.alternatives].some(candidate =>
           candidate.backend === retryRoute.backend && candidate.model === retryRoute.model
           && candidate.config_revision === retryRoute.config_revision
+          && (!retryRoute.review || candidate.tier === retryRoute.review.tier)
           && usableFor(schedulingRequirements(), candidate, host, String(row.project ?? "")))
         && state.terminal.generation === state.attempt.generation && state.terminal.attempt_id === state.attempt.attempt_id
         && providerRecoveryDiagnosis(state.terminal.outcome) === "provider_route_unavailable"
-        && !this.proxyTrialConsumed(id, String(meta.work_revision ?? "legacy"))) {
+        && !this.providerTrialConsumed(id, String(meta.work_revision ?? "legacy"),
+          retryRoute.review ? "managed_review_prompt" : "configured_proxy_request")) {
         routeCandidates.push({ id, created: Number(row.created_ts) });
       }
       if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
@@ -6976,10 +6987,21 @@ export class KnowledgeHub {
     // cached past this synchronous statement. dispatchCandidates and the
     // final claim transaction keep every eligibility/CAS fence first-hand.
     const work = this.executionWork();
-    const selection = capabilities ? work.withHostSnapshot(() => {
+    let selection = capabilities ? work.withHostSnapshot(() => {
       work.reopenCapabilityWaits();
       return this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
     }) : { eligible: [], entries: new Map<string, SelectionEntry>(), reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
+    if (mode === "reserve" && capabilities && (selection.reasons.provider_route ?? 0) > 0
+      && occupancy.active + occupancy.reserved + selection.eligible.length < gatewayCapacity(capabilities)) {
+      const now = Date.now();
+      if (now - Number(observation?.observed_ts) < 120_000
+        && body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
+        && (capabilities.inventory_revision !== 2 || body.inventory_protocol === 2)
+        && this.executorReadiness(tokenId, host, capabilities, now).kind === "ready"
+        && this.recoverManagedReviewRoute(body, tokenId, host, capabilities, now)) {
+        selection = this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
+      }
+    }
     const recoveryCapacity = this.recoveryCapacity();
     const pending = recoveryCapacity.prepare(tokenId, selection.eligible.map(priorityTask), mode !== "inspect");
     if (pending?.phase === "slot_available") {
@@ -7182,6 +7204,59 @@ export class KnowledgeHub {
     }
   }
 
+  private recoverManagedReviewRoute(body: Record<string, unknown>, tokenId: string, host: string,
+    capabilities: ExecutorCapabilities, now: number): boolean {
+    const observations = this.state.storage.sql.exec(
+      `SELECT proof FROM managed_review_route_success WHERE host=? AND observed_at>? AND observed_at<=?
+       ORDER BY observed_at DESC LIMIT 4`, host, now - 300_000, now,
+    ).toArray();
+    for (const row of observations) {
+      const proof = ManagedReviewRouteProofSchema.parse(JSON.parse(String(row.proof)));
+      const key = "provider-route:" + host;
+      if (this.one(`SELECT 1 FROM execution_commands WHERE task_id=? AND command_id=?`, key, proof.id)) continue;
+      const route = { ...proof, review: proof.witness };
+      const candidates = this.dispatchCandidates(tokenId, host, capabilities, undefined, route).routeCandidates;
+      const result = this.grantProviderRouteBatch(body, "system:scheduler", proof, candidates, 1, JSON.stringify(proof));
+      if (result.granted.length) return true;
+    }
+    return false;
+  }
+
+  private grantProviderRouteBatch(body: Record<string, unknown>, actor: string,
+    proof: ExecutionRecoveryPermit["proof"], candidates: string[], limit: number, request: string) {
+    return this.state.storage.transactionSync(() => {
+      const granted: string[] = [];
+      if (limit) for (const id of candidates) {
+        const execution = this.executionState(id);
+        const attempt = execution?.attempt;
+        if (!execution?.terminal || !attempt?.executor || attempt.host !== proof.host
+          || attempt.executor.backend !== proof.backend || attempt.executor.model !== proof.model
+          || attempt.executor.config_revision !== proof.config_revision
+          || providerRecoveryDiagnosis(execution.terminal.outcome) !== "provider_route_unavailable") continue;
+        try {
+          this.executionCommand({ ...body, id, command_id: "verified-route:" + proof.id, command: {
+            kind: "recover_provider_failure", terminal: execution.terminal, proof,
+            diagnosis: "provider_route_unavailable",
+            continuation: "Check current upstream state, preserve previous work, and record a verified outcome.",
+            evidence: proof.receipts,
+          } }, actor, undefined, true);
+          granted.push(id);
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith("gate:")) throw error;
+        }
+        if (granted.length >= limit) break;
+      }
+      const result = { kind: "verified_route_recovery", granted };
+      // A managed observation that had no matching task can still cover one
+      // on a later scheduler pass. Manual submissions keep their original ACK.
+      if (granted.length || proof.witness.kind !== "managed_review_prompt") {
+        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,
+          "provider-route:" + proof.host, proof.id, request, JSON.stringify(result));
+      }
+      return result;
+    });
+  }
+
   /** No awaits between read/decide/write. State and replay receipt share one
    * SQLite transaction; replay after a lost response never authorises a second
    * Git/AWS effect. Those effects still require inspect-and-reconcile. */
@@ -7224,33 +7299,8 @@ export class KnowledgeHub {
       const limit = host?.live && host.readiness.kind === "ready"
         ? Math.max(0, Math.min(command.limit, host.capacity - host.active - host.reserved - host.eligible))
         : 0;
-      return this.state.storage.transactionSync(() => {
-        const granted: string[] = [];
-        if (limit) for (const id of host.routeCandidates) {
-          const execution = this.executionState(id);
-          const attempt = execution?.attempt;
-          if (!execution?.terminal || !attempt?.executor || attempt.host !== proof.host
-            || attempt.executor.backend !== proof.backend || attempt.executor.model !== proof.model
-            || attempt.executor.config_revision !== proof.config_revision
-            || providerRecoveryDiagnosis(execution.terminal.outcome) !== "provider_route_unavailable") continue;
-          try {
-            this.executionCommand({ ...body, id, command_id: "verified-route:" + proof.id, command: {
-              kind: "recover_provider_failure", terminal: execution.terminal, proof,
-              diagnosis: "provider_route_unavailable",
-              continuation: "Check current upstream state, preserve previous work, and record a verified outcome.",
-              evidence: proof.receipts,
-            } }, actor, undefined, true);
-            granted.push(id);
-          } catch (error) {
-            if (!(error instanceof Error) || !error.message.startsWith("gate:")) throw error;
-          }
-          if (granted.length >= limit) break;
-        }
-        const result = { kind: "verified_route_recovery", granted };
-        this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,
-          key, proof.id, effectRequest, JSON.stringify(result));
-        return result;
-      });
+      return this.grantProviderRouteBatch(body, actor, proof, host?.routeCandidates ?? [], limit, effectRequest);
+
     }
     // BR#14765 — `refresh: true` bypasses the per-host memo: the reserve loop's
     // schedule_status polls ride the 30s memo (safe: reserve itself is CAS'd
@@ -7332,7 +7382,7 @@ export class KnowledgeHub {
       return { ok: readiness.kind === "ready", readiness, observed_ts: now, expires_ts: now + 120_000, lifecycle_protocol: 2,
         upgrade_notice_recorded: !keepReady && !!command.capabilities.admission_hold };
     }
-    const row = this.one(`SELECT owner, status, meta FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
+    const row = this.one(`SELECT owner, status, meta, roles, project FROM artefacts WHERE id = ? AND type = 'task'`, req.id);
     if (!row) throw new Error("gate: durable execution requires a task");
     const meta = JSON.parse(row.meta ?? "{}");
     let current = this.executionState(req.id) ?? initialExecution(ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}));
@@ -7379,7 +7429,10 @@ export class KnowledgeHub {
     if (command.kind === "recover_provider_failure") {
       // This is an audited human/full-agent diagnosis, never a worker's own
       // retry request. It preserves the failed attempt and grants one begin.
-      if (!this.executionWork().isInteractive(tokenId) || !req.session) throw new Error("gate: provider recovery requires authenticated full-agent diagnosis and session");
+      const managed = command.proof.witness.kind === "managed_review_prompt";
+      const internal = managed && inRecoveryBatch && actor === "system:scheduler";
+      if (!req.session || (managed ? !internal : !this.executionWork().isInteractive(tokenId)))
+        throw new Error("gate: provider recovery requires authenticated full-agent diagnosis or an internal managed review receipt");
       if (!validRecoveryRequestProof(command.proof, command.diagnosis)) throw new Error("gate: recovery proof must bind the actual model and observed request ceiling to the configured route and failure diagnosis");
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
@@ -7399,9 +7452,11 @@ export class KnowledgeHub {
       if (providerRecoveryDiagnosis(terminal.outcome) !== command.diagnosis) throw new Error("gate: terminal has no matching typed or recognized archived provider failure; retain ambiguous evidence");
       if (!executionNeedsRecoveryPermit(current, String(meta.work_revision ?? "legacy"))) throw new Error("gate: task does not require a recovery permit");
       if (current.recovery_permit?.phase === "consumed" && current.recovery_permit.generation === a.generation) throw new Error("gate: recovery permit for this failed attempt already consumed");
-      if (command.proof.witness.kind === "configured_proxy_request" && this.proxyTrialConsumed(req.id, String(meta.work_revision ?? "legacy")))
-        throw new Error("gate: the proxy-witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
-      if (current.recovery_permit?.phase === "available" && current.recovery_permit.proof.id === command.proof.id) throw new Error("gate: recovery proof already granted; use the original command receipt");
+      const witnessKind = command.proof.witness.kind;
+      if ((managed || witnessKind === "configured_proxy_request") && this.providerTrialConsumed(req.id, String(meta.work_revision ?? "legacy"), witnessKind))
+        throw new Error("gate: the witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
+      if (current.recovery_permit?.phase === "available" && (current.recovery_permit.proof.id === command.proof.id
+        || (managed && recoveryPermitCoversAttempt(current, now)))) throw new Error("gate: recovery proof already granted; use the original command receipt");
       const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
         .find(r => Number(JSON.parse(String(r.data)).generation) === a.generation);
       if (!ended || command.proof.observed_at <= Number(ended.ts) || command.proof.observed_at > now || now-command.proof.observed_at > 300_000) throw new Error("gate: recovery needs a fresh configured-model request after this terminal failure");
@@ -7657,6 +7712,29 @@ export class KnowledgeHub {
       }
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
+      const reviewExecutor = current.attempt?.executor;
+      const reviewHost = current.attempt?.host;
+      if (command.kind === "finalize" && command.outcome.kind === "completed"
+        && current.attempt && reviewExecutor?.backend === "opencode" && reviewHost && typeof row.project === "string" && row.project.length
+        && parseTags(row.roles).includes("review")) {
+        const observed = command.outcome.acp_prompt_observed_at;
+        if (observed && observed <= now && now - observed < 300_000) {
+          const responseReceipt = `execution:${req.id}:${current.attempt.generation}:${current.attempt.attempt_id}`;
+          const proof = ManagedReviewRouteProofSchema.parse({
+            id: responseReceipt, host: reviewHost, backend: "opencode", model: reviewExecutor.model,
+            config_revision: reviewExecutor.config_revision, observed_at: observed,
+            result: { kind: "succeeded", response_receipt: responseReceipt }, receipts: [responseReceipt],
+            witness: { kind: "managed_review_prompt", project: row.project, tier: reviewExecutor.tier },
+          });
+          this.state.storage.sql.exec(`DELETE FROM managed_review_route_success WHERE host=? AND observed_at<=?`, reviewHost, now - 300_000);
+          this.state.storage.sql.exec(
+            `INSERT INTO managed_review_route_success(host,model,config_revision,project,tier,observed_at,proof) VALUES(?,?,?,?,?,?,?)
+             ON CONFLICT(host,model,config_revision,project,tier) DO UPDATE SET observed_at=excluded.observed_at, proof=excluded.proof
+             WHERE excluded.observed_at > managed_review_route_success.observed_at`,
+            reviewHost, proof.model, proof.config_revision, proof.witness.project, proof.witness.tier, observed, JSON.stringify(proof),
+          );
+        }
+      }
       // Control polls do not authorise external effects. Keep a bounded replay
       // window for their transport retries; mutation/effect receipts persist.
       if (command.kind === "poll") this.state.storage.sql.exec(`DELETE FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' AND rowid NOT IN (SELECT rowid FROM execution_commands WHERE task_id = ? AND json_extract(request, '$.command.kind') = 'poll' ORDER BY rowid DESC LIMIT 32)`, req.id, req.id);
