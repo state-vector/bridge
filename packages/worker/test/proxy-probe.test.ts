@@ -1,6 +1,8 @@
 import { Miniflare } from "miniflare";
 import { existsSync, realpathSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { executorRequest } from "./executor-fixture";
+import { parseExternalChecksProbeKey } from "../src/kb/do.ts";
 
 /**
  * BR#4658 — the worker-executor verification leg for non-train typed-await
@@ -296,5 +298,165 @@ describe("proxy verification probes (BR#4658) — real DO", () => {
     await sweep();
     expect((await proxyCheck(id)).verdict).toBe("true");
     expect((await dutyChildrenOf(id)).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/** BR#18328 — durable external-CI waits, end-to-end on the real hub: the
+ *  await_external park releases the worker slot charge-free, the head-bound
+ *  probe settles through the ordinary executor probe queue, and exactly one
+ *  fresh verifier generation wakes. The wake is evidence, never acceptance. */
+describe("durable external-CI waits (BR#18328) — real DO", () => {
+  const REPO = "state-vector/superpositional", PR = 3644;
+  const sha = (c: string) => c.repeat(40);
+  let execSerial = 0;
+
+  /** Park a live review duty through the REAL flow: advertise → create →
+   *  claim → begin → await_external (writer-proof fenced). */
+  async function parkedReviewDuty(title: string, wait: { type: "pr_required_checks"; repo: string; pr: number; head_sha: string; contexts: string[] }) {
+    const host = `extwait-${++execSerial}`;
+    const gateway = (await kbJson("/admin.mint", { label: host, tags: ["gateway"] })).body;
+    const identity = (await kbJson("/auth.identify", { bearer: gateway.secret })).body;
+    const worker = (await kbJson("/agent.provision", { label: `${host}/worker`, actor: host })).body;
+    const base = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `extwait-${execSerial}` };
+    const advertise = (await kbJson("/execution", executorRequest({ ...base, id: "gateway", command_id: `adv-${execSerial}`, command: { kind: "advertise", capabilities: {
+      tier: "small", backend: "opencode", model: "test/small", tools: ["git"], environment: ["linux"], capacity: 1, projects: ["bridge"], worker: { kind: "provisioned", label: `${host}/worker` },
+    } } }))).body;
+    expect(advertise.error ?? null).toBeNull();
+    const id = (await kbJson("/create", executorRequest({ actor: host, type: "task", title, body_md: `BR#18328 rig: ${title}`, project: "bridge", roles: ["impl"], qualified: true }))).body.id as string;
+    expect(id, "create failed").toBeTruthy();
+    expect((await kbJson("/transition", executorRequest({ ...base, id, to: "in_progress" }))).body.error ?? null).toBeNull();
+    const exec = (command_id: string, command: object) => kbJson("/execution", executorRequest({ ...base, id, command_id, command }));
+    expect((await exec("begin", { kind: "begin", attempt_id: "one", worker: `${host}/worker`, action_budget_ms: 60_000 })).body.error ?? null).toBeNull();
+    const fence = { generation: 1, attempt_id: "one" };
+    expect((await exec("park", { kind: "await_external", ...fence, writers: "process_group_empty", wait })).body.error ?? null).toBeNull();
+    const key = `extchecks:${wait.repo}#${wait.pr}@${wait.head_sha}`;
+    return { id, base, exec, fence, key, wait };
+  }
+
+  const verify = async (payload: object) => (await kbJson("/proxy.verify", payload)).body;
+  const drill = async (now?: number) => {
+    const kb = (globalThis as any).__kb as (p: string, i?: RequestInit) => Promise<Response>;
+    const r = await kb("/admin.external_waits_sweep", { method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(now === undefined ? {} : { now }) });
+    const text = await r.text();
+    let body: any;
+    try { body = JSON.parse(text); } catch { body = { unparsed: text.slice(0, 300) }; }
+    return { status: r.status, ...body };
+  };
+  const card = async (id: string) => taskById(id);
+
+  it("parks charge-free: slot released, the wait is durable in todo, the exact-head probe is enqueued", async () => {
+    const r = await parkedReviewDuty("extwait rig A: verifier parks on pending hosted CI", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("3"), contexts: ["ci / Build", "ci / Lodestar Scenarios"] });
+    const c = await card(r.id);
+    expect(c.status).toBe("todo");
+    expect(c.owner).toBe("");
+    expect(c.meta.session).toBeUndefined(); // the worker slot is released
+    expect(c.meta.execution_wait).toMatchObject({ kind: "external_checks", await: { repo: REPO, pr: PR, head_sha: sha("3") }, generation: 1, attempt_id: "one" });
+    // no failure charge, no terminal evidence, attempt quiesced
+    const state = (await r.exec("inspect-state", { kind: "inspect" })).body;
+    expect(state).toMatchObject({ budget_exhaustions: 0, terminal: null, external_wait: { pr: PR, attempt_id: "one" }, attempt: { phase: "quiesced" } });
+    // the stopped-writer receipt of record is the park itself
+    expect((await r.exec("wr", { kind: "writer_receipt", ...r.fence })).body).toMatchObject({ kind: "writer_receipt_found", source: "await_external" });
+    // the head-bound probe is in the queue for the executor probe pass
+    const probe = (await kbJson("/proxy.probes", {})).body.probes.find((p: { key: string }) => p.key === r.key);
+    expect(probe).toMatchObject({ repo: REPO, pr: PR, kind: "pr_checks_green", expected_head: sha("3") });
+    expect(parseExternalChecksProbeKey(r.key)).toEqual({ repo: REPO, pr: PR, head_sha: sha("3") });
+  });
+
+  it("green checks wake exactly one verifier: duplicate check events cannot double-wake, and waiting avoids the retry charge", async () => {
+    const r = await parkedReviewDuty("extwait rig B: green CI wakes one verifier", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("3"), contexts: ["ci / Build", "ci / Lodestar Scenarios"] });
+    expect((await verify({ key: r.key, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("3"), conclusion: "checks green", contexts: ["ci / Build=SUCCESS", "ci / Lodestar Scenarios=SUCCESS"] })).verdict).toBe("satisfied");
+    // a duplicate check event hits the verdict of record, not a second wake
+    expect((await verify({ key: r.key, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("3"), conclusion: "checks green", contexts: ["ci / Build=SUCCESS", "ci / Lodestar Scenarios=SUCCESS"] })).error).toContain("verdict of record stands");
+    expect((await drill()).ok).toBe(true);
+    const c = await card(r.id);
+    expect(c.meta.execution_wait).toBeUndefined();
+    expect(c.meta.execution_external_checks).toMatchObject({ outcome: "checks_green", head_sha: sha("3") });
+    expect(c.status).toBe("todo");
+    const settled = async () => (await kbJson("/get_history", { id: r.id })).body.versions.filter((v: { action: string }) => v.action === "external_wait_settled");
+    expect(await settled()).toHaveLength(1);
+    expect(String((await settled())[0].summary)).toContain("GREEN");
+    // a second sweep (another duplicate event) wakes nobody
+    expect((await drill()).ok).toBe(true);
+    expect(await settled()).toHaveLength(1);
+    expect((await card(r.id)).meta.execution_wait).toBeUndefined();
+    // waiting never consumed the repair budget: the fresh verifier begins clean
+    expect((await kbJson("/transition", executorRequest({ ...r.base, id: r.id, to: "in_progress" }))).body.error ?? null).toBeNull();
+    expect((await r.exec("begin-two", { kind: "begin", generation: 2, attempt_id: "two", worker: `${r.base.actor}/worker`, action_budget_ms: 60_000 })).body.error ?? null).toBeNull();
+    const state = (await r.exec("inspect-state", { kind: "inspect" })).body;
+    expect(state).toMatchObject({ generation: 2, budget_exhaustions: 0, failure_charged_generation: 0 });
+  });
+
+  it("conclusively failed checks still reach a verifier, carrying the failing context names", async () => {
+    const r = await parkedReviewDuty("extwait rig C: red CI wakes the verifier against reality", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("4"), contexts: ["ci / Test"] });
+    expect((await verify({ key: r.key, ok: false, conclusive: true, error: "checks failing: ci / Test=FAILURE", head_sha: sha("4"), conclusion: "failing" })).verdict).toBe("negative");
+    expect((await drill()).ok).toBe(true);
+    const c = await card(r.id);
+    expect(c.meta.execution_wait).toBeUndefined();
+    expect(c.meta.execution_external_checks).toMatchObject({ outcome: "checks_failed", error: "checks failing: ci / Test=FAILURE" });
+    expect(c.status).toBe("todo"); // the verifier records the verdict, the wait did not fail the attempt
+    const settled = (await kbJson("/get_history", { id: r.id })).body.versions.filter((v: { action: string }) => v.action === "external_wait_settled");
+    expect(String(settled[0].summary)).toContain("ci / Test=FAILURE");
+  });
+
+  it("an amended head invalidates the old wait — even a green at the wrong head cannot wake it (BR#3409)", async () => {
+    const r = await parkedReviewDuty("extwait rig D: amended head invalidates the stale wait", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("5"), contexts: ["ci / Build"] });
+    expect((await verify({ key: r.key, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("6"), conclusion: "checks green", contexts: ["ci / Build=SUCCESS"] })).verdict).toBe("negative");
+    expect((await drill()).ok).toBe(true);
+    const c = await card(r.id);
+    expect(c.meta.execution_wait).toBeUndefined();
+    expect(c.meta.execution_external_checks).toMatchObject({ outcome: "head_moved", head_sha: sha("6") });
+    const settled = (await kbJson("/get_history", { id: r.id })).body.versions.filter((v: { action: string }) => v.action === "external_wait_settled");
+    expect(String(settled[0].summary)).toContain("INVALIDATED");
+    // a fresh verifier re-binds at the current head; the old signature wakes nothing
+    expect((await verify({ key: `extchecks:${REPO}#${PR}@${sha("6")}`, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("6"), conclusion: "checks green" })).error).toContain("no such probe");
+  });
+
+  it("a satisfied verdict missing a declared required context is NOT coverage — the probe re-arms until the set is whole", async () => {
+    const r = await parkedReviewDuty("extwait rig E: partial check coverage keeps waiting", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("7"), contexts: ["ci / Build", "ci / Lodestar Scenarios"] });
+    expect((await verify({ key: r.key, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("7"), conclusion: "checks green", contexts: ["ci / Build=SUCCESS"] })).verdict).toBe("satisfied");
+    expect((await drill()).ok).toBe(true);
+    let c = await card(r.id);
+    expect(c.meta.execution_wait).toMatchObject({ kind: "external_checks" }); // still held
+    const queued = (await kbJson("/proxy.probes", {})).body.probes.map((p: { key: string }) => p.key);
+    expect(queued).toContain(r.key); // re-armed, still in the queue
+    expect((await verify({ key: r.key, ok: true, receipt: `https://github.com/${REPO}/pull/${PR}`, head_sha: sha("7"), conclusion: "checks green", contexts: ["ci / Build=SUCCESS", "ci / Lodestar Scenarios=SUCCESS"] })).verdict).toBe("satisfied");
+    expect((await drill()).ok).toBe(true);
+    c = await card(r.id);
+    expect(c.meta.execution_wait).toBeUndefined();
+    expect(c.meta.execution_external_checks).toMatchObject({ outcome: "checks_green" });
+  });
+
+  it("a CI settle bound past every typical run releases the wait — a verifier decides on what CI never settled", async () => {
+    const r = await parkedReviewDuty("extwait rig F: unsettled CI past the bound releases the verifier", { type: "pr_required_checks", repo: REPO, pr: PR, head_sha: sha("8"), contexts: ["ci / Build"] });
+    const declared = (await card(r.id)).meta.execution_wait.declared_at as number;
+    expect((await drill(declared + 61 * 60_000)).ok).toBe(true);
+    const c = await card(r.id);
+    expect(c.meta.execution_wait).toBeUndefined();
+    expect(c.meta.execution_external_checks).toMatchObject({ released: "bound_exceeded" });
+    expect(c.status).toBe("todo");
+  });
+
+  it("ordinary accounting is untouched: a completed exit without a durable verdict still charges the budget", async () => {
+    const host = `extwait-${++execSerial}`;
+    const gateway = (await kbJson("/admin.mint", { label: host, tags: ["gateway"] })).body;
+    const identity = (await kbJson("/auth.identify", { bearer: gateway.secret })).body;
+    expect((await kbJson("/agent.provision", { label: `${host}/worker`, actor: host })).body.id ?? null).toBeTruthy();
+    const base = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `extwait-${execSerial}` };
+    expect((await kbJson("/execution", executorRequest({ ...base, id: "gateway", command_id: `adv-${execSerial}`, command: { kind: "advertise", capabilities: {
+      tier: "small", backend: "opencode", model: "test/small", tools: ["git"], environment: ["linux"], capacity: 1, projects: ["bridge"], worker: { kind: "provisioned", label: `${host}/worker` },
+    } } }))).body.error ?? null).toBeNull();
+    const id = (await kbJson("/create", executorRequest({ actor: host, type: "task", title: "extwait rig G: the BR#18314 shape stays charged", body_md: "returned after local tests, no publication, no durable continuation", project: "bridge", roles: ["impl"], qualified: true }))).body.id as string;
+    expect((await kbJson("/transition", executorRequest({ ...base, id, to: "in_progress" }))).body.error ?? null).toBeNull();
+    const exec = (command_id: string, command: object) => kbJson("/execution", executorRequest({ ...base, id, command_id, command }));
+    expect((await exec("begin", { kind: "begin", attempt_id: "one", worker: `${host}/worker`, action_budget_ms: 60_000 })).body.error ?? null).toBeNull();
+    const completed = { generation: 1, attempt_id: "one", writers: "process_group_empty", outcome: { kind: "completed", exit_code: 0, stdout_tail: "watch died with me", stderr_tail: "" } };
+    expect((await exec("stop", { kind: "stopped", ...completed })).body.error ?? null).toBeNull();
+    expect((await exec("finalize", { kind: "finalize", ...completed })).body.error ?? null).toBeNull();
+    const c = await card(id);
+    expect(c.status).toBe("todo");
+    expect(c.meta.execution_resume).toMatchObject({ kind: "terminal_result", generation: 1 });
+    const state = (await exec("inspect-state", { kind: "inspect" })).body;
+    expect(state.budget_exhaustions).toBe(1); // charged — unlike an await_external park
+    expect(state.failure_charged_generation).toBe(1);
   });
 });

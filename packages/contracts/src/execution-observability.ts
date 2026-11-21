@@ -55,6 +55,8 @@ export const ExecutionHistoryEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("local_handoff_requested"), handoff_id: z.string(), reason: z.string(), action: z.string(), next: z.string() }),
   z.object({ kind: z.literal("local_handoff_accepted"), handoff_id: z.string(), ...identity, host: z.string(), session: z.string() }),
   z.object({ kind: z.literal("local_handoff_returned"), handoff_id: z.string(), checkpoint_commit: z.string().nullable() }),
+  /** BR#18328 — the writer parked on its required external CI checks. */
+  z.object({ kind: z.literal("external_wait_declared"), generation: z.number(), repo: z.string(), pr: z.number(), head_sha: z.string(), contexts: z.array(z.string()) }),
 ]);
 export type ExecutionHistoryEvent = z.infer<typeof ExecutionHistoryEventSchema>;
 
@@ -67,6 +69,8 @@ export function executionCommandHistory(before: ExecutionState, after: Execution
     case "yield": return a ? { kind: "execution_yielded", generation: a.generation, destination: after.handoff.phase === "waiting" ? "local" : "agent_pool", minimum_tier: after.requirements.tier, checkpoint_commit: a.checkpoint?.commit ?? null } : null;
     case "local_handoff": return after.handoff.phase === "preparing" ? { kind: "local_handoff_requested", handoff_id: after.handoff.id,
       reason: command.reason, action: command.action, next: command.next } : null;
+    case "await_external": return { kind: "external_wait_declared", generation: after.generation,
+      repo: command.wait.repo, pr: command.wait.pr, head_sha: command.wait.head_sha, contexts: command.wait.contexts };
     default: return null; // polls/heartbeats/checkpoints are not user-facing history noise
   }
 }
@@ -79,5 +83,6 @@ export function executionHistorySummary(event: ExecutionHistoryEvent): string {
     case "local_handoff_requested": return `Local pickup required: ${event.action}. Why: ${event.reason}. Next: ${event.next}`;
     case "local_handoff_accepted": return `Local pickup accepted by ${event.session} on ${event.host}; model configured locally (${event.model ?? "ID unreported"})`;
     case "local_handoff_returned": return `Returned to autonomous execution${event.checkpoint_commit ? `; checkpoint ${event.checkpoint_commit}` : ""}`;
+    case "external_wait_declared": return `Parked on external CI checks: ${event.repo}#${event.pr} @ ${event.head_sha.slice(0, 12)} (${event.contexts.length} required context${event.contexts.length === 1 ? "" : "s"}) — the wake re-verifies first-hand`;
   }
 }

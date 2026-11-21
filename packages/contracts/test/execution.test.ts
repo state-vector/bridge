@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -374,5 +374,72 @@ describe("accepted recovery diagnosis stamps (BR#18198)", () => {
     const parsed = ExecutionStateSchema.parse(legacy);
     expect(parsed.attempt_diagnosis).toBeNull();
     expect(parsed.policy_version).toBe(1);
+  });
+});
+
+describe("durable external-CI waits (BR#18328)", () => {
+  const wait = { type: "pr_required_checks" as const, repo: "state-vector/superpositional", pr: 3644, head_sha: "3".repeat(40), contexts: ["ci / Build", "ci / Lodestar Scenarios"] };
+  const park = { kind: "await_external" as const, ...fence, writers: "process_group_empty" as const, wait };
+
+  it("parks the live attempt quiesced with no terminal evidence and no failure charge", () => {
+    const s = step(started(), park, 200);
+    expect(s.attempt?.phase).toBe("quiesced");
+    expect(s.terminal).toBeNull();
+    expect(s.budget_exhaustions).toBe(0);
+    expect(s.failure_charged_generation).toBe(0);
+    expect(s.external_wait).toMatchObject({ type: "pr_required_checks", repo: wait.repo, pr: wait.pr, head_sha: wait.head_sha, contexts: wait.contexts, generation: 1, attempt_id: "one", declared_at: 200 });
+    // Waiting is not a failed attempt: no admission hold, no recovery permit.
+    expect(executionAdmissionHold(s, "revision")).toBeNull();
+    expect(executionNeedsRecoveryPermit(s, "revision")).toBe(false);
+  });
+
+  it("replays an identical park durably but refuses a different signature once parked", () => {
+    const s = step(started(), park, 200);
+    expect(step(s, park, 300)).toEqual(s);
+    const amended = { ...park, wait: { ...wait, contexts: ["a different context set"] } };
+    expect(() => step(s, amended, 300)).toThrow(/only the live writer/);
+    expect(() => step(s, { ...park, wait: { ...wait, head_sha: "4".repeat(40) } }, 300)).toThrow(/only the live writer/);
+  });
+
+  it("re-keys prepared read-only check observations and refuses write-capable operations", () => {
+    let s = step(started(), { kind: "prepare", ...fence, operation_id: "watch", action: "gh run watch 44822825389 --exit-status --interval 30", input_revision: cp.commit, budget_ms: 1000 });
+    s = step(s, park, 200);
+    expect(s.operations[0]).toMatchObject({ id: "watch", state: "succeeded" });
+    expect(String(s.operations[0].receipts[0])).toContain("re-keyed");
+    const hostile = step(started(), { kind: "prepare", ...fence, operation_id: "merge", action: "gh pr merge 3644 --squash", input_revision: cp.commit, budget_ms: 1000 });
+    expect(() => step(hostile, park, 200)).toThrow(/merge.*not a read-only check observation/);
+    // a parked attempt can no longer run effects either — the attempt fence fires first
+    expect(() => step(s, { kind: "prepare", ...fence, operation_id: "late", action: "gh pr merge 3644", input_revision: cp.commit, budget_ms: 1000 })).toThrow(/lease expired or writer stopped/);
+  });
+
+  it("a new attempt clears the wait: a stale intent never parks a generation that did not declare it", () => {
+    let s = step(started(), { kind: "prepare", ...fence, operation_id: "watch", action: "gh pr checks 3644", input_revision: cp.commit, budget_ms: 1000 });
+    s = step(s, park, 200);
+    const next = step(s, { ...begin, attempt_id: "two" }, 300);
+    expect(next.generation).toBe(2);
+    expect(next.attempt?.phase).toBe("running");
+    expect(next.external_wait).toBeNull();
+    // the re-keyed observation no longer blocks the next begin
+    expect(next.operations[0].state).toBe("succeeded");
+  });
+
+  it("classifies GitHub check observation commands as the only re-keyable reads", () => {
+    for (const read of ["gh run watch 123 --exit-status", "gh run view 123", "gh run list --limit 5", "gh pr checks 3644", "gh pr view 3644 --json mergeable", "gh pr status 3644", "gh api repos/o/r/pulls/3644", "gh api -X GET repos/o/r/check-runs"]) {
+      expect(isReadOnlyCheckObservation(read)).toBe(true);
+    }
+    for (const write of ["gh pr merge 3644 --squash", "gh api -f body=hello repos/o/r/issues", "gh api -F body=hello repos/o/r/issues", "gh api --input payload.json repos/o/r", "gh api -X POST repos/o/r/check-runs", "gh run watch 123 && gh pr merge 3644", "cargo test --workspace", ""]) {
+      expect(isReadOnlyCheckObservation(write)).toBe(false);
+    }
+  });
+
+  it("coverage needs the same repo, PR and head plus every declared context", () => {
+    expect(externalWaitHeadMoved(wait, "4".repeat(40))).toBe(true);
+    expect(externalWaitHeadMoved(wait, wait.head_sha)).toBe(false);
+    const observed = { repo: wait.repo, pr: wait.pr, head_sha: wait.head_sha, contexts: ["ci / Build", "ci / Lodestar Scenarios", "extra / external=SUCCESS"] };
+    expect(externalWaitCoveredBy(wait, observed)).toBe(true); // extras are fine
+    expect(externalWaitCoveredBy(wait, { ...observed, head_sha: "4".repeat(40) })).toBe(false); // amended head
+    expect(externalWaitCoveredBy(wait, { ...observed, contexts: ["ci / Build"] })).toBe(false); // missing declared context
+    expect(externalWaitCoveredBy(wait, { ...observed, repo: "state-vector/bridge" })).toBe(false);
+    expect(externalWaitCoveredBy(wait, { ...observed, pr: 2 })).toBe(false);
   });
 });

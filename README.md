@@ -699,6 +699,32 @@ the fence-scoped same-UID `/proc` census — and only the resulting
 outcome. Drifted fences (newer generation, non-stopping phase, handoff or
 prepared operations) are skipped, never acted on.
 
+A verdict whose required hosted CI is still running parks durably instead of
+burning the slot (BR#18328): the live writer fences
+`{kind:"await_external", writers:"process_group_empty", wait:{type:"pr_required_checks", repo, pr, head_sha, contexts}}`
+— the exact repository, PR number, full 40-hex head SHA and required check
+contexts — and the attempt parks quiesced with **no terminal outcome and no
+failure charge**: waiting for CI never consumes the repair retry budget. The
+card returns to `todo` holding `meta.execution_wait` (held from dispatch as
+`independent_wait`, like capability waits — verdict duties never park
+`blocked`), the worker slot is released, and a read-only check observation the
+writer had prepared (`gh run watch`, `gh pr checks`) is re-keyed onto the wait
+so it cannot strand the next begin behind the unknown-operations gate;
+write-capable operations still gate the park. A head-bound probe
+(`extchecks:<repo>#<pr>@<sha>`) rides the ordinary executor probe queue, and the
+wake evaluator settles it exactly once: green at the bound head, conclusive
+failure, an amended head (which invalidates the old wait under the BR#3409
+head law — a green at the wrong head cannot wake anything), or past the CI
+settle bound releases the card for **one** fresh verifier generation. Duplicate
+check events collapse onto the single verdict of record. The wake is evidence,
+never acceptance: the fresh verifier re-verifies signature, mergeability and
+substance at the current head and records an independent structured verdict. A
+turn that ends without a park or a durable outcome — the local background
+`gh run watch` that dies with the worker — is still charged as an ordinary
+lost-result attempt (BR#18314's cost), so the launcher guidance tells writers to
+poll live with a declared grace window or park through `await_external` and
+never end the turn expecting a background watch to resume them.
+
 To retire a laptop from autonomous execution, an authenticated full agent or
 human uses `execution` with `id:"gateway"` and command
 `{kind:"gateway_control",host:"<hostname>",mode:"draining",reason:"<reason>"}`.

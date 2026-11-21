@@ -252,7 +252,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -354,6 +354,30 @@ export function proxyProbeKey(atom: Pick<ProxyAtom, "kind" | "repo" | "runId" | 
     return Number(atom.number ?? 0) > 0 ? `merged:${repo}#${Number(atom.number)}` : null;
   }
   return null;
+}
+
+/** BR#18328 — the head-bound checks probe key for a durable external-CI
+ *  wait. Deliberately NOT the prose-derived `checks:<repo>#<n>` grammar:
+ *  one row per awaited head (each amendment gets a fresh probe), latched
+ *  once per verdict of record, with expected_head set so the hub's BR#3409
+ *  head law classifies an amended head as a conclusive negative. */
+export function externalChecksProbeKey(wait: { repo: string; pr: number; head_sha: string }): string {
+  return `extchecks:${wait.repo.trim()}#${wait.pr}@${wait.head_sha.toLowerCase()}`;
+}
+export function parseExternalChecksProbeKey(key: string): { repo: string; pr: number; head_sha: string } | null {
+  const m = /^extchecks:([^#\s]+)#(\d+)@([0-9a-f]{40})$/.exec(key);
+  return m ? { repo: m[1], pr: Number(m[2]), head_sha: m[3] } : null;
+}
+/** BR#18328 — the optional observed-checks payload an executor feeds with a
+ *  pr_checks_green verdict ("NAME=STATE" strings). Additive evidence: old
+ *  executors omit it and the hub treats satisfied-at-the-awaited-head as
+ *  coverage (the wake verifier still re-checks first-hand). */
+function parseProbeContexts(input: unknown): string | null {
+  if (!Array.isArray(input)) return null;
+  const list = input.map(c => String(c ?? "").trim())
+    .filter(c => /^[\w .,\-()/]{1,160}=(SUCCESS|NEUTRAL|SKIPPED|FAILURE|ERROR|CANCELLED|TIMED_OUT|STARTUP_FAILURE|ACTION_REQUIRED|EXPECTED|PENDING|QUEUED|IN_PROGRESS|NOT_FOUND)$/i.test(c))
+    .slice(0, 64);
+  return list.length ? JSON.stringify(list) : null;
 }
 
 /** The hub-side head law (BR#3409 / BR#4658): the observed head matches the
@@ -1335,6 +1359,15 @@ export class KnowledgeHub {
       this.audit("hub:proxy-watch", "sweep_error", "unblock_proxy_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
     }
 
+    // (F2) BR#18328 — the durable external-CI wait evaluator: todo cards
+    // parked on required checks wake exactly once when their head-bound
+    // probe settles (green, conclusive-failing, head-moved or bound).
+    try {
+      this.sweepExternalWaits(now);
+    } catch (e) {
+      this.audit("hub:proxy-watch", "sweep_error", "external_waits_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+
     // (G) train-watch (BR#3516): the hub's credential-free half of the merge
     // train — lane lease staleness. A lease past its expiry with no live
     // heartbeat means the executor died/went to sleep: the lane card shows
@@ -2140,7 +2173,7 @@ export class KnowledgeHub {
   private proxyProbes(body: any): any {
     const limit = Math.max(1, Math.min(Number(body?.limit ?? 10) || 10, 25));
     const rows = this.state.storage.sql.exec(
-      `SELECT CASE WHEN kind='pr_checks_green' AND ok IS NOT NULL THEN key || '@' || updated_ts ELSE key END AS key,
+      `SELECT CASE WHEN kind='pr_checks_green' AND key NOT LIKE 'extchecks:%' AND ok IS NOT NULL THEN key || '@' || updated_ts ELSE key END AS key,
          repo, kind, run_id, newer_than, pr, expected_head, card_id, attempts FROM proxy_probes
        WHERE state = 'pending' ORDER BY updated_ts ASC LIMIT ?`,
       limit,
@@ -2160,7 +2193,7 @@ export class KnowledgeHub {
     const key = presentedKey.startsWith("checks:") ? presentedKey.split("@", 1)[0] : presentedKey;
     const probe = this.one(`SELECT * FROM proxy_probes WHERE key = ?`, key) as any;
     if (!probe) return { ok: false, error: `no such probe: ${key}` };
-    if (probe.kind === "pr_checks_green" && probe.ok !== null &&
+    if (probe.kind === "pr_checks_green" && probe.ok !== null && !key.startsWith("extchecks:") &&
       (probe.state !== "pending" || presentedKey !== `${key}@${probe.updated_ts}`)) {
       return { ok: false, error: "PR check observation belongs to a previous probe" };
     }
@@ -2189,8 +2222,8 @@ export class KnowledgeHub {
         return { ok: false, error: "receipt must carry the GitHub URL(s) of the evidence (BR#4658 contract)" };
       }
       this.state.storage.sql.exec(
-        `UPDATE proxy_probes SET state = 'verified', ok = 1, receipt = ?, head_sha = ?, conclusion = ?, error = NULL, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
-        receipt.slice(0, 500), headSha || null, conclusion || null, now, key,
+        `UPDATE proxy_probes SET state = 'verified', ok = 1, receipt = ?, head_sha = ?, conclusion = ?, error = NULL, contexts = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+        receipt.slice(0, 500), headSha || null, conclusion || null, parseProbeContexts(body?.contexts), now, key,
       );
       if (probe.kind === "pr_merged" && conclusion === "MERGED" && /^[0-9a-f]{40}$/.test(headSha)
         && receipt === `https://github.com/${probe.repo}/pull/${probe.pr}`) {
@@ -2216,8 +2249,8 @@ export class KnowledgeHub {
       const ev = receipt && /https:\/\/github\.com\//.test(receipt) ? receipt : `https://github.com/${probe.repo}/actions`;
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(
-          `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
-          ev.slice(0, 500), headSha || null, conclusion || null, why, now, key,
+          `UPDATE proxy_probes SET state = 'verified', ok = 0, receipt = ?, head_sha = ?, conclusion = ?, error = ?, contexts = ?, attempts = attempts + 1, updated_ts = ? WHERE key = ?`,
+          ev.slice(0, 500), headSha || null, conclusion || null, why, parseProbeContexts(body?.contexts), now, key,
         );
         if (prClosed) this.recordDeliveryPrOutcome(String(probe.repo), Number(probe.pr), "CLOSED", null, null, now);
       });
@@ -2242,6 +2275,98 @@ export class KnowledgeHub {
     return { ok: true, verdict: attempts >= PROBE_ATTEMPT_CAP ? "exhausted" : "retry", attempts };
   }
 
+
+  /** BR#18328 — the wake evaluator for durable external-CI waits. todo cards
+   *  holding meta.execution_wait {kind:"external_checks"} are held from
+   *  dispatch (independent_wait, via isExecutionWait) while their head-bound
+   *  `extchecks:` probe settles through the ordinary executor probe queue:
+   *  - verified ok=1 at the awaited head → the gate fired: clear the wait,
+   *    ride the receipts on the card. The next reserve is ONE fresh verifier
+   *    generation — the wake is evidence, never acceptance (the verifier
+   *    re-checks signature, mergeability and substance at the current head).
+   *  - verified ok=0 → conclusive: a head mismatch (BR#3409 law) INVALIDATES
+   *    the old wait; failing checks still reach a verifier (green AND red
+   *    both wake — the verdict must be rendered against reality).
+   *  - pending/failed → re-arm on the shared probe backoff; past the CI
+   *    settle bound (TRAIN_CI_TYPICAL_MINUTES × TRAIN_CI_BOUND_MULTIPLIER,
+   *    the train's ladder) release the park — a verifier decides on what CI
+   *    never settled. A fed contexts payload that lacks a declared required
+   *    context is NOT coverage — re-arm and let the bound decide.
+   *  The sweep only clears waits and stamps evidence: it never flips a
+   *  verdict, never charges the retry budget, and each card wakes exactly
+   *  once (clearing the wait removes it from the matched set). */
+  private sweepExternalWaits(now: number): void {
+    const boundMin = TRAIN_CI_TYPICAL_MINUTES * TRAIN_CI_BOUND_MULTIPLIER;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, meta FROM artefacts WHERE type='task' AND status='todo' AND owner=''
+        AND json_extract(meta,'$.execution_wait.kind')='external_checks' LIMIT 50`,
+    ).toArray() as any[];
+    for (const row of rows) {
+      const id = String(row.id);
+      let meta: any;
+      try { meta = JSON.parse(String(row.meta ?? "{}")); } catch { continue; }
+      const wait = meta?.execution_wait;
+      if (wait?.kind !== "external_checks" || !wait.await?.repo || !wait.await?.pr || !/^[0-9a-f]{40}$/.test(String(wait.await.head_sha ?? ""))) continue;
+      const key = externalChecksProbeKey(wait.await);
+      const probe = this.one(`SELECT state, ok, receipt, head_sha, error, contexts, attempts, updated_ts FROM proxy_probes WHERE key = ?`, key) as any;
+      if (!probe) {
+        // The probe row predates neither the park nor a restart — (re)create it.
+        this.state.storage.sql.exec(
+          `INSERT INTO proxy_probes (key, repo, kind, run_id, newer_than, pr, expected_head, card_id, state, attempts, created_ts, updated_ts)
+           VALUES (?, ?, 'pr_checks_green', NULL, NULL, ?, ?, ?, 'pending', 0, ?, ?)
+           ON CONFLICT(key) DO NOTHING`,
+          key, String(wait.await.repo), Number(wait.await.pr), String(wait.await.head_sha), id, now, now,
+        );
+        continue;
+      }
+      if (probe.state !== "verified") {
+        if (now - Number(wait.declared_at ?? 0) > boundMin * 60_000) {
+          meta.execution_external_checks = { released: "bound_exceeded", probe: key, error: String(probe.error ?? ""), at: now };
+          delete meta.execution_wait;
+          this.state.storage.sql.exec(`UPDATE artefacts SET updated_ts=?, meta=? WHERE id=?`, now, JSON.stringify(meta), id);
+          this.version(id, "hub:proxy-watch", "external_wait_released",
+            `External CI wait released on the ${boundMin}m settle bound — checks never conclusively settled; the verifier decides on current evidence (BR#18328)`, { probe: key });
+          this.audit("hub:proxy-watch", "external_wait_bound_exceeded", key, { card: id });
+        } else if (probe.state === "failed" && now - Number(probe.updated_ts ?? 0) >= PROBE_RETRY_MS
+          && Number(probe.attempts ?? 0) < PROBE_ATTEMPT_CAP) {
+          this.state.storage.sql.exec(`UPDATE proxy_probes SET state='pending', updated_ts=? WHERE key=?`, now, key);
+        }
+        continue;
+      }
+      // One latched verdict of record. Coverage: a fed contexts payload must
+      // contain every declared required context at the awaited head — an
+      // executor satisfied verdict without the names still counts (old
+      // executor; the wake verifier re-checks first-hand either way).
+      const observed: string[] | null = (() => {
+        if (probe.contexts === null || probe.contexts === undefined) return null;
+        try { const v = JSON.parse(String(probe.contexts)); return Array.isArray(v) ? v.map(String) : null; } catch { return null; }
+      })();
+      const headSha = String(probe.head_sha ?? "").toLowerCase();
+      if (Number(probe.ok) === 1 && observed && !externalWaitCoveredBy(wait.await, {
+        repo: String(wait.await.repo), pr: Number(wait.await.pr), head_sha: headSha,
+        contexts: observed.map(c => c.split("=", 1)[0] ?? ""),
+      })) {
+        this.state.storage.sql.exec(`UPDATE proxy_probes SET state='pending', updated_ts=? WHERE key=?`, now, key);
+        continue;
+      }
+      const headMoved = Number(probe.ok) !== 1 && /head mismatch/i.test(String(probe.error ?? ""));
+      meta.execution_external_checks = {
+        outcome: Number(probe.ok) === 1 ? "checks_green" : headMoved ? "head_moved" : "checks_failed",
+        probe: key, receipt: String(probe.receipt ?? ""), head_sha: headSha || null,
+        contexts: observed, error: String(probe.error ?? ""), at: now,
+      };
+      delete meta.execution_wait;
+      this.state.storage.sql.exec(`UPDATE artefacts SET updated_ts=?, meta=? WHERE id=?`, now, JSON.stringify(meta), id);
+      const note = Number(probe.ok) === 1
+        ? `External CI checks GREEN at the awaited head ${headSha.slice(0, 12)} — wait released for ONE fresh verifier generation; the wake is evidence, never acceptance (BR#18328)`
+        : headMoved
+          ? `External CI wait INVALIDATED — PR head moved off the awaited ${String(wait.await.head_sha).slice(0, 12)} (${String(probe.error ?? "").slice(0, 180)}); a fresh verifier re-binds at the current head (BR#18328)`
+          : `External CI checks conclusively NOT green — ${String(probe.error ?? "").slice(0, 180)}; the verifier records the verdict against the current head (BR#18328)`;
+      this.version(id, "hub:proxy-watch", "external_wait_settled", note,
+        { probe: key, ok: Number(probe.ok), receipt: String(probe.receipt ?? "").slice(0, 300), head_sha: headSha || null });
+      this.audit("hub:proxy-watch", Number(probe.ok) === 1 ? "external_wait_wake" : headMoved ? "external_wait_invalidated" : "external_wait_negative_wake", key, { card: id });
+    }
+  }
 
   private async unblockProxySweep(now: number): Promise<void> {
     const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("unblock_proxy_sweep_minutes", "15"), 10) || 15));
@@ -4157,6 +4282,7 @@ export class KnowledgeHub {
         head_sha TEXT,            -- the observed head at verification time
         conclusion TEXT,          -- the observed run conclusion / checks verdict
         error TEXT,               -- last transient gh failure (state=failed)
+        contexts TEXT,            -- BR#18328: JSON ["NAME=STATE", ...] observed at the verified head
         attempts INTEGER NOT NULL DEFAULT 0,
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL
@@ -4207,6 +4333,7 @@ export class KnowledgeHub {
       `ALTER TABLE lane_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
       `ALTER TABLE train_check_retries ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE proxy_probes ADD COLUMN contexts TEXT`, // BR#18328: observed check names+states at the verified head
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
     }
@@ -5076,6 +5203,7 @@ export class KnowledgeHub {
         case "admin.stall_sweep":
         case "admin.startup_sweep":
         case "admin.awaiting_requeue_sweep":
+        case "admin.external_waits_sweep":
         case "admin.verify_verdict_sweep":
         case "admin.ask_escalation_sweep":
         case "admin.question_claim_sweep":
@@ -5120,6 +5248,14 @@ export class KnowledgeHub {
             // the pass itself is clockless (verdict coverage, not age).
             const flipped = await this.awaitingRequeueSweep(Number(body.now ?? Date.now()));
             return this.json({ ok: true, flipped });
+          }
+          if (op === "admin.external_waits_sweep") {
+            // BR#18328 drill/liveness path: runs ONLY the external-CI wake
+            // evaluator (park probe settlement → one wake / invalidation /
+            // bound release). Pass now=<future epoch ms> to place parks past
+            // their settle bound.
+            this.sweepExternalWaits(Number(body.now ?? Date.now()));
+            return this.json({ ok: true });
           }
           if (op === "admin.verify_verdict_sweep") {
             // drill/liveness path for the BR#5377 F4 adoption pass: runs ONLY
@@ -7301,14 +7437,14 @@ export class KnowledgeHub {
       const receipt = this.one(`SELECT command_id,request,result FROM execution_commands
         WHERE task_id=? AND json_extract(request,'$.actor')=? AND json_extract(request,'$.session')=?
         AND json_extract(request,'$.command.generation')=? AND json_extract(request,'$.command.attempt_id')=?
-        AND json_extract(request,'$.command.kind') IN ('quiesce','stopped','finalize') ORDER BY rowid DESC LIMIT 1`,
+        AND json_extract(request,'$.command.kind') IN ('quiesce','await_external','stopped','finalize') ORDER BY rowid DESC LIMIT 1`,
         req.id, actor, req.session, command.generation, command.attempt_id);
       if (!receipt) return { kind: "writer_receipt_missing" };
       const storedRequest: unknown = JSON.parse(String(receipt.request));
       if (!storedRequest || typeof storedRequest !== "object" || !("command" in storedRequest)) return { kind: "writer_receipt_missing" };
       const stored = ExecutionRequestSchema.shape.command.safeParse(storedRequest.command);
       const state = ExecutionStateSchema.safeParse(JSON.parse(String(receipt.result)));
-      if (!stored.success || !["quiesce", "stopped", "finalize"].includes(stored.data.kind)
+      if (!stored.success || !["quiesce", "await_external", "stopped", "finalize"].includes(stored.data.kind)
         || !("writers" in stored.data) || !state.success) return { kind: "writer_receipt_missing" };
       const attempt = state.data.attempt;
       if (!attempt || attempt.phase !== "quiesced" || attempt.host !== actor || attempt.session !== req.session
@@ -7463,8 +7599,8 @@ export class KnowledgeHub {
       workerTokenId = child.id;
       begunExecutor = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: [], inventory_revision: inventory.inventory_revision });
       this.state.storage.sql.exec(`DELETE FROM executor_start_barriers WHERE token_id = ?`, tokenId);
-    } else if (["poll", "restore", "checkpoint", "quiesce", "stopped", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
-      throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence");
+    } else if (["poll", "restore", "checkpoint", "quiesce", "await_external", "stopped", "finalize"].includes(command.kind) && (!gateway || actor !== attemptHost)) {
+      throw new Error("gate: only the authenticated originating runner can attest checkpoint/restoration/process quiescence/external waits");
     }
     if (current.failure_charged_generation === null && current.attempt) {
       const generation=current.attempt.generation;
@@ -7481,6 +7617,11 @@ export class KnowledgeHub {
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
     const currentClaim = row.status === "in_progress" && meta.session === session;
     const finalizeCurrentClaim = command.kind === "finalize" && currentClaim;
+    // BR#18328 — the durable external-CI park takes the claim with it: the
+    // card returns to todo holding the wait signature, the worker slot is
+    // released charge-free, and the head-bound probe + wake evaluator own
+    // the rest (no live runner watches CI — that was the BR#18314 loss).
+    const awaitExternalClaim = command.kind === "await_external" && currentClaim;
     // Finalize can leave the claim in place while an external effect is unknown.
     // A later receipt may release that exact claim, but only after durable
     // finalization, and only when every effect is resolved.
@@ -7504,9 +7645,16 @@ export class KnowledgeHub {
       meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
-    const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) } : next;
+    const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) }
+      : command.kind === "await_external" ? { ...next, task_status: awaitExternalClaim ? "todo" : String(row.status) }
+      : next;
     this.state.storage.transactionSync(() => {
-      if (command.kind === "begin") this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+      if (command.kind === "begin") {
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+        // BR#18328 — a new attempt invalidates any standing external wait:
+        // the intent was scoped to the attempt that declared it.
+        if (meta.execution_wait?.kind === "external_checks") delete meta.execution_wait;
+      }
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
       // Control polls do not authorise external effects. Keep a bounded replay
@@ -7526,6 +7674,28 @@ export class KnowledgeHub {
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
         this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
         this.version(req.id, actor, "execution_terminal", "Writer stopped; captured result awaits reconciliation through the hub scheduler, not inferred completion", { generation: next.generation, outcome: next.terminal?.outcome.kind ?? "unknown" });
+      } else if (awaitExternalClaim) {
+        // BR#18328 — the durable external-CI park. The attempt is quiesced in
+        // execution_state with NO terminal outcome and NO failure charge:
+        // waiting for required CI checks is not a failed attempt (the
+        // finalize charge site is never reached). The card returns to TODO —
+        // verdict duties never park blocked (BR#4392) — holding the exact
+        // repo/PR/head/contexts signature; isExecutionWait holds the
+        // scheduler (independent_wait) until the head-bound probe settles
+        // and sweepExternalWaits clears the wait: one wake, one fresh
+        // verifier generation.
+        meta.execution_wait = { kind: "external_checks", await: command.wait, generation: next.generation, attempt_id: command.attempt_id, declared_at: now };
+        delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
+        this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',status_ts=?,updated_ts=?,meta=? WHERE id=?`, now, now, JSON.stringify(meta), req.id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+        this.state.storage.sql.exec(
+          `INSERT INTO proxy_probes (key, repo, kind, run_id, newer_than, pr, expected_head, card_id, state, attempts, created_ts, updated_ts)
+           VALUES (?, ?, 'pr_checks_green', NULL, NULL, ?, ?, ?, 'pending', 0, ?, ?)
+           ON CONFLICT(key) DO NOTHING`,
+          externalChecksProbeKey(command.wait), command.wait.repo, command.wait.pr, command.wait.head_sha, req.id, now, now,
+        );
+        this.audit("hub:proxy-watch", "proxy_probe_enqueued", externalChecksProbeKey(command.wait), { card: req.id, kind: "external_checks", head: command.wait.head_sha });
       } else if (command.kind === "yield" || finalizedLocalHandoff) {
         delete meta.session;
         const local = next.handoff.phase === "waiting" ? next.handoff : null;

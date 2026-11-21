@@ -11,7 +11,7 @@ import { ExecutionModelIdentitySchema, type ExecutionHistoryEvent } from "@bridg
 
 interface TaskRow { id: string; title: string; project: string; status: string; owner: string; meta: string; updated_ts: number }
 interface Credential { id: string; label: string; principal: string | null; tags: string; revoked_ts: number | null }
-interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" }; blocked?: unknown; session?: string; [key: string]: unknown }
+interface TaskMeta { execution_requirements?: unknown; execution_wait?: { kind: "capability" } | { kind: "external_checks" }; blocked?: unknown; session?: string; [key: string]: unknown }
 interface HostInventory { tokenId: string; host: string; capabilities: ExecutorCapabilities; observed_at: number;
   active: number; occupancy?: ReturnType<typeof gatewayOccupancy>["occupancy"] }
 /** BR#14761: already-fetched artefact columns a page holds in hand. Passing
@@ -40,7 +40,11 @@ export const CAPABILITY_SWEEP_SQL = `SELECT rowid AS sweep_cursor,id,title,body_
   ORDER BY rowid LIMIT 25`;
 export function isExecutionWait(meta: TaskMeta): boolean {
   const b = meta.blocked as { await_event?: { event?: string } } | undefined;
-  return b?.await_event?.event === "local_handoff" || b?.await_event?.event === "executor_capability";
+  if (b?.await_event?.event === "local_handoff" || b?.await_event?.event === "executor_capability") return true;
+  // BR#18328 — a todo card parked on the durable external-CI wait holds the
+  // scheduler the same way (independent_wait): the wake evaluator, not the
+  // reserve loop, releases it, so no slot is burned polling CI.
+  return meta.execution_wait?.kind === "external_checks";
 }
 export function interactiveCredential(token: Credential | null): boolean {
   if (!token || token.revoked_ts) return false;
