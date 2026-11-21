@@ -21,6 +21,13 @@ beforeEach(async () => {
     export class SchedulingRig extends KnowledgeHub {
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        if (path === "/fixture/legacy-route-observation") {
+          const { host } = await request.json();
+          this.state.storage.sql.exec(
+            "UPDATE managed_review_route_success SET proof=json_remove(proof, '$.witness.assignment') WHERE host=?", host,
+          );
+          return Response.json({ ok: true });
+        }
         if (path === "/fixture/expired-stopping") {
           const { id } = await request.json();
           const row = this.state.storage.sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0];
@@ -444,9 +451,10 @@ describe("eligibility-first scheduling on real SQLite", () => {
   });
 
   it("uses a fresh managed review prompt once for an exact-route retry", async () => {
-    const project = "managed-review-recovery", g = await gateway(project, 2);
-    const otherModel = { ...g.capabilities, model: "test/different" };
-    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [otherModel] } });
+    const project = "managed-review-recovery", g = await gateway(project, 7);
+    const otherModels = Array.from({ length: 4 }, (_, i) => ({ ...g.capabilities, model: `test/different-${i}` }));
+    const [otherModel] = otherModels;
+    await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: otherModels } });
     const failed = { kind: "failed", exit_code: null, stdout_tail: "",
       stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
     const completed = { kind: "completed", exit_code: 0, stdout_tail: "Checked the change", stderr_tail: "" };
@@ -473,27 +481,55 @@ describe("eligibility-first scheduling on real SQLite", () => {
       expect(result.error).toBeUndefined();
       expect(await g.cmd(finalize, commandId, id, session)).toEqual(result);
     }
-    async function observation(model: string, observed?: number) {
-      const id = await review();
-      await finalize(await begin(id, model), { ...completed, acp_prompt_observed_at: observed });
-      expect((await post("update", { id, meta: { operator_gated: true } })).error).toBeUndefined();
+    async function completeObservation(attempt: Awaited<ReturnType<typeof begin>>, observed?: number) {
+      await finalize(attempt, { ...completed, acp_parent_prompt_observed_at: observed });
+      expect((await post("update", { id: attempt.id, meta: { operator_gated: true } })).error).toBeUndefined();
+    }
+    async function observation(model: string, observe?: () => number) {
+      const attempt = await begin(await review(), model);
+      await completeObservation(attempt, observe?.());
     }
     const id = await review();
     await finalize(await begin(id), failed);
     await observation(g.capabilities.model); // An older runner provides only exit status.
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
-    await observation(otherModel.model, Date.now());
+    await observation(otherModel.model, Date.now);
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
-    await observation(g.capabilities.model, Date.now() - 301_000);
+    await observation(g.capabilities.model, () => Date.now() - 301_000);
+    const beforeSourceBegan = Date.now();
+    await observation(g.capabilities.model, () => beforeSourceBegan);
+    const retagged = await begin(await task(project));
+    expect((await post("update", { id: retagged.id, roles: ["review"] })).error).toBeUndefined();
+    await completeObservation(retagged, Date.now());
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
-    await observation(g.capabilities.model, Date.now());
+
+    const legacyRunner = await begin(await review());
+    await finalize(legacyRunner, { ...completed, acp_prompt_observed_at: Date.now() });
+    expect((await post("update", { id: legacyRunner.id, meta: { operator_gated: true } })).error).toBeUndefined();
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+
+    const retaggedTarget = await begin(await task(project));
+    await finalize(retaggedTarget, failed);
+    expect((await post("update", { id: retaggedTarget.id, roles: ["review"] })).error).toBeUndefined();
+
+    // Complete the exact review, then four newer reviews on different models
+    // before the next reserve. Unrelated observations must never mask it.
+    const exact = await begin(await review());
+    const unrelated = [];
+    for (const model of otherModels) unrelated.push(await begin(await review(), model.model));
+    const exactObservedAt = Date.now();
+    await observation(g.capabilities.model, Date.now);
+    expect(await post("fixture/legacy-route-observation", { host: g.host })).toEqual({ ok: true });
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
+    await completeObservation(exact, exactObservedAt);
+    for (const attempt of unrelated) await completeObservation(attempt, Date.now());
     const retry = await begin(id, g.capabilities.model, 2);
     expect(retry.result).toMatchObject({ generation: 2, budget_exhaustions: 0, recovery_permit: {
       phase: "consumed", proof: { witness: { kind: "managed_review_prompt", project, tier: "small" } },
     } });
     await finalize(retry, failed);
-    await observation(g.capabilities.model, Date.now());
-    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+    await observation(g.capabilities.model, Date.now);
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 2 } });
   });
 
   it("requires a witnessed request on a replacement route before reservation and begin", async () => {

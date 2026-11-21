@@ -629,6 +629,13 @@ import { LaneStore, LANE_REVISION, LANE_RUNTIME_KEYS, LANE_VIEW_SQL } from "./la
 import type { HubRequestStage } from "@bridge/contracts";
 import type { ExecutorReadiness } from "@bridge/contracts";
 
+type ManagedReviewProof = ReturnType<typeof ManagedReviewRouteProofSchema.parse>;
+type ProviderRoute = { backend: string; model: string; config_revision: string };
+
+function managedReviewRouteKey(project: string, route: ProviderRoute & { tier: string }): string {
+  return JSON.stringify([project, route.backend, route.model, route.config_revision, route.tier]);
+}
+
 export class KnowledgeHub {
   constructor(private state: DurableObjectState, private env: any) {}
   private readonly schemaInitialization = new SchemaInitialization();
@@ -4037,6 +4044,9 @@ export class KnowledgeHub {
       CREATE INDEX IF NOT EXISTS execution_proxy_grant_receipts ON execution_commands(json_extract(result,'$.permit.proof.id'))
         WHERE json_extract(result,'$.kind')='provider_recovery_granted'
           AND json_extract(result,'$.permit.proof.witness.kind')='configured_proxy_request';
+      CREATE INDEX IF NOT EXISTS execution_reserved_session ON execution_commands(
+        task_id, json_extract(result,'$.session')
+      ) WHERE json_extract(result,'$.kind')='reserved';
       CREATE INDEX IF NOT EXISTS execution_writer_receipts ON execution_commands(
         task_id, json_extract(request, '$.actor'), json_extract(request, '$.session'),
         json_extract(request, '$.command.generation'), json_extract(request, '$.command.attempt_id')
@@ -6513,11 +6523,11 @@ export class KnowledgeHub {
 
   /** One eligibility predicate for discovery and reservations. No global top-N
    * window: incompatible tasks cannot hide compatible work further down. */
-  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: { backend: string; model: string; config_revision: string; review?: { project: string; tier: string } },
+  private dispatchCandidates(tokenId: string, host: string, capabilities: ExecutorCapabilities | null, taskIds?: string[], retryRoute?: ProviderRoute,
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
      *  host-inventory/readiness/policy read across the reopen + selection. */
-    work: ExecutionWork = this.executionWork()) {
+    work: ExecutionWork = this.executionWork(), reviewProofs?: ReadonlyMap<string, ManagedReviewProof>) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
@@ -6544,7 +6554,7 @@ export class KnowledgeHub {
       ...(taskIds ? [JSON.stringify(taskIds)] : []),
     ).toArray();
     const taskHolds = new Map<string, SchedulingReason>();
-    const routeCandidates: { id: string; created: number }[] = [];
+    const routeCandidates: { id: string; created: number; proof?: ManagedReviewProof }[] = [];
     const sinks = this.alarmSinkIds();
     let readiness: ExecutorReadiness | undefined;
     // BR#14767 — per-sweep bulk prefetch: every per-row helper below hit its
@@ -6645,21 +6655,25 @@ export class KnowledgeHub {
           }
         }
       }
-      if (retryRoute && reason === "provider_route" && state?.terminal && state.attempt?.host === host
-        && state.attempt.executor?.backend === retryRoute.backend && state.attempt.executor.model === retryRoute.model
-        && state.attempt.executor.config_revision === retryRoute.config_revision
-        && (!retryRoute.review || (row.project === retryRoute.review.project
-          && state.attempt.executor.tier === retryRoute.review.tier && parseTags(row.roles).includes("review")))
-        && capabilities && [capabilities, ...capabilities.alternatives].some(candidate =>
-          candidate.backend === retryRoute.backend && candidate.model === retryRoute.model
-          && candidate.config_revision === retryRoute.config_revision
-          && (!retryRoute.review || candidate.tier === retryRoute.review.tier)
-          && usableFor(schedulingRequirements(), candidate, host, String(row.project ?? "")))
-        && state.terminal.generation === state.attempt.generation && state.terminal.attempt_id === state.attempt.attempt_id
-        && providerRecoveryDiagnosis(state.terminal.outcome) === "provider_route_unavailable"
-        && !this.providerTrialConsumed(id, String(meta.work_revision ?? "legacy"),
-          retryRoute.review ? "managed_review_prompt" : "configured_proxy_request")) {
-        routeCandidates.push({ id, created: Number(row.created_ts) });
+      const attempt = state?.attempt;
+      if ((retryRoute || reviewProofs) && reason === "provider_route" && state?.terminal
+        && attempt?.host === host && attempt.executor && capabilities) {
+        const project = String(row.project ?? "");
+        const proof = reviewProofs && parseTags(row.roles).includes("review")
+          ? reviewProofs.get(managedReviewRouteKey(project, attempt.executor)) : undefined;
+        const route = retryRoute ?? proof;
+        if (route && attempt.executor.backend === route.backend && attempt.executor.model === route.model
+          && attempt.executor.config_revision === route.config_revision
+          && [capabilities, ...capabilities.alternatives].some(candidate =>
+            candidate.backend === route.backend && candidate.model === route.model
+            && candidate.config_revision === route.config_revision
+            && (!proof || candidate.tier === proof.witness.tier)
+            && usableFor(schedulingRequirements(), candidate, host, project))
+          && (!proof || this.hasManagedReviewAssignment(tokenId, id, attempt.session, project, String(meta.work_revision ?? "legacy")))
+          && !this.providerTrialConsumed(id, String(meta.work_revision ?? "legacy"),
+            proof ? "managed_review_prompt" : "configured_proxy_request")) {
+          routeCandidates.push({ id, created: Number(row.created_ts), proof });
+        }
       }
       if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
       return true;
@@ -6678,7 +6692,8 @@ export class KnowledgeHub {
       || Number(String(a.queue_id).slice(3)) - Number(String(b.queue_id).slice(3))
       || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
-    return { eligible, entries, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id) };
+    return { eligible, entries, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id),
+      managedRouteCandidates: routeCandidates.flatMap(({ id, proof }) => proof ? [{ id, proof }] : []) };
   }
 
   private boardDispatch(ids: string[], now: number): Map<string, GatewayDispatch> {
@@ -7205,19 +7220,38 @@ export class KnowledgeHub {
     }
   }
 
+  private hasManagedReviewAssignment(tokenId: string, taskId: string, session: string, project: string, revision: string): boolean {
+    // The worker builds its prompt from this reservation snapshot. Current
+    // card tags and roles can change while the assigned worker is running.
+    return !!this.one(`SELECT 1 FROM execution_commands
+      WHERE task_id=? AND json_extract(result,'$.kind')='reserved'
+        AND json_extract(result,'$.session')=? AND json_extract(result,'$.task.id')=?
+        AND json_extract(result,'$.task.project')=?
+        AND COALESCE(json_extract(result,'$.task.meta.work_revision'),'legacy')=?
+        AND EXISTS (SELECT 1 FROM json_each(result,'$.task.roles') WHERE value='review')
+      LIMIT 1`, "schedule:" + tokenId, session, taskId, project, revision);
+  }
+
   private recoverManagedReviewRoute(body: Record<string, unknown>, tokenId: string, host: string,
     capabilities: ExecutorCapabilities, now: number): boolean {
     const observations = this.state.storage.sql.exec(
-      `SELECT proof FROM managed_review_route_success WHERE host=? AND observed_at>? AND observed_at<=?
-       ORDER BY observed_at DESC LIMIT 4`, host, now - 300_000, now,
+      `SELECT o.proof FROM managed_review_route_success o
+       WHERE o.host=? AND o.observed_at>? AND o.observed_at<=?
+         AND json_extract(o.proof,'$.witness.assignment')='reserved_review_v1'
+         AND NOT EXISTS (SELECT 1 FROM execution_commands c
+           WHERE c.task_id=? AND c.command_id=json_extract(o.proof,'$.id'))`,
+      host, now - 300_000, now, "provider-route:" + host,
     ).toArray();
+    if (!observations.length) return false;
+    const proofs = new Map<string, ManagedReviewProof>();
     for (const row of observations) {
       const proof = ManagedReviewRouteProofSchema.parse(JSON.parse(String(row.proof)));
-      const key = "provider-route:" + host;
-      if (this.one(`SELECT 1 FROM execution_commands WHERE task_id=? AND command_id=?`, key, proof.id)) continue;
-      const route = { ...proof, review: proof.witness };
-      const candidates = this.dispatchCandidates(tokenId, host, capabilities, undefined, route).routeCandidates;
-      const result = this.grantProviderRouteBatch(body, "system:scheduler", proof, candidates, 1, JSON.stringify(proof));
+      proofs.set(managedReviewRouteKey(proof.witness.project, { ...proof, tier: proof.witness.tier }), proof);
+    }
+    const { managedRouteCandidates } = this.dispatchCandidates(tokenId, host, capabilities,
+      undefined, undefined, this.executionWork(), proofs);
+    for (const { id, proof } of managedRouteCandidates) {
+      const result = this.grantProviderRouteBatch(body, "system:scheduler", proof, [id], 1, JSON.stringify(proof));
       if (result.granted.length) return true;
     }
     return false;
@@ -7718,20 +7752,35 @@ export class KnowledgeHub {
       if (command.kind === "finalize" && command.outcome.kind === "completed"
         && current.attempt && reviewExecutor?.backend === "opencode" && reviewHost && typeof row.project === "string" && row.project.length
         && parseTags(row.roles).includes("review")) {
-        const observed = command.outcome.acp_prompt_observed_at;
-        if (observed && observed <= now && now - observed < 300_000) {
+        const observed = command.outcome.acp_parent_prompt_observed_at;
+        // Bind the gateway timestamp to this exact source attempt's immutable
+        // begin receipt. The original deadline embeds the hub's begin time.
+        const begin = observed && this.one(
+          `SELECT json_extract(result,'$.attempt.action_deadline')
+                    - json_extract(request,'$.command.action_budget_ms') AS began_at
+           FROM execution_commands WHERE task_id=?
+             AND json_extract(request,'$.command.kind')='begin'
+             AND json_extract(result,'$.attempt.generation')=?
+             AND json_extract(result,'$.attempt.attempt_id')=? LIMIT 1`,
+          req.id, current.attempt.generation, current.attempt.attempt_id,
+        );
+        if (observed && begin && typeof begin.began_at === "number" && begin.began_at > 0
+          && observed >= begin.began_at && observed <= now && now - observed < 300_000
+          && this.hasManagedReviewAssignment(tokenId, req.id, current.attempt.session,
+            row.project, String(meta.work_revision ?? "legacy"))) {
           const responseReceipt = `execution:${req.id}:${current.attempt.generation}:${current.attempt.attempt_id}`;
           const proof = ManagedReviewRouteProofSchema.parse({
             id: responseReceipt, host: reviewHost, backend: "opencode", model: reviewExecutor.model,
             config_revision: reviewExecutor.config_revision, observed_at: observed,
             result: { kind: "succeeded", response_receipt: responseReceipt }, receipts: [responseReceipt],
-            witness: { kind: "managed_review_prompt", project: row.project, tier: reviewExecutor.tier },
+            witness: { kind: "managed_review_prompt", project: row.project, tier: reviewExecutor.tier, assignment: "reserved_review_v1" },
           });
           this.state.storage.sql.exec(`DELETE FROM managed_review_route_success WHERE host=? AND observed_at<=?`, reviewHost, now - 300_000);
           this.state.storage.sql.exec(
             `INSERT INTO managed_review_route_success(host,model,config_revision,project,tier,observed_at,proof) VALUES(?,?,?,?,?,?,?)
              ON CONFLICT(host,model,config_revision,project,tier) DO UPDATE SET observed_at=excluded.observed_at, proof=excluded.proof
-             WHERE excluded.observed_at > managed_review_route_success.observed_at`,
+             WHERE json_extract(managed_review_route_success.proof,'$.witness.assignment') IS NOT 'reserved_review_v1'
+                OR excluded.observed_at > managed_review_route_success.observed_at`,
             reviewHost, proof.model, proof.config_revision, proof.witness.project, proof.witness.tier, observed, JSON.stringify(proof),
           );
         }

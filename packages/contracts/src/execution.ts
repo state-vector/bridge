@@ -247,7 +247,10 @@ export const TerminalOutcomeSchema = z.object({
    * `default` keeps old records parseable, and the authenticated failure
    * provenance + raw sanitized evidence ride ONLY on this field (BR#8821). */
   cause: ProviderCauseSchema.optional(),
+  // Retain old terminal evidence for replay. Only the versioned producer
+  // field certifies a parent prompt for managed review recovery.
   acp_prompt_observed_at: z.number().int().positive().optional(),
+  acp_parent_prompt_observed_at: z.number().int().positive().optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
 
@@ -332,14 +335,18 @@ const ProviderRequestProofSchema = ProviderRecoveryRouteSchema.extend({
 });
 export const ManagedReviewRouteProofSchema = ProviderRecoveryRouteSchema.extend({
   backend: z.literal("opencode"),
-  witness: z.object({ kind: z.literal("managed_review_prompt"), project: text, tier: ReasoningTierSchema }),
+  witness: z.object({ kind: z.literal("managed_review_prompt"), project: text, tier: ReasoningTierSchema,
+    // Read earlier receipts without letting their unverified assignments
+    // release a hold or consume an already-issued permit.
+    assignment: z.literal("reserved_review_v1").optional() }),
 });
 export const ProviderRecoveryProofSchema = z.union([ProviderRequestProofSchema, ManagedReviewRouteProofSchema]);
 export function validRecoveryRequestProof(
   proof: z.infer<typeof ProviderRecoveryProofSchema>,
   diagnosis: "provider_authentication" | "provider_quota" | "provider_route_unavailable",
 ): boolean {
-  if (!("request" in proof)) return diagnosis === "provider_route_unavailable";
+  if (!("request" in proof)) return diagnosis === "provider_route_unavailable"
+    && proof.witness.assignment === "reserved_review_v1";
   const witness = proof.witness;
   return witness.configured_model === proof.model
     && witness.allowed_actual_models.includes(proof.actual_model)

@@ -186,6 +186,23 @@ describe("witnessed legacy recovery fences", () => {
     expect(validRecoveryRequestProof({ ...proof, witness }, "provider_authentication")).toBe(false);
     expect(validRecoveryRequestProof({ ...proof, witness: { ...witness, observed_max_output_tokens: 1 } }, "provider_route_unavailable")).toBe(false);
   });
+  it("keeps legacy managed permits readable but requires a checked reservation to spend one", () => {
+    const state = held();
+    const permit = state.recovery_permit!;
+    permit.diagnosis = "provider_route_unavailable";
+    const proof = {
+      id: "managed-review", host: "mac", backend: "opencode" as const, model: "route", config_revision: "config",
+      result: { kind: "succeeded" as const, response_receipt: "execution:review" },
+      observed_at: 150, receipts: ["execution:review"],
+      witness: { kind: "managed_review_prompt" as const, project: "bridge", tier: "small" as const },
+    };
+    permit.proof = proof;
+    const decoded = ExecutionStateSchema.parse(state);
+    expect(recoveryPermitMatches(decoded, { ...capability, tier: "small" }, "mac", "revision", 200)).toBe(false);
+    expect(() => reduceExecution(decoded, { ...begin, attempt_id: "legacy-permit" }, "mac", "dispatch-BR-1", 200, "revision")).toThrow(/current recovery permit/);
+    permit.proof = { ...proof, witness: { ...proof.witness, assignment: "reserved_review_v1" } };
+    expect(recoveryPermitMatches(state, { ...capability, tier: "small" }, "mac", "revision", 200)).toBe(true);
+  });
   it("invalidates proof for changed evidence, routing, work and age while preserving the record", () => {
     const s=held();
     expect(recoveryPermitMatches(s,capability,"mac","revision",200)).toBe(true);
