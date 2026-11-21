@@ -5907,6 +5907,7 @@ fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeV
                     receipt: url.to_string(),
                     head_sha: sha,
                     conclusion: "merged".into(),
+                    contexts: Vec::new(),
                 }
             } else {
                 ProbeVerdict::Transient {
@@ -6161,7 +6162,11 @@ fn sync_pr_labels(ctx: &mut Ctx, repo: &str, rows: &Value) -> (usize, Vec<Value>
 #[derive(Debug, PartialEq)]
 enum ProbeVerdict {
     /// The gate fired — feed ok=true with the evidence URL.
-    Satisfied { receipt: String, head_sha: String, conclusion: String },
+    /// BR#18328: `contexts` carries the observed check names+states
+    /// ("NAME=STATE") so the hub can prove every DECLARED required context
+    /// of a durable external-CI wait actually ran and settled; empty for
+    /// non-rollup probes (older hubs ignore the extra payload field).
+    Satisfied { receipt: String, head_sha: String, conclusion: String, contexts: Vec<String> },
     /// The gate conclusively did NOT fire (run failed/cancelled, checks red)
     /// — feed ok=false conclusive=true; the hub stamps a negative
     /// proxy_verified and the park stands (BR#3409 fail-closed).
@@ -6183,6 +6188,7 @@ fn classify_run_conclusion(conclusion: &str, url: &str, head_sha: &str) -> Probe
             receipt: url.to_string(),
             head_sha: head_sha.to_string(),
             conclusion: "success".into(),
+            contexts: Vec::new(),
         },
         "FAILURE" | "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => ProbeVerdict::Conclusive {
             error: format!("run concluded {conclusion}"),
@@ -6206,6 +6212,7 @@ fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
                 receipt: r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 head_sha: r.get("headSha").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 conclusion: "success".into(),
+                contexts: Vec::new(),
             };
         }
     }
@@ -6218,6 +6225,9 @@ fn classify_run_list(rows: &[Value], newer_than: &str) -> ProbeVerdict {
 fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict {
     let mut failed: Vec<String> = Vec::new();
     let mut external: Vec<String> = Vec::new();
+    // BR#18328: every observed check name+state, exempt entries included —
+    // the hub proves its declared required contexts against this list.
+    let mut observed: Vec<String> = Vec::new();
     let mut pending = 0usize;
     let mut applicable = 0usize;
     for e in rollup {
@@ -6228,6 +6238,7 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
             .unwrap_or("unknown")
             .to_ascii_uppercase();
         let name = vstr(e, "name").or_else(|| vstr(e, "context")).unwrap_or("?");
+        observed.push(format!("{name}={state}"));
         if crate::train_gate::is_exempt_check_name(name) {
             if !matches!(state.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
                 external.push(format!("{name}={state}"));
@@ -6265,9 +6276,10 @@ fn classify_rollup(rollup: &[Value], url: &str, head_sha: &str) -> ProbeVerdict 
             receipt: url.to_string(),
             head_sha: head_sha.to_string(),
             conclusion: format!("checks green (exempt external: {first}{more})"),
+            contexts: observed,
         };
     }
-    ProbeVerdict::Satisfied { receipt: url.to_string(), head_sha: head_sha.to_string(), conclusion: "checks green".into() }
+    ProbeVerdict::Satisfied { receipt: url.to_string(), head_sha: head_sha.to_string(), conclusion: "checks green".into(), contexts: observed }
 }
 
 /// Run the read-only gh observation for one probe — the only GitHub I/O on
@@ -6328,11 +6340,16 @@ fn observe_probe(ctx: &Ctx, repo: &str, kind: &str, p: &Value) -> Result<ProbeVe
 fn probe_report_body(key: &str, observed: Result<ProbeVerdict, String>) -> Value {
     let mut body = json!({ "key": key });
     match observed {
-        Ok(ProbeVerdict::Satisfied { receipt, head_sha, conclusion }) => {
+        Ok(ProbeVerdict::Satisfied { receipt, head_sha, conclusion, contexts }) => {
             body["ok"] = json!(true);
             body["receipt"] = json!(receipt);
             body["head_sha"] = json!(head_sha);
             body["conclusion"] = json!(conclusion);
+            // BR#18328 — the observed check names+states; the hub proves a
+            // durable external wait's declared contexts against this list.
+            if !contexts.is_empty() {
+                body["contexts"] = json!(contexts);
+            }
         }
         Ok(ProbeVerdict::Conclusive { error, receipt, conclusion }) => {
             body["ok"] = json!(false);
@@ -7007,7 +7024,7 @@ mod tests {
     fn pr_merged_merged_with_merge_commit_is_satisfied_citing_it_br6384() {
         let v = classify_pr_merge_state("MERGED", "ABC123DEF4560000000000000000000000000000", "https://github.com/o/r/pull/9");
         match v {
-            ProbeVerdict::Satisfied { receipt, head_sha, conclusion } => {
+            ProbeVerdict::Satisfied { receipt, head_sha, conclusion, .. } => {
                 assert_eq!(head_sha, "abc123def4560000000000000000000000000000"); // the mergeCommit IS the head receipt
                 assert_eq!(conclusion, "merged");
                 assert_eq!(receipt, "https://github.com/o/r/pull/9");
@@ -8913,6 +8930,41 @@ mod tests {
         }
     }
 
+    // ---- BR#18328: the satisfied verdict carries the observed check
+    // names+states so the hub can prove a durable external-CI wait's
+    // DECLARED required contexts actually ran and settled at the awaited
+    // head; pending sets stay transient so the wait keeps holding. ----
+
+    #[test]
+    fn rollup_satisfied_carries_observed_contexts_for_durable_waits_br18328() {
+        let pending_set = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "ci / Lodestar Scenarios", "state": "PENDING" }
+        ]);
+        assert!(matches!(
+            classify_rollup(pending_set.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef"),
+            ProbeVerdict::Transient { .. }
+        ));
+        let all_green = json!([
+            { "name": "Test", "conclusion": "SUCCESS" },
+            { "name": "ci / Lodestar Scenarios", "conclusion": "SUCCESS" },
+            { "name": "Superpositional", "state": "NEUTRAL" }
+        ]);
+        let v = classify_rollup(all_green.as_array().unwrap(), "https://github.com/o/r/pull/9/checks", "deadbeef");
+        match &v {
+            ProbeVerdict::Satisfied { contexts, .. } => {
+                assert!(contexts.contains(&"Test=SUCCESS".to_string()));
+                assert!(contexts.contains(&"ci / Lodestar Scenarios=SUCCESS".to_string()));
+                assert!(contexts.contains(&"Superpositional=NEUTRAL".to_string()), "exempt entries ride too — the hub proves its declared set against the whole observation");
+            }
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+        // the report body carries the observed contexts for the hub's coverage proof
+        let body = probe_report_body("checks:o/r#9", Ok(v));
+        let contexts = body["contexts"].as_array().expect("the contexts payload must ride the satisfied report");
+        assert!(contexts.iter().any(|c| c == "ci / Lodestar Scenarios=SUCCESS"));
+    }
+
     // ---- BR#6568: the probe path applies the BR#2267/BR#6001 external-check
     // exemption the head gate already applies — a degraded Superpositional
     // flow runner must not park a typed pr_checks_green await (live: PR
@@ -9051,7 +9103,7 @@ mod tests {
 
     #[test]
     fn report_body_maps_the_three_verdicts_and_errors() {
-        let sat = probe_report_body("run:o:r:1", Ok(ProbeVerdict::Satisfied { receipt: "https://github.com/o/r/actions/runs/1".into(), head_sha: "ca18675f0f".into(), conclusion: "success".into() }));
+        let sat = probe_report_body("run:o:r:1", Ok(ProbeVerdict::Satisfied { receipt: "https://github.com/o/r/actions/runs/1".into(), head_sha: "ca18675f0f".into(), conclusion: "success".into(), contexts: Vec::new() }));
         assert_eq!(sat["ok"], json!(true));
         assert!(sat["receipt"].as_str().unwrap().starts_with("https://github.com/"));
         let con = probe_report_body("checks:o/r#9", Ok(ProbeVerdict::Conclusive { error: "checks failing: Test=FAILURE".into(), receipt: "u".into(), conclusion: "failing".into() }));

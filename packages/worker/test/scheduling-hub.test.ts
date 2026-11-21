@@ -648,6 +648,24 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(discovery).toMatchObject({ kind: "ready", candidates: [runnable], reasons: { independent_wait: 3 } });
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: runnable });
   });
+  it("holds a todo card parked on durable external-CI checks (independent_wait) and wakes exactly one verifier when the bound checks settle (BR#18328)", async () => {
+    const project = "external-ci-wait", g = await gateway(project, 2);
+    const runnable = await task(project);
+    const parked = await task(project, { execution_wait: { kind: "external_checks", await: { repo: "state-vector/superpositional", pr: 3644, head_sha: "3".repeat(40), contexts: ["ci / Build"] }, generation: 1, attempt_id: "one", declared_at: Date.now() } });
+    // the parked card is held from dispatch without a worker slot or a blocked leg
+    const discovery = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "inspect" }));
+    expect(discovery).toMatchObject({ kind: "ready", candidates: [runnable], reasons: { independent_wait: 1 } });
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: runnable });
+    // the wake evaluator enqueues the head-bound probe; the executor feeds green at the bound head; the sweep clears the wait
+    const key = `extchecks:state-vector/superpositional#3644@${"3".repeat(40)}`;
+    expect((await post("admin.external_waits_sweep", {})).error ?? null).toBeNull();
+    expect((await post("proxy.verify", { key, ok: true, receipt: "https://github.com/state-vector/superpositional/pull/3644", head_sha: "3".repeat(40), conclusion: "checks green", contexts: ["ci / Build=SUCCESS"] })).error ?? null).toBeNull();
+    expect((await post("admin.external_waits_sweep", {})).error ?? null).toBeNull();
+    expect((await post("get", { id: parked })).meta.execution_wait).toBeUndefined();
+    expect((await post("get", { id: parked })).meta.execution_external_checks).toMatchObject({ outcome: "checks_green" });
+    // the released card is the ONE fresh verifier generation the scheduler reserves
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: parked });
+  });
   it("cancels a never-launched reservation without poisoning readiness or spending retry budget, including lost-response replay", async () => {
     const project = "drain-cancel-reservation", g = await gateway(project), peer = await gateway(project);
     const id = await task(project), claim = await reserve(g);

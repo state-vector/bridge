@@ -222,7 +222,7 @@ export const WriterReceiptSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("writer_receipt_missing") }),
   z.object({ kind: z.literal("writer_receipt_held"), reason: text }),
   z.object({ kind: z.literal("writer_receipt_found"), task_id: text, command_id: text,
-    source: z.enum(["quiesce", "stopped", "finalize"]),
+    source: z.enum(["quiesce", "await_external", "stopped", "finalize"]),
     proof: FenceSchema.extend({ host: text, session: text, phase: z.literal("quiesced"), writers: WriterProofSchema }),
   }),
 ]);
@@ -249,6 +249,66 @@ export const TerminalOutcomeSchema = z.object({
   cause: ProviderCauseSchema.optional(),
 });
 export const TerminalReceiptSchema = FenceSchema.extend({ outcome: TerminalOutcomeSchema, writers: WriterProofSchema.default("process_group_empty") });
+
+/** BR#18328 — the attempt-level durable external-CI wait signature. A
+ * verdict duty whose hosted checks are still running binds its pre-CI
+ * review readiness to the exact repository, PR number, FULL 40-hex head
+ * SHA and required context set. The signature is immutable in the record:
+ * an amended head invalidates the wait, and the wake verifier always
+ * re-verifies signature, mergeability and substance at the CURRENT head
+ * first-hand — the wake is evidence, never acceptance. */
+export const ExternalChecksWaitSchema = z.object({
+  type: z.literal("pr_required_checks"),
+  repo: text,
+  pr: z.number().int().positive(),
+  head_sha: z.string().regex(/^[a-f0-9]{40}$/),
+  contexts: z.array(z.string().min(1)).min(1),
+});
+export type ExternalChecksWait = z.infer<typeof ExternalChecksWaitSchema>;
+/** The durable record: the signature plus the attempt that declared it.
+ * A later attempt's begin always clears the field — a stale intent can
+ * never park a generation that did not declare it. */
+export const ExternalWaitRecordSchema = ExternalChecksWaitSchema.extend({
+  generation: z.number().int().positive(),
+  attempt_id: text,
+  declared_at: z.number().int().positive(),
+});
+export type ExternalWaitRecord = z.infer<typeof ExternalWaitRecordSchema>;
+/** Read-only GitHub check-observation operations whose prepared entry a
+ * park may re-key to the durable wait (BR#18314: a prepared read-only
+ * `gh run watch` stranded the card behind the unknown_operations begin
+ * gate even after CI passed). Anything that can write is never re-keyed —
+ * the park refuses and the executor reconciles first. */
+export function isReadOnlyCheckObservation(action: string): boolean {
+  const a = action.trim();
+  if (!a) return false;
+  // Shell compounds, pipes and substitutions can hide a write behind a read
+  // prefix — only single, whole commands are ever classifiable as read-only.
+  if (/&&|\|\||[;|`]|\$\(/.test(a)) return false;
+  if (/^gh\s+run\s+(watch|view|list)\b/i.test(a) || /^gh\s+pr\s+(checks|view|status)\b/i.test(a)) return true;
+  if (/^gh\s+api\b/i.test(a)) {
+    if (/\s(-f|-F|--field|--raw-field|--input)\b/i.test(a)) return false; // field assignment implies a write
+    const withoutGet = a.replace(/\s(-X|--method)\s+GET\b/i, " ");
+    return !/\s(-X|--method)\b/i.test(withoutGet); // only GET (explicit or default) is read-only
+  }
+  return false;
+}
+/** True when the PR's CURRENT head no longer matches the waited signature —
+ *  the amended-head invalidation (BR#18319 D7): the old wait is stale, the
+ *  fresh checks belong to a different review surface. */
+export function externalWaitHeadMoved(wait: ExternalChecksWait, currentHeadSha: string): boolean {
+  return wait.head_sha !== currentHeadSha;
+}
+/** True when an observed check-set satisfies the waited signature at the
+ *  SAME head: every declared required context is present in the observation.
+ *  Extra observed contexts are fine; a missing declared context means the
+ *  checks have not all registered yet — not coverage. */
+export function externalWaitCoveredBy(wait: ExternalChecksWait, observed: { repo: string; pr: number; head_sha: string; contexts: string[] }): boolean {
+  if (wait.repo.toLowerCase() !== observed.repo.toLowerCase() || wait.pr !== observed.pr) return false;
+  if (externalWaitHeadMoved(wait, observed.head_sha)) return false;
+  const have = new Set(observed.contexts);
+  return wait.contexts.every(c => have.has(c));
+}
 /** A bounded, witnessed request on the configured route. A model catalog,
  * CLI version, answered billing question or timestamp alone is not evidence. */
 export const ProviderRecoveryProofSchema = z.object({
@@ -335,10 +395,14 @@ export const ExecutionStateSchema = z.object({
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
   terminal: TerminalReceiptSchema.nullable().default(null),
+  /** BR#18328 — the declared external-CI wait. Set by the live writer's
+   *  signed intent command; the attempt's quiesced proof turns it into the
+   *  durable park. Additive and defaulted: old journals parse unchanged. */
+  external_wait: ExternalWaitRecordSchema.nullable().default(null),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null, external_wait: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -372,6 +436,14 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("restore"), ...FenceSchema.shape, tree: sha, commit: sha }),
   z.object({ kind: z.literal("checkpoint"), ...FenceSchema.shape, checkpoint: CheckpointSchema }),
   z.object({ kind: z.literal("quiesce"), ...FenceSchema.shape, writers: z.literal("process_group_empty") }),
+  /** BR#18328 — the durable external-CI park. The LIVE writer fences the
+   *  exact repo/PR/head/contexts signature of the required checks its
+   *  verdict depends on, plus a process-group-empty writer proof, and the
+   *  attempt parks to quiesced WITHOUT a terminal outcome: the duty is not
+   *  over, it is waiting on hosted CI. The park is its own command — it
+   *  never reaches the finalize charge site, so waiting consumes no retry
+   *  budget. */
+  z.object({ kind: z.literal("await_external"), ...FenceSchema.shape, writers: z.literal("process_group_empty"), wait: ExternalChecksWaitSchema }),
   z.object({ kind: z.literal("stopped"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
@@ -468,6 +540,9 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         }
       }
       s.generation += 1;
+      // BR#18328 — a new attempt always clears a prior wait: a stale intent
+      // can never park a generation that did not declare it.
+      s.external_wait = null;
       if (needsRecoveryPermit && s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {
         generation: s.generation, attempt_id: command.attempt_id, host, session,
@@ -506,6 +581,39 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       break;
     }
     case "quiesce": requireAttempt(true).phase = "quiesced"; break;
+    case "await_external": {
+      // BR#18328 — the durable external-CI park (design BR#18319 C/D). The
+      // LIVE writer fences the exact repo/PR/full-head/required-contexts
+      // signature plus a process-group-empty writer proof; the attempt
+      // parks to quiesced WITHOUT terminal evidence and WITHOUT a failure
+      // charge — waiting for CI is not a failed attempt, and the budget
+      // accounting site (finalize/stopped) is never reached. The wake
+      // verifier re-verifies signature, mergeability and substance at the
+      // CURRENT head first-hand: the wake is evidence, never acceptance.
+      const current = requireAttempt(true);
+      const waitSig = (w: ExternalChecksWait) => JSON.stringify([w.repo.toLowerCase(), w.pr, w.head_sha, [...w.contexts].sort()]);
+      if (s.external_wait && s.external_wait.generation === current.generation
+        && s.external_wait.attempt_id === current.attempt_id
+        && waitSig(s.external_wait) === waitSig(command.wait)) return s; // durable retry/replay of the same park
+      if (!["running", "stopping"].includes(current.phase)) throw new Error("gate: only the live writer declares an external wait — a parked or finalizing attempt cannot");
+      if (s.terminal) throw new Error("gate: terminal evidence is already captured — an external wait cannot override a stopped attempt");
+      // Read-only check observations the writer had prepared (gh run watch
+      // et al — the BR#18314 specimen) are re-keyed to the durable wait so
+      // the wake verifier's begin is not blocked by them. Anything that can
+      // write still gates: reconcile first.
+      const unresolved = s.operations.filter(op => op.state === "prepared" || op.state === "outcome_unknown");
+      for (const op of unresolved) {
+        if (!isReadOnlyCheckObservation(op.action))
+          throw new Error(`gate: unresolved external operation ${op.id} is not a read-only check observation — reconcile it before parking`);
+      }
+      for (const op of unresolved) {
+        op.state = "succeeded";
+        op.receipts = [`await_external: read-only check observation re-keyed to the durable wait ${command.wait.repo}#${command.wait.pr}@${command.wait.head_sha.slice(0, 12)} (BR#18328)`];
+      }
+      s.external_wait = { ...command.wait, generation: current.generation, attempt_id: current.attempt_id, declared_at: now };
+      current.phase = "quiesced";
+      break;
+    }
     case "stopped": {
       const current = requireAttempt(true);
       if (s.terminal?.generation === command.generation && s.terminal.attempt_id === command.attempt_id

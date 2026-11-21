@@ -36,3 +36,13 @@ it("records actual model selection, escalation reason/from/to, and omits poll no
   expect(executionHistorySummary(event!)).toContain(command.reason);
   expect(executionCommandHistory(before, after, { kind: "poll", generation: 1, attempt_id: "one" })).toBeNull();
 });
+it("records a durable external-CI park with its exact repo/PR/head signature (BR#18328)", () => {
+  const before = running();
+  const wait = { type: "pr_required_checks" as const, repo: "state-vector/superpositional", pr: 3644, head_sha: "3".repeat(40), contexts: ["ci / Build", "ci / Lodestar Scenarios"] };
+  const command = { kind: "await_external" as const, generation: 1, attempt_id: "one", writers: "process_group_empty" as const, wait };
+  const after = reduceExecution(before, command, "host", "session", 2_000);
+  const event = executionCommandHistory(before, after, command);
+  expect(event).toMatchObject({ kind: "external_wait_declared", generation: 1, repo: wait.repo, pr: wait.pr, head_sha: wait.head_sha, contexts: wait.contexts });
+  expect(executionHistorySummary(event!)).toContain("3644");
+  expect(executionHistorySummary(event!)).toContain("the wake re-verifies first-hand");
+});
