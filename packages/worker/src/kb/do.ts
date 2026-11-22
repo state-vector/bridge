@@ -190,6 +190,7 @@ import {
   type AdmissionLegCoverage,
   releaseHold,
   todoDispatchHold,
+  cancelledCoordinationAsk,
   stoppedManagedWriterProof,
   trainProxyEvent,
   // prose-card disposition ladder (BR#4416)
@@ -6450,8 +6451,46 @@ export class KnowledgeHub {
 
   private todoLifecycleHold(id: string, meta: RecoveredPrMeta): string | null {
     const hold = todoDispatchHold(meta);
-    if (!hold || !this.recoveredPrFindings(id, meta)) return hold;
-    return todoDispatchHold({ ...meta, recovery: undefined });
+    let recovered: { id: string; summary: string } | null = null;
+    if (hold) recovered = this.recoveredPrFindings(id, meta);
+    const effective = recovered ? todoDispatchHold({ ...meta, recovery: undefined }) : hold;
+    // BR#18868 — admission ignore: a bound-ask marker whose canonical exact
+    // ask is a cancelled or expired NON-human coordination request is stale
+    // machine metadata, not a live wait. The ask row's cancellation receipt
+    // is the proof, read first-hand by the exact id the marker carries; open
+    // and answered asks still hold, human decisions never qualify, and the
+    // ignore applies ONLY when stripping the marker leaves no other hold
+    // (typed waits, train slots, recovery duties still own their exits).
+    // This heals a stranded claimable card even where the cancel-time
+    // reconcile was skipped (a live writer, a marker that predates the fix).
+    // Gated on the bound-ask hold itself so cards held by other reasons make
+    // no provenance read (the hot dispatch loop; BR#16935 lesson).
+    if (effective && effective.startsWith("a bound ask") && this.cancelledCoordinationMarker(meta)) {
+      const strippedMeta: RecoveredPrMeta = { ...meta, awaiting_ask: undefined };
+      if (recovered) delete strippedMeta.recovery;
+      return todoDispatchHold(strippedMeta);
+    }
+    return effective;
+  }
+
+  /** BR#18868 — does this card's awaiting_ask marker name an ask whose
+   *  canonical row (read first-hand by the exact id) is a cancelled or
+   *  expired non-human coordination request? Question-node asks (BR# ids)
+   *  prove their cancellation from the artefact row; legacy asks-table rows
+   *  (ASK-…) are dead only when EXPIRED (watchdog TTL — nobody will ever
+   *  answer) or MIGRATED (the migration retired the row). An ANSWERED legacy
+   *  row keeps holding (BR#3578 keep-park — the answer owns the exit), an
+   *  OPEN row holds, and an unknown legacy id is NOT provably dead — keep
+   *  holding. */
+  private cancelledCoordinationMarker(meta: RecoveredPrMeta): boolean {
+    const askId = String((meta.awaiting_ask as { ask_id?: unknown } | undefined)?.ask_id ?? "").trim();
+    if (!askId) return false;
+    if (/^BR#\d+$/.test(askId)) {
+      const node = this.one(`SELECT status, meta FROM artefacts WHERE id = ? AND type = 'question'`, askId);
+      return !!node && cancelledCoordinationAsk({ status: String(node.status), meta: JSON.parse(String(node.meta ?? "{}")) });
+    }
+    const legacy = this.one(`SELECT status FROM asks WHERE id = ?`, askId);
+    return !!legacy && ["expired", "migrated"].includes(String(legacy.status));
   }
 
   private startupHasAsk(id: string, except = ""): boolean {
@@ -10837,7 +10876,9 @@ export class KnowledgeHub {
   }
 
   /** Machine-owned cancellation: the condition requiring a decision vanished.
-   * It records no human answer and never runs answer verb dispatch. */
+   * It records no human answer and never runs answer verb dispatch. The
+   * machine cancellation record (resolution + audit) is preserved verbatim;
+   * a non-human ask's stale affected-task marker is reconciled below it. */
   private cancelRequest(id: string, reason: string, actor: string): void {
     const row = this.one(`SELECT type, status, meta FROM artefacts WHERE id = ?`, id);
     if (!row || row.type !== "question") return;
@@ -10849,6 +10890,51 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(`UPDATE artefacts SET status = 'done', status_ts = ?, updated_ts = ?, meta = ? WHERE id = ?`, now, now, JSON.stringify(meta), id);
     this.version(id, actor, "transition", `request cancelled: ${reason}`, { from: row.status, to: "done", resolution: meta.ask.resolution });
     this.audit(actor, "ask_cancelled", id, { reason });
+    this.reconcileCancelledAskMarker(id, meta.ask, actor);
+  }
+
+  /** BR#18868 — a cancelled non-human coordination ask must not leave its
+   *  bound task carrying a stale `awaiting_ask` marker: the marker's only job
+   *  was to keep the card out of dispatch until the ask resolved, and the
+   *  cancellation receipt proves nobody will ever answer it. This is the
+   *  cancel-side completion of askAnswer's marker cleanup (the answer deletes
+   *  `awaiting_ask?.ask_id === id`); without it, a card that later reaches
+   *  claimable todo (a recovery duty's blocked→todo, a bounce release) is
+   *  held independent_wait forever — the BR#18852 specimen, where recovery
+   *  had to strip the marker by hand before dispatch resumed.
+   *  Reconciles ONLY the exact stale marker (`awaiting_ask.ask_id === askId`):
+   *  never a newer/replacement ask's marker, never the paired typed
+   *  await_event (the proxy watch and a recovery duty own a still-blocked
+   *  card's exit), never a human decision's marker, and never a card whose
+   *  writer is live or stopping (quiescence — the scheduler's admission
+   *  ignore is the convergence backstop once the writer stops). Terminal
+   *  cards carry no dispatch hold, so they are not churned. */
+  private reconcileCancelledAskMarker(askId: string, ask: unknown, actor: string): void {
+    if (isHumanDecisionAsk(ask as { route?: unknown; to?: unknown })) return;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, status, meta FROM artefacts INDEXED BY idx_artefacts_ask_marker
+        WHERE type='task' AND status IN ('todo','in_progress','blocked')
+          AND json_extract(meta,'$.awaiting_ask.ask_id')=?`, askId).toArray();
+    for (const r of rows) {
+      const taskId = String(r.id);
+      const meta = JSON.parse(String(r.meta ?? "{}"));
+      if (meta.awaiting_ask?.ask_id !== askId) continue; // concurrent re-stamp: a newer ask owns the marker
+      const execution = this.executionState(taskId);
+      const defer = meta.interactive_execution ? "interactive_claim" // the interactive claim owns the card outright (BR#6068)
+        : this.protectedExecution(taskId, meta) ? "protected_execution" // startup wait / execution wait / live handoff
+        : this.startupHasAsk(taskId, askId) ? "startup_rebind" // another open ask is mid-flight on this card
+        : execution?.attempt && execution.attempt.phase !== "quiesced" ? "writer_live"
+        : execution?.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown") ? "unknown_operations"
+        : this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, taskId) ? "start_claimed" : null;
+      if (defer) {
+        this.audit(actor, "ask_marker_reconcile_deferred", taskId, { ask_id: askId, why: defer });
+        continue;
+      }
+      delete meta.awaiting_ask;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), Date.now(), taskId);
+      this.version(taskId, actor, "update", `cancelled coordination ask ${askId} reconciled — its stale awaiting_ask marker no longer holds this card out of dispatch`, { ask_id: askId });
+      this.audit(actor, "ask_marker_reconciled", taskId, { ask_id: askId });
+    }
   }
 
   /** Runs inside the SAME SQLite transaction that closes the independent review.

@@ -16,6 +16,7 @@ import {
   validateTransition,
   verifyVerdictStatement,
   canonicalVerdictTitle,
+  cancelledCoordinationAsk,
 } from "../src/kb/core.ts";
 
 describe("tag parsing (stored column is untrusted)", () => {
@@ -629,5 +630,33 @@ describe("trainMergeReceipt — board-native pr_merged receipt (BR#4282)", () =>
     const both = { pr: { repo: "o/r", number: 259 }, merge_train: { state: "awaiting-ci", pr: 259, repo: "p/q", merge_sha: sha } };
     expect(trainMergeReceipt(both, "o/r", 259)).toEqual({ merge_sha: sha, merged_at: 0 });
     expect(trainMergeReceipt(both, "p/q", 259)).toBeNull();
+  });
+});
+
+describe("cancelledCoordinationAsk (BR#18868 provenance)", () => {
+  const askNode = (ask: unknown, status = "done") => ({ status, meta: { ask } });
+  const coordination = { route: { kind: "agent_coordination" }, to: "peer-agent" };
+
+  it("a cancelled or expired non-human coordination ask is provably dead", () => {
+    expect(cancelledCoordinationAsk(askNode({ ...coordination, resolution: { kind: "cancelled", reason: "Linked work is done" } }))).toBe(true);
+    expect(cancelledCoordinationAsk(askNode({ ...coordination, resolution: { kind: "expired", reason: "timed out" } }))).toBe(true);
+  });
+
+  it("an open ask holds, and an ANSWERED ask keeps its marker (BR#3578 keep-park)", () => {
+    expect(cancelledCoordinationAsk(askNode(coordination, "in_progress"))).toBe(false);
+    expect(cancelledCoordinationAsk(askNode({ ...coordination, answer: "GO", answered_by: "peer" }))).toBe(false);
+  });
+
+  it("a human decision is never machine-ignored — even a cancelled one", () => {
+    const human = { route: { kind: "human_decision" }, to: "human", decision: { task_id: "BR#1", context: "c", why_human: "w", choices: [{ label: "A", executor: "bridge", consequence: "c", action: "resume" }, { label: "B", executor: "human", consequence: "c", action: "hold" }] } };
+    expect(cancelledCoordinationAsk(askNode({ ...human, resolution: { kind: "cancelled", reason: "obsolete" } }))).toBe(false);
+    // legacy asks carried no route — the target decides; human targets are human decisions
+    expect(cancelledCoordinationAsk(askNode({ to: "human", resolution: { kind: "cancelled", reason: "obsolete" } }))).toBe(false);
+  });
+
+  it("malformed rows fail closed (no ask payload — nothing proven dead)", () => {
+    expect(cancelledCoordinationAsk({ status: "done", meta: {} })).toBe(false);
+    expect(cancelledCoordinationAsk({ status: "done", meta: { ask: "garbage" } })).toBe(false);
+    expect(cancelledCoordinationAsk(null as unknown as { status: string })).toBe(false);
   });
 });

@@ -1998,6 +1998,19 @@ RELEASE/CANCEL releases it to the pool, SUPERSEDE drops it, anything else resume
 the verb is matched after a leading `(Recommended)` marker is stripped (BR#5570), so a
 rule-6c recommended option dispatches like a verb-first one and a `(Recommended) KEEP`
 click stays a deliberate park instead of silently resuming.
+**Cancellation reconciles the wait, not the record (BR#18868).** A machine-cancelled
+coordination ask — its producer finished, so nobody will ever answer it — keeps its
+cancellation receipt (resolution + audit, never fabricated) and reconciles the exact
+stale `awaiting_ask` marker from the affected task: the marker's only job was to keep
+the card out of dispatch until the ask resolved, so a card the park stranded (a recovery
+release to todo, a bounce) re-enters dispatch instead of being held `independent_wait`
+forever. Scheduler admission independently reaches the same verdict: a marker whose
+canonical exact ask is a cancelled or expired NON-human coordination request is stale
+metadata, not a live hold. Open asks hold; answered asks keep their marker (the
+deliberate BR#3578 keep-park record); human decisions are never machine-ignored; a newer
+replacement ask's marker survives an older ask's cancel (exact-id match only); and a
+live or stopping writer defers the cleanup — the admission backstop heals the card once
+the writer quiesces, so the two paths can never race a working session.
 **The ask renders whole, and a click never moves the cards (BR#6390).** Every ask-band row
 and For Me card renders the FULL question title (no ellipsis kernel), the full escalation
 reason, and the ask's `body_md` as rendered markdown inline in the card itself — the human
