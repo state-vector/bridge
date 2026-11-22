@@ -3425,6 +3425,17 @@ a parent parked in `todo` (the BR#7642 shape — the close previously
 required `in_review` and stranded verified delivered work in the pool).
 Pinned in `packages/worker/test/br9510-admission-livelock.test.ts`.
 
+And the terminal stamp obeys the closure-receipt law (BR#18822): a leg the
+queue path filters as CLOSED-unmerged — the reconcile replacement-delivery
+shape, a superseded PR closed unmerged with a receipt, headless and
+receipt-less by construction — is dropped from the terminal stamp (audited
+`terminal_stamp_closed_leg_dropped`) instead of being resurrected from the
+card's own prior stamp on every pass. A dead leg riding `meta.prs` kept
+`every trainLegLanded` false forever, the acceptance-qualify gate refused
+the terminal close every sweep, and the BR#9510 carry retried it once per
+minute for hours (the BR#17666 `gate:done-unreviewed` storm). Pinned in
+`packages/worker/test/br18822-closed-leg-terminal-stamp.test.ts`.
+
 ### The queue gates on the ledger, not the observation; an observed merge lands its own row (BR#15528)
 
 The derived queue retired a queued car the moment any delivery observation

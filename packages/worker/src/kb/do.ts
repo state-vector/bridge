@@ -17293,11 +17293,33 @@ export class KnowledgeHub {
     // stamp the legs the acceptance names (same shape as the queue path —
     // trainLegs() readers and the acceptance-qualify gate read meta.prs/
     // meta.pr; without them an in_review-position close looks unlanded)
+    // BR#18822 (specimen BR#17666, gate:done-unreviewed storm 2026-11-22):
+    // the stamp must NOT resurrect a CLOSED-unmerged leg the queue path just
+    // filtered. `known` seeds from the card's own stamp, so a superseded PR
+    // (reconcile replacement delivery — headless, no merge receipt, none
+    // ever possible) rode back into meta.prs on every pass;
+    // trainLegs(meta).every(trainLegLanded) then stayed false forever and
+    // the acceptance-qualify gate refused the terminal close every sweep
+    // (~1 merged_admission_close_refused/min, BR#9510 retry loop). The
+    // closure receipt is the authority to stop carrying that PR forward —
+    // the same law queueAcceptedPrLegs applies to its local leg set.
+    // (Legs reaching this close always carry a merge receipt, which is never
+    // a closed receipt — the filter can only ever drop stamped dead legs, so
+    // the stamped set ⊇ legs and never empties.)
     const known = new Map(trainLegs(meta).map((l) => [`${l.repo}#${l.number}`, l]));
     for (const l of legs) if (!known.has(`${l.repo}#${l.number}`)) known.set(`${l.repo}#${l.number}`, l);
-    const allLegs = [...known.values()];
-    meta.prs = allLegs;
-    meta.pr = { ...(meta.pr ?? {}), repo: allLegs[0].repo, number: allLegs[0].number, head_sha_at_acceptance: allLegs[0].head_sha_at_acceptance, ...(allLegs[0].base ? { base: allLegs[0].base } : {}) };
+    const deadLegs = [...known.values()].filter((l) => !!this.closedPrReceipt(l.repo, l.number));
+    if (deadLegs.length)
+      this.audit(actor, "terminal_stamp_closed_leg_dropped", parentId, {
+        dropped: deadLegs.map((l) => `${l.repo}#${l.number}`),
+        kept: legs.map((l) => `${l.repo}#${l.number}`),
+        reason: "closed-unmerged leg carries no merge receipt and must not ride the terminal stamp (BR#18822)",
+      });
+    const stampedLegs = deadLegs.length
+      ? [...known.values()].filter((l) => !this.closedPrReceipt(l.repo, l.number))
+      : [...known.values()];
+    meta.prs = stampedLegs;
+    meta.pr = { ...(meta.pr ?? {}), repo: stampedLegs[0].repo, number: stampedLegs[0].number, head_sha_at_acceptance: stampedLegs[0].head_sha_at_acceptance, ...(stampedLegs[0].base ? { base: stampedLegs[0].base } : {}) };
     const legsMap: Record<string, any> = { ...(meta.merge_train?.legs ?? {}) };
     for (const r of merged) {
       const prior = legsMap[String(r.number)] ?? {};
