@@ -8,7 +8,7 @@
  */
 
 import type { AwaitEvent } from "./closure";
-import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask, checkObligationKey } from "@bridge/contracts";
+import { DeployCoverageStateSchema, isAwaitingMerge, mergePhaseOf, mergeCompletesTask, checkObligationKey, askLifecycle, isHumanDecisionAsk } from "@bridge/contracts";
 import type {
   BaseRedPhase,
   BaseRedResolution,
@@ -2664,6 +2664,21 @@ export function releaseHold(meta: any): string | null {
 export function todoDispatchHold(meta: any): string | null {
   if (meta?.merge_train?.state !== "bounced" || meta?.recovery?.task_id) return releaseHold(meta);
   return releaseHold({ ...meta, merge_train: undefined });
+}
+
+/** BR#18868 — is the ask row this marker names a CANCELLED or EXPIRED
+ *  non-human coordination request? Pure provenance over the row the marker
+ *  carries by exact id (do.ts reads that row first-hand). The cancellation
+ *  receipt is the machine record: nobody will ever answer the ask, so a
+ *  marker naming it is stale metadata, not a live hold. An OPEN ask holds
+ *  (the live human/peer leg), an ANSWERED ask's marker can be the deliberate
+ *  KEEP-park record (BR#3578 — it prevents re-ask spam), and a human decision
+ *  is never machine-ignored — its exit stays human-owned even when retired. */
+export function cancelledCoordinationAsk(node: { status: string; meta?: { ask?: unknown } }): boolean {
+  const ask = node?.meta?.ask;
+  if (!ask || typeof ask !== "object" || isHumanDecisionAsk(ask as { route?: unknown; to?: unknown })) return false;
+  const state = askLifecycle({ status: node.status, meta: node.meta }).state;
+  return state === "cancelled" || state === "expired";
 }
 
 /** BR#5750 — the blocked.reason prefix that keeps a hold-parked card INSIDE

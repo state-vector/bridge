@@ -58,6 +58,9 @@ export const WATCHDOG_REVIEW_LOOKUP_SCHEMA = `
       AND json_extract(meta,'$.ask.route.kind')='executor_coordination';
   CREATE INDEX IF NOT EXISTS idx_open_question_id
     ON artefacts(id) WHERE type='question' AND status IN ('todo','in_progress','blocked');
+  CREATE INDEX IF NOT EXISTS idx_artefacts_ask_marker
+    ON artefacts(json_extract(meta,'$.awaiting_ask.ask_id'))
+    WHERE type='task' AND status IN ('todo','in_progress','blocked');
 `;
 
 // Lead with the active wait set. Driving the join from admission history to
