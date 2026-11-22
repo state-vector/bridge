@@ -450,6 +450,54 @@ describe("eligibility-first scheduling on real SQLite", () => {
     }
   });
 
+  it("refuses foreign, mismatched, mutated, misdiagnosed, stale and duplicate recovery evidence without granting a permit", async () => {
+    const project = "provider-recovery-refusals", g = await gateway(project);
+    const larger = {...g.capabilities, tier: "large"};
+    await g.cmd({kind: "advertise", capabilities: {...g.capabilities, alternatives: [larger]}});
+    const id = await task(project, {execution_requirements: {tier: "large", tools: [], environment: []}});
+    const outcome = { kind: "failed", exit_code: 1, stdout_tail: "Preserved partial work",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    const claim = await reserve(g);
+    if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
+    expect((await g.cmd({ kind: "begin", attempt_id: "failed-large", worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: g.capabilities.backend, model: g.capabilities.model, tier: "large" } },
+      "begin-failed", id, claim.session)).error).toBeUndefined();
+    const stopped = { generation: 1, attempt_id: "failed-large", writers: "process_group_empty", outcome };
+    expect((await g.cmd({ kind: "stopped", ...stopped }, "stop-failed", id, claim.session)).error).toBeUndefined();
+    const final = await g.cmd({ kind: "finalize", ...stopped }, "final-failed", id, claim.session);
+    expect(final.terminal).toBeDefined();
+    // One typed route failure arms the provider_route hold: the same task is
+    // refused until a witnessed grant releases it.
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 1 } });
+
+    const token = await post("admin.mint", { label: `recovery-reviewer-${serial}`, tags: [] });
+    const identity = await post("auth.identify", { bearer: token.secret });
+    const auth = { actor: `recovery-reviewer-${serial}`, token_id: identity.token_id, session: "recovery-review" };
+    const proof = { id: "request-refusal", host: g.host, backend: g.capabilities.backend, model: g.capabilities.model, config_revision: "one",
+      result: { kind: "succeeded", response_receipt: "ssm:request" }, observed_at: Date.now(),
+      request: { kind: "configured_model_request", max_output_tokens: 32000, tools: "none" }, actual_model: "provider/small",
+      configuration_receipt: "ssm:config", receipts: ["ssm:request"],
+      witness: { kind: "configured_proxy_request", configured_model: g.capabilities.model, allowed_actual_models: ["provider/small"],
+        observed_max_output_tokens: 32000, configuration_receipt: "ssm:config" } };
+    const command = { kind: "recover_provider_failure", terminal: final.terminal, proof, diagnosis: "provider_route_unavailable",
+      continuation: "Continue from the recorded checkpoint", evidence: ["ssm:request"] };
+    const recover = (command_id: string, c: object = command) => post("execution", { ...auth, id, command_id, command: c });
+    expect((await recover("foreign-host", { ...command, proof: { ...proof, host: "never-inventoried-host" } })).error).toMatch(/inventory is missing or stale/);
+    expect((await recover("capability-mismatch", { ...command, proof: { ...proof, model: "test/other",
+      witness: { ...proof.witness, configured_model: "test/other" } } })).error).toMatch(/usable selected configured capability/);
+    expect((await recover("mutated-terminal", { ...command, terminal: { ...final.terminal, generation: 99 } })).error).toMatch(/terminal evidence changed/);
+    expect((await recover("wrong-diagnosis", { ...command, diagnosis: "provider_quota",
+      proof: { ...proof, witness: { ...proof.witness, kind: "configured_route_observed", configured_max_output_tokens: 32000 } } })).error).toMatch(/no matching typed or recognized/);
+    expect((await recover("stale-proof", { ...command, proof: { ...proof, id: "stale-proof", observed_at: Date.now() - 400_000 } })).error)
+      .toMatch(/needs a fresh configured-model request/);
+    // The refusals consumed nothing: the healthy grant still goes through afterwards.
+    expect(await recover("valid-grant")).toMatchObject({ kind: "provider_recovery_granted" });
+    // One-use proof: replaying the granted proof id refuses...
+    expect((await recover("duplicate-grant")).error).toMatch(/already granted/);
+    // ...and the diagnosed task is reservable again on the granted route.
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
+  });
+
   it("uses a fresh managed review prompt once for an exact-route retry", async () => {
     const project = "managed-review-recovery", g = await gateway(project, 7);
     const otherModels = Array.from({ length: 4 }, (_, i) => ({ ...g.capabilities, model: `test/different-${i}` }));
