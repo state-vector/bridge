@@ -117,6 +117,25 @@ pub(super) fn environment(root: &Path) -> Vec<(String, String)> {
 }
 
 impl Owner {
+    pub(super) fn inspection_paths(cfg: &DispatchConfig, task: &str) -> Result<Vec<PathBuf>, String> {
+        let Ok(allocations) = PathBuf::from(&cfg.workdir).join("workspaces").canonicalize() else { return Ok(vec![]); };
+        let ledger = gateway_pipeline::root(cfg)?.join("workspaces");
+        if !ledger.exists() { return Ok(vec![]); }
+        Self { cfg: cfg.clone(), ledger, allocations }.active_paths_for_task(task)
+    }
+
+    fn active_paths_for_task(&self, task: &str) -> Result<Vec<PathBuf>, String> {
+        Ok(self.records()?.into_iter().filter_map(|record| {
+            match (&record.location, &record.phase) {
+                (Location::Managed { .. }, Phase::InUse { owner: Ownership::Attempt { ticket, .. } })
+                    if ticket.task_id == task => Some(record.location.work()),
+                (Location::AdoptedExecution { task: id, .. }, Phase::InUse { .. })
+                    if id == task => Some(record.location.work()),
+                _ => None,
+            }
+        }).collect())
+    }
+
     pub fn open(cfg: &DispatchConfig) -> Result<Self, String> {
         let allocations = PathBuf::from(&cfg.workdir).join("workspaces");
         fs::create_dir_all(&allocations).map_err(|e| e.to_string())?;

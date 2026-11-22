@@ -18,13 +18,39 @@ import {
   mcpToolsList,
   StartupWaitSchema,
   startupWaitReason,
+  CoordinationWaitSchema,
+  type CoordinationResult,
   type ToolCtx,
   type ToolName,
   type ToolTable,
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.8.0";
+export const BUILD = "0.8.1";
+
+function coordinationDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise(resolve => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+async function waitForCoordination(ctx: ToolCtx, id: string, waitMs: number): Promise<CoordinationResult> {
+  const deadline = Date.now() + waitMs;
+  while (!ctx.signal?.aborted) {
+    const result: CoordinationResult = await ctx.call("ask.coordination_status", { id });
+    const remaining = deadline - Date.now();
+    if (result.state !== "pending" || remaining <= 0) return result;
+    await coordinationDelay(Math.min(1000, remaining), ctx.signal);
+  }
+  return { id, state: "pending" };
+}
 
 export const toolsList = (table: ToolTable) => mcpToolsList(table);
 
@@ -281,14 +307,22 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("get_history", { id: args.id, limit: args.limit }), null, 1)),
   },
   ask_agent: {
-    description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
+    description: "Typed requests: route independent_review + task_id schedules/reuses an independent agent review (no question/options needed); executor_coordination + task_id follows the current executor; agent_coordination targets a peer or pool; human_decision addresses human only for a genuine choice/authority Bridge lacks. Never ask the human to find another agent. Decisions/coordination require a complete plain-English question ≤240 chars and 2–8 explicit options naming actor and consequence. Human decisions also require reason (why Bridge needs the human) and details (self-contained user-visible context; technical evidence second). Recommended option first, prefixed '(Recommended)'. Bind artefact_id to pause your task until answered. For an unbound executor question, coordination {request_id, wait_ms} waits briefly without parking your task. Continue independent work if pending; retry with the same credential, request_id and question fields. Resolve questions via answer_ask, never progress notes. Offline agent delivery returns to the agent pool, not the human inbox.",
     schema: TOOL_ARG_SCHEMAS.ask_agent,
     handler: async (args, ctx) => {
+      const coordination = args.coordination === undefined ? undefined : CoordinationWaitSchema.parse(args.coordination);
       // BR#18305: urgency rides through — the native ask.create validates and
       // stores the contract v2 vocabulary ("time-sensitive" | "normal");
       // dropping it here made every MCP ask persist as "normal" even when the
       // caller flagged it time-sensitive.
-      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, urgency: args.urgency, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName });
+      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, urgency: args.urgency, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName, coordination_request_id: coordination?.request_id });
+      if (coordination) {
+        const result = await waitForCoordination(ctx, a.id, coordination.wait_ms ?? 5000);
+        const receipt = { ...result, url: a.url };
+        return text(JSON.stringify(result.state === "pending" ? {
+          ...receipt, note: "Continue independent work. When needed, retry with the same coordination.request_id and question fields.",
+        } : receipt));
+      }
       return text(JSON.stringify({
         ...a,
         note: a.kind === "independent_review" ? a.message : a.task_status === "blocked"

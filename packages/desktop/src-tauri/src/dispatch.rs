@@ -33,6 +33,8 @@ mod worker_session;
 mod writer_scan;
 #[path = "workspace.rs"]
 mod workspace;
+#[path = "workspace_inspect.rs"]
+mod workspace_inspect;
 #[path = "recovery.rs"]
 mod recovery;
 
@@ -46,6 +48,12 @@ pub fn workspaces_command(cfg: &DispatchConfig, reconcile: bool) -> Result<serde
         owner.reconcile(&[])?;
     }
     owner.report()
+}
+
+pub fn inspect_workspace(task: &str, file: Option<&str>) -> Result<serde_json::Value, String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("local home missing")?);
+    let cfg = crate::store::TokenStore::open().read_config().or_else(DispatchConfig::from_env);
+    workspace_inspect::inspect(&home, cfg.as_ref(), task, file)
 }
 
 pub fn worker_entry(path: &Path) -> Result<(), String> { worker_session::entry(path) }
@@ -2723,12 +2731,17 @@ fn worktree_owner(path: &Path, fallback: &str) -> String {
 /// check must never hang the dispatch loop (a misconfigured signingProgram —
 /// e.g. a 1Password bridge that blocks on a locked agent — must fail loudly,
 /// not stall dispatch). ssh-keygen from file signs instantly; 15s is generous.
-pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::process::Output, String> {
+pub(crate) fn run_with_timeout(cmd: Command, secs: u64) -> Result<std::process::Output, String> {
+    run_with_output_limit(cmd, secs, u64::MAX)
+}
+
+fn run_with_output_limit(mut cmd: Command, secs: u64, max_bytes: u64) -> Result<std::process::Output, String> {
     use std::io::{Read, Seek};
     // A child can fill a pipe before it exits. File-backed capture lets the
     // timeout poll independently of output volume or inherited descriptors.
     let capture = || -> std::io::Result<_> {
-        let file = tempfile::NamedTempFile::new()?;
+        let file = if max_bytes == u64::MAX { tempfile::NamedTempFile::new()? }
+            else { tempfile::NamedTempFile::new_in("/tmp")? };
         let writer = file.reopen()?;
         Ok((file.into_file(), writer))
     };
@@ -2749,6 +2762,9 @@ pub(crate) fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<std::proce
                     // Limit the read to bytes captured at exit even if a
                     // descendant inherited the output descriptor.
                     let len = file.metadata()?.len();
+                    if len > max_bytes {
+                        return Err(std::io::Error::other("command output exceeds the inspection limit"));
+                    }
                     file.rewind()?;
                     let mut bytes = Vec::new();
                     file.take(len).read_to_end(&mut bytes)?;

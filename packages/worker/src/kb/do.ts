@@ -257,6 +257,7 @@ import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSche
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
+import { CoordinationRequestIdSchema, type CoordinationResult } from "@bridge/contracts";
 import { projectExecutionModel, executionCommandHistory, executionHistorySummary, ExecutionHistoryEventSchema } from "@bridge/contracts";
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
@@ -3976,6 +3977,13 @@ export class KnowledgeHub {
       );
       CREATE INDEX IF NOT EXISTS idx_artefacts_open_work_id ON artefacts(id)
         WHERE type IN ('task','question') AND status NOT IN ('done','superseded');
+      CREATE TABLE IF NOT EXISTS coordination_requests (
+        token_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        ask_id TEXT NOT NULL UNIQUE,
+        PRIMARY KEY (token_id, request_id)
+      );
       CREATE TABLE IF NOT EXISTS relations (
         src_id TEXT NOT NULL,
         relation TEXT NOT NULL,
@@ -5163,6 +5171,7 @@ export class KnowledgeHub {
         case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
+        case "ask.coordination_status": return this.json(this.coordinationStatus(String(body.token_id ?? ""), String(body.id ?? "")));
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
@@ -5357,7 +5366,7 @@ export class KnowledgeHub {
 
   // ---------- ops ----------
 
-  private async create(body: any, actor: string, reviewOffer?: ReviewOffer) {
+  private async create(body: any, actor: string, reviewOffer?: ReviewOffer, coordination?: { tokenId: string; requestId: string; fingerprint: string }) {
     let type = body.type as ArtefactType;
     if (!isArtefactType(type)) throw new Error(`unknown artefact type '${type}' (valid: ${ARTEFACT_TYPES.join(", ")})`);
     // let: BR#5377 F3 mints the canonical verify-verdict title over the
@@ -5547,12 +5556,24 @@ export class KnowledgeHub {
       tags ? JSON.stringify(tags) : null, roles.length ? JSON.stringify(roles) : null,
     );
     if (createBudget) throw new Error(createBudget);
-    this.state.storage.sql.exec(
+    const insert = () => this.state.storage.sql.exec(
       `INSERT INTO artefacts (id, type, title, status, body_md, meta, owner, created_ts, updated_ts, tags, roles, status_ts, project, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, type, title, status, bodyMd, JSON.stringify({ ...createMeta, session }), owner, ts, ts,
       tags ? JSON.stringify(tags) : null, roles.length ? JSON.stringify(roles) : null, ts, project, actor,
     );
+    if (coordination) {
+      const existing = this.state.storage.transactionSync(() => {
+        const prior = this.coordinationReplay(coordination);
+        if (prior) return prior;
+        insert();
+        this.state.storage.sql.exec(
+          `INSERT INTO coordination_requests(token_id, request_id, fingerprint, ask_id) VALUES (?, ?, ?, ?)`,
+          coordination.tokenId, coordination.requestId, coordination.fingerprint, id,
+        );
+      });
+      if (existing) return { id: existing, type, status, coordinationReplay: true };
+    } else insert();
     if (!bodyMd.trim() && (type === "task" || type === "goal")) {
       bodyMd = scaffoldBody(title, owner || actor);
     }
@@ -11343,10 +11364,32 @@ export class KnowledgeHub {
     return { session: name, worktree };
   }
 
+  private coordinationReplay(request: { tokenId: string; requestId: string; fingerprint: string }): string | undefined {
+    const row = this.one(`SELECT ask_id, fingerprint FROM coordination_requests WHERE token_id=? AND request_id=?`,
+      request.tokenId, request.requestId);
+    if (!row) return;
+    if (row.fingerprint !== request.fingerprint) throw new Error("coordination request_id already used for a different question; use a new request_id");
+    return String(row.ask_id);
+  }
+
+  private coordinationStatus(tokenId: string, id: string): CoordinationResult {
+    const row = this.one(`SELECT a.status, a.meta FROM coordination_requests r LEFT JOIN artefacts a ON a.id=r.ask_id
+      WHERE r.token_id=? AND r.ask_id=?`, tokenId, id);
+    if (!row) throw new Error("no such coordination request for this credential");
+    if (!row.meta) return { id, state: "cancelled", reason: "The coordination question was removed." };
+    const result = askLifecycle({ status: String(row.status), meta: JSON.parse(String(row.meta)) });
+    return result.state === "open" ? { id, state: "pending" } : { id, ...result };
+  }
+
   private async askCreate(body: any, actor: string) {
     let to = String(body.to ?? (body.route?.kind === "human_decision" ? "human" : "any"));
     const route = askRoute({ route: body.route, to });
     const decision = body.decision === undefined ? undefined : HumanDecisionSchema.parse(body.decision);
+    const requestId = body.coordination_request_id === undefined ? undefined : CoordinationRequestIdSchema.parse(body.coordination_request_id);
+    if (requestId !== undefined && (route.kind !== "executor_coordination" || body.artefact_id !== undefined
+      || !body.token_id || body.token_id === "shared")) {
+      throw new Error("coordination wait requires a named credential and an unbound executor_coordination ask");
+    }
     if (route.kind === "human_decision") this.admitHumanAsk({ ...body, to, route });
     if (decision && route.kind !== "human_decision") throw new Error("decision is only valid for human_decision requests");
     if (route.kind === "independent_review") {
@@ -11406,6 +11449,15 @@ export class KnowledgeHub {
     // every urgent ask collapse to a normal-looking one: the urgent door
     // silently failed (found wiring BR#3008's stop-the-line sweep).
     const urgency = body.urgency === "time-sensitive" ? "time-sensitive" : "normal";
+    const coordination = requestId === undefined ? undefined : {
+      tokenId: String(body.token_id),
+      requestId,
+      fingerprint: await hashAuthToken(JSON.stringify([route, question, details, reason, options, urgency])),
+    };
+    if (coordination) {
+      const prior = this.coordinationReplay(coordination);
+      if (prior) return { id: prior, question };
+    }
 
     // the ask IS a question node: BR#-numbered, child_of its subject, answered
     // by transition. The legacy asks row is no longer written.
@@ -11430,8 +11482,11 @@ export class KnowledgeHub {
         meta: { ask: { route, decision, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
       },
       actor,
+      undefined,
+      coordination,
     );
     const id = created.id;
+    if (created.coordinationReplay) return { id, question };
     let taskStatus: string | undefined;
     if (artefactId) {
       const row = this.one(`SELECT type, status, meta FROM artefacts WHERE id = ?`, artefactId);

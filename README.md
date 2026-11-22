@@ -1112,6 +1112,27 @@ The native gateway owns allocation, preservation, reclamation and disk admission
 After the exact execution's stopped result is acknowledged, its workspace is released independently of whether the task awaits review, is blocked, or is finished. The owner verifies that Git source is clean and reachable from a published branch, then atomically renames the allocation to a journalled retirement path and removes it. Dirty or unpublished Git source, non-Git scratch inputs, open readers and dependent worktrees remain local with a durable retention reason.
 
 A bounded, fair reconciliation job runs every 30 seconds under sustained load, held executions and managed-update drain. Restart resumes the recorded preservation/deletion stage. Removed counts and allocation bytes are recorded only after the retirement path is gone; a skipped or retained resource is never reported as removed. `bridge status` includes workspace accounting and disk-admission state. `bridge workspaces status` shows resource states, retention errors and checkpoint receipts. `bridge workspaces reconcile` invokes the same owner for offline recovery and refuses to race a live gateway controller.
+
+For same-host coordination, run `bridge workspaces inspect 'BR#123' --file path/to/test.ts`
+from an account with OS read access to the local Bridge registry and worktree.
+The command selects the active managed workspace or falls back to a unique
+interactive registration. It reports the committed `HEAD` separately from a
+live patch of one tracked UTF-8 file (up to 64 KiB per version). Omit `--file`
+for `HEAD` only. The patch compares live bytes to `HEAD`; it is not a staging
+receipt or a stable snapshot. This command is local only. It grants no write,
+build, or claim authority and refuses untracked files, symlinks and ambiguous paths.
+
+Use MCP `ask_agent` with `route: {kind: "executor_coordination", task_id: "BR#123"}`
+and `coordination: {request_id: "<unique caller-generated ID>", wait_ms: 5000}`
+to ask the current executor if they are already fixing the test. Supply the usual
+`question` and `options`, and omit `artefact_id`: this does not park your task.
+The executor replies with `answer_ask`. If the result is `pending`, continue
+independent work and retry using the same credential, request ID and question
+fields. Timeout or disconnect does not cancel the ask. The wait defaults to
+5 seconds, is capped at 15 seconds, and `wait_ms: 0` checks immediately. A
+resolved ask returns `answered`, `cancelled`, or `expired`. There is no reserved
+answer capacity; don’t wait repeatedly when no executor can respond.
+
 Completed resource records move to cold history, outside the active reconciliation
 and rewrite set; immutable removal receipts preserve cumulative accounting. Fair
 passes prefer larger resources among equally unvisited allocations. Under disk pressure, one slot per pass is offered to the largest eligible released workspace and the remaining slots retain fair order.

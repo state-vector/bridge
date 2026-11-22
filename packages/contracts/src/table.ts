@@ -16,7 +16,8 @@ import { TOOL_ARG_SCHEMAS, TOOL_NAMES, type ToolName } from "./mcp.ts";
 export interface ToolCtx {
   call: (op: string, payload: object) => Promise<any>;
   identity: { token_id: string; label: string; tags: string[]; principal: string | null };
-  sessionName: string;
+  sessionName: string | undefined;
+  signal?: AbortSignal;
 }
 
 export interface ToolDef {

@@ -28,6 +28,21 @@ New allocations pause when the budget is exceeded; reclamation continues, with o
 resource states, retention errors and checkpoint receipts. Offline
 `bridge workspaces reconcile` uses the same owner and controller lock.
 
+Agents with OS read access on the same host can run
+`bridge workspaces inspect 'BR#123' --file path/to/test.ts`. Bridge uses the
+active managed workspace or a unique local registration. The command shows
+committed `HEAD` and a separate live patch for one tracked text file (up to 64
+KiB per version), or just `HEAD` if `--file` is omitted. It does not modify the
+worktree or transfer the claim. Live edits are evidence, not a committed receipt.
+
+To follow up, use MCP `ask_agent` with `route: {kind: "executor_coordination",
+task_id: "BR#123"}` and `coordination: {request_id: "<unique ID>", wait_ms: 5000}`.
+Include a question and options, but leave out `artefact_id` so the caller's
+task stays active. The executor replies via `answer_ask`. If the wait returns
+`pending` or the connection drops, keep working and retry later with the same
+credential, request ID and question fields. Waits default to 5 seconds and
+can be 0–15 seconds; they never reserve capacity or cancel the durable ask.
+
 Old registered worktrees, runner session/scratch roots, `~/opencode-tmp` and
 repository caches are adopted into the same lifecycle with preservation and
 reader checks. Removal counters describe actual completed reclamation.

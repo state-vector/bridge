@@ -61,6 +61,16 @@ export type AskLifecycle =
   | { state: "answered"; answer: string; by: string }
   | { state: "cancelled"; reason: string }
   | { state: "expired"; reason: string };
+
+export const CoordinationRequestIdSchema = z.string().min(1).max(128).regex(/^[a-zA-Z0-9_-]+$/);
+export const CoordinationWaitSchema = z.strictObject({
+  request_id: CoordinationRequestIdSchema.describe("Caller-generated unique ID. Retry with the same ID and question, even if you never received a response."),
+  wait_ms: z.number().int().min(0).max(15_000).optional().describe("Default 5000; use 0 to check without waiting."),
+});
+export type CoordinationResult = { id: string } & (
+  | { state: "pending" }
+  | Exclude<AskLifecycle, { state: "open" }>
+);
 export function askLifecycle(node: { status: string; meta?: { ask?: { answer?: string; answered_by?: string; resolution?: { kind?: string; reason?: string } } } }): AskLifecycle {
   const ask = node.meta?.ask;
   if (ask?.answer) return { state: "answered", answer: ask.answer, by: ask.answered_by ?? "unknown" };

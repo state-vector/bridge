@@ -175,6 +175,10 @@ impl TokenStore {
     /// principal into its own file eagerly — every load path (doctor,
     /// resolve, loop) converges the state; the stale field itself leaves
     /// config.json on the next save (loads never write).
+    pub fn read_config(&self) -> Option<DispatchConfig> {
+        serde_json::from_slice(&std::fs::read(self.config_path()).ok()?).ok()
+    }
+
     pub fn load_config(&self) -> Option<DispatchConfig> {
         let raw = std::fs::read_to_string(self.config_path()).ok()?;
         match serde_json::from_str::<DispatchConfig>(&raw) {

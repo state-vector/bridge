@@ -42,6 +42,27 @@ fn configure(path: &Path, root: &Path) {
 }
 
 #[test]
+fn inspection_uses_only_the_active_attempt_from_the_owner_ledger() {
+    let sandbox = Sandbox::new();
+    let owner = sandbox.owner();
+    let wanted = ticket("BR#42");
+    let other = ticket("BR#43");
+    for (id, phase) in [
+        ("active", Phase::InUse { owner: attempt(&wanted) }),
+        ("released", Phase::Released { owner: attempt(&wanted) }),
+        ("preparing", Phase::InUse { owner: Ownership::Reservation { ticket: wanted.clone() } }),
+        ("other", Phase::InUse { owner: attempt(&other) }),
+    ] {
+        owner.save(&Resource {
+            version: 1, id: id.into(), location: Location::Managed { root: owner.allocations.join(id) },
+            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+        }).unwrap();
+    }
+    assert_eq!(owner.active_paths_for_task("BR#42").unwrap(), vec![owner.allocations.join("active/work")]);
+    assert!(owner.active_paths_for_task("BR#44").unwrap().is_empty());
+}
+
+#[test]
 fn nested_legacy_caches_are_discovered_without_adopting_unpublished_inputs() {
     let sandbox = Sandbox::new();
     let owner = sandbox.owner();

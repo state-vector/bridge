@@ -1,6 +1,7 @@
 name = "bridge"
 main = "src/index.js"
 compatibility_date = "2026-01-15"
+compatibility_flags = ["enable_request_signal"]
 # account_id comes from CLOUDFLARE_ACCOUNT_ID in the environment — not committed.
 
 # The workers.dev subdomain stays enabled explicitly: defining routes makes

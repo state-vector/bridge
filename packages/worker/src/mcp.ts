@@ -224,7 +224,7 @@ async function handleAuthenticatedMcp(request: Request, env: any): Promise<Respo
         result = { tools: toolsList(TOOL_TABLE) };
         break;
       case "tools/call": {
-        result = await callTool(String(msg.params?.name ?? ""), msg.params?.arguments ?? {}, { call, identity, sessionName });
+        result = await callTool(String(msg.params?.name ?? ""), msg.params?.arguments ?? {}, { call, identity, sessionName, signal: request.signal });
         break;
       }
       default:
@@ -273,6 +273,7 @@ interface Ctx {
   call: (op: string, payload: object) => Promise<any>;
   identity: { token_id: string; label: string; tags: string[]; principal: string | null; token_epoch?: number; token_stale?: boolean };
   sessionName: string | undefined;
+  signal?: AbortSignal;
 }
 
 /** BR#4212: DO errors ride typed — result_class + HTTP status survive the

@@ -65,13 +65,95 @@ async function mcpAskAgent(args: Record<string, unknown>) {
   return JSON.parse(out.content[0].text);
 }
 
-async function inProgressTask(title: string) {
-  const created = await call("create", { type: "task", title, qualified: true, actor: LABEL, session: mcpCtx.sessionName });
+async function inProgressTask(title: string, actor = LABEL) {
+  const created = await call("create", { type: "task", title, qualified: true, actor, session: mcpCtx.sessionName });
   expect(created.status, JSON.stringify(created.body)).toBe(200);
   const id = created.body.id;
-  expect((await call("transition", { id, to: "in_progress", actor: LABEL, session: mcpCtx.sessionName })).status).toBe(200);
+  expect((await call("transition", { id, to: "in_progress", actor, session: mcpCtx.sessionName })).status).toBe(200);
   return id as string;
 }
+
+describe("bounded executor coordination", () => {
+  async function setup(requestId: string) {
+    const task = await inProgressTask(`Coordination target ${requestId}`);
+    const requester = `coordination-requester-${requestId}`;
+    const caller = await inProgressTask(`Independent work ${requestId}`, requester);
+    const ctx = {
+      ...mcpCtx,
+      identity: { ...mcpCtx.identity, label: requester, token_id: "coordination-credential" },
+      async call(op: string, payload: object) {
+        const r = await call(op, { ...payload, actor: requester, token_id: "coordination-credential" });
+        if (r.status >= 400) throw new Error(r.body.error);
+        return r.body;
+      },
+    };
+    const args = {
+      route: { kind: "executor_coordination", task_id: task },
+      question: "Are you already fixing the failing test?",
+      options: ["I am handling the fix", "You can handle the fix; I am not changing it"],
+      coordination: { request_id: requestId, wait_ms: 0 },
+    };
+    const ask = async (waitMs: number, signal?: AbortSignal) => {
+      const out = await TOOL_TABLE.ask_agent.handler({ ...args, coordination: { ...args.coordination, wait_ms: waitMs } }, { ...ctx, signal }) as { content: Array<{ text: string }> };
+      return JSON.parse(out.content[0].text);
+    };
+    return { task, caller, requester, ctx, args, ask };
+  }
+
+  it("delivers the current executor's answer during the call without parking independent work", async () => {
+    const f = await setup("during-wait");
+    let published!: (id: string) => void;
+    const oncePublished = new Promise<string>(resolve => { published = resolve; });
+    const result = TOOL_TABLE.ask_agent.handler({ ...f.args, coordination: { request_id: "during-wait", wait_ms: 2500 } }, {
+      ...f.ctx,
+      call: async (op, payload) => {
+        const read = await f.ctx.call(op, payload);
+        if (op === "ask.coordination_status") published(read.id);
+        return read;
+      },
+    }) as Promise<{ content: Array<{ text: string }> }>;
+    const id = await oncePublished;
+    const inbox = await call("ask.inbox", { label: LABEL });
+    expect(inbox.body.inbox).toContainEqual(expect.objectContaining({ id, to_target: `${LABEL}@${mcpCtx.sessionName}` }));
+    const ownTask = await call("get", { id: f.caller });
+    expect(ownTask.body.status).toBe("in_progress");
+    const answer = "Yes; tracked test fixture is edited in my worktree.";
+    expect((await call("ask.answer", { id, answer, actor: LABEL })).status).toBe(200);
+    expect(JSON.parse((await result).content[0].text)).toMatchObject({ id, state: "answered", answer, by: LABEL });
+  });
+
+  it("reattaches after timeout, cancellation and concurrent retries, including after answer", async () => {
+    const f = await setup("lost-reply");
+    const timeout = await f.ask(10);
+    expect(timeout).toMatchObject({ state: "pending", note: expect.stringContaining("Continue independent work") });
+    const controller = new AbortController();
+    const cancelled = TOOL_TABLE.ask_agent.handler({ ...f.args, coordination: { request_id: "lost-reply", wait_ms: 15_000 } }, {
+      ...f.ctx, signal: controller.signal,
+      call: async (op, payload) => {
+        const read = await f.ctx.call(op, payload);
+        if (op === "ask.coordination_status") controller.abort();
+        return read;
+      },
+    }) as Promise<{ content: Array<{ text: string }> }>;
+    const retries = await Promise.all([cancelled, f.ask(0), f.ask(0)]);
+    expect(JSON.parse(retries[0].content[0].text)).toMatchObject({ id: timeout.id, state: "pending" });
+    expect(retries.slice(1).map(r => (r as { id: string }).id)).toEqual([timeout.id, timeout.id]);
+    const wrongCredential = await call("ask.coordination_status", { id: timeout.id, token_id: "other-credential" });
+    expect(wrongCredential.status).toBe(400);
+    expect((await call("ask.answer", { id: timeout.id, answer: "No overlap", actor: LABEL })).status).toBe(200);
+    expect(await f.ask(0)).toMatchObject({ id: timeout.id, state: "answered", answer: "No overlap" });
+    await expect(TOOL_TABLE.ask_agent.handler({ ...f.args, question: "Is this a different question?" }, f.ctx))
+      .rejects.toThrow(/request_id already used/);
+    const sent = await call("ask.inbox", { label: f.requester });
+    expect(sent.body.sent).toMatchObject([{ id: timeout.id, question: f.args.question }]);
+
+    const concurrent = await setup("concurrent-creation");
+    const firstCalls = await Promise.all([concurrent.ask(0), concurrent.ask(0), concurrent.ask(0)]);
+    expect(new Set(firstCalls.map(r => r.id)).size).toBe(1);
+    await expect(TOOL_TABLE.ask_agent.handler({ ...concurrent.args, artefact_id: f.caller }, concurrent.ctx))
+      .rejects.toThrow(/unbound executor_coordination ask/);
+  });
+});
 
 describe("BR#18305 — the MCP schema carries the ask urgency vocabulary", () => {
   it("ask_agent accepts the contract v2 words and rejects off-vocabulary values", () => {

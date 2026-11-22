@@ -15,7 +15,7 @@
  * generated surface against `fixtures/mcp-tools.json`.
  */
 import { z } from "zod";
-import { AskRouteSchema, HumanDecisionSchema } from "./ask.ts";
+import { AskRouteSchema, CoordinationWaitSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema, UnblockResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
@@ -225,6 +225,7 @@ export const TOOL_ARG_SCHEMAS = {
     // omitted stays "normal" (the native ask.create default).
     urgency: z.enum(["normal", "time-sensitive"]).optional().describe('Ask urgency: "time-sensitive" surfaces the human-facing NOW chip and interrupt priority; omit for "normal".'),
     artefact_id: z.string().optional(),
+    coordination: CoordinationWaitSchema.optional().describe("Bounded synchronous wait for an executor_coordination ask. Do not bind artefact_id; a pending answer does not park your work."),
     session: z.string().optional(),
   }),
   asks: z.looseObject({}),
