@@ -262,7 +262,7 @@ import { projectExecutionModel, executionCommandHistory, executionHistorySummary
 import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
-import { gatewayOccupancy, gatewayCapacity } from "./scheduling.ts";
+import { gatewayOccupancy, gatewayCapacity, dispatchAdmissionCapacity } from "./scheduling.ts";
 import { RecoveryCapacity, schedulingRank, schedulingBoost, priorityTask, recoveryReviewMeta, trainReviewParentJoin, selectionOrder, selectionEntry, bypassesWaiter, SELECTION_BYPASS_BOUND, type SelectionEntry } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
@@ -3745,11 +3745,15 @@ export class KnowledgeHub {
       const occupancy = gatewayOccupancy(this.state.storage.sql, tokenId, host);
       const readiness = this.executorReadiness(tokenId, host, capabilities, now);
       const usable = [capabilities, ...capabilities.alternatives].some(model => model.availability.kind === "usable");
+      const admissionCap = dispatchAdmissionCapacity(capabilities);
       const state = now - Number(row.observed_ts) >= 120_000 ? "offline"
         : readiness.kind === "draining" || readiness.kind === "updating" ? "draining"
         : readiness.kind !== "ready" || !usable || capabilities.capacity <= 0 ? "unavailable"
-        : occupancy.active + occupancy.reserved >= capabilities.capacity ? "busy" : "ready";
-      return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, readiness, ...occupancy, capacity: capabilities.capacity,
+        // BR#14528 — at the admission cap no further session can start (the
+        // remaining slot is reserved for the control plane), so the host is
+        // busy for dispatch even though its nominal capacity is not full.
+        : occupancy.active + occupancy.reserved >= admissionCap ? "busy" : "ready";
+      return WorkerStatusSchema.parse({ host, observed_at: Number(row.observed_ts), state, readiness, ...occupancy, capacity: capabilities.capacity, admission_cap: admissionCap,
         reason: state === "offline" ? "Worker heartbeat is stale." : readiness.kind !== "ready" ? readiness.reason
           : !usable ? [capabilities, ...capabilities.alternatives].map(c => c.availability.kind === "unavailable" ? c.availability.reason : "").find(Boolean) || "No configured model is usable."
           : capabilities.capacity <= 0 ? "No worker slots configured."
@@ -7098,7 +7102,7 @@ export class KnowledgeHub {
         const health: SchedulingHealth = !pending ? { kind: "clear" } : now - Number(pending.since) < 120_000 ? { kind: "waiting", since: Number(pending.since) }
           : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
         const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
-        return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), eligible: selection.eligible.length,
+        return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), admission_cap: dispatchAdmissionCapacity(capabilities), eligible: selection.eligible.length,
           reasons: selection.reasons, held: selection.held, routeCandidates: selection.routeCandidates, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
@@ -7153,13 +7157,22 @@ export class KnowledgeHub {
         const hold = this.dispatchCandidates(tokenId, host, capabilities, [id]).taskHolds.get(id);
         perHost[host] = hold
           ? { claimed: false, reason: hold }
-          : { claimed: false, reason: occupancy.active + occupancy.reserved >= gatewayCapacity(capabilities) ? "at_capacity" : "eligible_but_not_reserved", ...occupancy };
+          : { claimed: false, reason: occupancy.active + occupancy.reserved >= dispatchAdmissionCapacity(capabilities) ? "at_capacity" : "eligible_but_not_reserved", ...occupancy };
       }
       if (!anyReady) continue;
       this.audit("system:scheduler", "root_fix_dispatch_starved", id, { age_ms: now - updated, hosts: perHost });
       this.version(id, "system:scheduler", "note",
         `ROOT-FIX DISPATCH STARVED (GH#455 invariant): this p0 root-fix card is unclaimed in todo while a ready executor ticks — ${JSON.stringify(perHost).slice(0, 400)} — a ready executor plus an unclaimed root-fix is a dispatch defect, not a staffing shortage`, {});
     }
+  }
+  /** BR#14528 — repeated admission refusals surface as a capacity signal on
+   *  the gateway-capability lane (dispatch_health / schedule_status / stats,
+   *  BR#6992 family), not as blind retries: one throttled ledger signal per
+   *  host per 30m names the saturated host and the work it had to refuse. */
+  private noteAdmissionAtCapacity(host: string, facts: { active?: number; reserved?: number; capacity: number; admission_cap?: number; eligible?: number }, now = Date.now()) {
+    if (this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='admission_at_capacity' AND json_extract(data,'$.host')=? AND ts>?`, host, now - 1_800_000)) return;
+    this.audit("system:scheduler", "admission_at_capacity", null, { host, active: facts.active ?? 0, reserved: facts.reserved ?? 0,
+      capacity: facts.capacity, admission_cap: facts.admission_cap ?? Math.max(1, facts.capacity - 1), eligible: facts.eligible ?? 0, observed_at: now });
   }
   private reconcileSchedulingHealth(now: number) {
     this.rootFixDispatchStarvationSweep(now);
@@ -7186,8 +7199,29 @@ export class KnowledgeHub {
     }
     const statuses = this.schedulingStatus(undefined, now);
     for (const status of statuses) {
-      if (!status.live || status.readiness.kind !== "ready" || !status.eligible || status.active + status.reserved >= status.capacity) {
-        this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id); continue;
+      // BR#14528 — a host at its ADMISSION cap (capacity minus the reserved
+      // control-plane slot) with eligible work is a capacity signal, not
+      // silence: keep the health window, raise one throttled
+      // admission_at_capacity signal naming the saturated host, and never
+      // mis-alarm dispatch_starved for it (saturation is the reservation
+      // working as designed; the queued cards stay claimable). Every other
+      // dead shape still deletes the row so the next live episode starts
+      // from a fresh window.
+      const atAdmissionCap = status.active + status.reserved >= status.admission_cap;
+      if (!status.live || status.readiness.kind !== "ready" || !status.eligible || atAdmissionCap) {
+        if (status.live && status.readiness.kind === "ready" && status.eligible && atAdmissionCap) {
+          this.state.storage.sql.exec(`INSERT OR IGNORE INTO dispatch_health(token_id,since) VALUES(?,?)`, status.token_id, now);
+          const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, status.token_id);
+          if (now - Number(pending.since) >= 120_000 && (!pending.attention_at || now - Number(pending.attention_at) >= 1_800_000)) {
+            this.state.storage.transactionSync(() => {
+              this.state.storage.sql.exec(`UPDATE dispatch_health SET attention_at=? WHERE token_id=?`, now, status.token_id);
+              this.audit("system:scheduler", "admission_at_capacity", null, { host: status.host, eligible: status.eligible, active: status.active, reserved: status.reserved, admission_cap: status.admission_cap, capacity: status.capacity, since: pending.since });
+            });
+          }
+        } else {
+          this.state.storage.sql.exec(`DELETE FROM dispatch_health WHERE token_id=?`, status.token_id);
+        }
+        continue;
       }
       this.state.storage.sql.exec(`INSERT OR IGNORE INTO dispatch_health(token_id,since) VALUES(?,?)`, status.token_id, now);
       const pending = this.one(`SELECT since,attention_at FROM dispatch_health WHERE token_id=?`, status.token_id);
@@ -7269,13 +7303,13 @@ export class KnowledgeHub {
       return this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
     }) : { eligible: [], entries: new Map<string, SelectionEntry>(), reasons: {} as Partial<Record<SchedulingReason, number>>, held: {} as Partial<Record<SchedulingReason, string[]>> };
     if (mode === "reserve" && capabilities && (selection.reasons.provider_route ?? 0) > 0
-      && occupancy.active + occupancy.reserved + selection.eligible.length < gatewayCapacity(capabilities)) {
+      && occupancy.active + occupancy.reserved + selection.eligible.length < dispatchAdmissionCapacity(capabilities)) {
       const now = Date.now();
       if (now - Number(observation?.observed_ts) < 120_000
         && body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
         && (capabilities.inventory_revision !== 2 || body.inventory_protocol === 2)
         && this.executorReadiness(tokenId, host, capabilities, now).kind === "ready") {
-        const spare = gatewayCapacity(capabilities) - occupancy.active - occupancy.reserved - selection.eligible.length;
+        const spare = dispatchAdmissionCapacity(capabilities) - occupancy.active - occupancy.reserved - selection.eligible.length;
         const recovered = capabilities.inventory_revision === 2
           ? this.drainProviderRouteHolds(body, tokenId, host, capabilities, spare, now)
           : this.recoverManagedReviewRoute(body, tokenId, host, capabilities, now);
@@ -7290,7 +7324,7 @@ export class KnowledgeHub {
       const index = selection.eligible.findIndex(t => String(t.id) === pending.recovery_id);
       if (index > 0) selection.eligible.unshift(...selection.eligible.splice(index, 1));
     }
-    const facts = { host, ...occupancy, capacity: capabilities ? gatewayCapacity(capabilities) : 0, eligible: selection.eligible.length, reasons: selection.reasons,
+    const facts = { host, ...occupancy, capacity: capabilities ? gatewayCapacity(capabilities) : 0, admission_cap: capabilities ? dispatchAdmissionCapacity(capabilities) : 0, eligible: selection.eligible.length, reasons: selection.reasons,
       preemption: pending ?? undefined, observed_at: Date.now() };
     const record = (outcome: SchedulingOutcome) => {
       const result = SchedulingOutcomeSchema.parse(outcome);
@@ -7300,7 +7334,7 @@ export class KnowledgeHub {
     if (!capabilities || Date.now() - Number(observation?.observed_ts) >= 120_000) return record({ kind: "gateway_not_ready", ...facts, reason: "Executor capability observation missing or stale" });
     const readiness = this.executorReadiness(tokenId, host, capabilities, Date.now());
     if (readiness.kind !== "ready" || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2)) return record({ kind: "gateway_not_ready", ...facts, reason: readiness.kind === "ready" ? "Runner protocol upgrade required" : readiness.reason });
-    if (occupancy.active + occupancy.reserved >= facts.capacity) {
+    if (occupancy.active + occupancy.reserved >= facts.admission_cap) {
       if (mode !== "inspect" && selection.eligible[0]) {
         // GH#455 (Ray ruling 2026-11-15): at capacity the preemption request
         // names the board's highest-precedence ELIGIBLE work — a root-fix
@@ -7313,6 +7347,10 @@ export class KnowledgeHub {
         });
         facts.preemption = recoveryCapacity.request(tokenId, host, priorityTask(rootFixFirst ?? selection.eligible[0])) ?? undefined;
       }
+      // BR#14528 — refusing eligible work at the admission cap is a capacity
+      // signal (throttled, gateway-capability lane), never a blind retry:
+      // the cards stay queued and claimable for the next free slot or host.
+      if (mode === "reserve" && selection.eligible.length) this.noteAdmissionAtCapacity(host, facts);
       return record({ kind: "at_capacity", ...facts });
     }
     if (occupancy.active + occupancy.reserved + occupancy.finalizing >= facts.capacity + Math.min(facts.capacity, 4)) return record({ kind: "finalization_backpressure", ...facts });
@@ -7363,7 +7401,10 @@ export class KnowledgeHub {
           facts.reasons.lifecycle_gate = (facts.reasons.lifecycle_gate ?? 0) + 1;
           this.audit(host, "dispatch_candidate_rejected", id, { reason: message.slice(0, 500) });
           const n = gatewayOccupancy(this.state.storage.sql, tokenId, host);
-          if (n.active + n.reserved >= facts.capacity) { result = { kind: "at_capacity", ...facts, ...n }; break; }
+          if (n.active + n.reserved >= facts.admission_cap) {
+            this.noteAdmissionAtCapacity(host, { ...facts, ...n });
+            result = { kind: "at_capacity", ...facts, ...n }; break;
+          }
         }
       }
       this.state.storage.sql.exec(`UPDATE execution_commands SET result=? WHERE task_id=? AND command_id=?`, JSON.stringify(result), key, commandId);
@@ -8191,6 +8232,18 @@ export class KnowledgeHub {
         throw new Error("gate: gateway admission changed before begin; retry through the scheduler");
       }
       if (readiness.kind !== "ready") throw new Error(`gate: gateway readiness before begin: ${readiness.reason}`);
+      // BR#14528 — capacity-aware begin: before minting a generation, verify
+      // the host still has a free writer slot under the ADMISSION cap
+      // (capacity minus the reserved control-plane slot), counting every
+      // unquiesced attempt and unclaimed reservation except this task's own.
+      // The hub is executing this command, so reachability is proven; a
+      // refusal here throws before reduceExecution mints anything — the
+      // runner reconciles it as a charge-free cancel_start (no retry budget,
+      // no start barrier), and the card returns to the queue claimable.
+      const admissionOccupancy = gatewayOccupancy(this.state.storage.sql, tokenId, actor, req.id, now);
+      if (admissionOccupancy.active + admissionOccupancy.reserved >= dispatchAdmissionCapacity(inventory)) {
+        throw new Error(`gate: host at admission capacity (${admissionOccupancy.active} active + ${admissionOccupancy.reserved} reserved of ${dispatchAdmissionCapacity(inventory)}; capacity ${inventory.capacity} reserves one control-plane slot) — no free writer slot; release the claim to the queue [rule: admission-capacity]`);
+      }
       if (capabilities.worker.kind !== "provisioned" || capabilities.worker.label !== command.worker) throw new Error("gate: begin worker identity differs from the advertised credential");
       if (this.startupWait(req.id) || this.startupRejected(req.id, actor, readiness.fingerprint)) throw new Error("gate: startup prerequisite requires changed executor/configuration proof before begin");
       const blockers = capabilityBlockers(current.requirements, capabilities, actor);
@@ -9962,7 +10015,9 @@ export class KnowledgeHub {
           const observation = this.one(`SELECT capabilities FROM execution_hosts WHERE token_id=?`, String(body.token_id));
           const capacity = gatewayCapacity(ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)));
           const n = gatewayOccupancy(this.state.storage.sql, String(body.token_id), String(credential.label));
-          if (n.active + n.reserved >= capacity) throw new Error("gate: gateway capacity is fully reserved or occupied");
+          // BR#14528 — a gateway-claimed session is a runner session: it can
+          // never occupy the reserved control-plane slot either.
+          if (n.active + n.reserved >= dispatchAdmissionCapacity(ExecutorCapabilitiesSchema.parse(JSON.parse(observation.capabilities)))) throw new Error("gate: gateway capacity is fully reserved or occupied");
           if (n.active + n.reserved + n.finalizing >= capacity + Math.min(capacity, 4)) throw new Error("gate: gateway finalization backlog is full; deliver retained outcomes before claiming more work");
         }
       }
@@ -10835,11 +10890,11 @@ export class KnowledgeHub {
     // by hand. Surface the per-host scheduler state (starved-since, held
     // counts by reason) here so the watchdog prose sweep and the operator
     // both see WHY nothing is dispatching from the stats route alone.
-    let scheduler: { host: string; live: boolean; ready: string; eligible: number; active: number; reserved: number; capacity: number; starved_since: number | null; held: Record<string, number> }[] | undefined;
+    let scheduler: { host: string; live: boolean; ready: string; eligible: number; active: number; reserved: number; capacity: number; admission_cap: number; starved_since: number | null; held: Record<string, number> }[] | undefined;
     try {
       scheduler = this.schedulingStatus(undefined, Date.now()).map(s => ({
         host: s.host, live: s.live, ready: s.readiness?.kind ?? "unknown", eligible: s.eligible ?? 0,
-        active: s.active ?? 0, reserved: s.reserved ?? 0, capacity: s.capacity ?? 0,
+        active: s.active ?? 0, reserved: s.reserved ?? 0, capacity: s.capacity ?? 0, admission_cap: s.admission_cap ?? 0,
         starved_since: s.health?.kind === "starved" ? Number(s.health.since) : null,
         held: Object.fromEntries(Object.entries(s.reasons ?? {}).map(([k, v]) => [k, Number(v)])),
       }));
