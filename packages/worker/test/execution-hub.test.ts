@@ -82,6 +82,42 @@ describe("historical stopped-writer receipts", () => {
     return { id, auth, worker, command };
   }
 
+  it.each(["before-stop", "after-stop"] as const)("binds the same ask after a proven stop, with its answer arriving %s", async when => {
+    const shared = stub;
+    stub = await hub(`checkpoint-wait-${when}`);
+    try {
+    const r = await setup();
+    const peer = await setup();
+    const fence = { generation: 1, attempt_id: "old" };
+    const worker = { actor: r.auth.agent, token_id: r.worker.id, session: r.auth.session,
+      execution_scope: { id: r.id, ...fence } };
+    const ask = await post<{ id: string }>("ask.create", {
+      ...worker, route: { kind: "executor_coordination", task_id: peer.id },
+      question: "Are the branch receipts ready?", options: ["They are ready", "They are not ready"],
+      coordination_request_id: `checkpoint-${when}`,
+    });
+    expect(ask.status, JSON.stringify(ask.data)).toBe(200);
+    const phase = () => post<{ status: string }>("get", { id: r.id }).then(result => result.data.status);
+    const answer = () => post("ask.answer", { ...peer.auth, id: ask.data.id, answer: "The branch receipts are ready" });
+    expect((await r.command("publish", { kind: "checkpoint", ...fence, checkpoint })).data.error).toBeUndefined();
+    const intent = { kind: "request_coordination_wait", ...fence, ask_id: ask.data.id, checkpoint_commit: checkpoint.commit };
+    expect((await r.command("intent", intent, worker)).data).toMatchObject({ attempt: { phase: "stopping" } });
+    expect(await phase()).toBe("in_progress");
+    if (when === "before-stop") expect((await answer()).status).toBe(200);
+    const stop = { ...fence, writers: "process_group_empty", outcome: {
+      kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "", at_ms: Date.now(),
+    } };
+    expect((await r.command("writer-stopped", { kind: "stopped", ...stop })).data.error).toBeUndefined();
+    expect(await phase()).toBe("in_progress");
+    const finalized = await r.command("finalize-wait", { kind: "finalize", ...stop });
+    expect(finalized.status, JSON.stringify(finalized.data)).toBe(200);
+    expect(await phase()).toBe(when === "after-stop" ? "blocked" : "todo");
+    if (when === "after-stop") expect((await answer()).status).toBe(200);
+    expect(await phase()).toBe("todo");
+    expect((await r.command("finalize-wait", { kind: "finalize", ...stop })).data).toEqual(finalized.data);
+    } finally { stub = shared; }
+  });
+
   it("uses only live gateway output from the current recovery claim as liveness", async () => {
     const r = await setup({ recovery_links: [{ repo: "state-vector/bridge", base: "main", head_sha: "a".repeat(40),
       cause: { kind: "check_failure", check: "Test" } }] });

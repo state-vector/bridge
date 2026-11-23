@@ -7867,6 +7867,22 @@ export class KnowledgeHub {
     const next = reduceExecution(current, command, worker ? String(attemptHost) : actor, session, now, String(meta.work_revision??"legacy"));
     const currentClaim = row.status === "in_progress" && meta.session === session;
     const finalizeCurrentClaim = command.kind === "finalize" && currentClaim;
+    const waitIntent = current.coordination_wait_intent;
+    const stoppedForCoordination = command.kind === "finalize" && finalizeCurrentClaim
+      && command.outcome.kind === "interrupted" && command.writers === "process_group_empty"
+      && waitIntent && waitIntent.generation === command.generation && waitIntent.attempt_id === command.attempt_id
+      && next.attempt?.checkpoint?.commit === waitIntent.checkpoint_commit
+      && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
+      && !this.protectedExecution(req.id, meta, true) && !meta.operator_gated
+      && !this.startupHasAsk(req.id) && !releaseHold(meta) ? waitIntent : null;
+    const waitAsk = stoppedForCoordination ? this.one(
+      `SELECT a.status,a.meta FROM coordination_requests r JOIN artefacts a ON a.id=r.ask_id
+       WHERE r.ask_id=? AND r.token_id=? AND a.type='question'`, stoppedForCoordination.ask_id, workerTokenId) : null;
+    const waitAskMeta = waitAsk ? JSON.parse(String(waitAsk.meta)) : null;
+    const waitState = waitAsk ? askLifecycle({ status: String(waitAsk.status), meta: waitAskMeta }) : null;
+    const waitRoute = waitAskMeta ? askRoute(waitAskMeta.ask ?? {}) : null;
+    const coordinationStop = stoppedForCoordination && waitState && waitRoute?.kind === "executor_coordination"
+      && !waitAskMeta.ask?.artefact_id ? { intent: stoppedForCoordination, outcome: waitState, route: waitRoute } : null;
     // BR#18328 — the durable external-CI park takes the claim with it: the
     // card returns to todo holding the wait signature, the worker slot is
     // released charge-free, and the head-bound probe + wake evaluator own
@@ -7895,7 +7911,9 @@ export class KnowledgeHub {
       meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
     }
     if (command.kind === "yield" && ((!localYield && row.status !== "in_progress") || meta.session !== session)) throw new Error("gate: yield requires the still-current task claim");
-    const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) }
+    const response = command.kind === "finalize" || reconcileFinalizedClaim ? { ...next, task_status: coordinationStop
+      ? coordinationStop.outcome.state === "open" ? "blocked" : "todo"
+      : canRescheduleFinalized ? "todo" : finalizedLocalHandoff ? "blocked" : String(row.status) }
       : command.kind === "await_external" ? { ...next, task_status: awaitExternalClaim ? "todo" : String(row.status) }
       : next;
     this.state.storage.transactionSync(() => {
@@ -7946,7 +7964,28 @@ export class KnowledgeHub {
       meta.execution_requirements = next.requirements;
       const history = executionCommandHistory(current, next, command);
       if (history) this.version(req.id, actor, "execution", executionHistorySummary(history), history);
-      if (canRescheduleFinalized) {
+      if (coordinationStop) {
+        const { intent, outcome, route } = coordinationStop;
+        const open = outcome.state === "open";
+        meta.execution_resume = { kind: "coordination_checkpoint", generation: intent.generation,
+          attempt_id: intent.attempt_id, ask_id: intent.ask_id, checkpoint_commit: intent.checkpoint_commit };
+        if (open) {
+          waitAskMeta.ask.artefact_id = req.id;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=? WHERE id=?`, JSON.stringify(waitAskMeta), intent.ask_id);
+          this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id,relation,dst_id,created_ts) VALUES (?,'child_of',?,?)`,
+            intent.ask_id, req.id, now);
+          meta.awaiting_ask = { ask_id: intent.ask_id, route, to: this.askRecipient(waitAskMeta.ask), ts: now };
+          meta.blocked = { reason: `Waiting for coordination answer ${intent.ask_id}`, ts: now,
+            unblock_condition: `Answer ${intent.ask_id}`, await_event: { event: "ask", ask_id: intent.ask_id } };
+        }
+        delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
+        this.state.storage.sql.exec(`UPDATE artefacts SET status=?,owner='',status_ts=?,updated_ts=?,meta=? WHERE id=?`,
+          open ? "blocked" : "todo", now, now, JSON.stringify(meta), req.id);
+        this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);
+        this.state.storage.sql.exec(`DELETE FROM dispatch_reservations WHERE task_id=?`, req.id);
+        this.version(req.id, actor, "transition", open ? "Stopped at a fenced checkpoint to wait for coordination" : "Coordination resolved while stopping; checkpoint retained for continuation",
+          { from: row.status, to: open ? "blocked" : "todo", ask_id: intent.ask_id, checkpoint: intent.checkpoint_commit, state: outcome.state });
+      } else if (canRescheduleFinalized) {
         // One scheduling path for both fresh work and terminal reconciliation.
         // Keep the exact captured outcome in execution_state; a fresh session
         // reconciles it instead of guessing completion or reusing a conversation.
