@@ -39,7 +39,12 @@ pub struct Outcome { pub kind: OutcomeKind, pub exit_code: Option<i32>, pub stdo
     /// Typed provider provenance (BR#8821). Serialized only when present so
     /// older hubs/recovery paths parse unchanged records identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cause: Option<crate::transport::ProviderCause> }
+    pub cause: Option<crate::transport::ProviderCause>,
+    /// GH#481: end-of-turn background yield — the agent ended its turn with
+    /// processes still live in the runner's process group. Serialized only
+    /// when present; an absent field is a drained turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_yield: Option<crate::transport::BackgroundYield> }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TerminalReceipt { pub generation: u64, pub attempt_id: String, pub outcome: Outcome }
 

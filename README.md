@@ -728,6 +728,20 @@ lost-result attempt (BR#18314's cost), so the launcher guidance tells writers to
 poll live with a declared grace window or park through `await_external` and
 never end the turn expecting a background watch to resume them.
 
+The turn boundary itself is typed, not advisory (GH#481): a managed session
+closes the moment its turn ends — stdin drops, the agent exits, the
+runner-owned process group is reaped — so a background shell job the agent
+left running has no delivery path and no continuation, whatever the shell
+tool's "you will be notified" promise says. The teardown probe observes the
+process group *before* the mop-up kill: a turn that ends with live processes
+still in the runner's group is killed, journaled as typed `background_yield`
+evidence (group class, live member count, observation time), and charged as
+an incomplete attempt — never a delivered success, never an auto-resumed
+continuation, and never a silent loss. The deployed worker prompt states the
+one supported lifecycle: await long commands inline within the turn (declaring
+quiet stretches first), or park durably via `await_external` / a coordination
+checkpoint before ending the turn.
+
 To retire a laptop from autonomous execution, an authenticated full agent or
 human uses `execution` with `id:"gateway"` and command
 `{kind:"gateway_control",host:"<hostname>",mode:"draining",reason:"<reason>"}`.

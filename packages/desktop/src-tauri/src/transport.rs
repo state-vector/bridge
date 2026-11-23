@@ -29,9 +29,47 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessIdentity { Linux { group: u32, start_ticks: u64, #[serde(default)] boot_id: String }, Unverifiable { group: u32 } }
 impl ProcessIdentity { pub fn group(&self) -> u32 { match self { Self::Linux { group, .. } | Self::Unverifiable { group } => *group } } }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GroupState { Empty, ZombiesOnly, Live, Unobservable }
-impl GroupState { pub fn quiescent(self) -> bool { matches!(self, Self::Empty | Self::ZombiesOnly) } }
+impl GroupState {
+    pub fn quiescent(self) -> bool { matches!(self, Self::Empty | Self::ZombiesOnly) }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Empty => "empty", Self::ZombiesOnly => "zombies_only", Self::Live => "live", Self::Unobservable => "unobservable" }
+    }
+}
+
+/// GH#481: end-of-turn background yield. The agent finished its turn while
+/// processes it had started were still members of the runner's process group.
+/// The session closes the moment the turn ends (stdin dropped, group reaped),
+/// so the deployed shell tool's "you will be notified when it completes"
+/// promise has no delivery path here: the outstanding job is destroyed work.
+/// The yield is typed evidence instead of a fake completion — the run is
+/// charged incomplete (`ok: false`), the stragglers are killed (they are ours:
+/// the group was created by this runner), and the terminal capture refuses to
+/// finalize the attempt as a completed success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundYield {
+    /// Pre-teardown group observation. Never `Empty`/`ZombiesOnly` — a
+    /// quiescent observation records no yield.
+    pub group: GroupState,
+    /// Live member count when the group is Linux-procfs observable; the
+    /// unobservable class carries `None` rather than inventing a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_members: Option<usize>,
+    pub observed_at: u64,
+}
+
+impl BackgroundYield {
+    pub fn note(self) -> String {
+        format!(
+            "background yield (GH#481): the agent ended its turn with processes still in the runner's process group ({}{}, observed {}) — no continuation exists past end of turn, the outstanding processes were killed, and the attempt is charged incomplete",
+            self.group.as_str(),
+            self.live_members.map(|n| format!(", {n} live member(s)")).unwrap_or_default(),
+            self.observed_at
+        )
+    }
+}
 
 // Test-visible so the fence-scoped census (writer_scan.rs, BR#9843) can be
 // exercised against fixture /proc trees on every platform.
@@ -106,6 +144,11 @@ pub struct RunOutcome {
     /// no adapter-typed provider discriminator (transport/process/timeout);
     /// `Some` provenance drives the canonical route incident end-to-end.
     pub cause: Option<ProviderCause>,
+    /// GH#481: end-of-turn background yield evidence. `Some` ⇒ `ok` is
+    /// false — a turn that ends with live processes in the runner's process
+    /// group is an incomplete attempt, never a delivered success.
+    /// (Serialized form: the journal `Outcome.background_yield`.)
+    pub background_yield: Option<BackgroundYield>,
 }
 
 fn ms_now() -> u64 {
@@ -546,19 +589,61 @@ fn kill_group(child: &mut Child, control: Option<&Arc<RunControl>>) {
     }
 }
 
-fn wait_or_kill(child: &mut Child, timeout: Duration, control: Option<&Arc<RunControl>>) -> (Option<std::process::ExitStatus>, bool) {
+/// GH#481: probe the runner-owned process group BEFORE the mop-up kill.
+/// Only a quiescent observation (Empty, or ZombiesOnly — zombies cannot
+/// perform I/O or fork) clears the turn; every other state means the agent
+/// left processes behind at end of turn, which is a typed background yield.
+fn outstanding_background(child: &Child) -> Option<BackgroundYield> {
+    let group = group_state(&ProcessIdentity::Unverifiable { group: child.id() });
+    if group.quiescent() { return None; }
+    let live_members = if group == GroupState::Live { live_group_members(child.id()) } else { None };
+    Some(BackgroundYield { group, live_members, observed_at: ms_now() })
+}
+
+/// Linux procfs live (non-zombie) member count for the observation evidence.
+#[cfg(target_os = "linux")]
+fn live_group_members(group: u32) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut live = 0;
+    for entry in entries {
+        let Ok(entry) = entry else { return None };
+        if !entry.file_name().to_string_lossy().bytes().all(|c| c.is_ascii_digit()) { continue; }
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+        let Some((state, process_group, _)) = proc_stat(&raw) else { continue };
+        if process_group == group && !matches!(state, 'Z' | 'X') { live += 1; }
+    }
+    Some(live)
+}
+#[cfg(not(target_os = "linux"))]
+fn live_group_members(_group: u32) -> Option<usize> { None }
+
+/// End-of-turn teardown, GH#481-aware. Waits for the child to exit on its
+/// own within `timeout` (polling the stop/cancel flags exactly like the old
+/// `wait_or_kill`) and — on a NATURAL exit — observes the runner-owned
+/// process group BEFORE the mop-up kill, so processes the agent left behind
+/// are typed evidence instead of silently destroyed work. The timeout and
+/// cancellation paths kill a live child (its in-flight commands are torn
+/// down with it) and record no yield: the interruption itself is the
+/// verdict, and a kill under cancellation must never read as the agent's
+/// failed promise.
+fn wait_and_drain(child: &mut Child, timeout: Duration, control: Option<&Arc<RunControl>>)
+  -> (Option<std::process::ExitStatus>, bool, Option<BackgroundYield>) {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => { kill_group(child, control); return (Some(st), false); },
+            Ok(Some(status)) => {
+                let background_yield = outstanding_background(child);
+                kill_group(child, control);
+                return (Some(status), false, background_yield);
+            }
             Ok(None) => {
                 if Instant::now() >= deadline || control.map(|c| c.should_stop()).unwrap_or(false) {
                     kill_group(child, control);
-                    return (child.wait().ok(), true);
+                    return (child.wait().ok(), true, None);
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err(_) => { kill_group(child, control); return (None, false); },
+            Err(_) => { kill_group(child, control); return (None, false, None); },
         }
     }
 }
@@ -640,6 +725,7 @@ impl AgentTransport for OpencodeRun {
                     session_id: None,
                     acp_parent_prompt_observed_at: None,
                     cause: None,
+                    background_yield: None,
                 };
             }
         };
@@ -703,13 +789,16 @@ impl AgentTransport for OpencodeRun {
             })
         });
 
-        let (status, timed_out) = wait_or_kill(&mut child, timeout, req.control);
+        let (status, timed_out, background_yield) = wait_and_drain(&mut child, timeout, req.control);
         let drain = |h: Option<std::thread::JoinHandle<String>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
         let stdout_tail = tail(drain(stdout), 4000);
-        let stderr_tail = tail(drain(stderr), 2000);
+        let mut stderr_tail = tail(drain(stderr), 2000);
+        if let Some(yielded) = background_yield {
+            stderr_tail = if stderr_tail.is_empty() { yielded.note() } else { format!("{stderr_tail}\n{}", yielded.note()) };
+        }
 
         RunOutcome {
-            ok: status.map(|s| s.success()).unwrap_or(false) && !timed_out,
+            ok: status.map(|s| s.success()).unwrap_or(false) && !timed_out && background_yield.is_none(),
             stdout_tail,
             stderr_tail,
             exit_code: status.and_then(|s| s.code()),
@@ -717,6 +806,7 @@ impl AgentTransport for OpencodeRun {
             session_id: None,
             acp_parent_prompt_observed_at: None,
             cause: None,
+            background_yield,
         }
     }
 }
@@ -764,6 +854,7 @@ impl AgentTransport for OpencodeAcp {
                     session_id: None,
                     acp_parent_prompt_observed_at: None,
                     cause: None,
+                    background_yield: None,
                 };
             }
         };
@@ -988,7 +1079,11 @@ impl AgentTransport for OpencodeAcp {
         let _ = stdin.flush();
         drop(stdin);
         if prompt_res.is_err() { kill_group(&mut child, req.control); }
-        let (status, timed_out) = wait_or_kill(&mut child, Duration::from_secs(30), req.control);
+        // GH#481 end-of-turn teardown: on a natural exit the runner-owned
+        // process group is observed BEFORE the mop-up kill, so a background
+        // job the agent left outstanding is typed evidence and an incomplete
+        // attempt — never a delivered success over a destroyed session.
+        let (status, timed_out, background_yield) = wait_and_drain(&mut child, Duration::from_secs(30), req.control);
         let _ = reader.join();
 
         match prompt_res {
@@ -998,19 +1093,22 @@ impl AgentTransport for OpencodeAcp {
                     .and_then(|s| s.as_str())
                     .unwrap_or("end_turn")
                     .to_string();
+                let yield_note = background_yield.map(BackgroundYield::note);
                 RunOutcome {
-                    ok: !timed_out && stop != "refusal" && stop != "cancelled",
+                    ok: !timed_out && stop != "refusal" && stop != "cancelled" && background_yield.is_none(),
                     stdout_tail: tail(accumulated, 4000),
-                    stderr_tail: String::new(),
+                    stderr_tail: yield_note.unwrap_or_default(),
                     exit_code: status.and_then(|s| s.code()).or(Some(0)),
                     timed_out,
                     acp_parent_prompt_observed_at: (req.model.is_some()
                         && !timed_out
                         && retry_cause.is_none()
+                        && background_yield.is_none()
                         && v.get("stopReason").and_then(|s| s.as_str()) == Some("end_turn"))
                         .then_some(last_model_response_at).flatten(),
                     session_id,
                     cause: None,
+                    background_yield,
                 }
             }
             Err(e) if e.text.contains("timed out") => RunOutcome {
@@ -1022,6 +1120,7 @@ impl AgentTransport for OpencodeAcp {
                 session_id,
                 acp_parent_prompt_observed_at: None,
                 cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
+                background_yield: None,
             },
             Err(e) => {
                 let observed = (req.model.is_some() && e.origin == AcpFailureOrigin::Transport
@@ -1037,6 +1136,7 @@ impl AgentTransport for OpencodeAcp {
                     session_id,
                     acp_parent_prompt_observed_at: observed,
                     cause: if e.origin == AcpFailureOrigin::Response { e.cause } else { e.cause.or(retry_cause) },
+                    background_yield: None,
                 }
             },
         }
@@ -1056,6 +1156,7 @@ fn acp_fail(mut child: Child, msg: String, cause: Option<ProviderCause>) -> RunO
         session_id: None,
         acp_parent_prompt_observed_at: None,
         cause,
+        background_yield: None,
     }
 }
 
@@ -1187,6 +1288,7 @@ impl AgentTransport for KiroChat {
                     session_id: None,
                     acp_parent_prompt_observed_at: None,
                     cause: None,
+                    background_yield: None,
                 };
             }
         };
@@ -1204,18 +1306,20 @@ impl AgentTransport for KiroChat {
                 String::from_utf8_lossy(&bytes).into_owned()
             })
         });
-        let (status, timed_out) = wait_or_kill(&mut child, timeout, req.control);
+        let (status, timed_out, background_yield) = wait_and_drain(&mut child, timeout, req.control);
         let stdout_full = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
         let session_id = find_session_id(&stdout_full);
+        let yield_note = background_yield.map(BackgroundYield::note);
         RunOutcome {
-            ok: status.map(|s| s.success()).unwrap_or(false) && !timed_out,
+            ok: status.map(|s| s.success()).unwrap_or(false) && !timed_out && background_yield.is_none(),
             stdout_tail: tail(stdout_full, 4000),
-            stderr_tail: String::new(),
+            stderr_tail: yield_note.unwrap_or_default(),
             exit_code: status.and_then(|s| s.code()),
             timed_out,
             session_id,
             acp_parent_prompt_observed_at: None,
             cause: None,
+            background_yield,
         }
     }
 }
@@ -1692,5 +1796,207 @@ mod provider_cause_tests {
         assert!(!serde_json::to_string(&redacted).unwrap().contains("sk-abcdef1234567890"));
         let replaced = serde_json::to_string(&redacted).unwrap();
         assert!(replaced.contains("[redacted:depth]"), "{replaced}");
+    }
+}
+
+// GH#481 — the end-of-turn pending-work class. Verified incidents: a managed
+// worker ended its turn while a background shell job it had started was still
+// running; the runner closed the session (stdin drop → agent exit →
+// process-group mop-up) and finalized the attempt as a delivered success —
+// the shell tool's "you will be notified when it completes" promise had no
+// delivery path, and the pending work was silently destroyed. The
+// turn-boundary teardown now types that state instead: observe the
+// runner-owned process group BEFORE the mop-up kill, kill the stragglers
+// (they are ours — the group was created by this runner), and charge the
+// attempt incomplete. Never infer job completion from prose.
+#[cfg(test)]
+mod background_yield_tests {
+    use super::*;
+
+    /// sh fixture speaking the ACP handshake. `body` runs after the third
+    /// request line (session/prompt) is consumed.
+    fn acp_fixture(dir: &std::path::Path, body: &str) {
+        let mut script = String::from(
+            "#!/bin/sh\nread -r line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nread -r line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"parent\"}}'\nread -r line\n",
+        );
+        script.push_str(body);
+        std::fs::write(dir.join("acp"), script).unwrap();
+    }
+
+    fn acp_run(dir: &std::path::Path, control: Option<&Arc<RunControl>>, live: Option<Arc<Mutex<String>>>) -> RunOutcome {
+        OpencodeAcp.dispatch(&RunRequest {
+            workdir: dir.to_str().unwrap(),
+            bin: "/bin/sh",
+            agent: None,
+            model: Some("llmgw/glm-5.3"),
+            prompt: "test",
+            title: None,
+            resume: None,
+            extra_config: None,
+            control,
+        }, Duration::from_secs(10), live)
+    }
+
+    fn nonce_dir(prefix: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Poll the runner-owned group (exposed by the fixture through `$$`,
+    /// which is the group leader pid) until the teardown's SIGKILL drains it.
+    fn group_drained(dir: &std::path::Path) -> GroupState {
+        let group: u32 = std::fs::read_to_string(dir.join("pgid")).unwrap().trim().parse().unwrap();
+        for _ in 0..100 {
+            let state = group_state(&ProcessIdentity::Unverifiable { group });
+            if state.quiescent() { return state; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("straggler survived the GH#481 teardown: group {group} still {:?}", group_state(&ProcessIdentity::Unverifiable { group }));
+    }
+
+    /// The issue's exact regression shape: the fake ACP session starts a long
+    /// command, returns end_turn with the work still pending, then exits.
+    /// The result must be consumed exactly once — typed as an incomplete
+    /// attempt with killed stragglers, never as a delivered success and
+    /// never as a continuation promise.
+    #[test]
+    fn end_turn_with_pending_work_is_typed_incomplete_and_stragglers_are_killed() {
+        let dir = nonce_dir("bridge-gh481-yield");
+        acp_fixture(&dir, "printf '%s' $$ > pgid\nsleep 30 &\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}'\n");
+        let out = acp_run(&dir, None, None);
+        assert_eq!(out.session_id.as_deref(), Some("parent"), "{}", out.stderr_tail);
+        assert!(!out.timed_out, "{}", out.stderr_tail);
+        assert_eq!(out.exit_code, Some(0), "the agent exited on its own — the yield is the teardown probe, not a kill");
+        assert!(!out.ok, "a turn that ends with pending work is never a delivered success");
+        let evidence = out.background_yield.expect("typed background-yield evidence");
+        assert!(!evidence.group.quiescent(), "a pending straggler is not a quiescent group");
+        assert!(evidence.observed_at > 0);
+        if cfg!(target_os = "linux") {
+            assert_eq!(evidence.group, GroupState::Live);
+            assert!(evidence.live_members.unwrap_or(0) >= 1, "procfs counts the pending straggler");
+        } else {
+            assert_eq!(evidence.live_members, None, "an unobservable group invents no count");
+        }
+        assert!(out.stderr_tail.contains("background yield (GH#481)"), "{}", out.stderr_tail);
+        assert!(out.stderr_tail.contains("no continuation exists past end of turn"), "{}", out.stderr_tail);
+        assert!(group_drained(&dir).quiescent(), "the straggler was ours: the teardown must have killed it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The clean counterpart: a turn that ends with nothing pending stays a
+    /// delivered success, and the observation survives for managed review.
+    #[test]
+    fn clean_end_turn_without_pending_work_stays_a_delivered_success() {
+        let dir = nonce_dir("bridge-gh481-clean");
+        acp_fixture(&dir, "printf '%s\\n' '{\"method\":\"session/update\",\"params\":{\"sessionId\":\"parent\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"checked the change\"}}}}'\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}'\n");
+        let out = acp_run(&dir, None, None);
+        assert_eq!(out.session_id.as_deref(), Some("parent"), "{}", out.stderr_tail);
+        assert!(out.ok, "{}", out.stderr_tail);
+        assert!(out.background_yield.is_none(), "{}", out.stderr_tail);
+        assert_eq!(out.stderr_tail, "");
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.acp_parent_prompt_observed_at.is_some(), "a clean turn keeps its managed-review observation");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Cancellation: an interrupted turn records the interruption — never a
+    /// background yield and never the agent's failed promise. The straggler
+    /// still dies with the group (it is ours).
+    #[test]
+    fn cancelled_turn_with_pending_straggler_is_an_interruption_not_a_yield() {
+        let dir = nonce_dir("bridge-gh481-cancel");
+        acp_fixture(&dir, "printf '%s' $$ > pgid\nsleep 30 &\nprintf '%s\\n' '{\"method\":\"session/update\",\"params\":{\"sessionId\":\"parent\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"worker tick\"}}}}'\nprintf '%s\\n' '{\"method\":\"session/update\",\"params\":{\"sessionId\":\"parent\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"message\":\"teardown ready\"}}}'\nread -r line\n");
+        let live = Arc::new(Mutex::new(String::new()));
+        let control = Arc::new(RunControl::default());
+        control.grant_lease_from(Instant::now());
+        let watcher = {
+            let control = control.clone();
+            let live = live.clone();
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(4);
+                loop {
+                    if live.lock().unwrap().contains("teardown ready") {
+                        control.stop.store(true, Ordering::SeqCst);
+                        return true;
+                    }
+                    if Instant::now() >= until { return false; }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let out = acp_run(&dir, Some(&control), Some(live));
+        assert!(watcher.join().unwrap(), "fixture did not reach the teardown marker");
+        assert_eq!(out.stderr_tail, "acp interrupted — stop for a fresh attempt");
+        assert!(!out.ok);
+        assert!(out.background_yield.is_none(), "the interruption is the verdict — never a typed yield");
+        assert!(group_drained(&dir).quiescent(), "the cancelled group is still torn down");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The stdio fallback transport carries the same boundary: a run that
+    /// exits 0 with pending work is incomplete evidence, not success.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_run_with_pending_work_is_typed_incomplete_and_stragglers_are_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = nonce_dir("bridge-gh481-stdio");
+        let script = dir.join("agent");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s' $$ > pgid\nsleep 30 &\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = OpencodeRun.dispatch(&RunRequest {
+            workdir: dir.to_str().unwrap(),
+            bin: script.to_str().unwrap(),
+            agent: None,
+            model: Some("fixture"),
+            prompt: "argv-is-ignored-by-the-fixture",
+            title: None,
+            resume: None,
+            extra_config: None,
+            control: None,
+        }, Duration::from_secs(10), None);
+        assert_eq!(out.session_id, None);
+        assert_eq!(out.exit_code, Some(0));
+        assert!(!out.timed_out);
+        assert!(!out.ok, "a stdio run ending with pending work is never a delivered success");
+        let evidence = out.background_yield.expect("typed background-yield evidence");
+        assert!(!evidence.group.quiescent());
+        assert!(out.stderr_tail.contains("background yield (GH#481)"), "{}", out.stderr_tail);
+        assert!(group_drained(&dir).quiescent(), "the straggler was ours: the teardown must have killed it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A child job that already failed and exited before the turn ended is
+    /// not pending work — a corpse cannot perform I/O or fork — and must not
+    /// charge the turn. Linux-only: only procfs classifies a zombie as
+    /// quiescent; other platforms cannot make this distinction.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_child_job_left_unreaped_is_not_pending_work() {
+        let dir = nonce_dir("bridge-gh481-zombie");
+        acp_fixture(&dir, "/bin/false &\nsleep 0.3\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}'\n");
+        let out = acp_run(&dir, None, None);
+        assert!(out.ok, "a dead child job is not pending work: {}", out.stderr_tail);
+        assert!(out.background_yield.is_none(), "{}", out.stderr_tail);
+        assert_eq!(out.exit_code, Some(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The evidence type keeps its wire shape: stable snake_case fields, the
+    /// member count absent (not zero) when the group was unobservable.
+    #[test]
+    fn background_yield_serializes_stably() {
+        let live = BackgroundYield { group: GroupState::Live, live_members: Some(2), observed_at: 1795410000000 };
+        assert_eq!(
+            live.note(),
+            "background yield (GH#481): the agent ended its turn with processes still in the runner's process group (live, 2 live member(s), observed 1795410000000) — no continuation exists past end of turn, the outstanding processes were killed, and the attempt is charged incomplete"
+        );
+        assert_eq!(serde_json::to_string(&live).unwrap(), "{\"group\":\"live\",\"live_members\":2,\"observed_at\":1795410000000}");
+        assert_eq!(serde_json::from_str::<BackgroundYield>(&serde_json::to_string(&live).unwrap()).unwrap(), live);
+        let unobservable = BackgroundYield { group: GroupState::Unobservable, live_members: None, observed_at: 1 };
+        assert_eq!(serde_json::to_string(&unobservable).unwrap(), "{\"group\":\"unobservable\",\"observed_at\":1}");
+        let zombies = BackgroundYield { group: GroupState::ZombiesOnly, live_members: None, observed_at: 1 };
+        assert_eq!(serde_json::to_string(&zombies).unwrap(), "{\"group\":\"zombies_only\",\"observed_at\":1}");
     }
 }

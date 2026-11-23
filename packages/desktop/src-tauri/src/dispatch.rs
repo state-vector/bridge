@@ -3191,6 +3191,15 @@ fn is_config_error(text: &str) -> bool {
 
 const BRIDGE_TOOLS_MISSING: &str = "MCP UNAVAILABLE: bridge tools missing";
 
+/// GH#481: the runner's ONE supported lifecycle for background shell jobs.
+/// The runner closes the agent session the moment the turn ends, so the
+/// deployed shell tool's "you will be notified when it completes" promise has
+/// no delivery path — the transport charges a yielded turn as an incomplete
+/// attempt with typed evidence, never an auto-resume and never a delivered
+/// success. This contract line is guidance; the transport probe is the
+/// enforcement (see transport.rs `wait_and_drain`).
+const BACKGROUND_JOBS_LINE: &str = "\nBackground jobs (GH#481): your session closes the moment your turn ends — nothing of yours survives the turn boundary, and no background-completion notification can ever reach you afterwards (the shell tool's \"you will be notified\" promise is void under this runner). Await long-running commands inline within the turn, declaring quiet stretches first with log_progress {will, grace_minutes ≤ 60}; for work that outlives the turn, park durably before ending it via execution(command={kind:\"await_external\", ...}) or a coordination checkpoint. Never detach a subprocess from the runner process group. A turn that ends with live processes still in the runner's process group is killed, typed as a background yield, and charged as an incomplete attempt — it is never auto-resumed and never counts as delivered work.\n";
+
 fn agent_environment_prompt(bridge_session: &str) -> String {
     format!(
         "# Environment\n\n\
@@ -3763,6 +3772,7 @@ fn spawn_opencode(
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
     let checkpoint_slug: String = tid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
     prompt.push_str(&format!("\nIf a coordination ask remains pending and there is genuinely no independent work left, a managed implementation task can request a stop, not certify one. First preserve your work in a signed Git commit and publish its exact HEAD to a fresh refs/heads/bridge-checkpoints/{checkpoint_slug}/{generation}/<unique checkpoint> ref on this repository's origin. Do not stage ignored inputs or publish secrets. Send execution command request_coordination_wait with this generation and attempt_id, the existing ask_id, checkpoint_commit, and checkpoint {{repo, remote_ref, commit, tree, base, environment, next, tests}}. Then stop working. The originating gateway checks physical writer stop and the published checkpoint; only then can the ask own a wait and the slot be released. If the request reports the ask already resolved, keep working from that result instead.\n"));
+    prompt.push_str(BACKGROUND_JOBS_LINE);
     prompt.push_str("\nCI waits (BR#18328): ending your turn kills every background watch you started, and a turn that ends past its action budget is charged as a failed attempt — never park a CI wait on a local `gh run watch` or polling loop. If your verdict depends on hosted checks that are still running, either (a) keep the turn alive and poll live, declaring the quiet stretch first with log_progress {will, grace_minutes ≤ 60}, or (b) park durably before ending the turn: execution(id=<task>, command_id=<unique stable id>, command={kind:\"await_external\", generation, attempt_id, writers:\"process_group_empty\", wait:{type:\"pr_required_checks\", repo:\"owner/name\", pr:<n>, head_sha:\"<full 40-hex head your review is bound to>\", contexts:[\"<required check names>\"]}}). The attempt parks quiesced charge-free (the wait never consumes the retry budget), the card holds in todo as independent_wait with the worker slot released, and exactly one fresh verifier wakes when the bound checks settle green, conclusively fail, the head moves (the stale wait invalidates), or the settle bound (~60m) releases. The wake is evidence, never acceptance — the fresh verifier re-verifies signature, mergeability and substance at the current head first-hand.\n");
     prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
     EXECUTION_FENCES.get_or_init(Default::default).lock().unwrap().insert(tid.into(), (generation, execution.attempt_id.clone()));
@@ -4130,6 +4140,25 @@ mod tests {
             "`answer_ask`",
         ] {
             assert!(prompt.contains(expected), "missing prompt contract: {expected}");
+        }
+    }
+
+    /// GH#481: the deployed worker prompt voids the shell tool's "you will
+    /// be notified" promise — no delivery path exists past end of turn under
+    /// this runner — and names the one supported lifecycle instead: await
+    /// inline with a declared grace window, or park durably via
+    /// await_external / a coordination checkpoint before ending the turn.
+    #[test]
+    fn deployed_prompt_states_the_one_supported_background_job_lifecycle() {
+        for expected in [
+            "your session closes the moment your turn ends",
+            "no background-completion notification can ever reach you afterwards",
+            "Await long-running commands inline within the turn",
+            "await_external",
+            "charged as an incomplete attempt",
+            "never counts as delivered work",
+        ] {
+            assert!(super::BACKGROUND_JOBS_LINE.contains(expected), "missing deployed lifecycle contract: {expected}");
         }
     }
 

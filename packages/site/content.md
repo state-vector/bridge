@@ -1134,6 +1134,17 @@ wait (GH #478): the hub's own board state proves the wait satisfied
 (`process_group_empty`) stands, and the settle records the conclusive outcome
 without releasing the wait — the ordinary continuation consumes it exactly once.
 
+The ACP turn boundary is typed evidence, not prose (GH#481): a managed session
+closes the moment its turn ends, so a background shell job left running at
+end_turn has no delivery path. The teardown observes the runner-owned process
+group before the mop-up kill; a turn that ends with live members is killed,
+journaled with typed `background_yield` evidence (group class, live member
+count, observation time) and charged as an incomplete attempt — never a
+completed success and never an auto-resumed continuation. The deployed worker
+prompt names the supported lifecycles: await long commands inline within the
+turn (declaring quiet stretches first), or park durably via `await_external`
+or a coordination checkpoint before the turn ends.
+
 Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
 
 Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.

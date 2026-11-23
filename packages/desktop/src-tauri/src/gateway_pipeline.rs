@@ -101,7 +101,7 @@ impl Launch {
     fn unstarted_work(&self, reason: String) -> Option<Work> {
         if !matches!(self.stage, LaunchStage::Preparing) || self.record.process.is_some() { return None; }
         Some(Work::Stopped {
-            outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None },
+            outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason, acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None },
             writers: WriterProof::ProcessGroupEmpty,
             worktree: self.worktree.clone(),
             step: Step::Stop,
@@ -201,14 +201,18 @@ fn record(cfg: &DispatchConfig, task: &str, runtime: &ExecutionRuntime, result: 
         host: cfg.label.clone().ok_or("gateway host missing")?, generation: runtime.generation, attempt_id: runtime.attempt_id.clone() };
     let voided = void_run(&result.stdout_tail, &result.stderr_tail);
     let interrupted = runtime.control.stop.load(Ordering::SeqCst);
+    // GH#481: a background yield can never finalize as a completed success —
+    // the transport already charges it ok:false, and this gate keeps the
+    // invariant even if a future transport forgets. The typed evidence rides
+    // the outcome so recovery surfaces the honest class.
     let kind = if interrupted { OutcomeKind::Interrupted } else if result.timed_out { OutcomeKind::TimedOut }
-        else if result.ok && !voided { OutcomeKind::Completed } else { OutcomeKind::Failed };
-    let observed = result.acp_parent_prompt_observed_at.filter(|_| !voided);
+        else if result.ok && !voided && result.background_yield.is_none() { OutcomeKind::Completed } else { OutcomeKind::Failed };
+    let observed = result.acp_parent_prompt_observed_at.filter(|_| !voided && result.background_yield.is_none());
     let outcome = Outcome { kind, exit_code: result.exit_code, stdout_tail: result.stdout_tail.clone(), stderr_tail: result.stderr_tail.clone(),
         acp_prompt_observed_at: None,
         acp_parent_prompt_observed_at: if interrupted { None } else { observed },
         acp_parent_teardown_observed_at: if interrupted { observed } else { None },
-        cause: result.cause.clone() };
+        cause: result.cause.clone(), background_yield: result.background_yield };
     let work = if let Some(writers) = runtime.control.writer_state().and_then(WriterProof::observed) {
         Work::Stopped { outcome, writers, worktree, step: Step::Stop }
     } else { Work::Unproven { outcome, worktree } };
@@ -276,7 +280,7 @@ fn prepare(shared: &Config, snap: &SharedSnapshot, input: Input, cancel: Arc<Ato
                             if let (Some(generation), Some(attempt_id)) = (a["generation"].as_u64(), a["attempt_id"].as_str()) {
                                 let owner = Ownership::Attempt { ticket: ticket.clone(), host: cfg.label.clone().unwrap(), generation, attempt_id: attempt_id.into() };
                                 let record = Record { owner: owner.clone(), host: cfg.label.clone().unwrap(), url: cfg.url.trim_end_matches('/').into(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
-                                    work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+                                    work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Interrupted, exit_code: None, stdout_tail: String::new(), stderr_tail: reason.clone(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
                                 return Prepared::Finalize { owner, value: FinalWork::Fresh(record) };
                             }
                         }
@@ -434,7 +438,8 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
 fn bounded_outcome(outcome: &Outcome) -> Outcome {
     // The typed cause survives bounding: its sanitized fields are already
     // bounded at classification time, so provenance reaches the hub intact.
-    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000), acp_prompt_observed_at: outcome.acp_prompt_observed_at, acp_parent_prompt_observed_at: outcome.acp_parent_prompt_observed_at, acp_parent_teardown_observed_at: outcome.acp_parent_teardown_observed_at, cause: outcome.cause.clone() }
+    // The GH#481 background yield is Copy evidence — it survives bounding too.
+    Outcome { kind: outcome.kind.clone(), exit_code: outcome.exit_code, stdout_tail: tail_bytes(&outcome.stdout_tail, 16_000), stderr_tail: tail_bytes(&outcome.stderr_tail, 8_000), acp_prompt_observed_at: outcome.acp_prompt_observed_at, acp_parent_prompt_observed_at: outcome.acp_parent_prompt_observed_at, acp_parent_teardown_observed_at: outcome.acp_parent_teardown_observed_at, cause: outcome.cause.clone(), background_yield: outcome.background_yield }
 }
 fn tail_bytes(text: &str, max: usize) -> String {
     let mut start = text.len().saturating_sub(max);
@@ -608,7 +613,7 @@ fn reconcile_record(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resul
             };
             let outcome = match &saved.work {
                 Work::Unproven { outcome, .. } => outcome.clone(),
-                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None },
+                _ => Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Original worker stopped without a captured result; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None },
             };
             let worktree = match &saved.work { Work::Unproven { worktree: Some(path), .. } => Some(path.clone()), _ => worktree };
             journal::save(&terminal, &Record { work: Work::Stopped { outcome, writers: WriterProof::NoLiveGroupMembers, worktree, step: Step::Stop }, disposition: Disposition::Pending, ..saved })?;
@@ -666,10 +671,10 @@ fn self_heal_release(cfg: &DispatchConfig, record: &Record, apply: bool) -> Resu
     };
     let outcome = if evidence["result"] == "live" {
         Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
-            stderr_tail: "Fenced stop of an orphaned live writer matched by the exact execution fence; its uncaptured result is unavailable; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }
+            stderr_tail: "Fenced stop of an orphaned live writer matched by the exact execution fence; its uncaptured result is unavailable; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }
     } else {
         Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
-            stderr_tail: format!("Daemon restart left no manifest or receipt; a complete same-UID /proc census ({} entries) found no process matching the exact execution fence; the writer is kernel-proved absent; original work retained", evidence["scanned"]), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }
+            stderr_tail: format!("Daemon restart left no manifest or receipt; a complete same-UID /proc census ({} entries) found no process matching the exact execution fence; the writer is kernel-proved absent; original work retained", evidence["scanned"]), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }
     };
     let terminal = terminal_root(cfg)?;
     let launch_path = root(cfg)?.join("launches").join(record.name());
@@ -825,7 +830,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
             } else if let Some(work) = unstarted {
                 work
             } else {
-                Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }, worktree: launch.worktree }
+                Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted before capturing the transport result; inspect existing receipts and preserved work before continuing".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }, worktree: launch.worktree }
             };
             let record = journal::insert(&root.join("terminal"), record)?;
             recovered.push(Recovered::Final(record.owner.clone(), FinalWork::Journal(record)));
@@ -852,7 +857,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
                     .filter(|intent| intent.host == host && intent.url == cfg.url.trim_end_matches('/') && intent.expected_attempt == attempt_id);
                 Record { owner: Ownership::Attempt { ticket: input.ticket, host: host.into(), generation, attempt_id }, host: host.into(), url: cfg.url.clone(), observed_at: now_ms(), disposition: Disposition::Pending, process: None,
                     work: if let Some(intent) = identified {
-                        Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted after begin before the launch journal existed; no writer crossed the launch boundary; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }, worktree: intent.worktree }
+                        Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(), stderr_tail: "Daemon restarted after begin before the launch journal existed; no writer crossed the launch boundary; original work retained".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }, worktree: intent.worktree }
                     } else {
                         Work::UnknownWriter { reason: "Daemon restarted without a terminal process-group-empty receipt; retain writer ownership for kernel reconciliation".into() }
                     } }
@@ -935,7 +940,7 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
                         let record = Record { owner, host: host.into(), url: cfg.url.clone(), observed_at: now, process: None,
                             disposition: Disposition::Pending,
                             work: Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: String::new(),
-                                stderr_tail: "Hub still charges this host for a stopping attempt past its lease and action deadline while this host holds no local journal evidence (daemon loss before the terminal record); adopted for original-host kernel reconciliation, never discharged on time alone".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None },
+                                stderr_tail: "Hub still charges this host for a stopping attempt past its lease and action deadline while this host holds no local journal evidence (daemon loss before the terminal record); adopted for original-host kernel reconciliation, never discharged on time alone".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None },
                                 worktree } };
                         match journal::insert(&root.join("terminal"), record) {
                             Ok(saved) => recovered.push(Recovered::Final(saved.owner.clone(), FinalWork::Journal(saved))),
@@ -1002,7 +1007,7 @@ impl Controller {
                 }
             },
             Err(TryRecvError::Disconnected) => {
-                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, acp_parent_prompt_observed_at: None, cause: None };
+                let outcome = opencode::RunOutcome { ok: false, stdout_tail: String::new(), stderr_tail: "transport result channel disconnected; proof required".into(), exit_code: None, timed_out: false, session_id: None, acp_parent_prompt_observed_at: None, cause: None, background_yield: None };
                 record(&config(&shared), &running.task_id, &running.execution, &outcome, running.worktree.clone()).ok().map(|r| FinalWork::Active(r, running.execution.clone()))
             },
             Err(TryRecvError::Empty) => None,
@@ -1284,6 +1289,7 @@ pub(crate) mod tests {
                 stderr_tail: "acp interrupted — stop for a fresh attempt".into(),
                 exit_code: None, timed_out: false, session_id: Some("parent".into()),
                 acp_parent_prompt_observed_at: Some(42), cause: None,
+                background_yield: None,
             };
             let captured = record(&cfg, "BR#999", &runtime, &result, None).unwrap();
             let Work::Unproven { outcome, .. } = captured.work else { panic!("fixture owns no writer proof") };
@@ -1291,6 +1297,71 @@ pub(crate) mod tests {
             assert_eq!(outcome.acp_parent_prompt_observed_at, None);
             assert_eq!(outcome.acp_parent_teardown_observed_at, expected);
         }
+    }
+
+    /// GH#481: the terminal capture gate is the last line of defense — a
+    /// yielded turn (agent ended with pending processes in the runner's
+    /// process group) can never journal as a completed success, even if a
+    /// transport forgets its own incomplete charge. The typed evidence rides
+    /// the journal outcome; the managed-review observation is suppressed.
+    #[test]
+    fn a_background_yield_can_never_finalize_as_a_completed_success() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({
+            "url": "https://example.invalid", "token": "fixture-only", "label": "teardown-fixture"
+        })).unwrap();
+        let control = Arc::new(crate::transport::RunControl::default());
+        let runtime = ExecutionRuntime { generation: 1, attempt_id: "attempt-two".into(), control, maintenance: None };
+        let yield_ = crate::transport::BackgroundYield {
+            group: crate::transport::GroupState::Live, live_members: Some(2), observed_at: 42,
+        };
+        let base = || opencode::RunOutcome {
+            ok: true,
+            stdout_tail: "checked the change".into(),
+            stderr_tail: String::new(),
+            exit_code: Some(0), timed_out: false, session_id: Some("parent".into()),
+            acp_parent_prompt_observed_at: Some(42), cause: None,
+            background_yield: None,
+        };
+        // A lying transport (exit 0, ok true) still cannot complete a turn
+        // that the teardown probe typed as yielded.
+        let mut lying = base();
+        lying.background_yield = Some(yield_);
+        let captured = record(&cfg, "BR#999", &runtime, &lying, None).unwrap();
+        let Work::Unproven { outcome, .. } = captured.work else { panic!("fixture owns no writer proof") };
+        assert!(matches!(outcome.kind, OutcomeKind::Failed), "a yielded turn journals as failed, never completed");
+        assert_eq!(outcome.background_yield, Some(yield_));
+        assert_eq!(outcome.acp_parent_prompt_observed_at, None, "an incomplete attempt carries no managed-review observation");
+        // The honest transport (ok false) journals the same honest class.
+        let mut honest = base();
+        honest.ok = false;
+        honest.background_yield = Some(yield_);
+        let captured = record(&cfg, "BR#999", &runtime, &honest, None).unwrap();
+        let Work::Unproven { outcome, .. } = captured.work else { panic!("fixture owns no writer proof") };
+        assert!(matches!(outcome.kind, OutcomeKind::Failed));
+        assert_eq!(outcome.background_yield, Some(yield_));
+        // A drained turn keeps its completed-success class and observation.
+        let clean = base();
+        let captured = record(&cfg, "BR#999", &runtime, &clean, None).unwrap();
+        let Work::Unproven { outcome: clean_outcome, .. } = captured.work else { panic!("fixture owns no writer proof") };
+        assert!(matches!(clean_outcome.kind, OutcomeKind::Completed), "a drained turn stays a completed success");
+        assert_eq!(clean_outcome.background_yield, None);
+        assert_eq!(clean_outcome.acp_parent_prompt_observed_at, Some(42));
+        // An absent yield is not serialized, pre-GH#481 journals deserialize
+        // with no yield (serde default), and the typed evidence
+        // round-trips through the journal boundary.
+        let clean_wire = serde_json::to_string(&clean_outcome).unwrap();
+        assert!(!clean_wire.contains("background_yield"), "an absent yield is not serialized: {clean_wire}");
+        assert_eq!(serde_json::from_str::<Outcome>(&clean_wire).unwrap().background_yield, None);
+        let legacy = serde_json::from_str::<Outcome>(
+            "{\"kind\":\"completed\",\"exit_code\":null,\"stdout_tail\":\"\",\"stderr_tail\":\"\"}").unwrap();
+        assert_eq!(legacy.background_yield, None);
+        let mut yielded = base();
+        yielded.background_yield = Some(yield_);
+        let captured = record(&cfg, "BR#999", &runtime, &yielded, None).unwrap();
+        let Work::Unproven { outcome, .. } = captured.work else { panic!("fixture owns no writer proof") };
+        let wire = serde_json::to_string(&outcome).unwrap();
+        assert!(wire.contains("\"background_yield\":{\"group\":\"live\",\"live_members\":2,\"observed_at\":42}"), "{wire}");
+        assert_eq!(serde_json::from_str::<Outcome>(&wire).unwrap().background_yield, Some(yield_));
     }
 
     #[test]
@@ -1378,7 +1449,7 @@ pub(crate) mod tests {
         let ticket = Ticket {task_id:"old-task".into(),session:"old-session".into()};
         let record = Record {owner:Ownership::Attempt {ticket:ticket.clone(),host:cfg.label.clone().unwrap(),generation:1,attempt_id:"old-attempt".into()},
             host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:now_ms(),process:None,disposition:Disposition::Rejected {reason:"old missing proof".into()},
-            work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into(),acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None},worktree:Some(wip.clone())}};
+            work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::ResultUnavailable,exit_code:None,stdout_tail:"original captured tail".into(),stderr_tail:"original transport loss".into(),acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None},worktree:Some(wip.clone())}};
         journal::insert(&terminal,record.clone()).unwrap();
         let launch_path=root(&cfg).unwrap().join("launches").join(record.name());
         let launch=serde_json::to_vec(&Launch {record:record.clone(),worktree:Some(wip.clone()),stage:LaunchStage::MayHaveLaunched}).unwrap();
@@ -1426,7 +1497,7 @@ pub(crate) mod tests {
             host:cfg.label.clone().unwrap(),url:cfg.url.clone(),observed_at:generation,process:None,disposition:Disposition::Rejected {reason:"retained".into()},work:Work::UnknownWriter {reason:"old uncertain writer".into()}};
         let old=record(1);*owner.lock().unwrap()=Some(old.owner.clone());
         let newer=record(2);let uncertain=record(3);
-        let captured=Record {work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::Completed,exit_code:Some(0),stdout_tail:"real result still needs delivery".into(),stderr_tail:String::new(),acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None},worktree:Some(root(&cfg).unwrap().join("captured-work"))},..record(4)};
+        let captured=Record {work:Work::Unproven {outcome:Outcome {kind:OutcomeKind::Completed,exit_code:Some(0),stdout_tail:"real result still needs delivery".into(),stderr_tail:String::new(),acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None},worktree:Some(root(&cfg).unwrap().join("captured-work"))},..record(4)};
         for r in [&old,&newer,&uncertain,&captured] {journal::insert(&terminal,r.clone()).unwrap();}
         let bytes=|r:&Record|std::fs::read(terminal.join(r.name())).unwrap();
         let old_bytes=bytes(&old);let newer_bytes=bytes(&newer);let uncertain_bytes=bytes(&uncertain);let captured_bytes=bytes(&captured);
@@ -1722,7 +1793,7 @@ pub(crate) mod tests {
         let (cfg, ready, snap) = fixture(&hub); *host.lock().unwrap() = cfg.label.clone().unwrap();
         let owner = Ownership::Attempt { ticket: Ticket { task_id: "terminal-fixture".into(), session: "captured-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "captured-one".into() };
         let record = Record { owner: owner.clone(), url: cfg.url.clone(), host: cfg.label.clone().unwrap(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "the exact captured result survives restart".into(), stderr_tail: String::new(), acp_prompt_observed_at: Some(42), acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
+            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "the exact captured result survives restart".into(), stderr_tail: String::new(), acp_prompt_observed_at: Some(42), acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }, writers: WriterProof::ProcessGroupEmpty, worktree: None, step: Step::Stop } };
         let record = if legacy_missing {
             let path = root(&cfg).unwrap().join("missing-old-worktree");
             let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -1776,7 +1847,7 @@ pub(crate) mod tests {
         let work = root(&cfg).unwrap().join("newer-work"); std::fs::create_dir_all(&work).unwrap(); std::fs::write(work.join("keep"), "newer generation's work").unwrap();
         let record = Record { owner: Ownership::Attempt { ticket: Ticket { task_id: "old-result".into(), session: "old-session".into() }, host: cfg.label.clone().unwrap(), generation: 1, attempt_id: "old-one".into() },
             host: cfg.label.clone().unwrap(), url: cfg.url.clone(), observed_at: 1, disposition: Disposition::Pending, process: None,
-            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "original result".into(), stderr_tail: String::new(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None }, writers: WriterProof::ProcessGroupEmpty, worktree: Some(work.clone()), step: Step::Capture } };
+            work: Work::Stopped { outcome: Outcome { kind: OutcomeKind::Completed, exit_code: Some(0), stdout_tail: "original result".into(), stderr_tail: String::new(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None }, writers: WriterProof::ProcessGroupEmpty, worktree: Some(work.clone()), step: Step::Capture } };
         journal::insert(&terminal_root(&cfg).unwrap(), record).unwrap();
         let mut controller = Controller::new(&cfg, &ready, &snap); let deadline = Instant::now() + Duration::from_secs(3);
         while !controller.idle() { controller.tick(&snap, true, false).unwrap(); assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(1)); }
@@ -1894,7 +1965,7 @@ pub(crate) mod tests {
         });
         let (cfg, ready, snap) = fixture(&hub);
         let mut record = unclaimed_record(&cfg, "orphan-absent", 4);
-        record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: "original captured tail".into(), stderr_tail: "original transport loss".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None },
+        record.work = Work::Unproven { outcome: Outcome { kind: OutcomeKind::ResultUnavailable, exit_code: None, stdout_tail: "original captured tail".into(), stderr_tail: "original transport loss".into(), acp_prompt_observed_at: None, acp_parent_prompt_observed_at: None, acp_parent_teardown_observed_at: None, cause: None, background_yield: None },
             worktree: Some(root(&cfg).unwrap().join("retained-work")) };
         *owner.lock().unwrap() = Some(record.owner.clone());
         let wip = root(&cfg).unwrap().join("retained-work"); journal::write_file(&wip, b"unpublished work").unwrap();
