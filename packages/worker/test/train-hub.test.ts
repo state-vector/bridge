@@ -3045,6 +3045,69 @@ describe("BR#4753 landed-close recovery (real bundled worker)", () => {
     expect(noop.status).toBeGreaterThanOrEqual(400);
     await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-carry" });
   });
+
+  it("GH#480 unconfirmed burst stop: fail-closed admission, NO bisect record, no culprit bounce, no train_red ding — train.bisect refuses the stop; exact green clears it", async () => {
+    const repo = "state-vector/lane-gh480";
+    await acquire(repo, "gw-uc", { required_workflows: ["Test"], burst_max: 10 });
+    const H1 = "4".repeat(40), H2 = "5".repeat(40);
+    const c1 = await queueViaAccept({ repo, pr: 5441, head: H1, title: "IMPL: GH#480 drill — intermediate" });
+    const c2 = await queueViaAccept({ repo, pr: 5442, head: H2, title: "IMPL: GH#480 drill — final" });
+    // the final card's impl session: pre-#480 the stop flow named the final
+    // card the DEFAULT culprit (currently.task_id) and dinged its sessions
+    await kbJson("/progress.log", {
+      id: c2, actor: "impl-uc-ding", note: "GH#480 drill — the would-be ding victim",
+      completion_pct: 30, confidence_pct: 70, risk_pct: 20,
+    });
+    const M1 = "6".repeat(40), M2 = "7".repeat(40);
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-uc", pr: 5441,
+      merge_sha: M1, head_sha: H1, task_id: c1, burst_merged: 1, burst_cap: 10,
+      merged_at: Date.now() - 90 * 60_000, // 90m — past the 3×20m fail-closed bound
+    });
+    await kbJson("/train.event", {
+      repo, base: "main", kind: "merged", actor: "gw-uc", pr: 5442,
+      merge_sha: M2, head_sha: H2, task_id: c2, burst_merged: 2, burst_cap: 10, burst_settling: true,
+      merged_at: Date.now() - 90 * 60_000,
+    });
+    // CI unknown past the bound — no check run ever registered on the settle
+    // (the exact GH#480 incident class): the line stops fail-closed, but NO
+    // required check has actually failed
+    const ci = await kbJson("/train.ci", { repo, base: "main", actor: "gw-uc", sha: M2, checks: [] });
+    expect(ci.body.decided).toBe("stopped_bound");
+    const laneId = (await laneSnap(repo)).card;
+    const stopped = (await kbJson("/get", { id: laneId })).body.meta;
+    expect(stopped.stop.kind).toBe("checks_unconfirmed");
+    expect(stopped.stop.failing).toEqual([]);
+    expect(stopped.stop.culprit_task).toBeUndefined();
+    expect(stopped.stop.bisect).toBeUndefined(); // GH#480: no walk state off overdue evidence
+    expect(stopped.currently?.phase).toBe("stopped");
+    // the final card is NOT bounced: unconfirmed evidence blames no code — it
+    // stays parked awaiting-ci and closes on the next green settle
+    const fin = (await kbJson("/get", { id: c2 })).body;
+    expect(fin.status).toBe("blocked");
+    expect(fin.meta?.merge_train?.state).toBe("awaiting-ci");
+    expect(fin.meta?.merge_train?.bisect_culprit).toBeUndefined();
+    // ...and its impl session eats NO train_red ding
+    const board = (await kbJson("/board")).body.agents as any[];
+    expect(board.find((a: any) => a.label === "impl-uc-ding")?.train_red ?? 0).toBe(0);
+    // the walk endpoint refuses the unconfirmed stop outright — the persisted
+    // pre-#480 incident shape (kind checks_unconfirmed + a stamped record)
+    // hits the same gate before any step can stamp
+    const bisect = await kbJson("/train.bisect", {
+      repo, base: "main", actor: "gw-uc",
+      step: { sha: M1, verdict: "red" }, culprit_task: c1, culprit_sha: M1,
+    });
+    expect(bisect.status).toBeGreaterThanOrEqual(400);
+    expect(String(bisect.body.error)).toContain("GH#480");
+    // exact-head green settles the hold normally: the stop clears, the lane
+    // resumes — fail-closed admission never wedges the line
+    const green = await kbJson("/train.ci", { repo, base: "main", actor: "gw-uc", sha: M2, checks: [check(76, "Test", "success")] });
+    expect(green.body.decided).toBe("line_green");
+    const cleared = (await kbJson("/get", { id: laneId })).body.meta;
+    expect(cleared.stop ?? null).toBeNull();
+    expect(cleared.currently ?? null).toBeNull();
+    await kbJson("/train.lease", { repo, base: "main", action: "release", actor: "gw-uc" });
+  });
 });
 
 describe("BR#4977 lane lifecycle + queue base scoping", () => {

@@ -3051,9 +3051,42 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
             // BR#4934 red-settle bisect: a burst stop pre-stamps stop.bisect —
             // drive the walk ONE step per tick while the line holds (state
             // hub-side, crash-safe: any executor picks it up mid-flight).
-            match bisect_step(ctx, key, repo, base, stop, &required) {
-                Ok(()) => {}
-                Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
+            // GH#480: the walk runs ONLY on a CONFIRMED required-check
+            // failure — this tick's live base-tip classification. A stop
+            // whose evidence is unconfirmed (checks_unconfirmed: CI
+            // unknown/overdue — including persisted legacy stops that still
+            // carry a pre-#480 bisect record) parks the walk whole: no
+            // ancestor probes, no probe re-runs, no culprit naming while no
+            // failed required check is established. The record survives
+            // untouched (crash-safe); the walk resumes the moment the
+            // classification confirms red, and the green release above
+            // still clears the stop normally.
+            let stop_kind = vstr(stop, "kind").unwrap_or("").to_string();
+            if v.verdict != MainVerdict::Red {
+                // GH#480 (half 1): this tick's live base-tip classification is
+                // the only failure confirmation. Unsettled/Settling/Empty —
+                // CI absent, pending or overdue — is NOT a red verdict: no
+                // ancestor probes, no probe re-runs, no culprit naming off
+                // evidence that never arrived. The record survives untouched
+                // (crash-safe); the walk resumes the moment the classification
+                // confirms red, and the green release above still clears the
+                // stop normally.
+                log(Some(key), "bisect parked — base red unconfirmed (GH#480): no probes, no re-runs, no culprit while the required checks are absent/pending/overdue");
+            } else if stop_kind == "checks_unconfirmed" {
+                // GH#480 (half 2): a stop RECORDED as checks_unconfirmed never
+                // walks, even once a later red confirms live — a bisect record
+                // on such a stop is pre-#480 bug state (the post-#480 hub never
+                // stamps one), and probing the old pass to attribute a LATER
+                // confirmed red mis-blames its merges. The hub's train.bisect
+                // gate rejects the stamps too; parking here keeps the executor
+                // from dispatching a single gh probe re-run first. The root-fix
+                // card and the green release own the recovery.
+                log(Some(key), "bisect parked — checks_unconfirmed stop never walks (GH#480): the pre-#480 bisect record is inert; root-fix card and green release own the recovery");
+            } else {
+                match bisect_step(ctx, key, repo, base, stop, &required) {
+                    Ok(()) => {}
+                    Err(e) => log(Some(key), &format!("bisect step error: {}", trunc(&e, 200))),
+                }
             }
             // Rapid self-heal on a non-bisect red stop: auto-rerun failing
             // required workflow runs ONCE per (lane, base_sha) so transient/race
@@ -9416,6 +9449,104 @@ mod tests {
             !prod.contains("classify_main_check_runs("),
             "train.rs production code must use classify_base_check_runs(&runs, &required), never unscoped classify_main_check_runs"
         );
+    }
+
+    #[test]
+    fn gh480_unconfirmed_stop_never_walks_the_bisect_but_confirmed_red_still_does() {
+        // GH#480: bisection, failure re-runs and code-culprit attribution ride
+        // ONLY on a confirmed required-check failure. The stop record's kind
+        // and this tick's live base-tip classification gate the walk together:
+        // (a) a persisted checks_unconfirmed stop that still carries a
+        //     pre-#480 bisect record parks EVEN on a live RED base — the
+        //     record is overdue-evidence bug state, not a walk;
+        // (b) a checks_unconfirmed stop with CI merely in flight parks too;
+        // (c) a base_red stop walks the same live RED (regression guard:
+        //     real confirmed failures still bisect, one step per tick).
+        for (scenario, kind, base_conclusion) in [
+            ("unconfirmed-red", "checks_unconfirmed", Some("failure")),
+            ("unconfirmed-unknown", "checks_unconfirmed", None),
+            ("base-red", "base_red", Some("failure")),
+        ] {
+            let base = "b".repeat(40);
+            let m1 = "a".repeat(40); // the pass's oldest intermediate (the probe target)
+            let m2 = "c".repeat(40); // the pass's final merge (the stopped settle)
+            let lane = json!({
+                "queue": [],
+                "required_workflows": ["Test"],
+                "currently": { "phase": "stopped", "pr": 1 },
+                "stop": {
+                    "kind": kind,
+                    "sha": m2.clone(),
+                    "reason": if kind == "checks_unconfirmed" { "CI unknown past the fail-closed bound (~3× typical)" } else { "required workflows RED: Test" },
+                    "at": now_ms() - 90 * 60_000,
+                    "pr": 1,
+                    "failing": [],
+                    // the persisted pre-#480 incident shape: a bisect record
+                    // stamped on UNCONFIRMED evidence — inert to the walk
+                    "bisect": { "pass": { "merged": 2, "cap": 10 }, "steps": {}, "culprit_task": null, "culprit_sha": null, "inconclusive": false },
+                },
+            });
+            let (m1_hist, m2_hist) = (m1.clone(), m2.clone());
+            let (hub, calls) = mock_hub_with(move |params| {
+                match call_name(params).as_str() {
+                    // the walk's pass history: newest first (the final = m2),
+                    // so the oldest intermediate m1 is the first probe target
+                    "train_history" => Ok(json!({ "events": [
+                        { "merge_sha": m2_hist, "task_id": "BR#9002", "pr": 12 },
+                        { "merge_sha": m1_hist, "task_id": "BR#9001", "pr": 11 },
+                    ] })),
+                    "train_lease" | "train_queue_facts" | "train_event" | "train_ci" | "train_bisect" => Ok(json!({})),
+                    other => panic!("unexpected hub operation {other}"),
+                }
+            });
+            let reran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let rerun_count = reran.clone();
+            let mut ctx = test_ctx(&hub);
+            ctx.base_probe = true;
+            ctx.sh_mock = Some(std::sync::Arc::new(move |cmd, args| {
+                if cmd != "gh" { return None; }
+                if args.first() == Some(&"run") && args.get(1) == Some(&"rerun") {
+                    rerun_count.fetch_add(1, Ordering::SeqCst);
+                    return Some(Ok(String::new()));
+                }
+                let endpoint = args.get(1).copied().unwrap_or("");
+                if endpoint.ends_with("/commits/main") {
+                    return Some(Ok(json!({ "sha": base, "committed_at": crate::logging::iso(now_ms()) }).to_string()));
+                }
+                if endpoint.contains("/check-runs?") {
+                    // the base tip carries the scenario's live classification;
+                    // any probe sha carries a REAL failed required check (a
+                    // genuine culprit exists for the walk to name)
+                    let conclusion = if endpoint.contains(&base) { base_conclusion } else { Some("failure") };
+                    return Some(Ok(json!([
+                        { "id": 1, "name": "Test",
+                          "status": if conclusion.is_some() { "completed" } else { "in_progress" },
+                          "conclusion": conclusion, "html_url": "https://example/ci/1" }
+                    ]).to_string()));
+                }
+                if endpoint.contains("/actions/runs?") { return Some(Ok("[]".into())); }
+                panic!("unexpected gh command {args:?}");
+            }));
+            let result = drive_lane_inner(&mut ctx, &lane, "o/r@main", "o/r", "main", 60_000, 10);
+            assert!(result.is_ok(), "{scenario}: {result:?}");
+            let bisect_calls = calls.lock().unwrap().iter()
+                .filter(|p| call_name(p) == "train_bisect").count();
+            let reruns = reran.load(Ordering::SeqCst);
+            if scenario == "base-red" {
+                assert_eq!(bisect_calls, 1, "{scenario}: a confirmed base_red stop walks one step per tick");
+                let stamp = calls.lock().unwrap().iter()
+                    .find(|p| call_name(p) == "train_bisect")
+                    .map(|p| call_args(p).clone()).unwrap();
+                assert_eq!(stamp["step"]["sha"], json!(m1));
+                assert_eq!(stamp["step"]["verdict"], json!("red"));
+                assert_eq!(stamp["culprit_task"], json!("BR#9001"));
+                assert_eq!(stamp["culprit_sha"], json!(m1));
+                assert_eq!(reruns, 0, "{scenario}: a completed-failure probe stamps — it never needs a re-run dispatch");
+            } else {
+                assert_eq!(bisect_calls, 0, "{scenario}: an unconfirmed stop never walks (GH#480)");
+                assert_eq!(reruns, 0, "{scenario}: no probe re-runs off unconfirmed evidence (GH#480)");
+            }
+        }
     }
 
     #[test]

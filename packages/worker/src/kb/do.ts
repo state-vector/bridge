@@ -15760,9 +15760,22 @@ export class KnowledgeHub {
       if (!mergeSha && !headSha) throw new Error("train:stopped needs sha (merge_sha or head_sha)");
       const sha = mergeSha ?? headSha!;
       const failing: { name: string; conclusion?: string | null; url?: string | null }[] = Array.isArray(body.failing) ? body.failing : [];
-      const culprit = String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null;
       const stopKind = body.stop_kind === "checks_unconfirmed" ? "checks_unconfirmed" : "base_red";
       const why = String(body.reason ?? (failing.length ? `required workflows RED: ${failing.map((f) => f.name).join(", ")}` : "stop-the-line"));
+      // GH#480: failure confirmation — the stop KIND is the verdict. A base_red
+      // stop (the red-settle path, or a gateway's asserted-red event) is a
+      // confirmed failure: the full stop vocabulary stands (bisect pre-stamp
+      // under a burst pass, culprit bounce, blame edge, train_red ding). A
+      // checks_unconfirmed stop (CI unknown past the fail-closed bound —
+      // evidence absent, pending or overdue) keeps the fail-closed admission:
+      // the line stays stopped and the p0 root-fix card still spawns below.
+      // But unconfirmed evidence is never a failure verdict — no bisect
+      // record, no culprit bounce, no blame edge, no train_red ding while no
+      // required check has actually failed. The executor's walk gate
+      // (train.rs, GH#480) is the second half: it also parks on persisted
+      // legacy stops.
+      const failureConfirmed = stopKind === "base_red";
+      const culprit = failureConfirmed ? (String(body.culprit_task ?? "") || (meta.currently?.task_id ?? null) || null) : null;
       // BR#5061 storm dedupe: the SAME stop re-reported by an executor tick
       // loop (the stop arm clears on green main, the awaiting-ci arm re-fires
       // it — observed as ~2 stopped events/min for hours on bridge@main)
@@ -15780,7 +15793,11 @@ export class KnowledgeHub {
       // pass's merge count + per-sha step verdicts + the named culprit.
       // Legacy stops keep the exact legacy shape (no bisect key beyond the
       // culprit_task the BR#4981 vocabulary names).
-      const burstStop = meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
+      // GH#480: the pre-stamp rides ONLY a confirmed failure — an
+      // unconfirmed stop under a burst pass stamps the stop (fail-closed
+      // admission) with NO walk state, so nothing can probe, rerun or name
+      // a culprit off evidence that never arrived.
+      const burstStop = failureConfirmed && meta.currently?.burst_merged != null ? { merged: Number(meta.currently.burst_merged), cap: meta.currently.burst_cap ?? null } : null;
       // culprit_task rides the stop record (BR#4849): the Top view banner
       // answers "who broke it" from the stop itself, not session memory.
       meta.stop = { kind: stopKind, sha, reason: why, at: now, pr, failing, ...(culprit ? { culprit_task: culprit } : {}), ...(burstStop ? { bisect: { pass: burstStop, steps: {}, culprit_task: null as string | null, culprit_sha: null as string | null, inconclusive: false } } : {}) };
@@ -16856,6 +16873,13 @@ export class KnowledgeHub {
     if (!lease || lease.holder !== actor) throw new Error(`train.bisect requires the lane lease — held by ${lease?.holder ?? "nobody"}`);
     const stop: any = meta.stop;
     if (!stop) throw new Error("train.bisect requires a stopped lane — no stop stamped");
+    // GH#480: a checks_unconfirmed stop never walks. The stop was recorded on
+    // overdue evidence — no required check had actually failed — so any bisect
+    // record it carries is pre-#480 bug state, not a confirmed-failure walk.
+    // The executor-side gate (train.rs, GH#480) parks the same class before
+    // dispatching a single probe; this endpoint gate holds the line for every
+    // other caller (an unfixed executor, a manual MCP client).
+    if (stop.kind === "checks_unconfirmed") throw new Error("train.bisect requires a confirmed base-red stop — unconfirmed checks bisect nothing (GH#480)");
     if (!stop.bisect) throw new Error("train.bisect requires a burst-red stop — a legacy stop bisects nothing (BR#4934)");
     const now = Date.now();
     const step = body.step;

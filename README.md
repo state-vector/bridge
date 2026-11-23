@@ -3050,6 +3050,17 @@ later) — the labeler maps best-fit.
   BR#4068 boost while the wrongly stop-bounced final card re-parks to close on
   the next green settle; probes that stall past the CI bound (or leave nothing
   re-runnable) stamp the walk INCONCLUSIVE and the pass bounces oldest-first.
+  Unconfirmed evidence never bisects and never blames (GH#480): a stop recorded
+  because CI ran unknown past the fail-closed bound (`stop.kind:
+  "checks_unconfirmed"`) stays fail-closed admission — the line holds, the p0
+  root-fix card still spawns — but it carries no bisect record, no culprit
+  bounce, no blame edge and no train_red ding, because no required check has
+  actually failed. The executor parks the walk (probes, probe re-runs, culprit
+  naming) until the tick's live base-tip classification confirms a failed
+  required check — including on persisted pre-GH#480 stops that already carry
+  a stamped record — and `train.bisect` rejects a `checks_unconfirmed` stop
+  outright. Bisection, failure re-runs and code-culprit attribution ride only
+  on a confirmed required-check failure.
 - **Batch merges: one settle window per batch, not per merge (BR#4996, Ray
   ruling 2026-10-29)** — the drain classifies the whole queue first, then
   lands a maximal set of MUTUALLY non-conflicting gate-clean heads

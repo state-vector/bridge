@@ -613,8 +613,13 @@ describe("train stop-the-line (real DO — executor-fed red, hub decides)", () =
     // BR#5631: no stop-time ask on the fail-closed class either — the
     // root-fix card owns the diagnosis (unknowns are agent-workable)
     expect((await stopAsks("888888888")).length).toBe(0);
-    // the culprit bounced like any other stop
-    expect((await kbJson("/get", { id: card })).body.status).toBe("in_progress");
+    // GH#480: unconfirmed evidence blames no code — the bound stop is
+    // fail-closed admission, never a failure verdict. No culprit bounce (the
+    // merged card stays parked awaiting-ci and closes on the next green
+    // settle), no bisect record, no train_red ding.
+    expect(snap.stop.kind).toBe("checks_unconfirmed");
+    expect(snap.stop.bisect).toBeUndefined();
+    expect((await kbJson("/get", { id: card })).body.status).toBe("blocked");
   });
 
   it("every train op demands the lane lease (the lease holder IS the authenticated actor)", async () => {
