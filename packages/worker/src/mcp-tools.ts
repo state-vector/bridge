@@ -26,7 +26,7 @@ import {
 } from "@bridge/contracts";
 
 /** Build marker — bump on every behavioural change. Agents verify what's live via orient.build. */
-export const BUILD = "0.8.1";
+export const BUILD = "0.8.2";
 
 function coordinationDelay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
@@ -41,12 +41,12 @@ function coordinationDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function waitForCoordination(ctx: ToolCtx, id: string, waitMs: number): Promise<CoordinationResult> {
+async function waitForCoordination(ctx: ToolCtx, id: string, waitMs: number, session?: string): Promise<CoordinationResult> {
   const deadline = Date.now() + waitMs;
   while (!ctx.signal?.aborted) {
-    const result: CoordinationResult = await ctx.call("ask.coordination_status", { id });
+    const result: CoordinationResult = await ctx.call("ask.coordination_status", { id, session });
     const remaining = deadline - Date.now();
-    if (result.state !== "pending" || remaining <= 0) return result;
+    if (result.state !== "pending" || result.wait_skipped || remaining <= 0) return result;
     await coordinationDelay(Math.min(1000, remaining), ctx.signal);
   }
   return { id, state: "pending" };
@@ -317,7 +317,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       // caller flagged it time-sensitive.
       const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, urgency: args.urgency, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName, coordination_request_id: coordination?.request_id });
       if (coordination) {
-        const result = await waitForCoordination(ctx, a.id, coordination.wait_ms ?? 5000);
+        const result = await waitForCoordination(ctx, a.id, coordination.wait_ms ?? 5000, args.session ?? ctx.sessionName);
         const receipt = { ...result, url: a.url };
         return text(JSON.stringify(result.state === "pending" ? {
           ...receipt, note: "Continue independent work. When needed, retry with the same coordination.request_id and question fields.",

@@ -74,15 +74,25 @@ async function inProgressTask(title: string, actor = LABEL) {
 }
 
 describe("bounded executor coordination", () => {
+  async function namedCredential(label: string) {
+    const minted = await call("admin.mint", { label });
+    expect(minted.status).toBe(200);
+    await call("session.touch", { token_id: minted.body.id, session: mcpCtx.sessionName });
+    return minted.body.id as string;
+  }
+
   async function setup(requestId: string) {
-    const task = await inProgressTask(`Coordination target ${requestId}`);
+    const targetLabel = `coordination-executor-${requestId}`;
+    await namedCredential(targetLabel);
+    const task = await inProgressTask(`Coordination target ${requestId}`, targetLabel);
     const requester = `coordination-requester-${requestId}`;
+    const tokenId = await namedCredential(requester);
     const caller = await inProgressTask(`Independent work ${requestId}`, requester);
     const ctx = {
       ...mcpCtx,
-      identity: { ...mcpCtx.identity, label: requester, token_id: "coordination-credential" },
+      identity: { ...mcpCtx.identity, label: requester, token_id: tokenId },
       async call(op: string, payload: object) {
-        const r = await call(op, { ...payload, actor: requester, token_id: "coordination-credential" });
+        const r = await call(op, { ...payload, actor: requester, token_id: tokenId });
         if (r.status >= 400) throw new Error(r.body.error);
         return r.body;
       },
@@ -97,7 +107,7 @@ describe("bounded executor coordination", () => {
       const out = await TOOL_TABLE.ask_agent.handler({ ...args, coordination: { ...args.coordination, wait_ms: waitMs } }, { ...ctx, signal }) as { content: Array<{ text: string }> };
       return JSON.parse(out.content[0].text);
     };
-    return { task, caller, requester, ctx, args, ask };
+    return { task, caller, requester, targetLabel, ctx, args, ask };
   }
 
   it("delivers the current executor's answer during the call without parking independent work", async () => {
@@ -113,13 +123,13 @@ describe("bounded executor coordination", () => {
       },
     }) as Promise<{ content: Array<{ text: string }> }>;
     const id = await oncePublished;
-    const inbox = await call("ask.inbox", { label: LABEL });
-    expect(inbox.body.inbox).toContainEqual(expect.objectContaining({ id, to_target: `${LABEL}@${mcpCtx.sessionName}` }));
+    const inbox = await call("ask.inbox", { label: f.targetLabel });
+    expect(inbox.body.inbox).toContainEqual(expect.objectContaining({ id, to_target: `${f.targetLabel}@${mcpCtx.sessionName}` }));
     const ownTask = await call("get", { id: f.caller });
     expect(ownTask.body.status).toBe("in_progress");
     const answer = "Yes; tracked test fixture is edited in my worktree.";
-    expect((await call("ask.answer", { id, answer, actor: LABEL })).status).toBe(200);
-    expect(JSON.parse((await result).content[0].text)).toMatchObject({ id, state: "answered", answer, by: LABEL });
+    expect((await call("ask.answer", { id, answer, actor: f.targetLabel })).status).toBe(200);
+    expect(JSON.parse((await result).content[0].text)).toMatchObject({ id, state: "answered", answer, by: f.targetLabel });
   });
 
   it("reattaches after timeout, cancellation and concurrent retries, including after answer", async () => {
@@ -152,6 +162,58 @@ describe("bounded executor coordination", () => {
     expect(new Set(firstCalls.map(r => r.id)).size).toBe(1);
     await expect(TOOL_TABLE.ask_agent.handler({ ...concurrent.args, artefact_id: f.caller }, concurrent.ctx))
       .rejects.toThrow(/unbound executor_coordination ask/);
+  });
+
+  it("returns immediately for same-session or unknown callers and resumes a retry once a distinct executor is available", async () => {
+    const f = await setup("no-peer");
+    const run = async (session: string | undefined) => {
+      const out = await TOOL_TABLE.ask_agent.handler({
+        ...f.args, route: { kind: "executor_coordination", task_id: f.caller },
+        coordination: { request_id: "no-peer", wait_ms: 15_000 },
+      }, { ...f.ctx, sessionName: session }) as { content: Array<{ text: string }> };
+      return JSON.parse(out.content[0].text);
+    };
+    const same = await run(f.ctx.sessionName);
+    expect(same).toMatchObject({ state: "pending", wait_skipped: "same_executor" });
+    expect(await run(undefined)).toMatchObject({ id: same.id, state: "pending", wait_skipped: "caller_session_unknown" });
+    expect((await call("transition", { id: f.caller, to: "todo", actor: f.requester, note: "Release fixture", session: f.ctx.sessionName })).status).toBe(200);
+    expect(await run(f.ctx.sessionName)).toMatchObject({ id: same.id, state: "pending", wait_skipped: "no_live_executor" });
+    expect((await call("transition", { id: f.caller, to: "in_progress", actor: f.targetLabel, session: f.ctx.sessionName })).status).toBe(200);
+    expect((await call("ask.answer", { id: same.id, answer: "New executor confirms", actor: f.targetLabel })).status).toBe(200);
+    expect(await run(f.ctx.sessionName)).toMatchObject({ id: same.id, state: "answered", by: f.targetLabel });
+  });
+
+  it("stops polling when the target loses its claim during the wait", async () => {
+    const f = await setup("peer-disappears");
+    let reads = 0;
+    const out = await TOOL_TABLE.ask_agent.handler({
+      ...f.args, coordination: { request_id: "peer-disappears", wait_ms: 15_000 },
+    }, {
+      ...f.ctx,
+      async call(op, payload) {
+        const result = await f.ctx.call(op, payload);
+        if (op === "ask.coordination_status" && ++reads === 1) {
+          expect(result).toMatchObject({ state: "pending" });
+          expect(result.wait_skipped).toBeUndefined();
+          expect((await call("transition", { id: f.task, to: "todo", actor: f.targetLabel, note: "Release fixture", session: f.ctx.sessionName })).status).toBe(200);
+        }
+        return result;
+      },
+    }) as { content: Array<{ text: string }> };
+    expect(reads).toBe(2);
+    expect(JSON.parse(out.content[0].text)).toMatchObject({ state: "pending", wait_skipped: "no_live_executor" });
+  });
+
+  it("does not use a fresh credential or task update as proof that the named executor is live", async () => {
+    const f = await setup("wrong-session");
+    const task = await call("create", { type: "task", title: "Task whose exact executor has not connected", qualified: true, actor: f.targetLabel });
+    expect(task.status).toBe(200);
+    expect((await call("transition", { id: task.body.id, to: "in_progress", actor: f.targetLabel, session: "offline-fixture" })).status).toBe(200);
+    const out = await TOOL_TABLE.ask_agent.handler({
+      ...f.args, route: { kind: "executor_coordination", task_id: task.body.id },
+      coordination: { request_id: "wrong-session", wait_ms: 15_000 },
+    }, f.ctx) as { content: Array<{ text: string }> };
+    expect(JSON.parse(out.content[0].text)).toMatchObject({ state: "pending", wait_skipped: "no_live_executor" });
   });
 });
 

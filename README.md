@@ -1131,7 +1131,11 @@ independent work and retry using the same credential, request ID and question
 fields. Timeout or disconnect does not cancel the ask. The wait defaults to
 5 seconds, is capped at 15 seconds, and `wait_ms: 0` checks immediately. A
 resolved ask returns `answered`, `cancelled`, or `expired`. There is no reserved
-answer capacity; don’t wait repeatedly when no executor can respond.
+answer capacity yet. The caller must use a named session; Bridge returns
+`pending` with `wait_skipped` immediately if it cannot observe a distinct live
+executor (or if that executor becomes unavailable during the wait). The ask
+stays open and follows claim changes. Don’t wait repeatedly when no executor
+can respond.
 
 Completed resource records move to cold history, outside the active reconciliation
 and rewrite set; immutable removal receipts preserve cumulative accounting. Fair

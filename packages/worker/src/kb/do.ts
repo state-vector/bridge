@@ -5171,7 +5171,7 @@ export class KnowledgeHub {
         case "agents.list": return this.json(await this.listAgents());
         case "session.touch": return this.json(await this.sessionTouch(body));
         case "ask.create": return this.json(await this.askCreate(body, actor));
-        case "ask.coordination_status": return this.json(this.coordinationStatus(String(body.token_id ?? ""), String(body.id ?? "")));
+        case "ask.coordination_status": return this.json(this.coordinationStatus(String(body.token_id ?? ""), String(body.id ?? ""), String(body.session ?? ""), actor));
         case "ask.inbox": return this.json(await this.askInbox(body));
         case "ask.answer": return this.json(await this.askAnswer(body, actor));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
@@ -11372,13 +11372,34 @@ export class KnowledgeHub {
     return String(row.ask_id);
   }
 
-  private coordinationStatus(tokenId: string, id: string): CoordinationResult {
+  private coordinationStatus(tokenId: string, id: string, session: string, actor: string): CoordinationResult {
     const row = this.one(`SELECT a.status, a.meta FROM coordination_requests r LEFT JOIN artefacts a ON a.id=r.ask_id
       WHERE r.token_id=? AND r.ask_id=?`, tokenId, id);
     if (!row) throw new Error("no such coordination request for this credential");
     if (!row.meta) return { id, state: "cancelled", reason: "The coordination question was removed." };
-    const result = askLifecycle({ status: String(row.status), meta: JSON.parse(String(row.meta)) });
-    return result.state === "open" ? { id, state: "pending" } : { id, ...result };
+    const meta = JSON.parse(String(row.meta));
+    const result = askLifecycle({ status: String(row.status), meta });
+    if (result.state !== "open") return { id, ...result };
+    const pending = { id, state: "pending" } as const;
+    if (!session || !this.one(`SELECT 1 FROM sessions WHERE token_id=? AND name=?`, tokenId, session)) {
+      return { ...pending, wait_skipped: "caller_session_unknown" };
+    }
+    const route = askRoute(meta.ask ?? {});
+    if (route.kind !== "executor_coordination") return { ...pending, wait_skipped: "no_live_executor" };
+    const target = this.executorAskTarget(route.task_id);
+    if (!target?.session || humanClaimLive(meta, Date.now())) return { ...pending, wait_skipped: "no_live_executor" };
+    if (target.session === session && target.label === this.canonLabel(actor)) return { ...pending, wait_skipped: "same_executor" };
+    // A gateway heartbeat or an old attempt is not proof that this exact
+    // writer can take a turn. Interactive replies use the same per-session
+    // presence read exposed by the ask band; managed writers also need a
+    // running attempt with an unexpired lease and action deadline.
+    const now = Date.now();
+    const attempt = this.executionState(route.task_id)?.attempt;
+    if (!this.askTargetPresence(`${target.label}@${target.session}`, now).online
+      || (attempt?.session === target.session && (attempt.phase !== "running" || attempt.lease_until <= now || attempt.action_deadline <= now))) {
+      return { ...pending, wait_skipped: "no_live_executor" };
+    }
+    return pending;
   }
 
   private async askCreate(body: any, actor: string) {
@@ -11610,12 +11631,16 @@ export class KnowledgeHub {
   private askRecipient(ask: { route?: unknown; to?: unknown }): string {
     const route = askRoute(ask);
     if (route.kind !== "executor_coordination") return String(ask.to ?? "any");
-    const task = this.one(`SELECT status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, route.task_id);
-    if (!task || task.status !== "in_progress" || !task.owner) return "any";
+    const target = this.executorAskTarget(route.task_id);
+    return target ? `${target.label}${target.session ? `@${target.session}` : ""}` : "any";
+  }
+
+  private executorAskTarget(taskId: string): { label: string; session?: string } | null {
+    const task = this.one(`SELECT status, owner, meta, updated_ts FROM artefacts WHERE id = ?`, taskId);
+    if (!task || task.status !== "in_progress" || !task.owner) return null;
     const meta = JSON.parse(String(task.meta ?? "{}"));
-    if (Date.now() - Number(task.updated_ts) > 10 * 60_000 && !this.holderIsAlive(meta, String(task.owner))) return "any";
-    const session = meta.session;
-    return `${this.canonLabel(this.displayOwner(String(task.owner)))}${session ? `@${session}` : ""}`;
+    if (Date.now() - Number(task.updated_ts) > 10 * 60_000 && !this.holderIsAlive(meta, String(task.owner))) return null;
+    return { label: this.canonLabel(this.displayOwner(String(task.owner))), session: typeof meta.session === "string" ? meta.session : undefined };
   }
   // ---------- question human-claim hold (BR#3911) ----------
 

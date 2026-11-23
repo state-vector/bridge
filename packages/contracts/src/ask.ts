@@ -68,7 +68,7 @@ export const CoordinationWaitSchema = z.strictObject({
   wait_ms: z.number().int().min(0).max(15_000).optional().describe("Default 5000; use 0 to check without waiting."),
 });
 export type CoordinationResult = { id: string } & (
-  | { state: "pending" }
+  | { state: "pending"; wait_skipped?: "caller_session_unknown" | "same_executor" | "no_live_executor" }
   | Exclude<AskLifecycle, { state: "open" }>
 );
 export function askLifecycle(node: { status: string; meta?: { ask?: { answer?: string; answered_by?: string; resolution?: { kind?: string; reason?: string } } } }): AskLifecycle {
