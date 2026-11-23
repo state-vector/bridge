@@ -207,6 +207,17 @@ beforeEach(async () => {
           this.state.storage.sql.exec("UPDATE artefacts SET status='done' WHERE id=?", id);
           return Response.json({ ok: true });
         }
+        // GH #478 — park a card blocked exactly as the board parks it (typed
+        // await, owner optional, session released), without a live writer path.
+        if (path === "/fixture/park-blocked") {
+          const { id, owner = "", await_event } = await request.json();
+          const row = this.state.storage.sql.exec("SELECT meta FROM artefacts WHERE id=?", id).toArray()[0];
+          const meta = JSON.parse(String(row.meta ?? "{}"));
+          delete meta.session;
+          meta.blocked = { reason: "fixture park", unblock_condition: "fixture park", await_event, ts: Date.now() };
+          this.state.storage.sql.exec("UPDATE artefacts SET status='blocked',owner=?,meta=? WHERE id=?", owner, JSON.stringify(meta), id);
+          return Response.json({ ok: true });
+        }
         if (path !== "/fixture/spent-route" && path !== "/fixture/watchdog-release") return super.fetch(request);
         const { id } = await request.json();
         const sql = this.state.storage.sql;
@@ -959,6 +970,98 @@ describe("eligibility-first scheduling on real SQLite", () => {
       "begin-resumed", id, resumed.session)).toMatchObject({
       generation: 2, attempt: { phase: "running" }, operations: [{ id: operation_id, state: "succeeded" }],
     });
+  });
+  it("settles a satisfied typed-wait park's stopped-writer receipt and releases the wait exactly once (GH #478)", async () => {
+    const project = "satisfied-wait-reconcile", g = await gateway(project, 2);
+    // The prerequisite the parked subject awaits is already done on the board:
+    // the typed wait is satisfied, but the prepared operation still fences
+    // both the interactive pickup and the blocked→todo release (the deadlock).
+    const prereq = await task(project);
+    expect(await post("fixture/closed-diagnosis", { id: prereq })).toEqual({ ok: true });
+    const fence = { generation: 1, attempt_id: "parked-writer" };
+    const writerCycle = async (gw: typeof g, subject: string, operation_id: string, input_revision: string) => {
+      const claim = await reserve(gw);
+      if (claim.kind !== "reserved" || claim.task_id !== subject) throw new Error("expected reservation: " + JSON.stringify(claim));
+      await gw.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: gw.auth.agent, action_budget_ms: 60_000 }, `begin-${subject}`, subject, claim.session);
+      await gw.cmd({ kind: "prepare", ...fence, operation_id, input_revision, action: "Rerun the failed health leg", budget_ms: 60_000 }, `prepare-${subject}`, subject, claim.session);
+      const terminal = { ...fence, writers: "process_group_empty", outcome: { kind: "timed_out", exit_code: null, stdout_tail: "", stderr_tail: "acp timed out (budget + grace exhausted)" } };
+      await gw.cmd({ kind: "stopped", ...terminal }, `stopped-${subject}`, subject, claim.session);
+      await gw.cmd({ kind: "finalize", ...terminal }, `finalize-${subject}`, subject, claim.session);
+      expect(await post("fixture/watchdog-release", { id: subject })).toEqual({ ok: true });
+    };
+    const id = await task(project);
+    await writerCycle(g, id, "publish", "old-head");
+    expect((await post("transition", { id, to: "blocked", actor: "author", note: "Await the merged prerequisite fix",
+      await_event: { event: "br_done", id: prereq } })).status).toBe("blocked");
+
+    // Authorization is unchanged: only the assigned diagnostic or an
+    // authenticated interactive (full-agent) session settles receipts.
+    const fixer = await post("admin.mint", { label: "fixer", tags: [] });
+    const fixerId = (await post("auth.identify", { bearer: fixer.secret })).token_id;
+    const receipt = { kind: "reconcile_operation", ...fence, operation_id: "publish", input_revision: "old-head", outcome: "failed",
+      receipts: ["https://github.com/state-vector/superpositional/actions/runs/44499480063/job/135513689306 — terminal failure at the exact head"] };
+    const settle = (card: string, command_id: string, command: object = receipt) => post("execution",
+      { actor: "fixer", token_id: fixerId, gateway: false, id: card, session: "fixer-interactive", command_id, command });
+    expect((await post("execution", { ...g.worker, id, session: "worker-1", command_id: "worker-refused", command: receipt })).error).toMatch(/assigned diagnostic/);
+    expect((await settle(id, "mismatched", { ...receipt, input_revision: "other-head" })).error).toMatch(/stale/);
+    // The request contract itself refuses a conclusive settle with no receipts.
+    expect((await settle(id, "no-receipts", { ...receipt, receipts: [] })).error).toMatch(/receipts/);
+
+    // An unsatisfied typed wait is not settleable: the same writer shape parked
+    // on a still-open prerequisite stays refused (separate project pool so the
+    // reserve order stays deterministic).
+    const sibling = "satisfied-wait-reconcile-unsat", g2 = await gateway(sibling);
+    const unsat = await task(sibling);
+    await writerCycle(g2, unsat, "publish-unsat", "old-head");
+    const pending = await task(sibling); // an unsatisfied prerequisite (never closed)
+    expect((await post("transition", { id: unsat, to: "blocked", actor: "author", note: "Await the still-open prerequisite",
+      await_event: { event: "br_done", id: pending } })).status).toBe("blocked");
+    expect((await settle(unsat, "unsatisfied-wait")).error).toMatch(/unassigned task/);
+
+    // The settle itself: ledger-only, exact identity, conclusive receipts.
+    const settled = await settle(id, "confirmed");
+    expect(settled.operations).toMatchObject([{ id: "publish", state: "failed", receipts: [receipt.receipts[0]] }]);
+    expect(await settle(id, "confirmed")).toEqual(settled); // stable-command replay
+    expect((await settle(id, "confirmed", { ...receipt, outcome: "succeeded" })).error).toMatch(/reused with different input/);
+    expect((await settle(id, "second-settle")).error).toMatch(/operation missing or already resolved/);
+    expect((await g.cmd({ kind: "inspect" }, "inspected", id, "fixer-interactive")).operations)
+      .toMatchObject([{ id: "publish", state: "failed", receipts: [receipt.receipts[0]] }]);
+    // The typed wait is untouched by the settle — only the ordinary
+    // continuation consumes it, exactly once.
+    expect((await post("get", { id })).meta.blocked.await_event).toEqual({ event: "br_done", id: prereq });
+    expect((await post("admin.unblock_proxy_sweep", { now: Date.now() })).ok).toBe(true);
+    const released = await post("get", { id });
+    expect(released.status).toBe("todo");
+    expect(released.meta.blocked).toBeUndefined();
+    expect(released.meta.proxy_check).toMatchObject({ verdict: "true" });
+    expect(released.meta.provenance).toMatchObject({ kind: "system_auto_resume", via: "consumed_wait" });
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(id);
+    expect(await g.cmd({ kind: "begin", attempt_id: "resumed-after-wait", worker: g.auth.agent, action_budget_ms: 60_000 },
+      "begin-resumed", id, resumed.session)).toMatchObject({
+      generation: 2, attempt: { phase: "running" }, operations: [{ id: "publish", state: "failed" }],
+    });
+    // A later sweep pass finds nothing left to consume: the fired wait was
+    // consumed exactly once and cannot fire again — the card is already
+    // claimed (in_progress) with no park and no second consumption receipt.
+    expect((await post("admin.unblock_proxy_sweep", { now: Date.now() + 20 * 60_000 })).ok).toBe(true);
+    const after = await post("get", { id });
+    expect(after.status).toBe("in_progress");
+    expect(after.meta.blocked).toBeUndefined();
+    expect(after.meta.provenance).toEqual(released.meta.provenance);
+
+    // Owned parked cards stay refused — the owner check is not relaxed.
+    const owned = await task(project);
+    expect(await post("fixture/park-blocked", { id: owned, owner: g.auth.actor, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    expect((await settle(owned, "owned-refused")).error).toMatch(/unassigned task/);
+    // A live writer is not a stopped writer, even unowned and parked.
+    const running = await task(project);
+    const runningClaim = await reserve(g);
+    if (runningClaim.kind !== "reserved" || runningClaim.task_id !== running) throw new Error(JSON.stringify(runningClaim));
+    await g.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-running", running, runningClaim.session);
+    expect(await post("fixture/park-blocked", { id: running, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    expect((await settle(running, "running-refused")).error).toMatch(/unassigned task/);
   });
   it("recovers a stranded diagnosis after the old cooldown without retrying the unchanged work", async () => {
     const project = "aged-diagnosis", g = await gateway(project);

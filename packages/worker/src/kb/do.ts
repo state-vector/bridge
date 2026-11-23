@@ -3391,6 +3391,41 @@ export class KnowledgeHub {
   }
 
 
+  /** GH #478 — is this unowned parked subject settleable by receipt only?
+   *  A satisfied typed wait can outlive its writer's terminal stop while one
+   *  prepared operation fences BOTH exits: the release path
+   *  (continueBlockedWork) refuses the unresolved operation and the settle
+   *  path refused the parked status — a closed lifecycle deadlock (witness
+   *  BR#17145). This opens the settle for exactly the safely parked shape:
+   *  unowned, blocked on a typed wait the hub's own board state proves
+   *  satisfied, held by a writer whose terminal stop (process_group_empty)
+   *  is on record with no fresh launch in flight. Every other gate is
+   *  unchanged (narrow authorization, stable-command replay, byte-exact
+   *  input revision, conclusive receipts, ledger-only write); the ordinary
+   *  proxy path consumes the satisfied wait afterward. */
+  private reconcilableBlockedWait(id: string, row: { status: string; owner: string }, meta: any, current: ExecutionState, now: number): boolean {
+    if (row.status !== "blocked" || row.owner) return false;
+    const attempt = current.attempt, terminal = current.terminal;
+    if (!attempt || attempt.phase !== "quiesced" || !terminal
+      || terminal.generation !== attempt.generation || terminal.attempt_id !== attempt.attempt_id
+      || terminal.writers !== "process_group_empty") return false;
+    if (this.one(`SELECT task_id FROM executor_start_claims WHERE task_id=?`, id)) return false;
+    const aw = validateAwaitEvent(meta.blocked?.await_event);
+    if (!aw) return false;
+    switch (aw.event) {
+      // Board-local facts only: the hub proves satisfaction from its own state
+      // with zero external calls (the conservatism law — never guess).
+      case "br_done": return this.dependencyOutcome(aw.id, [id]).ok;
+      case "br_answered":
+      case "ask": {
+        const target = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.event === "ask" ? aw.ask_id : aw.id);
+        return !!target && ["done", "superseded"].includes(String(target.status));
+      }
+      case "time": return now >= aw.until_ts;
+      default: return false; // external-atom waits: their own probe/verify paths own the release
+    }
+  }
+
   private boardWorkWaits(
     task: { id: string; status: string; meta: { blocked?: { await_event?: unknown; repairing?: { duty: string; original: unknown } }; startup_wait?: unknown }; gateway_dispatch?: GatewayDispatch },
     state: ExecutionState | undefined,
@@ -7591,7 +7626,10 @@ export class KnowledgeHub {
         return JSON.parse(replay.result);
       }
       const attempt = current.attempt;
-      if (!attempt || row.status !== "todo" || row.owner) throw new Error("gate: operation reconciliation requires an unassigned task");
+      // GH #478: the settle also reaches an unowned parked subject whose typed
+      // wait the hub's own board state proves satisfied (reconcilableBlockedWait).
+      if (!attempt || row.owner || (row.status !== "todo" && !this.reconcilableBlockedWait(req.id, row, meta, current, now)))
+        throw new Error("gate: operation reconciliation requires an unassigned task");
       const next = reduceExecution(current, command, attempt.host, attempt.session, now, String(meta.work_revision ?? "legacy"));
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`UPDATE execution_state SET state=? WHERE task_id=?`, JSON.stringify(next), req.id);

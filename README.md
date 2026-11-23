@@ -4284,6 +4284,20 @@ claim for reconciliation, and a live queue slot, typed wait, declared recovery
 window, operator gate or interactive claim keeps the existing exit.
 Train-bound bounces demote through the existing bounce-re-entry carve-out.
 
+A satisfied typed wait can no longer deadlock receipt-only settlement (GH #478).
+When a writer stopped with its terminal proof (`process_group_empty`) on record
+but one prepared operation still fenced both exits — the blocked→todo release
+refuses the unresolved operation and the settle path refused the parked status —
+the lifecycle deadlocked (witness BR#17145). The receipt-only `reconcile_operation`
+settle now also admits an unowned card parked `blocked` on a typed wait the hub's
+own board state proves satisfied (`br_done`, `br_answered`, `ask`, `time`), with
+no fresh launch in flight. Every other gate is unchanged: the assigned-diagnostic
+or interactive-credential authorization, stable-command replay, the byte-exact
+input revision, conclusive receipts, and the ledger-only write. The settle never
+releases the wait and never touches the typed event — the ordinary proxy path
+consumes the satisfied wait exactly once afterward, returning the card to the
+pool for a fresh attempt.
+
 Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
 
 Bypass requests are bound to the current failing revision and its cause-specific repair task. A historical merged cure is never reused for a new incident. The gateway records a distinct bypass-required verdict only after the exact independently reviewed head is mergeable, signed, and has settled with only circular base-health failures. The hub uses that saved evidence for both the owner request and train panel, includes the exact head in the merge command, and withdraws the request when eligibility changes. A DONE reply asks Bridge to observe the owner’s merge of that exact head; it never grants a delayed automatic bypass. If the head or base changes, or main recovers, Bridge retires the old request. A merged repair still needs a decisive passing deployment before normal merges resume.

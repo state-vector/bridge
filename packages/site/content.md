@@ -1123,6 +1123,11 @@ The gateway protocol separates a captured process result from business
 completion. Exact-fence `finalize` receipts persist the result and stopped-writer
 proof atomically; retries replay that receipt. Unfinished work is reconciled
 through the hub scheduler while independent waits and unknown effects stay held.
+A receipt-only settle also reaches an unowned card parked on a satisfied typed
+wait (GH #478): the hub's own board state proves the wait satisfied
+(`br_done`/`br_answered`/`ask`/`time`), the writer's stopped proof
+(`process_group_empty`) stands, and the settle records the conclusive outcome
+without releasing the wait — the ordinary continuation consumes it exactly once.
 
 Review clients with a cached connector schema may send the explicit captured `subject_revision` at the top level of `transition` alongside `review_result`. If both locations are supplied, they must agree. Bridge still requires that revision to match the duty’s captured subject and the current task submission; it never fills in a missing revision or accepts stale work.
 
