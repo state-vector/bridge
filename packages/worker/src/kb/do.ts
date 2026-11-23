@@ -6064,6 +6064,27 @@ export class KnowledgeHub {
     // the re-claim transition above rewrote meta in DB (cleared the dead-end
     // blocked record) — merge against the POST-transition row, never the stale
     // pre-claim snapshot, or the parked reason resurrects
+    // BR#18608: the meta KEY budget is a CALLER budget, not a whole-row cap.
+    // The old path ran the key-count limit against the entire MERGED meta on
+    // every write, so once the hub's own lifecycle machinery (session,
+    // completion, work_revision, last_progress, blocked+typed await,
+    // execution/recovery/proxy/escalation receipts — all stamped through
+    // direct SQL paths that bypass this check) pushed a card past
+    // LIMITS.metaKeys, EVERY update_artefact failed atomically with
+    // "meta exceeds 20 keys" — including title/body/tags edits that sent no
+    // metadata at all (first-hand: blocked BR#6073, 28 keys / 5,851B — far
+    // under the byte budget — rejected two body-only edits 2026-11-21; the
+    // typed wait made archive impossible, so the card was simply stranded).
+    // The limit's job is policing what CALLERS can supply, and the hub-owned
+    // keys are not the caller's to police: validate the PATCH (shape + key
+    // count) here, before it merges, and leave the merged whole to the byte
+    // budgets below — which still gate the resulting row on every write.
+    if (body.meta !== undefined) {
+      if (typeof body.meta !== "object" || body.meta === null || Array.isArray(body.meta))
+        throw new Error("meta must be an object");
+      if (Object.keys(body.meta).length > LIMITS.metaKeys)
+        throw new Error(`meta exceeds ${LIMITS.metaKeys} keys`);
+    }
     const postRow = reclaimed ? this.one(`SELECT meta FROM artefacts WHERE id = ?`, id) : null;
     const metaObj: any = { ...(postRow ? JSON.parse(postRow.meta ?? "{}") : preMeta) };
     if (body.meta !== undefined) Object.assign(metaObj, JSON.parse(JSON.stringify(body.meta)));
@@ -6127,7 +6148,11 @@ export class KnowledgeHub {
       if (rolesIn.ok === false) throw new Error(rolesIn.error);
       roles = rolesIn.roles;
     }
-    const limitErr = checkLimits(title, bodyMd, JSON.parse(meta));
+    // BR#18608: title/body limits still apply to every write; the meta key
+    // count is policed at the caller patch above (a create-time whole-object
+    // check would strand every lifecycle-heavy card — the hub's own stamps
+    // don't run this check, so only API callers were punished for them).
+    const limitErr = checkLimits(title, bodyMd);
     if (limitErr) throw new Error(limitErr);
     // BR#11554 storage budget: every row write re-binds the full title+body+
     // meta+tags+roles — the resulting row must stay well under the DO SQLite

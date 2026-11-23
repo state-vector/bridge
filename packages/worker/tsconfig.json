@@ -47,6 +47,8 @@
     // BR#11637: same rig as do.test.ts (miniflare + workerd fetch types)
     "test/br11637-tags-accretion.test.ts",
     // BR#14413: same rig as do.test.ts (miniflare + workerd fetch types)
-    "test/br14413-conditional-get.test.ts"
+    "test/br14413-conditional-get.test.ts",
+    // BR#18608: same rig as do.test.ts (miniflare + workerd fetch types)
+    "test/br18608-meta-key-cap.test.ts"
   ]
 }
