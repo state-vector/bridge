@@ -278,6 +278,11 @@ export const ExternalWaitRecordSchema = ExternalChecksWaitSchema.extend({
   attempt_id: text,
   declared_at: z.number().int().positive(),
 });
+
+const CoordinationWaitIntentSchema = FenceSchema.extend({
+  ask_id: z.string().regex(/^BR#\d+$/),
+  checkpoint_commit: sha,
+});
 export type ExternalWaitRecord = z.infer<typeof ExternalWaitRecordSchema>;
 /** Read-only GitHub check-observation operations whose prepared entry a
  * park may re-key to the durable wait (BR#18314: a prepared read-only
@@ -417,10 +422,11 @@ export const ExecutionStateSchema = z.object({
    *  signed intent command; the attempt's quiesced proof turns it into the
    *  durable park. Additive and defaulted: old journals parse unchanged. */
   external_wait: ExternalWaitRecordSchema.nullable().default(null),
+  coordination_wait_intent: CoordinationWaitIntentSchema.nullable().default(null),
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null, external_wait: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null, external_wait: null, coordination_wait_intent: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -462,6 +468,7 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
    *  never reaches the finalize charge site, so waiting consumes no retry
    *  budget. */
   z.object({ kind: z.literal("await_external"), ...FenceSchema.shape, writers: z.literal("process_group_empty"), wait: ExternalChecksWaitSchema }),
+  CoordinationWaitIntentSchema.extend({ kind: z.literal("request_coordination_wait") }),
   z.object({ kind: z.literal("stopped"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
@@ -561,6 +568,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       // BR#18328 — a new attempt always clears a prior wait: a stale intent
       // can never park a generation that did not declare it.
       s.external_wait = null;
+      s.coordination_wait_intent = null;
       if (needsRecoveryPermit && s.recovery_permit?.phase === "available") s.recovery_permit = { ...s.recovery_permit, phase: "consumed", consumed_generation: s.generation, consumed_attempt_id: command.attempt_id };
       const common = {
         generation: s.generation, attempt_id: command.attempt_id, host, session,
@@ -595,7 +603,28 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const current = requireAttempt(true);
       if (current.phase === "quiesced") throw new Error("gate: quiesced writer cannot publish new checkpoints");
       if (command.checkpoint.tests.some(t => t.tree !== command.checkpoint.tree)) throw new Error("gate: test evidence does not cover checkpoint content");
+      if (s.coordination_wait_intent && current.checkpoint?.commit !== command.checkpoint.commit) {
+        throw new Error("gate: the coordination wait is bound to the published checkpoint");
+      }
       current.checkpoint = command.checkpoint;
+      break;
+    }
+    case "request_coordination_wait": {
+      const current = requireAttempt();
+      if (current.phase !== "running" || current.action_deadline <= now || s.terminal
+        || !["none", "returned"].includes(s.handoff.phase)) {
+        throw new Error("gate: coordination wait requires the current running attempt with no typed exit");
+      }
+      if (current.checkpoint?.commit !== command.checkpoint_commit) {
+        throw new Error("gate: coordination wait requires the exact published checkpoint");
+      }
+      if (s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
+        throw new Error("gate: reconcile external operations before requesting a coordination wait");
+      }
+      const { kind: _kind, ...intent } = command;
+      s.coordination_wait_intent = intent;
+      // This requests a stop; it does not attest it or release the slot.
+      s.attempt = { ...current, phase: "stopping" };
       break;
     }
     case "quiesce": requireAttempt(true).phase = "quiesced"; break;

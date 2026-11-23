@@ -8,6 +8,19 @@ const fence = { generation: 1, attempt_id: "one" };
 const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", session = "dispatch-BR-1") => reduceExecution(s, c, host, session, now);
 const started = () => step(initialExecution(), begin);
 
+it("requests a checkpoint-bound coordination stop without attesting quiescence", () => {
+  const command = { kind: "request_coordination_wait", ...fence, ask_id: "BR#42", checkpoint_commit: cp.commit } as const;
+  expect(() => step(started(), command)).toThrow(/published checkpoint/);
+  const checkpointed = step(started(), { kind: "checkpoint", ...fence, checkpoint: cp });
+  const waiting = step(checkpointed, command);
+  expect(waiting.attempt?.phase).toBe("stopping");
+  expect(waiting.terminal).toBeNull();
+  expect(waiting.coordination_wait_intent).toEqual({ ...fence, ask_id: "BR#42", checkpoint_commit: cp.commit });
+  expect(() => step(waiting, { ...command, generation: fence.generation + 1 })).toThrow(/fenced/);
+  const changedCheckpoint = { ...cp, commit: cp.base };
+  expect(() => step(waiting, { kind: "checkpoint", ...fence, checkpoint: changedCheckpoint })).toThrow(/bound to the published checkpoint/);
+});
+
 describe("durable execution failure boundaries", () => {
   it("finishes an authored local handoff only after stopped proof, never by exit code", () => {
     let s = step(started(), { kind: "local_handoff", ...fence, reason: "Local device needed", action: "Run on paired device", findings: "Remote device is unavailable", tried: "Inspected device binding", next: "Verify on local device", evidence: ["device binding"], approvals: [], recipient: null });
