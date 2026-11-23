@@ -509,8 +509,8 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
   });
 
-  it("retries one held task and drains matching work only after a fenced provider response", async () => {
-    const project = "automatic-provider-recovery", g = await gateway(project, 4, true);
+  it.each(["completed", "interrupted"])("drains matching work after a fenced provider response on a %s trial", async outcomeKind => {
+    const project = "automatic-provider-recovery-" + outcomeKind, g = await gateway(project, 4, true);
     const foreign = { ...g.capabilities, model: "test/other" };
     expect((await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [foreign] } })).ok).toBe(true);
     const failed = { kind: "failed", exit_code: null, stdout_tail: "",
@@ -550,7 +550,12 @@ describe("eligibility-first scheduling on real SQLite", () => {
       phase: "consumed", proof: { witness: { kind: "scheduler_capacity_trial" } },
     } });
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 3 } });
-    await finish(canary, { ...completed, acp_parent_prompt_observed_at: Date.now() });
+    const observed = Date.now();
+    const response = outcomeKind === "completed"
+      ? { ...completed, acp_parent_prompt_observed_at: observed }
+      : { ...completed, kind: "interrupted", exit_code: null,
+          stderr_tail: "acp interrupted — stop for a fresh attempt", acp_parent_teardown_observed_at: observed };
+    expect((await finish(canary, response)).terminal.outcome.kind).toBe(outcomeKind);
     expect((await post("update", { id: first, meta: { operator_gated: true } })).error).toBeUndefined();
 
     const resumed = await start(second, 2);

@@ -7567,8 +7567,8 @@ export class KnowledgeHub {
     const outcome = terminal.outcome;
     const observed = outcome.kind === "completed" ? outcome.acp_parent_prompt_observed_at
       : outcome.kind === "interrupted" && outcome.acp_parent_teardown_observed_at
-        && this.hasManagedAssignment(tokenId, id, attempt.session, project, true)
-        && this.managedReviewVerdictExists(id, attempt)
+        && (isTrial || (this.hasManagedAssignment(tokenId, id, attempt.session, project, true)
+          && this.managedReviewVerdictExists(id, attempt)))
         ? outcome.acp_parent_teardown_observed_at : undefined;
     const begin = observed && this.one(
       `SELECT json_extract(result,'$.attempt.action_deadline') - json_extract(request,'$.command.action_budget_ms') AS began_at
