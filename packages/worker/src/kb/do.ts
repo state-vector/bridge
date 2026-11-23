@@ -7721,6 +7721,26 @@ export class KnowledgeHub {
           req.id, req.command_id, encoded, JSON.stringify(result)));
         return result;
       }
+      // Follow only current outstanding coordination wait edges. This
+      // handler is synchronous through the receipt write, so another
+      // request cannot insert the inverse edge after this check.
+      const seen = new Set([req.id]);
+      let targetId: string | undefined = route.task_id;
+      while (targetId) {
+        if (seen.has(targetId)) throw new Error("gate: a cyclic coordination wait cannot release work");
+        if (seen.size >= 64) throw new Error("gate: coordination wait chain is too long to prove acyclic");
+        seen.add(targetId);
+        const target = this.one(`SELECT status,meta FROM artefacts WHERE id=? AND type='task'`, targetId);
+        const targetMeta = target ? JSON.parse(String(target.meta)) : null;
+        const event = validateAwaitEvent(targetMeta?.blocked?.await_event);
+        const waitingOn = target?.status === "blocked" && event?.event === "ask" ? event.ask_id
+          : target?.status === "in_progress" ? this.executionState(targetId)?.coordination_wait_intent?.ask_id : undefined;
+        const downstream = waitingOn ? this.one(`SELECT status,meta FROM artefacts WHERE id=? AND type='question'`, waitingOn) : null;
+        const downstreamMeta = downstream ? JSON.parse(String(downstream.meta)) : null;
+        const downstreamRoute = downstream && askLifecycle({ status: String(downstream.status), meta: downstreamMeta }).state === "open"
+          ? askRoute(downstreamMeta.ask ?? {}) : null;
+        targetId = downstreamRoute?.kind === "executor_coordination" ? downstreamRoute.task_id : undefined;
+      }
     }
     if (command.kind === "start_failed" || command.kind === "recover_unstarted" || command.kind === "cancel_start") {
       const recovering = command.kind === "recover_unstarted";
