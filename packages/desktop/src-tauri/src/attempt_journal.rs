@@ -51,6 +51,7 @@ pub enum Step {
     Publish { checkpoint: crate::checkpoint::Checkpoint },
     Register { checkpoint: crate::checkpoint::Checkpoint },
     Finalize,
+    FinalizeCoordination { checkpoint: crate::checkpoint::Checkpoint },
     Acknowledged { reply: serde_json::Value },
 }
 #[derive(Clone, Serialize, Deserialize)]

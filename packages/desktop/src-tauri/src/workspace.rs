@@ -684,7 +684,7 @@ fn is_bridge_cli_target(repository: &Path, target: &Path) -> Result<bool, String
     Ok(legacy::cache_tag(target))
 }
 
-fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
+pub(super) fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
     let ignored=git(path,&["ls-files","--others","--ignored","--exclude-standard","--directory","-z"])?;
     // BR#14740 — recreatable caches are disposable BY CLASS, not by per-allocation
     // declaration: node_modules/target (the exact names `disposable()` sanctions

@@ -360,7 +360,16 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
             report.released(Released::from_hub(&record.owner, &reply)?);
             // Finalize has always followed the hub's stopped receipt. Persist
             // that boundary so a delivery failure resumes at finalize.
-            record.work = Work::Stopped { outcome, writers, worktree, step: Step::Finalize };
+            let intent = &reply["coordination_wait_intent"];
+            let step = if intent["generation"].as_u64() == Some(*generation) && intent["attempt_id"] == attempt_id.as_str() {
+                let checkpoint: crate::checkpoint::Checkpoint = serde_json::from_value(reply["attempt"]["checkpoint"].clone())
+                    .map_err(|error| format!("gate: coordination checkpoint missing: {error}"))?;
+                if intent["checkpoint_commit"] != checkpoint.commit {
+                    return Err("gate: coordination checkpoint changed after the stop request".into());
+                }
+                Step::FinalizeCoordination { checkpoint }
+            } else { Step::Finalize };
+            record.work = Work::Stopped { outcome, writers, worktree, step };
             record.disposition = Disposition::Pending;
             journal::save(&root, &record)?;
         }
@@ -390,10 +399,14 @@ fn finalize_record(shared: &Config, mut record: Record, report: &Reporter, fresh
                     let ticket = record.ticket().clone();
                     let next = match step {
                         Step::Stop | Step::Capture | Step::Publish { .. } | Step::Register { .. } => unreachable!("stopped receipt must precede finalization"),
-                        Step::Finalize => {
-                            let bounded = bounded_outcome(&outcome);
-                            let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("finalize"),
-                                json!({"kind":"finalize","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded}))?;
+                        Step::Finalize | Step::FinalizeCoordination { .. } => {
+                            let mut command = json!({"kind":"finalize","generation":generation,"attempt_id":attempt_id,"writers":writers,"outcome":bounded_outcome(&outcome)});
+                            if let Step::FinalizeCoordination { checkpoint } = step {
+                                let path = worktree.as_deref().ok_or("gate: coordination stop has no original worktree")?;
+                                crate::checkpoint::verify_stopped(path, &checkpoint, &ticket.task_id, *generation)?;
+                                command["coordination_checkpoint_verified"] = json!(checkpoint.commit);
+                            }
+                            let reply = execution_request(&cfg, &ticket.task_id, &ticket.session, &record.command_id("finalize"), command)?;
                             let released = Released::from_hub(&record.owner, &reply)?;
                             report.released(released);
                             Step::Acknowledged { reply }

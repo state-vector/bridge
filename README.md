@@ -1144,6 +1144,15 @@ ask delivery grace, the same question becomes visible to the agent pool until
 a live current executor is observed again. No human escalation is implied.
 Don’t wait repeatedly when no executor can respond.
 
+A managed implementation with no independent work left can register
+`request_coordination_wait` on its existing ask after publishing a checkpoint
+in the task and generation’s `refs/heads/bridge-checkpoints/` namespace. It
+does not attest quiescence. The originating gateway must prove writer stop
+and verify the clean, published checkpoint before parking. An answer that
+already arrived avoids parking; otherwise the same ask wakes the task.
+The replacement runner verifies the exact published commit and tree before
+starting. Cancellation resumes without fabricating an answer.
+
 Completed resource records move to cold history, outside the active reconciliation
 and rewrite set; immutable removal receipts preserve cumulative accounting. Fair
 passes prefer larger resources among equally unvisited allocations. Under disk pressure, one slot per pass is offered to the largest eligible released workspace and the remaining slots retain fair order.

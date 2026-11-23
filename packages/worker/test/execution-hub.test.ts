@@ -73,7 +73,8 @@ describe("historical stopped-writer receipts", () => {
     const worker = (await post<{ id: string }>("agent.provision", { label: `${host}/worker`, actor: host })).data;
     const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `writer-proof-${serial}` };
     expect((await post("execution", { ...auth, id: "gateway", command_id: "ready", command: { kind: "advertise", capabilities: {
-      ...localCapabilities, backend: "opencode", capacity: 4, worker: { kind: "provisioned", label: `${host}/worker` },
+      ...localCapabilities, tools: [...localCapabilities.tools, "coordination-checkpoint-v1"],
+      backend: "opencode", capacity: 4, worker: { kind: "provisioned", label: `${host}/worker` },
     } } })).data.error).toBeUndefined();
     const id = (await post<{ id: string }>("create", { type: "task", title: `Writer proof ${serial}`, project: "bridge", roles: ["impl"], qualified: true, meta })).data.id;
     expect((await post("transition", { ...auth, id, to: "in_progress" })).data.error).toBeUndefined();
@@ -89,6 +90,7 @@ describe("historical stopped-writer receipts", () => {
     const r = await setup();
     const peer = await setup();
     const fence = { generation: 1, attempt_id: "old" };
+    const waitCheckpoint = { ...checkpoint, remote_ref: `refs/heads/bridge-checkpoints/${r.id.replace("#", "-")}/1/test` };
     const worker = { actor: r.auth.agent, token_id: r.worker.id, session: r.auth.session,
       execution_scope: { id: r.id, ...fence } };
     const ask = await post<{ id: string }>("ask.create", {
@@ -99,8 +101,7 @@ describe("historical stopped-writer receipts", () => {
     expect(ask.status, JSON.stringify(ask.data)).toBe(200);
     const phase = () => post<{ status: string }>("get", { id: r.id }).then(result => result.data.status);
     const answer = () => post("ask.answer", { ...peer.auth, id: ask.data.id, answer: "The branch receipts are ready" });
-    expect((await r.command("publish", { kind: "checkpoint", ...fence, checkpoint })).data.error).toBeUndefined();
-    const intent = { kind: "request_coordination_wait", ...fence, ask_id: ask.data.id, checkpoint_commit: checkpoint.commit };
+    const intent = { kind: "request_coordination_wait", ...fence, ask_id: ask.data.id, checkpoint_commit: checkpoint.commit, checkpoint: waitCheckpoint };
     expect((await r.command("intent", intent, worker)).data).toMatchObject({ attempt: { phase: "stopping" } });
     expect(await phase()).toBe("in_progress");
     if (when === "before-stop") expect((await answer()).status).toBe(200);
@@ -109,12 +110,23 @@ describe("historical stopped-writer receipts", () => {
     } };
     expect((await r.command("writer-stopped", { kind: "stopped", ...stop })).data.error).toBeUndefined();
     expect(await phase()).toBe("in_progress");
-    const finalized = await r.command("finalize-wait", { kind: "finalize", ...stop });
+    const finalize = { kind: "finalize", ...stop, coordination_checkpoint_verified: checkpoint.commit };
+    const finalized = await r.command("finalize-wait", finalize);
     expect(finalized.status, JSON.stringify(finalized.data)).toBe(200);
     expect(await phase()).toBe(when === "after-stop" ? "blocked" : "todo");
     if (when === "after-stop") expect((await answer()).status).toBe(200);
     expect(await phase()).toBe("todo");
-    expect((await r.command("finalize-wait", { kind: "finalize", ...stop })).data).toEqual(finalized.data);
+    expect((await r.command("finalize-wait", finalize)).data).toEqual(finalized.data);
+    const nextSession = `${r.auth.session}-restored`;
+    expect((await post("transition", { ...r.auth, id: r.id, session: nextSession, to: "in_progress" })).data.error).toBeUndefined();
+    const begin = await r.command("begin-resume", { kind: "begin", attempt_id: "resumed", worker: r.auth.agent,
+      action_budget_ms: 60_000 }, { session: nextSession });
+    expect(begin.data).toMatchObject({ attempt: { phase: "restoring", checkpoint: waitCheckpoint } });
+    const restore = { kind: "restore", generation: 2, attempt_id: "resumed", commit: checkpoint.commit, tree: checkpoint.tree };
+    expect((await r.command("wrong-restore", { ...restore, tree: "f".repeat(40) }, { session: nextSession })).data.error).toMatch(/exact commit and tree/);
+    const ack = await r.command("restore", restore, { session: nextSession });
+    expect(ack.data).toMatchObject({ attempt: { phase: "running", restored_tree: checkpoint.tree } });
+    expect((await r.command("restore", restore, { session: nextSession })).data).toEqual(ack.data);
     } finally { stub = shared; }
   });
 

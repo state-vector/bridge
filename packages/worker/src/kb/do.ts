@@ -2739,6 +2739,15 @@ export class KnowledgeHub {
       this.stampProxyCheck(r.id, meta, now, "waiting", `awaiting ask ${aw.ask_id}`, prev);
       return;
     }
+    if (meta.execution_resume?.kind === "coordination_checkpoint" && meta.execution_resume.ask_id === aw.ask_id) {
+      const resolution = a ? askLifecycle({ status: String(a.status), meta: JSON.parse(String(a.meta)) }) : null;
+      if (resolution?.state === "cancelled" || resolution?.state === "expired") {
+        this.continueBlockedWork(String(r.id), meta, { kind: "satisfied", receipts: [
+          `Coordination ask ${aw.ask_id} ${resolution.state} without an answer: ${resolution.reason}`,
+        ] });
+        return;
+      }
+    }
     const receipts = [`${describeAwaitEvent(aw)} → ask ${aw.ask_id} answered/closed`];
     const coordination = a?.status === "done"
       ? this.managedCoordinationReceipt(String(r.id), meta.blocked, aw.ask_id, JSON.parse(String(a.meta ?? "{}")).ask) : null;
@@ -5408,6 +5417,7 @@ export class KnowledgeHub {
     // qualifications stack: a publisher may declare self-analyzed readiness AND request
     // further confirmation bars (await: ["review"]) before the task goes ready
     const createMeta: any = { ...(body.meta ?? {}) };
+    if (createMeta.execution_resume?.kind === "coordination_checkpoint") throw new Error("gate: coordination checkpoints are lifecycle-owned");
     if (["review_result", "review_subject", "review_target", "review_offer", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => createMeta[k] !== undefined)) throw new Error("gate: review results and work revisions are owned by the task/review lifecycle, not create metadata");
     if (reviewOffer) createMeta.review_offer = reviewOffer;
     // BR#14366 (ADR BR#14118): acceptance criteria are validated on write —
@@ -5957,6 +5967,11 @@ export class KnowledgeHub {
     // meta_delete: ["key"] — a null VALUE is stored as null, never treated as a
     // delete (lane stop/currently rest at null).
     const metaDel: string[] = Array.isArray(body.meta_delete) ? body.meta_delete.map((k: unknown) => String(k)) : [];
+    if ((preMeta.execution_resume?.kind === "coordination_checkpoint" || body.meta?.execution_resume?.kind === "coordination_checkpoint")
+      && (metaDel.includes("execution_resume") || (body.meta && Object.hasOwn(body.meta, "execution_resume")
+        && JSON.stringify(body.meta.execution_resume) !== JSON.stringify(preMeta.execution_resume)))) {
+      throw new Error("gate: coordination checkpoints are lifecycle-owned");
+    }
     if (metaDel.includes(LANE_REVISION) || body.meta && Object.hasOwn(body.meta, LANE_REVISION)) throw new Error("gate: lane revisions are owned by canonical persistence");
     if (["review_result", "execution_review_of", "review_subject", "review_target", "review_offer", "acceptance_snapshot", "work_revision", "human_delivery_approval", "wait_repair_result"].some(k => metaDel.includes(k)
       || (body.meta && Object.hasOwn(body.meta, k) && JSON.stringify(body.meta[k]) !== JSON.stringify(preMeta[k]))))
@@ -6134,6 +6149,10 @@ export class KnowledgeHub {
     if (typeof body.meta !== "object" || body.meta === null || Array.isArray(body.meta))
       throw new Error("gate: artefact_slim replaces meta wholesale — pass the complete stubbed meta object");
     const stub: Record<string, unknown> = JSON.parse(JSON.stringify(body.meta));
+    if ((oldMeta.execution_resume as { kind?: string } | undefined)?.kind === "coordination_checkpoint") stub.execution_resume = oldMeta.execution_resume;
+    else if ((stub.execution_resume as { kind?: string } | undefined)?.kind === "coordination_checkpoint") {
+      throw new Error("gate: coordination checkpoints are lifecycle-owned");
+    }
     const infraPreserved: string[] = [];
     for (const k of ["lane", "lease", "currently", "stop", "blocked"]) {
       if (oldMeta[k] !== undefined && stub[k] === undefined) { stub[k] = oldMeta[k]; infraPreserved.push(k); }
@@ -6699,6 +6718,8 @@ export class KnowledgeHub {
       if (!reason && capabilities) {
         const requirements = schedulingRequirements();
         if (requirements.host && requirements.host !== host) reason = "host_affinity";
+        else if (meta.execution_resume?.kind === "coordination_checkpoint"
+          && !capabilities.tools.includes("coordination-checkpoint-v1")) reason = "capability";
         else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
         else {
           readiness ??= this.executorReadiness(tokenId, host, capabilities, Date.now());
@@ -7254,7 +7275,9 @@ export class KnowledgeHub {
       const row = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, String(body.id ?? ""));
       const a = this.executionState(String(body.id ?? ""))?.attempt;
       if (row?.status === "todo" && a && a.phase !== "quiesced") throw new Error("gate: previous executor writer not quiescent — preserve host affinity");
-      const requirements = row ? JSON.parse(row.meta ?? "{}").execution_requirements : null;
+      const claimedMeta = row ? JSON.parse(row.meta ?? "{}") : {};
+      const requirements = claimedMeta.execution_requirements;
+      const checkpointResume = claimedMeta.execution_resume?.kind === "coordination_checkpoint";
       if (["todo", "blocked"].includes(row?.status) && this.executionState(String(body.id ?? ""))?.handoff.phase !== "accepted") {
         const token = this.one(`SELECT label, tags FROM auth_tokens WHERE id = ? AND revoked_ts IS NULL`, String(body.token_id ?? ""));
         if (token && tagsSayGateway(parseTags(token.tags))) {
@@ -7262,6 +7285,9 @@ export class KnowledgeHub {
           const host = this.one(`SELECT capabilities, observed_ts FROM execution_hosts WHERE token_id = ?`, String(body.token_id));
           if (!host || Date.now() - host.observed_ts > 120_000) throw new Error("gate: claim requires a live executor capability observation");
           const capabilities = ExecutorCapabilitiesSchema.parse(JSON.parse(host.capabilities));
+          if (checkpointResume && !capabilities.tools.includes("coordination-checkpoint-v1")) {
+            throw new Error("gate: this continuation requires a checkpoint-compatible gateway");
+          }
           if (capabilities.inventory_revision === 2 && body.inventory_protocol !== 2) throw new Error("gate: claim requires the scoped-inventory runner protocol; obsolete GUI may drain but not borrow newer readiness");
           const readiness = this.executorReadiness(String(body.token_id), token.label, capabilities, Date.now());
           if (readiness.kind !== "ready") throw new Error(`gate: claim requires provisioned worker readiness: ${readiness.reason}`);
@@ -7272,6 +7298,7 @@ export class KnowledgeHub {
           const project = String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(body.id)).project ?? "");
           if (![capabilities, ...capabilities.alternatives].some(c => usableFor(scheduling, c, token.label, project) && (!!a || c.tier === scheduling.tier))) throw new Error("gate: claim requires the globally selected live usable model tier in the task's capability scope");
         } else if (token && this.executionWork().isInteractive(String(body.token_id))) {
+          if (checkpointResume) throw new Error("gate: this continuation requires a fenced checkpoint restore before any writer can start");
           this.executionWork().assertInteractiveClaim(String(body.id), String(body.token_id), String(body.session ?? ""));
         } else if (token && requirements) {
           throw new Error("gate: direct claim requires a live full interactive credential or a ready gateway");
@@ -7701,6 +7728,14 @@ export class KnowledgeHub {
         || scope.attempt_id !== command.attempt_id || row.status !== "in_progress" || meta.session !== session) {
         throw new Error("gate: a coordination stop intent requires the current scoped worker and claim");
       }
+      if (!current.attempt?.executor?.tools.includes("coordination-checkpoint-v1")) {
+        throw new Error("gate: this attempt's gateway has not advertised coordination checkpoint support");
+      }
+      const checkpoint = command.checkpoint ?? current.attempt.checkpoint;
+      const slug = req.id.replace(/[^A-Za-z0-9-]/g, "-");
+      if (!checkpoint?.remote_ref.startsWith(`refs/heads/bridge-checkpoints/${slug}/${command.generation}/`)) {
+        throw new Error("gate: publish the coordination checkpoint under this task and attempt generation");
+      }
       if (parseTags(row.roles).some(role => role === "review" || role === "unblock")
         || meta.operator_gated || this.protectedExecution(req.id, meta)
         || this.startupWait(req.id) || this.startupHasAsk(req.id) || releaseHold(meta)) {
@@ -7869,9 +7904,10 @@ export class KnowledgeHub {
     const finalizeCurrentClaim = command.kind === "finalize" && currentClaim;
     const waitIntent = current.coordination_wait_intent;
     const stoppedForCoordination = command.kind === "finalize" && finalizeCurrentClaim
-      && command.outcome.kind === "interrupted" && command.writers === "process_group_empty"
+      && ["interrupted", "completed"].includes(command.outcome.kind) && command.writers === "process_group_empty"
       && waitIntent && waitIntent.generation === command.generation && waitIntent.attempt_id === command.attempt_id
       && next.attempt?.checkpoint?.commit === waitIntent.checkpoint_commit
+      && command.coordination_checkpoint_verified === waitIntent.checkpoint_commit
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")
       && !this.protectedExecution(req.id, meta, true) && !meta.operator_gated
       && !this.startupHasAsk(req.id) && !releaseHold(meta) ? waitIntent : null;
@@ -7903,9 +7939,24 @@ export class KnowledgeHub {
       && !meta.operator_gated && !this.startupHasAsk(req.id) && !releaseHold(meta)
       && ["none", "returned"].includes(next.handoff.phase)
       && !next.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown");
-    if (finalizeCurrentClaim && command.kind === "finalize" && command.outcome.kind !== "interrupted"
+    if (finalizeCurrentClaim && !coordinationStop && command.kind === "finalize" && command.outcome.kind !== "interrupted"
       && providerRecoveryDiagnosis(command.outcome) !== "provider_route_unavailable") chargeExecutionFailure(next,command.generation);
     if (begunExecutor && next.attempt) {
+      const resume = meta.execution_resume;
+      if (resume?.kind === "coordination_checkpoint") {
+        if (!begunExecutor.tools.includes("coordination-checkpoint-v1")) {
+          throw new Error("gate: a coordination checkpoint requires a compatible gateway");
+        }
+        const source = current.attempt?.checkpoint;
+        const continuation = current.coordination_wait_intent;
+        if (!source || !continuation || continuation.ask_id !== resume.ask_id
+          || continuation.generation !== resume.generation || continuation.attempt_id !== resume.attempt_id
+          || continuation.checkpoint_commit !== resume.checkpoint_commit || source.commit !== resume.checkpoint_commit) {
+          throw new Error("gate: coordination continuation lost its exact checkpoint; retain and reconcile it");
+        }
+        next.coordination_wait_intent = continuation;
+        next.attempt = { ...next.attempt, phase: "restoring", checkpoint: source, restored_tree: null };
+      }
       next.attempt.executor = begunExecutor;
       next.requirements.tier = maxTier(next.requirements.tier, begunExecutor.tier);
       meta.execution_last_model = { model: begunExecutor.model, tier: begunExecutor.tier, backend: begunExecutor.backend };
@@ -7922,6 +7973,11 @@ export class KnowledgeHub {
         // BR#18328 — a new attempt invalidates any standing external wait:
         // the intent was scoped to the attempt that declared it.
         if (meta.execution_wait?.kind === "external_checks") delete meta.execution_wait;
+      }
+      if (command.kind === "checkpoint" && meta.execution_resume?.kind === "coordination_checkpoint"
+        && next.coordination_wait_intent?.generation !== command.generation) {
+        delete meta.execution_resume;
+        next.coordination_wait_intent = null;
       }
       this.state.storage.sql.exec(`INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, worker_token_id=excluded.worker_token_id`, req.id, JSON.stringify(next), workerTokenId);
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
@@ -7989,7 +8045,9 @@ export class KnowledgeHub {
         // One scheduling path for both fresh work and terminal reconciliation.
         // Keep the exact captured outcome in execution_state; a fresh session
         // reconciles it instead of guessing completion or reusing a conversation.
-        meta.execution_resume = { kind: "terminal_result", generation: next.generation, attempt_id: next.attempt?.attempt_id };
+        if (meta.execution_resume?.kind !== "coordination_checkpoint") {
+          meta.execution_resume = { kind: "terminal_result", generation: next.generation, attempt_id: next.attempt?.attempt_id };
+        }
         delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
         this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',status_ts=?,updated_ts=?,meta=? WHERE id=?`, now, now, JSON.stringify(meta), req.id);
         this.state.storage.sql.exec(`DELETE FROM executor_start_claims WHERE task_id=?`, req.id);

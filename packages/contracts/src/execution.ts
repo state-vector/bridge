@@ -468,9 +468,9 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
    *  never reaches the finalize charge site, so waiting consumes no retry
    *  budget. */
   z.object({ kind: z.literal("await_external"), ...FenceSchema.shape, writers: z.literal("process_group_empty"), wait: ExternalChecksWaitSchema }),
-  CoordinationWaitIntentSchema.extend({ kind: z.literal("request_coordination_wait") }),
+  CoordinationWaitIntentSchema.extend({ kind: z.literal("request_coordination_wait"), checkpoint: CheckpointSchema.optional() }),
   z.object({ kind: z.literal("stopped"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
-  z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
+  z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema, coordination_checkpoint_verified: sha.optional() }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
   z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]) }),
   z.object({ kind: z.literal("ack"), ...FenceSchema.shape, message_id: text, state: z.enum(["acknowledged", "acted"]) }),
@@ -603,7 +603,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const current = requireAttempt(true);
       if (current.phase === "quiesced") throw new Error("gate: quiesced writer cannot publish new checkpoints");
       if (command.checkpoint.tests.some(t => t.tree !== command.checkpoint.tree)) throw new Error("gate: test evidence does not cover checkpoint content");
-      if (s.coordination_wait_intent && current.checkpoint?.commit !== command.checkpoint.commit) {
+      if (s.coordination_wait_intent?.generation === current.generation && current.checkpoint?.commit !== command.checkpoint.commit) {
         throw new Error("gate: the coordination wait is bound to the published checkpoint");
       }
       current.checkpoint = command.checkpoint;
@@ -615,16 +615,18 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         || !["none", "returned"].includes(s.handoff.phase)) {
         throw new Error("gate: coordination wait requires the current running attempt with no typed exit");
       }
-      if (current.checkpoint?.commit !== command.checkpoint_commit) {
+      const checkpoint = command.checkpoint ?? current.checkpoint;
+      if (checkpoint?.commit !== command.checkpoint_commit
+        || checkpoint.tests.some(test => test.tree !== checkpoint.tree)) {
         throw new Error("gate: coordination wait requires the exact published checkpoint");
       }
       if (s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
         throw new Error("gate: reconcile external operations before requesting a coordination wait");
       }
-      const { kind: _kind, ...intent } = command;
+      const { kind: _kind, checkpoint: _candidate, ...intent } = command;
       s.coordination_wait_intent = intent;
       // This requests a stop; it does not attest it or release the slot.
-      s.attempt = { ...current, phase: "stopping" };
+      s.attempt = { ...current, phase: "stopping", checkpoint };
       break;
     }
     case "quiesce": requireAttempt(true).phase = "quiesced"; break;
