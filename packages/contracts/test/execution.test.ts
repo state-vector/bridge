@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, type Checkpoint, type ExecutionCommand, type ExecutionState } from "../src/execution.ts";
+import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -122,6 +122,72 @@ describe("durable execution failure boundaries", () => {
     const held = step(step(s, { ...begin, attempt_id: "three" }, 300), poll, 301);
     expect(held.attempt?.phase).toBe("stopping");
     expect(held.messages.at(-1)).toMatchObject({ id: "operator-stop", state: "delivered" });
+  });
+
+  it("BR#19479: settles prior-attempt preemption at begin from real quiescence and never replays it", () => {
+    const preemptText = "Priority line recovery BR#19440 needs this slot. Stop safely, confirm process-group quiescence and yield.";
+    let s = step(started(), { kind: "message", message_id: "recovery-preempt:BR#19440:1:one", priority: "interrupt", text: preemptText, fence: { generation: 1, attempt_id: "one" } });
+    s = step(s, { kind: "poll", ...fence });
+    expect(s.attempt?.phase).toBe("stopping"); // the fresh interrupt stops its own attempt
+    s = step(s, { kind: "ack", ...fence, message_id: "recovery-preempt:BR#19440:1:one", state: "acknowledged" });
+    s = step(s, { kind: "ack", ...fence, message_id: "recovery-preempt:BR#19440:1:one", state: "acted" });
+    s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    expect(s.messages).toMatchObject([{ id: "recovery-preempt:BR#19440:1:one", state: "acted", fence: { generation: 1, attempt_id: "one" } }]); // audit preserved, nothing deleted
+    expect(step(s, { kind: "poll", generation: 2, attempt_id: "two" }, 201).attempt?.phase).toBe("running"); // no replayed stop
+    expect(actionableMailbox(s.messages, { generation: 2, attempt_id: "two" })).toHaveLength(0); // nothing actionable in the launch prompt
+  });
+
+  it("BR#19479: a crash leaves prior-attempt control delivered; begin settles it so the restart reaches work", () => {
+    let s = step(started(), { kind: "message", message_id: "recovery-preempt:BR#19440:1:one", priority: "interrupt", text: "Priority line recovery needs this slot.", fence: { generation: 1, attempt_id: "one" } });
+    s = step(s, { kind: "poll", ...fence }); // delivered; the writer is killed before any ack
+    const outcome = { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: "" } as const;
+    s = step(s, { kind: "stopped", ...fence, writers: "process_group_empty", outcome });
+    s = step(s, { kind: "finalize", ...fence, writers: "process_group_empty", outcome }, 150);
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    expect(s.messages[0]).toMatchObject({ id: "recovery-preempt:BR#19440:1:one", state: "acted" }); // settled by quiescence evidence, not model prose
+    expect(step(s, { kind: "poll", generation: 2, attempt_id: "two" }, 201).attempt?.phase).toBe("running");
+    expect(actionableMailbox(s.messages, { generation: 2, attempt_id: "two" })).toHaveLength(0);
+  });
+
+  it("BR#19479: generation-bearing preempt IDs fence even without the typed field (older rows)", () => {
+    let s = started();
+    s.messages.push({ id: "recovery-preempt:BR#19440:1:one", text: "Priority line recovery needs this slot.", priority: "interrupt", state: "acknowledged" });
+    s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    expect(s.messages[0].state).toBe("acted");
+    expect(actionableMailbox(s.messages, { generation: 2, attempt_id: "two" })).toHaveLength(0);
+  });
+
+  it("BR#19479: acknowledged-but-unacted coordination survives begin and stays actionable", () => {
+    let s = started();
+    s.messages.push({ id: "ask:BR#19480", text: "narrow factual continuation", priority: "normal", state: "acknowledged" });
+    s = step(s, { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    expect(s.messages[0]).toMatchObject({ id: "ask:BR#19480", state: "acknowledged" }); // not settled, not suppressed
+    expect(actionableMailbox(s.messages, { generation: 2, attempt_id: "two" }).map(m => m.id)).toEqual(["ask:BR#19480"]);
+  });
+
+  it("BR#19479: a fresh current-attempt preemption still stops the running attempt and renders actionable", () => {
+    let s = step(started(), { kind: "quiesce", ...fence, writers: "process_group_empty" });
+    s = step(s, { ...begin, attempt_id: "two" }, 200);
+    const two = { generation: 2, attempt_id: "two" };
+    s = step(s, { kind: "message", message_id: "recovery-preempt:BR#19442:2:two", priority: "interrupt", text: "Priority line recovery needs this slot.", fence: two });
+    expect(s.messages[0]).toMatchObject({ fence: two, state: "queued" });
+    s = step(s, { kind: "poll", ...two }, 201);
+    expect(s.attempt?.phase).toBe("stopping"); // fresh current interrupts are never suppressed
+    expect(actionableMailbox(s.messages, two).map(m => m.id)).toEqual(["recovery-preempt:BR#19442:2:two"]);
+  });
+
+  it("BR#19479: the actionable projection excludes acted history and other-attempt control only", () => {
+    const mailbox: ExecutionMessage[] = [
+      { id: "recovery-preempt:BR#19440:1:old", text: "stop", priority: "interrupt", state: "acted" },
+      { id: "recovery-preempt:BR#19441:1:old", text: "stop", priority: "interrupt", state: "delivered" },
+      { id: "ask:BR#19480", text: "pending", priority: "normal", state: "acknowledged" },
+      { id: "recovery-preempt:BR#19442:2:two", text: "stop", priority: "interrupt", state: "queued", fence: { generation: 2, attempt_id: "two" } },
+    ];
+    expect(actionableMailbox(mailbox, { generation: 2, attempt_id: "two" }).map(m => m.id)).toEqual(["ask:BR#19480", "recovery-preempt:BR#19442:2:two"]);
+    expect(actionableMailbox(mailbox, { generation: 1, attempt_id: "old" }).map(m => m.id)).toEqual(["recovery-preempt:BR#19441:1:old", "ask:BR#19480"]);
   });
 
   it("rejects content-unbound test evidence", () => {

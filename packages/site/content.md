@@ -492,7 +492,10 @@ active writers. Pollers stop and join before quiescence/transfer; a refused poll
 stops its writer and preserves WIP.
 Task-addressed coordination
 is delivered through a durable queued/delivered/acknowledged/acted mailbox;
-non-interruptible CLIs use bounded stop/checkpoint/resume. Stable command and
+prompts render only its actionable projection — acted history and
+attempt-fenced control bound to a prior attempt are preserved for audit and
+never re-issued as instructions to a fresh attempt. Non-interruptible CLIs
+use bounded stop/checkpoint/resume. Stable command and
 operation IDs prevent blind retries of unknown GitHub/AWS effects. The execution
 MCP tool exposes exact state and availability, including expired supporting
 gateways versus busy capacity. Backend `models` tier maps and task

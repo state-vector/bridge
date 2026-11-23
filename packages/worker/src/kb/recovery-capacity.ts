@@ -196,6 +196,10 @@ export class RecoveryCapacity {
       const pending: RecoveryPreemption = { phase: "stopping_verification", recovery_id: recovery.id, victim_id: id,
         generation: a.generation, attempt_id: a.attempt_id, session: a.session, requested_at: now, checkpoint_commit: a.checkpoint?.commit ?? null };
       const stopped = reduceExecution(state, { kind: "message", message_id: `recovery-preempt:${recovery.id}:${a.generation}:${a.attempt_id}`,
+        // BR#19479 — the preempt is attempt-scoped control: fence the exact
+        // target so a replacement attempt can neither replay it as a new
+        // instruction nor be stopped by its stale delivery.
+        fence: { generation: a.generation, attempt_id: a.attempt_id },
         priority: "interrupt", text: `Priority line recovery ${recovery.id} needs this slot. Stop safely, confirm process-group quiescence and yield. Record findings on the task. Verification starts fresh after recovery. Keep review separation.` }, host, a.session, now);
       this.storage.transactionSync(() => {
         this.sql.exec(`INSERT INTO recovery_preemptions(token_id,state) VALUES (?,?)`, token, JSON.stringify(pending));

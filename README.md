@@ -872,7 +872,13 @@ removing or changing the scope does not restore legacy write access.
   durable mailbox (`queued → delivered → acknowledged → acted`). For CLIs that
   cannot accept hot input, the runner stops and the next attempt receives the
   message. Interruptions gate conflicting hub writes immediately. Delivery is
-  not a claim that the requested repair succeeded.
+  not a claim that the requested repair succeeded. Attempt-scoped control
+  (recovery preemption, legacy claim ends) is fenced to the exact
+  generation/attempt it addresses; begin settles that control from the
+  previous writer's proven quiescence, and prompts render only the actionable
+  projection — handled history and stale prior-attempt control stay in the
+  durable record and are never re-issued as instructions, while unfenced
+  coordination and fresh current interrupts remain actionable.
 - **Bounded external operations:** the `execution` MCP tool supports
   `prepare`/`result` with stable operation IDs, exact input revisions, budgets
   and receipts. A timed-out effect becomes `outcome_unknown`; inspect GitHub/AWS

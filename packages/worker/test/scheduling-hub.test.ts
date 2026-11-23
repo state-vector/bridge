@@ -1952,6 +1952,7 @@ describe("priority line recovery capacity", () => {
     const stopped = await g.cmd({ kind: "poll", generation: 1, attempt_id: "verification" }, "verify-poll", victim, r.session);
     expect(stopped.attempt.phase).toBe("stopping");
     expect(stopped.messages).toHaveLength(1);
+    expect(stopped.messages[0]).toMatchObject({ fence: { generation: 1, attempt_id: "verification" } }); // BR#19479: the preempt binds its actual attempt
     const message = stopped.messages[0].id;
     await g.cmd({ kind: "ack", generation: 1, attempt_id: "verification", message_id: message, state: "acknowledged" }, "verify-ack", victim, r.session);
     await g.cmd({ kind: "ack", generation: 1, attempt_id: "verification", message_id: message, state: "acted" }, "verify-acted", victim, r.session);

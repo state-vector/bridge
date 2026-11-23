@@ -201,10 +201,47 @@ export const HandoffControlSchema = z.discriminatedUnion("kind", [
 export type HandoffControl = z.infer<typeof HandoffControlSchema>;
 export const HandoffCheckpointSchema = HandoffAcceptSchema.extend({ checkpoint: CheckpointSchema });
 const FenceSchema = z.object({ generation: z.number().int().positive(), attempt_id: text });
-const MessageSchema = z.object({
+export const MessageSchema = z.object({
   id: text, text, priority: z.enum(["normal", "interrupt"]),
   state: z.enum(["queued", "delivered", "acknowledged", "acted"]),
+  /** BR#19479 — attempt-scoped control (recovery preemption, legacy claim
+   * ends) is fenced to the exact generation/attempt it addresses. Unfenced
+   * messages are task-level coordination and stay pending across attempts. */
+  fence: FenceSchema.optional(),
 });
+export type ExecutionMessage = z.infer<typeof MessageSchema>;
+/** The legacy claim-end stop text: its exact text is part of the evidence bar
+ * for settling the older hub's attempt-scoped stop (BR#19479). */
+const LEGACY_CLAIM_ENDED_STOP = "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.";
+/** BR#19479 — the attempt fence a control message binds to: the typed
+ * `fence` field, or the generation-bearing control-ID shapes minted in
+ * production (`recovery-preempt:<duty>:<generation>:<attempt>`, and the
+ * legacy `claim-ended:<generation>:<attempt>` stop with its exact text).
+ * Anything else is task-level coordination, never attempt-scoped control. */
+export function messageAttemptFence(message: Pick<ExecutionMessage, "id" | "text" | "fence">): { generation: number; attempt_id: string } | null {
+  if (message.fence) return message.fence;
+  const parts = message.id.split(":");
+  const shaped = (generation: string, attempt_id: string) => {
+    const parsed = Number(generation);
+    return Number.isSafeInteger(parsed) && parsed >= 1 && attempt_id ? { generation: parsed, attempt_id } : null;
+  };
+  if (parts[0] === "recovery-preempt" && parts.length >= 4) return shaped(parts[parts.length - 2], parts[parts.length - 1]);
+  if (parts[0] === "claim-ended" && message.text === LEGACY_CLAIM_ENDED_STOP && parts.length >= 3) return shaped(parts[1], parts.slice(2).join(":"));
+  return null;
+}
+/** BR#19479 — the ONE canonical actionable mailbox projection for prompt
+ * construction. Acted messages are handled history, and attempt-fenced
+ * control bound to another attempt is stale for this writer — neither may
+ * render as an instruction; the durable record preserves both. Genuinely
+ * pending coordination (unfenced, or fenced to the exact current attempt)
+ * stays actionable, so fresh current interrupts are never suppressed. */
+export function actionableMailbox(messages: ExecutionMessage[], current: { generation: number; attempt_id: string }): ExecutionMessage[] {
+  return messages.filter(message => {
+    if (message.state === "acted") return false;
+    const bound = messageAttemptFence(message);
+    return !bound || (bound.generation === current.generation && bound.attempt_id === current.attempt_id);
+  });
+}
 const OperationSchema = z.object({
   id: text, action: text, input_revision: text, deadline: z.number().int(),
   state: z.enum(["prepared", "outcome_unknown", "succeeded", "failed"]),
@@ -472,7 +509,9 @@ export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("stopped"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema }),
   z.object({ kind: z.literal("finalize"), ...FenceSchema.shape, writers: WriterProofSchema, outcome: TerminalOutcomeSchema, coordination_checkpoint_verified: sha.optional() }),
   z.object({ kind: z.literal("yield"), ...FenceSchema.shape }),
-  z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]) }),
+  z.object({ kind: z.literal("message"), message_id: text, text, priority: z.enum(["normal", "interrupt"]),
+    /** BR#19479 — minters of attempt-scoped control fence the exact target attempt. */
+    fence: FenceSchema.optional() }),
   z.object({ kind: z.literal("ack"), ...FenceSchema.shape, message_id: text, state: z.enum(["acknowledged", "acted"]) }),
   z.object({ kind: z.literal("escalate"), ...FenceSchema.shape, tier: ReasoningTierSchema, reason: text }),
   z.object({ kind: z.literal("local_handoff"), ...FenceSchema.shape, reason: text, action: text, findings: text, tried: text, next: text,
@@ -550,16 +589,18 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
       if (s.operations.some(x => x.state === "prepared" || x.state === "outcome_unknown")) throw new Error("gate: reconcile unknown external operations before another attempt");
       if (a) {
-        // Older hubs put the previous claim's stop in the task mailbox. Its
-        // exact writer is now quiescent, so that stop has already taken effect.
-        const legacyStopText = "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.";
+        // BR#19479 — begin is the one place with real quiescence evidence:
+        // the gate above just proved the previous writer stopped. Attempt-
+        // scoped control (recovery preemption, legacy claim ends) bound to
+        // that stopped attempt or older has taken effect — settle it here so
+        // historical control is never replayed into a fresh prompt as a new
+        // instruction. Unfenced coordination and current interrupts are never
+        // touched, and the raw history is preserved for audit.
         for (const message of s.messages) {
-          if (message.priority !== "interrupt" || message.text !== legacyStopText) continue;
-          const [kind, generation, ...attemptParts] = message.id.split(":");
-          const stoppedGeneration = Number(generation);
-          const stoppedAttempt = attemptParts.join(":");
-          if (kind !== "claim-ended" || !Number.isSafeInteger(stoppedGeneration) || stoppedGeneration < 1 || !stoppedAttempt) continue;
-          if (stoppedGeneration < a.generation || (stoppedGeneration === a.generation && stoppedAttempt === a.attempt_id)) {
+          if (message.priority !== "interrupt" || message.state === "acted") continue;
+          const bound = messageAttemptFence(message);
+          if (!bound) continue;
+          if (bound.generation < a.generation || (bound.generation === a.generation && bound.attempt_id === a.attempt_id)) {
             message.state = "acted";
           }
         }
@@ -697,7 +738,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       if (!s.messages.some(x => x.id === command.message_id)) {
         if (s.messages.filter(x => x.state !== "acted").length >= 100) throw new Error("gate: execution mailbox full");
         if (s.messages.length >= 1000) throw new Error("gate: mailbox history budget exhausted; reconcile before adding messages");
-        s.messages.push({ id: command.message_id, text: command.text, priority: command.priority, state: "queued" });
+        s.messages.push({ id: command.message_id, text: command.text, priority: command.priority, state: "queued", fence: command.fence });
       }
       if (a && a.phase !== "quiesced" && a.phase !== "finalizing" && command.priority === "interrupt") a.phase = "stopping";
       break;

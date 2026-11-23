@@ -3289,6 +3289,69 @@ fn append_recovery_continuation(prompt: &mut String, state: &serde_json::Value, 
     prompt.push_str(&format!("\n# Authorized recovery continuation\n{}\nStart from the current repository and reconcile the prior terminal evidence above. Follow the continuation instructions; reconcile receipts before any external effect. This permission is for this attempt only.\n", permit));
 }
 
+/// The legacy claim-end stop text: its exact text is part of the evidence bar
+/// for the older hub's attempt-scoped stop (BR#19479). Mirrors contracts.
+const LEGACY_CLAIM_ENDED_STOP: &str = "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.";
+
+/// BR#19479 — the attempt fence a control message binds to: the typed
+/// `fence` field, or the generation-bearing control-ID shapes minted in
+/// production (`recovery-preempt:<duty>:<generation>:<attempt>`, and the
+/// legacy `claim-ended:<generation>:<attempt>` stop with its exact text).
+/// Anything else is task-level coordination, never attempt-scoped control.
+/// Mirrors contracts' `messageAttemptFence` — one canonical projection rule.
+fn message_attempt_fence(fence: Option<(u64, &str)>, id: &str, text: &str) -> Option<(u64, String)> {
+    if let Some((generation, attempt_id)) = fence {
+        return if generation >= 1 && !attempt_id.is_empty() { Some((generation, attempt_id.to_string())) } else { None };
+    }
+    let parts: Vec<&str> = id.split(':').collect();
+    let shaped = |generation: &str, attempt_id: &str| -> Option<(u64, String)> {
+        let generation = generation.parse::<u64>().ok()?;
+        if generation >= 1 && !attempt_id.is_empty() { Some((generation, attempt_id.to_string())) } else { None }
+    };
+    if parts.first() == Some(&"recovery-preempt") {
+        if parts.len() >= 4 { return shaped(parts[parts.len() - 2], parts[parts.len() - 1]); }
+        return None;
+    }
+    if parts.first() == Some(&"claim-ended") && text == LEGACY_CLAIM_ENDED_STOP && parts.len() >= 3 {
+        return shaped(parts[1], &parts[2..].join(":"));
+    }
+    None
+}
+
+/// BR#19479 — the ONE canonical actionable mailbox projection for prompt
+/// construction (the contracts `actionableMailbox` rule, applied where the
+/// prompt is produced). Acted messages are handled history, and attempt-
+/// fenced control bound to another attempt is stale for this writer —
+/// neither may render as an instruction; the durable record preserves both.
+/// Genuinely pending coordination (unfenced, or fenced to the exact current
+/// attempt) stays actionable, so fresh current interrupts are never
+/// suppressed.
+fn actionable_mailbox(messages: &serde_json::Value, generation: u64, attempt_id: &str) -> Vec<serde_json::Value> {
+    messages.as_array().map(|all| all.iter().filter(|m| {
+        if m["state"] == "acted" { return false; }
+        let fence = m["fence"].as_object().map(|f| (f["generation"].as_u64().unwrap_or(0), f["attempt_id"].as_str().unwrap_or("")));
+        match message_attempt_fence(fence, m["id"].as_str().unwrap_or(""), m["text"].as_str().unwrap_or("")) {
+            None => true,
+            Some((bound_generation, bound_attempt)) => bound_generation == generation && bound_attempt == attempt_id,
+        }
+    }).cloned().collect()).unwrap_or_default()
+}
+
+/// Render a mailbox prompt section from the canonical projection: the
+/// actionable JSON array, plus — only when historical control was withheld —
+/// a factual count so the audit trail stays visible without its handled or
+/// stale control becoming a new instruction.
+fn render_actionable_mailbox(messages: &serde_json::Value, generation: u64, attempt_id: &str) -> String {
+    let total = messages.as_array().map_or(0, Vec::len);
+    let actionable = actionable_mailbox(messages, generation, attempt_id);
+    let rendered = serde_json::to_string(&actionable).unwrap_or_default();
+    match total - actionable.len() {
+        0 => rendered,
+        withheld => format!("{rendered} ({withheld} handled or stale prior-attempt message{} preserved in the durable history — recorded, not actionable here)",
+            if withheld == 1 { "" } else { "s" }),
+    }
+}
+
 /// Spawn an opencode session for a task: strict policy pre-prompt + task body +
 /// delivery contract (commit, push branch, open PR). Uses an isolated worktree
 /// when cfg.isolate and the repo allows it; otherwise falls back to cfg.workdir.
@@ -3769,7 +3832,7 @@ fn spawn_opencode(
     }
     let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
     execution.control.grant_lease_from(begin_requested_at);
-    prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, state["messages"]));
+    prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, render_actionable_mailbox(&state["messages"], generation, &execution.attempt_id)));
     let checkpoint_slug: String = tid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
     prompt.push_str(&format!("\nIf a coordination ask remains pending and there is genuinely no independent work left, a managed implementation task can request a stop, not certify one. First preserve your work in a signed Git commit and publish its exact HEAD to a fresh refs/heads/bridge-checkpoints/{checkpoint_slug}/{generation}/<unique checkpoint> ref on this repository's origin. Do not stage ignored inputs or publish secrets. Send execution command request_coordination_wait with this generation and attempt_id, the existing ask_id, checkpoint_commit, and checkpoint {{repo, remote_ref, commit, tree, base, environment, next, tests}}. Then stop working. The originating gateway checks physical writer stop and the published checkpoint; only then can the ask own a wait and the slot be released. If the request reports the ask already resolved, keep working from that result instead.\n"));
     prompt.push_str(BACKGROUND_JOBS_LINE);
@@ -3782,7 +3845,7 @@ fn spawn_opencode(
         Ok(s) => s,
         Err(e) => { execution.stop_maintenance(); failed_start(cfg, tid, StartStage::Begin, &e, Some(&execution.attempt_id), worktree.as_deref()); return; }
     };
-    prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", safe_point["messages"]));
+    prompt.push_str(&format!("\nLatest safe-point mailbox (read and apply before conflicting work): {}\n", render_actionable_mailbox(&safe_point["messages"], execution.generation, &execution.attempt_id)));
     for message in safe_point["messages"].as_array().into_iter().flatten().filter(|m| m["state"] == "delivered") {
         let mut cmd = execution.command("ack"); cmd["message_id"] = message["id"].clone(); cmd["state"] = json!("acknowledged");
         if execution_call(cfg, tid, cmd).is_err() { return; }
@@ -4176,6 +4239,74 @@ mod tests {
             super::append_recovery_continuation(&mut stale, &state, generation, attempt);
             assert!(stale.is_empty());
         }
+    }
+
+    /// BR#19479 / Bridge #482: a handled generation-1 preemption must never
+    /// replay as an instruction in generation 2's launch prompt, while
+    /// genuinely pending coordination and fresh current interrupts stay
+    /// actionable in the same mailbox — asserted on the actual prompt
+    /// producer, not an isolated expected string.
+    #[test]
+    fn launch_prompt_projects_only_actionable_mailbox_for_the_current_attempt() {
+        let handled_gen1_preempt = serde_json::json!({
+            "id": "recovery-preempt:BR#19440:1:4181607-1795413800608",
+            "text": "Priority line recovery BR#19440 needs this slot. Stop safely, confirm process-group quiescence and yield.",
+            "priority": "interrupt", "state": "acted"
+        });
+        let stale_unacted_gen1_preempt = serde_json::json!({
+            "id": "recovery-preempt:BR#19441:1:4181607-1795413800608",
+            "text": "Priority line recovery BR#19441 needs this slot.",
+            "priority": "interrupt", "state": "delivered"
+        });
+        let pending_coordination = serde_json::json!({
+            "id": "ask:BR#19480", "text": "BR#19480: repair the handled-interrupt prompt replay.",
+            "priority": "normal", "state": "acknowledged"
+        });
+        let fresh_gen2_preempt = serde_json::json!({
+            "id": "recovery-preempt:BR#19442:2:2095108-1795420005180",
+            "text": "Priority line recovery BR#19442 needs this slot.",
+            "priority": "interrupt", "state": "delivered",
+            "fence": { "generation": 2, "attempt_id": "2095108-1795420005180" }
+        });
+        let mailbox = serde_json::json!([handled_gen1_preempt, stale_unacted_gen1_preempt, pending_coordination, fresh_gen2_preempt]);
+        let rendered = super::render_actionable_mailbox(&mailbox, 2, "2095108-1795420005180");
+        for stale in ["recovery-preempt:BR#19440:1:4181607-1795413800608", "recovery-preempt:BR#19441:1:4181607-1795413800608"] {
+            assert!(!rendered.contains(stale), "historical control must not render as actionable: {stale} in {rendered}");
+        }
+        for pending in ["ask:BR#19480", "recovery-preempt:BR#19442:2:2095108-1795420005180"] {
+            assert!(rendered.contains(pending), "genuinely pending coordination must stay actionable: missing {pending} in {rendered}");
+        }
+        assert!(rendered.contains("2 handled or stale prior-attempt messages"), "the withheld audit count stays visible: {rendered}");
+        assert_eq!(super::actionable_mailbox(&mailbox, 2, "2095108-1795420005180").len(), 2);
+        // A mailbox with nothing withheld renders the plain array — no advisory text.
+        let plain = super::render_actionable_mailbox(&serde_json::json!([pending_coordination]), 2, "2095108-1795420005180");
+        assert!(plain.contains(r#""id":"ask:BR#19480""#) && !plain.contains("durable history"), "no-withholding render must stay plain: {plain}");
+        assert_eq!(super::render_actionable_mailbox(&serde_json::json!([]), 2, "2095108-1795420005180"), "[]");
+    }
+
+    /// BR#19479: attempt fences bind control to the attempt they actually
+    /// address — the legacy claim-ended stop settles against its own
+    /// generation, its non-legacy lookalike is coordination, and unfenced
+    /// coordination is never attempt-scoped.
+    #[test]
+    fn attempt_fences_bind_control_to_their_own_attempt_only() {
+        let legacy_stop = serde_json::json!({
+            "id": "claim-ended:1:old-attempt",
+            "text": "Task claim ended. Stop the writer and report process-group quiescence; do not continue execution.",
+            "priority": "interrupt", "state": "delivered"
+        });
+        let lookalike = serde_json::json!({
+            "id": "claim-ended:1:other-attempt", "text": "please also review the README",
+            "priority": "interrupt", "state": "delivered"
+        });
+        let ask = serde_json::json!({ "id": "ask:BR#19480", "text": "narrow factual continuation", "priority": "normal", "state": "delivered" });
+        let mailbox = serde_json::json!([legacy_stop, lookalike, ask]);
+        let gen2_render = super::render_actionable_mailbox(&mailbox, 2, "new-attempt");
+        assert!(!gen2_render.contains("claim-ended:1:old-attempt"), "legacy generation-1 control is stale for a generation-2 writer: {gen2_render}");
+        assert!(gen2_render.contains("claim-ended:1:other-attempt"), "a lookalike without the legacy stop text is coordination, not control: {gen2_render}");
+        assert!(gen2_render.contains("ask:BR#19480"));
+        let gen1_render = super::render_actionable_mailbox(&mailbox, 1, "old-attempt");
+        assert!(gen1_render.contains("claim-ended:1:old-attempt"), "the exact addressed attempt still receives its control: {gen1_render}");
     }
     #[test]
     fn failed_launch_refill_requires_conclusive_no_writer_not_expiry_or_transport_failure() {
