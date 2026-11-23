@@ -11,6 +11,11 @@ mod legacy;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 pub(super) const INTERVAL: Duration = Duration::from_secs(30);
+/// BR#19525 — cadence of the bounded admission sampler (see
+/// `refresh_admission`): cheap enough to run while the slow reclaim pass
+/// crawls, frequent enough that the 120s proof window never lapses on the
+/// sampler alone.
+pub(super) const ADMISSION_SAMPLE: Duration = Duration::from_secs(15);
 const BATCH: usize = 4;
 /// BR#14716 — the pressure drain width (see `reconcile`): a held admission
 /// means the ladder owes the budget bytes; the fair 4-per-30s pass cannot
@@ -82,6 +87,16 @@ pub struct Status {
     /// per-record ledger.
     #[serde(default)]
     pub error_head: Vec<(String, String)>,
+    /// BR#19525 — the admissible total from the LAST full inventory, cached
+    /// so the bounded admission sampler never needs to re-measure with `du`.
+    /// `None` means no full measurement has completed; the sampler fails
+    /// closed on it.
+    #[serde(default)]
+    pub admissible_bytes: Option<u64>,
+    /// BR#19525 — the preserved (errored/retained) bytes behind that total,
+    /// cached for the sampler's Held reason.
+    #[serde(default)]
+    pub preserved_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -430,8 +445,7 @@ impl Owner {
         Ok(())
     }
     fn measure(&self) -> Result<Status, String> {
-        let budget = std::env::var("BRIDGE_WORKSPACE_BUDGET_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(100).saturating_mul(GIB);
-        let floor = std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB);
+        let (budget, floor) = Self::budget_floor();
         self.measure_with_limits(budget, floor)
     }
     fn reader_authority(&self,record:&Resource)->Result<legacy::ReaderAuthority,String> {
@@ -485,6 +499,14 @@ impl Owner {
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }
         Ok(())
+    }
+    /// BR#19525 — the single budget/floor resolution, shared by the full
+    /// reconcile pass and the bounded admission sampler so the two can never
+    /// disagree about what "held" means.
+    fn budget_floor() -> (u64, u64) {
+        let budget = std::env::var("BRIDGE_WORKSPACE_BUDGET_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(100).saturating_mul(GIB);
+        let floor = std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB);
+        (budget, floor)
     }
     fn measure_with_limits(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
         let records = self.records()?;
@@ -574,8 +596,63 @@ impl Owner {
             resources: records.len(), pending: records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count(),
             retained: records.iter().filter(|r| r.error.is_some()).count(), budget_bytes, available_bytes, admission,
             wedge: wedge.then_some(()),
-            error_head: errors.into_iter().take(10).collect() };
-        journal::write_file(&self.ledger.join("status.json"), &serde_json::to_vec(&status).map_err(|e| e.to_string())?)?;
+            error_head: errors.into_iter().take(10).collect(),
+            admissible_bytes: Some(admissible_bytes),
+            preserved_bytes };
+        self.write_status(&status)?;
+        Ok(status)
+    }
+    /// BR#19525 — serialised status.json writer. The full inventory pass and
+    /// the bounded admission sampler are both writers of this proof file, so
+    /// both route through this best-effort lock (short retry, then an atomic
+    /// write anyway — journal::write_file never tears).
+    fn write_status(&self, status: &Status) -> Result<(), String> {
+        let bytes = serde_json::to_vec(status).map_err(|e| e.to_string())?;
+        for _ in 0..10 {
+            if let Ok(Some(_guard)) = self.lock("status") {
+                return journal::write_file(&self.ledger.join("status.json"), &bytes);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        journal::write_file(&self.ledger.join("status.json"), &bytes)
+    }
+    /// BR#19525 — bounded admission sampling, decoupled from the slow reclaim
+    /// ladder. A full `reconcile` pass can run for minutes on a crowded
+    /// workspace (`du` per record, up to 30s each) while dispatch only needs
+    /// to know whether admission is still open. This re-proofs admission from
+    /// the LAST full inventory plus a first-hand filesystem capacity check:
+    /// it never re-measures with `du`, never advances the ladder and never
+    /// takes a resource lock — the slow pass stays the sole reclamation
+    /// owner. A stale, corrupt or missing proof, or a sampling failure, is an
+    /// error — nothing is written and the old proof ages out, so admission
+    /// fails closed exactly as before.
+    pub fn refresh_admission(&self) -> Result<Status, String> {
+        let (budget, floor) = Self::budget_floor();
+        self.refresh_admission_with(budget, floor)
+    }
+    pub fn refresh_admission_with(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
+        let mut status: Status = serde_json::from_slice(&fs::read(self.ledger.join("status.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let Some(admissible_bytes) = status.admissible_bytes else {
+            return Err("workspace inventory has not yet been measured; admission sampling unavailable".into());
+        };
+        status.available_bytes = available_bytes(&self.allocations)?;
+        status.admission = if admissible_bytes >= budget_bytes || status.available_bytes < floor {
+            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget, {} available; reclamation continues", status.managed_bytes, status.preserved_bytes, admissible_bytes.saturating_sub(status.cache_bytes).saturating_sub(status.evidence_bytes), status.cache_bytes, status.evidence_bytes, budget_bytes, status.available_bytes) }
+        } else { Admission::Ready };
+        // The record counters are re-derived cheaply from the journalled
+        // records; byte totals stay as last fully measured.
+        let records = self.records()?;
+        let errors: Vec<(String, String)> = records.iter().filter(|r| r.error.is_some())
+            .map(|r| (r.id.clone(), r.error.clone().unwrap_or_default())).collect();
+        status.resources = records.len();
+        status.pending = records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count();
+        status.retained = errors.len();
+        status.wedge = (matches!(status.admission, Admission::Held { .. })
+            && !errors.is_empty() && errors.len() == records.len()).then_some(());
+        status.error_head = errors.into_iter().take(10).collect();
+        status.observed_at = now_ms();
+        self.write_status(&status)?;
         Ok(status)
     }
     pub fn report(&self) -> Result<serde_json::Value, String> {

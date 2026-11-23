@@ -468,3 +468,84 @@ fn an_unrelated_real_non_dumpable_daemon_does_not_own_a_released_execution_works
     assert!(owner.reconcile(&[]).unwrap().reclaimed_bytes>=8192);assert!(!root.exists());
     assert!(daemon.0.try_wait().unwrap().is_none(),"reconciliation must not stop the unrelated daemon");
 }
+
+#[test]
+fn admission_sampling_reproofs_a_stale_proof_from_the_cached_inventory_without_touching_records() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let t=ticket("sampled");let a=owner.allocate(&t,None).unwrap();fs::write(a.work.join("active-input"),"keep").unwrap();
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();drop(a);
+    owner.reconcile(&[]).unwrap();
+    let cached=owner.status().unwrap();assert!(cached.admissible_bytes.is_some());
+    let record_before=owner.read(&id).unwrap();
+    // BR#19262 live shape: the full pass (du per record) crawls for minutes
+    // while dispatch keeps asking; the only proof on disk ages past the 120s
+    // window and the owner holds admission with 107 GiB actually free. The
+    // bounded sampler must refresh the proof from the cached inventory alone.
+    let mut stale=cached.clone();stale.observed_at=now_ms().saturating_sub(121_000);stale.admission=Admission::Held { reason:"aged out".into() };
+    journal::write_file(&owner.ledger.join("status.json"),&serde_json::to_vec(&stale).unwrap()).unwrap();
+    assert!(matches!(owner.admission(),Admission::Held {..}),"the aged proof must hold first (precondition)");
+    let sampled=owner.refresh_admission_with(u64::MAX,0).unwrap();
+    assert!(matches!(sampled.admission,Admission::Ready));
+    assert!(now_ms().saturating_sub(sampled.observed_at)<5_000,"sampling must produce a fresh proof");
+    assert_eq!(sampled.admissible_bytes,cached.admissible_bytes,"the sampler reuses the last full inventory, it never re-measures");
+    assert_eq!(sampled.budget_bytes,cached.budget_bytes);
+    assert_eq!(serde_json::to_value(owner.read(&id).unwrap()).unwrap(),serde_json::to_value(record_before).unwrap(),"sampling is not a ladder step: the in-use record is untouched");
+    assert!(matches!(owner.admission(),Admission::Ready),"a fresh proof reopens admission");
+}
+
+#[test]
+fn admission_sampling_fails_closed_and_never_fabricates_a_proof() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();
+    // No proof at all: the sampler cannot conjure an inventory out of nothing.
+    assert!(owner.refresh_admission_with(u64::MAX,0).is_err());
+    ready(&owner);
+    let path=owner.ledger.join("status.json");
+    let mut legacy:serde_json::Value=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("admissible_bytes");
+    fs::write(&path,legacy.to_string()).unwrap();
+    let error=owner.refresh_admission_with(u64::MAX,0).unwrap_err();
+    assert!(error.contains("not yet been measured"),"{error}");
+    // A corrupt proof fails closed too — and in EVERY failure the previous
+    // proof file is left exactly as it was.
+    fs::write(&path,b"{").unwrap();
+    assert!(owner.refresh_admission_with(u64::MAX,0).is_err());
+    assert_eq!(fs::read(&path).unwrap(),b"{");
+}
+
+#[test]
+fn admission_sampling_holds_under_genuine_pressure_but_never_advances_the_reclaim_ladder() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("pressured");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    fs::write(a.root.join("cache/object"),vec![7u8;64*1024]).unwrap();
+    a.bind(&attempt(&t)).unwrap();drop(a);
+    owner.release(&released(&attempt(&t))).unwrap();
+    let baseline=owner.reconcile(&[]).unwrap();
+    assert!(matches!(baseline.admission,Admission::Ready),"fixture precondition: an empty workspace is admissible");
+    let t2=ticket("pending");let b=owner.allocate(&t2,Some(source.to_str().unwrap())).unwrap();configure(&b.work,&sandbox.0);
+    fs::write(b.root.join("cache/other"),vec![3u8;32*1024]).unwrap();
+    b.bind(&attempt(&t2)).unwrap();let id2=b.id.clone();let root2=b.root.clone();drop(b);
+    owner.release(&released(&attempt(&t2))).unwrap();
+    // Genuine pressure: a one-byte budget holds admission on the cached
+    // inventory while the disk floor holds independently of it. (The held
+    // proof also pauses new allocations — the sampler gates them exactly like
+    // the full pass does.)
+    let held=owner.refresh_admission_with(1,0).unwrap();
+    let Admission::Held { reason }=&held.admission else { panic!("expected held under a one-byte budget") };
+    assert!(reason.contains("reclamation continues"),"{reason}");
+    assert!(matches!(owner.refresh_admission_with(u64::MAX,u64::MAX).unwrap().admission,Admission::Held {..}),"the disk floor is a hard safety independent of the budget");
+    // The sampler is not a reclamation owner: a pending retirement survives
+    // it byte-for-byte, with no removal receipt written behind the ladder's
+    // back.
+    assert!(root2.exists(),"sampling must not retire a pending resource");
+    assert!(!matches!(owner.read(&id2).unwrap().phase,Phase::Removed { .. }));
+    assert!(fs::read_dir(owner.ledger.join("removals")).map(|entries| entries.filter_map(|e| e.ok()).all(|e| {
+        let receipt:Removal=serde_json::from_slice(&fs::read(e.path()).unwrap()).unwrap();
+        receipt.resource_id!=id2
+    })).unwrap_or(true),"no removal receipt may be written by sampling");
+    assert!(matches!(owner.status().unwrap().admission,Admission::Held {..}));
+    // The full reconcile pass remains the sole ladder owner.
+    owner.reconcile(&[]).unwrap();
+    assert!(!root2.exists());
+    assert!(matches!(owner.read(&id2).unwrap().phase,Phase::Removed { .. }));
+}

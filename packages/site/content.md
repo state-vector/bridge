@@ -24,6 +24,11 @@ directories still require complete host visibility before adoption.
 The default budget is 100 GiB of owned disk with 5 GiB filesystem headroom;
 `BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` configure it.
 New allocations pause when the budget is exceeded; reclamation continues, with one slot per pass for the largest eligible released workspace. The owner can reclaim the declared Bridge worker dry-run bundle from stopped workspaces when it contains only the expected generated files, and the nested CLI target when Cargo marks it as a cache and no files are tracked.
+While reclamation runs, a bounded sampling job on the same owner re-proofs
+disk admission every 15 seconds from the last measured inventory plus a fresh
+capacity check — dispatch is never fenced just because the slow pass (which
+re-measures every record) is still walking. It reclaims nothing and fails
+closed on a stale or missing proof.
 `bridge status` includes disk accounting, and `bridge workspaces status` shows
 resource states, retention errors and checkpoint receipts. Offline
 `bridge workspaces reconcile` uses the same owner and controller lock.

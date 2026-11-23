@@ -1143,6 +1143,8 @@ After the exact execution's stopped result is acknowledged, its workspace is rel
 
 A bounded, fair reconciliation job runs every 30 seconds under sustained load, held executions and managed-update drain. Restart resumes the recorded preservation/deletion stage. Removed counts and allocation bytes are recorded only after the retirement path is gone; a skipped or retained resource is never reported as removed. `bridge status` includes workspace accounting and disk-admission state. `bridge workspaces status` shows resource states, retention errors and checkpoint receipts. `bridge workspaces reconcile` invokes the same owner for offline recovery and refuses to race a live gateway controller.
 
+Dispatch admission stays responsive while that pass crawls: a bounded sampling job on the same workspace owner re-proofs disk admission every 15 seconds from the last measured inventory plus a fresh filesystem capacity check — never `du`, never the reclaim ladder. On a crowded workspace the reconciliation pass (which walks every record) can run for minutes; without the sampler its proof would age out after 120 seconds and dispatch would be fenced with gigabytes actually free. A stale, corrupt or missing proof fails closed exactly as before, and the sampler reclaims nothing: the reconciliation job remains the sole reclamation owner.
+
 For same-host coordination, run `bridge workspaces inspect 'BR#123' --file path/to/test.ts`
 from an account with OS read access to the local Bridge registry and worktree.
 The command selects the active managed workspace or falls back to a unique

@@ -958,6 +958,8 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
 pub(super) struct Controller { registry: Registry, admission: Admission, shared: Config, recovery: Recovery, last_snapshot: Instant,
     capacity_probe: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_capacity_probe: Instant,
     workspace_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_workspace: Instant,
+    /// BR#19525 — bounded admission sampling, decoupled from the slow reclaim pass.
+    admission_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_admission: Instant,
     disk_admission: workspace::Admission, disk_observed: Instant,
     /// BR#14716 — throttle stamp for the wedge class alarm (see the workspace tick).
     last_wedge_alarm_at: Option<u64>,
@@ -980,13 +982,13 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), admission_job: None, next_admission: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
     }
-    pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
+    pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && self.admission_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
     pub fn controller_ready(&self) -> bool {
         let cfg=config(&self.shared);
-        self.capacity_probe.is_none() && self.workspace_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
+        self.capacity_probe.is_none() && self.workspace_job.is_none() && self.admission_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. })
             && self.registry.handoff_ready(|running| running.worker.as_ref().is_some_and(|worker| !worker.stop.load(Ordering::SeqCst) && worker.reattachable.load(Ordering::SeqCst)),
                 |owner,value,stop| durable_handoff(&cfg,owner,value,stop))
     }
@@ -1086,6 +1088,33 @@ impl Controller {
             let cfg = cfg.clone();
             let protected = self.registry.tickets();
             self.workspace_job = Some(lifecycle::Job::start(move || workspace::Owner::open(&cfg)?.reconcile(&protected)));
+        }
+        // BR#19525 — the admission proof is kept fresh by a short, bounded
+        // sampling job on its own cadence. The full reconcile pass (reclaim
+        // ladder + du inventory) can run for minutes; while it crawls, this
+        // sampler re-writes the admission proof from the last measured
+        // inventory plus a fresh statvfs floor, so dispatch is never fenced
+        // just because reclamation is slow. It reclaims nothing itself: the
+        // slow pass remains the workspace's sole reclamation owner.
+        if let Some(job) = &mut self.admission_job {
+            if let Some(result) = job.poll() {
+                match result {
+                    Ok(Ok(status)) => {
+                        self.disk_admission = status.admission.clone();
+                        self.disk_observed = Instant::now();
+                        if let Ok(mut snapshot) = snap.lock() { snapshot.workspaces = Some(status); }
+                    },
+                    Ok(Err(error)) | Err(error) => {
+                        self.disk_admission = workspace::Admission::Held { reason: error.clone() };
+                        dlog("workspace", &format!("admission sampling failed; fails closed until next sample: {error}"));
+                    },
+                }
+                self.admission_job = None; self.next_admission = Instant::now() + workspace::ADMISSION_SAMPLE;
+            }
+        }
+        if !stop && !update && self.next_admission <= Instant::now() && self.admission_job.is_none() {
+            let cfg = cfg.clone();
+            self.admission_job = Some(lifecycle::Job::start(move || workspace::Owner::open(&cfg)?.refresh_admission()));
         }
         let disk_ready = matches!(self.disk_admission, workspace::Admission::Ready) && self.disk_observed.elapsed()<Duration::from_secs(120);
         if let Some(job) = &mut self.capacity_probe {
