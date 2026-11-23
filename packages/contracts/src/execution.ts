@@ -383,13 +383,31 @@ export const ManagedReviewRouteProofSchema = ProviderRecoveryRouteSchema.extend(
     // release a hold or consume an already-issued permit.
     assignment: z.literal("reserved_review_v1").optional() }),
 });
-export const ProviderRecoveryProofSchema = z.union([ProviderRequestProofSchema, ManagedReviewRouteProofSchema]);
+/** Authenticated hub receipts for an exact scheduler route. A trial is
+ * permission for a single attempt, while a prompt receipt is provider evidence. */
+const SchedulerRouteScopeSchema = z.object({
+  id: text, host: text, backend: z.literal("opencode"), model: text, config_revision: text,
+  inventory_revision: z.union([z.literal(1), z.literal(2)]), tier: ReasoningTierSchema,
+  observed_at: z.number().int().positive(), receipts: z.array(text).min(1),
+});
+export const SchedulerRouteTrialProofSchema = SchedulerRouteScopeSchema.extend({
+  trial: z.object({ task_id: text, generation: z.number().int().nonnegative(), attempt_id: text }),
+  witness: z.object({ kind: z.literal("scheduler_capacity_trial") }),
+});
+export const ManagedTaskRouteProofSchema = SchedulerRouteScopeSchema.extend({
+  result: z.object({ kind: z.literal("succeeded"), response_receipt: text }),
+  witness: z.object({ kind: z.literal("managed_task_prompt") }),
+});
+export const ProviderRecoveryProofSchema = z.union([
+  ProviderRequestProofSchema, ManagedReviewRouteProofSchema, SchedulerRouteTrialProofSchema, ManagedTaskRouteProofSchema,
+]);
 export function validRecoveryRequestProof(
   proof: z.infer<typeof ProviderRecoveryProofSchema>,
   diagnosis: "provider_authentication" | "provider_quota" | "provider_route_unavailable",
 ): boolean {
+  if ("inventory_revision" in proof) return diagnosis === "provider_route_unavailable";
   if (!("request" in proof)) return diagnosis === "provider_route_unavailable"
-    && proof.witness.assignment === "reserved_review_v1";
+    && proof.witness.kind === "managed_review_prompt" && proof.witness.assignment === "reserved_review_v1";
   const witness = proof.witness;
   return witness.configured_model === proof.model
     && witness.allowed_actual_models.includes(proof.actual_model)
@@ -868,7 +886,8 @@ export function recoveryPermitMatches(state: ExecutionState, capability: Pick<Ex
   return recoveryPermitCoversAttempt(state, now) && !!p && p.task_revision === revision
     && p.proof.host === host && p.proof.backend === capability.backend
     && p.proof.model === capability.model && p.proof.config_revision === capability.config_revision
-    && (p.proof.witness.kind !== "managed_review_prompt" || p.proof.witness.tier === capability.tier);
+    && (p.proof.witness.kind !== "managed_review_prompt" || p.proof.witness.tier === capability.tier)
+    && (!("inventory_revision" in p.proof) || p.proof.tier === capability.tier);
 }
 
 /** Cumulative history is immutable; admission is bounded within an explicit

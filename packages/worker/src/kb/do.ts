@@ -253,7 +253,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -296,6 +296,22 @@ import {
  *  sink the destination-green sweep used (BR#3124, infrastructure). Override
  *  with the `train_alarm_sink_id` setting if the sink card is re-issued. */
 const TRAIN_ALARM_SINK_ID = "BR#3124";
+const PROVIDER_PROOF_WINDOW_MS = 300_000;
+const PROVIDER_TRIAL_BACKOFF_MS = 120_000;
+type SchedulerRouteScope = Pick<ReturnType<typeof SchedulerRouteTrialProofSchema.parse>,
+  "host" | "backend" | "model" | "config_revision" | "inventory_revision" | "tier">;
+
+function schedulerRouteScope(host: string, route: Pick<ExecutorCapabilities, "backend" | "model" | "config_revision" | "tier">,
+  inventory: number | undefined): SchedulerRouteScope | null {
+  return route.backend === "opencode" && route.model ? {
+    host, backend: route.backend, model: route.model, config_revision: route.config_revision,
+    tier: route.tier, inventory_revision: inventory === 2 ? 2 : 1,
+  } : null;
+}
+
+function schedulerRouteKey(scope: SchedulerRouteScope): string {
+  return JSON.stringify([scope.host, scope.backend, scope.model, scope.config_revision, scope.tier, scope.inventory_revision]);
+}
 /** BR#5916: the machine re-arm window for unclaimable infra anchors — when a
  *  do-not-claim anchor's typed time await expires, the sweep re-parks it on a
  *  fresh wait of this length instead of leaving an expired atom in place
@@ -4111,6 +4127,12 @@ export class KnowledgeHub {
         PRIMARY KEY (host, model, config_revision, project, tier)
       );
       CREATE INDEX IF NOT EXISTS managed_review_route_freshness ON managed_review_route_success(host, observed_at);
+      CREATE TABLE IF NOT EXISTS scheduler_provider_routes (
+        route_key TEXT PRIMARY KEY, host TEXT NOT NULL,
+        failed_at INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER NOT NULL DEFAULT 0,
+        success TEXT, trial TEXT
+      );
+      CREATE INDEX IF NOT EXISTS scheduler_provider_routes_host ON scheduler_provider_routes(host);
       CREATE TABLE IF NOT EXISTS execution_hosts (
         token_id TEXT PRIMARY KEY, capabilities TEXT NOT NULL, observed_ts INTEGER NOT NULL
       );
@@ -6641,7 +6663,8 @@ export class KnowledgeHub {
     /** BR#14761 — the caller's already-open fleet pass; default keeps the
      *  per-call instance. Sharing one instance lets the reserve path pay one
      *  host-inventory/readiness/policy read across the reopen + selection. */
-    work: ExecutionWork = this.executionWork(), reviewProofs?: ReadonlyMap<string, ManagedReviewProof>) {
+    work: ExecutionWork = this.executionWork(), reviewProofs?: ReadonlyMap<string, ManagedReviewProof>,
+    automaticScopes?: ReadonlySet<string>) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
@@ -6669,6 +6692,7 @@ export class KnowledgeHub {
     ).toArray();
     const taskHolds = new Map<string, SchedulingReason>();
     const routeCandidates: { id: string; created: number; proof?: ManagedReviewProof }[] = [];
+    const automaticRouteCandidates = new Map<string, typeof rows>();
     const sinks = this.alarmSinkIds();
     let readiness: ExecutorReadiness | undefined;
     // BR#14767 — per-sweep bulk prefetch: every per-row helper below hit its
@@ -6713,6 +6737,9 @@ export class KnowledgeHub {
     for (const r of this.state.storage.sql.exec(
       `SELECT task_id AS tid, host AS host, fingerprint AS fp FROM executor_start_rejections WHERE task_id IN (SELECT value FROM json_each(?))`, idList,
     ).toArray()) startupRejections.add(`${String(r.tid)}\u0000${String(r.host)}\u0000${String(r.fp)}`);
+    const routeFailures = new Map(this.state.storage.sql.exec(
+      `SELECT route_key, failed_at FROM scheduler_provider_routes WHERE host=? AND failed_at>0`, host,
+    ).toArray().map(row => [String(row.route_key), Number(row.failed_at)]));
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
@@ -6725,6 +6752,11 @@ export class KnowledgeHub {
         id, state?.requirements ?? ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), state ?? undefined,
         { roles: String(row.roles ?? "[]"), project: String(row.project ?? ""), meta: String(row.meta ?? "{}") },
       );
+      const recoveryProof = state?.recovery_permit?.proof;
+      const scheduledProof = recoveryProof && "inventory_revision" in recoveryProof ? recoveryProof : null;
+      const scheduledProofCurrent = !scheduledProof || (scheduledProof.host === host
+        && scheduledProof.inventory_revision === (capabilities?.inventory_revision ?? 1)
+        && scheduledProof.observed_at > (routeFailures.get(schedulerRouteKey(scheduledProof)) ?? 0));
       let reason: SchedulingReason | null = null;
       if (meta.operator_gated) reason = "operator_gate";
       else if (isQuestionTask(meta)) reason = "question";
@@ -6743,19 +6775,26 @@ export class KnowledgeHub {
       else {
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state ?? undefined, revision);
-        const permit = (hold === "retry_budget" || hold === "provider_route") && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
+        const permit = scheduledProofCurrent && (hold === "retry_budget" || hold === "provider_route") && state && capabilities && [capabilities, ...capabilities.alternatives].some(c =>
           usableFor(schedulingRequirements(), c, host, String(row.project ?? ""))
           && recoveryPermitMatches(state, c, host, revision, Date.now()));
-        const awaitingPermitHost = (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
+        const awaitingPermitHost = scheduledProofCurrent && (hold === "retry_budget" || hold === "provider_route") && state && recoveryPermitCoversAttempt(state, Date.now())
           && state.recovery_permit?.task_revision === revision;
         reason = permit ? null : awaitingPermitHost ? "recovery_route" : hold;
       }
-      if (!reason && capabilities) {
+      const attempt = state?.attempt;
+      const routeScope = attempt?.executor && schedulerRouteScope(attempt.host, attempt.executor, attempt.executor.inventory_revision);
+      const routeKey = routeScope && schedulerRouteKey(routeScope);
+      const automatic = reason === "provider_route" && routeScope?.host === host && routeKey
+        && automaticScopes?.has(routeKey) && state
+        && !executionAttemptBudgetExhausted(state, String(meta.work_revision ?? "legacy"));
+      if ((!reason || automatic) && capabilities) {
+        let prerequisites: SchedulingReason | null = null;
         const requirements = schedulingRequirements();
-        if (requirements.host && requirements.host !== host) reason = "host_affinity";
+        if (requirements.host && requirements.host !== host) prerequisites = "host_affinity";
         else if (meta.execution_resume?.kind === "coordination_checkpoint"
-          && !capabilities.tools.includes("coordination-checkpoint-v1")) reason = "capability";
-        else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) reason = "capability";
+          && !capabilities.tools.includes("coordination-checkpoint-v1")) prerequisites = "capability";
+        else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) prerequisites = "capability";
         else {
           readiness ??= this.executorReadiness(tokenId, host, capabilities, Date.now());
           // BR#14767 — startupRejected inline (bulk rejections + the row's own
@@ -6767,11 +6806,20 @@ export class KnowledgeHub {
               meta: { ...metaForProof, execution_requirements: ExecutionRequirementsSchema.parse(metaForProof.execution_requirements ?? {}) },
             });
             if (startupRejections.has(`${id}\u0000${host}\u0000${readiness.fingerprint}`)
-              || startupRejections.has(`${id}\u0000${host}\u0000${proof2}`)) reason = "startup_prerequisite";
+              || startupRejections.has(`${id}\u0000${host}\u0000${proof2}`)) prerequisites = "startup_prerequisite";
           }
         }
+        if (!reason) reason = prerequisites;
+        if (!prerequisites && automatic && routeKey && routeScope
+          && [capabilities, ...capabilities.alternatives].some(candidate =>
+            candidate.backend === routeScope.backend && candidate.model === routeScope.model
+            && candidate.config_revision === routeScope.config_revision && candidate.tier === routeScope.tier
+            && usableFor(requirements, candidate, host, String(row.project ?? "")))) {
+          const candidates = automaticRouteCandidates.get(routeKey) ?? [];
+          candidates.push(row);
+          automaticRouteCandidates.set(routeKey, candidates);
+        }
       }
-      const attempt = state?.attempt;
       if ((retryRoute || reviewProofs) && reason === "provider_route" && state?.terminal
         && attempt?.host === host && attempt.executor && capabilities) {
         const project = String(row.project ?? "");
@@ -6785,7 +6833,7 @@ export class KnowledgeHub {
             && candidate.config_revision === route.config_revision
             && (!proof || candidate.tier === proof.witness.tier)
             && usableFor(schedulingRequirements(), candidate, host, project))
-          && (!proof || this.hasManagedReviewAssignment(tokenId, id, attempt.session, project, String(meta.work_revision ?? "legacy")))
+          && (!proof || this.hasManagedAssignment(tokenId, id, attempt.session, project, true, String(meta.work_revision ?? "legacy")))
           && !this.providerTrialConsumed(id, String(meta.work_revision ?? "legacy"),
             proof ? "managed_review_prompt" : "configured_proxy_request")) {
           routeCandidates.push({ id, created: Number(row.created_ts), proof });
@@ -6808,7 +6856,7 @@ export class KnowledgeHub {
       || Number(String(a.queue_id).slice(3)) - Number(String(b.queue_id).slice(3))
       || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
-    return { eligible, entries, reasons, held, taskHolds, routeCandidates: routeCandidates.map(task => task.id),
+    return { eligible, entries, reasons, held, taskHolds, automaticRouteCandidates, routeCandidates: routeCandidates.map(task => task.id),
       managedRouteCandidates: routeCandidates.flatMap(({ id, proof }) => proof ? [{ id, proof }] : []) };
   }
 
@@ -7129,9 +7177,14 @@ export class KnowledgeHub {
       if (now - Number(observation?.observed_ts) < 120_000
         && body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
         && (capabilities.inventory_revision !== 2 || body.inventory_protocol === 2)
-        && this.executorReadiness(tokenId, host, capabilities, now).kind === "ready"
-        && this.recoverManagedReviewRoute(body, tokenId, host, capabilities, now)) {
-        selection = this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
+        && this.executorReadiness(tokenId, host, capabilities, now).kind === "ready") {
+        const spare = gatewayCapacity(capabilities) - occupancy.active - occupancy.reserved - selection.eligible.length;
+        const recovered = capabilities.inventory_revision === 2
+          ? this.drainProviderRouteHolds(body, tokenId, host, capabilities, spare, now)
+          : this.recoverManagedReviewRoute(body, tokenId, host, capabilities, now);
+        if (recovered) {
+          selection = this.dispatchCandidates(tokenId, host, capabilities, undefined, undefined, work);
+        }
       }
     }
     const recoveryCapacity = this.recoveryCapacity();
@@ -7342,16 +7395,23 @@ export class KnowledgeHub {
     }
   }
 
-  private hasManagedReviewAssignment(tokenId: string, taskId: string, session: string, project: string, revision: string): boolean {
+  private hasManagedAssignment(tokenId: string, taskId: string, session: string, project: string, review: boolean, revision?: string): boolean {
     // The worker builds its prompt from this reservation snapshot. Current
     // card tags and roles can change while the assigned worker is running.
     return !!this.one(`SELECT 1 FROM execution_commands
       WHERE task_id=? AND json_extract(result,'$.kind')='reserved'
         AND json_extract(result,'$.session')=? AND json_extract(result,'$.task.id')=?
         AND json_extract(result,'$.task.project')=?
-        AND COALESCE(json_extract(result,'$.task.meta.work_revision'),'legacy')=?
-        AND EXISTS (SELECT 1 FROM json_each(result,'$.task.roles') WHERE value='review')
-      LIMIT 1`, "schedule:" + tokenId, session, taskId, project, revision);
+        AND (? IS NULL OR COALESCE(json_extract(result,'$.task.meta.work_revision'),'legacy')=?)
+        AND (?=0 OR EXISTS (SELECT 1 FROM json_each(result,'$.task.roles') WHERE value='review'))
+      LIMIT 1`, "schedule:" + tokenId, session, taskId, project, revision ?? null, revision ?? null, Number(review));
+  }
+
+  private managedReviewVerdictExists(id: string, attempt: ExecutionAttempt, revision?: string): boolean {
+    return !!this.one(`SELECT 1 FROM ledger WHERE artefact_id=? AND action='managed_review_verdict'
+      AND json_extract(data,'$.generation')=? AND json_extract(data,'$.attempt_id')=?
+      AND json_extract(data,'$.session')=? AND (? IS NULL OR json_extract(data,'$.revision')=?) LIMIT 1`,
+      id, attempt.generation, attempt.attempt_id, attempt.session, revision ?? null, revision ?? null);
   }
 
   /** The caller owns the same transaction as the transport receipt or review verdict.
@@ -7402,7 +7462,7 @@ export class KnowledgeHub {
       || state.messages.some(message => message.priority === "interrupt" && message.state !== "acted")) return;
     const gateway = this.one(`SELECT id,tags FROM auth_tokens WHERE label=? AND revoked_ts IS NULL`, attempt.host);
     if (!gateway || !tagsSayGateway(parseTags(gateway.tags))
-      || !this.hasManagedReviewAssignment(String(gateway.id), id, attempt.session, String(binding.project ?? ""), revision)) return;
+      || !this.hasManagedAssignment(String(gateway.id), id, attempt.session, String(binding.project ?? ""), true, revision)) return;
     this.version(id, "system:executor", "managed_review_verdict", "Captured a verdict from the active managed review attempt",
       { generation: attempt.generation, attempt_id: attempt.attempt_id, session: attempt.session, revision });
   }
@@ -7432,6 +7492,109 @@ export class KnowledgeHub {
     return false;
   }
 
+  private schedulerRouteTrialActive(proof: ReturnType<typeof SchedulerRouteTrialProofSchema.parse>, now: number): boolean {
+    const state = this.executionState(proof.trial.task_id);
+    const permit = state?.recovery_permit;
+    if (!state || !permit || permit.proof.id !== proof.id) return false;
+    if (permit.phase === "available") return recoveryPermitCoversAttempt(state, now);
+    return state.attempt?.generation === permit.consumed_generation
+      && state.attempt.attempt_id === permit.consumed_attempt_id && state.attempt.phase !== "quiesced";
+  }
+
+  /** The reserve path owns both the initial trial and subsequent permits.
+   * Its transaction records a trial only when the task actually receives
+   * the permit. Expired pre-start permits and finalized attempts can be retried. */
+  private drainProviderRouteHolds(body: Record<string, unknown>, tokenId: string, host: string,
+    capabilities: ExecutorCapabilities, spare: number, now: number): boolean {
+    const scopes = new Map<string, SchedulerRouteScope>();
+    for (const capability of [capabilities, ...capabilities.alternatives]) {
+      const scope = schedulerRouteScope(host, capability, capabilities.inventory_revision);
+      if (scope) scopes.set(schedulerRouteKey(scope), scope);
+    }
+    if (!scopes.size) return false;
+    const { automaticRouteCandidates } = this.dispatchCandidates(tokenId, host, capabilities,
+      undefined, undefined, this.executionWork(), undefined, new Set(scopes.keys()));
+    const routeRows = [...automaticRouteCandidates.values()].flat();
+    const protectedIds = this.protectedLineWork(routeRows);
+    const candidates = [...automaticRouteCandidates.entries()].flatMap(([key, rows]) =>
+      rows.map(row => ({ key, row, entry: selectionEntry(row, protectedIds) })));
+    candidates.sort((a, b) => selectionOrder(a.entry, b.entry)
+      || Number(String(a.row.id).slice(3)) - Number(String(b.row.id).slice(3)));
+    const checked = new Set<string>();
+    for (const { key } of candidates) {
+      if (checked.has(key)) continue;
+      checked.add(key);
+      const scope = scopes.get(key)!;
+      const route = this.one(`SELECT failed_at,cooldown_until,success,trial FROM scheduler_provider_routes WHERE route_key=?`, key);
+      const ids = candidates.filter(candidate => candidate.key === key).map(({ row }) => String(row.id));
+      const success = route?.success && ManagedTaskRouteProofSchema.parse(JSON.parse(String(route.success)));
+      if (success && success.observed_at > Number(route?.failed_at ?? 0)
+        && success.observed_at <= now && now - success.observed_at <= PROVIDER_PROOF_WINDOW_MS) {
+        if (this.grantProviderRouteBatch(body, "system:scheduler", success, ids, spare, JSON.stringify(success)).granted.length) return true;
+      }
+      if (Number(route?.cooldown_until ?? 0) > now) continue;
+      const previous = route?.trial && SchedulerRouteTrialProofSchema.parse(JSON.parse(String(route.trial)));
+      if (previous && this.schedulerRouteTrialActive(previous, now)) continue;
+      for (const id of ids) {
+        const attempt = this.executionState(id)?.attempt;
+        if (attempt?.phase !== "quiesced") continue;
+        const proof = SchedulerRouteTrialProofSchema.parse({
+          ...scope, id: `route-trial:${id}:${attempt.generation}:${now}`, observed_at: now,
+          trial: { task_id: id, generation: attempt.generation, attempt_id: attempt.attempt_id },
+          receipts: [`scheduler capacity trial of ${id} generation ${attempt.generation} on ${host}`],
+          witness: { kind: "scheduler_capacity_trial" },
+        });
+        if (this.grantProviderRouteBatch(body, "system:scheduler", proof, [id], 1, JSON.stringify(proof)).granted.length) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Only the originating gateway's fenced finalization may publish a parent
+   * ACP response. Logs, session startup and a worker's own verdict are not
+   * provider witnesses. Called inside the terminal receipt transaction. */
+  private recordSchedulerRouteOutcome(id: string, state: ExecutionState, project: string, tokenId: string, now: number): void {
+    const attempt = state.attempt;
+    const terminal = state.terminal;
+    if (!attempt?.executor || !terminal) return;
+    const scope = schedulerRouteScope(attempt.host, attempt.executor, attempt.executor.inventory_revision);
+    if (!scope || scope.inventory_revision !== 2) return;
+    const key = schedulerRouteKey(scope);
+    const permit = state.recovery_permit;
+    const isTrial = permit?.phase === "consumed" && "trial" in permit.proof
+      && permit.consumed_generation === attempt.generation && permit.consumed_attempt_id === attempt.attempt_id;
+    const failure = providerRecoveryDiagnosis(terminal.outcome);
+    const outcome = terminal.outcome;
+    const observed = outcome.kind === "completed" ? outcome.acp_parent_prompt_observed_at
+      : outcome.kind === "interrupted" && outcome.acp_parent_teardown_observed_at
+        && this.hasManagedAssignment(tokenId, id, attempt.session, project, true)
+        && this.managedReviewVerdictExists(id, attempt)
+        ? outcome.acp_parent_teardown_observed_at : undefined;
+    const begin = observed && this.one(
+      `SELECT json_extract(result,'$.attempt.action_deadline') - json_extract(request,'$.command.action_budget_ms') AS began_at
+       FROM execution_commands WHERE task_id=? AND json_extract(request,'$.command.kind')='begin'
+         AND json_extract(result,'$.attempt.generation')=? AND json_extract(result,'$.attempt.attempt_id')=? LIMIT 1`,
+      id, attempt.generation, attempt.attempt_id);
+    if (!failure && observed && begin && observed >= Number(begin.began_at) && Number(begin.began_at) > 0
+      && observed <= now && now - observed <= PROVIDER_PROOF_WINDOW_MS
+      && this.hasManagedAssignment(tokenId, id, attempt.session, project, false)) {
+      const receipt = `acp-parent:${id}:${attempt.generation}:${attempt.attempt_id}`;
+      const proof = ManagedTaskRouteProofSchema.parse({
+        ...scope, id: receipt, observed_at: observed, receipts: [receipt],
+        witness: { kind: "managed_task_prompt" }, result: { kind: "succeeded", response_receipt: receipt },
+      });
+      this.state.storage.sql.exec(`INSERT INTO scheduler_provider_routes(route_key,host,success) VALUES(?,?,?)
+        ON CONFLICT(route_key) DO UPDATE SET success=excluded.success
+        WHERE scheduler_provider_routes.success IS NULL
+          OR json_extract(scheduler_provider_routes.success,'$.observed_at') < ?`, key, scope.host, JSON.stringify(proof), observed);
+    } else if (failure || isTrial) {
+      this.state.storage.sql.exec(`INSERT INTO scheduler_provider_routes(route_key,host,failed_at,cooldown_until) VALUES(?,?,?,?)
+        ON CONFLICT(route_key) DO UPDATE SET failed_at=MAX(scheduler_provider_routes.failed_at,excluded.failed_at),
+          cooldown_until=MAX(scheduler_provider_routes.cooldown_until,excluded.cooldown_until)`,
+        key, scope.host, failure ? now : 0, isTrial ? now + PROVIDER_TRIAL_BACKOFF_MS : 0);
+    }
+  }
+
   private grantProviderRouteBatch(body: Record<string, unknown>, actor: string,
     proof: ExecutionRecoveryPermit["proof"], candidates: string[], limit: number, request: string) {
     return this.state.storage.transactionSync(() => {
@@ -7459,7 +7622,12 @@ export class KnowledgeHub {
       const result = { kind: "verified_route_recovery", granted };
       // A managed observation that had no matching task can still cover one
       // on a later scheduler pass. Manual submissions keep their original ACK.
-      if (granted.length || proof.witness.kind !== "managed_review_prompt") {
+      if ("inventory_revision" in proof) {
+        if ("trial" in proof && granted.length) {
+          this.state.storage.sql.exec(`INSERT INTO scheduler_provider_routes(route_key,host,trial) VALUES(?,?,?)
+            ON CONFLICT(route_key) DO UPDATE SET trial=excluded.trial`, schedulerRouteKey(proof), proof.host, JSON.stringify(proof));
+        }
+      } else if (granted.length || proof.witness.kind !== "managed_review_prompt") {
         this.state.storage.sql.exec(`INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,
           "provider-route:" + proof.host, proof.id, request, JSON.stringify(result));
       }
@@ -7643,9 +7811,10 @@ export class KnowledgeHub {
       // This is an audited human/full-agent diagnosis, never a worker's own
       // retry request. It preserves the failed attempt and grants one begin.
       const managed = command.proof.witness.kind === "managed_review_prompt";
-      const internal = managed && inRecoveryBatch && actor === "system:scheduler";
-      if (!req.session || (managed ? !internal : !this.executionWork().isInteractive(tokenId)))
-        throw new Error("gate: provider recovery requires authenticated full-agent diagnosis or an internal managed review receipt");
+      const scheduled = "inventory_revision" in command.proof ? command.proof : null;
+      const internal = inRecoveryBatch && actor === "system:scheduler" && (managed || scheduled !== null);
+      if (!req.session || (managed || scheduled ? !internal : !this.executionWork().isInteractive(tokenId)))
+        throw new Error("gate: provider recovery requires authenticated full-agent diagnosis or an internal scheduler recovery receipt");
       if (!validRecoveryRequestProof(command.proof, command.diagnosis)) throw new Error("gate: recovery proof must bind the actual model and observed request ceiling to the configured route and failure diagnosis");
       const encoded = JSON.stringify({ command, session:req.session, actor });
       const replay = this.one(`SELECT request,result FROM execution_commands WHERE task_id=? AND command_id=?`, req.id, req.command_id);
@@ -7668,6 +7837,14 @@ export class KnowledgeHub {
       const witnessKind = command.proof.witness.kind;
       if ((managed || witnessKind === "configured_proxy_request") && this.providerTrialConsumed(req.id, String(meta.work_revision ?? "legacy"), witnessKind))
         throw new Error("gate: the witnessed trial already ran for this task revision; diagnose its outcome before another attempt");
+      if (scheduled && (executionAdmissionHold(current, String(meta.work_revision ?? "legacy")) !== "provider_route"
+        || executionAttemptBudgetExhausted(current, String(meta.work_revision ?? "legacy"))
+        || !a.executor || schedulerRouteKey(scheduled) !== schedulerRouteKey({
+          ...scheduled, host: a.host, model: a.executor.model ?? "", config_revision: a.executor.config_revision,
+          inventory_revision: a.executor.inventory_revision ?? 1, tier: a.executor.tier,
+        }) || a.executor.backend !== scheduled.backend
+        || ("trial" in scheduled && (scheduled.trial.task_id !== req.id || scheduled.trial.generation !== a.generation
+          || scheduled.trial.attempt_id !== a.attempt_id)))) throw new Error("gate: scheduled trial requires the exact provider-only hold");
       if (current.recovery_permit?.phase === "available" && (current.recovery_permit.proof.id === command.proof.id
         || (managed && recoveryPermitCoversAttempt(current, now)))) throw new Error("gate: recovery proof already granted; use the original command receipt");
       const ended = this.state.storage.sql.exec(`SELECT ts,data FROM ledger WHERE artefact_id=? AND action='execution_terminal' ORDER BY seq DESC LIMIT 20`, req.id).toArray()
@@ -7677,6 +7854,7 @@ export class KnowledgeHub {
       if (!host || now-Number(host.observed_ts)>120_000) throw new Error("gate: recovery gateway inventory is missing or stale");
       const inventory = ExecutorCapabilitiesSchema.parse(JSON.parse(String(host.capabilities)));
       const selected = [inventory,...inventory.alternatives].find(c => c.backend===command.proof.backend && c.model===command.proof.model && c.config_revision===command.proof.config_revision
+        && (!scheduled || (scheduled.inventory_revision === (inventory.inventory_revision ?? 1) && scheduled.tier === c.tier))
         && usableFor(current.requirements,c,command.proof.host,String(this.one(`SELECT project FROM artefacts WHERE id=?`,req.id)?.project??"")));
       if (!selected) throw new Error("gate: recovery proof does not match a usable selected configured capability");
       current.recovery_permit = { phase:"available",id:`${req.id}:${a.generation}:${a.attempt_id}`,generation:a.generation,attempt_id:a.attempt_id,
@@ -7903,6 +8081,13 @@ export class KnowledgeHub {
       const selected = selection ? [inventory, ...inventory.alternatives].find(c => c.backend === selection.backend && c.model === selection.model && c.tier === selection.tier) : inventory;
       if (!selected) throw new Error("gate: selected model is not in the gateway's live capability inventory");
       if (executionNeedsRecoveryPermit(current,String(meta.work_revision??"legacy")) && !recoveryPermitMatches(current,selected,actor,String(meta.work_revision??"legacy"),now)) throw new Error("gate: retry budget or provider route requires a current one-use recovery permit for the exact selected route");
+      const providerProof = current.recovery_permit?.proof;
+      if (current.recovery_permit?.phase === "available" && providerProof && "inventory_revision" in providerProof) {
+        const failed = this.one(`SELECT failed_at FROM scheduler_provider_routes WHERE route_key=?`, schedulerRouteKey(providerProof));
+        if (providerProof.inventory_revision !== (inventory.inventory_revision ?? 1) || providerProof.observed_at <= Number(failed?.failed_at ?? 0)) {
+          throw new Error("gate: scheduler route permit was invalidated by new provider or inventory evidence");
+        }
+      }
       const capabilities = ExecutorCapabilitiesSchema.parse({ ...selected, worker: inventory.worker, alternatives: inventory.alternatives, inventory_revision: inventory.inventory_revision });
       const readiness = this.executorReadiness(tokenId, actor, inventory, now);
       if (readiness.kind === "cooldown" || readiness.kind === "paused" || readiness.kind === "updating" || readiness.kind === "draining") {
@@ -8021,18 +8206,13 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(`INSERT INTO execution_commands (task_id, command_id, request, result) VALUES (?, ?, ?, ?)`, req.id, req.command_id, encoded, JSON.stringify(response));
       const reviewExecutor = current.attempt?.executor;
       const reviewHost = current.attempt?.host;
-      if (command.kind === "finalize" && current.attempt && reviewExecutor?.backend === "opencode" && reviewHost && typeof row.project === "string" && row.project.length
+      if (command.kind === "finalize" && current.attempt && reviewExecutor?.backend === "opencode" && reviewExecutor.inventory_revision !== 2 && reviewHost && typeof row.project === "string" && row.project.length
         && parseTags(row.roles).includes("review")) {
         const observed = command.outcome.kind === "interrupted"
           ? command.outcome.acp_parent_teardown_observed_at : command.outcome.acp_parent_prompt_observed_at;
         const revision = String(meta.work_revision ?? "legacy");
         const source = command.outcome.kind === "completed" ? "execution"
-          : command.outcome.kind === "interrupted" && observed && this.one(
-            `SELECT 1 FROM ledger WHERE artefact_id=? AND action='managed_review_verdict'
-             AND json_extract(data,'$.generation')=? AND json_extract(data,'$.attempt_id')=?
-             AND json_extract(data,'$.session')=? AND json_extract(data,'$.revision')=? LIMIT 1`,
-            req.id, current.attempt.generation, current.attempt.attempt_id, current.attempt.session, revision,
-          ) ? "review-verdict" : null;
+          : command.outcome.kind === "interrupted" && observed && this.managedReviewVerdictExists(req.id, current.attempt, revision) ? "review-verdict" : null;
         // Bind the gateway timestamp to this exact source attempt's immutable
         // begin receipt. The original deadline embeds the hub's begin time.
         const begin = observed && source && this.one(
@@ -8046,10 +8226,13 @@ export class KnowledgeHub {
         );
         if (source && observed && begin && typeof begin.began_at === "number" && begin.began_at > 0
           && observed >= begin.began_at && observed <= now && now - observed < 300_000
-          && this.hasManagedReviewAssignment(tokenId, req.id, current.attempt.session,
-            row.project, revision)) {
+          && this.hasManagedAssignment(tokenId, req.id, current.attempt.session,
+            row.project, true, revision)) {
           this.recordManagedReviewObservation(req.id, current.attempt, row.project, observed, now, source);
         }
+      }
+      if (command.kind === "finalize" && current.attempt?.phase === "finalizing" && typeof row.project === "string") {
+        this.recordSchedulerRouteOutcome(req.id, next, row.project, tokenId, now);
       }
       // Control polls do not authorise external effects. Keep a bounded replay
       // window for their transport retries; mutation/effect receipts persist.

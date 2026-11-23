@@ -256,14 +256,14 @@ afterEach(async () => { await mf?.dispose(); });
 const publishedCheckpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/recovery-priority",
   commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Resume the preserved verification", tests: [] };
 
-async function gateway(project: string, capacity = 1) {
+async function gateway(project: string, capacity = 1, scoped = false) {
   const host = `scheduler-${++serial}`;
   const token = await post("admin.mint", { label: host, tags: ["gateway"] });
   const identity = await post("auth.identify", { bearer: token.secret });
   const provisioned = await post("agent.provision", { label: `${host}/worker`, actor: host });
   const worker = { actor: `${host}/worker`, token_id: provisioned.id, gateway: false };
-  const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `gateway-${serial}` };
-  const capabilities = { tier: "small", tools: ["git"], environment: ["linux"], backend: "opencode", model: "test/small", config_revision: "one", capacity, projects: [project], worker: { kind: "provisioned", label: `${host}/worker` } };
+  const auth = { actor: host, token_id: identity.token_id, gateway: true, agent: `${host}/worker`, session: `gateway-${serial}`, ...(scoped && { inventory_protocol: 2 }) };
+  const capabilities = { ...(scoped && { inventory_revision: 2 }), tier: "small", tools: ["git"], environment: ["linux"], backend: "opencode", model: "test/small", config_revision: "one", capacity, projects: [project], worker: { kind: "provisioned", label: `${host}/worker` } };
   const cmd = (command: object, command_id = `command-${++serial}`, id = "gateway", session = auth.session) => post("execution", { ...auth, id, session, command_id, command });
   expect((await cmd({ kind: "advertise", capabilities })).ok).toBe(true);
   return { auth, worker, capabilities, cmd, host };
@@ -507,6 +507,69 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await recover("duplicate-grant")).error).toMatch(/already granted/);
     // ...and the diagnosed task is reservable again on the granted route.
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: id });
+  });
+
+  it("retries one held task and drains matching work only after a fenced provider response", async () => {
+    const project = "automatic-provider-recovery", g = await gateway(project, 4, true);
+    const foreign = { ...g.capabilities, model: "test/other" };
+    expect((await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [foreign] } })).ok).toBe(true);
+    const failed = { kind: "failed", exit_code: null, stdout_tail: "",
+      stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
+    const completed = { kind: "completed", exit_code: 0, stdout_tail: "", stderr_tail: "" };
+    async function start(id: string, generation: number, model = g.capabilities.model, reservationKey?: string) {
+      const claim = await reserve(g, reservationKey);
+      if (claim.kind !== "reserved" || claim.task_id !== id) throw new Error(JSON.stringify(claim));
+      if (reservationKey) expect(await reserve(g, reservationKey)).toEqual(claim);
+      const attempt_id = id + "-g" + generation;
+      const result = await g.cmd({ kind: "begin", attempt_id, worker: g.auth.agent, action_budget_ms: 60_000,
+        selection: { backend: "opencode", model, tier: "small" } }, undefined, id, claim.session);
+      expect(result.error).toBeUndefined();
+      return { id, session: claim.session, attempt_id, generation, result };
+    }
+    async function finish(attempt: Awaited<ReturnType<typeof start>>, outcome: object) {
+      const { id, session, generation, attempt_id } = attempt;
+      const stopped = { generation, attempt_id, writers: "process_group_empty", outcome };
+      expect((await g.cmd({ kind: "stopped", ...stopped }, undefined, id, session)).error).toBeUndefined();
+      const finish = { kind: "finalize", ...stopped };
+      const commandId = "finish-" + attempt_id;
+      const result = await g.cmd(finish, commandId, id, session);
+      expect(result.error).toBeUndefined();
+      expect(await g.cmd(finish, commandId, id, session)).toEqual(result);
+      return result;
+    }
+    const first = await task(project);
+    const second = await task(project);
+    const third = await task(project);
+    const different = await task(project);
+    const attempts = [await start(first, 1), await start(second, 1), await start(third, 1), await start(different, 1, foreign.model)];
+    for (const attempt of attempts) await finish(attempt, failed);
+    expect((await g.cmd({ kind: "advertise", capabilities: g.capabilities })).ok).toBe(true);
+
+    const canary = await start(first, 2, g.capabilities.model, "canary-reservation");
+    expect(canary.result).toMatchObject({ budget_exhaustions: 0, recovery_permit: {
+      phase: "consumed", proof: { witness: { kind: "scheduler_capacity_trial" } },
+    } });
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { provider_route: 3 } });
+    await finish(canary, { ...completed, acp_parent_prompt_observed_at: Date.now() });
+    expect((await post("update", { id: first, meta: { operator_gated: true } })).error).toBeUndefined();
+
+    const resumed = await start(second, 2);
+    expect(resumed.result).toMatchObject({ recovery_permit: {
+      phase: "consumed", proof: { witness: { kind: "managed_task_prompt" } },
+    } });
+    const before = await g.cmd({ kind: "inspect" }, undefined, third);
+    expect(before.recovery_permit).toMatchObject({ phase: "available", proof: { witness: { kind: "managed_task_prompt" } } });
+    expect((await g.cmd({ kind: "inspect" }, undefined, different)).recovery_permit).toBeNull();
+
+    // A new provider failure fences an already-granted batch permit.
+    await finish(resumed, failed);
+    const inspection = await g.cmd({ kind: "schedule", mode: "inspect" });
+    expect(inspection).toMatchObject({ kind: "no_eligible_work", eligible: 0, reasons: { provider_route: 3 } });
+    // With old provider evidence invalidated, only one fresh trial can start.
+    const nextTrial = await start(third, 2);
+    expect(nextTrial.result.recovery_permit.proof.witness.kind).toBe("scheduler_capacity_trial");
+    expect((await finish(nextTrial, failed)).budget_exhaustions).toBe(0);
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", eligible: 0 });
   });
 
   it("uses a fresh managed review prompt once for an exact-route retry", async () => {
