@@ -1441,6 +1441,25 @@ export const BREACH_THRESHOLDS: Record<string, number> = {
   // lawfully closed done on findings with the leg-sha-rebind bounce
   // (breach card BR#18402).
   "review:held-submitted-legs": Number.POSITIVE_INFINITY,
+  // BR#17095: the human-authority supersede fences (BR#2480/BR#3913) — a
+  // bare agent session's blocked→superseded attempt refused by the
+  // supersede-authority rule (machine.ts, bare throw), and the
+  // recorded-human-disposition drop refused by applyBatchAuthorization's
+  // server-side verification fence (do.ts — the batch-auth-* [rule:] tagged
+  // refusals). The refusal IS the drop-authority law working: zero state is
+  // destroyed, the executor supplies an ask reference and never the
+  // authority itself, and the human's web click or the answered-ask
+  // dispatch stays the one legal executor — so it joins the
+  // BR#4562/BR#6654/BR#7008/BR#7684 never-a-breach pricing family (pricing
+  // it FINITE would re-arm breach cards on exactly the authority fence the
+  // drop law prescribes). Named so the Log says WHAT held: a drop, held for
+  // human authority. Specimen: BR#16528 (the BR#16926 conflict-disposition
+  // duty), 3 refusals 2026-11-19 06:53:39–07:15:06Z — the plain supersede
+  // attempt, the batch_auth attempt citing the answered per-card decision
+  // ask BR#17074, and the post-staging-park retry — folded "unclassified"
+  // and raised breach card BR#17095; the sibling batch-auth-not-batch storm
+  // (BR#8911, breach card BR#8996) folds into the same class.
+  "drop:held-human-authority": Number.POSITIVE_INFINITY,
   default: BREACH_THRESHOLD,
 };
 
@@ -1555,6 +1574,26 @@ const RULE_BREACH_CLASSES: Record<string, string> = {
   // stem below owns the tag-cut forms (a long bar list pushes the tag past
   // the slice — the BR#4562 tag-cut case).
   "claim-bars": "claim:held-publisher-bars",
+  // BR#17095: the recorded-human-disposition drop fence (do.ts
+  // applyBatchAuthorization) — every refusal is the server-side authority
+  // verification working (BR#2480/BR#6432): the executor supplies an ask
+  // reference, never the authority itself, and each refusal names its own
+  // cure (file the ask and let a human answer it; recheck the target's live
+  // park state; name the ids in the answer). They join
+  // drop:held-human-authority (pricing above). The messages are short
+  // enough that their trailing [rule: …] tags survive the 300-char audit
+  // slice, so these entries own the anchored forms; the ladder stem below
+  // owns the tag-cut forms (BR#8911's interpolated answer text pushed the
+  // batch-auth-not-batch tag past the slice — breach card BR#8996).
+  "batch-auth-ask-id": "drop:held-human-authority",
+  "batch-auth-ask-missing": "drop:held-human-authority",
+  "batch-auth-unanswered": "drop:held-human-authority",
+  "batch-auth-not-human": "drop:held-human-authority",
+  "batch-auth-not-batch": "drop:held-human-authority",
+  "batch-auth-target-not-parked": "drop:held-human-authority",
+  "batch-auth-target-protected": "drop:held-human-authority",
+  "batch-auth-target-rebound": "drop:held-human-authority",
+  "batch-auth-target-out-of-scope": "drop:held-human-authority",
 };
 
 export function breachClass(reason: string): string {
@@ -1888,6 +1927,20 @@ export function breachClass(reason: string): string {
   // mid-window) — the gate's FIRST live firings, 49 minutes after BR#17396
   // landed it; folded "unclassified" and raised breach card BR#17493.
   if (r.includes("still needs a continuation")) return "recovery:held-diagnosis";
+  // BR#17095: the human-authority supersede fences, tag-cut/bare forms.
+  // (a) The supersede-authority guard (machine.ts, BR#2480/BR#3913) is a
+  // BARE throw — no [rule:] tag — so only this stem can own it; the stem
+  // sits ~12 chars in (after "task BR#NNNNN "), far inside the 300-char
+  // audit slice, so the classification survives any tail. (b)
+  // applyBatchAuthorization's batch-auth-not-batch refusal, whose
+  // interpolated answer text can push the trailing [rule: …] tag past the
+  // slice (BR#8911's form — breach card BR#8996). Match the structural
+  // fragments, not sentence literals (BR#3611/BR#3612 wording-drift
+  // lesson); each fragment is unique to its generator (the
+  // close:held-human-signoff message says "human-authoritative", never
+  // "cannot be superseded by an agent session").
+  if (r.includes("cannot be superseded by an agent session")) return "drop:held-human-authority";
+  if (r.includes("not a batch supersede authorization")) return "drop:held-human-authority";
   return "unclassified";
 }
 

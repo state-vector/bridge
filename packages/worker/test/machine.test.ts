@@ -2136,6 +2136,72 @@ describe("breachClass: review:held-submitted-legs (BR#18402)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BR#17095 — the human-authority supersede fences. Two generators fold into
+// one class:
+//   (a) the supersede-authority guard (machine.ts, BR#2480/BR#3913) refusing
+//       a bare agent session's blocked→superseded attempt — a BARE throw, no
+//       [rule:] tag;
+//   (b) applyBatchAuthorization's recorded-human-disposition verification
+//       fence (do.ts) — the batch-auth-* [rule:] tagged refusals.
+// The refusal IS the drop-authority law working (zero state destroyed; the
+// human's web click or the answered-ask dispatch stays the one legal
+// executor), so it joins the never-a-breach pricing family. Specimen:
+// BR#16528, 3 refusals 2026-11-19 06:53:39–07:15:06Z (the plain supersede
+// attempt + the batch_auth attempt citing the answered decision ask
+// BR#17074 + the post-staging-park retry), folded "unclassified" and raised
+// breach card BR#17095; BR#8911's tag-cut batch-auth-not-batch form (breach
+// card BR#8996) folds into the same class.
+// ---------------------------------------------------------------------------
+describe("breachClass: drop:held-human-authority (BR#17095)", () => {
+  // the exact audited reason shape (machine.ts supersede-authority guard,
+  // bare throw — no [rule:] tag)
+  const FENCE = "task BR#16528 cannot be superseded by an agent session — dropping a card is a human-authority act (BR#2480). Route it through an answered ask whose options offer SUPERSEDE (the answer is the authorisation) or the web.";
+  // the batch-auth-not-batch refusal, anchored form (tag survives the slice)
+  const BATCH_TAGGED = "ask BR#17074's recorded answer is not a batch SUPERSEDE authorization ('SUPERSEDE BR#16528') — per-card drops ride their own answered asks [rule: batch-auth-not-batch]";
+  // BR#8911's tag-cut form: the long interpolated answer pushes the trailing
+  // [rule: …] tag past the 300-char audit slice
+  const BATCH_TAGCUT = ("ask BR#8931's recorded answer is not a batch SUPERSEDE authorization ('Supersede BR#8911 (drop the single-verdict Candidate CI approach; keep the existing holder and the accepted acceptance bar; re-issue only if the successor PR is ever reverted on main)') — per-card drops ride their own answered asks [rule: batch-auth-not-batch]").slice(0, 300);
+
+  it("the supersede-authority refusal classifies from its message stem (bare throw)", () => {
+    expect(breachClass(FENCE)).toBe("drop:held-human-authority");
+    // ~170 chars with a typical id — the stem sits ~12 chars in, far inside
+    // the audit trail's 300-char reason slice; classification survives any
+    // tail cut
+    expect(breachClass(FENCE.slice(0, 300))).toBe("drop:held-human-authority");
+  });
+
+  it("the batch-auth refusals classify from their anchored [rule:] tags", () => {
+    expect(breachClass(BATCH_TAGGED)).toBe("drop:held-human-authority");
+    expect(breachClass("batch_auth.ask must be the answered authorization ask id (BR#N), got 'x' [rule: batch-auth-ask-id]")).toBe("drop:held-human-authority");
+    expect(breachClass("ask BR#17074 is not answered — a batch SUPERSEDE authorization is the human's recorded answer on the ask (BR#2480); file the ask and let the answer authorize the drops [rule: batch-auth-unanswered]")).toBe("drop:held-human-authority");
+    expect(breachClass("ask BR#17074's answer was recorded by 'rogue-agent' — batch drop authority requires a human principal (web:/human:) [rule: batch-auth-not-human]")).toBe("drop:held-human-authority");
+    expect(breachClass("target BR#16528 is 'in_progress', not an open park — recheck its current state before applying the ruling (the drop edge is blocked → superseded, BR#3913) [rule: batch-auth-target-not-parked]")).toBe("drop:held-human-authority");
+  });
+
+  it("the tag-cut batch-auth-not-batch form still classifies from its message stem", () => {
+    expect(BATCH_TAGCUT.length).toBe(300);
+    expect(BATCH_TAGCUT.endsWith("[rule: batch-auth-not-batch]")).toBe(false);
+    expect(breachClass(BATCH_TAGCUT)).toBe("drop:held-human-authority");
+  });
+
+  it("a fence-refusal storm never raises a breach, however many pile up", () => {
+    const events = Array.from({ length: 6 }, (_, i) => ({
+      op: "transition_rejected", task: "BR#16528", ts: 1000 + i * 60_000, reason: FENCE,
+    }));
+    expect(detectBreaches(events as any, new Set())).toEqual([]);
+  });
+
+  it("pricing is never-a-breach (POSITIVE_INFINITY), pinned in BREACH_THRESHOLDS", () => {
+    expect(BREACH_THRESHOLDS["drop:held-human-authority"]).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("sister authority fences keep their own classes", () => {
+    expect(breachClass("gate: an open human decision owns this exit; answer it before claiming")).toBe("claim:held-human-decision");
+    expect(breachClass("task BR#1 is a human sign-off task (role: human) — completion is human-authoritative; a human marks it done in the webapp")).toBe("close:held-human-signoff");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BR#6740 — the doTransition exit gate for typed execution waits (do.ts
 // ~6549: isExecutionWait / local handoff preparing|waiting): ANY ordinary
 // transition/ask/timeout on a card whose exit a durable execution wait owns

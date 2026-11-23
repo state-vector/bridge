@@ -9176,7 +9176,18 @@ export class KnowledgeHub {
       && [...stripped.matchAll(/(?:^|[;—–]\s*)retire\s+(BR#\d+)\b/gi)].some(m => m[1].toUpperCase() === id);
     const namedSupersede = /^SUPERSEDE\s+(BR#\d+)\b/i.exec(stripped)?.[1]?.toUpperCase();
     const recordedWebRetirement = /^GO\s*[—–-]\s*superseded\s+via\s+web\s+now\b/i.test(stripped);
-    const single = subject === id && !am.ask?.decision && (!namedSupersede || namedSupersede === id)
+    // BR#17095: a decision-object ask (route human_decision forces one) is
+    // equally valid per-card authority when its recorded answer is the
+    // verb-first SUPERSEDE disposition naming THIS card — the choice label
+    // is what the human actually clicked, and the remaining checks (bound
+    // subject, named target, non-batch verb grammar, human answerer) stay
+    // exact. The old `!am.ask?.decision` exclusion made the per-card drop
+    // machine-impossible: NO agent-constructible human ask could ever reach
+    // this path (BR#17074 + BR#17104, both answered SUPERSEDE by web:rayh,
+    // were refused batch-auth-not-batch here), while the answer dispatch
+    // had already released the card — the drop churn re-armed breach
+    // BR#17095. Explicit retire/web-confirmation grammars are unchanged.
+    const single = subject === id && (!namedSupersede || namedSupersede === id)
       && (/^SUPERSEDE\b(?!\s+(?:all|only|\d+)\b)/i.test(stripped) || explicitRetire || recordedWebRetirement);
     if (single) {
       if (row.status === "superseded" && prior.batch_auth?.ask === askId) return { id, status: "superseded", batch_auth: prior.batch_auth };
@@ -12360,14 +12371,39 @@ export class KnowledgeHub {
           // deliberate-park semantics.
           const stripRecommended = (s: string): string =>
             s.trim().replace(/^\(recommended\)\s*/i, "").trim();
-          const strippedAnswer = decisionAction ? ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]) : stripRecommended(answer);
+          // BR#17095: a decision ask's SUPERSEDE choice must dispatch the
+          // drop exactly like a plain verb-first ask does (machine.ts
+          // supersede-authority: an answered ask whose options offer
+          // SUPERSEDE is the authorisation; the dispatch leg acts as
+          // system:question(<answerer>)). decisionAction has no SUPERSEDE
+          // spelling — {resume→GO, hold→KEEP, release→RELEASE} — so routing
+          // the chosen label through the action map silently downgraded the
+          // human's SUPERSEDE click to a plain pool release: asks BR#17074
+          // AND BR#17104 were answered SUPERSEDE by web:rayh and BOTH
+          // released BR#16528 to the pool instead of dropping it, and the
+          // re-ask churn re-armed breach BR#17095. Elevate ONLY the
+          // self-naming verb form — the answer must say SUPERSEDE <this
+          // card> (the BR#17074/BR#17104 shape, what rule-6c/6e asks
+          // render) — so an authorization ask's bare SUPERSEDE verb can
+          // never drop its own bound disposition task (the BR#6383/BR#6387
+          // misfire, BR#6395) and batch phrasing stays a resume
+          // authorization; GO/KEEP/RELEASE keep the author's action mapping.
+          const answerStripped = stripRecommended(answer);
+          const selfNamedSupersede = /^SUPERSEDE\s+(BR#\d+)\b/i.exec(answerStripped);
+          const decisionSupersede = decisionAction != null
+            && !!selfNamedSupersede
+            && selfNamedSupersede[1].toUpperCase() === String(subject?.id ?? "").toUpperCase()
+            && !/^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(answerStripped);
+          const strippedAnswer = decisionSupersede
+            ? answerStripped
+            : (decisionAction ? ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]) : answerStripped);
           // BR#6395: a batch-authorization answer ("SUPERSEDE all 29 — ...",
           // "SUPERSEDE only the 6 dead parks") authorizes the bound disposition
           // task to supersede target cards — it must resume the bound task,
           // NEVER drop the bound task itself (the BR#6383/BR#6387 misfire).
           const isBatchSupersedeAuth =
             !isMigrationAsk && /^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(strippedAnswer);
-          const optHit = decisionAction ? decisionAction !== "resume" : !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
+          const optHit = decisionAction ? (decisionAction !== "resume" || decisionSupersede) : !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
             .map((o) => stripRecommended(String(o ?? "")).split(/\s+/)[0] ?? "")
             .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
             .some((verb) => strippedAnswer.toLowerCase().startsWith(verb.toLowerCase()));

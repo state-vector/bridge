@@ -296,6 +296,44 @@ describe("batch_auth supersede (BR#6432)", () => {
     expect((await kbJson("/get", { id: victim })).body.status).toBe("blocked");
   });
 
+  // BR#17095: a DECISION ask (route human_decision forces a decision object)
+  // whose recorded answer is the self-naming verb-first SUPERSEDE
+  // disposition of its bound card carries the same per-card authority as a
+  // plain ask. The old `!am.ask?.decision` exclusion in the single path made
+  // the drop machine-impossible — BR#17074 AND BR#17104 were answered
+  // SUPERSEDE by web:rayh and both were refused here (batch-auth-not-batch)
+  // while the answer dispatch had already released BR#16528 to the pool.
+  // This test replays the exact residual shape: the card rests todo, the
+  // answered decision ask is bound to it, the executor supplies the ask
+  // reference and the hub verifies the human answer server-side.
+  it("BR#17095: a decision ask answered with the self-naming SUPERSEDE disposition authorizes the single per-card drop", async () => {
+    const victim = await task("park released before the drop executed (drill)");
+    const supLabel = `(Recommended) SUPERSEDE BR#${victim.slice(3)} — executes the recorded disposition; drops the obsolete card; zero repo changes`;
+    const askId = await authAsk(victim, [victim], [supLabel, "Keep the card open — I'll click Supersede on the web card myself"]);
+    await kbJson("/ask.answer", { id: askId, answer: supLabel, actor: "web:rayh" });
+    // the victim rests todo (never parked) — the answer dispatch had no
+    // blocked subject to act on, exactly like BR#16528 after its release
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("todo");
+    const r = await apply(victim, askId);
+    expect(r.status, `apply failed: ${JSON.stringify(r.body)}`).toBe(200);
+    expect(r.body.status).toBe("superseded");
+    expect(r.body.batch_auth).toMatchObject({ ask: askId, answered_by: "web:rayh" });
+    const hist = (await kbJson(`/history?id=${encodeURIComponent(victim)}&limit=5`)).body;
+    const dropRow = (hist.versions ?? []).find((v: any) => v.action === "transition" && v.data?.to === "superseded");
+    expect(dropRow).toBeTruthy();
+    expect(String(dropRow.actor)).toBe("system:question(web:rayh)");
+  });
+
+  it("BR#17095 twin: a decision ask answered without the SUPERSEDE verb still refuses the single path", async () => {
+    const victim = await task("park under a keep-answered decision ask (drill)");
+    const askId = await authAsk(victim, [victim], ["SUPERSEDE — placeholder option never clicked", "KEEP — stay parked"]);
+    await kbJson("/ask.answer", { id: askId, answer: "KEEP — stay parked", actor: "web:rayh" });
+    const r = await apply(victim, askId);
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toContain("batch-auth-not-batch");
+    expect((await kbJson("/get", { id: victim })).body.status).toBe("todo");
+  });
+
   it("'only'-scoped answers resolve to exactly the ids the answer names", async () => {
     const drain = await task("EXECUTE: only-scoped drain (drill)");
     const deadOne = await task("only-scoped dead park (drill)");

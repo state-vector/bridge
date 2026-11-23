@@ -576,6 +576,122 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     expect((await kbJson("/get", { id: t.id })).body.status).toBe("in_progress");
   });
 
+  // ---------------------------------------------------------------------------
+  // BR#17095 — a DECISION ask's SUPERSEDE choice must dispatch the drop.
+  // decisionAction has no SUPERSEDE spelling ({resume→GO, hold→KEEP,
+  // release→RELEASE}), so the answer dispatch downgraded the human's
+  // SUPERSEDE click to a plain pool release: asks BR#17074 AND BR#17104
+  // were answered SUPERSEDE by web:rayh and both released BR#16528 to the
+  // pool instead of dropping it — the re-ask churn re-armed breach
+  // BR#17095. The elevation requires the self-naming verb form
+  // (SUPERSEDE <this card>) so an authorization ask's bare SUPERSEDE verb
+  // can never drop its own bound disposition task (BR#6395).
+  // ---------------------------------------------------------------------------
+  it("a DECISION ask answered with the self-naming SUPERSEDE choice (action release) dispatches the drop (BR#17095 — asks BR#17074/BR#17104 released the card twice)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 decision-ask supersede dispatch target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const supLabel = `(Recommended) SUPERSEDE ${t.id} — executes the recorded disposition; drops the obsolete card; zero repo changes`;
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Execute the recorded disposition: drop this card?",
+      reason: "BR#2480: dropping a card is a human-authority act — the supersede gate requires an answered ask offering SUPERSEDE as the authorisation.",
+      details: "drill brief: fixture ask exercising the decision-ask supersede dispatch end-to-end — no live decision rides on it.",
+      to: "human",
+      decision: {
+        kind: "authority", task_id: t.id,
+        context: "The recorded disposition is receipt-verified; the drop awaits your authority.",
+        why_human: "BR#2480: dropping a card is a human-authority act; the answer is the authorisation.",
+        choices: [
+          { label: supLabel, executor: "bridge", consequence: `The hub drops ${t.id} in your name.`, action: "release" },
+          { label: "Keep the card open — I'll click Supersede on the web card myself", executor: "human", consequence: "The card returns to the pool; you perform the web supersede.", action: "hold" },
+        ],
+      },
+    });
+    expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
+    // ask.create parked the subject blocked-on-ask
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("blocked");
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: supLabel, actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.error).toBeUndefined();
+    // the drop executes AT ANSWER TIME as the human's answered-ask decision
+    expect(ans.body.task_status).toBe("superseded");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("superseded");
+  });
+
+  it("a decisionFixture ask (action resume) with the self-naming SUPERSEDE choice still dispatches the drop — the verb wins over the author's routing hint (BR#17095)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 fixture-shape supersede dispatch target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const supLabel = `(Recommended) SUPERSEDE ${t.id} — drop the obsolete card`;
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Drop this card on the recorded disposition?",
+      reason: "BR#2480 authority drill",
+      details: "drill brief: fixture ask exercising the decision-ask supersede dispatch end-to-end — no live decision rides on it.",
+      to: "human",
+      decision: decisionFixture(t.id, [supLabel, "KEEP — stay parked"]),
+    });
+    expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: supLabel, actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.task_status).toBe("superseded");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("superseded");
+  });
+
+  it("a decision ask's batch-phrased SUPERSEDE answer NEVER drops the bound task — it resumes/releases (BR#6395 leg intact)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 batch-answer bound task survives" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Authorize the batch disposition?",
+      reason: "BR#6432 authority drill",
+      details: "drill brief: fixture ask exercising the batch-answer resume leg — no live decision rides on it.",
+      to: "human",
+      decision: {
+        kind: "authority", task_id: t.id,
+        context: "Batch census of stale parks awaits authorization.",
+        why_human: "BR#2480: dropping cards is a human-authority act.",
+        choices: [
+          { label: "(Recommended) SUPERSEDE all 3 — the dead strand parks", executor: "bridge", consequence: "The executor applies the drops per target.", action: "release" },
+          { label: "KEEP — stay parked", executor: "bridge", consequence: "Nothing drops.", action: "hold" },
+        ],
+      },
+    });
+    expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "(Recommended) SUPERSEDE all 3 — the dead strand parks", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    // batch phrasing is a resume authorization, never a drop of the bound task
+    expect(ans.body.task_status).not.toBe("superseded");
+    expect(["in_progress", "todo"]).toContain(ans.body.task_status);
+    expect((await kbJson("/get", { id: t.id })).body.status).not.toBe("superseded");
+  });
+
+  it("a decision ask answered with a non-verb label keeps the author's action mapping — no over-elevation (BR#17095)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 non-verb release target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "How should the card proceed?",
+      reason: "BR#17095 mapping drill",
+      details: "drill brief: fixture ask exercising the decision-action mapping — no live decision rides on it.",
+      to: "human",
+      decision: {
+        kind: "preference", task_id: t.id,
+        context: "The premise reverted; pick the follow-up.",
+        why_human: "The operator owns the follow-up choice.",
+        choices: [
+          { label: "(Recommended) Re-issue the follow-up ask once the successor lands", executor: "bridge", consequence: "The card releases to the pool.", action: "release" },
+          { label: "Hold the park", executor: "bridge", consequence: "The card stays parked.", action: "hold" },
+        ],
+      },
+    });
+    expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "(Recommended) Re-issue the follow-up ask once the successor lands", actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    // no SUPERSEDE verb → the author's release mapping still applies
+    expect(ans.body.task_status).toBe("todo");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("todo");
+  });
+
   it("a bare agent session cannot supersede a parked card via transition (BR#3913 authority guard)", async () => {
     const { body: t } = await kbJson("/create", { type: "task", title: "BR#3913 agent-supersede refused" });
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
