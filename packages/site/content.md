@@ -588,6 +588,18 @@ shortage: after a two-minute dispatch grace the scheduler raises one throttled
 `root_fix_dispatch_starved` alarm per card per 15 minutes, naming the per-host
 reason it was not claimed.
 
+**Capacity is reserved, not best-effort (BR#14528).** Every host reserves one
+slot of its capacity for the control plane — the lease-holder's merge-train tick
+and the next dispatch preparation. The hub and the runner both cap session
+admission at capacity minus one, so a saturated host holds cards queued and
+claimable instead of launching preparations it then kills: a `begin` that would
+exceed the admission cap is refused before a generation is minted, reconciled as
+a charge-free `cancel_start` (nothing ran — no retry budget, no burned
+workspace), and repeated refusals surface as one throttled
+`admission_at_capacity` signal per host per 30 minutes. Worker status and
+schedule status publish `admission_cap`; a capacity-1 host donates no slot and
+stays exempt.
+
 **Capability waits are composable.** Inventories declare configured model IDs,
 enabled state, project scope and explicit reasoning tiers. Unconfigured, expired,
 unavailable and merely busy hosts produce different facts. Queued unsupported

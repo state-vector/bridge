@@ -1660,7 +1660,9 @@ describe("interactive claim takeover (BR#6135)", () => {
 
   it("verify duty cards refuse (SoD is not transferable) and typed-wait holds refuse", async () => {
     const gw = await kbJson("/admin.mint", { label: "br6135-gw3", tags: ["gateway"] });
-    await readyGateway(kbJson, gw.body.id, "br6135-gw3", 2);
+    // BR#14528: the admission cap reserves one control-plane slot, so the two
+    // gateway-claimed sessions below need capacity 3.
+    await readyGateway(kbJson, gw.body.id, "br6135-gw3", 3);
     // verdict duty
     const { body: duty } = await kbJson("/create", { type: "task", title: "Verify: takeover duty br6135", roles: ["review"] });
     const dc = await kbJson("/transition", {

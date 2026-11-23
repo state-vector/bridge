@@ -591,6 +591,18 @@ enum StartStage { Inspect, Begin }
 
 /// These paths have launched no child. Reconcile a committed-but-lost begin
 /// by its exact attempt; never release another writer or discard local work.
+/// Probe whether a never-launched preparation left durable local work behind:
+/// a dirty worktree or a published HEAD. Retaining host affinity for such
+/// work is the point; a clean, unpublished scratch worktree releases freely.
+fn probe_retained_work(path: Option<&Path>) -> bool {
+    path.map(|p| {
+        let clean = Command::new("git").current_dir(p).args(["status", "--porcelain"]).output();
+        let published = Command::new("git").current_dir(p).args(["branch", "-r", "--contains", "HEAD"]).output();
+        !matches!(clean, Ok(o) if o.status.success() && o.stdout.is_empty())
+            || !matches!(published, Ok(o) if o.status.success() && !o.stdout.is_empty())
+    }).unwrap_or(false)
+}
+
 fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str, expected_attempt: Option<&str>, path: Option<&Path>) {
     let result = (|| -> Result<serde_json::Value, String> {
         let state = execution_call(cfg, tid, json!({ "kind": "inspect" }))?;
@@ -603,12 +615,7 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
                 return Err("begun preparation is retained for the canonical terminal finalizer; no writer launched".into());
             }
         }
-        let retained_work = path.map(|p| {
-            let clean = Command::new("git").current_dir(p).args(["status", "--porcelain"]).output();
-            let published = Command::new("git").current_dir(p).args(["branch", "-r", "--contains", "HEAD"]).output();
-            !matches!(clean, Ok(o) if o.status.success() && o.stdout.is_empty())
-                || !matches!(published, Ok(o) if o.status.success() && !o.stdout.is_empty())
-        }).unwrap_or(false);
+        let retained_work = probe_retained_work(path);
         let failure_class = if reason.contains("gate:") { "prerequisite" } else { "transport" };
         execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
     })();
@@ -1082,6 +1089,17 @@ pub fn default_schema_version() -> u64 {
 }
 fn default_max_sessions() -> usize {
     1
+}
+
+/// BR#14528 — the runner-side mirror of the hub's logical capacity
+/// reservation: one slot of the advertised capacity is reserved for the
+/// control plane (the lease-holder's merge-train tick thread and the next
+/// dispatch preparation). The local admission registry never admits a
+/// preparation the hub would refuse, so a saturated host holds cards queued
+/// instead of churning refused reservations. A capacity-1 host has no slot
+/// to donate and stays exempt.
+pub fn dispatch_admission_capacity(capacity: usize) -> usize {
+    capacity.saturating_sub(1).max(1)
 }
 fn default_isolate() -> bool {
     true
@@ -3774,7 +3792,21 @@ fn spawn_opencode(
     });
     let mut state = match begin {
         Ok(s) => s,
-        Err(e) => { failed_start(cfg, tid, StartStage::Begin, &e, Some(&expected_attempt), worktree.as_deref()); return; }
+        Err(e) => {
+            // BR#14528 — an admission-capacity refusal is not a start failure:
+            // no writer launched, nothing is wrong with the task or this
+            // runner, and the host was simply full. Reconcile as a charge-free
+            // cancel_start (no retry budget, no start barrier, no task-level
+            // startup prerequisite) so the card returns to the queue claimable.
+            if e.contains("[rule: admission-capacity]") {
+                dlog(tid, &format!("begin refused: host at admission capacity; releasing the claim charge-free: {e}"));
+                let retained_work = probe_retained_work(worktree.as_deref());
+                let _ = execution_call(cfg, tid, json!({ "kind": "cancel_start", "writers": "not_launched", "retained_work": retained_work }));
+                return;
+            }
+            failed_start(cfg, tid, StartStage::Begin, &e, Some(&expected_attempt), worktree.as_deref());
+            return;
+        }
     };
     let remote = match RemoteExecution::parse(state.clone()).and_then(|s| s.attempt.ok_or("execution begin returned no attempt".into())) {
         Ok(a) if a.generation > 0 && !a.attempt_id.is_empty() => a,
@@ -4184,6 +4216,35 @@ pub fn logout(state: &DispatchState) {
 
 #[cfg(test)]
 mod tests {
+    /// BR#14528 — the reserved control-plane slot: session admission caps at
+    /// capacity-1 on every host; a capacity-1 host is exempt (no slot to
+    /// donate), and a zero/nonsensical configuration still admits one.
+    #[test]
+    fn admission_capacity_reserves_one_control_plane_slot() {
+        assert_eq!(super::dispatch_admission_capacity(20), 19);
+        assert_eq!(super::dispatch_admission_capacity(8), 7);
+        assert_eq!(super::dispatch_admission_capacity(2), 1);
+        assert_eq!(super::dispatch_admission_capacity(1), 1, "capacity-1 host: no slot to donate, admission stays 1");
+        assert_eq!(super::dispatch_admission_capacity(0), 1, "degenerate config still admits one session");
+    }
+
+    /// BR#14528 — an admission-capacity refusal routes the never-launched
+    /// preparation to a charge-free cancel_start. The routing key is the
+    /// hub's typed rule tag: any other begin failure must NOT match it.
+    #[test]
+    fn admission_capacity_refusal_is_typed_by_the_hub_rule_tag() {
+        let refusal = "gate: host at admission capacity (0 active + 0 reserved of 1; capacity 2 reserves one control-plane slot) — no free writer slot; release the claim to the queue [rule: admission-capacity]";
+        assert!(refusal.contains("[rule: admission-capacity]"));
+        for other in [
+            "gate: begin requires the worker-ready runner protocol",
+            "gate: gateway readiness before begin: cooldown",
+            "gate: startup prerequisite requires changed executor/configuration proof before begin",
+            "transport: hub unreachable",
+        ] {
+            assert!(!other.contains("[rule: admission-capacity]"), "unrelated failure must not take the cancel_start path: {other}");
+        }
+    }
+
     #[test]
     fn dispatched_prompt_exposes_read_only_coordination_without_broadening_access() {
         let prompt = super::agent_environment_prompt("dispatch-fixture");

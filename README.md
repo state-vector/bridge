@@ -139,6 +139,19 @@ uses indexed declared subjects and incoming child relations instead of scanning
 retained review history per task; pending, findings and detached rounds retain
 their exact submission/revision authority.
 
+Host capacity reserves one slot for the control plane (BR#14528). The scheduler
+caps session admission at capacity minus one — the remaining slot is reserved for
+the lease-holder's merge-train tick and the next dispatch preparation, and runner
+sessions can never occupy it — so a saturated host holds queued cards claimable
+instead of launching preparations it would then cancel. `begin` re-checks the
+admission cap before minting a generation: a refusal is typed
+(`[rule: admission-capacity]`), the runner reconciles it as a charge-free
+`cancel_start` (no retry budget, no start barrier), and the card returns to the
+queue. Repeated refusals raise one throttled `admission_at_capacity` signal per
+host per 30 minutes on the gateway-capability lane instead of silent retries, and
+`admission_cap` is published on worker status and schedule status. A capacity-1
+host has no slot to donate and stays exempt.
+
 Review recovery follows the same foreground-first rule: historical backfill and
 current-verdict repair rotate over at most 25 cards per pass, with durable cursors
 that survive a hub restart. Admission replay and closure repair yield **between

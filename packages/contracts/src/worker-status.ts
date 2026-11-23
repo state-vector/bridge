@@ -26,6 +26,9 @@ export const WorkerStatusSchema = z.object({
   host: z.string(), observed_at: z.number(),
   state: z.enum(["ready", "busy", "offline", "draining", "unavailable"]),
   reason: z.string(), active: z.number(), reserved: z.number(), capacity: z.number(),
+  // BR#14528 — the admission cap the host enforces for runner sessions:
+  // capacity minus the reserved control-plane slot (0 = pre-reservation row).
+  admission_cap: z.number().default(0),
   // Optional only for a rolling deployment from the older aggregate-only publisher.
   occupancy: WorkerOccupancySchema.optional(),
   readiness: ExecutorReadinessSchema.optional(),

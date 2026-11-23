@@ -33,3 +33,14 @@ export function gatewayCapacity(capabilities: ExecutorCapabilities): number {
   // Models share one physical gateway. Alternatives never multiply its slots.
   return capabilities.capacity;
 }
+
+/** BR#14528 — logical capacity reservation. One slot of every host's capacity
+ * is reserved for the control plane: the lease-holder's merge-train tick and
+ * the next dispatch preparation. Runner sessions can never occupy it — both
+ * the hub's scheduler and the runner's local admission registry cap session
+ * admission at capacity-1, so a saturated host holds cards queued/claimable
+ * instead of consuming generations into launch-and-cancel. A capacity-1 host
+ * has no slot to donate and stays exempt (admission = capacity). */
+export function dispatchAdmissionCapacity(capabilities: ExecutorCapabilities): number {
+  return Math.max(1, gatewayCapacity(capabilities) - 1);
+}

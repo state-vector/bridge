@@ -199,7 +199,7 @@ describe("BR#18868 — a cancelled coordination ask stops holding its affected t
   });
 
   it("a still-open coordination ask keeps holding its resumed card; the answer still resumes it", async () => {
-    const project = "br18868-open", g = await gateway(project, 2); // two reserves: the filler, then the consumer after the answer
+    const project = "br18868-open", g = await gateway(project, 3); // two reserves: the filler, then the consumer after the answer (admission cap reserves one control-plane slot, so two runner reserves need capacity 3)
     const producerId = await producer(project), consumer = await task(project);
     const askId = await coordinationAsk(project, producerId, consumer, `Need producer input for ${consumer}?`);
     await resumeToTodo(consumer); // the stranded shape, but the ask is OPEN
@@ -215,7 +215,7 @@ describe("BR#18868 — a cancelled coordination ask stops holding its affected t
   });
 
   it("a newer replacement ask keeps the hold when an older bound ask is cancelled", async () => {
-    const project = "br18868-replacement", g = await gateway(project, 2); // two reserves: the filler, then the consumer after the replacement cancels
+    const project = "br18868-replacement", g = await gateway(project, 3); // two reserves: the filler, then the consumer after the replacement cancels (admission cap reserves one control-plane slot, so two runner reserves need capacity 3)
     const older = await producer(project), newer = await producer(project), consumer = await task(project);
     const firstAsk = await coordinationAsk(project, older, consumer, `First question for ${consumer}?`);
     // re-ask: resume, then bind the replacement — the marker's ask_id moves
@@ -261,7 +261,7 @@ describe("BR#18868 — a cancelled coordination ask stops holding its affected t
   });
 
   it("an ANSWERED ask keeps its keep-park record and holds a stamped marker (BR#3578); legacy ids hold only when alive or unknown", async () => {
-    const project = "br18868-answered", g = await gateway(project, 4); // four reserves: the three hold fillers, then the expired-legacy carrier
+    const project = "br18868-answered", g = await gateway(project, 5); // four reserves: the three hold fillers, then the expired-legacy carrier (admission cap reserves one control-plane slot, so four runner reserves need capacity 5)
     const producerId = await producer(project), parkedCard = await task(project);
     const askId = await coordinationAsk(project, producerId, parkedCard, `Answer me for ${parkedCard}?`, ["KEEP — stay parked", "RELEASE to the pool"]);
     // A KEEP answer is the deliberate park: the card stays blocked and the

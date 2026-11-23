@@ -18,6 +18,10 @@ export const RecoveryPreemptionSchema = z.object({
 });
 export type RecoveryPreemption = z.infer<typeof RecoveryPreemptionSchema>;
 const counts = { host: z.string(), active: z.number(), reserved: z.number(), finalizing: z.number().default(0), capacity: z.number(), eligible: z.number(),
+  /** BR#14528 — the admission cap this host enforced when the outcome was
+   *  recorded: capacity minus one reserved control-plane slot. Default 0 so
+   *  outcomes persisted before the reservation roll out still parse. */
+  admission_cap: z.number().default(0),
   preemption: RecoveryPreemptionSchema.optional(),
   reasons: z.record(z.string(), z.number()), observed_at: z.number() };
 export const ReservedTaskSchema = z.object({ id: z.string(), title: z.string(), body_md: z.string(),

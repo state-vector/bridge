@@ -183,9 +183,32 @@ beforeEach(async () => {
           const started = now;
           this.reconcileSchedulingHealth(Date.now());
           const alarms = this.state.storage.sql.exec(
-            "SELECT action, data FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile') AND ts>=? ORDER BY seq", started,
+            "SELECT action, data FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile','admission_at_capacity') AND ts>=? ORDER BY seq", started,
           ).toArray().map(row => ({ action: String(row.action), data: JSON.parse(String(row.data)) }));
-          return Response.json({ ok: true, alarms });
+          const health = this.state.storage.sql.exec(
+            "SELECT d.token_id, d.since, d.attention_at FROM dispatch_health d JOIN auth_tokens t ON t.id=d.token_id WHERE t.revoked_ts IS NULL",
+          ).toArray().map(row => ({ token_id: String(row.token_id), since: Number(row.since), attention_at: row.attention_at == null ? null : Number(row.attention_at) }));
+          return Response.json({ ok: true, alarms, health });
+        }
+        // BR#14528 — stamp a stale unquiesced running attempt so a test can
+        // drive occupancy drift between a reservation and its begin (the
+        // invariant the capacity-aware begin gate closes).
+        if (path === "/fixture/stamp-running-attempt") {
+          const { id, host } = await request.json();
+          const now = Date.now();
+          const state = { policy_version: 1, revision: 0, generation: 1,
+            attempt: { generation: 1, attempt_id: id + "-stale", host, session: "stale-attempt", phase: "running",
+              lease_until: now + 600_000, action_deadline: now + 600_000, executor: null, checkpoint: null, restored_tree: null },
+            requirements: {}, messages: [], operations: [] };
+          this.state.storage.sql.exec("INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, '') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state", id, JSON.stringify(state));
+          return Response.json({ ok: true });
+        }
+        // BR#14528 — raw execution-state projection for charge assertions.
+        if (path === "/fixture/inspect-state") {
+          const { id } = await request.json();
+          const row = this.state.storage.sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0];
+          const state = row ? JSON.parse(String(row.state)) : null;
+          return Response.json(state ?? { generation: 0, attempt: null });
         }
         // Arm a recorded retry-budget hold, including historic exhaustions.
         if (path === "/fixture/budget-pile") {
@@ -305,6 +328,69 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
     expect(status.hosts[0].candidates.slice(0, 2)).toEqual([second, first]);
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: second });
+  });
+
+  it("reserves at most capacity-1 sessions, keeps queued cards claimable, and signals saturation instead of silence", async () => {
+    const project = "admission-cap", g = await gateway(project, 3);
+    const first = await task(project), second = await task(project), queued = await task(project);
+    const firstClaim = await reserve(g);
+    expect(firstClaim).toMatchObject({ kind: "reserved", task_id: first });
+    if (firstClaim.kind !== "reserved") throw new Error("expected a reservation");
+    const secondClaim = await reserve(g);
+    expect(secondClaim).toMatchObject({ kind: "reserved", task_id: second });
+    // Two of three slots charged = the admission cap; the remaining slot is
+    // reserved for the control plane (merge-train tick + dispatch prep).
+    const refused = await reserve(g);
+    expect(refused).toMatchObject({ kind: "at_capacity", capacity: 3, admission_cap: 2, active: 0, reserved: 2 });
+    // The refused card stays queued and claimable — the schedule still lists it.
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
+    expect(status.hosts[0]).toMatchObject({ admission_cap: 2, capacity: 3, eligible: 1 });
+    expect(status.hosts[0].candidates).toEqual([queued]);
+    // Releasing a slot re-admits the queued card with no lost generation.
+    const cancelled = await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true }, undefined, first, firstClaim.session);
+    expect(cancelled).toMatchObject({ kind: "released", barrier: null });
+    expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: queued });
+  });
+
+  it("refuses a capacity-drifted begin before minting a generation and releases it charge-free", async () => {
+    const project = "admission-begin", g = await gateway(project, 2);
+    const first = await task(project), holder = await task(project);
+    const claim = await reserve(g);
+    expect(claim).toMatchObject({ kind: "reserved", task_id: first });
+    if (claim.kind !== "reserved") throw new Error("expected a reservation");
+    // Occupancy drifts past the admission cap after the reservation: a stale
+    // unquiesced attempt (the BR#14126 class) now charges the host.
+    expect(await stub.fetch("https://kb/fixture/stamp-running-attempt", { method: "POST", body: JSON.stringify({ id: holder, host: g.host }) }).then(r => r.json())).toEqual({ ok: true });
+    const begin = await g.cmd({ kind: "begin", attempt_id: `${first}-g1`, worker: g.auth.agent, action_budget_ms: 60_000,
+      selection: { backend: "opencode", model: g.capabilities.model, tier: "small" } }, undefined, first, claim.session);
+    expect(String(begin.error)).toMatch(/admission capacity.*\[rule: admission-capacity\]/);
+    // Nothing was minted: no generation, no attempt, no budget charge.
+    const before = await stub.fetch("https://kb/fixture/inspect-state", { method: "POST", body: JSON.stringify({ id: first }) }).then(r => r.json()) as { generation: number; attempt: unknown };
+    expect(before.generation).toBe(0);
+    expect(before.attempt ?? null).toBeNull();
+    // The runner reconciles the refusal as a charge-free cancel_start: the
+    // card returns to todo claimable, with a cancellation marker and NO
+    // retry-budget charge, start barrier or task-level startup prerequisite.
+    const cancelled = await g.cmd({ kind: "cancel_start", writers: "not_launched", retained_work: true }, undefined, first, claim.session);
+    expect(cancelled).toMatchObject({ kind: "released", barrier: null });
+    const board = await (await stub.fetch("https://kb/board", { method: "GET" })).json() as { tasks: { id: string; status: string; meta: Record<string, any> }[] };
+    const card = board.tasks.find(t => t.id === first)!;
+    expect(card.status).toBe("todo");
+    expect(card.meta.execution_cancelled_start).toMatchObject({ stage: "begin" });
+    expect(card.meta.startup_wait).toBeUndefined();
+    expect(card.meta.execution_start_failure).toBeUndefined();
+    const after = await stub.fetch("https://kb/fixture/inspect-state", { method: "POST", body: JSON.stringify({ id: first }) }).then(r => r.json()) as { generation: number; attempt: unknown; budget_exhaustions?: number; failure_charged_generation: number | null };
+    expect(after.generation).toBe(0);
+    expect(after.attempt ?? null).toBeNull();
+    expect(after.budget_exhaustions ?? 0).toBe(0);
+    expect(after.failure_charged_generation ?? 0).toBe(0);
+    // The signal lane saw the saturation, not silence: a throttled capacity
+    // signal names the host while dispatch_starved stays quiet.
+    const health = await stub.fetch("https://kb/fixture/scheduling-health", { method: "POST", body: JSON.stringify({ age_s: 180 }) }).then(r => r.json()) as { alarms: { action: string; data: Record<string, any> }[] };
+    const capacity = health.alarms.find(a => a.action === "admission_at_capacity");
+    expect(capacity).toBeDefined();
+    expect(capacity!.data).toMatchObject({ host: g.host });
+    expect(health.alarms.some(a => a.action === "dispatch_starved")).toBe(false);
   });
 
   it("resolves fresh tasks from one fleet inventory without changing their order", async () => {
@@ -510,7 +596,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
   });
 
   it.each(["completed", "interrupted"])("drains matching work after a fenced provider response on a %s trial", async outcomeKind => {
-    const project = "automatic-provider-recovery-" + outcomeKind, g = await gateway(project, 4, true);
+    const project = "automatic-provider-recovery-" + outcomeKind, g = await gateway(project, 5, true);
     const foreign = { ...g.capabilities, model: "test/other" };
     expect((await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, alternatives: [foreign] } })).ok).toBe(true);
     const failed = { kind: "failed", exit_code: null, stdout_tail: "",
@@ -660,7 +746,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
   });
 
   it("learns from a fenced review verdict even when normal worker teardown interrupts ACP", async () => {
-    const project = "managed-verdict-recovery", g = await gateway(project, 2);
+    const project = "managed-verdict-recovery", g = await gateway(project, 3);
     const failed = { kind: "failed", exit_code: null, stdout_tail: "",
       stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" };
     const interrupted = { kind: "interrupted", exit_code: null, stdout_tail: "Reviewed the change",
@@ -822,7 +908,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
   });
 
   it("reopens and claims a newly serviceable wait through one shared fleet pass per reserve", async () => {
-    const project = "reserve-shared-pass", g = await gateway(project, 2);
+    const project = "reserve-shared-pass", g = await gateway(project, 3);
     const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });
     expect((await post("get", { id })).status).toBe("blocked");
     // Capability renewal advertises without reconciling the backlog; the
@@ -856,7 +942,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
   });
 
   it("advances the reopen cursor fairly across reserves and never flips an ask-owned wait", async () => {
-    const project = "reopen-fairness", g = await gateway(project, 3);
+    const project = "reopen-fairness", g = await gateway(project, 4);
     const ids: string[] = [];
     for (let i = 0; i < 30; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
     // The held wait carries an open human decision: it occupies the reopen
@@ -932,7 +1018,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(await reserve(g)).toMatchObject({ kind: "reserved", task_id: runnable });
   });
   it("holds a todo card parked on durable external-CI checks (independent_wait) and wakes exactly one verifier when the bound checks settle (BR#18328)", async () => {
-    const project = "external-ci-wait", g = await gateway(project, 2);
+    const project = "external-ci-wait", g = await gateway(project, 3);
     const runnable = await task(project);
     const parked = await task(project, { execution_wait: { kind: "external_checks", await: { repo: "state-vector/superpositional", pr: 3644, head_sha: "3".repeat(40), contexts: ["ci / Build"] }, generation: 1, attempt_id: "one", declared_at: Date.now() } });
     // the parked card is held from dispatch without a worker slot or a blocked leg
@@ -992,7 +1078,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await g.cmd(final, "old-final-not-replay", id, "wrong-session")).error).toMatch(/fenced|session/);
   });
   it("diagnoses a stranded repair and resumes it only after an attempt-bound receipt", async () => {
-    const project = "stranded-repair", g = await gateway(project, 2);
+    const project = "stranded-repair", g = await gateway(project, 3);
     const id = await task(project, { machine_duty: { by: "recovery", kind: "task-recovery", subject: "BR#999", reason: "queue_binding" } });
     const claim = await reserve(g);
     if (claim.kind !== "reserved") throw new Error(JSON.stringify(claim));
@@ -1040,7 +1126,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     });
   });
   it("settles a satisfied typed-wait park's stopped-writer receipt and releases the wait exactly once (GH #478)", async () => {
-    const project = "satisfied-wait-reconcile", g = await gateway(project, 2);
+    const project = "satisfied-wait-reconcile", g = await gateway(project, 3);
     // The prerequisite the parked subject awaits is already done on the board:
     // the typed wait is satisfied, but the prepared operation still fences
     // both the interactive pickup and the blocked→todo release (the deadlock).
@@ -1132,7 +1218,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await settle(running, "running-refused")).error).toMatch(/unassigned task/);
   });
   it("schedules a receipt-only diagnostic for a safely parked stopped attempt and settles it without a full-agent credential (GH #479)", async () => {
-    const project = "parked-diagnosis", g = await gateway(project, 4);
+    const project = "parked-diagnosis", g = await gateway(project, 5);
     const prereq = await task(project);
     expect(await post("fixture/closed-diagnosis", { id: prereq })).toEqual({ ok: true });
     const fence = { generation: 1, attempt_id: "parked-writer" };
@@ -1564,7 +1650,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(begin.error).toContain("gateway admission changed before begin");
   });
   it("separates an operator admission pause from model readiness and preserves active writer control", async () => {
-    const project = "operator-pause", g = await gateway(project, 2);
+    const project = "operator-pause", g = await gateway(project, 3);
     const first = await task(project), claimed = await reserve(g);
     if (claimed.kind !== "reserved") throw new Error("no reservation");
     await g.cmd({ kind: "begin", attempt_id: "active", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin", first, claimed.session);
@@ -1705,7 +1791,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const project = `bounded-bypass-${contender}`, repo = `state-vector/br17649-${contender === "boost" ? "boost" : "repair"}`;
     const actor = "gw-bounded-bypass", red = "e".repeat(40);
     expect((await post("train.lease", { repo, actor, action: "acquire", required_workflows: ["Deploy Dev"] })).error).toBeUndefined();
-    const g = await gateway(project, 2);
+    const g = await gateway(project, 3);
     const ordinary = await task(project);
     const release = async (r: { kind: string; task_id?: string; session?: string }) => {
       if (r.kind !== "reserved" || !r.task_id) throw new Error(JSON.stringify(r));
@@ -1825,7 +1911,7 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await g.cmd({ kind: "quiesce", generation: 1, attempt_id: "drain-writer", writers: "process_group_empty" }, "quiet", id, r.session)).error).toBeUndefined();
   }, 15_000);
   it("keeps a task prerequisite scoped, ignores priority/progress churn, and recovers after its repository input changes", async () => {
-    const project = "suppression", g = await gateway(project, 2);
+    const project = "suppression", g = await gateway(project, 3);
     const id = await task(project, { repo: "https://github.com/ghost/missing" }), r = await reserve(g);
     if (r.kind !== "reserved") throw new Error("no reservation");
     expect((await g.cmd({ kind: "start_failed", stage: "begin", reason: "gate: repository not found", retained_work: false, failure_class: "prerequisite" }, "failed", id, r.session)).kind).toBe("released");

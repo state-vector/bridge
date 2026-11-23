@@ -971,7 +971,12 @@ impl Controller {
     pub(crate) fn held_for_test(&self) -> usize { self.registry.counts().held }
     pub fn new(cfg: &DispatchConfig, readiness: &GatewayReadiness, snap: &SharedSnapshot) -> Self {
         let shared = readiness.data.clone(); let preparing = shared.clone(); let finalizing = shared.clone(); let snap = snap.clone();
-        let registry = Pipeline::new(cfg.max_sessions.max(1), cfg.max_sessions.clamp(1, 4), cfg.max_sessions.clamp(1, 4),
+        // BR#14528 — the local mirror of the hub's admission cap: session
+        // preparations fill capacity-1 slots; the remaining slot stays free
+        // for the control plane (merge-train tick thread + this dispatch
+        // prep), so a saturated host queues cards instead of churning
+        // refused reservations against the hub.
+        let registry = Pipeline::new(crate::dispatch::dispatch_admission_capacity(cfg.max_sessions), cfg.max_sessions.clamp(1, 4), cfg.max_sessions.clamp(1, 4),
             move |input, cancel| prepare(&preparing, &snap, input, cancel), move |work, report| finalize(&finalizing, work, report));
         let admission = match root(cfg).and_then(|root| match std::fs::read(root.join("admission.json")) {
             Ok(bytes) => serde_json::from_slice::<String>(&bytes).map(Some).map_err(|e| format!("gate: admission journal corrupt; preserve unknown reservation: {e}")),
