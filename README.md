@@ -2186,7 +2186,15 @@ that law, and BR#3008 makes it mechanical instead of discipline. Three halves, s
   root-fix fast-track (BR#5189) as the carve-out. Direct-to-main pushes run the
   required checks on the exact commit first (`scripts/push-main.sh` preflight — a
   `main-preflight/*` branch must land `Test` + `CLI build (packages/cli)` green
-  before main advances). The repo's own `main-green gate` required check
+  before main advances), and the preflight is claim-fenced at the door
+  (`scripts/check-claim-fence.sh`, BR#19572): a `bridge/BR-<N>` branch whose card
+  is `in_progress` under a different live session refuses the push BEFORE any
+  push to origin, naming the holder and the sanctioned path — the hub's
+  one-executor-per-task rule is enforced at the push, not audited after it.
+  The fence fails open (warn + proceed) on a hub blip, a missing credential, a
+  non-`in_progress` card, or a shell with no `BRIDGE_EXECUTOR_SESSION` /
+  `BRIDGE_SESSION` — the human plane keeps its authority (take the claim over
+  via the hub, `claim.takeover` BR#6135/BR#6788, instead of racing it). The repo's own `main-green gate` required check
   (`.github/workflows/main-green-gate.yml` + `scripts/main-green-gate.sh`,
   BR#3008/BR#3009) was DELETED 2026-11-09 (Ray ruling): it repeatedly
   false-blocked — stale reds while the recovery deploy was mid-flight

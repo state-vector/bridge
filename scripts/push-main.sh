@@ -12,6 +12,12 @@ if [[ "$candidate" == "$base" ]] || ! git merge-base --is-ancestor "$base" "$can
   exit 1
 fi
 
+# BR#19572 — the claim fence runs BEFORE any push to origin, so a refusal
+# costs nothing: the hub's one-executor-per-task rule becomes mechanically
+# binding at the push instead of a post-hoc audit. Fail-open by design —
+# only an in_progress card held by a different live session refuses.
+bash "${BASH_SOURCE[0]%/*}/check-claim-fence.sh" "$(git rev-parse --abbrev-ref HEAD)"
+
 branch="main-preflight/${candidate}-$(date +%s)-$$"
 ref="refs/heads/$branch"
 cleanup() {

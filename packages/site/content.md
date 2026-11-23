@@ -660,7 +660,12 @@ live execution advertisement endpoint before claiming work during rollout;
 a version stamp alone does not prove endpoint readiness. Bound human decisions
 remain separate from authorised local acceptance. Bridge's own
 repository uses signed direct-main delivery and independent receipt review;
-other repositories retain their PR/merge-train policy.
+other repositories retain their PR/merge-train policy. Direct-main pushes are
+claim-fenced at the door (`scripts/check-claim-fence.sh` wired into
+`scripts/push-main.sh`, BR#19572): a branch whose card is in progress under
+another live session refuses before any push to origin, with the holder and
+the takeover path in the refusal; hub outages and human shells pass warned,
+never blocked.
 Managed updates can pause only that gateway's new claims for five minutes,
 checkpoint active tasks through their durable mailbox, and resume after a
 writer-free replacement. Neither the pause nor expiry weakens transfer fences.
