@@ -7695,6 +7695,33 @@ export class KnowledgeHub {
       if (old.request !== encoded) throw new Error("gate: command_id reused with different input");
       return JSON.parse(old.result);
     }
+    if (command.kind === "request_coordination_wait") {
+      const scope = body.execution_scope as { id?: string; generation?: number; attempt_id?: string } | null | undefined;
+      if (gateway || !worker || scope?.id !== req.id || scope.generation !== command.generation
+        || scope.attempt_id !== command.attempt_id || row.status !== "in_progress" || meta.session !== session) {
+        throw new Error("gate: a coordination stop intent requires the current scoped worker and claim");
+      }
+      if (parseTags(row.roles).some(role => role === "review" || role === "unblock")
+        || meta.operator_gated || this.protectedExecution(req.id, meta)
+        || this.startupWait(req.id) || this.startupHasAsk(req.id) || releaseHold(meta)) {
+        throw new Error("gate: a protected exit or verdict duty cannot request a coordination stop");
+      }
+      const node = this.one(`SELECT a.status,a.meta FROM coordination_requests r JOIN artefacts a ON a.id=r.ask_id
+        WHERE r.ask_id=? AND r.token_id=? AND a.type='question'`, command.ask_id, tokenId);
+      const askMeta = node ? JSON.parse(String(node.meta)) : null;
+      const route = askMeta ? askRoute(askMeta.ask ?? {}) : null;
+      if (!node || route?.kind !== "executor_coordination" || askMeta.ask?.artefact_id || route.task_id === req.id) {
+        throw new Error("gate: coordination stop requires your own unbound ask to another task");
+      }
+      const lifecycle = askLifecycle({ status: String(node.status), meta: askMeta });
+      if (lifecycle.state !== "open") {
+        const result = { kind: "coordination_already_resolved", ask_id: command.ask_id, ...lifecycle };
+        this.state.storage.transactionSync(() => this.state.storage.sql.exec(
+          `INSERT INTO execution_commands(task_id,command_id,request,result) VALUES(?,?,?,?)`,
+          req.id, req.command_id, encoded, JSON.stringify(result)));
+        return result;
+      }
+    }
     if (command.kind === "start_failed" || command.kind === "recover_unstarted" || command.kind === "cancel_start") {
       const recovering = command.kind === "recover_unstarted";
       const legacyChurn = recovering && row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
