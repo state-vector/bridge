@@ -10830,8 +10830,12 @@ export class KnowledgeHub {
       // agent/session delivery returns to that set, without human escalation.
       if (!to || to === "any" || to.startsWith("tag:")) continue;
       const presence = this.askTargetPresence(to, now);
-      if (presence.online) continue;
-      m.ask.route = askRoute(ask);
+      const route = askRoute(ask);
+      const executor = route.kind === "executor_coordination" ? this.executorAskTarget(route.task_id) : null;
+      if (route.kind === "executor_coordination" && executor
+        ? this.executorReadyForAsk(route.task_id, executor, now)
+        : presence.online) continue;
+      m.ask.route = route;
       m.ask.to = "any";
       delete m.ask.escalated;
       m.ask.recovery = {
@@ -11393,10 +11397,7 @@ export class KnowledgeHub {
     // writer can take a turn. Interactive replies use the same per-session
     // presence read exposed by the ask band; managed writers also need a
     // running attempt with an unexpired lease and action deadline.
-    const now = Date.now();
-    const attempt = this.executionState(route.task_id)?.attempt;
-    if (!this.askTargetPresence(`${target.label}@${target.session}`, now).online
-      || (attempt?.session === target.session && (attempt.phase !== "running" || attempt.lease_until <= now || attempt.action_deadline <= now))) {
+    if (!this.executorReadyForAsk(route.task_id, target)) {
       return { ...pending, wait_skipped: "no_live_executor" };
     }
     return pending;
@@ -11628,11 +11629,24 @@ export class KnowledgeHub {
     return { kind: "independent_review", task_id: taskId, id: review.id, status: "pending", message: "Bridge is arranging an independent agent review. No action is needed from you." };
   }
 
-  private askRecipient(ask: { route?: unknown; to?: unknown }): string {
+  private askRecipient(ask: { route?: unknown; to?: unknown; recovery?: { from_target?: string } }): string {
     const route = askRoute(ask);
     if (route.kind !== "executor_coordination") return String(ask.to ?? "any");
     const target = this.executorAskTarget(route.task_id);
-    return target ? `${target.label}${target.session ? `@${target.session}` : ""}` : "any";
+    if (!target) return "any";
+    const recipient = `${target.label}${target.session ? `@${target.session}` : ""}`;
+    // The watchdog records delivery failure on the question; use it rather
+    // than repeatedly addressing the failed route. A live current holder can
+    // take the same ask back, including after a re-claim or reconnect.
+    if (ask.recovery?.from_target && !this.executorReadyForAsk(route.task_id, target)) return "any";
+    return recipient;
+  }
+
+  private executorReadyForAsk(taskId: string, target: { label: string; session?: string }, now = Date.now()): boolean {
+    if (!target.session || !this.askTargetPresence(`${target.label}@${target.session}`, now).online) return false;
+    const attempt = this.executionState(taskId)?.attempt;
+    return attempt?.session !== target.session ||
+      (attempt.phase === "running" && attempt.lease_until > now && attempt.action_deadline > now);
   }
 
   private executorAskTarget(taskId: string): { label: string; session?: string } | null {

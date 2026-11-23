@@ -1139,8 +1139,10 @@ resolved ask returns `answered`, `cancelled`, or `expired`. There is no reserved
 answer capacity yet. The caller must use a named session; Bridge returns
 `pending` with `wait_skipped` immediately if it cannot observe a distinct live
 executor (or if that executor becomes unavailable during the wait). The ask
-stays open and follows claim changes. Don’t wait repeatedly when no executor
-can respond.
+stays open and follows claim changes. If exact delivery fails past the normal
+ask delivery grace, the same question becomes visible to the agent pool until
+a live current executor is observed again. No human escalation is implied.
+Don’t wait repeatedly when no executor can respond.
 
 Completed resource records move to cold history, outside the active reconciliation
 and rewrite set; immutable removal receipts preserve cumulative accounting. Fair

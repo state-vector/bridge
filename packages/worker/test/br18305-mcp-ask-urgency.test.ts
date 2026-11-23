@@ -215,6 +215,37 @@ describe("bounded executor coordination", () => {
     }, f.ctx) as { content: Array<{ text: string }> };
     expect(JSON.parse(out.content[0].text)).toMatchObject({ state: "pending", wait_skipped: "no_live_executor" });
   });
+
+  it("offers a failed executor delivery to the pool after grace, then routes the same ask to a reconnected holder", async () => {
+    const f = await setup("agent-pool-fallback");
+    const session = "returning-executor";
+    const task = await call("create", { type: "task", title: "Work claimed by a disconnected session", qualified: true, actor: f.targetLabel });
+    const taskId = task.body.id;
+    expect((await call("transition", { id: taskId, to: "in_progress", actor: f.targetLabel, session })).status).toBe(200);
+    const retry = async () => {
+      const out = await TOOL_TABLE.ask_agent.handler({
+        ...f.args, route: { kind: "executor_coordination", task_id: taskId },
+      }, f.ctx) as { content: Array<{ text: string }> };
+      return JSON.parse(out.content[0].text);
+    };
+    const sent = await retry();
+    expect(sent).toMatchObject({ state: "pending", wait_skipped: "no_live_executor" });
+    const inbox = async (label: string) => (await call("ask.inbox", { label })).body.inbox;
+    expect(await inbox("pool-peer")).not.toContainEqual(expect.objectContaining({ id: sent.id }));
+    expect(await inbox(f.targetLabel)).toContainEqual(expect.objectContaining({ id: sent.id, to_target: `${f.targetLabel}@${session}` }));
+    const sweep = await call("admin.ask_escalation_sweep", { now: Date.now() + 3_600_000 });
+    expect(sweep.body.escalated).toContain(sent.id);
+    expect(await inbox("pool-peer")).toContainEqual(expect.objectContaining({ id: sent.id, to_target: "any" }));
+    expect(await retry()).toMatchObject({ id: sent.id, state: "pending", wait_skipped: "no_live_executor" });
+
+    const token = await call("admin.mint", { label: f.targetLabel });
+    await call("session.touch", { token_id: token.body.id, session });
+    expect(await inbox("pool-peer")).not.toContainEqual(expect.objectContaining({ id: sent.id }));
+    expect(await inbox(f.targetLabel)).toContainEqual(expect.objectContaining({ id: sent.id, to_target: `${f.targetLabel}@${session}` }));
+    expect(await retry()).toMatchObject({ id: sent.id, state: "pending" });
+    expect((await call("ask.answer", { id: sent.id, answer: "Recovered executor replied", actor: f.targetLabel })).status).toBe(200);
+    expect(await retry()).toMatchObject({ id: sent.id, state: "answered", by: f.targetLabel });
+  });
 });
 
 describe("BR#18305 — the MCP schema carries the ask urgency vocabulary", () => {

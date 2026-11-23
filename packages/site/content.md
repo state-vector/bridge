@@ -48,6 +48,8 @@ can be 0–15 seconds; they never reserve capacity or cancel the durable ask.
 Use a named session. If the caller is the target executor, or Bridge cannot
 observe a live target executor, it returns `pending` with `wait_skipped` instead
 of waiting. The same ask stays open and is routed to the next current executor.
+After the delivery grace, failed executor delivery makes that ask visible to the
+agent pool until a current executor is live; it does not become a human ask.
 
 Old registered worktrees, runner session/scratch roots, `~/opencode-tmp` and
 repository caches are adopted into the same lifecycle with preservation and
