@@ -659,6 +659,11 @@ export class KnowledgeHub {
   private readonly schemaInitialization = new SchemaInitialization();
   private dutyLookupReady: Promise<void> | undefined;
   private readonly requestDiagnostics = new RequestDiagnostics();
+  // BR#16950: per-stage timing of this instance's one initializeSchema run
+  // (SchemaInitialization caches it per DO instance/build). Cold-start cost
+  // used to be an unattributed 8-11s; the stage table makes the split between
+  // one-time migrations and per-boot work visible in every production tail.
+  private lastSchemaInitStages: { at: number; total_ms: number; stages: { stage: string; ms: number }[] } | null = null;
   /** BR#16935: panel-read cache (train status, throughput metrics) — the
    *  polled /api/kb/train and /api/kb/metrics/throughput reads cost ~2s DO
    *  CPU each at production data size, and at UI + gateway poll cadence the
@@ -4023,6 +4028,15 @@ export class KnowledgeHub {
     // Warm requests must not repeat hundreds of SQL statements/full-table
     // updates on the critical lease, inbox and readiness paths. Storage faults
     // clear the shared initializer so a partial failure is retried safely.
+    // BR#16950: every section below is bracketed by mark() calls — the stage
+    // table lands in lastSchemaInitStages and one schema_init_stages log line
+    // per boot, so cold-start cost is attributed by measurement, not guesswork.
+    const stageMarks: { stage: string; ms: number }[] = [];
+    let stageAt = performance.now();
+    const mark = (stage: string) => {
+      stageMarks.push({ stage, ms: Math.round((performance.now() - stageAt) * 10) / 10 });
+      stageAt = performance.now();
+    };
     this.state.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS artefacts (
         id TEXT PRIMARY KEY,
@@ -4394,9 +4408,19 @@ export class KnowledgeHub {
         answered_ts INTEGER
       );
     `);
+    mark("baseline_ddl");
 
-    // additive columns for DBs created before these existed
-    for (const ddl of [
+    // ---------- additive columns: one-time, count-stamped (BR#16950) ----------
+    // Columns for DBs created before they existed. This loop used to run on
+    // EVERY boot: on any established database all ~30 ALTERs throw
+    // "duplicate column" — 30 storage round-trips plus exceptions on the
+    // boot path of every cold isolate (the measured top boot stage at
+    // corpus scale, and part of the 8-11s production cold-start). The stamp
+    // records this list's length under settings.additive_columns_v1:
+    // appending a future column changes the length, fails the probe, and
+    // re-runs the loop exactly once. Stamps are JSON-encoded — settingsMap()
+    // JSON.parses every settings value.
+    const additiveColumns = [
       `ALTER TABLE decisions ADD COLUMN options TEXT`,
       `ALTER TABLE decisions ADD COLUMN urgency TEXT`,
       `ALTER TABLE decisions ADD COLUMN deadline_ts INTEGER`,
@@ -4427,9 +4451,21 @@ export class KnowledgeHub {
       `ALTER TABLE lane_state ADD COLUMN snapshot_json TEXT`,
       `ALTER TABLE train_check_retries ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE proxy_probes ADD COLUMN contexts TEXT`, // BR#18328: observed check names+states at the verified head
-    ]) {
-      try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+    ];
+    let additiveApplied = -1;
+    try {
+      additiveApplied = JSON.parse(String(this.one(`SELECT value FROM settings WHERE key = 'additive_columns_v1'`)?.value ?? ""));
+    } catch { /* unstamped — run the loop */ }
+    if (additiveApplied !== additiveColumns.length) {
+      for (const ddl of additiveColumns) {
+        try { this.state.storage.sql.exec(ddl); } catch { /* column exists */ }
+      }
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('additive_columns_v1', ?)`,
+        JSON.stringify(additiveColumns.length),
+      );
     }
+    mark("additive_columns");
     if (this.one(ARTEFACT_SEARCH_LEGACY_TRIGGER_SQL)) {
       this.state.storage.transactionSync(() => this.state.storage.sql.exec(ARTEFACT_SEARCH_MIGRATION_SQL));
     }
@@ -4437,6 +4473,7 @@ export class KnowledgeHub {
     this.state.storage.sql.exec(WATCHDOG_REVIEW_LOOKUP_SCHEMA);
     this.state.storage.sql.exec(CAPABILITY_SWEEP_SCHEMA);
     this.state.storage.sql.exec(LANE_VIEW_SQL);
+    mark("search_and_lookup_schemas");
     // BR#16935: the lane_cards view body changed (backlog arm pinned via
     // INDEXED BY) — IF NOT EXISTS keeps the old definition on existing DBs,
     // so recreate it once where the stored SQL predates the pin.
@@ -4446,6 +4483,7 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(LANE_VIEW_SQL);
     }
 
+    mark("lane_cards_view_pin");
     // ---------- ledger v1: one append-only record (events + versions merged) ----------
     this.state.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ledger (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4487,6 +4525,7 @@ export class KnowledgeHub {
     } catch (e) {
       console.log("ledger migration:", String(e).slice(0, 200));
     }
+    mark("ledger_v1");
     // BR#14766 — the audit-read indexes, each guarded (events is a VIEW on
     // migrated hubs — unindexable; ledger/execution_state always exist).
     // stats() launch_failed_1h and the watchdog prose sweep read
@@ -4513,6 +4552,7 @@ export class KnowledgeHub {
     }
     this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA + STALL_SESSION_LOOKUP_SCHEMA + BREACH_CARD_LOOKUP_SCHEMA);
 
+    mark("audit_read_indexes");
     // BR#16935 — the coordinator's remaining full scans. BR#14766 indexed the
     // ledger and the stall-sweep/board partials; these hot paths still
     // full-scanned on every call while the single DO's input gate serialized
@@ -4554,6 +4594,7 @@ export class KnowledgeHub {
       this.state.storage.sql.exec(ddl);
     }
 
+    mark("hot_path_indexes");
     // sessions.kind backfill: gateway identity via the local token registry
     try {
       this.state.storage.sql.exec(
@@ -4562,6 +4603,7 @@ export class KnowledgeHub {
       );
     } catch { /* fresh db */ }
 
+    mark("sessions_kind_backfill");
     // ---------- asks v2: open legacy asks become question nodes ----------
     try {
       if (!this.one(`SELECT value FROM settings WHERE key = 'asks_v2'`)) {
@@ -4607,6 +4649,7 @@ export class KnowledgeHub {
     }
 
 
+    mark("asks_v2");
     // ---------- asks options backfill: no ask ships button-less ----------
     try {
       if (!this.one(`SELECT value FROM settings WHERE key = 'asks_options_v1'`)) {
@@ -4649,6 +4692,7 @@ export class KnowledgeHub {
     }
 
 
+    mark("asks_options_v1");
     // ---------- tags v1: canonical encoding (defence in depth, SOLID) ----------
     // The tags column historically holds JSON arrays, bare strings and comma
     // lists — parseTags() reads them all, but every SQL tag filter guessed one
@@ -4686,6 +4730,7 @@ export class KnowledgeHub {
       console.log("tags_v1 migration:", String(e).slice(0, 200));
     }
 
+    mark("tags_v1");
     // ---------- roles_v1: system semantics leave the tag namespace (BR#2983) ----------
     // Tags become 100% inert user labels. Three system meanings move out:
     //   role:* tags      → the roles column (bare names: ["review"])
@@ -4719,6 +4764,7 @@ export class KnowledgeHub {
       console.log("roles_v1 migration:", String(e).slice(0, 200));
     }
 
+    mark("roles_v1");
     // ---------- self_edges_v1: a card is never its own relation (BR#3819) ----------
     // The BR#3423 class: a rollup stamped a card child_of ITSELF; the
     // done-open-children gate then counted the card as its own open child
@@ -4750,6 +4796,7 @@ export class KnowledgeHub {
       console.log("self_edges_v1 migration:", String(e).slice(0, 200));
     }
 
+    mark("self_edges_v1");
     // ---------- duties_v1: machine duty children stop fencing their close-targets (BR#5370) ----------
     // Two one-time repairs over state the new spawn path can no longer
     // produce:
@@ -4822,16 +4869,35 @@ export class KnowledgeHub {
       console.log("duties_v1 migration:", String(e).slice(0, 200));
     }
 
+    mark("duties_v1");
     this.state.storage.sql.exec(DUTY_LOOKUP_SCHEMA);
     this.state.waitUntil(this.prepareDutyLookup().catch(() => { /* a train read retries */ }));
 
-    // work enters as UNCLAIMED todo — release currently-todo tasks from their creators
-    const projectName = this.settingsMap().project_name || "superpositional";
-    this.state.storage.sql.exec(
-      `UPDATE artefacts SET project = ? WHERE project = '' AND type = 'task'`, projectName,
-    );
-    this.state.storage.sql.exec(`UPDATE artefacts SET owner = '' WHERE type = 'task' AND status = 'todo' AND owner != ''`);
+    mark("duty_lookup");
+    // ---------- unclaimed backfill: one-time, stamped (BR#16950) ----------
+    // Work enters as UNCLAIMED todo; legacy rows could still carry a creator
+    // owner or an empty project. Both repair statements used to run on EVERY
+    // boot — two walks over the task corpus on the boot path of every cold
+    // isolate, with production metas at 10-100KB blobs. Both invariants are
+    // now maintained at the write sites: create()/update() stamp project
+    // (defaulting to the project_name setting) and every status='todo'
+    // transition writes owner='' in the same statement, so this is a pure
+    // legacy-row migration: run once, stamp, never walk again. The stamp is
+    // JSON-encoded — settingsMap() JSON.parses every settings value.
+    if (!this.one(`SELECT value FROM settings WHERE key = 'project_backfill_v1'`)) {
+      const projectName = this.settingsMap().project_name || "superpositional";
+      this.state.storage.sql.exec(
+        `UPDATE artefacts SET project = ? WHERE project = '' AND type = 'task'`, projectName,
+      );
+      this.state.storage.sql.exec(`UPDATE artefacts SET owner = '' WHERE type = 'task' AND status = 'todo' AND owner != ''`);
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO settings (key, value) VALUES ('project_backfill_v1', ?)`,
+        JSON.stringify({ released: true, ts: Date.now() }),
+      );
+    }
+    mark("unclaimed_backfill");
 
+    mark("rev_triggers");
     // ---------- BR#14413 read-path: trigger-maintained content revisions ----------
     // GET /artefacts is the board's hottest route (30s polls per open tab re-ran
     // the full list() query + JSON serialize every call on a single-threaded DO).
@@ -4904,6 +4970,12 @@ export class KnowledgeHub {
       END;
     `);
     this.state.storage.sql.exec(workGraphChangeSchema(TRAIN_ALARM_SINK_ID));
+    mark("work_graph_schema");
+    const totalMs = Math.round(stageMarks.reduce((s, m) => s + m.ms, 0) * 10) / 10;
+    this.lastSchemaInitStages = { at: Date.now(), total_ms: totalMs, stages: stageMarks };
+    // One compact line per isolate boot — production cold-start cost is
+    // attributed stage-by-stage in wrangler tails (BR#16950 follow-up).
+    console.log(JSON.stringify({ type: "schema_init_stages", total_ms: totalMs, stages: stageMarks }));
   }
 
   // ---------- BR#4212: the fetch entry NEVER throws ----------
@@ -5096,7 +5168,7 @@ export class KnowledgeHub {
             if (this.ifNoneMatchHit(request.headers.get("if-none-match"), etag)) return this.notModified(etag);
             return this.json(await this.stats(), 200, { etag });
           }
-          case "/diagnostics": return this.json(this.requestDiagnostics.snapshot());
+          case "/diagnostics": return this.json({ ...this.requestDiagnostics.snapshot(), ...(this.lastSchemaInitStages ? { schema_init: this.lastSchemaInitStages } : {}) });
           case "/metrics.throughput": return this.json(await this.metricsThroughput(url.searchParams));
           case "/metrics.reports": return this.json(await this.metricsReports(url.searchParams));
           case "/provenance": { const b = await this.provenanceLookup(url.searchParams); return b ? this.json(b) : this.json({ error: "no bridge provenance for this sha" }, 404); }

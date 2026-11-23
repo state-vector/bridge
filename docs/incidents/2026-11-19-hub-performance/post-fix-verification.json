@@ -1,0 +1,38 @@
+{
+  "what": "BR#16950 item 2 — cold-isolate initializeSchema acceptance. Stage instrument + one-time guards (additive_columns_v1 count-stamped, project_backfill_v1 JSON-encoded) landed in packages/worker/src/kb/do.ts.",
+  "evidence_kind": "local workerd fixture (test/schema-init-scale.test.ts) over persisted SQLite — dispose → recreate Miniflare (durableObjectsPersist) = production cold-isolate shape",
+  "corpus_shape": {
+    "corpus_tasks_9kb_meta": 14000,
+    "legacy_todo_with_owner_and_empty_project": 500,
+    "auth_tokens_gateway": 1,
+    "sessions": 2,
+    "ledger_mutation_rows": 300
+  },
+  "fresh_boot": {
+    "total_ms": 75,
+    "additive_columns_ms": 32,
+    "note": "first boot runs the additive loop once (30 ALTERs execute) and stamps"
+  },
+  "upgrade_boot_over_populated_corpus": {
+    "total_ms": 55,
+    "unclaimed_backfill_ms": 50,
+    "note": "the boot after a pre-upgrade DB (stamps cleared): the one-time sweeps repair the 500 legacy rows exactly once — owners released, projects backfilled — then stamp"
+  },
+  "steady_cold_boot": {
+    "total_ms": 3,
+    "additive_columns_ms": 0,
+    "unclaimed_backfill_ms": 0,
+    "note": "guard probes are single settings-key reads; no per-boot corpus walking"
+  },
+  "stage_table_stages": ["baseline_ddl", "additive_columns", "search_and_lookup_schemas", "lane_cards_view_pin", "ledger_v1", "audit_read_indexes", "hot_path_indexes", "sessions_kind_backfill", "asks_v2", "asks_options_v1", "tags_v1", "roles_v1", "self_edges_v1", "duties_v1", "duty_lookup", "unclaimed_backfill", "rev_triggers", "work_graph_schema"],
+  "production_symptom": "auth.identify cpu≈10.9s once per isolate (2026-11-19 wrangler tails); steady cold boot at this scale is now ~3ms locally — the instrument attributes any residual production cost stage-by-stage via the schema_init_stages log line and /diagnostics schema_init",
+  "suite": { "files": 106, "tests": 1814, "result": "all green", "duration_s": 166 },
+  "bounds_pinned_by_fixture": {
+    "total_boot_ms": "<1000 (measured 3-75)",
+    "additive_columns_probe_ms": "<50 (measured 0-2 steady)",
+    "unclaimed_backfill_probe_ms": "<50 (measured 0 steady)",
+    "worst_stage_ms": "<500"
+  },
+  "measured_at": "2026-11-23",
+  "measured_by": "dispatch-BR-16950-d34f3906"
+}

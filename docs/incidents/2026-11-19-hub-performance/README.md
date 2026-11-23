@@ -112,3 +112,43 @@ at any scale) — so the same broken plan is caught at a 2,000-card hub and a
 keeps micro-reads out of ratio noise; 10× headroom absorbs legitimate
 index-seek overread. Log lines now carry the amplification factor.
 Pinned across four magnitudes in `test/train-read-query.test.ts`.
+
+## Cold-isolate schema init: the seconds were per-boot work, not DDL (BR#16950)
+
+Every `initializeSchema` DDL statement is an IF NOT EXISTS no-op on an
+established database — so the ~8–11s cold-start CPU (auth.identify once per
+isolate, 2026-11-19 tails) came from per-boot WORK, and there was no way to
+see which work. Two cures, both in `packages/worker/src/kb/do.ts`:
+
+**Stage instrument.** 18 `mark()` calls bracket the sections of
+`initializeSchema`; each boot records one
+`{"type":"schema_init_stages",total_ms,stages}` log line and pins the table
+on the instance (`lastSchemaInitStages`, exposed as `schema_init` on
+`/diagnostics`). Cold-start cost is now attributed stage-by-stage in every
+production tail instead of guessed at.
+
+**One-time guards on the measured per-boot work.**
+- `additive_columns` — the ~30 `ALTER TABLE ADD COLUMN` statements ran on
+  EVERY boot and all threw "duplicate column" on any established database.
+  Now count-stamped under `settings.additive_columns_v1`: the stamp records
+  the list's length, so appending a future column changes the length, fails
+  the probe, and re-runs the loop exactly once.
+- `unclaimed_backfill` — two unconditional corpus walkers ran on every boot
+  (project backfill over `project=''` tasks, todo owner release). Both
+  invariants are maintained at the write sites (create/update stamp project;
+  every `status='todo'` transition writes `owner=''` in the same statement),
+  so they are pure legacy-row migrations: one run under the JSON-encoded
+  `settings.project_backfill_v1` stamp, then never again. (The stamp is
+  JSON-encoded — `settingsMap()` JSON.parses every settings value.)
+- The BR#16935 schema note stands: no partial json_extract indexes were
+  added; the guards remove work instead of adding one-time builds.
+
+Local workerd fixture at production scale (14k cards, 9KB metas,
+`test/schema-init-scale.test.ts`, dispose → recreate over persisted SQLite =
+the cold-isolate shape): fresh boot 75ms (additive loop runs once, 32ms);
+upgrade boot over the populated corpus 55ms including the 50ms one-time
+legacy repair (500 legacy todo+owner rows released and project-backfilled
+exactly once); steady cold boot **3ms total** with both guard stages at 0ms.
+Receipt: `post-fix-verification.json`. Bounds pinned: total boot <1s, guard
+probes <50ms, no stage >500ms — three orders of magnitude under the
+incident's 8–11s, with the instrument to catch any residual in production.
