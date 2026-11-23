@@ -831,7 +831,17 @@ removing or changing the scope does not restore legacy write access.
   (BR#17649) — protected line recovery first, a starved candidate's bounded
   turn, then priority class, explicit boost, and creation age as the queue
   anchor — and reconciles a closed diagnosis
-  whose stopped subject still has no continuation. A diagnosis needs a usable
+  whose stopped subject still has no continuation. An unowned card parked
+  `blocked` on a typed wait the board itself proves satisfied joins the same
+  sweep only in the exact safely-parked shape (GH #479): a stopped writer with
+  process-group-empty proof left unresolved external operations, the
+  `unknown_operations` admission hold is the one fence a receipt can settle,
+  and the same native predicate is re-checked at classification and write
+  time. The assigned diagnostic records the original operation's conclusive
+  evidence by receipt — the card stays parked until its ordinary continuation
+  consumes the wait exactly once. A live train slot, an owner, an open bound
+  ask or any other live hold keeps a parked card out of the sweep, so no
+  separate merge-train stop changes. A diagnosis needs a usable
   retry authorization, a reachable repair dependency, or a bound decision before
   submission if its subject still holds the same unresolved attempt. Provider
   recovery uses the same witnessed request and one-use permit at reservation

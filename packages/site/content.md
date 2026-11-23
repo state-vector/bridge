@@ -129,7 +129,12 @@ not just occupied slots, when diagnosing throughput or slow gateway refill.
 An exhausted execution budget sends the oldest actionable work to diagnosis.
 Time alone does not authorize another attempt. A diagnosis needs an evidenced
 continuation, a reachable repair dependency, or a bound decision for the stopped
-task. Task-completion waits reject missing or impossible targets and known
+task. An unowned card parked on a typed wait the board proves satisfied also
+goes to diagnosis when its stopped writer left unresolved external operations
+(GH #479): the assigned diagnostic settles the original operation by receipt,
+the card stays parked, and its ordinary continuation consumes the wait — live
+train slots, owners and bound asks keep their own exits. Task-completion waits
+reject missing or impossible targets and known
 cycles; Bridge reassesses a prerequisite that later becomes impossible.
 Provider recovery requires a witnessed request on the route the next attempt will use.
 Indexed receipt-ledger lookups keep per-task history, activity and maintenance

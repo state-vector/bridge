@@ -19042,23 +19042,49 @@ export class KnowledgeHub {
       { generation: d?.generation ?? null, attempt_id: d?.attempt_id ?? null, duty: d?.duty ?? null, hold: d?.hold ?? null });
   }
 
+  /** GH #479 — a parked diagnosis candidate must be a park whose ordinary
+   *  continuation could actually consume the wait after the settle: mirror
+   *  the blocked continuation's own non-park refusals (a live merge-train
+   *  slot, the landed close held for human sign-off, lane/delivery/
+   *  interactive owners, an unresolved bound ask). The park itself is not
+   *  consulted — its typed wait is exactly the exit this stage's diagnostic
+   *  un-fences, and reconcilableBlockedWait already proved it satisfied. */
+  private parkDiagnosisHold(meta: any): string | null {
+    const train = String(meta.merge_train?.state ?? "");
+    if (["queued", "awaiting-ci", "awaiting", "conflicting"].includes(train)) return `merge-train ${train} slot owns the exit`;
+    if (train === "landed" && meta.merge_train?.close_held === "human-signoff") return "the landed close is held for human sign-off";
+    if (meta.lane || meta.delivery_disposition || meta.interactive_execution) return "a lane, delivery-disposition or interactive-execution owner holds the card";
+    if (meta.awaiting_ask?.ask_id) {
+      const ask = this.one(`SELECT status FROM artefacts WHERE id=?`, String(meta.awaiting_ask.ask_id));
+      if (!ask || !["done", "superseded"].includes(String(ask.status))) return `a bound ask (${String(meta.awaiting_ask.ask_id)}) owns the exit`;
+    }
+    return null;
+  }
+
   /** Assign evidence-gathering for exhausted budgets and unknown effects.
    * The subject's admission fence continues to own its exit. BR#17649 —
    * candidates are ordered by the ONE selection law both stages share
    * (protected line recovery first, a starved task's bounded turn, then
    * priority class and explicit boost) with creation age as this stage's
    * queue position — no longer age alone. Every evidence fence below stays
-   * first-hand per candidate. */
+   * first-hand per candidate. GH #479 — unowned parked subjects join the
+   * candidate set only in the exact safely parked shape the settle path
+   * already admits (reconcilableBlockedWait): stopped with
+   * process_group_empty proof, held by a typed wait the hub's own board
+   * state proves satisfied, and only for the unknown_operations hold — the
+   * one fence a receipt can actually settle. The status stays parked; the
+   * assigned diagnostic settles the original ledger entry and the ordinary
+   * continuation consumes the wait. */
   private async scheduleAttemptDiagnosis(): Promise<void> {
     const candidates = this.state.storage.sql.exec(`
-      SELECT a.id,a.created_ts,a.meta,a.tags,a.roles,e.state,duty.status AS diagnosis_status,
+      SELECT a.id,a.created_ts,a.meta,a.status AS subject_status,a.owner AS subject_owner,a.tags,a.roles,e.state,duty.status AS diagnosis_status,
         delivery.id IS NOT NULL AS train_review, delivery.meta AS train_parent_meta,
         COALESCE(bypass.bypasses, 0) AS bypassed, bypass.since AS bypass_since
       FROM artefacts a CROSS JOIN execution_state e ON e.task_id=a.id
       LEFT JOIN artefacts duty ON duty.id=json_extract(a.meta,'$.execution_diagnosis.duty')
       LEFT JOIN dispatch_selection_bypasses bypass ON bypass.task_id=a.id AND bypass.stage='diagnosis'
       ${trainReviewParentJoin}
-      WHERE a.type='task' AND a.status='todo' AND a.owner=''
+      WHERE a.type='task' AND a.status IN ('todo','blocked') AND a.owner=''
         -- A repair duty can itself need diagnosis. An execution-environment
         -- duty is the leaf, so the same fault cannot spawn an unbounded chain.
         AND coalesce(json_extract(a.meta,'$.machine_duty.reason'), '') != 'execution_environment'
@@ -19084,10 +19110,17 @@ export class KnowledgeHub {
         const state = ExecutionStateSchema.parse(JSON.parse(String(row.state)));
         const revision = String(meta.work_revision ?? "legacy");
         const hold = executionAdmissionHold(state, revision);
+        // GH #479 — classification: a parked candidate qualifies only in the
+        // exact reconcilableBlockedWait shape and only for the receipt-
+        // settleable hold; every other parked fault keeps its own owner.
+        const parked = String(row.subject_status) === "blocked";
+        if (parked && (hold !== "unknown_operations"
+          || !this.reconcilableBlockedWait(id, { status: "blocked", owner: String(row.subject_owner ?? "") }, meta, state, Date.now()))) continue;
         if ((hold !== "retry_budget" && hold !== "unknown_operations")
           || (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now()))
           || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
-          || this.protectedExecution(id, meta) || this.todoLifecycleHold(id, meta)) continue;
+          || this.protectedExecution(id, meta)
+          || (parked ? this.parkDiagnosisHold(meta) : this.todoLifecycleHold(id, meta))) continue;
         const diagnosedSameAttempt = meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis?.hold === hold;
         if (diagnosedSameAttempt && attemptDiagnosisCoversAttempt(state)) {
           // BR#18198 — the accepted duty's stamp already covers this stopped
@@ -19115,13 +19148,43 @@ export class KnowledgeHub {
         }
         if (scheduled >= 4) { waited.push(entry); continue; }
         const duty = await this.ensureTaskRecovery(id, "execution_environment");
+        // GH #479 — after the async recovery choice, recheck the same
+        // attempt, generation, work revision, claim, typed event and prior
+        // duty before writing: another session may have consumed the wait,
+        // moved the attempt, changed the card, or taken the diagnosis.
         const fresh = this.executionState(id);
-        if (fresh?.generation !== state.generation || executionAdmissionHold(fresh, String(meta.work_revision ?? "legacy")) !== hold
-          || !this.one(`SELECT 1 FROM artefacts WHERE id=? AND status='todo' AND owner=''`, id)) continue;
+        const claimed = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+        const claimedMeta = JSON.parse(String(claimed?.meta ?? "{}"));
+        // An OPEN prior duty for this same attempt keeps its ownership (a
+        // concurrent sweep's stamp); a closed one is exactly what a re-arm
+        // replaces, so it never blocks the fresh assignment.
+        const priorStamp = claimedMeta.execution_diagnosis;
+        const priorDutyLive = !!priorStamp?.duty
+          && ["todo", "in_progress", "in_review", "blocked"].includes(String(this.one(`SELECT status FROM artefacts WHERE id=?`, String(priorStamp.duty))?.status ?? ""));
+        if (fresh?.generation !== state.generation || fresh?.attempt?.attempt_id !== state.attempt?.attempt_id
+          || executionAdmissionHold(fresh, revision) !== hold
+          || !claimed || String(claimed.owner) !== "" || String(claimed.status) !== String(row.subject_status)
+          || String(claimedMeta.work_revision ?? "legacy") !== revision
+          || (priorDutyLive && priorStamp.generation === state.generation && priorStamp.hold === hold
+            && priorStamp.duty !== duty)
+          || (parked && (hold !== "unknown_operations"
+            || !this.reconcilableBlockedWait(id, { status: String(claimed.status), owner: String(claimed.owner) }, claimedMeta, fresh, Date.now())))) continue;
         const diagnosis = { generation: state.generation, hold, duty };
+        // Write-time classification (GH #479): the same native predicate
+        // re-decides in this synchronous window — no awaits remain before
+        // the commit — and the SQL guard carries the candidate's own status,
+        // so the authorization only lands on the shape it was classified
+        // from. Status untouched: a parked subject stays parked.
+        if (parked) {
+          const writeRow = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, id);
+          const writeMeta = JSON.parse(String(writeRow?.meta ?? "{}"));
+          if (!writeRow || String(writeRow.status) !== "blocked" || String(writeRow.owner) !== ""
+            || String(writeMeta.work_revision ?? "legacy") !== revision
+            || !this.reconcilableBlockedWait(id, writeRow, writeMeta, this.executionState(id) ?? fresh, Date.now())) continue;
+        }
         this.state.storage.transactionSync(() => {
           this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?))
-            WHERE id=? AND status='todo' AND owner=''`, JSON.stringify(diagnosis), id);
+            WHERE id=? AND status=? AND owner=''`, JSON.stringify(diagnosis), id, parked ? "blocked" : "todo");
           this.version(id, "system:recovery", "execution_diagnosis_scheduled", "Assigned diagnosis of a stopped execution attempt",
             { ...diagnosis, attempt_id: state.attempt?.attempt_id });
         });

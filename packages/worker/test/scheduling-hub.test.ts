@@ -1063,6 +1063,135 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect(await post("fixture/park-blocked", { id: running, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
     expect((await settle(running, "running-refused")).error).toMatch(/unassigned task/);
   });
+  it("schedules a receipt-only diagnostic for a safely parked stopped attempt and settles it without a full-agent credential (GH #479)", async () => {
+    const project = "parked-diagnosis", g = await gateway(project, 4);
+    const prereq = await task(project);
+    expect(await post("fixture/closed-diagnosis", { id: prereq })).toEqual({ ok: true });
+    const fence = { generation: 1, attempt_id: "parked-writer" };
+    // One writer shape for every subject: prepare an external operation, stop
+    // with process_group_empty proof, finalize, release to todo. The caller
+    // then parks the card however its scenario needs.
+    const writerCycle = async (gw: typeof g, subject: string, operation_id: string) => {
+      const claim = await reserve(gw);
+      if (claim.kind !== "reserved" || claim.task_id !== subject) throw new Error("expected reservation: " + JSON.stringify(claim));
+      await gw.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: gw.auth.agent, action_budget_ms: 60_000 }, `begin-${subject}`, subject, claim.session);
+      await gw.cmd({ kind: "prepare", ...fence, operation_id, input_revision: "old-head", action: "Rerun the failed health leg", budget_ms: 60_000 }, `prepare-${subject}`, subject, claim.session);
+      const terminal = { ...fence, writers: "process_group_empty", outcome: { kind: "timed_out", exit_code: null, stdout_tail: "", stderr_tail: "acp timed out (budget + grace exhausted)" } };
+      await gw.cmd({ kind: "stopped", ...terminal }, `stopped-${subject}`, subject, claim.session);
+      await gw.cmd({ kind: "finalize", ...terminal }, `finalize-${subject}`, subject, claim.session);
+      expect(await post("fixture/watchdog-release", { id: subject })).toEqual({ ok: true });
+    };
+    const park = (id: string, await_event: object, extra?: object) =>
+      post("transition", { id, to: "blocked", actor: "author", note: "Await the prerequisite", await_event, ...(extra ?? {}) });
+
+    // The witness shape: an unowned card parked on an already-satisfied typed
+    // wait, held by a safely stopped writer with one prepared operation.
+    const id = await task(project);
+    await writerCycle(g, id, "publish");
+    expect((await park(id, { event: "br_done", id: prereq })).status).toBe("blocked");
+    // Owned park: the owner check is not relaxed by the extension.
+    const owned = await task(project);
+    await writerCycle(g, owned, "publish-owned");
+    expect(await post("fixture/park-blocked", { id: owned, owner: g.auth.actor, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    // Live writer parked: writer_not_quiescent fences scheduling and settling.
+    const running = await task(project);
+    const runningClaim = await reserve(g);
+    if (runningClaim.kind !== "reserved" || runningClaim.task_id !== running) throw new Error(JSON.stringify(runningClaim));
+    await g.cmd({ kind: "begin", attempt_id: fence.attempt_id, worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-running", running, runningClaim.session);
+    expect(await post("fixture/park-blocked", { id: running, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    // A live merge-train stop keeps its own owner: a queued train slot with a
+    // satisfied wait and a prepared op must stay exactly as the train parked it.
+    const trainCar = await task(project);
+    await writerCycle(g, trainCar, "publish-train");
+    expect(await post("fixture/park-blocked", { id: trainCar, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    expect((await post("update", { id: trainCar, meta: { merge_train: { state: "queued", repo: "state-vector/bridge", pr: 1 } } })).error).toBeUndefined();
+    // An exhausted budget is a recovery-permit shape, never a diagnosis one.
+    const budget = await task(project);
+    expect(await post("fixture/budget-pile", { ids: [budget], age_ms: 60_000 })).toEqual({ ok: true, stamped: 1 });
+    expect(await post("fixture/park-blocked", { id: budget, await_event: { event: "br_done", id: prereq } })).toEqual({ ok: true });
+    // Unsatisfied typed wait (separate project pool keeps reserves deterministic).
+    const sibling = "parked-diagnosis-unsat", g2 = await gateway(sibling);
+    const unsat = await task(sibling);
+    await writerCycle(g2, unsat, "publish-unsat");
+    const pending = await task(sibling); // stays open forever
+    expect((await park(unsat, { event: "br_done", id: pending })).status).toBe("blocked");
+
+    // RED → GREEN: the sweep must reach the parked witness, and only it.
+    await post("fixture/attempt-diagnosis", {});
+    const witness = await post("get", { id });
+    expect(witness.status).toBe("blocked"); // the status stays parked
+    const scheduled = witness.meta.execution_diagnosis;
+    expect(scheduled).toMatchObject({ generation: 1, hold: "unknown_operations" });
+    expect((await post("get", { id: scheduled.duty })).meta.machine_duty).toMatchObject({ subject: id, reason: "execution_environment" });
+    for (const refused of [unsat, owned, running, trainCar, budget]) {
+      expect((await post("get", { id: refused })).meta.execution_diagnosis).toBeUndefined();
+      expect((await post("get", { id: refused })).status).toBe("blocked");
+    }
+    expect((await post("get", { id: trainCar })).meta.merge_train).toMatchObject({ state: "queued", pr: 1 });
+    // Dedup: a second pass reuses the same duty, keeps the park.
+    await post("fixture/attempt-diagnosis", {});
+    expect((await post("get", { id })).meta.execution_diagnosis).toEqual(scheduled);
+    expect((await post("get", { id: unsat })).meta.execution_diagnosis).toBeUndefined();
+
+    // The authorized managed diagnostic settles the exact original ledger
+    // entry as failed — no full-agent credential, no GitHub rerun.
+    const diagnostic = await reserve(g);
+    if (diagnostic.kind !== "reserved" || diagnostic.task_id !== scheduled.duty) throw new Error("expected the diagnostic: " + JSON.stringify(diagnostic));
+    const receipt = { kind: "reconcile_operation", ...fence, operation_id: "publish", input_revision: "old-head", outcome: "failed",
+      receipts: ["https://github.com/state-vector/superpositional/actions/runs/44499480063/job/135513689306 — terminal failure at the exact head"] };
+    const reconcile = (command_id: string, command: object = receipt, scope_attempt = "diagnostic") => post("execution",
+      { ...g.worker, id, session: diagnostic.session, command_id, command, execution_scope: { id: diagnostic.task_id, generation: 1, attempt_id: scope_attempt } });
+    expect((await reconcile("before-begin")).error).toMatch(/assigned diagnostic/);
+    await g.cmd({ kind: "begin", attempt_id: "diagnostic", worker: g.auth.agent, action_budget_ms: 60_000 }, "begin-diagnostic", diagnostic.task_id, diagnostic.session);
+    expect((await g.cmd(receipt, "gateway-bypass", id, runningClaim.session)).error).toMatch(/full-agent/);
+    expect((await reconcile("wrong-scope", receipt, "old-diagnostic")).error).toMatch(/assigned diagnostic/);
+    expect((await reconcile("stale", { ...receipt, input_revision: "other-head" })).error).toMatch(/stale/);
+    expect((await reconcile("no-receipts", { ...receipt, receipts: [] })).error).toMatch(/receipts/);
+    const settled = await reconcile("confirmed");
+    expect(settled.operations).toHaveLength(1);
+    expect(settled.operations[0]).toMatchObject({ id: "publish", state: "failed", receipts: [receipt.receipts[0]] });
+    expect(await reconcile("confirmed")).toEqual(settled); // stable-command replay
+    // A settled entry can never be re-settled — not with the same evidence,
+    // and not with a different verdict either (a terminal diagnostic cannot
+    // silently flip the outcome it recorded).
+    expect((await reconcile("re-settle", { ...receipt, outcome: "succeeded" })).error).toMatch(/operation missing or already resolved/);
+    expect((await reconcile("second-settle")).error).toMatch(/operation missing or already resolved/);
+
+    // The settle never touches the wait; the ordinary continuation consumes it
+    // exactly once and the subject resumes as a normal generation-2 dispatch.
+    expect((await post("get", { id })).meta.blocked.await_event).toEqual({ event: "br_done", id: prereq });
+    expect((await post("admin.unblock_proxy_sweep", { now: Date.now() })).ok).toBe(true);
+    const released = await post("get", { id });
+    expect(released.status).toBe("todo");
+    expect(released.meta.blocked).toBeUndefined();
+    expect(released.meta.provenance).toMatchObject({ kind: "system_auto_resume", via: "consumed_wait" });
+    const resumed = await reserve(g);
+    if (resumed.kind !== "reserved") throw new Error(JSON.stringify(resumed));
+    expect(resumed.task_id).toBe(id);
+    expect(await g.cmd({ kind: "begin", attempt_id: "resumed-after-wait", worker: g.auth.agent, action_budget_ms: 60_000 },
+      "begin-resumed", id, resumed.session)).toMatchObject({
+      generation: 2, attempt: { phase: "running" }, operations: [{ id: "publish", state: "failed" }],
+    });
+    expect((await post("admin.unblock_proxy_sweep", { now: Date.now() + 20 * 60_000 })).ok).toBe(true);
+    expect((await post("get", { id })).status).toBe("in_progress"); // no second consumption
+
+    // A terminal diagnostic that settles nothing cannot silently grant the
+    // continuation, and receipt-only recovery is not starved: the sweep re-arms.
+    const idle = await task(project);
+    await writerCycle(g, idle, "publish-idle");
+    expect((await park(idle, { event: "br_done", id: prereq })).status).toBe("blocked");
+    await post("fixture/attempt-diagnosis", {});
+    const idleStamp = (await post("get", { id: idle })).meta.execution_diagnosis;
+    expect(idleStamp).toMatchObject({ generation: 1, hold: "unknown_operations" });
+    expect(await post("fixture/closed-diagnosis", { id: idleStamp.duty })).toEqual({ ok: true });
+    expect((await post("admin.unblock_proxy_sweep", { now: Date.now() })).ok).toBe(true);
+    expect((await post("get", { id: idle })).status).toBe("blocked"); // no silent continuation
+    await post("fixture/attempt-diagnosis", {});
+    const reArmed = (await post("get", { id: idle })).meta.execution_diagnosis;
+    expect(reArmed.duty).toBeTruthy();
+    expect(reArmed.duty).not.toBe(idleStamp.duty); // legitimate recovery continues
+    expect((await post("get", { id: idle })).status).toBe("blocked");
+  });
   it("recovers a stranded diagnosis after the old cooldown without retrying the unchanged work", async () => {
     const project = "aged-diagnosis", g = await gateway(project);
     const id = await task(project);
