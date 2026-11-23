@@ -1628,6 +1628,18 @@ agent sessions (machinery/web/human authority only — the same authority class 
 close-protection law), and every meta set/delete is named in the card's history line,
 so a meta shrink is never silent.
 
+**Meta key budget is a caller budget (BR#18608)**: `LIMITS.metaKeys` (20) polices
+what an API caller supplies per write — create checks the fresh meta object, update
+checks the caller's patch (`meta` ≤ 20 keys per write) — never the MERGED row. The
+hub's own lifecycle machinery stamps keys (session, completion, work_revision,
+`last_progress`, a parked card's typed `blocked` wait, execution/recovery/proxy
+receipts) through direct paths that bypass the public limit, so a long-lived task
+legitimately grows past 20 keys; the old whole-object check on update rejected
+EVERY further edit on such a card — including title/body/tags-only edits that sent
+no metadata at all (first-hand: blocked BR#6073 stranded at 28 keys / 5,851B with
+its typed wait refusing archive too). Legacy keys are grandfathered in place; the
+byte budgets below still gate the resulting row on every write.
+
 **Storage budget (BR#11554)**: a card row is written with one DO SQLite statement that
 re-binds the row's full content — title + body + meta + tags + roles. Cross ~100KB of
 bound bytes and the platform rejects the write with `SQLITE_TOOBIG` — and because every

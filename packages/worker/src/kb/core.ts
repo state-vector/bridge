@@ -655,6 +655,16 @@ export function tallyConsensus(entries: Array<{ actor?: unknown; note?: unknown 
 export const LIMITS = {
   title: 300,
   body: 100_000,
+  /**
+   * BR#18608 — the meta KEY budget is a CALLER budget, not a whole-row cap:
+   * create checks the caller's fresh meta object, update checks the
+   * caller-supplied PATCH (≤ this many keys per write) and grandfathers the
+   * merged whole. The hub's own lifecycle machinery stamps keys through
+   * direct SQL paths that bypass this check, so capping the merged object on
+   * update used to strand every lifecycle-heavy card (blocked BR#6073: 28
+   * keys / 5,851B — every body-only edit rejected, the typed wait blocking
+   * archive too). Actual storage stays bounded by the byte budgets below.
+   */
   metaKeys: 20,
   relationsPerArtefact: 100,
   /**
