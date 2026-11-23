@@ -34,6 +34,9 @@ active managed workspace or a unique local registration. The command shows
 committed `HEAD` and a separate live patch for one tracked text file (up to 64
 KiB per version), or just `HEAD` if `--file` is omitted. It does not modify the
 worktree or transfer the claim. Live edits are evidence, not a committed receipt.
+Dispatched agents are prompted to use this command if it is already available
+locally and to check their ask inbox before conflicting work or finishing.
+They use MCP for board access, not other CLI commands or the gateway registry.
 
 To follow up, use MCP `ask_agent` with `route: {kind: "executor_coordination",
 task_id: "BR#123"}` and `coordination: {request_id: "<unique ID>", wait_ms: 5000}`.

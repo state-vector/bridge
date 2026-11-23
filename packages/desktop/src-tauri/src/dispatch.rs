@@ -3184,6 +3184,17 @@ fn is_config_error(text: &str) -> bool {
 
 const BRIDGE_TOOLS_MISSING: &str = "MCP UNAVAILABLE: bridge tools missing";
 
+fn agent_environment_prompt(bridge_session: &str) -> String {
+    format!(
+        "# Environment\n\n\
+         - Your Bridge session is `{bridge_session}`. Pass `session: \"{bridge_session}\"` on every Bridge MCP call, starting with `orient`.\n\
+         - Bridge MCP is the only interface to the board. Do not probe the hub over HTTP or read `~/.bridge`. If Bridge MCP is missing, output `{BRIDGE_TOOLS_MISSING}` and end the run; do not reconstruct access.\n\
+         - When work may overlap, use `get_artefact` to identify the other task. If the local CLI is already available, the only permitted Bridge CLI command is `bridge workspaces inspect 'BR#123' --file path/to/file`. It is read-only and same-host only. Treat the live patch as provisional evidence; never edit, build, or run commands in the other worktree. If inspection is unavailable, use the board and ask instead.\n\
+         - Ask the current executor with `ask_agent`, `route: {{kind: \"executor_coordination\", task_id: \"BR#123\"}}`, a plain question and clear options. Use `coordination: {{request_id: \"a-new-unique-id\", wait_ms: 5000}}` without `artefact_id` for a short non-parking wait. On `pending`, continue independent work and reuse the same ID and question when checking again; don't loop on a pending answer.\n\
+         - At a safe point before conflicting work or finishing, check `asks` for coordination addressed to you and reply via `answer_ask`. Progress notes don't answer asks."
+    )
+}
+
 fn bridge_tools_missing(text: &str) -> bool {
     text.lines().any(|line| line.trim() == BRIDGE_TOOLS_MISSING)
 }
@@ -3583,9 +3594,7 @@ fn spawn_opencode(
         )
     };
     let bridge_session = claim_session(cfg, tid);
-    let env_block = format!(
-        "# Environment\n\n- Your bridge session name is `{bridge_session}` — pass `session: \"{bridge_session}\"` on every bridge MCP call (orient, log_progress, transition, ask_agent). That is the session holding this task's claim; orienting as any other name shows you an empty desk and breaks attribution.\n- The `bridge` MCP server is already configured in this CLI. Its tools (orient, log_progress, transition, ask_agent, get_artefact, search_knowledge, related_artefacts, get_history) are the only interface to the board — call them directly.\n- Do NOT hunt for a `bridge` CLI, probe the hub over HTTP, or read `~/.bridge` — that directory is runner-internal state, not yours. If the bridge tools are genuinely absent from this session, output `MCP UNAVAILABLE: bridge tools missing` and end the run; do not attempt to reconstruct access."
-    );
+    let env_block = agent_environment_prompt(&bridge_session);
     let mut prompt = format!(
         "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract (execution policy v1)\n\n{}\n{}\n{}\n- Blocked on a specific human decision? Bind an ask to this task. Machine capability problems use the execution protocol escalation, not a human staffing request.\n- Do not touch files outside this worktree. Never detach a subprocess from the runner process group: transfer requires a proven empty writer group.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them before you end the run. The dispatch worktree itself is managed by the runner.",
         policy, tid, title, body_md, resume_note, env_block, provisioning_line, heartbeat_line, delivery_line
@@ -4061,6 +4070,28 @@ pub fn logout(state: &DispatchState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dispatched_prompt_exposes_read_only_coordination_without_broadening_access() {
+        let prompt = super::agent_environment_prompt("dispatch-fixture");
+        for expected in [
+            "session: \"dispatch-fixture\"",
+            "only interface to the board",
+            "Do not probe the hub over HTTP or read `~/.bridge`",
+            super::BRIDGE_TOOLS_MISSING,
+            "only permitted Bridge CLI command",
+            "bridge workspaces inspect 'BR#123' --file path/to/file",
+            "never edit, build, or run commands in the other worktree",
+            "executor_coordination",
+            "request_id",
+            "without `artefact_id`",
+            "continue independent work",
+            "check `asks`",
+            "`answer_ask`",
+        ] {
+            assert!(prompt.contains(expected), "missing prompt contract: {expected}");
+        }
+    }
+
     #[test]
     fn recovery_continuation_reaches_only_the_exact_consuming_worker() {
         let permit = serde_json::json!({"phase":"consumed","consumed_generation":4,"consumed_attempt_id":"next",

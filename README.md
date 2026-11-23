@@ -1122,6 +1122,11 @@ for `HEAD` only. The patch compares live bytes to `HEAD`; it is not a staging
 receipt or a stable snapshot. This command is local only. It grants no write,
 build, or claim authority and refuses untracked files, symlinks and ambiguous paths.
 
+The native gateway prompts dispatched agents to use this specific read-only
+command if it is already available on their host. Bridge MCP remains their
+only board interface; the prompt does not authorize other CLI commands or
+direct access to the gateway registry.
+
 Use MCP `ask_agent` with `route: {kind: "executor_coordination", task_id: "BR#123"}`
 and `coordination: {request_id: "<unique caller-generated ID>", wait_ms: 5000}`
 to ask the current executor if they are already fixing the test. Supply the usual
