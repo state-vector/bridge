@@ -263,7 +263,7 @@ import { usableFor, strengthensRequirements } from "@bridge/contracts";
 import { CAPABILITY_SWEEP_SCHEMA, CAPABILITY_WAIT_INDEX_SCHEMA, ExecutionWork, isExecutionWait, ownsInteractiveClaim } from "./execution-work.ts";
 import { DISPATCH_RESERVATION_MS, SchedulingOutcomeSchema, type SchedulingOutcome, type SchedulingReason, type SchedulingHealth, type GatewayDispatch } from "@bridge/contracts";
 import { gatewayOccupancy, gatewayCapacity, dispatchAdmissionCapacity } from "./scheduling.ts";
-import { RecoveryCapacity, schedulingRank, schedulingBoost, priorityTask, recoveryReviewMeta, trainReviewParentJoin, selectionOrder, selectionEntry, bypassesWaiter, SELECTION_BYPASS_BOUND, type SelectionEntry } from "./recovery-capacity.ts";
+import { RecoveryCapacity, schedulingRank, schedulingBoost, priorityTask, recoveryReviewMeta, trainReviewParentJoin, selectionOrder, selectionEntry, bypassesWaiter, SELECTION_BYPASS_BOUND, resumeInterruptedCandidate, hostAffinityFresh, type SelectionEntry } from "./recovery-capacity.ts";
 import { boundedWakeStream } from "./sse.ts";
 import { CheckRetryCommandSchema, CandidateRepairSchema } from "@bridge/contracts";
 import { currentTrainCandidateWaits, TrainPrHoldSchema } from "@bridge/contracts";
@@ -6841,6 +6841,16 @@ export class KnowledgeHub {
     const routeFailures = new Map(this.state.storage.sql.exec(
       `SELECT route_key, failed_at FROM scheduler_provider_routes WHERE host=? AND failed_at>0`, host,
     ).toArray().map(row => [String(row.route_key), Number(row.failed_at)]));
+    // BR#14525 — worktree affinity is a PREFERENCE, never a pin: last-seen
+    // timestamps per host label decide whether a task's retained-work host
+    // hold still applies. Past the fallback window (host unobserved), the
+    // task dispatches fresh elsewhere instead of stranding behind a dead host.
+    const hostLastSeen = new Map(this.state.storage.sql.exec(
+      `SELECT t.label AS label, MAX(h.observed_ts) AS seen FROM execution_hosts h
+       JOIN auth_tokens t ON t.id = h.token_id WHERE t.revoked_ts IS NULL GROUP BY t.label`,
+    ).toArray().map(row => [String(row.label), Number(row.seen)] as const));
+    const affinityHoldApplies = (pinned: string, now: number): boolean =>
+      pinned !== host && hostAffinityFresh(hostLastSeen.get(pinned), now);
     const eligible = work.withHostSnapshot(() => rows.filter(row => {
       const id = String(row.id), meta = JSON.parse(String(row.meta ?? "{}"));
       if (this.isUnclaimableAnchor(row, meta, sinks)) return false;
@@ -6892,7 +6902,7 @@ export class KnowledgeHub {
       if ((!reason || automatic) && capabilities) {
         let prerequisites: SchedulingReason | null = null;
         const requirements = schedulingRequirements();
-        if (requirements.host && requirements.host !== host) prerequisites = "host_affinity";
+        if (requirements.host && requirements.host !== host && affinityHoldApplies(requirements.host, Date.now())) prerequisites = "host_affinity";
         else if (meta.execution_resume?.kind === "coordination_checkpoint"
           && !capabilities.tools.includes("coordination-checkpoint-v1")) prerequisites = "capability";
         else if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, host, String(row.project ?? "")))) prerequisites = "capability";
@@ -6949,7 +6959,15 @@ export class KnowledgeHub {
     // count only promotes compatible work; lane protection is derived from
     // the current failure independently of the preference classes.
     const protectedIds = eligible.length > 1 ? this.protectedLineWork(eligible) : new Set<string>();
-    const entries = new Map(eligible.map(row => [String(row.id), selectionEntry(row, protectedIds)]));
+    // BR#14525 — resume-over-new band: a todo task whose last attempt stopped
+    // interrupted dispatches ahead of ordinary new work (bounded, see
+    // recovery-capacity.ts). The classification reads the retained terminal
+    // receipt each sweep already parsed, so no extra SQL per row.
+    const entries = new Map(eligible.map(row => {
+      const id = String(row.id);
+      const resumeInterrupted = resumeInterruptedCandidate(JSON.parse(String(row.meta ?? "{}")), stateById.get(id)?.terminal ?? null);
+      return [id, selectionEntry(row, protectedIds, resumeInterrupted)] as const;
+    }));
     eligible.sort((a, b) => selectionOrder(entries.get(String(a.id))!, entries.get(String(b.id))!)
       // Independent recovery review continues the repair's queue position.
       // A failed reservation moves the review itself to the back of its class.
@@ -8082,13 +8100,14 @@ export class KnowledgeHub {
         || scope.attempt_id !== command.attempt_id || row.status !== "in_progress" || meta.session !== session) {
         throw new Error("gate: a coordination stop intent requires the current scoped worker and claim");
       }
-      if (!current.attempt?.executor?.tools.includes("coordination-checkpoint-v1")) {
-        throw new Error("gate: this attempt's gateway has not advertised coordination checkpoint support");
-      }
+      if (!worker) throw new Error("gate: a coordination stop intent requires the current scoped worker and claim");
       const checkpoint = command.checkpoint ?? current.attempt.checkpoint;
-      const slug = req.id.replace(/[^A-Za-z0-9-]/g, "-");
-      if (!checkpoint?.remote_ref.startsWith(`refs/heads/bridge-checkpoints/${slug}/${command.generation}/`)) {
-        throw new Error("gate: publish the coordination checkpoint under this task and attempt generation");
+      // BR#14525: checkpoints are LOCAL commits in the surviving worktree — the
+      // worktree is the durability boundary. The hub records the exact commit;
+      // the originating gateway's stopped-workspace verification (local commit
+      // + tree, clean status) is the proof, never a published origin ref.
+      if (!checkpoint || !/^[0-9a-f]{40,64}$/.test(checkpoint.commit) || !/^[0-9a-f]{40,64}$/.test(checkpoint.tree)) {
+        throw new Error("gate: record the coordination checkpoint's local commit and tree in the surviving worktree");
       }
       if (parseTags(row.roles).some(role => role === "review" || role === "unblock")
         || meta.operator_gated || this.protectedExecution(req.id, meta)
@@ -8317,9 +8336,6 @@ export class KnowledgeHub {
     if (begunExecutor && next.attempt) {
       const resume = meta.execution_resume;
       if (resume?.kind === "coordination_checkpoint") {
-        if (!begunExecutor.tools.includes("coordination-checkpoint-v1")) {
-          throw new Error("gate: a coordination checkpoint requires a compatible gateway");
-        }
         const source = current.attempt?.checkpoint;
         const continuation = current.coordination_wait_intent;
         if (!source || !continuation || continuation.ask_id !== resume.ask_id
@@ -8346,6 +8362,14 @@ export class KnowledgeHub {
         // BR#18328 — a new attempt invalidates any standing external wait:
         // the intent was scoped to the attempt that declared it.
         if (meta.execution_wait?.kind === "external_checks") delete meta.execution_wait;
+        // BR#14525 — the bounded resume-over-new preference: every begin whose
+        // PRIOR attempt stopped interrupted consumes one unit of the task's
+        // resume-priority budget. At RESUME_PRIORITY_BOUND the dispatch band
+        // stops promoting the task (it ages to normal priority) and this count
+        // stays on the card as the churn signal recovery attention reads.
+        if (current.terminal?.outcome?.kind === "interrupted") {
+          meta.resume_priority_grants = (Number(meta.resume_priority_grants) || 0) + 1;
+        }
       }
       if (command.kind === "checkpoint" && meta.execution_resume?.kind === "coordination_checkpoint"
         && next.coordination_wait_intent?.generation !== command.generation) {

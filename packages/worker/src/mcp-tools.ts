@@ -120,7 +120,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.accept", args))),
   },
   handoff_checkpoint: {
-    description: "Record the winning local session's newly published checkpoint before explicit human-authorised return to autonomous execution. Increments the handoff version; never requeues work by itself.",
+    description: "Record the winning local session's newly recorded checkpoint (a local commit in the surviving worktree — BR#14525) before explicit human-authorised return to autonomous execution. Increments the handoff version; never requeues work by itself.",
     schema: TOOL_ARG_SCHEMAS.handoff_checkpoint,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("handoff.checkpoint", args))),
   },

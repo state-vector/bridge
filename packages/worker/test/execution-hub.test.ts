@@ -26,7 +26,7 @@ beforeAll(async () => {
 });
 
 let serial = 0;
-const checkpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/test/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Continue repair", tests: [] };
+const checkpoint = { repo: "https://github.com/state-vector/bridge", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Continue repair", tests: [] };
 const localCapabilities = { tier: "large", backend: "interactive", model: "test/large", tools: ["git"], environment: ["linux"], projects: ["bridge"] };
 async function runtimeTask() {
   const name = `handoff-host-${++serial}`;
@@ -90,7 +90,7 @@ describe("historical stopped-writer receipts", () => {
     const r = await setup();
     const peer = await setup();
     const fence = { generation: 1, attempt_id: "old" };
-    const waitCheckpoint = { ...checkpoint, remote_ref: `refs/heads/bridge-checkpoints/${r.id.replace("#", "-")}/1/test` };
+    const waitCheckpoint = { ...checkpoint };
     const worker = { actor: r.auth.agent, token_id: r.worker.id, session: r.auth.session,
       execution_scope: { id: r.id, ...fence } };
     const ask = await post<{ id: string }>("ask.create", {

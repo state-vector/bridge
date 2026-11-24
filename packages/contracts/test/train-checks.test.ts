@@ -21,8 +21,8 @@ describe("BR#9268 check-run producer identity", () => {
   });
 
   it("keeps the live #3057 collision pair distinct obligations; same-producer supersession preserved", () => {
-    const native = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: "actions_job" } };
-    const published = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: "published" } };
+    const native = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: "actions_job" } } as const;
+    const published = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: GITHUB_ACTIONS_APP_ID, producer: "published" } } as const;
     // Same name + app + suite, different producer → different obligations.
     expect(checkObligationKey(native)).not.toBe(checkObligationKey(published));
     // Same class, same everything → one obligation (supersession holds).
@@ -39,15 +39,15 @@ describe("BR#9268 check-run producer identity", () => {
   });
 
   it("keeps the pre-split identity byte-stable for legacy callers and derives the collapsed key for the fence", () => {
-    const withProducer = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: 15368, producer: "actions_job" } };
-    const withoutProducer = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: 15368 } };
+    const withProducer = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: 15368, producer: "actions_job" } } as const;
+    const withoutProducer = { name: "Deploy health (merge gate)", source: { kind: "check_run", suite_id: 115286627637, app_id: 15368 } } as const;
     // A producer-less observation keeps the EXACT pre-split key format.
     expect(checkObligationKey(withoutProducer)).toBe(JSON.stringify(["check_run", 15368, 115286627637, "Deploy health (merge gate)"]));
     // The legacy identity of a producer-typed observation IS that key — the
     // fence surface across the migration.
     expect(legacyCheckObligationKey(withProducer)).toBe(checkObligationKey(withoutProducer));
     // For workflow_run / unknown sources the two identities coincide.
-    const wf = { name: "Deploy Dev", source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 } };
+    const wf = { name: "Deploy Dev", source: { kind: "workflow_run", workflow_id: 99, run_attempt: 1 } } as const;
     expect(legacyCheckObligationKey(wf)).toBe(checkObligationKey(wf));
     expect(legacyCheckObligationKey({ name: "Gate" })).toBe(JSON.stringify(["unknown", "Gate"]));
   });

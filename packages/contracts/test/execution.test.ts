@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
-const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", remote_ref: "refs/heads/bridge-checkpoints/BR-1/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
+const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
 const begin = { kind: "begin", attempt_id: "one", worker: "mac/worker", action_budget_ms: 60_000 } as const;
 const fence = { generation: 1, attempt_id: "one" };
 const step = (s: ExecutionState, c: ExecutionCommand, now = 100, host = "mac", session = "dispatch-BR-1") => reduceExecution(s, c, host, session, now);
@@ -10,7 +10,7 @@ const started = () => step(initialExecution(), begin);
 
 it("requests a checkpoint-bound coordination stop without attesting quiescence", () => {
   const command = { kind: "request_coordination_wait", ...fence, ask_id: "BR#42", checkpoint_commit: cp.commit } as const;
-  expect(() => step(started(), command)).toThrow(/published checkpoint/);
+  expect(() => step(started(), command)).toThrow(/recorded checkpoint/);
   const checkpointed = step(started(), { kind: "checkpoint", ...fence, checkpoint: cp });
   const waiting = step(checkpointed, command);
   expect(waiting.attempt?.phase).toBe("stopping");
@@ -18,7 +18,7 @@ it("requests a checkpoint-bound coordination stop without attesting quiescence",
   expect(waiting.coordination_wait_intent).toEqual({ ...fence, ask_id: "BR#42", checkpoint_commit: cp.commit });
   expect(() => step(waiting, { ...command, generation: fence.generation + 1 })).toThrow(/fenced/);
   const changedCheckpoint = { ...cp, commit: cp.base };
-  expect(() => step(waiting, { kind: "checkpoint", ...fence, checkpoint: changedCheckpoint })).toThrow(/bound to the published checkpoint/);
+  expect(() => step(waiting, { kind: "checkpoint", ...fence, checkpoint: changedCheckpoint })).toThrow(/bound to the recorded checkpoint/);
 });
 
 describe("durable execution failure boundaries", () => {

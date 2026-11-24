@@ -55,7 +55,7 @@ fn inspection_uses_only_the_active_attempt_from_the_owner_ledger() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Managed { root: owner.allocations.join(id) },
-            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
         }).unwrap();
     }
     assert_eq!(owner.active_paths_for_task("BR#42").unwrap(), vec![owner.allocations.join("active/work")]);
@@ -199,7 +199,7 @@ fn budget_counts_aliased_nested_allocations_once() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Legacy { root, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
         }).unwrap();
     }
     let allocation_bytes = disk_bytes(&allocation).unwrap();
@@ -272,7 +272,7 @@ fn legacy_unknown_operations_are_retained_without_publishing_or_removing_source(
     let (cfg,ready,_)=fixture(&hub);let owner=Owner::open(&cfg).unwrap();
     let root=PathBuf::from(&cfg.workdir).join("legacy");fs::create_dir_all(&root).unwrap();fs::write(root.join("evidence"),"do not replay or delete").unwrap();
     let id=legacy::allocation_id("legacy",&root).unwrap();
-    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None}).unwrap();
+    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);assert!(root.join("evidence").exists());
     assert!(owner.read(&id).unwrap().error.unwrap().contains("operation evidence"));
     drop(ready);let _=fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
@@ -325,7 +325,7 @@ fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
         fs::write(path.join("unpublished-input"), "keep this").unwrap();
         owner.save(&Resource {
             version: 1, id, location: Location::Legacy { root: path, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
         }).unwrap();
     }
     let t = ticket("released-under-pressure");
@@ -445,7 +445,7 @@ fn completed_resource_history_is_cold_and_cannot_resurrect_a_claim() {
     let before=fs::read(owner.archive_file(&id)).unwrap();
     for n in 0..256 {
         let name=format!("historical-{n}");
-        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None}).unwrap();
+        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}).unwrap();
     }
     assert!(owner.records().unwrap().is_empty(),"completed history must not be scanned/rewritten as active work");
     owner.reconcile(&[]).unwrap();assert_eq!(fs::read(owner.archive_file(&id)).unwrap(),before);
@@ -548,4 +548,102 @@ fn admission_sampling_holds_under_genuine_pressure_but_never_advances_the_reclai
     owner.reconcile(&[]).unwrap();
     assert!(!root2.exists());
     assert!(matches!(owner.read(&id2).unwrap().phase,Phase::Removed { .. }));
+}
+
+// BR#14525 — worktree affinity: a retry generation adopts the SAME EXISTING
+// worktree of its task's prior (quiesced, released, in-TTL) generation, with
+// the inherited state assessed for the resume protocol; the re-keyed record
+// preserves the directory (moving a git worktree breaks its link).
+#[test]
+fn affinity_adopts_a_quiesced_prior_worktree_and_assesses_inherited_state() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let first=Ticket { task_id:"BR#42".into(), session:"gen-1".into() };
+    let a=owner.allocate(&first,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    let root=a.root.clone();let work=a.work.clone();
+    a.bind(&attempt(&first)).unwrap();drop(a);
+    fs::write(work.join("tracked"),"generation-1 WIP\n").unwrap();
+    owner.release(&released(&attempt(&first))).unwrap();
+    // The dirty released tree is held by the explicit retention policy, not
+    // error churn: stays Released as the adoptable value signal.
+    owner.reconcile(&[]).unwrap();
+    let old_id=journal::stable_key(&[&first.task_id,&first.session]);
+    let record=owner.read(&old_id).unwrap();
+    assert!(matches!(record.phase,Phase::Released { .. }));
+    assert!(record.retained_value.as_deref().is_some_and(|s| s.contains("unpublished worktree value")),"value signal missing: {:?}",record.retained_value);
+    assert!(record.error.is_none(),"retention is policy, not error churn");
+    assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("generation-1"));
+    // The next generation adopts in place.
+    let second=Ticket { task_id:"BR#42".into(), session:"gen-2".into() };
+    let b=owner.allocate(&second,Some(source.to_str().unwrap())).unwrap();
+    assert_eq!(b.root,root,"adoption must resume the SAME worktree");
+    assert!(b.adopted.as_deref().is_some_and(|s| s.contains("uncommitted")),"resume prompt needs the inherited assessment: {:?}",b.adopted);
+    assert_eq!(journal::stable_key(&[&second.task_id,&second.session]),b.id);
+    let adopted=owner.read(&b.id).unwrap();
+    assert!(matches!(adopted.phase,Phase::InUse {owner:Ownership::Reservation {ref ticket,..}} if ticket.session=="gen-2"));
+    assert_eq!(adopted.adopted_from.as_deref(),Some(old_id.as_str()));
+    assert!(!owner.file(&old_id).exists(),"the re-keyed record must not keep its old live file");
+    let receipt:Resource=serde_json::from_slice(&fs::read(owner.archive_file(&old_id)).unwrap()).unwrap();
+    assert!(matches!(receipt.phase,Phase::Removed { .. }),"the pre-adoption record survives as the adoption receipt");
+    // The adoption binds to the new generation's attempt and the WIP survives.
+    b.bind(&attempt(&second)).unwrap();
+    assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("generation-1"));
+    assert_eq!(owner.active_paths_for_task("BR#42").unwrap(),vec![work.clone()]);
+}
+
+// BR#14525 — affinity is a PREFERENCE, never a pin: past the TTL the tree is
+// no longer adoptable and a fresh allocation starts elsewhere; the retained
+// tree's hold ends (never a silent wipe — the fences still govern removal).
+#[test]
+fn expired_affinity_starts_fresh_and_ends_the_retention_hold() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let first=Ticket { task_id:"BR#42".into(), session:"gen-1".into() };
+    let a=owner.allocate(&first,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    let root=a.root.clone();let work=a.work.clone();
+    a.bind(&attempt(&first)).unwrap();drop(a);
+    fs::write(work.join("tracked"),"stale WIP\n").unwrap();
+    owner.release(&released(&attempt(&first))).unwrap();
+    let old_id=journal::stable_key(&[&first.task_id,&first.session]);
+    let mut record=owner.read(&old_id).unwrap();
+    record.last_activity_at=now_ms().saturating_sub(worktree_ttl().as_millis() as u64).saturating_sub(1);
+    owner.save(&record).unwrap();
+    let second=Ticket { task_id:"BR#42".into(), session:"gen-2".into() };
+    let b=owner.allocate(&second,Some(source.to_str().unwrap())).unwrap();
+    assert_ne!(b.root,root,"expired affinity must fall back to a fresh worktree");
+    assert!(b.adopted.is_none());
+    // The expired hold yields: the retention signal names the cure and the
+    // evidence fences still refuse to destroy the unpublished source.
+    owner.reconcile(&[]).unwrap();
+    let expired=owner.read(&old_id).unwrap();
+    assert!(expired.retained_value.as_deref().is_some_and(|s| s.contains("TTL expired")),"{:?}",expired.retained_value);
+    assert!(expired.error.as_deref().is_some_and(|e| e.contains("retention ended")));
+    assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("stale WIP"),"age alone is never deletion authority");
+}
+
+// BR#14525 — a clean, published done tree reclaims immediately (task done),
+// while a dirty tree inside the TTL stays adoptable; adoption clears the
+// value signal as the next generation takes over.
+#[test]
+fn done_trees_reclaim_while_dirty_trees_stay_adoptable_until_taken() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let done=Ticket { task_id:"BR#90".into(), session:"gen-1".into() };
+    let a=owner.allocate(&done,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    let done_root=a.root.clone();drop(a);
+    owner.release(&released(&attempt(&done))).unwrap();
+    let dirty=Ticket { task_id:"BR#91".into(), session:"gen-1".into() };
+    let b=owner.allocate(&dirty,Some(source.to_str().unwrap())).unwrap();configure(&b.work,&sandbox.0);
+    let dirty_root=b.root.clone();let dirty_work=b.work.clone();
+    b.bind(&attempt(&dirty)).unwrap();drop(b);
+    fs::write(dirty_work.join("tracked"),"precious WIP\n").unwrap();
+    owner.release(&released(&attempt(&dirty))).unwrap();
+    owner.reconcile(&[]).unwrap();
+    assert!(!done_root.exists(),"a clean published done tree is not retained by policy");
+    assert!(dirty_root.exists(),"a dirty tree inside the TTL is the adoptable value");
+    let next=Ticket { task_id:"BR#91".into(), session:"gen-2".into() };
+    let c=owner.allocate(&next,Some(source.to_str().unwrap())).unwrap();
+    assert_eq!(c.root,dirty_root);
+    let adopted=owner.read(&c.id).unwrap();
+    assert!(adopted.retained_value.is_none(),"adoption clears the value signal");
 }

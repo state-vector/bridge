@@ -139,10 +139,13 @@ export function capabilityBlockers(required: ExecutionRequirements, actual: Pick
   ];
 }
 
-/** A remote ref alone is insufficient: the restoring runner verifies BOTH objects. */
+/** BR#14525 (owner ruling 2026-11-13): NO git-pushed checkpoints — partial-state
+ * refs on origin pollute git and trigger CI. The WORKTREE is the durability
+ * boundary: a checkpoint records a LOCAL commit in the surviving worktree, and
+ * the originating gateway verifies the stopped workspace (commit + tree exist
+ * there), never a published ref. */
 export const CheckpointSchema = z.object({
   repo: text,
-  remote_ref: z.string().regex(/^refs\/heads\/bridge-checkpoints\/[A-Za-z0-9/_-]+$/),
   commit: sha,
   tree: sha,
   base: sha,
@@ -660,10 +663,10 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     }
     case "checkpoint": {
       const current = requireAttempt(true);
-      if (current.phase === "quiesced") throw new Error("gate: quiesced writer cannot publish new checkpoints");
+      if (current.phase === "quiesced") throw new Error("gate: quiesced writer cannot record new checkpoints");
       if (command.checkpoint.tests.some(t => t.tree !== command.checkpoint.tree)) throw new Error("gate: test evidence does not cover checkpoint content");
       if (s.coordination_wait_intent?.generation === current.generation && current.checkpoint?.commit !== command.checkpoint.commit) {
-        throw new Error("gate: the coordination wait is bound to the published checkpoint");
+        throw new Error("gate: the coordination wait is bound to the recorded checkpoint");
       }
       current.checkpoint = command.checkpoint;
       break;
@@ -677,7 +680,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       const checkpoint = command.checkpoint ?? current.checkpoint;
       if (checkpoint?.commit !== command.checkpoint_commit
         || checkpoint.tests.some(test => test.tree !== checkpoint.tree)) {
-        throw new Error("gate: coordination wait requires the exact published checkpoint");
+        throw new Error("gate: coordination wait requires the exact recorded checkpoint");
       }
       if (s.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) {
         throw new Error("gate: reconcile external operations before requesting a coordination wait");

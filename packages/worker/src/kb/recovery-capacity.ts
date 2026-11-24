@@ -66,6 +66,38 @@ export function schedulingBoost(meta: Meta): number {
  * verification never wait behind it. */
 export const SELECTION_BYPASS_BOUND = 10;
 
+/** BR#14525 — resume-over-new dispatch priority: a todo task whose LAST
+ *  attempt stopped interrupted outranks ordinary new work (rank 5) but stays
+ *  below review/unblock duties (4), explicit boosts (3) and every recovery
+ *  class (0-2), composing the owner's law: recovery > resume-interrupted >
+ *  new-todo. Bounded for fairness: at most RESUME_PRIORITY_BOUND priority
+ *  resumes per task (meta.resume_priority_grants, counted at each begin whose
+ *  prior attempt stopped interrupted) before it ages back to normal priority —
+ *  the count itself is the churn signal recovery attention reads. */
+export const RESUME_PRIORITY_RANK = 4.5;
+export const RESUME_PRIORITY_BOUND = 3;
+
+/** BR#14525 — worktree affinity is a PREFERENCE, never a pin (owner ruling
+ *  2026-11-13: the worktree is the durability boundary, so a retained tree is
+ *  worth chasing — but not at the price of stranding the task). The host hold
+ *  for a task pinned to its retained-work host expires once that host has
+ *  been unobserved past this window; dispatch then falls back to a fresh
+ *  start on any capable host. */
+export const HOST_AFFINITY_FALLBACK_MS = 30 * 60_000;
+
+/** The pinned host's last observation clears the hold once stale past the
+ *  fallback window; a host with no observation row is treated as gone. */
+export const hostAffinityFresh = (lastSeen: number | undefined, now: number): boolean =>
+  (lastSeen ?? 0) > now - HOST_AFFINITY_FALLBACK_MS;
+
+/** True when a todo task's last attempt stopped interrupted and the task has
+ *  not yet exhausted its bounded resume-priority budget. `terminal` is the
+ *  execution state's retained terminal receipt (prior attempt). */
+export const resumeInterruptedCandidate = (meta: Meta,
+  terminal: { outcome?: { kind?: string } } | null | undefined): boolean =>
+  terminal?.outcome?.kind === "interrupted"
+  && (!(typeof meta.resume_priority_grants === "number") || meta.resume_priority_grants < RESUME_PRIORITY_BOUND);
+
 export interface SelectionEntry {
   id: string;
   /** Derived from the current lane and its exact recovery dependencies. */
@@ -99,16 +131,20 @@ export function selectionOrder(a: SelectionEntry, b: SelectionEntry): number {
 /** The row -> SelectionEntry mapping every selection stage uses, so dispatch
  * and diagnosis cannot drift apart. Rows without dispatch enrichment (the
  * diagnosis sweep) fall back to their own columns. */
-export const selectionEntry = (row: Record<string, unknown>, protectedIds: ReadonlySet<string>): SelectionEntry => ({
+export const selectionEntry = (row: Record<string, unknown>, protectedIds: ReadonlySet<string>,
+  resumeInterrupted = false): SelectionEntry => {
+  const rank = taskSchedulingRank(priorityTask(row));
+  return {
   id: String(row.id),
   lineProtected: protectedIds.has(String(row.id)),
-  rank: taskSchedulingRank(priorityTask(row)),
+  rank: resumeInterrupted && rank >= 4 ? Math.min(rank, RESUME_PRIORITY_RANK) : rank,
   boost: Math.max(schedulingBoost(JSON.parse(String(row.meta ?? "{}"))),
     row.reserved_before ? 0 : schedulingBoost(JSON.parse(String(row.train_parent_meta ?? "{}")))),
   queue_ts: Number(row.queue_ts ?? row.created_ts ?? 0),
   bypassed: Number(row.bypassed ?? 0),
   waitingSince: Number(row.bypass_since ?? row.queue_ts ?? row.created_ts ?? 0),
-});
+  };
+};
 
 /** True when selecting `winner` while `waiter` stayed eligible is a priority
  * bypass — a better class or a stronger explicit boost — rather
