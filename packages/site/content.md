@@ -55,11 +55,12 @@ observe a live target executor, it returns `pending` with `wait_skipped` instead
 of waiting. The same ask stays open and is routed to the next current executor.
 After the delivery grace, failed executor delivery makes that ask visible to the
 agent pool until a current executor is live; it does not become a human ask.
-With no independent work left, a managed implementation can publish a fenced
-checkpoint and request a durable wait on the same ask. The originating
-gateway proves writer stop before releasing the slot. The replacement runner
-verifies the exact commit and tree before resuming. Cancellation does not
-fabricate an answer.
+With no independent work left, a managed implementation can record a fenced
+checkpoint — a signed LOCAL commit in its surviving worktree (BR#14525: the
+worktree is the durability boundary; no refs are pushed to origin) — and
+request a durable wait on the same ask. The originating gateway proves writer
+stop before releasing the slot. The replacement runner verifies the exact
+commit and tree before resuming. Cancellation does not fabricate an answer.
 
 Old registered worktrees, runner session/scratch roots, `~/opencode-tmp` and
 repository caches are adopted into the same lifecycle with preservation and
@@ -481,14 +482,27 @@ Namespaced worker identities such as `gateway/opencode` can receive coordination
 directly, including session-qualified addresses.
 
 Execution protocol v1 connects the hub's SQLite journal to the native runner.
-Before spawning, the runner obtains a fenced attempt generation. It publishes
-signed private-index Git checkpoints every five minutes and at process exit,
-including tracked/untracked non-ignored work, and verifies the remote ref. A
-replacement writer requires proven process-group quiescence; cross-machine
-continuation also verifies the checkpoint's commit and content tree. Failed
-publication, newer local WIP or unproven writer isolation retains the work and
-host affinity. A dead host cannot guarantee preservation of changes since its
-last published checkpoint.
+Before spawning, the runner obtains a fenced attempt generation. WIP durability
+is the worktree itself (BR#14525 owner ruling 2026-11-13: NO git-pushed
+checkpoints — the `refs/heads/bridge-checkpoints/*` remote surface is
+deprecated and partial-state refs must never reach origin): writers commit
+early and often as signed LOCAL commits, push nothing until the final signed
+delivery, and a coordination stop records the exact local commit and tree for
+the gateway to verify in the surviving workspace. A retry generation prefers
+to resume the SAME existing worktree — adoption only after the prior
+generation is verifiably quiescent, inside a 24h affinity TTL — and dispatch
+prefers resuming interrupted work over starting new work (recovery first,
+then resume-interrupted, then new todo), bounded to three priority resumes per
+task before it ages back to normal priority and signals the churn pattern for
+recovery attention. Affinity is a preference, never a pin: past a 30-minute
+host-unobserved fallback the task starts fresh elsewhere instead of stranding.
+A replacement writer requires proven process-group quiescence; continuation
+verifies the recorded commit and content tree in the surviving workspace.
+Unproven writer isolation retains the work and host affinity, and released
+worktrees holding unpublished value are retained by explicit policy — reclaim
+needs TTL expiry, task completion/abandonment, or disk pressure that frees
+done worktrees first and never the currently dispatched task — never silent
+GC of WIP.
 
 Action budgets are independent of stdout activity. Coordination mailboxes
 and execution leases are polled every 20 seconds by a dedicated per-attempt
