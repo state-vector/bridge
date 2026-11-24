@@ -364,7 +364,7 @@ impl Owner {
         // live ledger keeps exactly one record for this allocation.
         let receipt = serde_json::to_vec(&Resource { phase: Phase::Removed { reclaimed_bytes: 0, at: now }, adopted_from: None, ..record.clone() }).map_err(|e| e.to_string())?;
         record.id = new_id.clone();
-        record.adopted_from = Some(old_id);
+        record.adopted_from = Some(old_id.clone());
         record.phase = Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } };
         record.last_activity_at = now;
         record.retained_value = None;
@@ -386,7 +386,7 @@ impl Owner {
         let status = git(work, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?;
         let lines: Vec<&str> = status.lines().collect();
         let dirty = lines.len();
-        let published = if dirty { true } else {
+        let published = if dirty > 0 { true } else {
             git(work, &["for-each-ref", "--format=%(objectname)", "--contains", "HEAD", "refs/remotes/origin"])?.lines().count() > 0
         };
         let head = git(work, &["rev-parse", "--short", "HEAD"])?;
@@ -539,7 +539,21 @@ impl Owner {
         if let Phase::Released { .. } = &record.phase {
             match self.retention(record)? {
                 Retention::Reclaim => { record.retained_value = None; },
-                Retention::Hold { signal } => { record.retained_value = Some(signal); return Ok(()); },
+                Retention::Hold { signal } => {
+                    // Holding the worktree's unpublished value never freezes
+                    // its regenerable build cache: the disposable sweep
+                    // (BR#14740 class) still runs this pass, journalled and
+                    // byte-counted, while the retirement ladder below stays
+                    // fenced. Unique ignored evidence still reports through
+                    // the standard fence error.
+                    record.retained_value = Some(signal);
+                    legacy::no_readers(record.location.root(), self.reader_authority(record)?)?;
+                    let mut paths = Vec::new();
+                    repositories(&record.location.work(), &mut paths)?;
+                    self.retire_disposable_children(record, &paths)?;
+                    for path in &paths { unpreserved_ignored_inputs(path)?; }
+                    return Ok(());
+                },
                 Retention::Yield { signal } => {
                     record.retained_value = Some(signal);
                     return Err("BR#14525 retention ended (TTL expiry or disk pressure); unpublished worktree value needs an explicit adoption or a recorded reset before reclaim; source retained".into());
@@ -623,10 +637,10 @@ impl Owner {
         // can only over-report publication, erring toward reclaiming a
         // genuinely-published done tree, never toward destroying WIP. The
         // live `verify_published_source` fence still governs any removal.
-        let published = if dirty { true } else {
+        let published = if dirty > 0 { true } else {
             git(&work, &["for-each-ref", "--format=%(objectname)", "--contains", "HEAD", "refs/remotes/origin"])?.lines().count() > 0
         };
-        if !dirty && published { return Ok(Retention::Reclaim); }
+        if dirty == 0 && published { return Ok(Retention::Reclaim); }
         let signal = format!("unpublished worktree value (BR#14525 value signal): {dirty} uncommitted entries, local commits {}published", if published { "" } else { "UN" });
         let pressure = self.status().is_ok_and(|s| matches!(s.admission, Admission::Held { .. }));
         if pressure { return Ok(Retention::Yield { signal: format!("{signal}; yielding to disk pressure") }); }

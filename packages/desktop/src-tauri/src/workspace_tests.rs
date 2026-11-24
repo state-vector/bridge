@@ -630,6 +630,7 @@ fn done_trees_reclaim_while_dirty_trees_stay_adoptable_until_taken() {
     let source=crate::checkpoint::tests::init(&sandbox.0);
     let done=Ticket { task_id:"BR#90".into(), session:"gen-1".into() };
     let a=owner.allocate(&done,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&done)).unwrap();
     let done_root=a.root.clone();drop(a);
     owner.release(&released(&attempt(&done))).unwrap();
     let dirty=Ticket { task_id:"BR#91".into(), session:"gen-1".into() };
