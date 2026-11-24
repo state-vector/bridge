@@ -11,6 +11,7 @@ import { useKb } from "../server/kbStore";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { CopyContextBtn } from "./copyContext";
 import { SupersedeBtn } from "./supersede";
+import { OwnerOverrides } from "./ownerOverrides";
 import { ExecutionModel, ExecutionStatus } from "./ExecutionModel";
 import { ExecutionHistoryEventSchema, executionHistorySummary } from "@bridge/contracts";
 import { StartupWaitNotice } from "./StartupWaitNotice";
@@ -482,6 +483,14 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             <>{((task.meta as TaskMeta | undefined)?.superseded_by ? " · " : " — ")}{(task.meta as TaskMeta | undefined)!.superseded_reason}</>
           )}
         </div>
+      )}
+      {/* BR#21657: the owner overrides row — the human escape hatch for wedged
+          claims (BR#3625 class). Renders on any non-terminal task card that
+          carries a claim or a hold marker; the component hides itself when
+          neither applies. Authority is re-verified server-side (admin-mint
+          web session); refusals render inline, never a silent no-op. */}
+      {task.type === "task" && (
+        <OwnerOverrides task={task as any} onChanged={onChanged} />
       )}
       {ask && ask.status === "open" && (
         <div className="task-blocked-info">

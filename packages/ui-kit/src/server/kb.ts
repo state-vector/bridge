@@ -581,6 +581,20 @@ export const kbApi = {
       method: "POST",
       body: JSON.stringify({ id, decision, ...(note ? { note } : {}) }),
     }),
+  // BR#21657: owner web-plane overrides — claim release (any claim class,
+  // typed reason mandatory) and wedged-hold clear/park (typed wait / bound
+  // ask / stale train bounce). Web/human-only server-side (bearers 403);
+  // both write an audit event naming actor + reason.
+  releaseClaim: (id: string, reason: string) =>
+    j<{ ok: boolean; id: string; status: string; holder_session: string | null }>(`/api/kb/release_claim`, {
+      method: "POST",
+      body: JSON.stringify({ id, reason }),
+    }),
+  clearHold: (id: string, hold: "merge_train" | "await_event" | "bound_ask", action: "clear" | "park", reason: string, unblock_condition?: string) =>
+    j<{ ok: boolean; id: string; status: string; action: string; hold: string }>(`/api/kb/clear_hold`, {
+      method: "POST",
+      body: JSON.stringify({ id, hold, action, reason, ...(unblock_condition ? { unblock_condition } : {}) }),
+    }),
   update: (id: string, patch: { title?: string; body_md?: string; meta?: object; tags?: string[]; roles?: string[] }) =>
     j<{ id: string }>("/api/kb/update", { method: "POST", body: JSON.stringify({ id, ...patch }) }),
 

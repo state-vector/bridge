@@ -349,6 +349,36 @@ export default {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
         }));
       }
+      if (sub === "release_claim" && request.method === "POST") {
+        // BR#21657 override 1: owner claim release — the human escape hatch for
+        // wedged claims (the BR#3625 class: a delivered card held by a dead
+        // interactive credential had no release path; takeover was refused
+        // takeover-held behind a stale typed wait). Web/human-only: the
+        // session cookie is the human, a bearer is an agent identity and the
+        // overrides are never agent-reachable. The DO re-verifies the
+        // admin-mint header server-side (this is the same trust class as the
+        // admin API below) and composes the release through the normal
+        // transition executor; the typed reason is mandatory and audited.
+        if (auth.bearer) return kbCors(json({ error: "release claim is web/human-only (BR#21657) — the claim escape hatch is never agent-reachable; coordinate via claim_takeover or ask_agent" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(env.KB.get(kbId).fetch("https://kb/task.release_claim", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body),
+        }));
+      }
+      if (sub === "clear_hold" && request.method === "POST") {
+        // BR#21657 override 2: owner clear/park of a WEDGED hold — a typed
+        // wait, bound ask or stale train bounce whose defect no longer
+        // matches live state. Explicit action + typed reason, audited, never
+        // automatic (the automatic legs are #474/BR-17043 and stay separate
+        // mechanisms); same web/human-only trust class as release_claim.
+        if (auth.bearer) return kbCors(json({ error: "clear hold is web/human-only (BR#21657) — the hold override is never agent-reachable" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(env.KB.get(kbId).fetch("https://kb/task.clear_hold", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body),
+        }));
+      }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);

@@ -5249,6 +5249,12 @@ export class KnowledgeHub {
         case "claim.takeover": return this.json(await this.claimTakeover(body, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
         case "card.force_review": return this.json(await this.cardForceReview(body, actor));
+        // BR#21657 — owner web-plane overrides: claim release + wedged-hold
+        // clear/park. The DO re-verifies the admin-mint session server-side
+        // (isAdmin header + web actor + no bearer identity); the ops are
+        // never agent-reachable even though the switch itself is shared.
+        case "task.release_claim": return this.json(await this.taskReleaseClaim(body, actor, isAdmin));
+        case "task.clear_hold": return this.json(await this.taskClearHold(body, actor, isAdmin));
         case "link": return this.json(await this.link(body, actor));
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats(body));
@@ -8687,6 +8693,139 @@ export class KnowledgeHub {
       }
       throw e;
     }
+  }
+
+  /** BR#21657 — authority gate shared by the owner web-plane overrides. The
+   *  trust class is the admin mint: the worker stamps `x-kb-admin: 1` ONLY
+   *  after an interactive cookie session authenticated (index.js), so the
+   *  flag arriving here is server-verified session authority, never a body
+   *  claim. A bearer identity (body.token_id — an agent credential) or a
+   *  non-web actor is refused: the overrides are the human escape hatch for
+   *  wedged claims (the BR#3625 class) and are never agent-reachable. */
+  private ownerOverrideGate(op: string, body: any, actor: string, isAdmin: boolean) {
+    if (!isAdmin || !actor.startsWith("web:") || body.token_id)
+      throw Object.assign(
+        new Error(`gate: ${op} is the owner web-plane override (BR#21657, admin-mint session authority) — human web session only; agents coordinate via claim_takeover or ask_agent`),
+        { result_class: "gate_rejected" },
+      );
+  }
+
+  /** BR#21657 override 1 — release ANY claim class (interactive or runner)
+   *  to the pool, with a typed audited reason. The motivating wedge: a
+   *  delivered card claimed by a dead interactive credential had no release
+   *  path at all (only runner-class claims have the dispatch-internal one,
+   *  and takeover is refused takeover-held while a typed wait lives).
+   *
+   *  The release composes through the ONE transition executor with the web
+   *  actor: `release-needs-ownership` passes (OWNER_RELEASE_EXEMPT), the
+   *  todo leg deletes meta.session/interactive_execution and clears the
+   *  owner, and a live managed attempt flips to stopping — identical
+   *  bookkeeping to a normal owner release, no parallel state path (rule 9:
+   *  consolidate owners, never add a second one). Hold state (train slot,
+   *  typed wait, bound ask) is NOT touched — it still owns its exit; the
+   *  dedicated clear/park override (task.clear_hold) is for the stale
+   *  marker whose defect no longer matches live state. */
+  private async taskReleaseClaim(body: any, actor: string, isAdmin: boolean) {
+    this.ownerOverrideGate("release claim", body, actor, isAdmin);
+    const id = String(body.id ?? "").trim();
+    if (!id) throw new Error("release claim requires id");
+    const reason = String(body.reason ?? "").trim();
+    if (reason.length < 3) throw new Error("release claim requires a typed reason — every override is audited with its actor + reason");
+    const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "task") throw new Error(`release claim is a task action — ${id} is a ${row.type}`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (meta.lane) throw new Error(`gate: ${id} is a standing lane card — the merge train owns its lifecycle; owner overrides do not apply`);
+    if (!["in_progress", "blocked"].includes(row.status)) {
+      const hint = row.status === "in_review"
+        ? " (under review — bounce or close it through review)"
+        : row.status === "todo"
+          ? " (unclaimed — claim it normally)"
+          : " (terminal)";
+      throw new Error(`release claim applies to a claimed card (in_progress|blocked) — ${id} is '${row.status}'${hint}`);
+    }
+    const holderSession = typeof meta.session === "string" ? meta.session : null;
+    const ts = Date.now();
+    await this.transition({ id, to: "todo", note: `claim released by owner override (web) — ${reason}` }, actor, "client");
+    this.audit(actor, "release_claim_override", id, {
+      from: row.status, owner: String(row.owner ?? ""), holder_session: holderSession, reason,
+    });
+    this.version(id, actor, "note",
+      `owner override: claim released — holder ${holderSession ?? "(none)"} → pool; reason: ${reason}`,
+      { release_claim: { at: ts, from: row.status, holder_session: holderSession, reason } });
+    return { ok: true, id, status: "todo", released: true, holder_session: holderSession };
+  }
+
+  /** BR#21657 override 2 — clear or park a WEDGED hold: a typed wait, bound
+   *  ask or stale train bounce whose defect no longer matches live state
+   *  (the BR#3625 stale bounce: train state `bounced` while the pr_merged
+   *  leg had already landed). Explicit owner action + typed reason, audited,
+   *  never automatic — the automatic legs live in BR#17043 (refusal bound)
+   *  and #474 (managed re-dispatch) and stay separate mechanisms.
+   *
+   *  Live train slots (queued/awaiting-ci/conflicting) are NOT clearable —
+   *  the serialized train owns them and clearing would strand the queue
+   *  (the BR#4067/BR#4995 class); the park action is the safe override for
+   *  a wedge the human judges real. Standing lane cards are refused: the
+   *  lane lifecycle owns them. */
+  private async taskClearHold(body: any, actor: string, isAdmin: boolean) {
+    this.ownerOverrideGate("clear hold", body, actor, isAdmin);
+    const id = String(body.id ?? "").trim();
+    if (!id) throw new Error("clear hold requires id");
+    const reason = String(body.reason ?? "").trim();
+    if (reason.length < 3) throw new Error("clear hold requires a typed reason — every override is audited with its actor + reason");
+    const action = String(body.action ?? "clear");
+    if (!["clear", "park"].includes(action)) throw new Error("clear hold action must be 'clear' or 'park'");
+    const hold = String(body.hold ?? "").trim();
+    if (!["merge_train", "await_event", "bound_ask"].includes(hold)) throw new Error("clear hold requires hold: 'merge_train' | 'await_event' | 'bound_ask'");
+    const row = this.one(`SELECT * FROM artefacts WHERE id = ?`, id);
+    if (!row) throw new Error(`no such artefact: ${id}`);
+    if (row.type !== "task") throw new Error(`clear hold is a task action — ${id} is a ${row.type}`);
+    const meta = JSON.parse(row.meta ?? "{}");
+    if (meta.lane) throw new Error(`gate: ${id} is a standing lane card — the merge train owns its lifecycle; owner overrides do not apply`);
+    if (["done", "superseded"].includes(row.status)) throw new Error(`${id} is '${row.status}' — a terminal card carries no live hold`);
+    if (action === "park" && row.status === "blocked") throw new Error(`${id} is already parked (blocked) — the park override applies to a wedged in_progress card`);
+    const ts = Date.now();
+    if (action === "park") {
+      const live = releaseHold(meta);
+      if (!live) throw new Error(`${id} holds no live machine wait — the park override exists for wedged holds (BR#21657), not as a general block`);
+      // Grammar-valid park: a typed `time` re-check timer (the BR#3578 law —
+      // a blocked card always awaits something typed; prose alone is
+      // annotation). The timer re-presents the card to a fresh session after
+      // the window; the human can resume it earlier from the board.
+      const hours = Math.max(1, Math.min(168, Number(body.hours) || 24));
+      await this.transition(
+        {
+          id, to: "blocked",
+          note: `owner override park (wedged hold: ${live}) — ${reason}`,
+          await_event: { event: "time", until_ts: ts + hours * 3_600_000 },
+          ...(String(body.unblock_condition ?? "").trim() ? { unblock_condition: String(body.unblock_condition).trim().slice(0, 400) } : {}),
+        },
+        actor, "client",
+      );
+      this.audit(actor, "park_hold_override", id, { hold: live, from: row.status, reason });
+      this.version(id, actor, "note", `owner override: card parked over a wedged hold (${live}) — reason: ${reason}`, { park_hold: { at: ts, hold: live, reason } });
+      return { ok: true, id, status: "blocked", action: "park", hold: live };
+    }
+    if (hold === "merge_train") {
+      const st = String((meta.merge_train ?? {}).state ?? "");
+      if (["queued", "awaiting-ci", "conflicting"].includes(st))
+        throw new Error(`gate: ${id} is a live train slot (${st}) — the serialized train owns it and clearing would strand the queue (BR#4067). Use the park override if the wedge is real.`);
+      if (!["bounced", "awaiting", "stopped", "base-red-park"].includes(st))
+        throw new Error(`${id} holds no clearable train state (state: '${st || "none"}') — a stale bounced/awaiting/stopped/base-red-park is clearable; live slots are not`);
+      meta.merge_train = { ...(meta.merge_train ?? {}), state: "unbound" };
+    } else if (hold === "await_event") {
+      if (!meta.blocked?.await_event) throw new Error(`${id} carries no typed await_event to clear`);
+      delete meta.blocked.await_event;
+    } else {
+      if (!meta.awaiting_ask) throw new Error(`${id} carries no bound ask to clear`);
+      delete meta.awaiting_ask;
+    }
+    meta.hold_cleared = { at: ts, by: actor, hold, reason };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(meta), ts, id);
+    this.audit(actor, "clear_hold_override", id, { hold, action, reason });
+    this.version(id, actor, "note", `owner override: ${hold} hold cleared — reason: ${reason}`, { clear_hold: { at: ts, hold, reason } });
+    return { ok: true, id, status: row.status, action: "clear", hold };
   }
 
   /** BR#3910: one-click human supersede from the web plane. BR#2480 law: no
