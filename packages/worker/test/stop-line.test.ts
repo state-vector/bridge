@@ -796,6 +796,11 @@ describe("train.status red-main episode — who broke it / who is fixing it (BR#
     expect(snap.red_main?.status).toBe("in_progress");
     expect(snap.red_main?.executor_session).toBe("banner-drill-fixer");
 
+    // BR#20730 (Ray): the banner's fixing-it card carries the typed repair
+    // marker — the bound root-fix episode qualifies (tags + meta.root_fix
+    // binding, never a title match), so the panel badges it REPAIR.
+    expect(snap.line?.remediation?.task?.repair).toBe(true);
+
     // A live passing result clears the stop. The owner can then close with
     // that receipt through the independent execution review gate (BR#7564).
     const green = await kbJson("/train.ci", {

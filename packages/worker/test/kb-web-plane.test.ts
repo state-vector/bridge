@@ -667,6 +667,10 @@ describe("TrainPanel stop-the-line banner — who broke it + who is fixing it (B
     expect(trainPanelSrc).toContain("UNOWNED — nobody is fixing it");
     // the fixer line click-opens the episode task
     expect(trainPanelSrc).toMatch(/openTask\?\.\(red\.id\)/);
+    // BR#20730 (Ray): the fixing-it card carries the typed REPAIR badge —
+    // driven by the hub-typed repair marker, never a title match
+    expect(trainPanelSrc).toMatch(/red\.repair &&/);
+    expect(trainPanelSrc).toContain(">REPAIR</Chip>");
   });
 
   it("the lane status pill consumes only the typed line projection", () => {

@@ -68,6 +68,12 @@ export const TrainFixCardSchema = z.object({
   owner: z.string().optional(),
   executor_session: z.string().optional(),
   active_agent: z.boolean().optional(),
+  /** BR#20730: the hub-typed repair-class marker — true iff the card is the
+   *  lane's bound main-repair work (isRootFixCard: tags + failing-run
+   *  binding, never a title match) or a machine recovery duty
+   *  (line_recovery / task-recovery / diagnostic). Drives the trains-panel
+   *  REPAIR badge; absent/undefined reads as ordinary work. */
+  repair: z.boolean().optional(),
   blocked_reason: z.string().optional(),
   execution_blockers: z.array(ExecutionBlockerSchema).optional(),
   preemption: RecoveryPreemptionSchema.optional(),

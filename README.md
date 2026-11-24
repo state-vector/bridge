@@ -2737,6 +2737,13 @@ reconcile deploy coverage as a closed 6-state machine (`DeployCoverageState`:
   unconfirmed) and **who is fixing it** (the open root-blocker/main-red episode task in
   the lane's project, with its owner/executor session — or a loud `⚠ UNOWNED — nobody is
   fixing it` chip, because an unclaimed blocker must be impossible to miss). The
+  fixing-it card is labeled at a glance with a loud `REPAIR` chip (BR#20730, Ray
+  2026-11-24) riding the hub-typed `TrainFixCard.repair` marker the projection serves
+  for every fix card: set when the card is a bound root-fix repair (`isRootFixCard` —
+  the tag + failing-run binding qualification, never a title match) or a machine
+  recovery duty (`line_recovery` / `task-recovery` / `diagnostic`), so repair-class
+  work is distinguishable from ordinary impl cards on the banner without parsing
+  titles. The
   derivation is hub-native (`red_main` in `GET /api/kb/train`: newest OPEN task tagged
   `main-red`/`root-blocker` in the lane's project): it catches reds the train never saw
   fed — a post-merge deploy failing on main files no train stop, but the episode task

@@ -22,6 +22,11 @@ const unavailable: TrainLineProjection = {
   remediation: { kind: "attention", text: "Waiting for a current status from the hub. Work has not been confirmed healthy." },
 };
 
+/** BR#20730 (Ray): repair-class work must be labeled at a glance — the chip
+ *  rides the hub-typed `TrainFixCard.repair` marker (bound root-fix repair or
+ *  machine recovery duty), never a title match. */
+const REPAIR_CHIP_TITLE = "Repair-class work: the hub-typed repair marker (bound root-fix repair or machine recovery duty) — never a title match";
+
 function TaskLink({ id, url, children, openTask }: {
   id: string; url: string; children: React.ReactNode; openTask?: (id: string) => void;
 }) {
@@ -60,7 +65,7 @@ function Recovery({ action, now, openTask }: { action: LineRemediation; now: num
         <span className="train-banner-line">{action.text}</span>
         {task.pr && task.pr_url && <span className="train-banner-line">
           <a href={task.pr_url} target="_blank" rel="noreferrer">PR #{task.pr}</a>
-          {" · "}<TaskLink id={task.id} url={task.url} openTask={openTask}>Repair {task.id}</TaskLink>
+          {" · "}{task.repair && <><Chip tone="err" title={REPAIR_CHIP_TITLE}>REPAIR</Chip>{" "}</>}<TaskLink id={task.id} url={task.url} openTask={openTask}>Repair {task.id}</TaskLink>
           {task.owner && ` · ${task.owner}`}
         </span>}
         <details className="train-banner-line">
@@ -214,6 +219,11 @@ function StopLineBanner({ l, now, openTask }: { l: KbTrainLane; now: number; ope
           ) : red ? (
             <>
               <a className="train-stopline-who-link" onClick={() => openTask?.(red.id)}>{red.id}</a>
+              {/* BR#20730 (Ray): label the repair at a glance — the chip rides
+                  the hub-typed `repair` marker, never a title match. */}
+              {red.repair && (
+                <Chip tone="err" title={REPAIR_CHIP_TITLE}>REPAIR</Chip>
+              )}
               {fixer ? (
                 <span> · {fixer}{red.owner && red.executor_session ? ` (${red.executor_session})` : ""}</span>
               ) : remediation?.kind === "queued" || remediation?.kind === "blocked" ? (

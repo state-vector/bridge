@@ -20237,11 +20237,11 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   ): TrainFixCard | null {
     const r =
       typeof rowOrId === "string"
-        ? (this.one(`SELECT id, title, status, owner, updated_ts, meta FROM artefacts WHERE id = ?`, rowOrId) as any)
+        ? (this.one(`SELECT id, title, status, owner, updated_ts, tags, meta FROM artefacts WHERE id = ?`, rowOrId) as any)
         : rowOrId && typeof rowOrId === "object" && rowOrId.id
           ? (rowOrId.meta !== undefined && rowOrId.owner !== undefined && rowOrId.updated_ts !== undefined
               ? rowOrId
-              : (this.one(`SELECT id, title, status, owner, updated_ts, meta FROM artefacts WHERE id = ?`, String(rowOrId.id)) as any) ?? rowOrId)
+              : (this.one(`SELECT id, title, status, owner, updated_ts, tags, meta FROM artefacts WHERE id = ?`, String(rowOrId.id)) as any) ?? rowOrId)
           : null;
     if (!r || !r.id) return null;
     let m: any = {};
@@ -20250,6 +20250,20 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     } catch {
       m = {};
     }
+    // BR#20730: the typed repair-class marker. Root-fix bound (isRootFixCard —
+    // the tag + meta-binding qualification, never the title) or a machine
+    // recovery duty; the trains panel badges the fixing-it card REPAIR from
+    // this field instead of scraping card titles.
+    let fixTags: string[] = [];
+    try {
+      const t = Array.isArray(r.tags) ? r.tags : JSON.parse(typeof r.tags === "string" && r.tags.trim() ? r.tags : "[]");
+      if (Array.isArray(t)) fixTags = t.filter((x): x is string => typeof x === "string");
+    } catch {
+      fixTags = [];
+    }
+    const dutyKind = String(m?.machine_duty?.kind ?? "");
+    const repair = isRootFixCard({ tags: fixTags, meta: m })
+      || ["line_recovery", "task-recovery", "diagnostic"].includes(dutyKind);
     // Older machine cards could be rebound with their previous title and
     // progress still attached. Project the exact binding without rewriting WIP.
     const generatedBinding = typeof m.child_of_lane === "string" && m.root_fix ? mainRedBinding(m) : null;
@@ -20292,6 +20306,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       ...(owner ? { owner } : {}),
       ...(executorSession ? { executor_session: executorSession } : {}),
       active_agent: activeAgent,
+      repair,
       preemption: this.recoveryCapacity().forRecovery(String(r.id)) ?? undefined,
       execution_blockers: ["todo", "blocked"].includes(status) && m.execution_requirements
         ? this.executionWork().blockers({ id: String(r.id), title: String(r.title ?? ""), project: String(this.one(`SELECT project FROM artefacts WHERE id=?`, String(r.id))?.project ?? ""),
