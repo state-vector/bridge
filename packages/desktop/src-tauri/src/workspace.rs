@@ -21,10 +21,35 @@ const BATCH: usize = 4;
 /// means the ladder owes the budget bytes; the fair 4-per-30s pass cannot
 /// repay a 684-deep pending pile before the next generation of work arrives.
 const PRESSURE_BATCH: usize = 64;
+/// BR#14525 (owner ruling 2026-11-13) — NO git-pushed checkpoints: the
+/// WORKTREE is the durability boundary for WIP. An interrupted generation's
+/// worktree therefore stays adoptable (affinity) and reclaim-protected
+/// (explicit retention policy) for this long after its last generation
+/// activity. Age alone is never deletion authority: expiry ends the
+/// preference/hold, the evidence fences still govern every removal.
+const WORKTREE_TTL: Duration = Duration::from_secs(24 * 3600);
+fn worktree_ttl() -> Duration {
+    std::env::var("BRIDGE_WORKTREE_TTL_HOURS").ok().and_then(|v| v.parse::<u64>().ok())
+        .map(|hours| Duration::from_secs(hours.saturating_mul(3600))).unwrap_or(WORKTREE_TTL)
+}
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all="snake_case")]
 enum CacheAuthority { ExclusiveAllocation, #[default] LegacyDiscovery }
+
+/// BR#14525 — the outcome of the explicit retention decision for a released
+/// worktree (see `retention`).
+enum Retention {
+    /// Nothing unpublished: a done tree — the ladder may reclaim it.
+    Reclaim,
+    /// Unpublished value inside the TTL, no pressure: stay Released as the
+    /// adoptable value signal (no error, no ladder advance).
+    Hold { signal: String },
+    /// Unpublished value whose retention window ended: stop protecting BY
+    /// POLICY (the tree re-enters the ladder, where the evidence fences and
+    /// `verify_published_source` still refuse to destroy unique source).
+    Yield { signal: String },
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -62,6 +87,26 @@ enum Phase {
 struct Resource {
     version: u32, id: String, location: Location, phase: Phase,
     observed_bytes: u64, checked_at: u64, retry_at: u64, error: Option<String>,
+    /// BR#14525 — last GENERATION activity on this allocation (ms epoch):
+    /// written when a generation releases or adopts the workspace. The
+    /// affinity and retention TTLs read this, never the owner's own pass
+    /// cadence (`checked_at`). `0` (records predating the field) means
+    /// unknown freshness: never adoptable, retention falls through to the
+    /// evidence fences.
+    #[serde(default)]
+    last_activity_at: u64,
+    /// BR#14525 — present while a released worktree is held by the explicit
+    /// retention policy (unpublished WIP inside the TTL). The board-visible
+    /// value signal: what the retained tree holds and why reclaim is
+    /// deferred. Cleared when the tree is adopted or reclaims.
+    #[serde(default)]
+    retained_value: Option<String>,
+    /// BR#14525 — set when a generation ADOPTED this allocation from a prior
+    /// generation's record (re-keyed id, preserved directory). Relaxes the
+    /// exact root-name validation to a parent-directory containment check:
+    /// the worktree must never move (that would break its git worktree link).
+    #[serde(default)]
+    adopted_from: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Removal { resource_id: String, bytes: u64, at: u64 }
@@ -106,6 +151,11 @@ pub(super) struct Owner { cfg: DispatchConfig, ledger: PathBuf, allocations: Pat
 /// The persistent InUse state then protects it across controller/worker swaps.
 pub(super) struct Allocation {
     pub root: PathBuf, pub work: PathBuf, pub checkout: Option<PathBuf>,
+    /// BR#14525 — present when this allocation ADOPTED a prior generation's
+    /// surviving worktree (after verified quiescence, inside the affinity
+    /// TTL). The value is the inherited-state summary the dispatch prompt
+    /// feeds the resume protocol, so the new generation is never blind.
+    pub adopted: Option<String>,
     id: String, owner: Owner, _lock: worker_session::Lock,
 }
 impl Allocation {
@@ -172,7 +222,14 @@ impl Owner {
         let record: Resource = serde_json::from_slice(&bytes).map_err(|e| format!("workspace journal corrupt: {e}"))?;
         if record.version != 1 || record.id != id { return Err("workspace journal identity/version mismatch".into()); }
         if let Location::Managed { root } = &record.location {
-            if *root != self.allocations.join(id) { return Err("workspace path escaped its allocation".into()); }
+            // BR#14525 — an adopted allocation preserves the ORIGINAL directory
+            // (moving a git worktree breaks its link), so the exact id-derived
+            // name check applies only to records that were never re-keyed.
+            if record.adopted_from.is_none() {
+                if *root != self.allocations.join(id) { return Err("workspace path escaped its allocation".into()); }
+            } else if root.parent() != Some(self.allocations.as_path()) {
+                return Err("workspace path escaped its allocation".into());
+            }
         }
         Ok(record)
     }
@@ -213,12 +270,28 @@ impl Owner {
     }
     pub fn allocate(&self, ticket: &Ticket, repo: Option<&str>) -> Result<Allocation, String> {
         if let Admission::Held { reason } = self.admission() { return Err(reason); }
+        // BR#14525 — worktree affinity: a retry generation prefers to resume
+        // in the SAME EXISTING worktree on this host instead of starting from
+        // a clean checkout. Affinity is a PREFERENCE, never a pin: adoption
+        // requires an adoptable prior record (see `adoptable`) and silently
+        // falls back to a fresh allocation otherwise. Adoption flips the prior
+        // record's ownership to this ticket AFTER verified quiescence (the
+        // Released phase is only ever reached through the quiescence gate in
+        // `recover_release`/`release`, so never two live generations share a
+        // worktree) and preserves the directory — moving a git worktree would
+        // break its worktree link, so the record is re-keyed, not the tree.
+        if repo.is_some() {
+            if let Some(allocation) = self.adopt(ticket)? {
+                return Ok(allocation);
+            }
+        }
         let id = journal::stable_key(&[&ticket.task_id, &ticket.session]);
         let lock = self.lock(&id)?.ok_or("workspace is being reconciled; retry preparation")?;
         if self.contains(&id) { return Err("workspace allocation already exists; reconcile its original execution instead of reusing it".into()); }
         let root = self.allocations.join(&id);
         let record = Resource { version: 1, id: id.clone(), location: Location::Managed { root: root.clone() },
-            phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None };
+            phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+            last_activity_at: 0, retained_value: None, adopted_from: None };
         self.save(&record)?; // intent precedes every directory and Git write
         for path in ["work", "tmp", "logs", "cache/cargo", "cache/npm", "cache/xdg"] { fs::create_dir_all(root.join(path)).map_err(|e| e.to_string())?; }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?; }
@@ -237,7 +310,8 @@ impl Owner {
                 }
             } else if cache_path.exists() {CacheAuthority::LegacyDiscovery} else {CacheAuthority::ExclusiveAllocation};
             let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path, authority },
-                phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None };
+                phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
+                last_activity_at: 0, retained_value: None, adopted_from: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
             if self.contains(&cache_record.id) && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
@@ -250,7 +324,74 @@ impl Owner {
             git(&cache, &["worktree", "add", "--detach", work.to_str().ok_or("workspace path is not UTF-8")?, "origin/HEAD"])?;
             Some(work.clone())
         } else { None };
-        Ok(Allocation { root, work, checkout, id, owner: self.clone(), _lock: lock })
+        Ok(Allocation { root, work, checkout, adopted: None, id, owner: self.clone(), _lock: lock })
+    }
+    /// BR#14525 — adopt a prior generation's surviving worktree for this task:
+    /// same task, different (stopped) session, worktree-backed, released
+    /// through the quiescence gate, and active within the affinity TTL. The
+    /// most recently active candidate wins. Under the record locks the phase
+    /// is re-verified (the atomic adopt-after-quiesce fence: a concurrent
+    /// adopter or reconcile re-read loses), the ownership flips to this
+    /// ticket's reservation, and the record re-keys onto this ticket's
+    /// identity while the directory stays put. Returns the adopted allocation
+    /// with an inherited-state summary for the dispatch prompt, or None when
+    /// no candidate qualifies (fresh start — affinity is a preference).
+    fn adopt(&self, ticket: &Ticket) -> Result<Option<Allocation>, String> {
+        let now = now_ms();
+        let ttl = worktree_ttl().as_millis() as u64;
+        let candidate = self.records()?.into_iter().filter(|record| {
+            let Location::Managed { root } = &record.location else { return false };
+            let Phase::Released { owner } = &record.phase else { return false };
+            let prior = owner.ticket();
+            if prior.task_id != ticket.task_id || prior.session == ticket.session { return false; }
+            if record.last_activity_at == 0 || now.saturating_sub(record.last_activity_at) > ttl { return false; }
+            root.join("work/.git").exists()
+        }).max_by_key(|record| record.last_activity_at);
+        let Some(prior) = candidate else { return Ok(None) };
+        let old_id = prior.id.clone();
+        let new_id = journal::stable_key(&[&ticket.task_id, &ticket.session]);
+        // Old-then-new acquisition order (the only multi-record lock this path
+        // takes; reconcile and retire paths hold one record lock at a time, and
+        // a same-ticket race re-reads the phase under the old lock).
+        let Some(_old_lock) = self.lock(&old_id)? else { return Ok(None) };
+        let Some(new_lock) = self.lock(&new_id)? else { return Ok(None) };
+        let mut record = self.read(&old_id)?;
+        // Re-verified under the locks: only a still-Released record adopts.
+        if !matches!(record.phase, Phase::Released { .. }) { return Ok(None); }
+        let work = record.location.work();
+        let inherited = self.assess_inherited(&work)?;
+        // The pre-adoption record is archived as the adoption receipt; the
+        // live ledger keeps exactly one record for this allocation.
+        let receipt = serde_json::to_vec(&Resource { phase: Phase::Removed { reclaimed_bytes: 0, at: now }, adopted_from: None, ..record.clone() }).map_err(|e| e.to_string())?;
+        record.id = new_id.clone();
+        record.adopted_from = Some(old_id.clone());
+        record.phase = Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } };
+        record.last_activity_at = now;
+        record.retained_value = None;
+        record.error = None;
+        record.retry_at = 0;
+        self.save(&record)?;
+        journal::write_file(&self.archive_file(&old_id), &receipt)?;
+        match fs::remove_file(self.file(&old_id)) { Ok(()) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(e.to_string()) }
+        #[cfg(unix)] fs::File::open(&self.ledger).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+        Ok(Some(Allocation { root: record.location.root().to_path_buf(), work: work.clone(), checkout: Some(work), adopted: Some(inherited), id: new_id, owner: self.clone(), _lock: new_lock }))
+    }
+    /// BR#14525 resume protocol (point 5) — first-hand assessment of an
+    /// inherited worktree: dirty state and whether HEAD carries local commits
+    /// the published branches do not contain. Local remote-tracking refs only
+    /// (no network): a stale tracking ref can only over-report publication,
+    /// which errs toward reclaiming a genuinely-published done tree, never
+    /// toward destroying WIP.
+    fn assess_inherited(&self, work: &Path) -> Result<String, String> {
+        let status = git(work, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?;
+        let lines: Vec<&str> = status.lines().collect();
+        let dirty = lines.len();
+        let published = if dirty > 0 { true } else {
+            git(work, &["for-each-ref", "--format=%(objectname)", "--contains", "HEAD", "refs/remotes/origin"])?.lines().count() > 0
+        };
+        let head = git(work, &["rev-parse", "--short", "HEAD"])?;
+        Ok(format!("HEAD {head}, {dirty} uncommitted entr{}, local commits {}published; assess with git status + compile smoke and record the finding on the card before building",
+            if dirty == 1 { "y" } else { "ies" }, if published { "" } else { "UN" }))
     }
     pub fn release(&self, receipt: &lifecycle::Released) -> Result<(), String> {
         let owner = receipt.owner();
@@ -261,6 +402,8 @@ impl Owner {
         match &record.phase {
             Phase::InUse { owner: expected } if expected == owner => {
                 record.phase = Phase::Released { owner: owner.clone() }; record.retry_at = 0;
+                // BR#14525 — the affinity/retention TTL starts at release.
+                record.last_activity_at = now_ms();
                 self.save(&record)
             },
             Phase::InUse { .. } => Err("workspace release does not match its exact owner".into()),
@@ -325,6 +468,12 @@ impl Owner {
         // pass widens (local FS ops are cheap; the 30s cadence stays) so the
         // ladder can actually clear in minutes.
         let batch = if self.status().is_ok_and(|status| matches!(status.admission, Admission::Held { .. })) { PRESSURE_BATCH } else { BATCH };
+        // BR#14525 — pressure LRU visits DONE worktrees first: records already
+        // carrying the retention value signal re-enter last, so pressure frees
+        // published/finished trees before it even re-checks retained WIP (and
+        // protected tickets — the currently dispatched task — are excluded
+        // above regardless of order).
+        if batch == PRESSURE_BATCH { records.sort_by_key(|record| record.retained_value.is_some()); }
         for old in &records {
             if matches!(old.phase, Phase::Removed { .. }) || old.retry_at > now_ms() { continue; }
             let ticket = match &old.phase { Phase::InUse { owner } | Phase::Released { owner } | Phase::Preserving { owner, .. } => Some(owner.ticket()), _ => None };
@@ -374,9 +523,42 @@ impl Owner {
                 record.phase = Phase::LegacyUnproved; self.save(record)?;
                 legacy::prove(self, record)?;
             },
-            Phase::InUse { owner } => { self.recover_release(&owner)?; record.phase = Phase::Released { owner }; self.save(record)?; },
+            Phase::InUse { owner } => { self.recover_release(&owner)?; record.phase = Phase::Released { owner }; record.last_activity_at = now_ms(); record.retained_value = None; self.save(record)?; },
             Phase::LegacyUnproved => { legacy::prove(self, record)?; },
             _ => {},
+        }
+        // BR#14525 — the explicit reclaim policy (was silent GC destroying
+        // WIP — BR#14126 lost four generations this way). A released worktree
+        // holding unpublished value is retained BY POLICY, not by error churn:
+        // within the TTL (and absent disk pressure) it stays Released as the
+        // adoptable value signal for the next generation; past the TTL, or
+        // under pressure, retention ends and the tree re-enters the ladder —
+        // where the evidence fences still decide. Age alone is never deletion
+        // authority; "reclaim on expiry" means the HOLD ends, never a silent
+        // wipe of unique source.
+        if let Phase::Released { .. } = &record.phase {
+            match self.retention(record)? {
+                Retention::Reclaim => { record.retained_value = None; },
+                Retention::Hold { signal } => {
+                    // Holding the worktree's unpublished value never freezes
+                    // its regenerable build cache: the disposable sweep
+                    // (BR#14740 class) still runs this pass, journalled and
+                    // byte-counted, while the retirement ladder below stays
+                    // fenced. Unique ignored evidence still reports through
+                    // the standard fence error.
+                    record.retained_value = Some(signal);
+                    legacy::no_readers(record.location.root(), self.reader_authority(record)?)?;
+                    let mut paths = Vec::new();
+                    repositories(&record.location.work(), &mut paths)?;
+                    self.retire_disposable_children(record, &paths)?;
+                    for path in &paths { unpreserved_ignored_inputs(path)?; }
+                    return Ok(());
+                },
+                Retention::Yield { signal } => {
+                    record.retained_value = Some(signal);
+                    return Err("BR#14525 retention ended (TTL expiry or disk pressure); unpublished worktree value needs an explicit adoption or a recorded reset before reclaim; source retained".into());
+                },
+            }
         }
         if matches!(record.phase, Phase::Released { .. } | Phase::Preserving { .. }) {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
@@ -444,6 +626,30 @@ impl Owner {
         }
         Ok(())
     }
+    /// BR#14525 — one retention decision per released worktree: what does the
+    /// tree hold, and does the explicit policy still protect it?
+    fn retention(&self, record: &Resource) -> Result<Retention, String> {
+        let work = record.location.work();
+        if !work.join(".git").exists() { return Ok(Retention::Reclaim); }
+        let status = git(&work, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?;
+        let dirty = status.lines().count();
+        // Local remote-tracking refs only (no network): a stale tracking ref
+        // can only over-report publication, erring toward reclaiming a
+        // genuinely-published done tree, never toward destroying WIP. The
+        // live `verify_published_source` fence still governs any removal.
+        let published = if dirty > 0 { true } else {
+            git(&work, &["for-each-ref", "--format=%(objectname)", "--contains", "HEAD", "refs/remotes/origin"])?.lines().count() > 0
+        };
+        if dirty == 0 && published { return Ok(Retention::Reclaim); }
+        let signal = format!("unpublished worktree value (BR#14525 value signal): {dirty} uncommitted entries, local commits {}published", if published { "" } else { "UN" });
+        let pressure = self.status().is_ok_and(|s| matches!(s.admission, Admission::Held { .. }));
+        if pressure { return Ok(Retention::Yield { signal: format!("{signal}; yielding to disk pressure") }); }
+        let ttl = worktree_ttl().as_millis() as u64;
+        if record.last_activity_at == 0 || now_ms().saturating_sub(record.last_activity_at) > ttl {
+            return Ok(Retention::Yield { signal: format!("{signal}; affinity/retention TTL expired") });
+        }
+        Ok(Retention::Hold { signal })
+    }
     fn measure(&self) -> Result<Status, String> {
         let (budget, floor) = Self::budget_floor();
         self.measure_with_limits(budget, floor)
@@ -494,7 +700,7 @@ impl Owner {
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
             let mut child=if self.file(&id).exists() {self.read(&id)?} else {
-                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None}
+                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}
             };
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }

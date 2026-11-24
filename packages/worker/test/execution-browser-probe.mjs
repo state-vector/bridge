@@ -10,9 +10,9 @@ import { spawn } from "node:child_process";
 const directory = await mkdtemp(join(tmpdir(), "bridge-execution-browser-"));
 const fixture = { workspace: "probe", items: [{ id: "BR#1", title: "Local dataset repair with an explicit capability requirement", project: "bridge", status: "blocked", url: "https://hub.fleetbridge.run/card/BR-1",
   handoff: { phase: "waiting", id: "local:probe", version: 1, requested_at: 1, reason: "Needs local data", action: "Repair the dataset", findings: "Remote lookup unavailable", tried: "Remote lookup", next: "Restore the checkpoint", evidence: [], approvals: [], recipient: null,
-    quiescence: { kind: "runner", host: "origin", generation: 1 }, checkpoint: { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/probe/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: [], next: "Repair", tests: [] } },
+    quiescence: { kind: "runner", host: "origin", generation: 1 }, checkpoint: { repo: "https://github.com/state-vector/bridge", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: [], next: "Repair", tests: [] } },
   requirements: { tier: "large", tools: ["git"], environment: ["local dataset"] }, blockers: [{ kind: "local_pickup_required", episode_id: "local:probe", handoff_id: "local:probe", version: 1, text: "Repair the local dataset after exact checkpoint restoration" }],
-  continuation_prompt: "Verify the exact published checkpoint. Do not claim or resume without explicit authorised handoff_accept.", can_accept: false, prerequisites: ["human_authorization"], accept_operation: "handoff_accept" }], next_cursor: null, interactive_agents: [{ label: "local-agent" }] };
+  continuation_prompt: "Verify the exact recorded checkpoint. Do not claim or resume without explicit authorised handoff_accept.", can_accept: false, prerequisites: ["human_authorization"], accept_operation: "handoff_accept" }], next_cursor: null, interactive_agents: [{ label: "local-agent" }] };
 await build({ stdin: { contents: `import React from 'react'; import {createRoot} from 'react-dom/client';
 import {ExecutionAttentionCards} from ${JSON.stringify(resolve("../ui-kit/src/views/ExecutionAttention.tsx"))};
 import ${JSON.stringify(resolve("../ui-kit/src/views/views.css"))};

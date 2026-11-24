@@ -126,7 +126,7 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   const escalationHistory = await post("get_history", { id: impl.id, limit: 100 });
   expect(escalationHistory.versions.filter(v => v.action === "execution" && v.data.kind === "model_escalated")).toHaveLength(1);
   expect(escalationHistory.versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "model_started", tier: "medium", model: "test/medium" }) })]));
-  const checkpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/models/1/1", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: [], next: "Continue implementation", tests: [] };
+  const checkpoint = { repo: "https://github.com/state-vector/bridge", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: [], next: "Continue implementation", tests: [] };
   await cmd("checkpoint", { kind: "checkpoint", checkpoint });
   await cmd("quiesce", { kind: "quiesce", writers: "process_group_empty" });
   expect((await cmd("yield", { kind: "yield" })).error).toBeUndefined();

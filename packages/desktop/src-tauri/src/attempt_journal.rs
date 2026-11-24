@@ -87,11 +87,11 @@ impl Record {
         }
         if let Work::Stopped { worktree, step, .. } = &self.work {
             if matches!(step, Step::Capture | Step::Publish { .. } | Step::Register { .. }) && worktree.is_none() { return Err("gate: checkpoint journal has no worktree".into()); }
+            // BR#14525: checkpoints are LOCAL commits in the surviving worktree —
+            // the worktree is the durability boundary; no published-ref binding.
             if let Step::Publish { checkpoint } | Step::Register { checkpoint } = step {
-                let Ownership::Attempt { generation, .. } = self.owner else { unreachable!() };
-                let slug: String = self.ticket().task_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
-                if !checkpoint.remote_ref.starts_with(&format!("refs/heads/bridge-checkpoints/{slug}/{generation}/")) {
-                    return Err("gate: checkpoint publication is not bound to this task/generation".into());
+                if checkpoint.commit.is_empty() || checkpoint.tree.is_empty() {
+                    return Err("gate: checkpoint journal is missing its local commit/tree".into());
                 }
             }
         }

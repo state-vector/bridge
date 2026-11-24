@@ -1,10 +1,13 @@
 //! Legacy Git checkpoint metadata retained for reading existing journals.
+//! BR#14525 (owner ruling 2026-11-13): NO git-pushed checkpoints — the
+//! WORKTREE is the durability boundary. A checkpoint records a LOCAL commit;
+//! verification inspects the provisioned clone's own object store, never a
+//! published origin ref.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub repo: String,
-    pub remote_ref: String,
     pub commit: String,
     pub tree: String,
     pub base: String,
@@ -14,26 +17,23 @@ pub struct Checkpoint {
 }
 
 /// Restore only from the provisioned repository, not a URL supplied by the
-/// checkpoint author. Pin the published ref and verify the objects before
-/// checkout. No fetch writes FETCH_HEAD in the shared repository cache.
-pub fn restore(worktree: &std::path::Path, checkpoint: &Checkpoint, task: &str, generation: u64) -> Result<(), String> {
-    verify_checkpoint(worktree, checkpoint, task, generation, true)
+/// checkpoint author. Verify the local objects before checkout. No fetch
+/// writes FETCH_HEAD in the shared repository cache; nothing is published.
+pub fn restore(worktree: &std::path::Path, checkpoint: &Checkpoint, _task: &str, _generation: u64) -> Result<(), String> {
+    verify_checkpoint(worktree, checkpoint, true)
 }
 
 /// An originating gateway must check the stopped workspace, not simply
 /// trust the worker's claimed checkpoint or account for dirty input as saved.
-pub fn verify_stopped(worktree: &std::path::Path, checkpoint: &Checkpoint, task: &str, generation: u64) -> Result<(), String> {
-    verify_checkpoint(worktree, checkpoint, task, generation, false)
+pub fn verify_stopped(worktree: &std::path::Path, checkpoint: &Checkpoint, _task: &str, _generation: u64) -> Result<(), String> {
+    verify_checkpoint(worktree, checkpoint, false)
 }
 
-fn verify_checkpoint(worktree: &std::path::Path, checkpoint: &Checkpoint, task: &str, generation: u64, checkout: bool) -> Result<(), String> {
+fn verify_checkpoint(worktree: &std::path::Path, checkpoint: &Checkpoint, checkout: bool) -> Result<(), String> {
     use std::process::Command;
-    let slug: String = task.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
-    let prefix = format!("refs/heads/bridge-checkpoints/{slug}/{generation}/");
     let sha = |value: &str| value.len() == 40 && value.bytes().all(|c| c.is_ascii_hexdigit());
-    if !checkpoint.remote_ref.starts_with(&prefix) || checkpoint.remote_ref.len() == prefix.len()
-        || !sha(&checkpoint.commit) || !sha(&checkpoint.tree) {
-        return Err("checkpoint does not identify exact task, generation, commit and tree".into());
+    if !sha(&checkpoint.commit) || !sha(&checkpoint.tree) {
+        return Err("checkpoint does not identify exact commit and tree".into());
     }
     let git = |args: &[&str]| -> Result<String, String> {
         let mut cmd = Command::new("git");
@@ -47,13 +47,10 @@ fn verify_checkpoint(worktree: &std::path::Path, checkpoint: &Checkpoint, task: 
     if origin.trim().trim_end_matches(".git") != checkpoint.repo.trim_end_matches(".git") {
         return Err("checkpoint repository differs from the provisioned origin".into());
     }
-    git(&["check-ref-format", &checkpoint.remote_ref])?;
-    let published = git(&["ls-remote", "--exit-code", "origin", &checkpoint.remote_ref])?;
-    if published.trim_end() != format!("{}\t{}", checkpoint.commit, checkpoint.remote_ref) {
-        return Err("published checkpoint ref no longer points to the recorded commit".into());
-    }
     if checkout {
-        git(&["fetch", "--no-tags", "--no-write-fetch-head", "--", "origin", &checkpoint.commit])?;
+        // The worktree shares the repository cache's object store: the local
+        // commit is already present — never fetched from origin.
+        git(&["cat-file", "-e", &format!("{}^{{commit}}", checkpoint.commit)])?;
     } else {
         if !git(&["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?.is_empty() {
             return Err("stopped workspace has unpublished changes; retain it".into());
@@ -61,7 +58,7 @@ fn verify_checkpoint(worktree: &std::path::Path, checkpoint: &Checkpoint, task: 
         crate::dispatch::assert_no_unpreserved_checkpoint_inputs(worktree)?;
     }
     if git(&["rev-parse", "--verify", &format!("{}^{{tree}}", checkpoint.commit)])?.trim() != checkpoint.tree {
-        return Err("published checkpoint tree differs from the recorded tree".into());
+        return Err("checkpoint tree differs from the recorded tree".into());
     }
     if checkout { git(&["checkout", "--detach", &checkpoint.commit])?; }
     if git(&["rev-parse", "--verify", "HEAD"])?.trim() != checkpoint.commit {
@@ -100,30 +97,37 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = init(temp.path());
         let repo = temp.path().join("remote.git").to_string_lossy().into_owned();
-        let refname = "refs/heads/bridge-checkpoints/BR-42/7/test";
         let read = |path: &Path, args: &[&str]| String::from_utf8(Command::new("git")
             .current_dir(path).args(args).output().unwrap().stdout).unwrap().trim().to_owned();
         let base = read(&source, &["rev-parse", "HEAD"]);
         std::fs::write(source.join("tracked"), "checkpoint\n").unwrap();
         git(&source, &["commit", "-am", "checkpoint"]).unwrap();
-        git(&source, &["push", "origin", &format!("HEAD:{refname}")]).unwrap();
         let commit = read(&source, &["rev-parse", "HEAD"]);
         let tree = read(&source, &["rev-parse", "HEAD^{tree}"]);
         let dest = temp.path().join("dest");
         git(temp.path(), &["clone", &repo, dest.to_str().unwrap()]).unwrap();
-        let cp = super::Checkpoint { repo, remote_ref: refname.into(), commit, tree,
+        // BR#14525: a checkpoint is a LOCAL commit — the destination clone must
+        // already hold the object (shared repository cache), never a fetched
+        // origin ref. The wrong-repo and wrong-tree cases still refuse.
+        let cp = super::Checkpoint { repo: repo.clone(), commit, tree,
             base: base.clone(), environment: vec![], next: "Resume".into(), tests: vec![] };
         for wrong in [
             super::Checkpoint { repo: "https://example.invalid/wrong.git".into(), ..cp.clone() },
-            super::Checkpoint { remote_ref: "refs/heads/bridge-checkpoints/BR-42/8/test".into(), ..cp.clone() },
             super::Checkpoint { tree: "f".repeat(40), ..cp.clone() },
             super::Checkpoint { commit: base.clone(), ..cp.clone() },
         ] {
             assert!(super::restore(&dest, &wrong, "BR#42", 7).is_err());
             assert_eq!(read(&dest, &["rev-parse", "HEAD"]), base);
         }
-        super::restore(&dest, &cp, "BR#42", 7).unwrap();
-        assert_eq!(read(&dest, &["rev-parse", "HEAD"]), cp.commit);
-        assert_eq!(std::fs::read_to_string(dest.join("tracked")).unwrap(), "checkpoint\n");
+        // The commit exists locally only after the clone carries it: push the
+        // branch to origin, clone again — the object is in the new clone's
+        // store without any ref magic, mirroring the shared cache.
+        git(&source, &["push", "origin", "HEAD:refs/heads/main-force"]).unwrap();
+        let dest2 = temp.path().join("dest2");
+        git(temp.path(), &["clone", &repo, dest2.to_str().unwrap()]).unwrap();
+        git(&dest2, &["fetch", "origin"]).unwrap();
+        super::restore(&dest2, &cp, "BR#42", 7).unwrap();
+        assert_eq!(read(&dest2, &["rev-parse", "HEAD"]), cp.commit);
+        assert_eq!(std::fs::read_to_string(dest2.join("tracked")).unwrap(), "checkpoint\n");
     }
 }

@@ -3630,6 +3630,20 @@ fn spawn_opencode(
         .as_ref()
         .map(|s| format!("\n\nYou are resuming opencode session `{s}` — an opencode id, NOT a bridge session name; your bridge session is stated under # Environment. Pick up where you left off; do not restart the task from scratch."))
         .unwrap_or_default();
+    // BR#14525 resume protocol: an adopted worktree must never blind-side the
+    // resuming agent — the inherited-state assessment (git status + compile
+    // smoke) is recorded on the card before any build, and a scorched-earth
+    // reset is a recorded deliberate choice, never a silent one.
+    let resume_protocol = allocation.adopted.as_ref()
+        .map(|inherited| format!("\n\n# Inherited worktree (BR#14525 resume protocol)\nThis worktree was ADOPTED from a prior generation of this task after verified quiescence — the worktree is the durability boundary for that generation's WIP (owner ruling 2026-11-13: no git-pushed checkpoints). First-hand assessment: {inherited}. Before building: run `git status --porcelain` and a compile/typecheck smoke yourself, then record what you found on the card via log_progress so no resuming agent is ever blind. Commit inherited WIP locally (signed) before further edits where you keep it. Continue the inherited work where it makes sense; a scorched-earth reset to clean origin/main is allowed ONLY as a recorded deliberate choice on the card, never silently."))
+        .unwrap_or_default();
+    // BR#14525 local commit discipline: early/often signed LOCAL commits in
+    // the worktree replace the deprecated remote checkpoint surface.
+    let commit_line = if worktree.is_some() {
+        "\n- Local commit discipline (BR#14525): commit early and often in this worktree — signed local commits are the WIP durability boundary (push nothing except your final signed delivery). Never push refs/heads/bridge-checkpoints/* refs: that remote checkpoint surface is deprecated."
+    } else {
+        ""
+    };
     // Reporting cadence: None (default) = report like a human collaborator —
     // meaningful steps and findings only, no fixed interval. The runner relays
     // your stdout lines to the board every poll, so your normal narration keeps
@@ -3693,8 +3707,8 @@ fn spawn_opencode(
     let bridge_session = claim_session(cfg, tid);
     let env_block = agent_environment_prompt(&bridge_session);
     let mut prompt = format!(
-        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n\n{}\n\n# Delivery contract (execution policy v1)\n\n{}\n{}\n{}\n- Blocked on a specific human decision? Bind an ask to this task. Machine capability problems use the execution protocol escalation, not a human staffing request.\n- Do not touch files outside this worktree. Never detach a subprocess from the runner process group: transfer requires a proven empty writer group.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them before you end the run. The dispatch worktree itself is managed by the runner.",
-        policy, tid, title, body_md, resume_note, env_block, provisioning_line, heartbeat_line, delivery_line
+        "{}\n\n# Task\n\n{}: {}\n\n{}\n{}\n{}\n\n{}\n\n# Delivery contract (execution policy v1)\n\n{}\n{}\n{}\n- Blocked on a specific human decision? Bind an ask to this task. Machine capability problems use the execution protocol escalation, not a human staffing request.\n- Do not touch files outside this worktree. Never detach a subprocess from the runner process group: transfer requires a proven empty writer group.\n- Scratch git worktrees or extra branches you create inside this worktree are your responsibility — remove them before you end the run. The dispatch worktree itself is managed by the runner.{}",
+        policy, tid, title, body_md, resume_note, resume_protocol, env_block, provisioning_line, heartbeat_line, delivery_line, commit_line
     );
     // clone for the ephemeral state file: the closure below moves the original
     let resume_session_for_state = resume_session.clone();
@@ -3865,8 +3879,12 @@ fn spawn_opencode(
     let mut execution = ExecutionRuntime { generation, attempt_id, control: Arc::new(control), maintenance: None };
     execution.control.grant_lease_from(begin_requested_at);
     prompt.push_str(&format!("\n\n# Durable execution\nGeneration {generation}, attempt {}. Use execution(id={tid}, command_id=<unique stable id>, command=...) to acknowledge messages, request a higher minimum reasoning tier, and prepare/result external GitHub/AWS operations with exact input revisions, time budgets and receipts. An unknown outcome must be inspected, not repeated. Before acting on an outstanding coordination message, read it and explicitly report ack(state=acted) after applying it. Outstanding mailbox: {}\n", execution.attempt_id, render_actionable_mailbox(&state["messages"], generation, &execution.attempt_id)));
-    let checkpoint_slug: String = tid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
-    prompt.push_str(&format!("\nIf a coordination ask remains pending and there is genuinely no independent work left, a managed implementation task can request a stop, not certify one. First preserve your work in a signed Git commit and publish its exact HEAD to a fresh refs/heads/bridge-checkpoints/{checkpoint_slug}/{generation}/<unique checkpoint> ref on this repository's origin. Do not stage ignored inputs or publish secrets. Send execution command request_coordination_wait with this generation and attempt_id, the existing ask_id, checkpoint_commit, and checkpoint {{repo, remote_ref, commit, tree, base, environment, next, tests}}. Then stop working. The originating gateway checks physical writer stop and the published checkpoint; only then can the ask own a wait and the slot be released. If the request reports the ask already resolved, keep working from that result instead.\n"));
+    // BR#14525 (owner ruling 2026-11-13): the remote checkpoint surface
+    // (refs/heads/bridge-checkpoints/*) is deprecated — partial-state refs on
+    // origin pollute git and trigger CI. The WORKTREE is the durability
+    // boundary: the stop intent records a LOCAL signed commit; the originating
+    // gateway verifies the surviving workspace's own object store.
+    prompt.push_str(&format!("\nIf a coordination ask remains pending and there is genuinely no independent work left, a managed implementation task can request a stop, not certify one. First preserve your work in a signed Git commit in this worktree (BR#14525: the worktree is the durability boundary — push nothing, and never publish refs/heads/bridge-checkpoints/* refs on origin). Do not stage ignored inputs or include secrets. Send execution command request_coordination_wait with this generation and attempt_id, the existing ask_id, checkpoint_commit, and checkpoint {{repo, commit, tree, base, environment, next, tests}}. Then stop working. The originating gateway checks physical writer stop and verifies the recorded local commit and tree in the surviving workspace; only then can the ask own a wait and the slot be released. If the request reports the ask already resolved, keep working from that result instead.\n"));
     prompt.push_str(BACKGROUND_JOBS_LINE);
     prompt.push_str("\nCI waits (BR#18328): ending your turn kills every background watch you started, and a turn that ends past its action budget is charged as a failed attempt — never park a CI wait on a local `gh run watch` or polling loop. If your verdict depends on hosted checks that are still running, either (a) keep the turn alive and poll live, declaring the quiet stretch first with log_progress {will, grace_minutes ≤ 60}, or (b) park durably before ending the turn: execution(id=<task>, command_id=<unique stable id>, command={kind:\"await_external\", generation, attempt_id, writers:\"process_group_empty\", wait:{type:\"pr_required_checks\", repo:\"owner/name\", pr:<n>, head_sha:\"<full 40-hex head your review is bound to>\", contexts:[\"<required check names>\"]}}). The attempt parks quiesced charge-free (the wait never consumes the retry budget), the card holds in todo as independent_wait with the worker slot released, and exactly one fresh verifier wakes when the bound checks settle green, conclusively fail, the head moves (the stale wait invalidates), or the settle bound (~60m) releases. The wake is evidence, never acceptance — the fresh verifier re-verifies signature, mergeability and substance at the current head first-hand.\n");
     prompt.push_str(&format!("\nActual execution model: {model_str}, reasoning tier {}. If this task exceeds your capability, inspect execution(command={{kind:availability}}) for next_available_tier, then request execution(command={{kind:escalate,generation:{generation},attempt_id:\"{}\",tier:<larger tier>,reason:<concrete limitation and next step>}}). Stop working after escalation; the runner stops writers and yields the task for a fresh attempt. An explicit unavailable tier blocks rather than downgrades. Ordinary review findings are not automatic escalation; a review duty can close with review_result={{kind:stronger_implementation_required,task_id:<subject>,summary:<why a larger model is necessary>}} when a larger tier is available. Human asks are only for a specific missing human decision/authority/information; low confidence, CI waiting and mechanical recovery alone are not human blockers. Use local_handoff only for a concrete local-only operation, with full findings and continuation details.\n", serde_json::to_string(&model_tier).unwrap_or_default(), execution.attempt_id));
@@ -4742,7 +4760,7 @@ mod tests {
         assert!(!state.permits_renewal(7, "other"));
         let mut restoring = base.clone();
         restoring["attempt"]["phase"] = json!("restoring");
-        restoring["attempt"]["checkpoint"] = json!({ "repo": "repo", "remote_ref": "refs/heads/checkpoint", "commit": "commit", "tree": "tree", "base": "base", "environment": [], "next": "restore", "tests": [] });
+        restoring["attempt"]["checkpoint"] = json!({ "repo": "repo", "commit": "commit", "tree": "tree", "base": "base", "environment": [], "next": "restore", "tests": [] });
         assert!(RemoteExecution::parse(restoring).unwrap().permits_renewal(7, "attempt"));
         for phase in ["stopping", "quiesced"] {
             let mut value = base.clone(); value["attempt"]["phase"] = json!(phase);

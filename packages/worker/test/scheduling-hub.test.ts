@@ -276,7 +276,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await mf?.dispose(); });
 
-const publishedCheckpoint = { repo: "https://github.com/state-vector/bridge", remote_ref: "refs/heads/bridge-checkpoints/recovery-priority",
+const publishedCheckpoint = { repo: "https://github.com/state-vector/bridge",
   commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Resume the preserved verification", tests: [] };
 
 async function gateway(project: string, capacity = 1, scoped = false) {

@@ -1190,17 +1190,46 @@ a live current executor is observed again. No human escalation is implied.
 Don’t wait repeatedly when no executor can respond.
 
 A managed implementation with no independent work left can register
-`request_coordination_wait` on its existing ask after publishing a checkpoint
-in the task and generation’s `refs/heads/bridge-checkpoints/` namespace. It
-does not attest quiescence. The originating gateway must prove writer stop
-and verify the clean, published checkpoint before parking. An answer that
-already arrived avoids parking; otherwise the same ask wakes the task.
-The replacement runner verifies the exact published commit and tree before
+`request_coordination_wait` on its existing ask after recording a checkpoint —
+a signed **local** commit in its surviving worktree (BR#14525, owner ruling
+2026-11-13: the worktree is the durability boundary; the
+`refs/heads/bridge-checkpoints/*` remote-checkpoint surface is deprecated and
+partial-state refs must never be pushed to origin). It does not attest
+quiescence. The originating gateway must prove writer stop and verify the
+recorded commit and tree in the surviving workspace before parking. An answer
+that already arrived avoids parking; otherwise the same ask wakes the task.
+The replacement runner verifies the exact recorded commit and tree before
 starting. Cancellation resumes without fabricating an answer.
 
 Completed resource records move to cold history, outside the active reconciliation
 and rewrite set; immutable removal receipts preserve cumulative accounting. Fair
 passes prefer larger resources among equally unvisited allocations. Under disk pressure, one slot per pass is offered to the largest eligible released workspace and the remaining slots retain fair order.
+
+**Worktree affinity and the explicit reclaim policy (BR#14525).** A task's retry
+generations prefer to resume in the SAME existing worktree on the same host:
+after the prior generation is verifiably quiescent, a new generation adopts the
+released worktree (record re-keyed, directory preserved) while the binding is
+fresh — 24h from last generation activity, `BRIDGE_WORKTREE_TTL_HOURS` overrides.
+Affinity is a preference, never a pin: the scheduler stops holding work for an
+unobserved host past a 30-minute fallback window and dispatches fresh elsewhere.
+Dispatch prefers resuming interrupted work over starting new work — recovery
+duties first, then resume-interrupted, then new todo — bounded to three
+priority resumes per task (`meta.resume_priority_grants`) before the task ages
+back to normal priority and the count signals the churn pattern for recovery
+attention. Adoption feeds the resuming agent a first-hand inherited-state
+assessment (dirty entries, local commits published or not) that it must record
+on the card before building; a scorched-earth reset to clean origin/main is a
+recorded deliberate choice, never a silent one. Reclaim is explicit policy, not
+silent GC: released worktrees holding unpublished value are retained inside the
+TTL as the adoptable value signal (the dirty-worktree signal is board-visible),
+and reclaim needs TTL expiry, a done/abandoned task, or disk pressure — which
+frees done worktrees first and never the currently dispatched task. Age alone
+is never deletion authority: expiry only ends the hold, and the evidence fences
+still refuse to destroy unique source. WIP durability is the worktree plus
+early/often signed LOCAL commits — nothing is pushed to origin until the final
+signed delivery, and the `refs/heads/bridge-checkpoints/*` remote-checkpoint
+surface is deprecated.
+
 
 Declared disposable cache/tmp/log allocations retire through the same state machine as soon as their execution is stopped, even when source must remain protected. Git-ignored unique inputs such as `.env` or measurement evidence are not assumed disposable: they retain source with a precise reason while bulky build caches can still be reclaimed. The reproducible Bridge worker dry-run bundle is reclaimed only when its directory matches the declared Wrangler output and contains no tracked or unexpected inputs. The CLI’s nested Cargo target is reclaimed only when it carries Cargo’s cache marker and contains no tracked files. Checkpoint publication never silently discards ignored evidence.
 
