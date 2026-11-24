@@ -9485,7 +9485,25 @@ export class KnowledgeHub {
     if (row.type === "task" && (body.to === "in_review" || origin === "client" && body.body_md !== undefined && String(body.body_md) !== row.body_md)) meta.work_revision = crypto.randomUUID();
     if (row.type === "task" && body.to === "in_review" && effectiveRole(tRoles) !== "review") {
       const note = String(body.note ?? "");
-      const target = reviewTarget ?? taskReviewTarget(meta, note);
+      let target = reviewTarget ?? taskReviewTarget(meta, note);
+      // BR#20312: a rebase after the first in_review leaves meta.review_target
+      // pinned at the ORIGINAL head while the re-entry's subject_revision names
+      // the new one — the acceptance gate requires accepted legs == submitted
+      // legs, so a fully verified new head could structurally never be
+      // accepted. A full 40-hex subject_revision on this submission now pins
+      // the submitted head into the bound legs; the seeded/reused verify duty
+      // derives its review_offer from taskReviewTarget(meta), so the fresh
+      // round reviews the head that was actually submitted. Precedence: a
+      // server-side train target wins untouched; a note binding its own head
+      // wins (its paired stamp is the submitted head); the pin replaces only a
+      // stale binding that neither transport carried a head for.
+      const subjectHead = typeof body.subject_revision === "string" && /^[0-9a-f]{40}$/.test(body.subject_revision)
+        ? body.subject_revision.toLowerCase() : undefined;
+      const noteTarget = reviewTarget ? undefined : reviewTargetFromNote(note);
+      const noteBindsHead = noteTarget?.kind === "pull_request" && noteTarget.legs.some(l => !!l.head_sha_at_acceptance);
+      if (subjectHead && !reviewTarget && !noteBindsHead && target.kind === "pull_request" && target.legs.length > 0) {
+        target = { ...target, legs: target.legs.map(l => ({ ...l, head_sha_at_acceptance: subjectHead })) };
+      }
       meta.review_target = target;
       if (note) meta.review_note = note.slice(0, 600);
       if (target.kind === "pull_request") {
