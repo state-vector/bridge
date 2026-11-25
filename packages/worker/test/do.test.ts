@@ -1774,4 +1774,47 @@ describe("interactive claim takeover (BR#6135)", () => {
     expect(door.body.taken_over).toBe(true);
   });
 });
+
+// GH#489 — retroactive exoneration for a train_red episode adjudicated
+// infra-caused after the line moved on (the bisect write path needs a live
+// lease + burst-red stop, so it can never express this). Operator authority:
+// the admin web plane only; agents exonerate nothing themselves.
+describe("GH#489 train.pardon — operator-only retroactive exoneration", () => {
+  const pardon = async (body: unknown, admin = true): Promise<{ status: number; body: any }> => {
+    const r = await kb("/train.pardon", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(admin ? { "x-kb-admin": "1" } : {}) },
+      body: JSON.stringify(executorRequest(body)),
+    });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+
+  it("refuses a non-admin caller — the ding a session earned it cannot pardon itself", async () => {
+    const { status, body } = await pardon({
+      sha: "74c6ddcd5aa", culprit: "BR#22423", reason: "GitHub-side transient, same run green on rerun",
+      evidence: [{ kind: "decision", decision_id: "BR#2517", class_token: "Post-Deploy Smoke" }],
+    }, false);
+    expect(status).toBeLessThan(500);
+    expect(String(body.error)).toMatch(/gate: train\.pardon is operator-only/);
+  });
+
+  it("refuses malformed calls with named errors, before any state is touched", async () => {
+    const sha = await pardon({ sha: "not-hex", culprit: "BR#1", reason: "GitHub-side transient adjudicated", evidence: [{ kind: "rerun_green", repo: "a/b", run_id: "123456", receipt_url: "https://github.com/a/b/actions/runs/123456" }] });
+    expect(String(sha.body.error)).toMatch(/needs sha/);
+    const culprit = await pardon({ sha: "74c6ddcd5aa", culprit: "22423", reason: "GitHub-side transient adjudicated", evidence: [{ kind: "rerun_green", repo: "a/b", run_id: "123456", receipt_url: "https://github.com/a/b/actions/runs/123456" }] });
+    expect(String(culprit.body.error)).toMatch(/needs culprit/);
+    const reason = await pardon({ sha: "74c6ddcd5aa", culprit: "BR#22423", reason: "short", evidence: [{ kind: "rerun_green", repo: "a/b", run_id: "123456", receipt_url: "https://github.com/a/b/actions/runs/123456" }] });
+    expect(String(reason.body.error)).toMatch(/needs reason/);
+    const evidence = await pardon({ sha: "74c6ddcd5aa", culprit: "BR#22423", reason: "GitHub-side transient adjudicated", evidence: [] });
+    expect(String(evidence.body.error)).toMatch(/needs evidence/);
+  });
+
+  it("refuses an episode with no unpardoned ding in the scoring window — nothing to pardon", async () => {
+    const { body } = await pardon({
+      sha: "74c6ddcd5aa", culprit: "BR#999999", reason: "GitHub-side transient, same run green on rerun",
+      evidence: [{ kind: "rerun_green", repo: "state-vector/superpositional", run_id: "45646090850", receipt_url: "https://github.com/state-vector/superpositional/actions/runs/45646090850" }],
+    });
+    expect(String(body.error)).toMatch(/gate: no unpardoned train_red_ding/);
+  });
+});
 import { completeExecutionReview } from "./completion-fixture";

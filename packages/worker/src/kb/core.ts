@@ -958,6 +958,54 @@ export function describeResultTrail(t: ResultTrail): string {
   return bits.join(", ") || "side effects present";
 }
 
+// ---------- machine_wait_stall: watcher-silence classification (GH#491) ----------
+
+/**
+ * A session parked watching a long-running machine job (a deploy run, a CI
+ * run, a verify stretch) goes quiet past the heartbeat window while the job
+ * it named is still in flight. The watchdog used to release such a card as a
+ * plain abandonment — punishing the wait pattern, not actual abandonment
+ * (the BR#17085 archetype: eleven watchdog releases on one card whose every
+ * release note ends "was about to: Wait for <run id> to reach completed").
+ * The classifier reads the last progress will/note the sweep already holds
+ * and names the wait, so the release can carry result_class
+ * `machine_wait_stall` — honest about the silence, exempt from the
+ * abandonment counter (same no-counter semantics as a BR#4067 hold-park).
+ *
+ * Evidence standard: the will/note must NAME a machine wait — an Actions run
+ * URL, a run id being waited on, an "on <job> completion" continuation, or
+ * an await of a run/deploy/build/merge. A declared human wait (ask/review/
+ * approval) proves nothing — those cards already hold on a bound ask, and a
+ * bare "wait" would reclassify every stall.
+ */
+export interface MachineWait {
+  /** the matched wait snippet from the trail (bounded, for the release note) */
+  evidence: string;
+}
+
+const GH_RUN_URL_RE = /github\.com\/[\w.-]+\/[\w.-]+\/actions\/runs\/\d+/;
+const WAIT_RUN_ID_RE = /\bwait(?:ing)?\s+(?:for|on)\s+(?:run\s+)?\d{6,}\b/i;
+const ON_COMPLETION_RE = /\bon\s+(?:deploy(?:ment)?|merge|ci|run|build|smoke|verify)\s+completion\b/i;
+const WAIT_CONCLUSION_RE = /\bwait(?:ing)?\s+for\b[^.;\n]{0,140}\b(?:reach|complet(?:e|ion)|conclud|finish|succeed|success|green|land|settle)\b/i;
+const AWAIT_JOB_RE = /\bawait(?:ing)?\s+(?:the\s+)?(?:run|deploy(?:ment)?|build|ci|merge)\b/i;
+/** a declared human-leg wait is NOT a machine wait — asks own those */
+const HUMAN_WAIT_RE = /\bwait(?:ing)?\s+(?:for|on)\s+(?:the\s+|a\s+)?(?:human|user|operator|answer|reply|response|ask|review|approval|decision|verdict)\b/i;
+
+/** The machine wait the session's own last words name. Returns null when the
+ *  trail names no wait (a genuine silent stall — classify plainly). */
+export function detectMachineWait(input: {
+  will?: string | null;
+  note?: string | null;
+}): MachineWait | null {
+  const text = [String(input.will ?? ""), String(input.note ?? "")].join("; ");
+  if (!text.trim() || HUMAN_WAIT_RE.test(text)) return null;
+  const re = [GH_RUN_URL_RE, WAIT_RUN_ID_RE, ON_COMPLETION_RE, WAIT_CONCLUSION_RE, AWAIT_JOB_RE]
+    .find((x) => x.test(text));
+  if (!re) return null;
+  const at = text.search(re);
+  return { evidence: text.slice(Math.max(0, at - 20), at + 120).trim().slice(0, 140) };
+}
+
 // ---------- agent behaviour score (self-reinforcing: gaming it = behaving well) ----------
 
 export interface AgentSignals {
@@ -2525,6 +2573,14 @@ export const PROXY_WAIT_HOLD_RESULT_CLASS = "proxy_wait_hold";
  *  it claimable instead of re-parking. The score side exempts it: a machine
  *  bounce + machine demote is nobody's abandonment. */
 export const BOUNCE_REENTRY_DEMOTE_RESULT_CLASS = "bounce_reentry_demote";
+
+/** result_class stamped on the watchdog's release of a card whose trail names
+ *  a machine wait (GH#491): the session went quiet watching a long-running
+ *  job (a deploy/CI run, a verify stretch) it had named in its last words —
+ *  a multi-hour watch cannot be expressed as a ≤60m grace window. The release
+ *  stays a release (claim drops, work is claimable), but the score side
+ *  exempts it: watching a machine job is not abandonment. */
+export const MACHINE_WAIT_STALL_RESULT_CLASS = "machine_wait_stall";
 
 /** The PR leg a card's merge-train state points at, from any of the shapes
  *  the hub stamps (meta.pr.number, meta.prs[0].number, meta.merge_train.pr).

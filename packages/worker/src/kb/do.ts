@@ -28,6 +28,7 @@ import {
   scoreAgent,
   AgentSignals,
   detectResultTrail,
+  detectMachineWait,
   describeResultTrail,
   ResultTrail,
   TRANSPORTS,
@@ -206,6 +207,7 @@ import {
   trainMergeReceipt,
   PROXY_WAIT_HOLD_RESULT_CLASS,
   BOUNCE_REENTRY_DEMOTE_RESULT_CLASS,
+  MACHINE_WAIT_STALL_RESULT_CLASS,
   // question human-claim hold (BR#3911)
   humanClaimLive,
   QUESTION_CLAIM_MINUTES,
@@ -1825,6 +1827,26 @@ export class KnowledgeHub {
       }
       const will = meta.last_progress?.will ? `; was about to: ${String(meta.last_progress.will).slice(0, 120)}` : "";
       const lapsedSub = meta.subprocess ? ` (declared subprocess window of ${meta.subprocess.budget_minutes ?? "?"}m lapsed)` : "";
+      // GH#491: classify a wait-stall BEFORE the result-trail check — the
+      // session's own last words name what it was doing at silence. A card
+      // whose will names a machine wait (an Actions run, "on deploy
+      // completion") went quiet WATCHING a job, not dead: a multi-hour watch
+      // cannot be expressed as a ≤60m grace window, and the sweep holds no
+      // VCS credentials to watch the named run itself (BR#3516) — the honest
+      // classification is the fix. Release with result_class
+      // machine_wait_stall: the claim still drops (a dead watcher must not
+      // squat on the card), but the score side exempts it (same no-counter
+      // semantics as a BR#4067 hold-park). Deriving the grace from the named
+      // wait would need executor-fed run facts (proxy probes) — not this sweep.
+      const wait = detectMachineWait({ will: meta.last_progress?.will, note: meta.last_progress?.note });
+      if (wait) {
+        await this.transition({
+          id: r.id, to: "todo",
+          note: `stalled — no update for >${staleMin}m; machine wait named in the trail — "${wait.evidence}"; released to the pool by watchdog (wait-stall, GH#491 — parked on a long-running machine wait, not abandoned)${will}`,
+          result_class: MACHINE_WAIT_STALL_RESULT_CLASS,
+        }, "system:watchdog");
+        continue;
+      }
       // BR#3352: classify the release from the session trail. A silent task
       // whose trail proves landed side effects (GitHub PR/issue/commit
       // receipts, or the runner's own completed_result_lost marker) is NOT an
@@ -3952,6 +3974,13 @@ export class KnowledgeHub {
         // release of a card whose executor was already gone — nobody
         // abandoned anything, so no counter moves.
       }
+      else if (d?.result_class === MACHINE_WAIT_STALL_RESULT_CLASS) {
+        // GH#491: the released card's trail named a machine wait (an Actions
+        // run, a deploy completion) — the session went quiet watching a
+        // long-running job, and a multi-hour watch cannot be expressed as a
+        // ≤60m heartbeat/grace window. The claim correctly dropped, but the
+        // silence is the wait pattern, not abandonment: no counter moves.
+      }
       else s.abandoned++;
     }
     for (const r of this.state.storage.sql.exec(
@@ -5297,6 +5326,14 @@ export class KnowledgeHub {
         case "train.status": return this.json(await this.trainStatus(body));
         case "train.history": return this.json(await this.trainHistory(body));
         case "train.bisect": return this.json(await this.trainBisect(body, actor));
+        // GH#489 — retroactive exoneration for an adjudicated infra-caused
+        // stop. Operator authority (admin web plane): agents never exonerate
+        // their own dings, so this rides x-kb-admin like the other human-leg
+        // controls, never the agent MCP surface.
+        case "train.pardon": {
+          if (!isAdmin) throw new Error("gate: train.pardon is operator-only — admin web plane (GH#489; agents exonerate nothing themselves)");
+          return this.json(this.trainPardon(body, actor));
+        }
         case "train.carry": return this.json(await this.trainCarry(body, actor));
         case "train.queue_facts": return this.json(await this.trainQueueFacts(body, actor));
         // BR#5186: base_live rides ONLY the executor's reseed ask — the tick
@@ -17793,6 +17830,112 @@ export class KnowledgeHub {
     });
     this.version(lane.id, actor, "train:bisect", `bisect walk: steps [${stepsShown}]${culpritTask ? ` — culprit ${culpritTask}${stop.bisect.culprit_sha ? ` @ ${String(stop.bisect.culprit_sha).slice(0, 9)}` : ""}${bounced ? " (bounced, final re-parked)" : " (the stop-bounced final card — bounce already stands)"}` : ""}${stop.bisect.inconclusive ? " — INCONCLUSIVE (pass bounces oldest-first)" : ""}`, { stop: meta.stop });
     return { ok: true, kind: "bisect", lane: laneKey(repo, base), stop: meta.stop, bounced, reparked };
+  }
+
+  /** train.pardon (GH#489): retroactive exoneration for a train_red episode
+   *  the bisect route cannot express — a stop adjudicated infra-caused AFTER
+   *  the line moved on (a bisect needs a live lease + a burst-red stop, so a
+   *  same-sha green rerun or a GitHub transient verdict has no write path;
+   *  the score read side is already pardon-aware, only the write side was
+   *  bisect-only). OPERATOR authority — admin web plane only: agents never
+   *  exonerate their own dings. The evidence bar is machine-checked from hub
+   *  data wherever the hub can check it (BR#3516: no VCS credentials — a
+   *  rerun receipt is operator-fed and recorded as vouched-by-operator, the
+   *  decision/root_fix routes are verified against stored artefacts). Writes
+   *  the SAME train_red_pardon audit stamp the bisect writes, with the ding's
+   *  exact sha:culprit pair, so computeAgentScores' 7d dedupe exonerates the
+   *  episode. */
+  private trainPardon(body: any, actor: string): any {
+    const shaIn = String(body?.sha ?? "").toLowerCase().trim();
+    const culpritIn = String(body?.culprit ?? "").trim();
+    const reason = String(body?.reason ?? "").trim();
+    if (!/^[0-9a-f]{7,40}$/.test(shaIn)) throw new Error("train.pardon needs sha — the episode's stop sha (7-40 hex)");
+    if (!/^BR#\d+$/i.test(culpritIn)) throw new Error("train.pardon needs culprit — the dinged task id (BR#N)");
+    if (reason.length < 10) throw new Error("train.pardon needs reason — why this episode was infra-caused (≥10 chars)");
+    const evidence: any[] = Array.isArray(body?.evidence) ? body.evidence : [];
+    if (!evidence.length) throw new Error("train.pardon needs evidence — a non-empty array of {kind: decision | rerun_green | root_fix, ...} atoms");
+    const now = Date.now();
+    const weekTs = now - 7 * 24 * 60 * 60_000;
+    // the episode must exist as an UNpardoned ding — the same rows and the
+    // same 7d window the score read honours (computeAgentScores)
+    const pardoned = new Set<string>();
+    for (const r of this.state.storage.sql.exec(
+      `SELECT detail FROM events WHERE op = 'train_red_pardon' AND ts >= ?`, weekTs,
+    ).toArray() as any[]) {
+      let d: any = {}; try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+      if (d?.sha && d?.culprit) pardoned.add(`${String(d.sha).toLowerCase()}:${String(d.culprit).toUpperCase()}`);
+    }
+    const ding = (this.state.storage.sql.exec(
+      `SELECT detail FROM events WHERE op = 'train_red_ding' AND ts >= ?`, weekTs,
+    ).toArray() as any[])
+      .map((r) => { try { return JSON.parse(r.detail ?? "{}"); } catch { return {} as any; } })
+      .find((d) => d?.sha && d?.culprit
+        && String(d.sha).toLowerCase() === shaIn
+        && String(d.culprit).toUpperCase() === culpritIn.toUpperCase());
+    if (!ding) throw new Error(`gate: no unpardoned train_red_ding episode for ${shaIn.slice(0, 9)}:${culpritIn.toUpperCase()} in the 7d scoring window — nothing to pardon (the ding rows and this op share one window)`);
+    const sha = String(ding.sha).toLowerCase();
+    const culprit = String(ding.culprit);
+    if (pardoned.has(`${sha}:${culprit.toUpperCase()}`)) throw new Error(`gate: episode ${sha.slice(0, 9)}:${culprit} is already pardoned — the score read already exempts it`);
+    // evidence verification — hub-side checks wherever the hub holds the facts
+    const artefactText = (id: string): string => {
+      const row = this.one(`SELECT title, body_md FROM artefacts WHERE id = ?`, id);
+      return row ? `${String(row.title ?? "")}\n${String(row.body_md ?? "")}` : "";
+    };
+    const contains = (haystack: string, needle: string): boolean => haystack.toLowerCase().includes(needle.toLowerCase());
+    const dingText = String(ding.reason ?? "");
+    const culpritText = artefactText(culprit);
+    const episodeRunIds = [...new Set((dingText.match(/\b\d{6,}\b/g) ?? []))].slice(0, 5);
+    const verified: any[] = [];
+    const rejected: string[] = [];
+    for (const atom of evidence) {
+      const kind = String(atom?.kind ?? "");
+      try {
+        if (kind === "decision") {
+          const id = String(atom.decision_id ?? "").trim();
+          const token = String(atom.class_token ?? "").trim();
+          if (!id || !token) throw new Error("decision atom needs {decision_id, class_token}");
+          const row = this.one(`SELECT type, status FROM artefacts WHERE id = ?`, id);
+          if (!row || String(row.type) !== "decision") throw new Error(`${id} is not a decision artefact`);
+          if (String(row.status) !== "accepted") throw new Error(`${id} is ${row.status ?? "unknown"}, not accepted`);
+          if (!contains(artefactText(id), token)) throw new Error(`accepted decision ${id} does not name class "${token}"`);
+          if (!contains(dingText, token) && !contains(culpritText, token)) throw new Error(`the episode (ding reason / culprit card) does not name class "${token}" — the decision must adjudicate THIS episode's class`);
+          verified.push({ kind, decision_id: id, class_token: token });
+        } else if (kind === "rerun_green") {
+          const repo = String(atom.repo ?? "").trim();
+          const runId = String(atom.run_id ?? "").trim();
+          const receipt = String(atom.receipt_url ?? "").trim();
+          if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("rerun_green atom needs repo owner/name");
+          if (!/^\d{6,}$/.test(runId)) throw new Error("rerun_green atom needs the numeric run id");
+          if (receipt !== `https://github.com/${repo}/actions/runs/${runId}`)
+            throw new Error("rerun_green receipt must be the exact run URL — the hub holds no VCS credentials to fetch run state (BR#3516), so the operator vouches this first-hand and the vouch is recorded");
+          verified.push({ kind, repo, run_id: runId, receipt_url: receipt, vouched_by: actor });
+        } else if (kind === "root_fix") {
+          const id = String(atom.task_id ?? "").trim();
+          if (!id) throw new Error("root_fix atom needs {task_id}");
+          const row = this.one(`SELECT status, title, body_md FROM artefacts WHERE id = ?`, id);
+          if (!row) throw new Error(`no artefact ${id}`);
+          if (String(row.status) !== "done") throw new Error(`${id} is ${row.status ?? "unknown"}, not done — a merged root-fix is a done card`);
+          const body = `${String(row.title ?? "")}\n${String(row.body_md ?? "")}`;
+          const named = [sha, culprit.toUpperCase(), ...episodeRunIds].find((n) => contains(body, n));
+          if (!named) throw new Error(`done card ${id} names none of this episode's facts (stop sha ${sha.slice(0, 9)}, culprit ${culprit}, run ids ${episodeRunIds.join(", ") || "none in ding reason"}) — a root-fix pardon names its stop`);
+          verified.push({ kind, task_id: id, names: String(named) });
+        } else {
+          throw new Error(`unknown evidence kind "${kind}" — decision | rerun_green | root_fix`);
+        }
+      } catch (e) {
+        rejected.push(`${kind || "unknown"}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      }
+    }
+    if (!verified.length)
+      throw new Error(`gate: no evidence atom verified — ${rejected.join(" | ")}`);
+    // the SAME audit stamp the bisect writes, with the ding's exact
+    // sha:culprit strings — the score read's dedupe key must match verbatim
+    const agents = this.blameAgents(culprit, now);
+    this.audit(actor, "train_red_pardon", culprit, { sha, culprit, agents, exonerated_by: "train.pardon", reason: reason.slice(0, 300), evidence: verified });
+    try {
+      this.version(culprit, actor, "train_red_pardon", `train_red episode exonerated (GH#489): stop ${sha.slice(0, 9)} adjudicated infra-caused — ${reason.slice(0, 200)} Evidence: ${verified.map((v) => v.kind).join(", ")}.`, { sha, evidence: verified, exonerated_by: "train.pardon" });
+    } catch { /* card note is best-effort — the audit stamp is the score-side fact */ }
+    return { ok: true, culprit, sha, agents, evidence: verified, rejected };
   }
 
   /** train.carry (BR#4934 settle-window rebase): the executor ran a

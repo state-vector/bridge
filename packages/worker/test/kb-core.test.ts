@@ -204,7 +204,7 @@ describe("trigram fuzzy vectors", () => {
   });
 });
 
-import { scoreAgent, AgentSignals, detectResultTrail, describeResultTrail } from "../src/kb/core.ts";
+import { scoreAgent, AgentSignals, detectResultTrail, detectMachineWait, describeResultTrail } from "../src/kb/core.ts";
 
 const zero: AgentSignals = {
   progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0,
@@ -337,6 +337,47 @@ describe("BR#3352 completed_result_lost — session-trail classification", () =>
     expect(d).toMatch(/worktree/);
     expect(d.length).toBeLessThan(220);
     expect(describeResultTrail({ receipt_url: null, commit_urls: [], worktree: null, session: null })).toMatch(/side effects present/);
+  });
+});
+
+// GH#491 — the watchdog used to release multi-hour watchers as plain
+// abandonments even when the release note itself quoted the wait ("was about
+// to: Wait for 45274016767 to reach completed"). The classifier reads the
+// same trail the sweep holds and NAMES the wait, so the release carries
+// result_class machine_wait_stall and the score side exempts it.
+describe("GH#491 machine_wait_stall — the trail names a machine wait", () => {
+  it("the BR#17085 archetype: waiting on an Actions run id to complete", () => {
+    const w = detectMachineWait({ will: "Wait for 45274016767 to reach completed (guard precondition)" });
+    expect(w).not.toBeNull();
+    expect(w!.evidence).toMatch(/45274016767/);
+  });
+
+  it("an 'on deploy completion' continuation is a machine wait", () => {
+    expect(detectMachineWait({ will: "On deploy completion: record smoke verdict" })).not.toBeNull();
+  });
+
+  it("an Actions run URL in the will is a machine wait", () => {
+    const w = detectMachineWait({
+      will: "Watching https://github.com/state-vector/superpositional/actions/runs/45646090850 to conclusion",
+    });
+    expect(w).not.toBeNull();
+    expect(w!.evidence).toMatch(/actions\/runs\/45646090850/);
+  });
+
+  it("the note carries the wait when the will is empty", () => {
+    expect(detectMachineWait({ will: "", note: "deploy in flight — waiting for run 45562685970 to finish" })).not.toBeNull();
+  });
+
+  it("a declared HUMAN wait is not a machine wait — bound asks own those", () => {
+    expect(detectMachineWait({ will: "waiting for the human to answer the ask" })).toBeNull();
+    expect(detectMachineWait({ will: "waiting for review to complete" })).toBeNull();
+    expect(detectMachineWait({ will: "awaiting operator approval" })).toBeNull();
+  });
+
+  it("a genuine silent stall names no wait", () => {
+    expect(detectMachineWait({ will: "Refactoring consumer.ts; next: wire the regression test" })).toBeNull();
+    expect(detectMachineWait({ will: "", note: "" })).toBeNull();
+    expect(detectMachineWait({})).toBeNull();
   });
 });
 
@@ -490,7 +531,7 @@ describe("splitSystemTags (roles_v1 migration transform)", () => {
   });
 });
 
-import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS, mergeTrainHoldPrefix, isWatchdogTrainHoldPark } from "../src/kb/core.ts";
+import { releaseHold, trainPrLeg, trainProxyEvent, trainMergeReceipt, PROXY_WAIT_HOLD_RESULT_CLASS, MACHINE_WAIT_STALL_RESULT_CLASS, mergeTrainHoldPrefix, isWatchdogTrainHoldPark } from "../src/kb/core.ts";
 
 // BR#4067 — the typed-proxy hold predicate: every watchdog release path
 // consults this one function. The PR #257/BR#4015 class: a card carrying a
@@ -540,6 +581,8 @@ describe("releaseHold — typed-proxy preservation (BR#4067)", () => {
 
   it("the hold result-class is the abandonment-scoring exemption stamp", () => {
     expect(PROXY_WAIT_HOLD_RESULT_CLASS).toBe("proxy_wait_hold");
+    // GH#491 — the wait-stall release shares the no-counter semantics
+    expect(MACHINE_WAIT_STALL_RESULT_CLASS).toBe("machine_wait_stall");
   });
 });
 
