@@ -44,6 +44,7 @@ const gatewayHoldLabels: Record<SchedulingReason, string> = {
   capability: "No ready gateway matches the required model, tools, or environment",
   startup_prerequisite: "Previous startup failed; needs a changed prerequisite",
   lifecycle_gate: "Task ownership or lifecycle prevents dispatch",
+  startup_interrupt: "Repeated zero-effect startup interrupts; dispatch is backing off before the next attempt",
 };
 
 function gatewayReason(dispatch?: GatewayDispatch): string {
@@ -60,6 +61,7 @@ function gatewayReason(dispatch?: GatewayDispatch): string {
     interrupted: "Last attempt stopped; earlier failures still count.",
     timed_out: "Last attempt timed out; cause needs diagnosis.",
     unclassified: "The recorded attempt does not establish a cause.",
+    startup_interrupt: "Last attempt stopped at startup with zero effect; a brief backoff owns the retry cadence.",
   }[dispatch.last_attempt];
   return [...dispatch.reasons.map(reason => gatewayHoldLabels[reason]), ...(attempt ? [attempt] : [])].join(" · ");
 }
