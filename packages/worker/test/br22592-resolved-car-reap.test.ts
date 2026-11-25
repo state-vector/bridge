@@ -163,10 +163,9 @@ describe("BR#22592 legs 1-3 — the reap (integration)", () => {
     expect(mt.legs?.["500"]?.state).toBe("awaiting-ci");
     const up = await post("/update", { id: wedged, meta: { merge_train: { ...mt, at: backdated, merged_at: backdated, legs: { "500": { ...mt.legs["500"], merged_at: backdated } } } } });
     expect(up.status).toBe(200);
-    expect((await laneQueueIds(REPO_A)).filter((id) => id === wedged)).toEqual(
-      [],
-      "a receipt-settled car must be reaped from the derived queue — holding it queue-visible IS the wedge",
-    );
+    // a receipt-settled car must be reaped from the derived queue — holding
+    // it queue-visible IS the wedge
+    expect((await laneQueueIds(REPO_A)).filter((id) => id === wedged)).toEqual([]);
     // and the line still admits a live candidate behind it
     const live = await queuedCar("BR#22592 live candidate behind the wedge", REPO_A, 501);
     expect((await laneQueueIds(REPO_A))).toContain(live);
@@ -251,10 +250,9 @@ describe("BR#22592 legs 1-3 — the reap (integration)", () => {
     const replay = await post("/train.event", { repo: REPO_E, base: "main", kind: "merged", actor: "fixture-gw", pr: 900, merge_sha: MERGE, head_sha: NEW, task_id: car });
     const rb = (await replay.json()) as any;
     expect(rb.deduped).toBe(true);
-    expect((await getOne(car)).meta?.merge_train?.legs?.["900"]?.state).toBe(
-      "landed",
-      "the dedupe must promote the leg stamp to terminal landed — the settle that should have done it never came",
-    );
+    // the dedupe must promote the leg stamp to terminal landed — the settle
+    // that should have done it never came
+    expect((await getOne(car)).meta?.merge_train?.legs?.["900"]?.state).toBe("landed");
     expect((await laneQueueIds(REPO_E)).filter((id) => id === car)).toEqual([]);
   });
 });
@@ -262,7 +260,9 @@ describe("BR#22592 legs 1-3 — the reap (integration)", () => {
 describe("BR#22592 leg 4 — the starve pickup SLA (source pin; the real clock cannot age an episode in-test)", () => {
   it("the starvation tick carries the pickup SLA: budget setting, re-boost, one-per-episode sink alarm", async () => {
     const { readFileSync } = await import("node:fs");
-    const src = readFileSync(new URL("../src/kb/do.ts", import.meta.url), "utf8");
+    // cwd-relative (vitest runs from packages/worker) — new URL's type here
+    // collides with miniflare's bundled undici URL under tsc
+    const src = readFileSync("src/kb/do.ts", "utf8");
     // the SLA lives in the starvation tick's EXISTING-episode path (the
     // init path just filed the duty; the tick that finds it unclaimed owns
     // the bound) — not in the init arm, which has no age to judge
