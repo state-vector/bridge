@@ -8,6 +8,7 @@ import { Btn, Chip, TextInput } from "./index-kit";
 import { ClaimLocallyBtn } from "./claimLocally";
 import { askLifecycle, isHumanDecisionAsk } from "@bridge/contracts";
 import { AskContext } from "./AskContext";
+import { AskActionBtn, askActionPlan } from "./askTemplate";
 
 /** The human-ask plane: proposed decisions + hub asks, rendered EXACTLY ONCE,
  *  as close to their subject as possible (2026-10-23 design, Ray):
@@ -197,6 +198,12 @@ export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending,
 
   // the subject BY NAME — an id alone doesn't say what the ask is about
   const subject = useKb((s) => s.tasks.find((t) => t.id === nodeAsk.part_of));
+  // BR#21762: the ask's AFFECTED card (decision.task_id) — where a typed
+  // one-click action executes
+  const target = useKb((s) => s.tasks.find((t) => t.id === ((ask.decision as any)?.task_id ?? nodeAsk.part_of)));
+  // the promoted executable choice renders ONCE as the direct primary
+  // button and is skipped in the option list
+  const promoted = askActionPlan(ask, nodeAsk.id)?.answer;
   // rows point, the detail view acts: option buttons answer inline (one click,
   // no typing); the last row is "type your own" — a free-text answer recorded
   // with the ask exactly like a click (BR#3912: "RE-SCOPE — I'll rewrite the
@@ -232,6 +239,7 @@ export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending,
       </div>
       <div className="ab-question-content">
         <AskContext body={nodeAsk.body_md} ask={ask} />
+        <AskActionBtn askId={nodeAsk.id} ask={ask} target={target ?? subject} disabled={busy || answered} onDone={onDone} onPending={onPending} />
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
           {/* BR#3942 — addressee presence: a stalled card shows WHO the ask is
@@ -245,7 +253,7 @@ export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending,
           {nodeAsk.part_of && <> · on {nodeAsk.part_of}{subject ? ` — ${subject.title.slice(0, 80)}${subject.title.length > 80 ? "…" : ""}` : ""}</>}
         </span>
         {(ask.options ?? []).length > 0 && (
-          <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} onPick={(o) => void answer(o)} />
+          <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy || answered} skip={promoted} onPick={(o) => void answer(o)} />
         )}
         {customOpen ? (
           <div className="ask-opt-row">

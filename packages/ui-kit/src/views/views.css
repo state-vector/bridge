@@ -1041,6 +1041,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: v
 .ask-opt-row { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 4px; cursor: pointer; }
 .ask-opt-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .ask-opt-row.disabled { opacity: 0.5; cursor: default; }
+
+/* BR#21762 typed ask templates — direct one-click actions + concise frames */
+.ask-exec-row { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; flex-wrap: wrap; }
+.ask-exec-row .ask-opt-text { font-size: 11px; }
+.ask-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.ask-details { margin: 4px 0 6px; }
+.ask-details summary { cursor: pointer; color: var(--text-faint); font-size: 11px; user-select: none; }
+.ask-details summary:hover { color: var(--text-dim); }
+.ask-details .md-body { margin-top: 4px; }
 .ask-opt-text { font-size: 11.5px; line-height: 1.4; min-width: 0; }
 
 /* band rows hosting a vertical option list: let the row grow naturally */

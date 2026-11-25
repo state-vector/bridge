@@ -8,6 +8,17 @@
  */
 import { z } from "zod";
 
+/** Typed effects a choice can name. The WEB-EXECUTABLE set (release,
+ * clear_hold, supersede, close) is performed BY THE CLICK: the ask surfaces
+ * render such choices as direct action buttons running the owner web
+ * plane's audited ops (BR#21657 overrides / transitions) and then record
+ * the answer with a receipt — never a confirmation the human must then
+ * hunt for (BR#21762). `local_handoff` keeps its old meaning: the human
+ * genuinely performs the step outside Bridge. */
+export const ASK_CHOICE_ACTIONS = ["resume", "hold", "release", "local_handoff", "clear_hold", "supersede", "close"] as const;
+export type AskChoiceAction = (typeof ASK_CHOICE_ACTIONS)[number];
+export const WEB_EXECUTABLE_ACTIONS: ReadonlySet<string> = new Set(["release", "clear_hold", "supersede", "close"]);
+
 /** The choice and its effect are separate from display prose. A location used
  * for notifications is never the action target. Diagnostic uncertainty has no
  * human-decision category: Bridge must investigate it first. */
@@ -20,11 +31,11 @@ export const HumanDecisionSchema = z.object({
     label: z.string().trim().min(1).max(200),
     executor: z.enum(["bridge", "human"]),
     consequence: z.string().trim().min(1).max(500),
-    action: z.enum(["resume", "hold", "release", "local_handoff"]),
+    action: z.enum(ASK_CHOICE_ACTIONS),
   })).min(2).max(8),
 }).superRefine((d, ctx) => {
   if (new Set(d.choices.map((c) => c.label)).size !== d.choices.length) ctx.addIssue({ code: "custom", message: "decision choice labels must be unique" });
-  for (const c of d.choices) if (c.executor === "human" && c.action !== "hold" && c.action !== "local_handoff") ctx.addIssue({ code: "custom", message: "a human execution step must hold the task or enter explicit local handoff until completion is confirmed" });
+  for (const c of d.choices) if (c.executor === "human" && c.action !== "hold" && c.action !== "local_handoff" && !WEB_EXECUTABLE_ACTIONS.has(c.action)) ctx.addIssue({ code: "custom", message: "a human execution step must hold the task, enter explicit local handoff, or name a web-executable action (release, clear_hold, supersede, close) the ask button performs itself" });
   if (d.choices.some((c, i) => i > 0 && /^\(recommended\)/i.test(c.label))) ctx.addIssue({ code: "custom", message: "put the recommended choice first" });
 });
 export type HumanDecision = z.infer<typeof HumanDecisionSchema>;
@@ -89,6 +100,41 @@ export function isHumanDecisionAsk(ask: { route?: unknown; to?: unknown }): bool
   return askRoute(ask).kind === "human_decision";
 }
 
+/* ------------------------------------------------------------------ */
+/* Well-known ask templates (BR#21762). Common asks compose from a     */
+/* closed registry — the hub writes the copy, so there is no random    */
+/* variation and length content, and every template's primary choice   */
+/* carries a typed web-executable action the ask button performs on    */
+/* click (audited owner override / transition), not a confirmation     */
+/* the human must then hunt for. Producers pass template + structured  */
+/* fields; NEVER question/options/decision alongside it.               */
+
+const T_TASK = z.string().regex(/^BR#\d+$/);
+const T_SUBJECT = z.string().trim().min(1).max(140);
+const T_WHY_NOW = z.string().trim().max(280).optional();
+
+export const AskTemplateSchema = z.discriminatedUnion("kind", [
+  /** Release a stale/wedged claim to the pool (holder gone, machine exits gate-refused). */
+  z.object({ kind: z.literal("release_hold"), task_id: T_TASK, subject: T_SUBJECT, why_now: T_WHY_NOW }),
+  /** Clear a stale hold marker whose defect no longer matches live state. */
+  z.object({ kind: z.literal("clear_hold"), task_id: T_TASK, subject: T_SUBJECT, hold: z.enum(["merge_train", "await_event", "bound_ask"]), why_now: T_WHY_NOW }),
+  /** Apply the resume leg on a card whose typed wait already fired (answer auto-resumes the bound card). */
+  z.object({ kind: z.literal("resume_card"), task_id: T_TASK, subject: T_SUBJECT, why_now: T_WHY_NOW }),
+  /** Apply the credential-gated completion disposition on an evidence-complete card. */
+  z.object({ kind: z.literal("close_card"), task_id: T_TASK, subject: T_SUBJECT, disposition: z.enum(["done", "in_review"]), receipts: z.string().trim().min(1).max(600), why_now: T_WHY_NOW }),
+  /** Rework loop (system:reaper class): release, supersede or re-scope. */
+  z.object({ kind: z.literal("churn_loop"), task_id: T_TASK, subject: T_SUBJECT, attempts: z.number().int().min(2).max(999), last_reason: z.string().trim().max(200).optional(), why_now: T_WHY_NOW }),
+  /** Human-gated merge: the asker executes the merge on GO. */
+  z.object({ kind: z.literal("merge_now"), task_id: T_TASK, subject: T_SUBJECT, repo: z.string().trim().min(3).max(100), pr: z.number().int().positive(), why_now: T_WHY_NOW }),
+]);
+export type AskTemplate = z.infer<typeof AskTemplateSchema>;
+
+const HOLD_WORD: Record<Extract<AskTemplate, { kind: "clear_hold" }>["hold"], string> = {
+  merge_train: "merge-train bounce",
+  await_event: "typed wait",
+  bound_ask: "bound ask",
+};
+
 export const AskCreatePayloadSchema = z.looseObject({
   route: AskRouteSchema.optional(),
   decision: HumanDecisionSchema.optional(),
@@ -113,8 +159,121 @@ export const AskCreatePayloadSchema = z.looseObject({
   options: z.array(z.string()).min(2).max(8).optional(),
   /** Your blocked task — links the decision, pauses the watchdog. */
   artefact_id: z.string().optional(),
+  /** BR#21762: well-known ask kind — the hub composes question/reason/
+   *  details/decision/options from the closed registry (fixed concise
+   *  copy, typed one-click actions). Mutually exclusive with the fields
+   *  it composes. */
+  template: AskTemplateSchema.optional(),
 });
 export type AskCreatePayload = z.infer<typeof AskCreatePayloadSchema>;
+
+/** Compose the full ask payload from a template. Pure: the worker's
+ *  askCreate runs the result through the SAME admission rules as a
+ *  hand-written ask (requireHumanDecision validates it like any other). */
+export function composeTemplateAsk(t: AskTemplate): { question: string; reason: string; details: string; decision: HumanDecision; options: string[] } {
+  const why = t.why_now ? `\n\nWhy now: ${t.why_now}` : "";
+  switch (t.kind) {
+    case "release_hold":
+      return {
+        question: `Release the stale claim on ${t.task_id} — ${t.subject}?`,
+        reason: "Only your owner web credential can release this claim; every machine exit is gate-refused or the holder is gone.",
+        details: `**Release ${t.task_id}** (${t.subject}). One click runs the audited owner override: the claim releases to the pool, hold state is untouched, and nothing on GitHub or in any repo changes.${why}`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**Release ${t.task_id}** (${t.subject}). One click runs the audited owner override: the claim releases to the pool, hold state is untouched, and nothing on GitHub or in any repo changes.${why}`,
+          why_human: "Only your owner web credential can release this claim; every machine exit is gate-refused or the holder is gone.",
+          choices: [
+            { label: "Release", executor: "human", action: "release", consequence: "One click releases the claim to the pool (audited). You do nothing else." },
+            { label: "Keep held", executor: "bridge", action: "hold", consequence: "The claim stays; recovery duties keep re-verifying the unchanged state." },
+          ],
+        },
+        options: ["Release", "Keep held"],
+      };
+    case "clear_hold":
+      return {
+        question: `Clear the stale ${HOLD_WORD[t.hold]} hold on ${t.task_id} — ${t.subject}?`,
+        reason: "The hold's defect no longer matches live state; only your owner web credential can clear it.",
+        details: `**Clear the ${HOLD_WORD[t.hold]} hold on ${t.task_id}** (${t.subject}). One click runs the audited owner override: the stale marker is removed and the card keeps its status. Live train slots cannot be cleared — the button refuses loudly if the slot went live again.${why}`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**Clear the ${HOLD_WORD[t.hold]} hold on ${t.task_id}** (${t.subject}). One click runs the audited owner override: the stale marker is removed and the card keeps its status. Live train slots cannot be cleared — the button refuses loudly if the slot went live again.${why}`,
+          why_human: "The hold's defect no longer matches live state; only your owner web credential can clear it.",
+          choices: [
+            { label: "Clear hold", executor: "human", action: "clear_hold", consequence: "One click clears the stale marker (audited); the card keeps its status." },
+            { label: "Keep parked", executor: "bridge", action: "hold", consequence: "The hold stays; the sweep keeps re-firing its predicate." },
+          ],
+        },
+        options: ["Clear hold", "Keep parked"],
+      };
+    case "resume_card":
+      return {
+        question: `Resume ${t.task_id} — its wait already fired (${t.subject})?`,
+        reason: "The machine resume is credential-gated for dispatched sessions; your answer authorizes and triggers the resume leg.",
+        details: `**Resume ${t.task_id}** (${t.subject}). Its typed wait fired and is verified; only the resume leg is missing. Your click records GO and the hub applies the resume on the bound card immediately — no hunting, no manual transitions.${why}`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**Resume ${t.task_id}** (${t.subject}). Its typed wait fired and is verified; only the resume leg is missing. Your click records GO and the hub applies the resume on the bound card immediately — no hunting, no manual transitions.${why}`,
+          why_human: "The machine resume is credential-gated for dispatched sessions; your answer authorizes and triggers the resume leg.",
+          choices: [
+            { label: "Resume now", executor: "bridge", action: "resume", consequence: "The hub applies the resume leg on the bound card the moment you click." },
+            { label: "Keep parked", executor: "bridge", action: "hold", consequence: "The card stays parked on the fired wait." },
+          ],
+        },
+        options: ["Resume now", "Keep parked"],
+      };
+    case "close_card": {
+      const word = t.disposition === "done" ? "delivered" : "in review";
+      return {
+        question: `Close ${t.task_id} as ${word} — ${t.subject}?`,
+        reason: "The completion leg is credential-gated: only your live web credential can apply the disposition.",
+        details: `**Close ${t.task_id} as ${word}** (${t.subject}). One click applies the disposition; the hub's gates still validate and refuse loudly if the receipts are stale.\n\nReceipts: ${t.receipts}${why}`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**Close ${t.task_id} as ${word}** (${t.subject}). One click applies the disposition; the hub's gates still validate and refuse loudly if the receipts are stale.\n\nReceipts: ${t.receipts}${why}`,
+          why_human: "The completion leg is credential-gated: only your live web credential can apply the disposition.",
+          choices: [
+            { label: `Close as ${word}`, executor: "human", action: "close", consequence: "One click applies the disposition with the cited receipts; gates still validate server-side." },
+            { label: "Keep open", executor: "bridge", action: "hold", consequence: "The card stays open; recovery keeps re-verifying." },
+          ],
+        },
+        options: [`Close as ${word}`, "Keep open"],
+      };
+    }
+    case "churn_loop":
+      return {
+        question: `${t.task_id} is stuck in a rework loop (${t.attempts} attempts) — release, drop, or re-scope?`,
+        reason: "Re-releasing unchanged repeats the same claim→stall cycle; the disposition is a human call.",
+        details: `**${t.task_id}** (${t.subject}) has failed ${t.attempts} dispatch attempts.${t.last_reason ? ` Last release reason: ${t.last_reason}.` : ""} Re-releasing unchanged just repeats the cycle — pick the disposition. Release and Supersede are one-click owner overrides; Re-scope waits for your rewrite of the brief (use the detail view).`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**${t.task_id}** (${t.subject}) has failed ${t.attempts} dispatch attempts.${t.last_reason ? ` Last release reason: ${t.last_reason}.` : ""} Re-releasing unchanged just repeats the cycle — pick the disposition. Release and Supersede are one-click owner overrides; Re-scope waits for your rewrite of the brief (use the detail view).`,
+          why_human: "Re-releasing unchanged repeats the same claim→stall cycle; the disposition is a human call.",
+          choices: [
+            { label: "Release to pool", executor: "human", action: "release", consequence: "One click releases the claim (audited); reasonable only if the failures were environmental." },
+            { label: "Supersede — drop it", executor: "human", action: "supersede", consequence: "One click supersedes the card (audited); the work is moot, done elsewhere, or not worth the loop." },
+            { label: "Re-scope it", executor: "human", action: "local_handoff", consequence: "You rewrite the card's brief (title/body/exit condition); the card waits for your edit." },
+          ],
+        },
+        options: ["Release to pool", "Supersede — drop it", "Re-scope it"],
+      };
+    case "merge_now":
+      return {
+        question: `Merge ${t.repo}#${t.pr} into main now — ${t.subject}?`,
+        reason: "The merge is human-gated; your GO executes it through the asker's merge lane.",
+        details: `**Merge ${t.repo}#${t.pr}** (${t.subject}). Your GO executes the merge through the asker's merge lane and the receipts land on ${t.task_id}.${why}`,
+        decision: {
+          kind: "authority", task_id: t.task_id,
+          context: `**Merge ${t.repo}#${t.pr}** (${t.subject}). Your GO executes the merge through the asker's merge lane and the receipts land on ${t.task_id}.${why}`,
+          why_human: "The merge is human-gated; your GO executes it through the asker's merge lane.",
+          choices: [
+            { label: "Merge now", executor: "bridge", action: "resume", consequence: "The asker merges on your GO and posts the receipts on the card." },
+            { label: "Hold", executor: "bridge", action: "hold", consequence: "The merge waits; nothing changes." },
+          ],
+        },
+        options: ["Merge now", "Hold"],
+      };
+  }
+}
 
 export const AskAnswerPayloadSchema = z.object({
   id: z.string(),

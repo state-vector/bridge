@@ -15,7 +15,7 @@
  * generated surface against `fixtures/mcp-tools.json`.
  */
 import { z } from "zod";
-import { AskRouteSchema, CoordinationWaitSchema, HumanDecisionSchema } from "./ask.ts";
+import { AskRouteSchema, AskTemplateSchema, CoordinationWaitSchema, HumanDecisionSchema } from "./ask.ts";
 import { ExecutionResultSchema, UnblockResultSchema } from "./work.ts";
 import { ReviewResultSchema } from "./review.ts";
 import { DeployObservationSchema } from "./train.ts";
@@ -224,6 +224,7 @@ export const TOOL_ARG_SCHEMAS = {
     // adapter dropped this field, so every MCP ask collapsed to "normal";
     // omitted stays "normal" (the native ask.create default).
     urgency: z.enum(["normal", "time-sensitive"]).optional().describe('Ask urgency: "time-sensitive" surfaces the human-facing NOW chip and interrupt priority; omit for "normal".'),
+    template: AskTemplateSchema.optional().describe("BR#21762 well-known ask — the hub composes ALL copy (question/reason/details/decision/options) from the closed registry, so common asks render as one line + a direct one-click action button. Pass template + urgency (+ artefact_id = task_id); do NOT pass question/options/decision/reason/details alongside. Kinds: release_hold {task_id,subject,why_now?} · clear_hold {…,hold: merge_train|await_event|bound_ask} · resume_card · close_card {…,disposition: done|in_review,receipts} · churn_loop {…,attempts,last_reason?} · merge_now {…,repo,pr}."),
     artefact_id: z.string().optional(),
     coordination: CoordinationWaitSchema.optional().describe("Bounded synchronous wait for an executor_coordination ask from a named session. Returns pending early if a distinct live executor is not observable. Do not bind artefact_id; a pending answer does not park your work."),
     session: z.string().optional(),

@@ -315,7 +315,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
       // stores the contract v2 vocabulary ("time-sensitive" | "normal");
       // dropping it here made every MCP ask persist as "normal" even when the
       // caller flagged it time-sensitive.
-      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, urgency: args.urgency, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName, coordination_request_id: coordination?.request_id });
+      const a = await ctx.call("ask.create", { route: args.route, decision: args.decision, to: args.to, question: args.question, reason: args.reason, details: args.details, options: args.options, urgency: args.urgency, template: args.template, artefact_id: args.artefact_id, session: args.session ?? ctx.sessionName, coordination_request_id: coordination?.request_id });
       if (coordination) {
         const result = await waitForCoordination(ctx, a.id, coordination.wait_ms ?? 5000, args.session ?? ctx.sessionName);
         const receipt = { ...result, url: a.url };

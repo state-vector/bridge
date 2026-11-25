@@ -68,17 +68,21 @@ export function askOptionVariant(o: string): "accept" | "reject" {
  *      [ A ] - Provision x
  *      [ B ] - Reword y
  *  Never letter-keys alone — an option without its text is not an option. */
-export function AskOptions({ options: raw, onPick, busy, choices }: {
+export function AskOptions({ options: raw, onPick, busy, choices, skip }: {
   options: string[]; onPick: (o: string) => void; busy?: boolean; compact?: boolean; choices?: import("@bridge/contracts").HumanDecision["choices"];
+  /** BR#21762: label promoted to the direct AskActionBtn — omitted here so
+   *  the executable choice appears exactly once, as the primary button. */
+  skip?: string;
 }) {
-  if (choices) return <div className="ask-opt-list">{choices.map((choice) => <div key={choice.label} className="ask-choice">
+  if (choices) return <div className="ask-opt-list">{choices.filter((choice) => choice.label !== skip).map((choice) => <div key={choice.label} className="ask-choice">
     <p className="ask-opt-text"><b>Action owner: {choice.executor === "human" ? "You" : "Bridge"}.</b> {choice.consequence}</p>
     {choice.executor === "human" && <p className="ask-opt-text">You perform the action described above. This button only sends your answer; it does not perform the action or give Bridge your permissions.</p>}
     <Btn disabled={busy} onClick={() => onPick(choice.label)}>{choice.label}</Btn>
   </div>)}</div>;
   const options = raw
     .map((o) => (typeof o === "string" ? o : String((o as any)?.label ?? (o as any)?.text ?? "")))
-    .filter((o) => o && !/\[object\s*object\]/i.test(o));
+    .filter((o) => o && !/\[object\s*object\]/i.test(o))
+    .filter((o) => o !== skip);
   if (options.length === 0) return null;
   if (options.length === 2 && options.every((o) => o.length <= 64)) {
     return (

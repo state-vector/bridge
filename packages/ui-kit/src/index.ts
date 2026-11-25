@@ -45,4 +45,6 @@ export { BacklogView, CompletedView } from "./views/BacklogView";
 export { StatusLights } from "./views/StatusLights";
 export { ForMeView } from "./views/ForMeView";
 export { DecisionPopover, decisionFrame } from "./views/decide";
+// BR#21762 typed ask templates — direct one-click actions on ask surfaces
+export { AskActionBtn, askActionPlan, isOneClickAsk, type AskActionPlan, type AskActionOp } from "./views/askTemplate";
 export { notifyExecutionAttention, type ExecutionNotice } from "./server/executionNotifications";

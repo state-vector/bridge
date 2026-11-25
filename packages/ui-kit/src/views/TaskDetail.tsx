@@ -4,6 +4,7 @@ import { kbApi } from "../server/kb";
 import type { KbAsk } from "../server/kb";
 import { md, AskOptions, askOptionVariant } from "./decide";
 import { AskContext } from "./AskContext";
+import { AskActionBtn, askActionPlan } from "./askTemplate";
 import type { KbArtefact, KbVersion } from "../server/kb";
 import { kindOf, rel } from "../server/views";
 import { linkifyHtml, escHtml, getCardLinkOpener } from "./refs";
@@ -647,6 +648,10 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
   const [err, setErr] = useState("");
   const [text, setText] = useState("");
   const [reframeText, setReframeText] = useState("");
+  // BR#21762: the affected card (decision.task_id) for a typed one-click
+  // action, and the promoted executable choice to skip in the option list
+  const actionTarget = useKb((s) => (s.tasks as any[]).find((t) => t.id === ask.decision?.task_id));
+  const promoted = askActionPlan(ask, task.id)?.answer;
   const answer = async (a: string) => {
     if (!a.trim()) return;
     setBusy(true);
@@ -671,8 +676,9 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
       <AskContext body={task.body_md} ask={ask} />
+      <AskActionBtn askId={task.id} ask={ask} target={actionTarget ?? (task as any)} disabled={busy} onDone={() => onChanged?.()} />
       {(ask.options ?? []).length > 0 && (
-        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} onPick={(o) => void answer(o)} />
+        <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} skip={promoted} onPick={(o) => void answer(o)} />
       )}
       <div className="steer-box" style={{ marginTop: 8 }}>
         <TextArea rows={2} value={text} placeholder="or answer in your own words…" onChange={(e) => setText(e.target.value)} />

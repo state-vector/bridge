@@ -251,7 +251,7 @@ import {
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
-import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
+import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, AskTemplateSchema, composeTemplateAsk, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
@@ -12113,6 +12113,21 @@ export class KnowledgeHub {
   }
 
   private async askCreate(body: any, actor: string) {
+    // BR#21762 typed ask templates: common asks compose from the closed
+    // registry — fixed concise copy + one-click typed actions, so there is
+    // no random variation and length content. The composed payload runs
+    // through the SAME admission rules below; producers cannot drift the
+    // copy (passing composed fields alongside a template is refused).
+    let askTemplate: ReturnType<typeof AskTemplateSchema.parse> | undefined;
+    if (body.template !== undefined) {
+      askTemplate = AskTemplateSchema.parse(body.template);
+      for (const k of ["question", "options", "decision", "reason", "details"] as const)
+        if (body[k] !== undefined) throw new Error(`a template composes the ask — do not pass ${k} alongside template (pass only template, urgency, artefact_id)`);
+      if (body.route !== undefined && body.route?.kind !== "human_decision") throw new Error("templates are human_decision asks; omit route");
+      if (body.artefact_id !== undefined && body.artefact_id !== askTemplate.task_id) throw new Error("the template's task_id must match artefact_id");
+      const composed = composeTemplateAsk(askTemplate);
+      body = { ...body, to: "human", route: { kind: "human_decision" }, ...composed, artefact_id: askTemplate.task_id };
+    }
     let to = String(body.to ?? (body.route?.kind === "human_decision" ? "human" : "any"));
     const route = askRoute({ route: body.route, to });
     const decision = body.decision === undefined ? undefined : HumanDecisionSchema.parse(body.decision);
@@ -12210,7 +12225,7 @@ export class KnowledgeHub {
         // the why, never just the bare question.
         body_md: details || (reason ? `${question}\n\nWHY ESCALATED: ${reason}` : question),
         owner: "",
-        meta: { ask: { route, decision, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(body.review_leg ? { review_leg: true } : {}) } },
+        meta: { ask: { route, decision, to, urgency, options, from: actor, reason: reason || undefined, artefact_id: artefactId || undefined, ...(askTemplate ? { template: askTemplate } : {}), ...(body.review_leg ? { review_leg: true } : {}) } },
       },
       actor,
       undefined,
