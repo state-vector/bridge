@@ -2004,6 +2004,37 @@ executors and consequences, and put supporting evidence under Details. They show
 no offline/never-seen diagnostics for human recipients. Legacy requests retain
 their full brief; their compatibility adapter does not rewrite their meaning.
 
+**Typed core workflows (BR#22008).** No free text drives a core workflow — not
+ask dispatch, not train legs, not await conditions, not churn classification,
+not gate rejections. The matcher is `resolveChoice(decision, answer)` in
+`@bridge/contracts` (exact trimmed label equality, the ONE authority; the hub
+imports it), and a decision ask whose answer matches no label exactly holds —
+the answer records as commentary and dispatches nothing. The typed action table
+(supersede / release / close / clear_hold / hold) executes through the legal
+lifecycle edges server-side: a `close` on a parked card claims it through
+`in_progress` first, then the disposition edge — every done gate (accepted
+review, admission, receipts) validates exactly as for a hand close, and a
+refusal surfaces as `answer_apply_failed` on the ask, never a raw 400 on the
+click (the BR#21657 op-first-button wedge class is dead: the UI button submits
+the typed choice only). Legacy options-only asks (no `decision` struct) keep
+their documented click semantics through the closed option-intent registry
+(`legacyOptionAction` in contracts — SUPERSEDE → drop, RELEASE → release,
+KEEP/RE-SCOPE → park), applied only to an answer that exactly equals one of
+the ask's own options; a free-text answer matching no option dispatches
+nothing. Train alarm answers are the exact matched option — the intent table
+reads the option label the ask itself filed; a typed "DONE" stamps nothing.
+Churn parks are typed at birth (`await_event {event:"recovery_required"}`,
+scheduler-authority only — a free transition cannot stamp one) and classify via
+`isChurnPark` typed-first; the old prose `reason.startsWith("churn guard:")`
+reads are one-way legacy adapters. Gate rejections are typed structs — `rule`
+and `owns_exit {ask_id}` ride the body and the client routes to the ask, no
+prose parsing. Closed backfills remain, each a read-only adapter: the
+first-submission note-leg receipt parse, the lane queue's legacy-card prose
+fallback, and the review-target head-binding notes. A source-scan suite
+(`br22008-source-pins.test.ts`) pins all of this mechanically — reintroducing
+verb-matching dispatch, prose leg-scavenging or prose churn classification
+fails the suite at the exact file, the same way a type error does.
+
 Task `meta.completion` is `{kind:"delivery"}` or `{kind:"execution",outcome}`.
 Only delivery work completes on a merge receipt. Execution work waits for its
 prerequisite, then returns to the agent pool with the receipt; its actual actions

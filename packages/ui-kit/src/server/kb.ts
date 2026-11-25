@@ -494,7 +494,22 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${base()}${path}`, { ...(init ?? {}), credentials: "include", headers });
   if (r.status === 401) throw new KbAuthError("unauthorized");
   if (isGet && r.status === 304 && cached) return cached.body as T;
-  if (!r.ok) throw new Error(`${r.status} ${await r.text().then((t) => t.slice(0, 200))}`);
+  if (!r.ok) {
+    // BR#22008 F5 — structured rejection fields ride 400 bodies from the
+    // hub (result_class, rule, owns_exit {ask_id}); surface them ON the
+    // Error so views route on the struct without parsing error prose —
+    // the human reads the message, the machine reads the fields. The
+    // message string keeps its historical shape.
+    const text = await r.text();
+    const err: any = new Error(`${r.status} ${text.slice(0, 200)}`);
+    try {
+      const body = JSON.parse(text) as { result_class?: string; rule?: string; owns_exit?: { ask_id?: string } };
+      if (body.result_class) err.result_class = body.result_class;
+      if (body.rule) err.rule = body.rule;
+      if (body.owns_exit?.ask_id) err.owns_exit_ask = String(body.owns_exit.ask_id);
+    } catch { /* prose body — the message carries it */ }
+    throw err;
+  }
   const parsed = (await r.json()) as T;
   const etag = r.headers.get("etag");
   if (isGet && etag) {

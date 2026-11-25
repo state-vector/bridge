@@ -198,11 +198,10 @@ export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending,
 
   // the subject BY NAME — an id alone doesn't say what the ask is about
   const subject = useKb((s) => s.tasks.find((t) => t.id === nodeAsk.part_of));
-  // BR#21762: the ask's AFFECTED card (decision.task_id) — where a typed
-  // one-click action executes
-  const target = useKb((s) => s.tasks.find((t) => t.id === ((ask.decision as any)?.task_id ?? nodeAsk.part_of)));
   // the promoted executable choice renders ONCE as the direct primary
-  // button and is skipped in the option list
+  // button and is skipped in the option list (BR#22008: the button submits
+  // the typed choice; the server applies the action — no client op, no
+  // target resolution needed here anymore)
   const promoted = askActionPlan(ask, nodeAsk.id)?.answer;
   // rows point, the detail view acts: option buttons answer inline (one click,
   // no typing); the last row is "type your own" — a free-text answer recorded
@@ -239,7 +238,7 @@ export function BandNodeAskRow({ nodeAsk, onDone, openDecision, nested, pending,
       </div>
       <div className="ab-question-content">
         <AskContext body={nodeAsk.body_md} ask={ask} />
-        <AskActionBtn askId={nodeAsk.id} ask={ask} target={target ?? subject} disabled={busy || answered} onDone={onDone} onPending={onPending} />
+        <AskActionBtn askId={nodeAsk.id} ask={ask} disabled={busy || answered} onDone={onDone} onPending={onPending} />
         <span className="ab-prior-line">
           {m.ask?.from ?? "agent"} → {m.ask?.to ?? "any"}
           {/* BR#3942 — addressee presence: a stalled card shows WHO the ask is

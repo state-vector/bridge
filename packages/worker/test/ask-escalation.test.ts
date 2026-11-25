@@ -210,19 +210,60 @@ describe("ask TTL escalation (real DO)", () => {
     expect(task.body.status).toBe("in_progress"); // the answer auto-resumed the bound task
   });
 
-  it("a RELEASE-class answer on an escalated ask releases the subject to the pool — the BR#3822 hand-release, now one click", async () => {
-    const { askId, taskId } = await askOnInProgressTask(
+  it("a typed RELEASE choice on a human_decision ask releases the subject to the pool — the BR#3822 hand-release, now typed (BR#22008)", async () => {
+    const { taskId } = await askOnInProgressTask(
       "escal-ghost-agent-3", "Will you release the third carrier task now that its atom can never fire?",
     );
-    // age + escalate it first
-    const sweep = await kbJson("/admin.ask_escalation_sweep", { now: t0 + 40 * 60_000 });
-    expect(sweep.body.escalated).toContain(askId);
-    // the human clicks the original RELEASE option on the escalated ask
+    // BR#22008: the one-click release rides a human_decision ask whose
+    // choices carry the typed action — the free-text verb dispatch
+    // ("RELEASE — …" on an agent-directed options-only ask) is deleted by
+    // law: prose never authorises a release.
+    const ask = await kbJson("/ask.create", {
+      to: "human",
+      question: `Release ${taskId} to the pool?`,
+      reason: "drill — typed hand-release",
+      options: ["RELEASE — back to the pool", "KEEP — keep it blocked"],
+      decision: {
+        kind: "authority", task_id: taskId,
+        context: `Escalation drill carrier ${taskId} — its atom can never fire.`,
+        why_human: "The claim is held; only the human may release it or keep it parked.",
+        choices: [
+          { label: "RELEASE — back to the pool", executor: "human", action: "release", consequence: "One click releases the claim to the pool (audited)." },
+          { label: "KEEP — keep it blocked", executor: "bridge", action: "hold", consequence: "The claim stays held." },
+        ],
+      },
+      artefact_id: taskId,
+    });
+    expect(ask.status, JSON.stringify(ask.body)).toBe(200);
+    const askId = String(ask.body.id);
+    // the human clicks the RELEASE choice — an EXACT label match
     const ans = await kbJson("/ask.answer", { id: askId, answer: "RELEASE — back to the pool", actor: "web:rayh" });
     expect(ans.status, JSON.stringify(ans.body)).toBe(200);
     expect(ans.body.task_status).toBe("todo");
     const task = await kbJson("/get", { id: taskId });
-    expect(task.body.status).toBe("todo"); // released to the pool, exactly as the option says
+    expect(task.body.status).toBe("todo"); // released to the pool, exactly as the typed choice says
+    // and the free-text form of the same intent NO LONGER authorises a
+    // release (commentary only — the ask records, the card stays):
+    const ask2 = await kbJson("/ask.create", {
+      to: "human", question: `Release ${taskId} again?`, reason: "drill — free text is commentary",
+      options: ["RELEASE — back to the pool", "KEEP — keep it blocked"],
+      decision: {
+        kind: "authority", task_id: taskId,
+        context: `Escalation drill carrier ${taskId} — second round.`,
+        why_human: "The claim is held; only the human may release it or keep it parked.",
+        choices: [
+          { label: "RELEASE — back to the pool", executor: "human", action: "release", consequence: "One click releases the claim to the pool (audited)." },
+          { label: "KEEP — keep it blocked", executor: "bridge", action: "hold", consequence: "The claim stays held." },
+        ],
+      },
+      artefact_id: taskId,
+    });
+    const t2 = await kbJson("/transition", { id: taskId, to: "in_progress", actor: "escal-driller", session: "escal-driller" });
+    expect(t2.status).toBe(200);
+    const ans2 = await kbJson("/ask.answer", { id: String(ask2.body.id), answer: "RELEASE please", actor: "web:rayh" });
+    expect(ans2.status, JSON.stringify(ans2.body)).toBe(200);
+    const task2 = await kbJson("/get", { id: taskId });
+    expect(task2.body.status).toBe("in_progress"); // prose answer = commentary: no release, the holder keeps the claim
   });
 
   it("the TTL honours ask_escalation_minutes (clamped to ≥5) — the presence differential at one clock", async () => {

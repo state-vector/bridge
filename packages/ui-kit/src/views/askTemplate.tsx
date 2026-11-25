@@ -1,10 +1,8 @@
 import { useState } from "react";
 import { AskTemplateSchema, HumanDecisionSchema, WEB_EXECUTABLE_ACTIONS } from "@bridge/contracts";
 import { kbApi } from "../server/kb";
-import type { KbArtefact } from "../server/kb";
 import { useKb } from "../server/kbStore";
 import { Btn } from "./index-kit";
-import { detectHolds } from "./ownerOverrides";
 
 /** BR#21762 — typed ask templates + direct one-click actions.
  *
@@ -60,12 +58,12 @@ export function askActionPlan(ask: { decision?: unknown; template?: unknown }, a
     const label = c.label.replace(/^\(Recommended\)\s*/i, "").trim();
     const reason = `ask ${askId}${tt ? ` (template ${tt.kind})` : ""}: ${firstSentence(d.why_human).slice(0, 180)}`;
     if (c.action === "release")
-      return { op: "release_claim", taskId: d.task_id, label, answer: c.label, reason, hint: `One click releases the claim on ${d.task_id} (audited owner override), then records your answer.` };
+      return { op: "release_claim", taskId: d.task_id, label, answer: c.label, reason, hint: `One click answers the ask; the hub releases the claim on ${d.task_id} (audited, server-side).` };
     if (c.action === "clear_hold")
-      return { op: "clear_hold", taskId: d.task_id, hold: tt?.kind === "clear_hold" ? tt.hold : undefined, label, answer: c.label, reason, hint: `One click clears the stale hold on ${d.task_id} (audited), then records your answer.` };
+      return { op: "clear_hold", taskId: d.task_id, hold: tt?.kind === "clear_hold" ? tt.hold : undefined, label, answer: c.label, reason, hint: `One click answers the ask; the hub clears the stale hold on ${d.task_id} (audited, server-side).` };
     if (c.action === "supersede")
-      return { op: "supersede", taskId: d.task_id, label, answer: c.label, reason, hint: `One click supersedes ${d.task_id} (audited), then records your answer.` };
-    return { op: "close_card", taskId: d.task_id, to: tt?.kind === "close_card" ? tt.disposition : "done", label, answer: c.label, reason, hint: `One click applies the disposition on ${d.task_id}; the hub's gates still validate server-side.` };
+      return { op: "supersede", taskId: d.task_id, label, answer: c.label, reason, hint: `One click answers the ask; the hub supersedes ${d.task_id} (audited, server-side).` };
+    return { op: "close_card", taskId: d.task_id, to: tt?.kind === "close_card" ? tt.disposition : "done", label, answer: c.label, reason, hint: `One click answers the ask; the hub closes ${d.task_id} through the legal edges — gates validate server-side, and it works from any park status.` };
   }
   return null;
 }
@@ -83,15 +81,18 @@ export function isOneClickAsk(ask: { decision?: unknown; template?: unknown }): 
   return human.length > 0 && human.every((c) => WEB_EXECUTABLE_ACTIONS.has(c.action));
 }
 
-/** The direct primary button for an ask's executable choice. Executes the
- *  typed op in the owner's authenticated web session (server re-verifies
- *  authority on every op), records the answer with the receipt, then
- *  refreshes. On refusal: inline error, ask unchanged. */
-export function AskActionBtn({ askId, ask, target, disabled, onDone, onPending, size = "md" }: {
+/** The direct primary button for an ask's executable choice. BR#22008:
+ *  the button ONLY submits the typed choice — kbApi.askAnswer with the
+ *  exact choice label. The server's answer dispatch applies the action
+ *  through the composed legal edges (system:question pen, human_verdict,
+ *  every gate validated server-side, refusals surfaced on the ask). The
+ *  op-first client ordering is gone by law: it 400'd on todo-parked cards
+ *  before the answer recorded (the BR#21657 wedge) and duplicated the
+ *  dispatch authority the server already owns. On refusal: inline error,
+ *  ask unchanged. */
+export function AskActionBtn({ askId, ask, disabled, onDone, onPending, size = "md" }: {
   askId: string;
   ask: { decision?: unknown; template?: unknown };
-  /** the affected card, from the live board — used to resolve clear_hold targets */
-  target?: (KbArtefact & { meta?: any }) | null;
   disabled?: boolean;
   onDone: () => void;
   onPending?: (on: boolean) => void;
@@ -107,23 +108,10 @@ export function AskActionBtn({ askId, ask, target, disabled, onDone, onPending, 
     setBusy(true);
     onPending?.(true);
     try {
-      let receipt = "";
-      if (plan.op === "release_claim") {
-        const r = await kbApi.releaseClaim(plan.taskId, plan.reason);
-        receipt = `claim released to pool (holder ${r.holder_session ?? "—"})`;
-      } else if (plan.op === "clear_hold") {
-        const hold = plan.hold ?? detectHolds(target ?? ({} as KbArtefact)).find((h) => h.clearable)?.kind;
-        if (!hold) throw new Error("no clearable hold on the target card — open the card and use Owner overrides");
-        await kbApi.clearHold(plan.taskId, hold, "clear", plan.reason);
-        receipt = `${hold} hold cleared`;
-      } else if (plan.op === "supersede") {
-        await kbApi.supersede(plan.taskId, undefined, plan.reason);
-        receipt = "card superseded";
-      } else {
-        const r = await kbApi.transition(plan.taskId, plan.to ?? "done", { note: plan.reason });
-        receipt = `card now ${r.status}`;
-      }
-      await kbApi.askAnswer(askId, `${plan.answer} — executed from this ask: ${receipt}`);
+      // BR#22008 answer-first: submit the exact choice label; the hub
+      // dispatches the typed action (never the client). The response's
+      // task_status is the receipt.
+      await kbApi.askAnswer(askId, plan.answer);
       await useKb.getState().refresh();
       onDone();
       // BR#6390 no-jump: stay pending until the refreshed board drops the row

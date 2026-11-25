@@ -337,7 +337,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     handler: async (_args, ctx) => text(JSON.stringify(await ctx.call("ask.inbox", { label: ctx.identity.label, tags: ctx.identity.tags }), null, 1)),
   },
   answer_ask: {
-    description: "Answer an ask from your inbox.",
+    description: "Answer an ask from your inbox. The answer must be the EXACT label of one of the ask's options (trimmed equality) — typed choice dispatch, BR#22008: free text is recorded as commentary and never drives any workflow; a decision ask with no exact label match holds. Decision + exact match applies the choice's typed action (supersede/release/close/clear_hold/hold) through the legal lifecycle edges server-side.",
     schema: TOOL_ARG_SCHEMAS.answer_ask,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("ask.answer", { id: args.id, answer: args.answer }))),
   },

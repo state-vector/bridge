@@ -4,6 +4,8 @@ import {
   composeTemplateAsk,
   HumanDecisionSchema,
   WEB_EXECUTABLE_ACTIONS,
+  legacyOptionAction,
+  resolveChoice,
 } from "../src/ask.ts";
 
 const cases = [
@@ -74,5 +76,36 @@ describe("ask templates (BR#21762)", () => {
         { label: "Keep", executor: "bridge", consequence: "y", action: "hold" },
       ],
     })).not.toThrow();
+  });
+});
+
+describe("typed answer law (BR#22008)", () => {
+  const decision = HumanDecisionSchema.parse({
+    kind: "authority", task_id: "BR#1", context: "c", why_human: "w",
+    choices: [
+      { label: "(Recommended) SUPERSEDE BR#1 — drop it", executor: "bridge", consequence: "x", action: "supersede" },
+      { label: "Keep held", executor: "bridge", consequence: "y", action: "hold" },
+    ],
+  });
+
+  it("resolveChoice: exact trimmed label equality — the ONE matcher", () => {
+    expect(resolveChoice(decision, " (Recommended) SUPERSEDE BR#1 — drop it ")?.action).toBe("supersede");
+    // near-miss free text matches NOTHING — commentary, never dispatch
+    expect(resolveChoice(decision, "SUPERSEDE BR#1")).toBeNull();
+    expect(resolveChoice(decision, "supersede — drop it")).toBeNull();
+    expect(resolveChoice(decision, "RELEASE it")).toBeNull();
+  });
+
+  it("legacyOptionAction: the closed option-intent registry (option labels, never free text)", () => {
+    // the documented laws ride the closed registry on EXACT-matched options
+    expect(legacyOptionAction("SUPERSEDE — drop it")).toBe("supersede");
+    expect(legacyOptionAction("(Recommended) SUPERSEDE — drop it now")).toBe("supersede"); // BR#5570 prefix echo
+    expect(legacyOptionAction("RELEASE — back to the pool anyway")).toBe("release");
+    expect(legacyOptionAction("(Recommended) KEEP — stay parked")).toBe("hold");
+    expect(legacyOptionAction("RE-SCOPE — I'll rewrite the card myself")).toBe("hold");
+    // anything outside the closed vocabulary has NO action — the generic legs
+    expect(legacyOptionAction("(Recommended) Yes — proceed")).toBeUndefined();
+    expect(legacyOptionAction("Investigate the named checks now")).toBeUndefined();
+    expect(legacyOptionAction("")).toBeUndefined();
   });
 });

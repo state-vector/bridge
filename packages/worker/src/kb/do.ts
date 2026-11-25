@@ -242,7 +242,7 @@ import {
   prTargetMatch,
   RECEIPTS_DOC,
   churnRelease,
-  blockedParkVerdict, CHURN_REASON_RX, CHURN_UNBLOCK_RX,
+  blockedParkVerdict, isChurnPark, CHURN_REASON_RX, CHURN_UNBLOCK_RX,
   UNBLOCK_SPAWN_CAP,
   OWNER_RELEASE_EXEMPT,
   HUMAN_ACTOR,
@@ -250,7 +250,7 @@ import {
   RuleCtx,
 } from "./machine.ts";
 import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
-import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
+import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, resolveChoice, legacyOptionAction, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, AskTemplateSchema, composeTemplateAsk, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
 import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
@@ -447,9 +447,27 @@ function reviewTargetFromNote(note: string): ReviewTarget | null {
 
 function taskReviewTarget(meta: Record<string, unknown>, submittedNote = ""): ReviewTarget {
   if (!mergeCompletesTask(meta)) return { kind: "execution" };
+  // BR#22008 F3 — typed-receipts-first, submission-aware. A note target that
+  // BINDS A HEAD (head_sha_at_acceptance legs — the BR#20312 rebase shape)
+  // or carries a direct-commit sha wins: it is the freshest
+  // machine-checkable pin. Beyond those:
+  //  - a typed COMMIT binding (a verified direct delivery) is prose-proof —
+  //    plain PR legs in a note can NEVER override it (the BR#21657 phantom:
+  //    "PR #486" prose overrode a verified direct delivery; #486 is a design
+  //    ISSUE — pulls/486 = 404 — and the merge train bounced on the leg
+  //    forever);
+  //  - a fresh submission's plain PR legs still REPLACE a bound
+  //    pull_request target: the submission note is the receipt of what was
+  //    actually submitted this round (the replacement-PR flow and the
+  //    BR#20312 lenient headless re-entry both pin this) — the transitional
+  //    adapter until the push pipeline stamps typed structs;
+  //  - the bound typed target wins when the note carries no legs at all.
   const submitted = reviewTargetFromNote(submittedNote);
-  if (submitted) return submitted;
+  if (submitted?.kind === "commit") return submitted;
+  if (submitted?.kind === "pull_request" && submitted.legs.some(l => !!l.head_sha_at_acceptance)) return submitted;
   const bound = meta.review_target as ReviewTarget | undefined;
+  if (bound?.kind === "commit") return bound;
+  if (submitted) return submitted;
   if (bound) return bound;
   const legacyNote = reviewTargetFromNote(String(meta.review_note ?? ""));
   const active = meta.review_pr as Partial<OfferedPullRequest> | undefined;
@@ -1229,6 +1247,9 @@ export class KnowledgeHub {
         const verdict = blockedParkVerdict({
           reason: String(b.reason ?? ""),
           unblockCondition: String(b.unblock_condition ?? ""),
+          // BR#22008: typed-first — the blocked record's own await_event
+          // classifies the park; prose is the legacy read adapter.
+          awaitEvent: validateAwaitEvent(b.await_event),
           now,
           staleMs: blockedStaleMs,
           blockedTs: Number(b.ts ?? 0) || undefined,
@@ -3324,7 +3345,10 @@ export class KnowledgeHub {
     // A historical bounce is repair work, not an active train slot. Keeping
     // its releaseHold after consuming the prerequisite would strand todo too.
     if (meta.merge_train?.state === "bounced") meta.merge_train = { ...meta.merge_train, state: "unbound" };
-    if (expected?.event === "time" && String(predicate.reason ?? "").startsWith("churn guard:")) delete meta.attempt;
+    // BR#22008: churn-park recognition is typed (isChurnPark — the birth
+    // stamp's await_event recovery_required), with the legacy prose shapes
+    // as read adapters only.
+    if (isChurnPark({ blocked: predicate })) delete meta.attempt;
     if (closedDelivery) {
       const isClosed = (leg: { repo?: string; number?: number }) => closedLegs.some(c => c.repo === leg.repo && c.number === leg.number);
       const remaining = trainLegs(meta).filter(leg => !isClosed(leg));
@@ -5321,7 +5345,7 @@ export class KnowledgeHub {
         case "ask.create": return this.json(await this.askCreate(body, actor));
         case "ask.coordination_status": return this.json(this.coordinationStatus(String(body.token_id ?? ""), String(body.id ?? ""), String(body.session ?? ""), actor));
         case "ask.inbox": return this.json(await this.askInbox(body));
-        case "ask.answer": return this.json(await this.askAnswer(body, actor));
+        case "ask.answer": return this.json(await this.askAnswer(body, actor, isAdmin));
         case "ask.get": return this.json(await this.askGet(String(body.id ?? "")));
         case "question.claim": return this.json(await this.questionClaim(body, actor));
         case "question.release": return this.json(await this.questionRelease(body, actor));
@@ -5508,7 +5532,17 @@ export class KnowledgeHub {
           result_class: "gate_rejected",
         }, 400);
       }
-      return this.json({ error: String((e as Error).message ?? e), ...(rc ? { result_class: rc } : {}) }, 400);
+      // BR#22008 F5 — structured rejection fields ride the body: rule (the
+      // machine's typed rule name) and owns_exit ({ask_id} — the open ask
+      // that owns the exit) route clients WITHOUT parsing error prose; the
+      // message stays for humans.
+      const e5: any = e;
+      return this.json({
+        error: String((e as Error).message ?? e),
+        ...(rc ? { result_class: rc } : {}),
+        ...(e5?.rule ? { rule: String(e5.rule) } : {}),
+        ...(e5?.owns_exit ? { owns_exit: e5.owns_exit } : {}),
+      }, 400);
     }
   }
 
@@ -6542,7 +6576,7 @@ export class KnowledgeHub {
       const meta = JSON.parse(String(row.meta ?? "{}"));
       const state = this.executionState(String(row.id));
       if (state && (state.generation !== 0 || state.attempt || state.operations.length)) continue;
-      const churn = row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      const churn = row.status === "blocked" && isChurnPark(meta);
       if (row.status === "blocked" && !churn) continue;
       if (row.status === "in_progress" && now - Math.max(Number(row.updated_ts), Number(row.status_ts), meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, this.sessionPing(meta), meta.grace_until ?? 0) <= this.staleMinutes() * 60_000) continue;
       if (this.protectedExecution(String(row.id), meta, true) || meta.operator_gated || meta.subprocess || releaseHold({ ...meta, blocked: undefined }) || this.startupHasAsk(String(row.id))) continue;
@@ -6581,7 +6615,7 @@ export class KnowledgeHub {
       // A new claim, human/local wait or independent gate always wins.
       if (row.status === "in_progress" && wait.source !== "legacy") continue;
       if (row.status === "in_progress" && now - Math.max(meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, this.sessionPing(meta), meta.grace_until ?? 0) <= this.staleMinutes() * 60_000) continue;
-      const legacyPark = wait.source === "legacy" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      const legacyPark = wait.source === "legacy" && isChurnPark(meta);
       if (this.protectedExecution(id, meta, true) || (meta.blocked && !legacyPark) || meta.operator_gated || meta.subprocess || releaseHold({ ...meta, blocked: undefined }) || this.startupHasAsk(id)) continue;
       const requirements = this.executionSchedulingRequirements(id, meta.execution_requirements);
       const ready = hosts.find(host => {
@@ -8158,7 +8192,7 @@ export class KnowledgeHub {
     }
     if (command.kind === "start_failed" || command.kind === "recover_unstarted" || command.kind === "cancel_start") {
       const recovering = command.kind === "recover_unstarted";
-      const legacyChurn = recovering && row.status === "blocked" && meta.blocked?.await_event?.event === "time" && String(meta.blocked?.reason ?? "").startsWith("churn guard:");
+      const legacyChurn = recovering && row.status === "blocked" && isChurnPark(meta);
       if (!gateway || body.runner_protocol !== EXECUTOR_READINESS_PROTOCOL || (!ownsUnstartedClaim && !(token.principal && token.principal === row.owner)) || (row.status !== "in_progress" && !legacyChurn) || meta.session !== session) throw new Error("gate: failed start requires the authenticated runner's current claim/session");
       if (recovering && (current.attempt || !String(meta.last_progress?.note ?? "").startsWith("runner: durable execution held:") || !String(meta.last_progress?.note ?? "").includes("worker credential must be provisioned before begin"))) throw new Error("gate: legacy recovery needs the recorded pre-begin credential rejection and no execution attempt");
       if (current.attempt && current.attempt.phase !== "quiesced") return { kind: "held", reason: "Reconcile and quiesce the existing writer before releasing its claim" };
@@ -8639,7 +8673,9 @@ export class KnowledgeHub {
         // typed, rule-tagged, terminal (retry law) — breachClass folds every
         // takeover tag into the never-a-breach families (machine.ts)
         const err: any = new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+        // BR#22008 F5 — typed rule on the body (see the doTransition guard).
         err.result_class = "gate_rejected";
+        err.rule = verdict.rule;
         throw err;
       }
       if (verdict.already) {
@@ -9624,7 +9660,10 @@ export class KnowledgeHub {
       // unavailable — retry" and duty sessions burned dozens of futile
       // retries on a transition that could never succeed.
       const err: any = new Error(`${verdict.message} [rule: ${verdict.rule}]`);
+      // BR#22008 F5 — the typed rule rides the rejection BODY (struct, not
+      // prose): clients route on err.rule, humans read the message.
       err.result_class = "gate_rejected";
+      err.rule = verdict.rule;
       throw err;
     }
     // (B) subprocess class: a declared block on a long/handed-off op, with a
@@ -12610,7 +12649,7 @@ export class KnowledgeHub {
     return `Coordination ask ${askId} answered: ${ask.answer.slice(0, 1000)}`;
   }
 
-  private async askAnswer(body: any, actor: string) {
+  private async askAnswer(body: any, actor: string, isAdmin = false) {
     const id = String(body.id ?? "");
     const answer = String(body.answer ?? "").trim();
     if (!answer) throw new Error("answer is required");
@@ -12623,10 +12662,23 @@ export class KnowledgeHub {
       if (!m.ask) throw new Error(`${id} is not an ask`);
       if (askLifecycle({ status: String(node.status), meta: m }).state !== "open") throw new Error(`ask ${id} is already resolved`);
       const decision = m.ask.decision ? HumanDecisionSchema.parse(m.ask.decision) : undefined;
-      const choice = decision?.choices.find((c) => c.label === answer);
+      // BR#22008: resolveChoice (contracts) is the ONE matcher — exact label
+      // equality against the closed choice set. Free text is commentary.
+      const choice = decision ? resolveChoice(decision, answer) : undefined;
+      // BR#22008: for a NON-decision ask (the legacy options-only shape), an
+      // answer that EXACTLY matches one of the ask's own options is a click
+      // on the closed set — the closed legacy option-intent registry
+      // (contracts) resolves its action. An answer matching no option is
+      // free text: commentary, no dispatch. Either way the ANSWER TEXT is
+      // never parsed.
+      const matchedOption =
+        choice?.label
+        ?? (Array.isArray(m.ask?.options) ? (m.ask.options as string[]).find((o) => String(o).trim() === answer) ?? null : null);
+      const legacyAction = decision == null && matchedOption != null ? legacyOptionAction(matchedOption) : undefined;
       // Free-text steering is recorded, but cannot silently authorise release
-      // or resume. Only an explicit choice can invoke its declared effect.
-      const decisionAction = decision ? choice?.action ?? "hold" : undefined;
+      // or resume. Only an explicit choice (or an exact legacy option click)
+      // can invoke its declared effect.
+      const decisionAction = decision ? choice?.action ?? "hold" : legacyAction;
       if (decisionAction === "local_handoff" && !actor.startsWith("web:")) throw new Error("gate: a human-web answer must authorise conversion to local handoff");
       m.ask = { ...(m.ask ?? {}), answer: answer.slice(0, 4000), answered_by: actor, answered_ts: Date.now() };
       // BR#3911: an answer resolves a live human-claim hold — the timer is
@@ -12686,89 +12738,132 @@ export class KnowledgeHub {
           taskStatus = "blocked";
         }
         if (answeredLocalExit && (localMode?.phase === "accepted" || localMode?.phase === "returned")) this.executionWork().resumeAfterAnswer(String(subject.id));
+        // BR#15528 (shared by the generic legs below): a card holding a
+        // merge-train slot NEVER moves under an answer — the train owns the
+        // exit. Computed once, checked by every dispatch path.
+        const trainHold = ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(sm.merge_train?.state ?? ""));
         const canDispatch = subject.status === "blocked" && !sinkAnchored && !isExecutionWait(sm)
           && localMode?.phase !== "accepted" && decisionAction !== "local_handoff";
+        // BR#22008: the CLOSE disposition alone reaches beyond a blocked
+        // subject — a watchdog-demoted todo card is exactly when close asks
+        // get filed (the BR#21657 wedge: todo→done has no lifecycle edge,
+        // so an op-first button 400s before the answer records), and
+        // in_progress/in_review closes compose existing legal edges. The
+        // train-hold law still applies (the queue slot is not ours to
+        // move); every other action leg keeps the blocked-subject law.
+        const canCloseDispatch = decisionAction === "close"
+          && ["todo", "blocked", "in_progress", "in_review"].includes(String(subject.status))
+          && !sinkAnchored && !isExecutionWait(sm)
+          && localMode?.phase !== "accepted" && !trainHold;
+        if (decisionAction === "close" && trainHold) {
+          this.audit(actor, "answer_dispatch_close_train_hold_skipped", subject.id, { ask_id: id, train_state: String(sm.merge_train?.state ?? ""), note: "the merge train owns this exit — the queued car stays blocked+queued for the walk (BR#15528)" });
+        }
         if (canDispatch && managedContinuation) {
           // An answer satisfies the prerequisite. If the previous writer is
           // still stopping, the proxy sweep will consume the same typed wait.
           taskStatus = this.continueBlockedWork(String(subject.id), sm, { kind: "satisfied", receipts: [managedContinuation] }) ? "todo" : "blocked";
-        } else if (canDispatch) {
+        } else if (canDispatch || canCloseDispatch) {
           // BR#3578 answer dispatch: when the ask IS the exit path (a
-          // migration ask, or an option that names the action), the ANSWER
+          // migration ask, or a choice that names the action), the ANSWER
           // actions the card — SUPERSEDE drops it, RELEASE/CANCEL releases
           // to the pool, KEEP/RE-SCOPE stays a deliberate human-owned park
           // (the answered ask is the record; the marker prevents re-ask spam).
           // Without dispatch semantics this is the generic rule-6 resume.
           const isMigrationAsk = String(sm.blocked?.await_migration_ask ?? "") === id;
-          // typed answers (BR#3912 type-your-own) must dispatch like the
-          // button click on the same option: match the option's verb token,
-          // not its first 12 chars — "RE-SCOPE: <new scope>" stays a
-          // human-owned park exactly like "RE-SCOPE — I'll rewrite…", and a
-          // typed "SUPERSEDE: x" drops instead of silently resuming
-          // BR#5570: rule-6c asks lead the recommended option with
-          // "(Recommended)" and a web button click echoes the FULL option
-          // text back as the answer — both the option's first token and
-          // the answer then start with "(recommended)", never the verb,
-          // so optHit was false and the ask fell through to the generic
-          // resume: the recorded GO never executed (ask BR#5531 → ghost
-          // lane BR#5497 unretired; the KEEP-park class silently RESUMED
-          // instead). Strip that leading marker (case-insensitive,
-          // optional trailing whitespace) from BOTH sides before the
-          // match; the verb-first style ("SUPERSEDE (Recommended) — …")
-          // still matches unchanged, and KEEP/RE-SCOPE keep their
-          // deliberate-park semantics.
-          const stripRecommended = (s: string): string =>
-            s.trim().replace(/^\(recommended\)\s*/i, "").trim();
-          // BR#17095: a decision ask's SUPERSEDE choice must dispatch the
-          // drop exactly like a plain verb-first ask does (machine.ts
-          // supersede-authority: an answered ask whose options offer
-          // SUPERSEDE is the authorisation; the dispatch leg acts as
-          // system:question(<answerer>)). decisionAction has no SUPERSEDE
-          // spelling — {resume→GO, hold→KEEP, release→RELEASE} — so routing
-          // the chosen label through the action map silently downgraded the
-          // human's SUPERSEDE click to a plain pool release: asks BR#17074
-          // AND BR#17104 were answered SUPERSEDE by web:rayh and BOTH
-          // released BR#16528 to the pool instead of dropping it, and the
-          // re-ask churn re-armed breach BR#17095. Elevate ONLY the
-          // self-naming verb form — the answer must say SUPERSEDE <this
-          // card> (the BR#17074/BR#17104 shape, what rule-6c/6e asks
-          // render) — so an authorization ask's bare SUPERSEDE verb can
-          // never drop its own bound disposition task (the BR#6383/BR#6387
-          // misfire, BR#6395) and batch phrasing stays a resume
-          // authorization; GO/KEEP/RELEASE keep the author's action mapping.
-          const answerStripped = stripRecommended(answer);
-          const selfNamedSupersede = /^SUPERSEDE\s+(BR#\d+)\b/i.exec(answerStripped);
-          const decisionSupersede = decisionAction != null
-            && !!selfNamedSupersede
-            && selfNamedSupersede[1].toUpperCase() === String(subject?.id ?? "").toUpperCase()
-            && !/^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(answerStripped);
-          const strippedAnswer = decisionSupersede
-            ? answerStripped
-            : (decisionAction ? ({ resume: "GO", hold: "KEEP", release: "RELEASE" }[decisionAction]) : answerStripped);
-          // BR#6395: a batch-authorization answer ("SUPERSEDE all 29 — ...",
-          // "SUPERSEDE only the 6 dead parks") authorizes the bound disposition
-          // task to supersede target cards — it must resume the bound task,
-          // NEVER drop the bound task itself (the BR#6383/BR#6387 misfire).
-          const isBatchSupersedeAuth =
-            !isMigrationAsk && /^SUPERSEDE\s+(?:all\b|only\b|(?:the\s+)?\d+\b)/i.test(strippedAnswer);
-          const optHit = decisionAction ? (decisionAction !== "resume" || decisionSupersede) : !isBatchSupersedeAuth && (Array.isArray(m.ask?.options) ? (m.ask.options as string[]) : [])
-            .map((o) => stripRecommended(String(o ?? "")).split(/\s+/)[0] ?? "")
-            .filter((verb) => /^(RELEASE|CANCEL|SUPERSEDE|RE-SCOPE|KEEP)\b/i.test(verb))
-            .some((verb) => strippedAnswer.toLowerCase().startsWith(verb.toLowerCase()));
+          // BR#22008 typed-answer dispatch law: the exact resolved choice's
+          // typed `action` is the SOLE dispatch key. Choices are matched by
+          // exact label equality (choices.find above — the resolveChoice law
+          // in contracts); free-text answers are commentary: recorded on the
+          // ask, rendered for humans, never dispatched. The BR#3912
+          // verb-token matcher and the BR#5570/BR#17095 string-remap
+          // machinery are deleted — dispatch never parses the answer text.
+          // Batch-authorization answers (BR#6395 "SUPERSEDE all N" prose on
+          // disposition tasks) match no choice, so they land in the generic
+          // resume legs — resuming the bound disposition task is exactly the
+          // BR#6395 ruling. Migration asks dispatch through their typed
+          // continuation leg; a free-text verb on one is commentary now.
           const asActor = `system:question(${actor})`;
-          const dispatchText = decisionAction ? strippedAnswer : answer;
-          if (isMigrationAsk || optHit) {
-            if (/\bSUPERSEDE\b/i.test(dispatchText)) {
-              // human_verdict: the human's answered-ask decision — the system
-              // actor is only the pen. The release-holds guards (BR#4067)
-              // exempt it: a human may release what a machine wait holds.
+          // BR#22008: the dispatch legs run for a resolved decision choice
+          // (typed action) OR an exact legacy option click (the closed
+          // option-intent registry) — never for free text (matchedOption
+          // null ⇒ legacyAction undefined ⇒ the generic legs below).
+          const choiceActs =
+            decisionAction !== undefined && decisionAction !== "resume";
+          if (isMigrationAsk || choiceActs) {
+            // human_verdict: the human's answered-ask decision — the system
+            // actor is only the pen. The release-holds guards (BR#4067)
+            // exempt it: a human may release what a machine wait holds.
+            if (decisionAction === "supersede") {
               await this.transition({ id: subject.id, to: "superseded", human_verdict: true, note: `ask ${id} answered — dropped: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "superseded";
-            } else if (/\b(?:RELEASE|CANCEL)\b/i.test(dispatchText)) {
+            } else if (decisionAction === "release") {
               await this.transition({ id: subject.id, to: "todo", human_verdict: true, note: `ask ${id} answered — released to the pool: ${answer.slice(0, 120)}` }, asActor);
               taskStatus = "todo";
+            } else if (decisionAction === "close") {
+              // BR#22008 composed-edge close — the cure for the BR#21657
+              // wedge class (todo→done has no lifecycle edge, so an op-first
+              // button 400s before the answer records). The ANSWER is the
+              // authority; the hub is the pen: a parked card (todo/blocked)
+              // is claimed through in_progress first — the only legal door —
+              // then the disposition edge applies and every done gate
+              // (accepted review, admission, receipts) validates exactly as
+              // for a hand close. Refusals surface on the ask (apply_failed
+              // + version note, the verdict-apply pattern), never swallowed,
+              // never a raw 400 on the human's click.
+              // The pen: the ANSWERING actor when human — the done-unreviewed
+              // gate accepts a human's authenticated close as the typed
+              // authority (machine.ts qualify "via: human"); a machine
+              // answerer keeps the system pen and the gate refuses loudly
+              // (an agent answer can never author completion).
+              const tt = AskTemplateSchema.safeParse(m.ask?.template);
+              const to = tt.success && tt.data.kind === "close_card" && tt.data.disposition === "in_review" ? "in_review" : "done";
+              const parkClaimed = ["todo", "blocked"].includes(String(subject.status));
+              const closePen = HUMAN_ACTOR_RX.test(actor) ? actor : asActor;
+              try {
+                if (parkClaimed) {
+                  await this.transition(
+                    { id: subject.id, to: "in_progress", human_verdict: true, note: `ask ${id} answered — close disposition: composed-edge claim through the only legal door from ${subject.status} (BR#22008)` },
+                    closePen,
+                  );
+                }
+                await this.transition(
+                  { id: subject.id, to, human_verdict: true, note: `ask ${id} answered — closed ${to} per typed choice (BR#22008); gates validated server-side` },
+                  closePen,
+                );
+                taskStatus = to;
+              } catch (e) {
+                const msg = String((e as Error).message ?? e).slice(0, 300);
+                this.audit(actor, "answer_apply_failed", subject.id, { ask_id: id, action: "close", error: msg, composed_claim: parkClaimed });
+                this.version(id, actor, "note", `close dispatch failed on ${subject.id} (${subject.status}): ${msg}`, { target: subject.id, error: msg });
+                taskStatus = parkClaimed ? "in_progress" : undefined;
+              }
+            } else if (decisionAction === "clear_hold") {
+              // BR#22008 server-side hold clear: the typed choice names the
+              // op; the answering web principal is the authority (the same
+              // ownerOverrideGate as the BR#21657 web panel — machine actors
+              // fail it by construction). The hold kind resolves from the
+              // subject's TYPED meta (train state / await_event /
+              // awaiting_ask) — never from prose.
+              const hold = ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(sm.merge_train?.state ?? ""))
+                ? "merge_train"
+                : sm.blocked?.await_event ? "await_event"
+                  : sm.awaiting_ask ? "bound_ask"
+                    : null;
+              try {
+                if (!hold) throw new Error("no live typed hold on the subject card — nothing to clear");
+                await this.taskClearHold(
+                  { id: subject.id, hold, action: "clear", reason: `ask ${id} answered per typed choice — ${String(node.title ?? "").slice(0, 120)}` },
+                  actor, isAdmin,
+                );
+                taskStatus = subject.status === "blocked" ? "todo" : String(subject.status);
+              } catch (e) {
+                const msg = String((e as Error).message ?? e).slice(0, 300);
+                this.audit(actor, "answer_apply_failed", subject.id, { ask_id: id, action: "clear_hold", error: msg, hold });
+                this.version(id, actor, "note", `clear-hold dispatch failed on ${subject.id}: ${msg}`, { target: subject.id, error: msg, hold });
+                taskStatus = undefined;
+              }
             } else {
-              taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE — the human owns the rewrite
+              taskStatus = "blocked"; // KEEP PARKED / RE-SCOPE / migration keep — the human owns the park
             }
           } else if (this.askAgeGuardHold(Number(node.created_ts ?? 0)) || this.holderIsAlive(sm, subject.owner)) {
             // BR#15528: a card holding a merge-train slot NEVER resumes
@@ -12777,7 +12872,7 @@ export class KnowledgeHub {
             // laneQueue (in_progress ≠ blocked) so the walk can never stamp
             // or close it. The fired wait's bookkeeping is consumed above;
             // the queued car stays blocked+queued and the walk drives it.
-            const trainHold = ["queued", "awaiting-ci", "awaiting", "conflicting"].includes(String(sm.merge_train?.state ?? ""));
+            // BR#15528: trainHold is computed once above (shared law).
             if (trainHold) {
               this.audit(actor, "answer_dispatch_train_hold_skipped", subject.id, { ask_id: id, train_state: String(sm.merge_train?.state ?? ""), note: "the merge train owns this exit — the queued car stays blocked+queued for the walk (BR#15528)" });
               taskStatus = "blocked";
@@ -12882,7 +12977,11 @@ export class KnowledgeHub {
       // fixes is stopped); RETRY/rerun stamps the re-run request. The executor
       // acks consumption through its per-tick queue_facts stamp.
       try {
-        await this.trainAlarmAnswerDispatch(id, m, String(node.title ?? ""), answer, actor);
+        // BR#22008: the alarm dispatch keys off the EXACT matched option —
+        // the system-authored closed set (decision choice for decision asks,
+        // exact options match for the legacy options-only asks). Prose
+        // answers are commentary: recorded on the ask, never dispatched.
+        await this.trainAlarmAnswerDispatch(id, m, String(node.title ?? ""), matchedOption, answer, actor);
       } catch (e) {
         this.audit(actor, "train:alarm_answer_dispatch_error", id, { error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
@@ -13459,7 +13558,11 @@ export class KnowledgeHub {
       // than abandonment. But if NOTHING moved for a full day the block is a
       // dead end too: release the task back to the pool with the error history
       // on the card (the BR#584-class 123-attempt rows were this).
-      const isStuckGate = reason.startsWith("runner:") || reason.startsWith("churn guard:");
+      // BR#22008: the churn half is typed (isChurnPark); the `runner:`
+      // prefix stays as the documented external-runner convention label
+      // (the Rust executor authors those notes; reading ONE external
+      // convention at ONE site — bounded residual on the card).
+      const isStuckGate = reason.startsWith("runner:") || isChurnPark(meta);
       if (!isAbandoned && !isStuckGate) continue;
       const idleLimit = isAbandoned ? staleMs : 24 * 60 * 60_000;
       const idleDesc = isAbandoned ? `silent >${staleMin}m after abandonment` : `no movement >24h after a gate-rejection block`;
@@ -20797,17 +20900,22 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
   /** 2026-11-02: TRAIN ALARM ANSWER DISPATCH — the answer is the missing
    *  merge authority. Two ask families:
    *  (1) the base-red alarm ask — `MERGE TRAIN BLOCKED: base <repo>@<base> RED
-   *      (…)` — whose options carry the four triage outcomes; a BYPASS answer
-   *      names the cure PR (`Bypass-merge fix PR #N now`, or a typed `#N` /
-   *      `repo#N`), a RETRY answer asks for the failed re-run;
+   *      (…)` — whose options carry the four triage outcomes; the DONE
+   *      option names the cure PR (`DONE — PR #N merged`);
    *  (2) the root-fix fast-lane ask — `Root-fix fast lane (BR#5189): merge
    *      <repo> PR #N now? …` — whose "Merge the cure now" IS the bypass.
    *  A BYPASS answer stamps `meta.lane.bypass_merge = {repo, base, pr, …}` on
    *  the LANE card; a RETRY answer stamps `meta.lane.rerun_failed`. The
    *  executor consumes both on its next tick (merge / gh run rerun) and acks
    *  through the per-tick queue_facts stamp. Failures are audited, never
-   *  thrown — the answer itself is already safely recorded above. */
-  private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, answer: string, actor: string): Promise<void> {
+   *  thrown — the answer itself is already safely recorded above.
+   *  BR#22008: dispatch keys off the EXACT matched OPTION (the closed,
+   *  system-authored set the ask itself filed) — never off the answer text.
+   *  The intent table below reads the option's own prefix; a free-text
+   *  answer is commentary (recorded above, rendered for humans, never
+   *  parsed). A typed "DONE"/"rerun" now records and does nothing — the
+   *  option buttons are the dispatch. */
+  private async trainAlarmAnswerDispatch(askId: string, askMeta: any, title: string, matchedOption: string | null, answer: string, actor: string): Promise<void> {
     const ownerMerge = RecoveryOwnerMergeSchema.safeParse(askMeta?.recovery_owner_merge);
     if (ownerMerge.success) {
       const request = ownerMerge.data;
@@ -20821,36 +20929,44 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         this.audit(actor, "train:stale_owner_merge_answer", askId, request);
         return;
       }
-      if (/\bdone\b/i.test(answer)) {
+      // BR#22008: DONE is the typed intent of the exact option label
+      // ("DONE — PR #N merged"); DECLINE is the reject option. Prose
+      // commentary stamps NOTHING — only a click on an option authorises.
+      if (matchedOption && /^DONE — PR #/.test(matchedOption)) {
         meta.lane = { ...meta.lane, bypass_merge: { ...request, ask_id: askId, at: Date.now() } };
-      } else {
+      } else if (matchedOption && /^DECLINE/.test(matchedOption)) {
         meta.lane = { ...meta.lane, base_red_ask_declined: { ...request, ask_title: title, ask_id: askId, at: Date.now() } };
+      } else {
+        // free text on a decision ask: commentary — recorded above, no stamp
+        this.audit(actor, "train:owner_merge_commentary", askId, { answer: answer.slice(0, 160) });
+        return;
       }
       this.saveLaneState(row.id, meta, Date.now());
       return;
     }
     const t = String(title ?? askMeta?.ask?.question ?? "");
-    const ans = answer.trim();
-    // BR#6390: the number the FILED ASK named — its options carry the cure PR
-    // ("DONE — PR #N merged"). A bare "DONE"/"DECLINE" answer carries no
-    // number, and re-resolving the episode needs the live queue, which the
-    // answer path does not carry — the filed ask is the gate's source of
-    // truth, so read the PR out of its own options first.
-    const askOptionPr = (m: any): number | null => {
-      const opts: string[] = Array.isArray(m?.ask?.options) ? m.ask.options.map((o: any) => String(o)) : [];
-      for (const o of opts) {
-        const hit = /#(\d+)/.exec(o);
-        if (hit) return Number(hit[1]);
-      }
-      return null;
-    };
+    // BR#22008 intent table — the closed mapping from the system-authored
+    // OPTION label to the train intent. The "(Recommended) " prefix renders
+    // inside the echoed label (BR#5570) and is tolerated. Anything else
+    // (Hold / Acknowledge / Other / No-resolution / prose) is commentary:
+    // the queue drains by itself once main recovers.
+    const opt = matchedOption ?? "";
+    const intent =
+      /^DONE — PR #/.test(opt) ? "done"
+      : /^DECLINE/.test(opt) ? "decline"
+      : /^Merge the cure now/.test(opt) ? "done"
+      : /^Transient — re-run/.test(opt) ? "rerun"
+      : /^Re-run the named checks/.test(opt) ? "rerun"
+      : /^Re-arm/.test(opt) ? "rearm"
+      : /^\(Recommended\) (?:Re-dispatch|Dispatch) |^(?:Re-dispatch|Dispatch) /.test(opt) ? "dispatch"
+      : null;
     // (2) the root-fix fast-lane ask — the PR is IN the title
     const fast = /^Root-fix fast lane \(BR#5189\): merge (\S+) PR #(\d+)/.exec(t);
     // (1) the base-red alarm ask — repo@base in the title
     const baseRed = /^MERGE TRAIN BLOCKED: base (\S+)@(\S+) RED/.exec(t);
     // (3) BR#6179 dark-tip alarm ask — repo@base in the title
     const darkTip = /^MERGE TRAIN DARK TIP: (\S+)@(\S+)/.exec(t);
-    if (darkTip && /\b(?:re-?)?dispatch\b/i.test(ans) && !/\backnowledge\b/i.test(ans)) {
+    if (darkTip && intent === "dispatch") {
       const repo = darkTip[1];
       const base = darkTip[2] || "main";
       const laneRow = this.one(
@@ -20864,7 +20980,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
         const now = Date.now();
         laneMeta.lane = {
           ...(laneMeta.lane ?? {}),
-          dispatch_deploy: { repo, base, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+          dispatch_deploy: { repo, base, ask_id: askId, answer: answer.slice(0, 400), by: actor, at: now },
         };
         delete laneMeta.lane.deploy_dispatched;
         this.saveLaneState(laneRow.id, laneMeta, now);
@@ -20874,28 +20990,22 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       return;
     }
     const bypassPr = ((): number | null => {
-      if (fast && /\b(merge|bypass|yes|go|done)\b/i.test(ans)) return Number(fast[2]);
-      if (!baseRed) return null;
-      // BR#6390: DONE is the human-gate accept — "I merged it". The brief's
-      // option carries the PR number; a bare "DONE" falls back to the number
-      // the FILED ASK named (its own options — the gate's source of truth),
-      // then to the episode's open cure PR so the stamp never lands on a
-      // guessed number.
-      if (/\bdone\b/i.test(ans)) {
-        const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
-        if (m) return Number(m[1]);
-        return askOptionPr(askMeta) ?? this.trainOpenRootFix(baseRed[1]).curePr?.number ?? null;
-      }
-      if (!/\bbypass\b|\bmerge\b/i.test(ans)) return null;
-      const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
-      return m ? Number(m[1]) : null;
+      if (fast && intent === "done") return Number(fast[2]);
+      if (!baseRed || intent !== "done") return null;
+      // BR#6390: the DONE option's label carries the PR number — the brief
+      // authored it from the episode's cure PR, so the filed ask is the
+      // gate's source of truth. Fallback: the episode's open cure PR — the
+      // stamp never lands on a guessed number.
+      const m = /#(\d+)/.exec(opt);
+      if (m) return Number(m[1]);
+      return this.trainOpenRootFix(baseRed[1]).curePr?.number ?? null;
     })();
-    const rerun = !!baseRed && !bypassPr && /\bre-?run\b|\bretry\b|\btransient\b/i.test(ans);
+    const rerun = !!baseRed && intent === "rerun";
     // BR#6390: DECLINE is the human-gate reject — "hold the line". No merge
     // authority is stamped; instead the decline suppresses re-asks for this
     // episode title + cure PR (24h) so the answered gate stays answered.
-    const decline = !!baseRed && !bypassPr && !rerun && /\bdecline\b|\bhold\b/i.test(ans);
-    const rearm = !!baseRed && !bypassPr && !rerun && /\bre-?arm\b|\bre-?issue\b/i.test(ans);
+    const decline = !!baseRed && intent === "decline";
+    const rearm = !!baseRed && intent === "rearm";
     if (!bypassPr && !rerun && !decline && !rearm) return;
     const repo = fast ? fast[1] : baseRed ? baseRed[1] : "";
     const base = baseRed ? baseRed[2] : "main";
@@ -20907,7 +21017,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       laneKey(repo, base),
     ) as any;
     if (!laneRow) {
-      this.audit(actor, "train:alarm_answer_no_lane", askId, { repo, base, answer: ans.slice(0, 160) });
+      this.audit(actor, "train:alarm_answer_no_lane", askId, { repo, base, answer: answer.slice(0, 160) });
       return;
     }
     const laneMeta = JSON.parse(laneRow.meta ?? "{}");
@@ -20934,7 +21044,7 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
             targetId,
             actor,
             "transition",
-            `re-armed by ask ${askId} (answer: "${ans.slice(0, 120)}") — cleared attempt/churn-guard exhaustion and returned to todo at p0 for a fresh agent session`,
+            `re-armed by ask ${askId} (answer: "${answer.slice(0, 120)}") — cleared attempt/churn-guard exhaustion and returned to todo at p0 for a fresh agent session`,
             { from: cardRow.status, to: "todo" },
           );
           this.audit(actor, "train:root_fix_rearmed", targetId, { repo, base, ask_id: askId });
@@ -20950,19 +21060,29 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
       }
       laneMeta.lane = {
         ...(laneMeta.lane ?? {}),
-        bypass_merge: { repo, base, pr: bypassPr, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+        bypass_merge: { repo, base, pr: bypassPr, ask_id: askId, answer: answer.slice(0, 400), by: actor, at: now },
       };
       this.saveLaneState(laneRow.id, laneMeta, now);
-      this.version(laneRow.id, actor, "update", `bypass-merge authorized by ask ${askId} — ${repo}#${bypassPr} merges out of turn on the next tick (answer: "${ans.slice(0, 120)}")`, {});
+      this.version(laneRow.id, actor, "update", `bypass-merge authorized by ask ${askId} — ${repo}#${bypassPr} merges out of turn on the next tick (answer: "${answer.slice(0, 120)}")`, {});
       this.audit(actor, "train:bypass_merge_stamped", laneRow.id, { repo, base, pr: bypassPr, ask_id: askId });
     } else if (decline) {
+      // BR#22008: the DECLINE option label carries no number — the episode's
+      // PR comes from the ask's own closed option set (the DONE option's
+      // "DONE — PR #N merged" names it) or the open cure PR, never from the
+      // answer text.
       const declinedPr = (() => {
-        const m = /#(\d+)/.exec(ans) ?? /(\d{2,})/.exec(ans);
-        return m ? Number(m[1]) : askOptionPr(askMeta) ?? this.trainOpenRootFix(repo).curePr?.number ?? 0;
+        const optM = /#(\d+)/.exec(opt);
+        if (optM) return Number(optM[1]);
+        const opts: string[] = Array.isArray(askMeta?.ask?.options) ? askMeta.ask.options.map((o: any) => String(o)) : [];
+        for (const o of opts) {
+          const hit = /#(\d+)/.exec(o);
+          if (hit) return Number(hit[1]);
+        }
+        return this.trainOpenRootFix(repo).curePr?.number ?? 0;
       })();
       laneMeta.lane = {
         ...(laneMeta.lane ?? {}),
-        base_red_ask_declined: { repo, base, pr: declinedPr, ask_title: String(title ?? ""), ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+        base_red_ask_declined: { repo, base, pr: declinedPr, ask_title: String(title ?? ""), ask_id: askId, answer: answer.slice(0, 400), by: actor, at: now },
       };
       this.saveLaneState(laneRow.id, laneMeta, now);
       this.version(laneRow.id, actor, "update", `human gate DECLINED by ask ${askId} — the line holds; this episode's gate stays answered for ${repo}#${declinedPr || "?"} (no re-ask for 24h or until a different cure PR binds)`, {});
@@ -20970,10 +21090,10 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     } else {
       laneMeta.lane = {
         ...(laneMeta.lane ?? {}),
-        rerun_failed: { repo, base, ask_id: askId, answer: ans.slice(0, 400), by: actor, at: now },
+        rerun_failed: { repo, base, ask_id: askId, answer: answer.slice(0, 400), by: actor, at: now },
       };
       this.saveLaneState(laneRow.id, laneMeta, now);
-      this.version(laneRow.id, actor, "update", `failed-check re-run authorized by ask ${askId} (answer: "${ans.slice(0, 120)}") — the executor re-runs the failing checks on the next tick`, {});
+      this.version(laneRow.id, actor, "update", `failed-check re-run authorized by ask ${askId} (answer: "${answer.slice(0, 120)}") — the executor re-runs the failing checks on the next tick`, {});
       this.audit(actor, "train:rerun_stamped", laneRow.id, { repo, base, ask_id: askId });
     }
   }

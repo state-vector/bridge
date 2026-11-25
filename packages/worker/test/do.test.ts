@@ -577,17 +577,14 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // BR#17095 — a DECISION ask's SUPERSEDE choice must dispatch the drop.
-  // decisionAction has no SUPERSEDE spelling ({resume→GO, hold→KEEP,
-  // release→RELEASE}), so the answer dispatch downgraded the human's
-  // SUPERSEDE click to a plain pool release: asks BR#17074 AND BR#17104
-  // were answered SUPERSEDE by web:rayh and both released BR#16528 to the
-  // pool instead of dropping it — the re-ask churn re-armed breach
-  // BR#17095. The elevation requires the self-naming verb form
-  // (SUPERSEDE <this card>) so an authorization ask's bare SUPERSEDE verb
-  // can never drop its own bound disposition task (BR#6395).
+  // BR#17095 / BR#22008 — the decision choice's TYPED action is the sole
+  // dispatch key. The old self-naming-verb elevation ("SUPERSEDE <this
+  // card>" label overriding the authored action) is deleted by law: a
+  // SUPERSEDE-labelled choice with action release RELEASES, action
+  // supersede DROPS. Ask authors own the mapping (the churn_loop template
+  // authors action: "supersede" for its drop choice); the label is prose.
   // ---------------------------------------------------------------------------
-  it("a DECISION ask answered with the self-naming SUPERSEDE choice (action release) dispatches the drop (BR#17095 — asks BR#17074/BR#17104 released the card twice)", async () => {
+  it("a DECISION ask's self-naming SUPERSEDE choice dispatches ITS TYPED ACTION — the authored action is the sole key (BR#17095/BR#22008)", async () => {
     const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 decision-ask supersede dispatch target" });
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
     const supLabel = `(Recommended) SUPERSEDE ${t.id} — executes the recorded disposition; drops the obsolete card; zero repo changes`;
@@ -602,7 +599,7 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
         context: "The recorded disposition is receipt-verified; the drop awaits your authority.",
         why_human: "BR#2480: dropping a card is a human-authority act; the answer is the authorisation.",
         choices: [
-          { label: supLabel, executor: "bridge", consequence: `The hub drops ${t.id} in your name.`, action: "release" },
+          { label: supLabel, executor: "bridge", consequence: `The hub drops ${t.id} in your name.`, action: "supersede" },
           { label: "Keep the card open — I'll click Supersede on the web card myself", executor: "human", consequence: "The card returns to the pool; you perform the web supersede.", action: "hold" },
         ],
       },
@@ -618,23 +615,54 @@ describe("roles/question/tags semantics (BR#2983, real storage)", () => {
     expect((await kbJson("/get", { id: t.id })).body.status).toBe("superseded");
   });
 
-  it("a decisionFixture ask (action resume) with the self-naming SUPERSEDE choice still dispatches the drop — the verb wins over the author's routing hint (BR#17095)", async () => {
-    const { body: t } = await kbJson("/create", { type: "task", title: "BR#17095 fixture-shape supersede dispatch target" });
+  it("a SUPERSEDE-labelled choice with authored action release RELEASES — the verb elevation is deleted (BR#22008 pin)", async () => {
+    // the BR#17095 incident class (a mis-authored action) now surfaces
+    // honestly: the label's verb never overrides the typed action. The fix
+    // lives at authoring time (the templates), never in dispatch.
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#22008 verb-elevation deletion target" });
+    await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
+    const supLabel = `(Recommended) SUPERSEDE ${t.id} — label says drop, action says release`;
+    const ask = await kbJson("/ask.create", {
+      artefact_id: t.id,
+      question: "Execute the recorded disposition?",
+      reason: "BR#22008 verb-elevation deletion drill",
+      details: "drill brief: fixture ask exercising the typed-action-authority pin — no live decision rides on it.",
+      to: "human",
+      decision: {
+        kind: "authority", task_id: t.id,
+        context: "The choice label names SUPERSEDE but its authored action is release.",
+        why_human: "The typed action is the authority; the label is prose.",
+        choices: [
+          { label: supLabel, executor: "bridge", consequence: `The hub releases ${t.id} to the pool.`, action: "release" },
+          { label: "Keep the card open", executor: "human", consequence: "The card stays parked.", action: "hold" },
+        ],
+      },
+    });
+    expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: supLabel, actor: "web:rayh" });
+    expect(ans.status).toBe(200);
+    expect(ans.body.task_status).toBe("todo");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("todo");
+  });
+
+  it("a decisionFixture ask (action resume) answers through the generic legs — the authored action wins, no verb elevation (BR#22008)", async () => {
+    const { body: t } = await kbJson("/create", { type: "task", title: "BR#22008 fixture-shape action-authority target" });
     await kbJson("/transition", { id: t.id, to: "in_progress", note: "claim" });
     const supLabel = `(Recommended) SUPERSEDE ${t.id} — drop the obsolete card`;
     const ask = await kbJson("/ask.create", {
       artefact_id: t.id,
       question: "Drop this card on the recorded disposition?",
       reason: "BR#2480 authority drill",
-      details: "drill brief: fixture ask exercising the decision-ask supersede dispatch end-to-end — no live decision rides on it.",
+      details: "drill brief: fixture ask exercising the decision-action mapping — no live decision rides on it.",
       to: "human",
       decision: decisionFixture(t.id, [supLabel, "KEEP — stay parked"]),
     });
     expect(ask.status, `ask failed: ${JSON.stringify(ask.body)}`).toBe(200);
     const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: supLabel, actor: "web:rayh" });
     expect(ans.status).toBe(200);
-    expect(ans.body.task_status).toBe("superseded");
-    expect((await kbJson("/get", { id: t.id })).body.status).toBe("superseded");
+    // action resume → the generic rule-6 legs (the label's verb elevates nothing)
+    expect(ans.body.task_status).toBe("in_progress");
+    expect((await kbJson("/get", { id: t.id })).body.status).toBe("in_progress");
   });
 
   it("a decision ask's batch-phrased SUPERSEDE answer NEVER drops the bound task — it resumes/releases (BR#6395 leg intact)", async () => {
@@ -1027,13 +1055,13 @@ describe("breach fold high-water: closed cards never re-raise stale events (BR#3
   });
 });
 
-describe("typed answers dispatch like the option click (BR#3912 type-your-own)", () => {
+describe("typed answers dispatch like the option click (BR#3912/BR#22008 closed-set law)", () => {
   // A rework-loop ask (reaper shape): a blocked subject + an ask whose options
-  // carry action verbs. The typed path must read the same dispatch law as the
-  // click path: verb-matched answers action the subject, everything else is
-  // the generic rule-6 resume. Before the verb-match fix, "RE-SCOPE: <scope>"
-  // missed the 12-char prefix of "RE-SCOPE — I'll rewrite…" and generic-resumed
-  // the parked card — silently restarting the loop the reaper had stopped.
+  // carry action verbs. BR#22008: dispatch keys the EXACT matched option (the
+  // ask's own closed set) through the legacy option-intent registry — the
+  // option click dispatches, free text is commentary (recorded, rendered,
+  // never parsed). The old verb-token matcher that read the ANSWER TEXT is
+  // deleted.
   const OPTIONS = ["RE-SCOPE — I'll rewrite the card myself", "RELEASE — back to the pool anyway", "SUPERSEDE — drop it"];
 
   async function parkedSubjectWithAsk(title: string) {
@@ -1054,26 +1082,38 @@ describe("typed answers dispatch like the option click (BR#3912 type-your-own)",
     return { subject, ask };
   }
 
-  it("typed 'RE-SCOPE: …' keeps the subject parked (human owns the rewrite)", async () => {
+  it("free-text 'RE-SCOPE: …' is commentary — the generic resume; the RE-SCOPE OPTION click is the deliberate park (human owns the rewrite)", async () => {
+    // free text (no exact option match) never dispatches: recorded with the
+    // ask, the subject takes the generic rule-6 resume leg
     const { subject, ask } = await parkedSubjectWithAsk("rework re-scope typed");
     const { body } = await kbJson("/ask.answer", { id: ask.id, answer: "RE-SCOPE: hunt the churn guard instead — new scope below" });
-    expect(body.task_status).toBe("blocked");
-    const got = await kbJson("/get", { id: subject.id });
-    expect(got.body.status).toBe("blocked");
+    expect(body.task_status).toBe("in_progress");
+    expect((await kbJson("/get", { id: subject.id })).body.status).toBe("in_progress");
     // the typed text is recorded with the ASK node, exactly like a click
     const askNode = await kbJson("/get", { id: ask.id });
     expect(String(askNode.body.meta?.ask?.answer ?? "")).toContain("hunt the churn guard");
+    // the OPTION click is the park: the closed registry maps RE-SCOPE → hold
+    const b = await parkedSubjectWithAsk("rework re-scope click");
+    const { body: bodyB } = await kbJson("/ask.answer", { id: b.ask.id, answer: "RE-SCOPE — I'll rewrite the card myself" });
+    expect(bodyB.task_status).toBe("blocked");
+    expect((await kbJson("/get", { id: b.subject.id })).body.status).toBe("blocked");
   });
 
-  it("typed 'RELEASE …' pools the parked subject (blocked → todo is a legal edge)", async () => {
-    const b = await parkedSubjectWithAsk("rework release typed");
-    const { body: bodyB } = await kbJson("/ask.answer", { id: b.ask.id, answer: "RELEASE — retry on a fresh worker" });
+  it("the RELEASE OPTION click pools the parked subject (blocked → todo); free-text 'RELEASE …' is commentary", async () => {
+    // the exact option click dispatches through the closed registry
+    const b = await parkedSubjectWithAsk("rework release click");
+    const { body: bodyB } = await kbJson("/ask.answer", { id: b.ask.id, answer: "RELEASE — back to the pool anyway" });
     expect(bodyB.task_status).toBe("todo");
     const got = await kbJson("/get", { id: b.subject.id });
     expect(got.body.status).toBe("todo");
+    // free text with the same verb dispatches NOTHING — the generic resume
+    const c = await parkedSubjectWithAsk("rework release typed");
+    const { body: bodyC } = await kbJson("/ask.answer", { id: c.ask.id, answer: "RELEASE — retry on a fresh worker" });
+    expect(bodyC.task_status).toBe("in_progress");
+    expect((await kbJson("/get", { id: c.subject.id })).body.status).toBe("in_progress");
   });
 
-  it("a typed answer matching no option verb is still the generic resume", async () => {
+  it("a typed answer matching no option is still the generic resume", async () => {
     const { subject, ask } = await parkedSubjectWithAsk("rework free-form typed");
     const { body } = await kbJson("/ask.answer", { id: ask.id, answer: "the gate is gone, retry as-is" });
     expect(body.task_status).toBe("in_progress");

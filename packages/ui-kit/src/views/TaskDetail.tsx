@@ -240,7 +240,11 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
   const [ask, setAsk] = useState<KbAsk | null>(null);
   const [answerText, setAnswerText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [cardErr, setCardErr] = useState("");
+  const [cardErr, setCardErrState] = useState<{ msg: string; ask?: string } | null>(null);
+  // BR#22008 F5 — errors surface their typed fields: owns_exit_ask routes
+  // the human to the open ask that owns the exit (struct, not prose regex).
+  const setCardErr = (e: unknown, fallback: string) =>
+    setCardErrState({ msg: (e as Error).message || fallback, ask: (e as any)?.owns_exit_ask || undefined });
 
   useEffect(() => {
     const id = m.awaiting_ask?.ask_id;
@@ -282,7 +286,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       await kbApi.askAnswer(m.awaiting_ask.ask_id, answer);
       await useKb.getState().refresh();
       onChanged?.();
-    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
+    } catch (e) { setCardErr(e, "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
       setBusy(false);
     }
   };
@@ -293,7 +297,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       else await kbApi.transition(task.id, "in_progress", { note: "unblocked by human — condition satisfied" });
       await useKb.getState().refresh();
       onChanged?.();
-    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
+    } catch (e) { setCardErr(e, "failed"); useKb.getState().reportError("ask answer / unblock", e); } finally {
       setBusy(false);
     }
   };
@@ -305,7 +309,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       await kbApi.transition(task.id, "in_progress", { takeover: true, note: "interactive takeover — human took the live claim" });
       await useKb.getState().refresh();
       onChanged?.();
-    } catch (e) { setCardErr((e as Error).message || "takeover failed"); useKb.getState().reportError("claim takeover", e); } finally {
+    } catch (e) { setCardErr(e, "takeover failed"); useKb.getState().reportError("claim takeover", e); } finally {
       setBusy(false);
     }
   };
@@ -322,7 +326,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       await kbApi.transition(task.id, "done", { note: "done — human sign-off (web plane, BR#15659 law)" });
       await useKb.getState().refresh();
       onChanged?.();
-    } catch (e) { setCardErr((e as Error).message || "sign-off failed"); useKb.getState().reportError("human sign-off", e); } finally {
+    } catch (e) { setCardErr(e, "sign-off failed"); useKb.getState().reportError("human sign-off", e); } finally {
       setBusy(false);
     }
   };
@@ -337,7 +341,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
       await kbApi.forceReview(task.id, decision);
       await useKb.getState().refresh();
       onChanged?.();
-    } catch (e) { setCardErr((e as Error).message || "failed"); useKb.getState().reportError("force-review", e); } finally {
+    } catch (e) { setCardErr(e, "failed"); useKb.getState().reportError("force-review", e); } finally {
       setBusy(false);
     }
   };
@@ -447,7 +451,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             <span className="muted-note">
               held by <span className="gw-mono">{m.session}</span> — taking over makes you the holder; the runner is stood down (BR#6135)
             </span>
-            {cardErr && <span className="k-err">{cardErr}</span>}
+            {cardErr && <span className="k-err">{cardErr.msg}{cardErr.ask && <> — an open decision (<RefText text={cardErr.ask} onOpen={onOpen} />) is asking exactly this; answer it there</>}</span>}
           </div>
         </div>
       )}
@@ -470,7 +474,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             <span className="muted-note">
               human sign-off (BR#15659): this card rests in_review until you mark it done — machine closes are refused by design; your web click is the one legal close.
             </span>
-            {cardErr && <span className="k-err">{cardErr}</span>}
+            {cardErr && <span className="k-err">{cardErr.msg}{cardErr.ask && <> — an open decision (<RefText text={cardErr.ask} onOpen={onOpen} />) is asking exactly this; answer it there</>}</span>}
           </div>
         </div>
       )}
@@ -514,7 +518,7 @@ export function TaskStateCard({ task, onChanged, onOpen }: { task: KbArtefact & 
             />
             <Btn size="sm" disabled={busy || !answerText.trim()} onClick={() => void answerAsk(answerText.trim())}>Answer</Btn>
             <Btn size="sm" quiet disabled={busy} title="answer 'unblocked' — resumes the task" onClick={() => void unblock()}>Unblock</Btn>
-            {cardErr && <span className="k-err">{cardErr}</span>}
+            {cardErr && <span className="k-err">{cardErr.msg}{cardErr.ask && <> — an open decision (<RefText text={cardErr.ask} onOpen={onOpen} />) is asking exactly this; answer it there</>}</span>}
           </div>
         </div>
       )}
@@ -648,9 +652,9 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
   const [err, setErr] = useState("");
   const [text, setText] = useState("");
   const [reframeText, setReframeText] = useState("");
-  // BR#21762: the affected card (decision.task_id) for a typed one-click
-  // action, and the promoted executable choice to skip in the option list
-  const actionTarget = useKb((s) => (s.tasks as any[]).find((t) => t.id === ask.decision?.task_id));
+  // the promoted executable choice to skip in the option list (BR#22008:
+  // the one-click button submits the typed choice; the server applies the
+  // action — the client no longer resolves an action target)
   const promoted = askActionPlan(ask, task.id)?.answer;
   const answer = async (a: string) => {
     if (!a.trim()) return;
@@ -676,7 +680,7 @@ function AskSelfCard({ task, onChanged }: { task: KbArtefact & { meta?: any }; o
         <span className="why-line">to {ask.to ?? "any"} · from {ask.from ?? "agent"} · asked {rel(task.created_ts)}</span>
       </div>
       <AskContext body={task.body_md} ask={ask} />
-      <AskActionBtn askId={task.id} ask={ask} target={actionTarget ?? (task as any)} disabled={busy} onDone={() => onChanged?.()} />
+      <AskActionBtn askId={task.id} ask={ask} disabled={busy} onDone={() => onChanged?.()} />
       {(ask.options ?? []).length > 0 && (
         <AskOptions options={ask.options as string[]} choices={ask.decision?.choices} busy={busy} skip={promoted} onPick={(o) => void answer(o)} />
       )}

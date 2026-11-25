@@ -306,6 +306,24 @@ export type Verdict = Applied | Rejection;
 export const CHURN_UNBLOCK_RX = /read the task history \(get_history\) and the last gate error/i;
 export const CHURN_REASON_RX = /^churn guard:/i;
 
+/** BR#22008 — typed churn-park recognition, the ONE authority. The churn
+ *  guard's park is TYPED at birth (release_redirect below stamps
+ *  await_event {event:"recovery_required", cause:"repeated_failure"}); the
+ *  prose reason ("churn guard: …") is the human label, never the dispatch
+ *  key. The string fallbacks are READ adapters for rows stamped before the
+ *  typed event existed (event-less parks, and the intermediate time-event
+ *  era) — they classify legacy rows only; every current writer stamps the
+ *  typed event. The scattered `reason.startsWith("churn guard:")` tests
+ *  (do.ts reclaim/recovery/stall paths) are deleted in favour of this
+ *  predicate: they silently rotted when the birth stamp changed shape —
+ *  exactly the free-text failure class BR#22008 closes. */
+export function isChurnPark(meta: any): boolean {
+  const b = meta?.blocked ?? {};
+  const ev = (b.await_event ?? {}).event;
+  if (ev === "recovery_required") return true;
+  return String(b.reason ?? "").startsWith("churn guard:") && (ev === "time" || !ev);
+}
+
 /** ASK- references inside unblock conditions ("Ray answers ASK-xyz-abc"). */
 // BR#4563: left word-boundary. Without it, a prose unblock_condition naming a
 // task id ("…a FRESH verify session closes TASK-016 done…") yields the phantom
@@ -335,12 +353,27 @@ export function blockedParkVerdict(input: {
   staleMs: number;
   blockedTs?: number;
   askIsOpen?: (id: string) => boolean;
+  /** BR#22008 typed-first: the blocked record's typed await_event. A
+   *  recovery_required event IS the churn park (the guard's typed birth
+   *  stamp) — classified by type, never prose. The regexes below remain
+   *  the legacy read adapter for rows that predate the typed stamp. */
+  awaitEvent?: { event?: string; [k: string]: unknown } | null;
 }): { klass: BlockedParkClass; why: string } {
   const reason = String(input.reason ?? "");
   const unblock = String(input.unblockCondition ?? "");
-  // 1. churn parks: the guard's own boilerplate — dead at any age
+  // 1. BR#22008 typed-first: a typed await_event IS the classification —
+  //    prose never reclassifies a typed park. recovery_required is the
+  //    churn guard's typed birth stamp (a retry instruction: dead at any
+  //    age); every other typed event is a machine-owned wait whose own
+  //    exit (the proxy watch / the answer / the timer) owns the park.
+  if (input.awaitEvent?.event === "recovery_required")
+    return { klass: "churn-park", why: "typed churn-guard park (await_event recovery_required) — a retry instruction, machine-authored" };
+  if (input.awaitEvent)
+    return { klass: "external", why: `typed wait (${String(input.awaitEvent.event)}) — the wait's own exit owns the park` };
+  // 2. legacy churn parks (no typed event): the guard's own boilerplate —
+  //    dead at any age. Read adapter for rows that predate the typed stamp.
   if (CHURN_REASON_RX.test(reason) || CHURN_UNBLOCK_RX.test(unblock))
-    return { klass: "churn-park", why: "churn-guard park — a retry instruction stamped as a block" };
+    return { klass: "churn-park", why: "churn-guard park — a retry instruction stamped as a block (legacy prose adapter)" };
   // 2. ask-ref parks: every referenced ask is gone/expired/answered — the
   //    wait can never fire (an OPEN ask keeps the card ask-gated upstream)
   const refs = [...new Set(unblock.match(ASK_REF_RX) ?? [])];
@@ -1859,8 +1892,10 @@ export function breachClass(reason: string): string {
   // Specimen: BR#14684, 3 refusals 2026-11-15 12:44:57–12:47:17Z during the
   // open human gate ask BR#14688 (main-red merge hold) — answered 12:48:17Z,
   // re-claim succeeded 12:48:42Z; folded "unclassified" and raised breach
-  // card BR#14689. Priced never-a-breach (thresholds above).
-  if (r.includes("an open human decision owns this exit")) return "claim:held-human-decision";
+  // card BR#14689. Priced never-a-breach (thresholds above). BR#22008: the
+  // fence throw now carries the typed rule tag — match it FIRST; the prose
+  // fragment stays as the pre-typing backstop.
+  if (r.includes("[rule: human-decision-owns-exit]") || r.includes("an open human decision owns this exit")) return "claim:held-human-decision";
   // BR#15643: the publisher-confirmation claim-bars gate's tag-cut backstop
   // (the same rule whose anchored [rule: claim-bars] tag the table above
   // owns). Match the structural fragments "unmet bars" / "requested further

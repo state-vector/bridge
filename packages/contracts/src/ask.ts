@@ -19,6 +19,43 @@ export const ASK_CHOICE_ACTIONS = ["resume", "hold", "release", "local_handoff",
 export type AskChoiceAction = (typeof ASK_CHOICE_ACTIONS)[number];
 export const WEB_EXECUTABLE_ACTIONS: ReadonlySet<string> = new Set(["release", "clear_hold", "supersede", "close"]);
 
+/** BR#22008 — typed-answer law. The answer that resolves a Decision must
+ *  reference a choice EXACTLY (buttons submit the full label; MCP callers
+ *  echo it verbatim). Free text is commentary: recorded on the ask, rendered
+ *  for humans, never dispatched — the BR#5570 ("(Recommended)" prefix broke
+ *  the verb matcher) / BR#17095 (SUPERSEDE click silently downgraded to a
+ *  pool release) matcher class is deleted by law, not patched. Matching is
+ *  exact-equality against the closed choice set; the returned choice's
+ *  typed `action` is the sole dispatch key. */
+export function resolveChoice(decision: HumanDecision, answer: string): HumanDecision["choices"][number] | null {
+  const a = answer.trim();
+  return decision.choices.find((c) => c.label === a) ?? null;
+}
+
+/** BR#22008 — the closed legacy option-intent registry. A NON-decision ask
+ *  (the pre-BR#21762 shape: options, no `decision` struct) has no typed
+ *  choice actions, yet its option clicks still carry the documented laws —
+ *  BR#3913 (the answered ask's SUPERSEDE option authorises the drop),
+ *  BR#18868 (a KEEP click is the deliberate park), BR#5570 (the option may
+ *  carry the "(Recommended) " display prefix). The registry resolves the
+ *  intent of an EXACTLY-MATCHED OPTION LABEL — the ask's own authored
+ *  closed set, never the free-text answer (an answer that matches no option
+ *  dispatches nothing; prose is commentary). Prefixes are the closed
+ *  vocabulary the hub's ask producers have filed for years — adding an
+ *  intent means adding a registry row, never parsing answer text. */
+export const LEGACY_OPTION_ACTIONS: ReadonlyArray<{ prefix: string; action: "supersede" | "release" | "hold" }> = [
+  { prefix: "SUPERSEDE", action: "supersede" },
+  { prefix: "RELEASE", action: "release" },
+  { prefix: "KEEP", action: "hold" },
+  { prefix: "RE-SCOPE", action: "hold" },
+];
+
+export function legacyOptionAction(option: string): "supersede" | "release" | "hold" | undefined {
+  const clean = option.trim().replace(/^\(recommended\)\s*/i, "");
+  for (const e of LEGACY_OPTION_ACTIONS) if (clean.startsWith(e.prefix)) return e.action;
+  return undefined;
+}
+
 /** The choice and its effect are separate from display prose. A location used
  * for notifications is never the action target. Diagnostic uncertainty has no
  * human-decision category: Bridge must investigate it first. */

@@ -142,7 +142,22 @@ export class ExecutionWork {
     if (state.handoff.phase === "accepted") throw new Error("gate: local handoff already has an executor; preserve its claim");
     const h = state.handoff; const token = this.credential(tokenId)!;
     if (h.phase === "waiting" && h.recipient && h.recipient !== token.label && h.recipient !== token.principal) throw new Error("gate: local handoff is addressed to another recipient");
-    if (this.asks(id).length || this.one(`SELECT q.id FROM relations r JOIN artefacts q ON q.id=r.src_id WHERE r.dst_id=? AND r.relation='child_of' AND q.type='question' AND q.status NOT IN ('done','superseded') AND json_extract(q.meta,'$.ask.to')='human' LIMIT 1`, id)) throw new Error("gate: an open human decision owns this exit; answer it before claiming");
+    if (this.asks(id).length || this.one(`SELECT q.id FROM relations r JOIN artefacts q ON q.id=r.src_id WHERE r.dst_id=? AND r.relation='child_of' AND q.type='question' AND q.status NOT IN ('done','superseded') AND json_extract(q.meta,'$.ask.to')='human' LIMIT 1`, id)) {
+      // BR#22008 F5 — the fence names WHICH ask owns the exit (typed
+      // owns_exit on the rejection body): the UI routes the human to the
+      // answer row instead of surfacing bare gate text. The bound ask wins
+      // (asks(id) — meta.awaiting_ask), else the human-routed child
+      // question found above.
+      const childAsk = this.one(
+        `SELECT q.id AS id FROM relations r JOIN artefacts q ON q.id=r.src_id WHERE r.dst_id=? AND r.relation='child_of' AND q.type='question' AND q.status NOT IN ('done','superseded') AND json_extract(q.meta,'$.ask.to')='human' LIMIT 1`,
+        id,
+      ) as { id?: string } | undefined;
+      const boundAsk = this.asks(id)[0] ?? childAsk?.id;
+      throw Object.assign(
+        new Error("gate: an open human decision owns this exit; answer it before claiming"),
+        { result_class: "gate_rejected", rule: "human-decision-owns-exit", ...(boundAsk ? { owns_exit: { ask_id: String(boundAsk) } } : {}) },
+      );
+    }
   }
   /** Caller owns the SQLite transaction containing the card's single claim write. */
   claimInteractive(id: string, tokenId: string, session: string, meta: TaskMeta) {

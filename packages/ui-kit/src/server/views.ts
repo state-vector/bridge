@@ -87,9 +87,13 @@ export const TIMEOUT_BLOCK_RX = /rework loop|churn guard/i;
  *  exit condition only. */
 export const CHURN_PARK_RX = /read the task history \(get_history\) and the last gate error|rework loop|churn guard/i;
 
-/** Churn-park test kept for Top's actionable admission filter. */
+/** Churn-park test kept for Top's actionable admission filter. BR#22008:
+ *  typed-first — the guard's typed birth stamp (await_event
+ *  recovery_required) classifies; the prose regex is the legacy adapter. */
 export function isTimeoutBlock(t: { status?: string; meta?: any }): boolean {
-  return t.status === "blocked" && TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
+  if (t.status !== "blocked") return false;
+  if (t.meta?.blocked?.await_event?.event === "recovery_required") return true;
+  return TIMEOUT_BLOCK_RX.test(String(t.meta?.blocked?.reason ?? ""));
 }
 
 /* ---- exit-condition classes (2026-10-29 spec, Ray): Top shows the
@@ -325,7 +329,10 @@ export function exitClassOf(t: { id?: string; status?: string; meta?: any }): Ex
     && Array.isArray(m.execution_blockers) && m.execution_blockers.length > 0
     && m.execution_blockers.every((blocker: { kind?: string }) => blocker.kind === "capability_unavailable" || blocker.kind === "executor_not_ready"))
     return EXIT_CLASSES.gateway;
-  if (CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return EXIT_CLASSES.timeout;
+  // BR#22008 typed-first churn mirror: the typed await_event
+  // (recovery_required — the guard's birth stamp) classifies the park; the
+  // prose regexes stay as the legacy read adapter for pre-typed rows.
+  if (ev === "recovery_required" || CHURN_PARK_RX.test(reason) || CHURN_PARK_RX.test(unblock)) return EXIT_CLASSES.timeout;
   // the Awaiting park outranks the typed leg it preserves (BR#4962): the
   // pr_merged await_event rides along on an Awaiting park, but the HUMAN
   // force-review owns the exit, not the proxy

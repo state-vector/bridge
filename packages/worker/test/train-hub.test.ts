@@ -4117,14 +4117,16 @@ describe("BR#5114 NOW/NEXT/QUEUE — progress seam + queue PRs (real bundled wor
     expect(lane3.base_red_resolution.fix_card.id).toBe(String(baseFix.body.id));
     expect(lane3.base_red_resolution.fix_card.pr).toBe(63939);
     expect(lane3.base_red_resolution.phase).toBe("cure_pr_awaiting_force_merge");
-    // the gate files for the BASE-FIX lane too — and a bare "DONE" (no PR
-    // number typed) still resolves the cure through the episode join: the
-    // dispatch falls back to the open cure on the lane's base-fix card
-    // (BR#6390: the human may click/typed DONE without the option text)
+    // BR#22008: the gate files for the BASE-FIX lane too — and the OPTION
+    // CLICK resolves the cure: the answer is the exact option label the ask
+    // itself filed (typed choice dispatch — free text is commentary)
     const askB = (await kbJson("/search", { q: "lane-br6390-basefix", type: "question", limit: 50 })).body.artefacts
       .find((x: any) => String(x.title).startsWith("MERGE TRAIN BLOCKED: base ") && String(x.title).includes(`${repo3}@main`) && x.status === "todo");
     expect(askB).toBeTruthy();
-    const aB = await kbJson("/ask.answer", { id: askB.id, answer: "DONE", actor: "web:ray" });
+    const doneOptB = (await kbJson("/get", { id: askB.id })).body.meta.ask.options
+      .find((o: string) => /^DONE — PR #/.test(o));
+    expect(doneOptB).toMatch(/^DONE — PR #63939 /);
+    const aB = await kbJson("/ask.answer", { id: askB.id, answer: doneOptB, actor: "web:ray" });
     expect(aB.status).toBe(200);
     lane3 = await laneSnap(repo3);
     expect(lane3.bypass_merge).toBeTruthy();
@@ -4921,14 +4923,21 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect((await kbJson("/get", { id: ask })).body.status).toBe("done");
     await stamp(proof);
     const ownerAsk = (await laneSnap(repo)).base_red_resolution.ask.id;
-    expect((await kbJson("/ask.answer", { id: ownerAsk, answer: "DONE", actor: "web:ray" })).status).toBe(200);
+    // BR#22008: the typed option click is the dispatch (free text = commentary)
+    const ownerDone = (await kbJson("/get", { id: ownerAsk })).body.meta.ask.options
+      .find((o: string) => /^DONE — PR #/.test(o));
+    expect((await kbJson("/ask.answer", { id: ownerAsk, answer: ownerDone, actor: "web:ray" })).status).toBe(200);
     expect((await laneSnap(repo)).bypass_merge).toMatchObject({ kind: "owner_merge", base_sha: base, head_sha: head, pr: 84681 });
     await kbJson("/train.queue_facts", { repo, actor: gateway, bypass_consumed: "observed" });
     await stamp(proof);
     const staleAsk = (await laneSnap(repo)).base_red_resolution.ask.id;
     // A later accepted head cannot consume the earlier owner's exact-head response.
     await kbJson("/update", { id: current, meta: { prs: [{ repo, number: 84681, head_sha_at_acceptance: "9".repeat(40) }] } });
-    await kbJson("/ask.answer", { id: staleAsk, answer: "DONE", actor: "web:ray" });
+    // BR#22008: the option click on a STALE ask still records the answer but
+    // the stale exact-head check refuses the stamp (typed dispatch, typed guard)
+    const staleDone = (await kbJson("/get", { id: staleAsk })).body.meta.ask.options
+      .find((o: string) => /^DONE — PR #/.test(o));
+    await kbJson("/ask.answer", { id: staleAsk, answer: staleDone, actor: "web:ray" });
     expect((await laneSnap(repo)).bypass_merge ?? null).toBeNull();
     await kbJson("/update", { id: current, meta: { prs: [{ repo, number: 84681, head_sha_at_acceptance: head }] } });
     expect((await kbJson("/train.event", { repo, actor: gateway, kind: "merged", pr: 84681,
@@ -4974,7 +4983,10 @@ describe("BR#5674 P1 + P4: empty-is-loud base alarm + 1h merge-starvation alarm 
     expect(updated.body_md).toBe(original.body_md);
     expect(updated.meta.recovery_owner_merge.base_sha).toBe(next);
     expect((await laneSnap(repo)).base_red_resolution.ask.id).toBe(ask);
-    await kbJson("/ask.answer", { id: ask, answer: "DONE", actor: "web:ray" });
+    // BR#22008: the typed option click is the dispatch (free text = commentary)
+    const doneOpt = original.meta.ask.options.find((o: string) => /^DONE — PR #/.test(o));
+    expect(doneOpt).toBeTruthy();
+    await kbJson("/ask.answer", { id: ask, answer: doneOpt, actor: "web:ray" });
     expect((await laneSnap(repo)).bypass_merge.base_sha).toBe(next);
   });
 
