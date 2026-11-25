@@ -70,12 +70,16 @@ run() {
   local identity_env=()
   if [ -n "${FENCE_IDENTITY+x}" ] && [ -n "${FENCE_IDENTITY}" ]; then
     identity_env=("BRIDGE_EXECUTOR_SESSION=${FENCE_IDENTITY}")
+  elif [ -n "${FENCE_IDENTITY+x}" ]; then
+    # FENCE_IDENTITY set but empty — the human-shell case: the fence must see
+    # no identity at all, so strip any inherited BRIDGE_EXECUTOR_SESSION too
+    # (agent/runner shells export it; CI does not).
+    identity_env=("-u" "BRIDGE_EXECUTOR_SESSION")
   fi
-  OUT=$(env PATH="${SHIM_DIR}:${PATH}" \
+  OUT=$(env "${identity_env[@]}" PATH="${SHIM_DIR}:${PATH}" \
     "BRIDGE_HUB_URL=https://hub.test" \
     "BRIDGE_HUB_TOKEN_FILE=${TOKEN_FILE}" \
     "FAKE_STATE_DIR=${STATE_DIR}" \
-    "${identity_env[@]}" \
     env -u BRIDGE_SESSION \
     bash "${SCRIPT}" "${branch}" 2>&1)
   RC=$?

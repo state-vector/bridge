@@ -19,7 +19,7 @@ export type AwaitEvent =
   | { event: "time"; until_ts: number };
 
 type ExecutionRecoveryReason = Extract<SchedulingReason,
-  "provider_route" | "retry_budget" | "recovery_route" | "host_affinity" | "capability" | "startup_prerequisite">;
+  "provider_route" | "retry_budget" | "recovery_route" | "host_affinity" | "capability" | "startup_prerequisite" | "startup_interrupt">;
 type PrerequisiteReason = Extract<SchedulingReason,
   "qualification" | "operator_gate" | "question" | "independent_wait" | "lifecycle_gate">;
 

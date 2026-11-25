@@ -253,7 +253,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, resolveChoice, legacyOptionAction, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, AskTemplateSchema, composeTemplateAsk, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isResourceRecoverableStartFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isResourceRecoverableStartFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, isAcpStartupInterrupt, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -3512,7 +3512,7 @@ export class KnowledgeHub {
     if (dispatch?.kind === "held") for (const reason of dispatch.reasons) {
       switch (reason) {
         case "writer_not_quiescent": case "unknown_operations": break;
-        case "provider_route": case "retry_budget": case "recovery_route": case "host_affinity": case "capability": case "startup_prerequisite":
+        case "provider_route": case "retry_budget": case "recovery_route": case "host_affinity": case "capability": case "startup_prerequisite": case "startup_interrupt":
           waits.push({ kind: "execution_recovery", exit: { event: "execution_admitted", task_id: id, reason } });
           break;
         case "independent_wait":
@@ -3605,7 +3605,7 @@ export class KnowledgeHub {
       for (const task of tasks) {
         const view = dispatch.get(String(task.id));
         const state = executionByTask.get(String(task.id));
-        if (view?.kind === "held" && view.reasons.includes("retry_budget")) {
+        if (view?.kind === "held" && (view.reasons.includes("retry_budget") || view.reasons.includes("startup_interrupt"))) {
           const terminal = state?.terminal;
           const outcome = terminal && terminal.generation === state?.attempt?.generation
             && terminal.attempt_id === state.attempt.attempt_id ? terminal.outcome : null;
@@ -3613,6 +3613,7 @@ export class KnowledgeHub {
           view.last_attempt = cause === "provider_route_unavailable" ? "provider_route"
             : cause === "provider_authentication" ? "provider_auth"
             : cause === "provider_quota" ? "provider_quota"
+            : outcome && isAcpStartupInterrupt(outcome) ? "startup_interrupt"
             : outcome?.kind === "completed" || outcome?.kind === "interrupted" || outcome?.kind === "timed_out"
               ? outcome.kind : "unclassified";
         }
@@ -7315,6 +7316,15 @@ export class KnowledgeHub {
       const sample = [...new Set(statuses.flatMap(s => s.held?.retry_budget ?? []))].slice(0, 10);
       this.audit("system:scheduler", "retry_budget_pile", null, { pile, threshold: 30, hosts: statuses.filter(s => Number(s.reasons?.retry_budget ?? 0) > 0).length, sample });
     }
+    // BR#22116 (W3) — the startup-interrupt pile: the blip class never
+    // charges the retry budget, so its cadence must be visible the same way.
+    // A small pile already means one dispatch-path fault is repeating across
+    // cards, so the threshold is far below the budget pile's.
+    const startupPile = statuses.reduce((n, s) => Math.max(n, Number(s.reasons?.startup_interrupt ?? 0)), 0);
+    if (startupPile > 5 && !this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='startup_interrupt_pile' AND ts>? LIMIT 1`, now - 1_800_000)) {
+      const sample = [...new Set(statuses.flatMap(s => s.held?.startup_interrupt ?? []))].slice(0, 10);
+      this.audit("system:scheduler", "startup_interrupt_pile", null, { pile: startupPile, threshold: 5, hosts: statuses.filter(s => Number(s.reasons?.startup_interrupt ?? 0) > 0).length, sample });
+    }
   }
 
   private recoveryCapacity() {
@@ -8535,6 +8545,16 @@ export class KnowledgeHub {
       }
     });
     if (command.kind !== "poll") this.audit(actor, `execution_${command.kind}`, req.id, { command_id: req.command_id, generation: next.generation, revision: next.revision });
+    // BR#22116 — every counted startup interrupt is audited with its cadence
+    // state: recovery duties and the board read the blip class straight from
+    // the ledger instead of classifying by absence against runner-fenced
+    // receipts. The stamp first lands at `stopped` (finalize preserves it),
+    // so the counter audit fires exactly once per blip.
+    const stoppedTerminal = command.kind === "stopped" ? next.terminal : null;
+    const startupInterrupt = stoppedTerminal && isAcpStartupInterrupt(stoppedTerminal.outcome) ? next.startup_interrupt : null;
+    if (startupInterrupt && startupInterrupt.generation === stoppedTerminal.generation && startupInterrupt.attempt_id === stoppedTerminal.attempt_id) {
+      this.audit(actor, "execution_startup_interrupt", req.id, { command_id: req.command_id, generation: next.generation, consecutive: startupInterrupt.consecutive, backoff_until: startupInterrupt.backoff_until });
+    }
     else this.publishWorkerStatus(next.attempt?.host ?? actor, now);
     if (command.kind === "yield") this.executionWork().sweep();
     if (command.kind === "finalize" || command.kind === "stopped") this.publishWorkerStatus(next.attempt?.host ?? actor, now);

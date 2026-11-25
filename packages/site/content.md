@@ -408,7 +408,15 @@ work creation age still drives diagnosis. Idle capacity with eligible work for t
 scheduler stays starved. The `stats` surface carries `starved_1h` (starvation
 alarms in the trailing hour), per-host `starved_since` and held counts by
 reason, and a retry-budget pile over 30 tasks raises one `retry_budget_pile`
-class alarm per 30 minutes naming the storm. A stale stopping attempt keeps
+class alarm per 30 minutes naming the storm. A writer killed at startup —
+interrupted within 30 seconds of its begin with the runner's exact
+startup-interrupt stderr, zero stdout and no cause — is stamped with the
+structured `acp_startup_interrupt` cause class on its terminal (BR#22116)
+instead of charging the retry budget: the blip's consecutive counter owns the
+cadence with an exponential backoff (30s doubling, 10m cap) surfaced as the
+`startup_interrupt` scheduling reason, each blip is audited with its cadence
+state, and a pile over 5 raises one `startup_interrupt_pile` alarm per 30
+minutes. A stale stopping attempt keeps
 its slot charged with a `stopping_writer_proof_pending` audit until the
 original host proves the writer absent — through a writer receipt, the
 original-worker stop proof or the fence-scoped same-UID `/proc` census — and

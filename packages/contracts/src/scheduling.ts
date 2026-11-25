@@ -5,11 +5,13 @@ export const DISPATCH_RESERVATION_MS = 300_000;
 export const SchedulingReasonSchema = z.enum([
   "qualification", "operator_gate", "question", "independent_wait", "writer_not_quiescent",
   "unknown_operations", "retry_budget", "provider_route", "host_affinity", "recovery_route", "capability", "startup_prerequisite", "lifecycle_gate",
+  // BR#22116 — zero-effect startup-interrupt backoff (time-based, self-clearing).
+  "startup_interrupt",
 ]);
 export type SchedulingReason = z.infer<typeof SchedulingReasonSchema>;
 export type GatewayDispatch =
   | { kind: "eligible" }
-  | { kind: "held"; reasons: SchedulingReason[]; last_attempt?: "provider_route" | "provider_auth" | "provider_quota" | "completed" | "interrupted" | "timed_out" | "unclassified" }
+  | { kind: "held"; reasons: SchedulingReason[]; last_attempt?: "provider_route" | "provider_auth" | "provider_quota" | "completed" | "interrupted" | "timed_out" | "unclassified" | "startup_interrupt" }
   | { kind: "gateway_unavailable"; reasons?: SchedulingReason[] };
 
 export const RecoveryPreemptionSchema = z.object({
