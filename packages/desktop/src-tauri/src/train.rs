@@ -3484,24 +3484,45 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // could be classified (and driven) by the wrong lane's walk; with it,
         // an entry whose legs all target other bases is honestly "no unlanded
         // leg on this lane" below. (BR#5753 walk half.)
+        // BR#22592 reap: a leg is resolved for lane purposes when it is
+        // landed, receipt-settled (orphaned awaiting-ci merge receipt past
+        // the settle window — the all-resolved-line deadlock) or dead (the
+        // hub's terminal closed-unmerged stamp). None of the three can ever
+        // drive on this lane again; counting them as unlanded held the line
+        // forever with every car resolved.
+        let now_ms_i64 = now_ms() as i64;
+        let leg_resolved = |leg: &TrainLeg| {
+            crate::train_gate::train_leg_landed(&card_meta, leg)
+                || crate::train_gate::train_leg_receipt_settled(&card_meta, leg, now_ms_i64)
+                || crate::train_gate::train_leg_state(&card_meta, leg) == Some("dead")
+        };
         let lane_legs: Vec<usize> = legs
             .iter()
             .enumerate()
             .filter(|(_, leg)| {
                 leg.repo == repo
                     && leg.base.as_deref().unwrap_or("main") == base
-                    && !train_leg_landed(&card_meta, leg)
+                    && !leg_resolved(leg)
             })
             .map(|(i, _)| i)
             .collect();
         if lane_legs.is_empty() {
             // Crash-window reconcile: every leg landed but the card never closed
             // (executor died between the last merge and train:landed) — re-stamp
-            // the last leg so the hub's landed flow runs.
-            let all_landed = !legs.is_empty() && legs.iter().all(|l| train_leg_landed(&card_meta, l));
-            let last_landed = legs.iter().rev().find(|l| train_leg_landed(&card_meta, l));
-            if all_landed && last_landed.map(|l| l.repo == repo).unwrap_or(false) && card_status.as_deref() == Some("blocked") {
-                let last = last_landed.unwrap();
+            // the last leg so the hub's landed flow runs. BR#22592: the same
+            // rescue now covers receipt-settled legs (merge stamped, settle
+            // never came) — the dedupe-safe merged re-stamp replays the landed
+            // close; and a dead-only card honestly advances (its exit is the
+            // hub's dead-leg policy, a merged re-stamp would fabricate a sha).
+            let all_resolved = !legs.is_empty() && legs.iter().all(|l| leg_resolved(l));
+            let last_resolved = legs.iter().rev().find(|l| {
+                crate::train_gate::train_leg_landed(&card_meta, l)
+                    || crate::train_gate::train_leg_receipt_settled(&card_meta, l, now_ms_i64)
+            });
+            if all_resolved && last_resolved.map(|l| l.repo == repo).unwrap_or(false) && card_status.as_deref() == Some("blocked") {
+                let last = last_resolved.unwrap();
+                let receipt_settled = crate::train_gate::train_leg_receipt_settled(&card_meta, last, now_ms_i64)
+                    && !crate::train_gate::train_leg_landed(&card_meta, last);
                 renew_lease(ctx, repo, base);
                 let mut ev = json!({
                     "repo": repo, "base": base, "kind": "merged", "pr": last.number,
@@ -3510,12 +3531,25 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
                     "merged_at": card_meta.pointer(&format!("/merge_train/legs/{}/merged_at", last.number))
                         .or_else(|| card_meta.pointer("/merge_train/merged_at")),
                     "task_id": head_id, "signer": ctx.holder,
-                    "reason": "reconcile: all legs landed but the card never closed (crash between merge and landed) — re-stamped",
+                    "reason": if receipt_settled {
+                        format!("reconcile: all legs receipt-settled but the card never closed (orphaned awaiting-ci receipt past the settle window, BR#22592) — receipt re-stamped")
+                    } else {
+                        "reconcile: all legs landed but the card never closed (crash between merge and landed) — re-stamped".to_string()
+                    },
                 });
                 stamp_canary(&mut ev, canary);
                 ctx.mcp("train_event", ev)?;
-                ctx.note(&format!("reconcile: re-stamped landed card {head_id}"));
-                log(Some(key), &format!("reconcile: card {head_id} all legs landed — re-stamped PR #{} for the landed close", last.number));
+                qfacts.push(json!({ "id": head_id, "pr": last.number, "cls": "blocked", "resolved": true, "resolved_why": "receipt-settled — merged reconcile re-fired" }));
+                ctx.note(&format!("reconcile: re-stamped resolved card {head_id}"));
+                log(Some(key), &format!("reconcile: card {head_id} all legs resolved — re-stamped PR #{} for the landed close", last.number));
+                return Ok(());
+            }
+            if all_resolved {
+                // BR#22592: resolved but no receipted/landed leg on this repo
+                // (dead-only card, or the receipts live on a sibling lane) —
+                // never a silent zombie: the reap is named, the hub's
+                // de-admission drops the entry within one tick.
+                log(Some(key), &format!("queue[{qi}] {head_id} has no unresolved leg on this lane — resolved car reaped, advancing (hub owns the card exit; BR#22592)"));
                 return Ok(());
             }
             // BR#3935: this entry can never drive on this lane — advance.
@@ -3618,6 +3652,28 @@ fn drive_lane_inner(ctx: &mut Ctx, lane: &Value, key: &str, repo: &str, base: &s
         // the card stays for the humans, the queue is not held.
         if !crate::train_gate::pr_state_is_batch_candidate(vstr(&facts, "state")) {
             let st = vstr(&facts, "state").unwrap_or("(unreadable)");
+            // BR#22592 reap: a CLOSED-unmerged leg is resolved-dead — it can
+            // NEVER land, so the old cls-blocked advance held the line
+            // forever (the hub re-admits the card every tick, the entry
+            // re-derives into lane.queue eternally). Report the terminal
+            // observation hub-side: a gate bounce carrying dead_leg evidence.
+            // The HUB stays the policy point — it stamps the leg terminal
+            // dead idempotently and only flips unprotected cards; protected
+            // ownership (interactive holds, bound waits) is never yanked.
+            if vstr(&facts, "state") == Some("CLOSED") && facts.pointer("/mergeCommit/oid").is_none() {
+                renew_lease(ctx, repo, base);
+                let defect = format!(
+                    "PR #{pr} is CLOSED without merging (live GitHub state) — the leg can never land on this lane (BR#22592); re-deliver: reopen the PR or open a fresh one, re-verify, re-queue"
+                );
+                ctx.mcp("train_event", json!({
+                    "repo": repo, "base": base, "kind": "bounced", "pr": pr, "task_id": head_id,
+                    "reason": defect, "bounce_kind": "gate", "dead_leg": true, "live_state": st,
+                }))?;
+                qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked", "resolved": true, "resolved_why": "closed-unmerged — dead leg reported, hub owns the exit" }));
+                ctx.note(&format!("reaped {head_id}: PR #{pr} closed unmerged — dead leg reported"));
+                log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} is CLOSED unmerged — resolved-dead, reported hub-side (gate bounce with dead_leg evidence; BR#22592), advancing to the next queue entry"));
+                return Ok(());
+            }
             qfacts.push(json!({ "id": head_id, "pr": pr, "cls": "blocked" }));
             log(Some(key), &format!("queue[{qi}] {head_id} PR #{pr} live state is {st} (not OPEN) — unlandable, never a batch candidate, advancing to the next queue entry (card stays for the humans)"));
             return Ok(());
@@ -7713,6 +7769,191 @@ mod tests {
         );
     }
 
+    // ---------- BR#22592: the reap — resolved cars never hold the line ----------
+    // The 2026-11-26 superpositional wedge: all four queued cars were RESOLVED
+    // (one receipted-awaiting-ci since Nov 22, three live-closed PRs) and the
+    // walk advanced past every one of them silently, forever. The parked
+    // filter treats an awaiting-ci stamp as "the pass settle owns it" — but
+    // the settle only runs when a pass lands something, and with every car
+    // resolved nothing ever lands: a permanent deadlock. The reap law: a leg
+    // is resolved for lane purposes when it is landed, receipt-settled
+    // (awaiting-ci + merge_sha + merged_at older than the settle window) or
+    // live-dead (PR closed unmerged) — and a resolved car must produce a
+    // terminal hub event or a resolved fact, never a silent advance.
+
+    fn receipt_leg_card(now: i64) -> Value {
+        json!({
+            "id": "BR#1", "status": "blocked",
+            "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 30, "base": "main" } ],
+                "merge_train": {
+                    "pr": 30, "state": "awaiting-ci",
+                    "legs": { "30": { "state": "awaiting-ci", "merge_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "merged_at": now - 20 * 60_000 } },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn receipt_settled_leg_reconciles_instead_of_parking_forever_br22592() {
+        // The BR#18567/PR#3665 shape: the leg is stamped awaiting-ci WITH the
+        // merge receipt (merge_sha + merged_at, Nov 22) but the settle never
+        // came — every car resolved, so no pass ever landed again. The old
+        // parked filter advanced silently on the stamp ("the pass settle owns
+        // it"); the reap law reads the receipt as the merge being FACT and
+        // re-fires the merged reconcile (dedupe-safe hub-side) so the landed
+        // close path runs and the lane advances to the live candidate.
+        let now = now_ms() as i64;
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(receipt_leg_card(now)),                                // get_artefact BR#1
+            ok(json!({ "ok": true })),                                // renew_lease (reconcile arm)
+            ok(json!({ "ok": true })),                                // train_event merged (reconcile)
+            ok(json!({ "ok": true })),                                // publish checked entries
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        assert!(
+            names.contains(&"train_event".to_string()),
+            "a receipt-settled leg must re-fire the merged reconcile, got {:?}",
+            names
+        );
+        let idx = names.iter().position(|n| n == "train_event").unwrap();
+        let ev = call_args(&recorded[idx]);
+        assert_eq!(ev.get("kind"), Some(&json!("merged")), "the reconcile rides the merged vocabulary, got {:?}", ev);
+        assert_eq!(ev.get("pr"), Some(&json!(30)));
+        assert_eq!(
+            ev.get("merge_sha").and_then(|v| v.as_str()),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the re-stamp carries the STAMPED receipt sha, got {:?}",
+            ev.get("merge_sha")
+        );
+        let reason = String::from(ev.get("reason").and_then(|v| v.as_str()).unwrap_or(""));
+        assert!(reason.contains("receipt"), "the reason must name the receipt reap, got: {reason}");
+    }
+
+    #[test]
+    fn closed_unmerged_leg_bounces_dead_and_stamps_resolved_br22592() {
+        // The BR#20855/PR#3939 shape: a live pr_facts read says CLOSED with no
+        // mergeCommit — the leg can NEVER land. The old path stamped cls
+        // "blocked" and advanced ("card stays for the humans") — the hub kept
+        // admitting the car, the line held it forever. The reap law reports
+        // the terminal observation hub-side (a gate bounce carrying dead_leg
+        // evidence; the HUB stays the policy point for the card flip) and the
+        // published fact marks the car resolved.
+        let gh = FakeGh::new("{\"number\":40,\"state\":\"CLOSED\",\"headRefOid\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mergeable\":\"MERGEABLE\",\"mergeStateStatus\":\"CLEAN\",\"mergeCommit\":null,\"mergedAt\":null,\"baseRefName\":\"main\",\"isDraft\":false,\"reviewDecision\":\"APPROVED\"}");
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(json!({ "id": "BR#1", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 40, "base": "main" } ],
+                "merge_train": { "pr": 40, "state": "queued" },
+            } })),                                                    // get_artefact BR#1
+            ok(json!({ "ok": true })),                                // renew_lease (dead-report arm)
+            ok(json!({ "ok": true })),                                // train_event bounced (dead leg)
+            ok(json!({ "ok": true })),                                // publish checked entries
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        gh.attach(&mut ctx);
+        drive_lane(&mut ctx, &lane());
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        let ev_idx = names
+            .iter()
+            .position(|n| n == "train_event")
+            .unwrap_or_else(|| panic!("a live-dead leg must be reported hub-side, got {:?}", names));
+        let ev = call_args(&recorded[ev_idx]);
+        assert_eq!(ev.get("kind"), Some(&json!("bounced")));
+        assert_eq!(ev.get("bounce_kind"), Some(&json!("gate")));
+        assert_eq!(ev.get("pr"), Some(&json!(40)));
+        assert_eq!(ev.get("dead_leg"), Some(&json!(true)), "the bounce must carry the dead-leg evidence, got {:?}", ev);
+        let reason = String::from(ev.get("reason").and_then(|v| v.as_str()).unwrap_or(""));
+        assert!(reason.to_lowercase().contains("closed"), "the defect must name the closed-unmerged state, got: {reason}");
+        // The published fact must mark the car resolved — the conformance
+        // reader (and the panel) must never see a dead car as a driving class.
+        let pub_idx = names.iter().position(|n| n == "train_queue_facts").unwrap();
+        let facts = call_args(&recorded[pub_idx]);
+        let entry = facts
+            .pointer("/entries")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find(|e| e.get("id").and_then(|i| i.as_str()) == Some("BR#1")))
+            .unwrap_or_else(|| panic!("BR#1 must appear in the published facts, got {:?}", facts));
+        assert_eq!(
+            entry.get("resolved"),
+            Some(&json!(true)),
+            "the dead car's published fact must carry resolved:true, got {:?}",
+            entry
+        );
+    }
+
+    #[test]
+    fn no_resolved_car_rides_the_line_past_one_tick_br22592() {
+        // CONFORMANCE (the mission guard): seed the line with the exact live
+        // wedge — one receipt-settled car + one live-closed car — and drive
+        // ONE tick. Every resolved car must have produced a terminal event or
+        // a resolved:true fact. On the pre-fix walk both cars silently
+        // advanced (awaiting-ci park / cls-blocked fall-through) and the line
+        // wedged forever; this assertion is the regression tripwire for the
+        // whole class.
+        let now = now_ms() as i64;
+        let gh = FakeGh::new("{\"number\":40,\"state\":\"CLOSED\",\"headRefOid\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mergeable\":\"MERGEABLE\",\"mergeStateStatus\":\"CLEAN\",\"mergeCommit\":null,\"mergedAt\":null,\"baseRefName\":\"main\",\"isDraft\":false,\"reviewDecision\":\"APPROVED\"}");
+        let resolved_line = json!({
+            "lane": "state-vector/bridge@main", "required_workflows": [],
+            "queue": [
+                { "id": "BR#1" },
+                { "id": "BR#2" },
+            ],
+        });
+        let (hub, calls) = mock_hub(vec![
+            ok(json!({ "note": "lease granted — lane was free" })),   // acquire
+            ok(receipt_leg_card(now)),                                // get_artefact BR#1
+            ok(json!({ "ok": true })),                                // renew_lease (reconcile arm)
+            ok(json!({ "ok": true })),                                // train_event merged (reconcile)
+            ok(json!({ "id": "BR#2", "status": "blocked", "meta": {
+                "prs": [ { "repo": "state-vector/bridge", "number": 40, "base": "main" } ],
+                "merge_train": { "pr": 40, "state": "queued" },
+            } })),                                                    // get_artefact BR#2
+            ok(json!({ "ok": true })),                                // renew_lease (dead-report arm)
+            ok(json!({ "ok": true })),                                // train_event bounced (dead leg)
+            ok(json!({ "ok": true })),                                // publish checked entries
+            ok(json!({ "lanes": [ { "lane": "state-vector/bridge@main", "queue": [], "currently": null, "stop": null } ] })), // release_if_idle status
+            ok(json!({ "note": "lease released — idle" })),           // release
+        ]);
+        let mut ctx = test_ctx(&hub);
+        gh.attach(&mut ctx);
+        drive_lane(&mut ctx, &resolved_line);
+        let recorded = calls.lock().unwrap();
+        let names: Vec<String> = recorded.iter().map(call_name).collect();
+        let events: Vec<&Value> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n == "train_event")
+            .map(|(i, _)| call_args(&recorded[i]))
+            .collect();
+        let reconciled = events.iter().any(|ev| ev.get("kind") == Some(&json!("merged")) && ev.get("pr") == Some(&json!(30)));
+        assert!(reconciled, "BR#1 (receipt-settled) must reconcile, events: {:?}", events);
+        let bounced = events.iter().any(|ev| ev.get("kind") == Some(&json!("bounced")) && ev.get("pr") == Some(&json!(40)) && ev.get("dead_leg") == Some(&json!(true)));
+        assert!(bounced, "BR#2 (live-closed) must report dead, events: {:?}", events);
+        let pub_idx = names.iter().position(|n| n == "train_queue_facts").unwrap();
+        let facts = call_args(&recorded[pub_idx]);
+        let entries = facts.pointer("/entries").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        for id in ["BR#1", "BR#2"] {
+            let entry = entries.iter().find(|e| e.get("id").and_then(|i| i.as_str()) == Some(id))
+                .unwrap_or_else(|| panic!("{id} must appear in the published facts, got {:?}", entries));
+            assert_eq!(
+                entry.get("resolved"),
+                Some(&json!(true)),
+                "conformance: {id} is resolved — its fact must say so after one tick, got {:?}",
+                entry
+            );
+        }
+    }
+
     #[test]
     fn tick_skips_a_retired_lane_before_any_traffic_br4977() {
         // The hub marks a retired lane (its lane card is done/superseded —
@@ -9136,7 +9377,7 @@ mod tests {
             std::fs::write(
                 &gh,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then echo \"{state}\"; exit 0; fi\nexit 0\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then echo '{state}'; exit 0; fi\nexit 0\n",
                     log.display(),
                 ),
             )

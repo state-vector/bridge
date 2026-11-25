@@ -654,6 +654,51 @@ pub fn train_leg_state<'a>(meta: &'a Value, leg: &TrainLeg) -> Option<&'a str> {
     mt.get("state").and_then(|v| v.as_str())
 }
 
+/// BR#22592 (the 2026-11-26 superpositional wedge): the settle window an
+/// orphaned awaiting-ci receipt must age past before the walk reads the
+/// stamped merge as FACT. A pass normally settles within one lease (5-min
+/// CAS TTL); the settle only runs when a pass LANDS something, so when every
+/// queued car is resolved nothing ever lands again and a fresh stamp would
+/// sit awaiting-ci forever too — 15 min is several ticks and three lease
+/// TTLs, far under the hours-scale starvation window. Below it the pass
+/// settle still owns the car (the BR#4934 park stands).
+pub const TRAIN_RECEIPT_SETTLE_WINDOW_MS: i64 = 15 * 60_000;
+
+/// True when the leg is parked awaiting-ci but carries a MERGE RECEIPT
+/// (merge_sha + merged_at) older than the settle window: the merge is a
+/// recorded fact and the settle that should have promoted it to "landed"
+/// never came (the all-resolved-line deadlock). The walk reaps such a leg
+/// out of the lane filter and re-fires the merged reconcile — the hub's
+/// dedupe makes the re-stamp idempotent and replays the landed close.
+/// Card-level fallbacks mirror `train_leg_state` (the hub stamps both).
+pub fn train_leg_receipt_settled(meta: &Value, leg: &TrainLeg, now_ms: i64) -> bool {
+    let mt = meta.get("merge_train").unwrap_or(&Value::Null);
+    let entry = mt.get("legs").and_then(|l| l.get(leg.number.to_string()));
+    let state = entry
+        .and_then(|l| l.get("state"))
+        .and_then(|v| v.as_str())
+        .or_else(|| mt.get("state").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if state != "awaiting-ci" {
+        return false;
+    }
+    let sha = entry
+        .and_then(|l| l.get("merge_sha"))
+        .and_then(|v| v.as_str())
+        .or_else(|| mt.get("merge_sha").and_then(|v| v.as_str()))
+        .map(String::from)
+        .unwrap_or_default();
+    let merged_at = entry
+        .and_then(|l| l.get("merged_at"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| mt.get("merged_at").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    if sha.is_empty() || merged_at <= 0 {
+        return false;
+    }
+    now_ms.saturating_sub(merged_at) >= TRAIN_RECEIPT_SETTLE_WINDOW_MS
+}
+
 // ---------- verdict coverage (core.ts 1234-1258, 1343) ----------
 
 fn is_sha_like(s: &str) -> bool {

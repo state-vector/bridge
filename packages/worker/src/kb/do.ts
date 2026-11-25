@@ -117,6 +117,7 @@ import {
   trainLegs,
   trainLegLanded,
   trainLegsRemaining,
+  trainLegsUnresolved,
   trainCardMatchesLane,
   trainOnlyAwait,
   trainStrandClass,
@@ -330,6 +331,11 @@ const HUMAN_ACTOR_RX = HUMAN_ACTOR;
 const VERDICT_ADOPTION_MIN_AGE_MS = 10 * 60_000;
 /** BR#4489: a queued lane with no merge-capable lease inside this window is STARVED — panel red + alarm. */
 const TRAIN_STARVE_MS = 10 * 60_000;
+/** BR#22592: the pickup SLA for a starve-episode diagnostic duty — a duty
+ *  still todo this long past the episode fired is the silent-starve class
+ *  (BR#4753); the sweep re-boosts it and alarms the train sink for dispatch.
+ *  Setting: train.starve_pickup_budget_min (clamped 5..240). */
+const TRAIN_STARVE_PICKUP_BUDGET_MIN_DEFAULT = 20;
 /** Ray 2026-10-29: a merge-capable lease op inside this window means the train is
  *  READY — an idle lane shows which machine last ticked it and when, not a
  *  vague "awaiting an available gateway"; readiness must be visible when
@@ -15844,6 +15850,25 @@ export class KnowledgeHub {
           const replay = await this.reuseLandedReceipt(lane, chainTask, repo, base, pr, seenSha, headSha, actor);
           if (replay) return replay;
         }
+        // BR#22592: the receipt is FACT even when the card's close is
+        // retained (interactive holds, review separation own the exit). The
+        // walk's receipt reconcile just re-proved this exact sha and the
+        // settle that should have promoted the awaiting-ci stamp to landed
+        // never came (the all-resolved-line deadlock) — promote the leg
+        // stamp to terminal landed here. Card-level state and the close
+        // itself are NOT touched: the landed-close paths own those, and a
+        // retained exit keeps its owner.
+        {
+          const dRow = chainTask ? row(chainTask) : null;
+          const dm = dRow ? JSON.parse(dRow.meta ?? "{}") : null;
+          const dLegs = dm?.merge_train?.legs;
+          const entry = dLegs ? dLegs[String(pr)] : undefined;
+          if (dm && entry && entry.state !== "landed" && String(entry.merge_sha ?? "").toLowerCase() === mergeSha.toLowerCase()) {
+            const dNext = { ...dm, merge_train: { ...dm.merge_train, legs: { ...dLegs, [String(pr)]: { ...entry, state: "landed", landed_at: now } } } };
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(dNext), now, chainTask);
+            this.audit(actor, "train:merged_receipt_promoted", chainTask, { lane: laneKey(repo, base), pr, sha: mergeSha.slice(0, 9) });
+          }
+        }
         this.audit(actor, "train:merged_deduped", lane.id, { lane: laneKey(repo, base), pr, sha: mergeSha });
         return { ok: true, deduped: true };
       }
@@ -16088,6 +16113,62 @@ export class KnowledgeHub {
           this.version(lane.id, actor, `train:${kind}`, `PR #${pr} parked conflicting — the mechanical rebase leg owns the exit`, { reason });
           return { ...response, conflict_files: conflictFiles, conflicting_park: true, reason };
         });
+      }
+      // BR#22592 — the walk's dead-leg report (dead_leg evidence on a gate
+      // bounce: a live CLOSED-unmerged leg can NEVER land). The hub is the
+      // POLICY point: it stamps the leg terminal dead idempotently and only
+      // re-hands the card to the repair pool when nothing protected owns
+      // its exit — interactive holds, awaiting asks, delivery dispositions
+      // and live execution (the BR#22079 shape: a typed run_success wait
+      // survives the stamp untouched). The stamp makes the car invisible to
+      // the derived queue (trainLegsUnresolved), which IS the reap; the
+      // conflicting/starvation sweeps still see the card (meta-scanned).
+      if (body.dead_leg === true && bounceKind === "gate") {
+        const legBelongs = Number(cm.merge_train?.pr ?? 0) === pr || trainLegs(cm).some((l) => Number(l.number) === Number(pr));
+        const dLegs = { ...(((cm.merge_train?.legs ?? {}) as Record<string, any>)) };
+        const alreadyDead = String(dLegs[String(pr)]?.state ?? "") === "dead";
+        // Protection (BR#22592): the train's OWN pr_merged leg wait is what
+        // the dead stamp supersedes — every OTHER exit keeps its owner:
+        // interactive holds, awaiting asks, delivery dispositions, foreign
+        // typed waits (the BR#22079 shape: a run_success bound wait with a
+        // named unblock condition survives the stamp untouched) and live
+        // execution fences.
+        const wait = validateAwaitEvent(cm.blocked?.await_event);
+        const foreignWait = !!(wait && wait.event !== "pr_merged");
+        const retained = foreignWait
+          || !!(cm.interactive_execution || cm.awaiting_ask || cm.delivery_disposition)
+          || this.protectedExecution(taskId, cm);
+        if (!alreadyDead && legBelongs) {
+          dLegs[String(pr)] = { ...(dLegs[String(pr)] ?? {}), state: "dead", at: now, why: (defect ?? "").slice(0, 300) || undefined, live_state: String(body.live_state ?? "CLOSED") };
+          cm.merge_train = { ...(cm.merge_train ?? {}), legs: dLegs };
+        }
+        if (!legBelongs) {
+          // The dead PR is not this card's leg — protocol mismatch, never a
+          // stamp. Audited ack; the walk's own queue re-derives next tick.
+          this.audit(actor, "train:dead_leg_refused", taskId, { lane: laneKey(repo, base), pr, detail: "dead PR is not a leg of this card" });
+          return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, dead_leg: true, refused: true, reason: defect ?? undefined };
+        }
+        if (alreadyDead || retained) {
+          // First report on a protected card (or a deduped re-report): the
+          // leg stamp IS the de-queue; no flip, no new ledger bounce row
+          // (the BR#4688 budget must never feed on reap re-reports).
+          if (!alreadyDead) {
+            this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(cm), now, taskId);
+            this.audit(actor, "train:dead_leg", taskId, { lane: laneKey(repo, base), pr, retained: true, live_state: String(body.live_state ?? "CLOSED") });
+            this.version(taskId, actor, "update", `PR #${pr} closed unmerged — leg stamped terminal dead (BR#22592); the exit stays with its protected owner, the car leaves the derived queue`, {});
+            const reason = this.laneSyncReason(lane.id, meta, now);
+            ev({ task: taskId, bounce_kind: "gate", dead_leg: true, reason: defect }, taskId);
+            this.version(lane.id, actor, `train:${kind}`, `PR #${pr} dead (closed unmerged) — car reaped, exit retained by its owner (BR#22592)`, { reason });
+          } else {
+            this.audit(actor, "train:dead_leg_deduped", taskId, { lane: laneKey(repo, base), pr });
+          }
+          return { ok: true, kind, lane: laneKey(repo, base), pr, task: taskId, dead_leg: true, ...(retained ? { retained: true } : {}), ...(alreadyDead ? { deduped: true } : {}), reason: defect ?? undefined };
+        }
+        // Unprotected first report: the leg stamp already rode cm — fall
+        // through to the gate repair handoff below, which flips the card to
+        // the repair pool (blocked → todo + the fix-up brief) and writes the
+        // one ledger bounce row for this episode.
+        this.audit(actor, "train:dead_leg", taskId, { lane: laneKey(repo, base), pr, retained: false, live_state: String(body.live_state ?? "CLOSED") });
       }
       // BR#5633 awaiting sweep: a re-assert of a card ALREADY parked
       // Awaiting classifies (and re-stamps) on the card's STORED park facts
@@ -18881,7 +18962,16 @@ export class KnowledgeHub {
       // Keep the task and its wait, while removing its stale train slot.
       const task = metaById.get(c.id);
       if (!cm || this.protectedExecution(c.id, task)) return false;
-      const legs = trainLegsRemaining(task, repo, base);
+      // BR#22592 reap: the lane filter reads UNRESOLVED legs — landed,
+      // receipt-settled (orphaned awaiting-ci merge receipt past the settle
+      // window; the walk's receipt reconcile re-fires the merged event and
+      // the dedupe replay/close paths own the card) and dead (terminal
+      // closed-unmerged stamp) legs cannot drive, and holding their cars
+      // queue-visible is the wedge itself (the live 2026-11-26 line: all
+      // four cars resolved, starved 144m). Alarmed visibility is unaffected:
+      // the strand/conflicting/starvation sweeps scan card meta, never this
+      // list.
+      const legs = trainLegsUnresolved(task, repo, base);
       // A duplicate single-leg slot cannot drive a merge already recorded
       // against another card. Leave the original binding to settlement.
       const recordedOwner = legs.length === 1 ? recordedOwners.get(legs[0].number) : undefined;
@@ -18900,7 +18990,7 @@ export class KnowledgeHub {
       // without a card fetch.
       const row = cards.find((x) => x.id === c.id)!;
       const cm = metaById.get(c.id);
-      const leg = trainLegsRemaining(cm, repo, base)[0];
+      const leg = trainLegsUnresolved(cm, repo, base)[0];
       const pr = Number(leg?.number ?? 0) || 0;
       const root_fix = c.root_fix && scope.kind === "current" &&
         mainRedBinding(cm, base)?.head_sha === scope.head_sha;
@@ -19442,6 +19532,58 @@ export class KnowledgeHub {
         meta.lane.starvation = existingEp;
         meta.starvation = existingEp;
         this.saveLaneState(l.id, meta, now0);
+      }
+      // BR#22592 pickup SLA: the episode's diagnostic duty sitting UNCLAIMED
+      // (todo, nobody holding it) past a bounded budget is the silent-starve
+      // class again (BR#4753: silent per-tick failures starve the lane) —
+      // the duty exists and nobody comes. Re-boost the duty and fire the
+      // ONE-per-episode pickup alarm to the train alarm sink naming the duty
+      // for dispatch (the conflicting-budget sweep's cadence: 24h dedupe via
+      // the episode stamp + askCreate's identical-open-ask guard).
+      {
+        const dutyId0 = typeof existingEp.duty_id === "string" ? existingEp.duty_id : "";
+        const firedAt = Number(existingEp.fired_at ?? 0);
+        const pickupAlarm = (existingEp as any).pickup_alarm as { at?: number; duty_id?: string; budget_min?: number } | undefined;
+        if (dutyId0 && firedAt > 0) {
+          const sRow = this.one(`SELECT value FROM settings WHERE key = 'train.starve_pickup_budget_min'`) as any;
+          const budgetParsed = sRow ? parseInt(String(sRow.value), 10) : NaN;
+          const pickupBudgetMin = Number.isFinite(budgetParsed) ? Math.min(240, Math.max(5, budgetParsed)) : TRAIN_STARVE_PICKUP_BUDGET_MIN_DEFAULT;
+          const dutyRow = this.one(`SELECT status FROM artefacts WHERE id = ?`, dutyId0) as any;
+          const dutyUnclaimed = !!dutyRow && String(dutyRow.status ?? "") === "todo";
+          const alarmFresh = now0 - Number(pickupAlarm?.at ?? 0) < 24 * 3_600_000;
+          if (dutyUnclaimed && now0 - firedAt > pickupBudgetMin * 60_000 && !alarmFresh) {
+            try {
+              this.state.storage.sql.exec(`UPDATE artefacts SET meta = json_set(meta, '$.boosted', ?), updated_ts = ? WHERE id = ?`, now0, now0, dutyId0);
+              this.audit("system:train", "boost", dutyId0, { root: l.id, via: "train:starve_pickup_sla" });
+              const sink = this.settingValue("train_alarm_sink_id", TRAIN_ALARM_SINK_ID);
+              await this.askCreate(
+                {
+                  to: sink,
+                  route: { kind: "executor_coordination", task_id: dutyId0 },
+                  question: `Merge-starved diagnostic duty ${dutyId0} unclaimed past the ${pickupBudgetMin}m pickup budget — dispatch an agent on it`,
+                  reason: `the lane starves with a filed duty no agent picked up inside the budget (the silent-starve class, BR#4753) — the duty is boosted and this alarm names it for pickup (BR#22592)`,
+                  details: [
+                    `Lane ${lane.repo}@${lane.base} starved since ${new Date(mergeRefTs).toISOString()} (queue ${queue.length}, awaiting ${awaiting.length}).`,
+                    `Diagnostic duty ${dutyId0} is still todo past the ${pickupBudgetMin}m pickup budget — no executor has claimed it.`,
+                    `Dispatch: claim ${dutyId0} and diagnose why the lane holds cars without merging; the duty is boosted (BR#4068 hot).`,
+                    `Fires once per episode; the duty's own completion or claim clears the class.`,
+                  ].join("\n\n"),
+                  artefact_id: String(l.id),
+                  urgency: "time-sensitive",
+                },
+                "system:train",
+              );
+              existingEp.pickup_alarm = { at: now0, duty_id: dutyId0, budget_min: pickupBudgetMin };
+              meta.lane.starvation = existingEp;
+              meta.starvation = existingEp;
+              this.saveLaneState(l.id, meta, now0);
+              this.audit("system:train", "train:starve_pickup_alarm", dutyId0, { lane: `${lane.repo}@${lane.base}`, lane_card: l.id, budget_min: pickupBudgetMin, duty_age_ms: now0 - firedAt });
+            } catch (pe) {
+              // an identical pickup alarm is already open for this episode — that IS once
+              this.audit("system:train", "starve_pickup_alarm_deduped", dutyId0, { detail: String((pe as Error).message ?? pe).slice(0, 160) });
+            }
+          }
+        }
       }
       const curMins = Math.max(60, Math.round(mergeAge / 60_000));
       return {

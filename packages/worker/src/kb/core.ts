@@ -2956,6 +2956,48 @@ export function trainLegsRemaining(meta: any, repo?: string, base?: string): Tra
   return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && (!base || String(l.base ?? "main") === base) && !trainLegLanded(meta, l));
 }
 
+/** BR#22592 (the 2026-11-26 superpositional wedge): the settle window an
+ *  orphaned awaiting-ci receipt must age past before the derived queue reads
+ *  the stamped merge as FACT. Mirrors the executor's
+ *  train_gate::TRAIN_RECEIPT_SETTLE_WINDOW_MS (train_gate.rs): a pass
+ *  normally settles within one lease (5-min CAS TTL), but the settle only
+ *  runs when a pass LANDS something — an all-resolved line never lands
+ *  again, so a fresh stamp would also sit awaiting-ci forever. 15 min is
+ *  several ticks and three lease TTLs, far under the hours-scale starvation
+ *  window. Below it the BR#4934 park stands and the leg stays queued. */
+export const TRAIN_RECEIPT_SETTLE_WINDOW_MS = 15 * 60_000;
+
+/** The resolved-LEG law (BR#22592) — DERIVED-QUEUE VISIBILITY ONLY. A leg is
+ *  resolved when it is landed (trainLegLanded), receipt-settled (awaiting-ci
+ *  + merge receipt past the settle window — the orphaned-stamp class: the
+ *  merge is a recorded fact, the settle that should have promoted it never
+ *  came) or dead (the terminal closed-unmerged stamp the walk's dead_leg
+ *  bounce writes; a closed PR can never land). Resolved legs never admit a
+ *  car onto a lane: holding them queue-visible is the wedge itself (all four
+ *  live cars resolved, starved 144m, the line held forever). This is NOT the
+ *  acceptance/closeout predicate — trainLegLanded keeps its strict meaning
+ *  for verdicts, landed closes and coverage everywhere else. */
+export function trainLegResolved(meta: any, leg: TrainLeg, now: number = Date.now()): boolean {
+  if (trainLegLanded(meta, leg)) return true;
+  const mt = meta?.merge_train ?? {};
+  const entry = (mt.legs ?? {})[String(leg.number)] ?? {};
+  const state = String(entry.state ?? mt.state ?? "");
+  if (state === "dead") return true;
+  if (state !== "awaiting-ci") return false;
+  const sha = String(entry.merge_sha ?? mt.merge_sha ?? "");
+  const mergedAt = Number(entry.merged_at ?? mt.merged_at ?? 0);
+  return !!sha && mergedAt > 0 && now - mergedAt >= TRAIN_RECEIPT_SETTLE_WINDOW_MS;
+}
+
+/** trainLegsRemaining under the resolved-LEG law: the legs that can still
+ *  drive on this repo+base. The derived-queue lane filter reads this — a car
+ *  whose every lane leg is resolved is reaped from the queue (the executor
+ *  walk reconciles receipts and reports dead legs hub-side; the card's own
+ *  close stays with the landed-close paths). */
+export function trainLegsUnresolved(meta: any, repo?: string, base?: string, now: number = Date.now()): TrainLeg[] {
+  return trainLegs(meta).filter((l) => (!repo || l.repo === repo) && (!base || String(l.base ?? "main") === base) && !trainLegResolved(meta, l, now));
+}
+
 /** Does this queued card ride the given repo's lane? True when at least one
  *  of its UNLANDED legs belongs to that repo — and, when `base` is given,
  *  to that lane's base (BR#4977). (BR#3659: replaces the old lane filter
