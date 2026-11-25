@@ -705,6 +705,33 @@ retry-budget pile over 30 simultaneously held tasks raises one
 `retry_budget_pile` class alarm per 30 minutes naming the storm — failure
 cooldowns cannot silently fence off a third of the backlog.
 
+A writer killed at startup is a dispatch-path fault, not a delivery failure
+(BR#22116). When a terminal arrives `interrupted` with the runner's exact
+startup-interrupt stderr (`acp interrupted — stop for a fresh attempt`), zero
+stdout and no existing cause within 30 seconds of the attempt's begin, the hub
+stamps a structured cause on the terminal — `class:"diagnostic"`,
+`error_name:"acp_startup_interrupt"`, the stderr as the evidence line — so
+recovery duties read the blip class from the durable record instead of
+classifying by absence against runner-fenced receipts. The stamp is
+idempotent: the `finalize` replay of a bare captured outcome aligns with the
+stamped terminal instead of tripping the immutability gate. A classified
+startup interrupt never charges `budget_exhaustions` (and a legacy counter
+already at the cap no longer fences the card): the consecutive counter's own
+exponential backoff — 30s doubling per consecutive same-signature blip,
+capped at 10 minutes — paces the next dispatch, holding the task with the
+distinct, stats-visible `startup_interrupt` scheduling reason while it runs
+and admitting it with no hold and no recovery permit once it lapses. Any real
+outcome (completed, failed, or a genuine mid-run interrupt with output)
+resets the counter. Each counted blip is audited (`execution_startup_interrupt`
+with the cadence state), and a startup-interrupt pile over 5 simultaneously
+held tasks raises one `startup_interrupt_pile` class alarm per 30 minutes —
+the duty→dispatch→blip treadmill is now visible in the same surface as every
+other scheduling storm. The interruptor itself is the runner's ACP call loop
+(`transport.rs` `RunControl::should_stop`): a set stop flag — lease expiry
+treated as expired when no deadline was ever granted, the maintenance poller's
+`permits_renewal` refusal, or the gateway handoff path — surfaces as exactly
+this stderr on the writer's next prompt call.
+
 A stopping-phase attempt never frees its slot on time alone: an expired lease
 and action deadline keep it capacity-charged, and the hub only names the
 missing proof (`stopping_writer_proof_pending`). The original host's recovery

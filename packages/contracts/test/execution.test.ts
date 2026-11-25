@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
+import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, isAcpStartupInterrupt, startupInterruptBackoffMs, ACP_STARTUP_INTERRUPT_STDERR, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -562,5 +562,86 @@ describe("durable external-CI waits (BR#18328)", () => {
     expect(externalWaitCoveredBy(wait, { ...observed, contexts: ["ci / Build"] })).toBe(false); // missing declared context
     expect(externalWaitCoveredBy(wait, { ...observed, repo: "state-vector/bridge" })).toBe(false);
     expect(externalWaitCoveredBy(wait, { ...observed, pr: 2 })).toBe(false);
+  });
+});
+
+describe("zero-effect startup interrupts (BR#22116)", () => {
+  const blip = { kind: "interrupted", exit_code: null, stdout_tail: "", stderr_tail: ACP_STARTUP_INTERRUPT_STDERR } as const;
+  const stoppedBlip = { kind: "stopped" as const, ...fence, writers: "process_group_empty" as const, outcome: blip };
+  const finalizeBlip = { kind: "finalize" as const, ...fence, writers: "process_group_empty" as const, outcome: blip };
+
+  it("classifies a zero-effect startup interrupt with a structured cause and starts the cadence counter", () => {
+    const s = step(started(), stoppedBlip, 200); // began_at=100, inside the 30s window
+    expect(s.terminal?.outcome.cause).toMatchObject({
+      class: "diagnostic", error_name: "acp_startup_interrupt",
+      evidence_line: ACP_STARTUP_INTERRUPT_STDERR, backend: "opencode",
+    });
+    expect(isAcpStartupInterrupt(s.terminal!.outcome)).toBe(true);
+    expect(s.startup_interrupt).toMatchObject({ consecutive: 1, generation: 1, attempt_id: "one", backoff_until: 200 + startupInterruptBackoffMs(1) });
+    // the blip itself never charged anything
+    expect(s.budget_exhaustions).toBe(0);
+    expect(s.failure_charged_generation).toBe(0);
+  });
+
+  it("paces the next dispatch with the counter's own backoff and never demands a recovery permit — even with a pinned legacy budget", () => {
+    let s = step(started(), stoppedBlip, 200);
+    s = step(s, finalizeBlip, 300);
+    s = { ...s, budget_exhaustions: 4, budget_exhausted_at: 100 }; // the BR#19889 pinned-legacy specimen
+    expect(executionAdmissionHold(s, "revision", 10_000)).toBe("startup_interrupt");
+    // backoff lapsed: dispatchable with NO recovery permit and NO duty cycle
+    expect(executionAdmissionHold(s, "revision", 40_000)).toBeNull();
+    expect(executionNeedsRecoveryPermit(s, "revision")).toBe(false);
+  });
+
+  it("grows the backoff exponentially across consecutive same-signature blips and caps it", () => {
+    expect(startupInterruptBackoffMs(1)).toBe(30_000);
+    expect(startupInterruptBackoffMs(2)).toBe(60_000);
+    expect(startupInterruptBackoffMs(3)).toBe(120_000);
+    expect(startupInterruptBackoffMs(9)).toBe(600_000);
+    expect(startupInterruptBackoffMs(30)).toBe(600_000);
+    let s = step(started(), stoppedBlip, 200);
+    s = step(s, finalizeBlip, 300);
+    s = step(s, { ...begin, attempt_id: "two" }, 40_000); // backoff lapsed
+    s = step(s, { ...stoppedBlip, generation: 2, attempt_id: "two" }, 45_000);
+    expect(s.startup_interrupt).toMatchObject({ consecutive: 2, backoff_until: 45_000 + 60_000, generation: 2, attempt_id: "two" });
+  });
+
+  it("preserves the stamped evidence when finalize replays the bare captured outcome", () => {
+    const s = step(step(started(), stoppedBlip, 200), finalizeBlip, 300);
+    expect(s.attempt?.phase).toBe("quiesced");
+    expect(isAcpStartupInterrupt(s.terminal!.outcome)).toBe(true);
+    // the counter counted the blip exactly once across the pair
+    expect(s.startup_interrupt?.consecutive).toBe(1);
+  });
+
+  it("does not classify when the window, output, stderr signature or existing cause does not match", () => {
+    const late = step(started(), stoppedBlip, 131_000); // outside the 30s window
+    expect(late.terminal?.outcome.cause).toBeUndefined();
+    expect(late.startup_interrupt).toBeNull();
+    const withOutput = step(started(), { ...stoppedBlip, outcome: { ...blip, stdout_tail: "made real progress" } }, 200);
+    expect(withOutput.terminal?.outcome.cause).toBeUndefined();
+    expect(withOutput.startup_interrupt).toBeNull();
+    const other = step(started(), { ...stoppedBlip, outcome: { ...blip, stderr_tail: "acp timed out — stalled: no output for 5m" } }, 200);
+    expect(other.terminal?.outcome.cause).toBeUndefined();
+    const withCause = step(started(), { ...stoppedBlip, outcome: { ...blip, cause: { class: "provider_internal" as const, backend: "opencode", model: null, code: null, error_name: "provider.quota", message: "quota", evidence_line: null, at_ms: 100 } } }, 200);
+    expect(withCause.terminal?.outcome.cause).toMatchObject({ class: "provider_internal" });
+    expect(withCause.startup_interrupt).toBeNull();
+    // legacy journals carry no began_at: the window is unprovable, never classified
+    const legacy = started();
+    delete (legacy.attempt as { began_at?: number }).began_at;
+    const stoppedLegacy = step(legacy, stoppedBlip, 200);
+    expect(stoppedLegacy.terminal?.outcome.cause).toBeUndefined();
+    expect(stoppedLegacy.startup_interrupt).toBeNull();
+  });
+
+  it("any real outcome — completed, failed or a genuine mid-run interrupt — proves the dispatch path and resets the cadence", () => {
+    let s = step(started(), stoppedBlip, 200);
+    s = step(s, finalizeBlip, 300);
+    s = step(s, { ...begin, attempt_id: "two" }, 40_000);
+    s = step(s, { kind: "stopped", ...fence, generation: 2, attempt_id: "two", writers: "process_group_empty", outcome: { kind: "interrupted", exit_code: null, stdout_tail: "mid-run output", stderr_tail: ACP_STARTUP_INTERRUPT_STDERR } }, 50_000);
+    expect(s.startup_interrupt).toBeNull();
+    s = step(s, { kind: "stopped", ...fence, generation: 2, attempt_id: "two", writers: "process_group_empty", outcome: { kind: "interrupted", exit_code: null, stdout_tail: "mid-run output", stderr_tail: ACP_STARTUP_INTERRUPT_STDERR } }, 50_100);
+    // identical redelivery of the same attempt's evidence stays aligned
+    expect(isAcpStartupInterrupt(s.terminal!.outcome)).toBe(false);
   });
 });

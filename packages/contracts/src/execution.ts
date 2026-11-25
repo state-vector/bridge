@@ -277,6 +277,11 @@ const AttemptFields = {
   lease_until: z.number().int(),
   action_deadline: z.number().int(),
   executor: ExecutorCapabilitiesSchema.nullable().default(null),
+  /** BR#22116 — hub-side begin timestamp (epoch-ms). The startup-interrupt
+   *  classifier compares the terminal capture time against this to bound the
+   *  "died at startup" window. Additive and optional: attempts recorded
+   *  before the field shipped parse unchanged and simply never classify. */
+  began_at: z.number().int().nonnegative().optional(),
 };
 export const WriterProofSchema = z.enum(["process_group_empty", "no_live_group_members"]);
 export const WriterReceiptSchema = z.discriminatedUnion("kind", [
@@ -478,6 +483,84 @@ export const AttemptDiagnosisSchema = z.object({
 });
 export type AttemptDiagnosis = z.infer<typeof AttemptDiagnosisSchema>;
 
+/** BR#22116 — cadence accounting for zero-effect startup interrupts. A writer
+ *  killed at startup with no tool output, no operations and no stdout is a
+ *  dispatch-path fault, not a delivery failure: it never charges the retry
+ *  budget. Consecutive same-signature interrupts pace the NEXT dispatch via a
+ *  deterministic exponential backoff instead of the duty→dispatch→blip
+ *  treadmill. Additive and defaulted: old journals parse unchanged. */
+export const StartupInterruptStateSchema = z.object({
+  consecutive: z.number().int().nonnegative(),
+  backoff_until: z.number().int().nonnegative(),
+  generation: z.number().int().positive(),
+  attempt_id: text,
+  at: z.number().int().nonnegative(),
+});
+export type StartupInterruptState = z.infer<typeof StartupInterruptStateSchema>;
+
+/** The exact runner-emitted stderr of a writer the runner itself stopped
+ *  while the ACP prompt was still starting (transport.rs RunControl stop). */
+export const ACP_STARTUP_INTERRUPT_STDERR = "acp interrupted — stop for a fresh attempt";
+export const ACP_STARTUP_INTERRUPT_ERROR_NAME = "acp_startup_interrupt";
+/** A terminal captured within this window of the attempt's begin, carrying
+ *  the exact startup-interrupt stderr and zero output, classifies as a
+ *  startup interrupt. Later interrupts with output stay unclassified. */
+export const ACP_STARTUP_INTERRUPT_WINDOW_MS = 30_000;
+export const STARTUP_INTERRUPT_BACKOFF_BASE_MS = 30_000;
+export const STARTUP_INTERRUPT_BACKOFF_CAP_MS = 600_000;
+export function startupInterruptBackoffMs(consecutive: number): number {
+  return Math.min(STARTUP_INTERRUPT_BACKOFF_BASE_MS * 2 ** (consecutive - 1), STARTUP_INTERRUPT_BACKOFF_CAP_MS);
+}
+/** The structured stamp left on a classified terminal. `class` stays inside
+ *  the closed ProviderCauseClass enum the Rust runner deserializes (BR#8821
+ *  wire law); `error_name` is the machine-readable interrupt class. */
+export function isAcpStartupInterrupt(outcome: { kind: string; cause?: unknown }): boolean {
+  const name = typeof outcome.cause === "object" && outcome.cause !== null
+    ? (outcome.cause as { error_name?: unknown }).error_name : null;
+  return outcome.kind === "interrupted" && name === ACP_STARTUP_INTERRUPT_ERROR_NAME;
+}
+/** Classify at capture time: interrupted + exact runner stderr + zero stdout
+ *  + no pre-existing cause + within the startup window of begin. */
+function classifyAcpStartupInterrupt(outcome: { kind: string; stdout_tail: string; stderr_tail: string; cause?: unknown },
+  attempt: { began_at?: number; executor?: { backend?: string; model?: string | null } | null } | null | undefined, now: number): boolean {
+  return outcome.kind === "interrupted"
+    && outcome.cause === undefined
+    && outcome.stdout_tail.trim() === ""
+    && outcome.stderr_tail.trim() === ACP_STARTUP_INTERRUPT_STDERR
+    && typeof attempt?.began_at === "number" && attempt.began_at > 0
+    && now - attempt.began_at <= ACP_STARTUP_INTERRUPT_WINDOW_MS;
+}
+function stampAcpStartupInterruptCause<T extends { stderr_tail: string }>(outcome: T,
+  attempt: { began_at?: number; executor?: { backend?: string; model?: string | null } | null } | null | undefined): T & { cause: z.infer<typeof ProviderCauseSchema> } {
+  return { ...outcome, cause: {
+    class: "diagnostic",
+    backend: attempt?.executor?.backend ?? "opencode",
+    model: attempt?.executor?.model ?? null,
+    code: null,
+    error_name: ACP_STARTUP_INTERRUPT_ERROR_NAME,
+    message: ACP_STARTUP_INTERRUPT_STDERR,
+    evidence_line: outcome.stderr_tail,
+    at_ms: attempt?.began_at ?? 0,
+  } };
+}
+/** Deterministic capture alignment: a bare re-delivery (transport retry of
+ *  `stopped`, or the follow-up `finalize`) of an outcome the hub already
+ *  stamped at first capture must equal the stamped stored evidence, or the
+ *  immutability gates would reject the retry forever. Stamp inputs are
+ *  attempt-derived (began_at), so first capture and every replay derive the
+ *  identical cause. */
+function alignCapturedOutcome<T extends { kind: string; stdout_tail: string; stderr_tail: string; cause?: unknown }>(incoming: T,
+  terminal: { generation: number; attempt_id: string; outcome: T } | null | undefined,
+  generation: number, attemptId: string, attempt: { began_at?: number; executor?: { backend?: string; model?: string | null } | null } | null | undefined, now: number): T {
+  if (!terminal || terminal.generation !== generation || terminal.attempt_id !== attemptId) {
+    return classifyAcpStartupInterrupt(incoming, attempt, now) ? stampAcpStartupInterruptCause(incoming, attempt) : incoming;
+  }
+  if (incoming.cause || !isAcpStartupInterrupt(terminal.outcome)) return incoming;
+  const { cause: _stored, ...storedRest } = terminal.outcome;
+  const { cause: _incoming, ...incomingRest } = incoming as Record<string, unknown>;
+  return JSON.stringify(incomingRest) === JSON.stringify(storedRest) ? terminal.outcome : incoming;
+}
+
 export const ExecutionStateSchema = z.object({
   policy_version: z.literal(EXECUTION_POLICY_VERSION),
   revision: z.number().int().nonnegative(),
@@ -493,6 +576,8 @@ export const ExecutionStateSchema = z.object({
   failure_charged_generation: z.number().int().nonnegative().nullable().default(null),
   retry_strategy: ExecutionRetryStrategySchema.nullable().default(null),
   attempt_diagnosis: AttemptDiagnosisSchema.nullable().default(null),
+  /** BR#22116 — consecutive zero-effect startup interrupts + backoff deadline. */
+  startup_interrupt: StartupInterruptStateSchema.nullable().default(null),
   recovery_permit: ExecutionRecoveryPermitSchema.nullable().default(null),
   delivery: ModelCapabilitySchema.nullable().default(null),
   handoff: LocalHandoffSchema.default({ phase: "none" }),
@@ -505,7 +590,7 @@ export const ExecutionStateSchema = z.object({
 });
 export type ExecutionState = z.infer<typeof ExecutionStateSchema>;
 export function initialExecution(requirements: ExecutionRequirements = ExecutionRequirementsSchema.parse({})): ExecutionState {
-  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null, external_wait: null, coordination_wait_intent: null };
+  return { policy_version: EXECUTION_POLICY_VERSION, revision: 0, generation: 0, attempt: null, requirements, messages: [], operations: [], budget_exhaustions: 0, budget_exhausted_at: 0, failure_charged_generation: 0, retry_strategy: null, attempt_diagnosis: null, startup_interrupt: null, recovery_permit: null, delivery: null, handoff: { phase: "none" }, terminal: null, external_wait: null, coordination_wait_intent: null };
 }
 
 export const ExecutionCommandSchema = z.discriminatedUnion("kind", [
@@ -659,7 +744,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
         action_deadline: now + command.action_budget_ms,
         executor: null,
       };
-      s.attempt = { ...common, phase: "running", checkpoint: null, restored_tree: null };
+      s.attempt = { ...common, phase: "running", checkpoint: null, restored_tree: null, began_at: now };
       break;
     }
     case "poll": {
@@ -748,19 +833,32 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
     }
     case "stopped": {
       const current = requireAttempt(true);
+      // BR#22116 — classify a zero-effect startup interrupt at the capture
+      // site and align bare replays with an already-stamped terminal so the
+      // immutability gates stay idempotent under transport retries.
+      const captured = alignCapturedOutcome(command.outcome, s.terminal, command.generation, command.attempt_id, current, now);
       if (s.terminal?.generation === command.generation && s.terminal.attempt_id === command.attempt_id
-        && (JSON.stringify(s.terminal.outcome) !== JSON.stringify(command.outcome) || s.terminal.writers !== command.writers)) throw new Error("gate: captured terminal evidence is immutable");
+        && (JSON.stringify(s.terminal.outcome) !== JSON.stringify(captured) || s.terminal.writers !== command.writers)) throw new Error("gate: captured terminal evidence is immutable");
       if (current.phase !== "quiesced") s.attempt = { ...current, phase: "finalizing", writers: command.writers };
-      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome, writers: command.writers };
+      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: captured, writers: command.writers };
+      if (isAcpStartupInterrupt(captured)) {
+        const consecutive = (s.startup_interrupt?.consecutive ?? 0) + 1;
+        s.startup_interrupt = { consecutive, backoff_until: now + startupInterruptBackoffMs(consecutive), generation: command.generation, attempt_id: command.attempt_id, at: now };
+      } else {
+        // Any real outcome — completed, failed, or a genuine mid-run
+        // interrupt — proves the dispatch path delivered; the cadence resets.
+        s.startup_interrupt = null;
+      }
       break;
     }
     case "finalize": {
       const current = requireAttempt(true);
       if (!["finalizing", "quiesced"].includes(current.phase)) throw new Error("gate: finalization requires an acknowledged stopped-writer receipt");
+      const captured = alignCapturedOutcome(command.outcome, s.terminal, command.generation, command.attempt_id, current, now);
       if (!s.terminal || s.terminal.generation !== command.generation || s.terminal.attempt_id !== command.attempt_id
-        || JSON.stringify(s.terminal.outcome) !== JSON.stringify(command.outcome) || s.terminal.writers !== command.writers) throw new Error("gate: finalization must preserve the captured terminal evidence");
+        || JSON.stringify(s.terminal.outcome) !== JSON.stringify(captured) || s.terminal.writers !== command.writers) throw new Error("gate: finalization must preserve the captured terminal evidence");
       current.phase = "quiesced";
-      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: command.outcome, writers: command.writers };
+      s.terminal = { generation: command.generation, attempt_id: command.attempt_id, outcome: captured, writers: command.writers };
       // Receipt of stop/interrupt does not mean its requested business action
       // was completed. Keep it acknowledged for the next executor to reconcile.
       for (const message of s.messages) if (message.state === "delivered") message.state = "acknowledged";
@@ -939,13 +1037,24 @@ export function executionNeedsRecoveryPermit(state: ExecutionState, revision: st
 
 /** Intrinsic attempt fences precede gateway availability. A compatible
  * gateway alone cannot clear any of these conditions. */
-export function executionAdmissionHold(state: ExecutionState | undefined, revision: string):
-  "writer_not_quiescent" | "unknown_operations" | "provider_route" | "retry_budget" | null {
+export function executionAdmissionHold(state: ExecutionState | undefined, revision: string, now = Date.now()):
+  "writer_not_quiescent" | "unknown_operations" | "provider_route" | "retry_budget" | "startup_interrupt" | null {
   if (!state) return null;
   if (state.attempt && state.attempt.phase !== "quiesced") return "writer_not_quiescent";
   if (state.operations.some(op => op.state === "prepared" || op.state === "outcome_unknown")) return "unknown_operations";
   const { attempt, terminal } = state;
-  if (attempt && terminal && terminal.generation === attempt.generation && terminal.attempt_id === attempt.attempt_id
+  const terminalMatches = !!attempt && !!terminal && terminal.generation === attempt.generation && terminal.attempt_id === attempt.attempt_id;
+  // BR#22116 — a zero-effect startup interrupt is a dispatch-path cadence
+  // fault, not a delivery failure. It must neither advance the retry budget
+  // nor leave the legacy exhaustion counter pinning the hold: the consecutive
+  // counter's own backoff owns the next dispatch instead. While the backoff
+  // runs the card is held with a distinct, stats-visible reason; once it
+  // lapses the scheduler may dispatch with no recovery permit at all.
+  if (terminalMatches && isAcpStartupInterrupt(terminal.outcome)) {
+    if (state.startup_interrupt && now < state.startup_interrupt.backoff_until) return "startup_interrupt";
+    return null;
+  }
+  if (attempt && terminal && terminalMatches
     && !(state.retry_strategy?.task_revision === revision && attempt.generation < state.retry_strategy.first_generation)
     && providerRecoveryDiagnosis(terminal.outcome) === "provider_route_unavailable") return "provider_route";
   if (executionAttemptBudgetExhausted(state, revision)) {

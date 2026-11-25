@@ -7,6 +7,8 @@ import {
   TOOL_NAMES,
   configJsonSchema,
 } from "../src/index.ts";
+import { SchedulingReasonSchema } from "../src/scheduling.ts";
+import { executionAdmissionHold, initialExecution, reduceExecution } from "../src/execution.ts";
 import { AgentProvisionResponseSchema } from "../src/provision.ts";
 import {
   PairPollResponseSchema,
@@ -244,5 +246,27 @@ describe("config file contract", () => {
     for (const forbidden of CONFIG_FORBIDDEN_KEYS) {
       expect(props, `${forbidden} must never be part of the config schema`).not.toContain(forbidden);
     }
+  });
+});
+
+describe("startup-interrupt scheduling surface (BR#22116)", () => {
+  it("the backoff hold is a first-class scheduling reason, work-wait recovery reason and board classification", () => {
+    expect(SchedulingReasonSchema.parse("startup_interrupt")).toBe("startup_interrupt");
+    // the reason rides the same typed surfaces as retry_budget: worker-status
+    // reason counts (BR#14703 W3), execution_recovery waits and the dispatch
+    // view's held classification all key off SchedulingReason.
+    const reasons = ["retry_budget", "startup_interrupt"] as const;
+    for (const reason of reasons) expect(SchedulingReasonSchema.parse(reason)).toBe(reason);
+  });
+
+  it("a startup-interrupt terminal holds with its own reason during backoff, then admits with no hold at all", () => {
+    const begin = { kind: "begin", attempt_id: "one", worker: "mac/worker", action_budget_ms: 60_000 } as const;
+    const fence = { generation: 1, attempt_id: "one" };
+    const blip = { kind: "interrupted" as const, exit_code: null, stdout_tail: "", stderr_tail: "acp interrupted — stop for a fresh attempt" };
+    let s = reduceExecution(initialExecution(), { ...begin }, "mac", "dispatch-BR-1", 100, "revision");
+    s = reduceExecution(s, { kind: "stopped", ...fence, writers: "process_group_empty", outcome: blip }, "mac", "dispatch-BR-1", 200, "revision");
+    s = reduceExecution(s, { kind: "finalize", ...fence, writers: "process_group_empty", outcome: blip }, "mac", "dispatch-BR-1", 300, "revision");
+    expect(executionAdmissionHold(s, "revision", 10_000)).toBe("startup_interrupt");
+    expect(executionAdmissionHold(s, "revision", 40_000)).toBeNull();
   });
 });
