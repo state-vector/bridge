@@ -2994,6 +2994,21 @@ export function trainLegs(meta: any): TrainLeg[] {
   return [];
 }
 
+/** BR#22657 — does the card's OWN delivery-leg stamps cover repo#pr? The
+ *  mergeCompletesTask skip in resumeMergedPrerequisites is honest only for a
+ *  card whose own legs ride the awaited merge — that park is the merged-park
+ *  close's to heal (sweepMergedParks → reviewObservedMerge). A
+ *  merge-completing card awaiting a FOREIGN pr_merged is a PREREQUISITE
+ *  park (specimen BR#21252: epic, completion=delivery, NO leg binding for
+ *  the awaited repo#pr — the 60s alarm leg skipped it every tick and only
+ *  the 15-min-cadence unblockProxySweep healed it, 4m15s late). Covers
+ *  meta.prs/meta.pr via trainLegs plus the review_pr binding stamp. */
+export function ownLegsCoverAwait(meta: any, repo: string, pr: number): boolean {
+  if (trainLegs(meta).some((l) => l.repo === repo && l.number === pr)) return true;
+  const rp = meta?.review_pr;
+  return !!rp && typeof rp === "object" && String(rp.repo ?? "") === repo && Number(rp.number ?? 0) === pr;
+}
+
 /** Is this leg landed? The per-leg map (meta.merge_train.legs — multi-PR)
  *  or the legacy card-level landed stamp (pre-3659: state "landed" is only
  *  ever written when the whole card closed). */

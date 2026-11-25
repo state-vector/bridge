@@ -119,6 +119,7 @@ import {
   trainLegLanded,
   trainLegsRemaining,
   trainLegsUnresolved,
+  ownLegsCoverAwait,
   trainCardMatchesLane,
   trainOnlyAwait,
   trainStrandClass,
@@ -16923,8 +16924,21 @@ export class KnowledgeHub {
     const rows = this.state.storage.sql.exec(`SELECT id, meta FROM artefacts WHERE type = 'task' AND status = 'blocked' AND json_extract(meta, '$.blocked.await_event.event') = 'pr_merged'`).toArray();
     for (const row of rows) {
       const meta = JSON.parse(String(row.meta ?? "{}"));
-      if (mergeCompletesTask(meta)) continue;
       const event = meta.blocked.await_event;
+      // BR#22657 Leg 1 — the mergeCompletesTask skip protects only a park on
+      // the card's OWN delivery leg: when the card's own stamps (trainLegs /
+      // review_pr) cover the awaited repo#pr, the merged-park close owns the
+      // exit (sweepMergedParks → reviewObservedMerge). A merge-completing
+      // card with NO own leg binding at all is a PREREQUISITE park (specimen
+      // BR#21252: epic, completion=delivery, parked pr_merged 4045 — merged
+      // 21:41:16Z, healed only 21:45:31Z by the 15-min unblockProxySweep
+      // because this 60s alarm leg skipped it every tick). Resume it here,
+      // on the provenance receipt. A card that still carries its own train
+      // legs — even foreign ones — keeps the train-owned park either way:
+      // the BR#4067 release-holds-train-queue gate refuses the machine
+      // todo-release for a queued car, and the delivery close still rides
+      // the train.
+      if (mergeCompletesTask(meta) && (ownLegsCoverAwait(meta, String(event.repo), Number(event.n)) || trainLegs(meta).length > 0)) continue;
       const receipt = this.one(`SELECT merge_sha FROM provenance WHERE repo = ? AND pr = ?`, event.repo, event.n);
       if (receipt?.merge_sha) await this.resumePrerequisite(String(row.id), event.repo, event.n, String(receipt.merge_sha));
     }
@@ -16935,11 +16949,41 @@ export class KnowledgeHub {
     if (!row || row.status !== "blocked") return;
     const meta = JSON.parse(String(row.meta ?? "{}"));
     const event = meta.blocked?.await_event;
-    if (mergeCompletesTask(meta) || event?.event !== "pr_merged" || event.repo !== repo || event.n !== pr) return;
-    delete meta.merge_train;
-    delete meta.review_pr;
-    delete meta.pr;
-    delete meta.prs;
+    // BR#22657 Leg 1: the mergeCompletesTask refusal applies only when the
+    // card's own legs cover the awaited repo#pr (a genuine own-delivery
+    // park). A merge-completing card awaiting a FOREIGN PR is exactly the
+    // prerequisite shape this resume exists for (the BR#21252 specimen).
+    if ((mergeCompletesTask(meta) && ownLegsCoverAwait(meta, repo, pr)) || event?.event !== "pr_merged" || event.repo !== repo || event.n !== pr) return;
+    // Scope the stale-leg cleanup to the AWAITED leg (BR#22657): a
+    // prerequisite resume must still wipe copied delivery stamps for the
+    // awaited PR (the BR#4691 shape — pinned in ask-lifecycle: merge_train
+    // for the awaited pr is gone after the resume) but must never erase the
+    // card's own stamps for OTHER legs (multi-leg/epic shapes ride foreign
+    // landed state; the new merge-completing prerequisite path makes that
+    // shape reachable here).
+    const awaitedLeg = (l: any) => !!l && typeof l === "object" && String(l.repo ?? "") === repo && Number(l.number ?? 0) === pr;
+    if (trainLegs(meta).every(awaitedLeg)) {
+      delete meta.merge_train;
+      delete meta.review_pr;
+      delete meta.pr;
+      delete meta.prs;
+    } else {
+      if (awaitedLeg(meta.pr)) delete meta.pr;
+      if (awaitedLeg(meta.review_pr)) delete meta.review_pr;
+      if (Array.isArray(meta.prs)) {
+        const kept = meta.prs.filter((l: any) => !awaitedLeg(l));
+        if (kept.length) meta.prs = kept; else delete meta.prs;
+      }
+      if (meta.merge_train && typeof meta.merge_train === "object") {
+        const mt = { ...meta.merge_train };
+        if (awaitedLeg(mt)) { delete mt.repo; delete mt.pr; delete mt.merge_sha; }
+        if (mt.legs && typeof mt.legs === "object" && mt.legs[String(pr)]) {
+          const { [String(pr)]: _awaited, ...legs } = mt.legs;
+          mt.legs = legs;
+        }
+        meta.merge_train = mt;
+      }
+    }
     delete meta.blocked.await_event;
     meta.prerequisite_receipt = { repo, pr, merge_sha: sha, at: Date.now() };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
@@ -17194,7 +17238,17 @@ export class KnowledgeHub {
       const n = Number(p?.pr ?? 0);
       if (n > 0 && p?.repo) prov.set(`${String(p.repo)}#${n}`, { merge_sha: String(p.merge_sha ?? ""), merged_at: Number(p.merged_at ?? 0) || 0 });
     }
-    if (!prov.size) return 0;
+    if (!prov.size) {
+      // BR#22657 Leg 2 — the provenance-gap no-op must not be silent: eligible
+      // car rows with an EMPTY provenance table is exactly the starvation
+      // shape the BR#22622 diagnosis caught live (the train ledger carries
+      // the merge, the provenance row is missing, and `return 0` here made
+      // the gap invisible every tick). Emit ONE audit row naming the class
+      // and the eligible-row count; resumeMergedPrerequisites above is
+      // unaffected — its lookups are per-card.
+      this.audit("system:train", "merged_park_provenance_empty", null, { rows: rows.length });
+      return 0;
+    }
     let closed = 0;
     for (const r of rows) {
       try {
@@ -18553,6 +18607,22 @@ export class KnowledgeHub {
    *  stamp, audits loud and returns false — the next admission replay or
    *  merged-park sweep retries the carry; it never spawns a fresh verify
    *  duty, so a refused close cannot resurrect the respawn livelock. */
+  /** BR#22593 — is any of these legs' lanes sitting on a checks_unconfirmed
+   *  stop RIGHT NOW (CI unknown past the fail-closed bound, GH#480)? Legacy
+   *  stops predate the kind stamp — the reason prefix identifies them (the
+   *  same normalization the train line facts apply). Reads the lane card
+   *  mirror's facts.stop via laneRow, like every other close-side lane read. */
+  private laneStopsUnconfirmed(legs: { repo: string; base?: string }[]): boolean {
+    for (const leg of legs) {
+      const lane = this.laneRow(laneKey(leg.repo, String(leg.base ?? "main")));
+      const stop = JSON.parse(String(lane?.meta ?? "{}"))?.stop;
+      if (!stop || typeof stop !== "object") continue;
+      const kind = String((stop as any).kind ?? (/^CI unknown past the fail-closed bound/.test(String((stop as any).reason ?? "")) ? "checks_unconfirmed" : ""));
+      if (kind === "checks_unconfirmed") return true;
+    }
+    return false;
+  }
+
   private async closeAdmittedMergedCard(
     parentId: string,
     merged: MergedLegReceipt[],
@@ -18568,6 +18638,17 @@ export class KnowledgeHub {
     const parentRoles = parseTags(String(row.roles ?? ""));
     const humanSignoff = effectiveRole(parentRoles) === "human";
     const first = merged[0];
+    // BR#22593 — the honest landed label: a merged-provenance close landing
+    // while a leg's lane sits on a checks_unconfirmed stop (CI unknown past
+    // the fail-closed bound, GH#480's fail-closed admission) is landed
+    // WITHOUT proven-green CI — the BR#22593 specimen closed `landed` 7.5s
+    // after a stopped(checks_unconfirmed) stop. Stamp ci_unproven on the
+    // landed state so the label never overstates certainty. Pure label: no
+    // gating behavior rides it.
+    const ciUnproven = this.laneStopsUnconfirmed(merged.map((m) => ({
+      repo: m.repo,
+      base: String(legs.find((l) => l.number === m.number)?.base ?? meta.pr?.base ?? "main"),
+    })));
     // An admitted delivery may be observed again by merge reconciliation.
     // Receipt settlement is idempotent while the task awaits the human.
     if (humanSignoff && meta.merge_train?.state === "landed" && merged.every(receipt =>
@@ -18678,9 +18759,11 @@ export class KnowledgeHub {
           `merged-provenance carry held for the human sign-off (role: human, machine.ts human-signoff-done; BR#15722, specimen BR#15616): every leg carries a hub merge receipt (${merged.map((m) => `${m.repo}#${m.number} merged as ${m.mergeSha.slice(0, 9)}`).join(", ")}) and the acceptance is carried — the machine close will not retry; a human marks ${parentId} done in the webapp`,
           { merge_sha: first.mergeSha, via, ...(reviewId ? { review: reviewId } : {}) });
       meta.merge_train = { ...meta.merge_train, state: "landed", pr: first.number, repo: first.repo,
-        merge_sha: first.mergeSha, landed_at: now, closed_via: via, close_held: "human-signoff" };
+        merge_sha: first.mergeSha, landed_at: now, closed_via: via, close_held: "human-signoff",
+        ...(ciUnproven ? { ci_unproven: true } : {}) };
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`UPDATE artefacts SET meta=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, parentId);
+        if (ciUnproven) this.audit(actor, "merged_park_close_ci_unproven", parentId, { via, review: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`), note: "landed while a lane it rides sits on a checks_unconfirmed stop — CI never proven green (BR#22593)" });
         this.audit(actor, "merged_admission_signoff_held", parentId, { via, review: reviewId ?? null, legs: merged.map((m) => `${m.repo}#${m.number}`) });
       });
       return true;
@@ -18739,8 +18822,12 @@ export class KnowledgeHub {
       return false;
     }
     const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, parentId).meta ?? "{}");
-    completed.merge_train = { ...(meta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via };
+    completed.merge_train = { ...(meta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via, ...(ciUnproven ? { ci_unproven: true } : {}) };
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(completed), now, parentId);
+    if (ciUnproven) {
+      this.audit(actor, "merged_park_close_ci_unproven", parentId, { via, legs: merged.map((m) => `${m.repo}#${m.number}`), note: "landed on merged provenance while a lane it rides sits on a checks_unconfirmed stop — CI never proven green (BR#22593)" });
+      this.version(parentId, actor, "merged_park_close_ci_unproven", `landed WITHOUT proven-green CI — the close landed while a lane it rides sits on a checks_unconfirmed stop (CI unknown past the fail-closed bound, BR#22593); the landed label carries ci_unproven and must never read as a green settle`, {});
+    }
     this.state.storage.sql.exec(
       `INSERT INTO train_events (ts, kind, repo, base, gateway, pr, task_id, merge_sha, head_sha, detail)
        SELECT ?, 'landed', ?, ?, ?, ?, ?, ?, NULL, ?

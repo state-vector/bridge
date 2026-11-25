@@ -180,6 +180,12 @@ deployment failures open a repair for that attempt.
 Repeat observations of a failed main head reuse its repair card. A different
 failed head gets its own card, with the previous investigation kept on its
 original task.
+Prerequisite parks heal on the 60s alarm leg; cars heal on the settle verdict
+one tick after green or the fail-closed bound. A merged park resumes as a
+prerequisite unless the card's own PR bindings cover the awaited merge, a
+missing provenance table with eligible cars is audited rather than silently
+skipped, and a landed close under an unconfirmed-CI stop carries an explicit
+`ci_unproven` stamp so the label never overstates certainty.
 Deployment verification checks the web edge and the actual stateful hub separately;
 current static assets alone do not prove that the scheduler adopted a fix.
 
