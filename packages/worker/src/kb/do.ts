@@ -253,7 +253,7 @@ import { decideTakeover, type TakenOverStamp } from "./takeover.ts";
 import { CompletionContractSchema, ExecutionResultSchema, DispositionRequestSchema, ReviewSubjectSchema, HumanDeliveryApprovalSchema, completionContract, mergeCompletesTask, planTaskRecovery, HumanDecisionSchema, resolveChoice, legacyOptionAction, dutyOutcome, AcceptanceCriteriaSchema, AcceptanceCriterionSchema, type AcceptanceCriterion, type AcceptanceCriteria, type CriterionVerdict, type RecoveryReason, type CurrentTaskReview } from "@bridge/contracts";
 import { DeployCoverageStateSchema, DeployObservationSchema, TrainBranchPreparationSchema, TrainExecutionHoldSchema, TrainBranchUpdateFenceSchema, TrainQueueScanSchema, TrainCarReadinessSchema, TrainLineFactsSchema, projectTrainLine, trainBaseObservedAt, repairProgressText, taskRemediation, RecoveryOwnerMergeSchema, RecoveryMergeGateSchema, recoveryRepairScope, type RecoveryRepairScope, ReviewResultSchema, parseReviewResult, askRoute, askLifecycle, isHumanDecisionAsk, requireHumanDecision, AskTemplateSchema, composeTemplateAsk, deployCoverageReceipt, type TrainLineProjection, type ReviewResult, type IndependentReviewReceipt } from "@bridge/contracts";
 import { RecoveryCommandSchema, RecoveryLedgerSchema, RecoveryLinksSchema, recoveryEpisodeKey, recoveryIsOpen, reduceRecoveryEpisode, verifyRecoveryEpisode, withRecoveryEpisodes, mergePhaseOf, type RecoveryEpisode, type RecoveryReducerEvent } from "@bridge/contracts";
-import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isSigningScratchResourceFailure, isBeginReadinessRetry, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
+import { EXECUTOR_READINESS_PROTOCOL, ExecutionRequestSchema, ExecutionStateSchema, WriterReceiptSchema, ExecutorCapabilitiesSchema, ExecutorStartBarrierSchema, nextExecutorStartBarrier, recoverResourceStartBarrier, isResourceRecoverableStartFailure, ExecutionRequirementsSchema, capabilityBlockers, initialExecution, reduceExecution, executionNeedsRecoveryPermit, executionAdmissionHold, attemptDiagnosisCoversAttempt, chargeExecutionFailure, legacyTimeoutChargeGeneration, recoveryPermitCoversAttempt, recoveryPermitMatches, validRecoveryRequestProof, ManagedReviewRouteProofSchema, ManagedTaskRouteProofSchema, SchedulerRouteTrialProofSchema, executionAttemptBudgetExhausted, providerRecoveryDiagnosis, externalWaitCoveredBy, ModelPolicySchema, maxTier, type ExecutionState, type ExecutionAttempt, type ExecutionRecoveryPermit, type ExecutorCapabilities } from "@bridge/contracts";
 import { continueRecoveryLineage, recoveryCauseKey } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupProofChanged, startupPrerequisiteFingerprint, executorStartupFingerprint, type StartupWait } from "@bridge/contracts";
 import { HandoffCheckpointSchema } from "@bridge/contracts";
@@ -6623,7 +6623,10 @@ export class KnowledgeHub {
         if (capabilityBlockers(requirements, capabilities, String(host.label)).length) return false;
         if (![capabilities, ...capabilities.alternatives].some(c => usableFor(requirements, c, String(host.label), String(row.project)))) return false;
         const proof = this.executorReadiness(String(host.token_id), String(host.label), capabilities, now);
-        return proof.kind === "ready" && ((wait.phase === "waiting_executor" && isBeginReadinessRetry(wait.reason))
+        // BR#6992 — a wait parked on a resource failure (identity provisioning
+        // refused by a full volume) clears as soon as any executor is ready
+        // again: the disk fence lifted, not a task prerequisite.
+        return proof.kind === "ready" && ((wait.phase === "waiting_executor" && isResourceRecoverableStartFailure(wait.reason))
           || startupProofChanged(wait, String(host.label), wait.phase === "recovery_required" ? this.taskStartupProof(id, proof.fingerprint) : proof.fingerprint))
           && !this.startupRejected(id, String(host.label), proof.fingerprint);
       });
@@ -7498,6 +7501,10 @@ export class KnowledgeHub {
     }
     if (control?.mode === "draining") return { kind: "draining", reason: String(control.reason) };
     if (pause && pause.until_ts > now) return { kind: "paused", until_ts: Number(pause.until_ts), reason: String(pause.reason) };
+    // BR#6992 — a declared resource fence (disk headroom) must read as a named
+    // hold on the board, never as a silently starved scheduler: the gateway
+    // itself refuses to claim work while the volume is below its floor.
+    if (capabilities.resource_hold) return { kind: "resource_held", reason: capabilities.resource_hold.reason };
     if (capabilities.admission_hold) return { kind: "updating", reason: capabilities.admission_hold.reason };
     return { kind: "ready", worker_id: String(child.id), fingerprint };
   }
@@ -7943,7 +7950,12 @@ export class KnowledgeHub {
       const readiness = obsoleteInventory ? { kind: "repair_required" as const, reason: "A scoped-inventory runner has adopted this gateway; upgrade this obsolete producer before new claims" } : body.runner_protocol === EXECUTOR_READINESS_PROTOCOL
         ? this.executorReadiness(tokenId, actor, command.capabilities, now)
         : { kind: "unprovisioned" as const, reason: "Upgrade to the worker-ready runner protocol before claiming work" };
-      const keepReady = obsoleteInventory || (!command.capabilities.admission_hold && readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
+      // BR#6992 — an honest, current-protocol resource hold MUST overwrite the
+      // stored row: keepReady exists so an obsolete producer cannot clobber a
+      // corrected runner's live proof, and a resource-held advertise from the
+      // running runner is exactly the state the board needs to persist (the
+      // starved-scheduler misread this class of fence).
+      const keepReady = obsoleteInventory || (!command.capabilities.admission_hold && !command.capabilities.resource_hold && readiness.kind !== "ready" && existing && now - Number(existing.observed_ts) < 120_000
         && this.executorReadiness(tokenId, actor, ExecutorCapabilitiesSchema.parse(JSON.parse(existing.capabilities)), now).kind === "ready");
       // An obsolete GUI can drain existing work, but cannot overwrite the live
       // readiness of a corrected runner or borrow its proof to claim a card.
@@ -8212,7 +8224,7 @@ export class KnowledgeHub {
       const stage = command.kind === "start_failed" ? command.stage : "begin";
       // Begin's task prerequisites (e.g. checkpoint transfer) do not invalidate
       // a proved worker credential for unrelated work on the same gateway.
-      const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && !isSigningScratchResourceFailure(reason) && !isBeginReadinessRetry(reason) && readiness.kind === "ready";
+      const taskPrerequisite = command.kind === "start_failed" && command.stage === "begin" && command.failure_class === "prerequisite" && !isResourceRecoverableStartFailure(reason) && readiness.kind === "ready";
       const paused = Number(this.one(`SELECT until_ts FROM executor_claim_pauses WHERE token_id=?`, tokenId)?.until_ts ?? 0) > now;
       const barrier = command.kind === "start_failed" && !taskPrerequisite && !paused ? nextExecutorStartBarrier(previous, fingerprint, reason, now, command.failure_class) : null;
       const requirements = { ...ExecutionRequirementsSchema.parse(meta.execution_requirements ?? {}), ...(command.retained_work ? { host: actor } : {}) };

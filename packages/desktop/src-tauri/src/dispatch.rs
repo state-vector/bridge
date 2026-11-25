@@ -390,7 +390,7 @@ impl GatewayReadinessState {
 enum GatewayProbe { Worker(WorkerCredential), Connection, AdmissionHeld { reason: String } }
 #[derive(Deserialize)]
 #[serde(tag="kind",rename_all="snake_case")]
-enum HubAdmissionReadiness { Ready { worker_id: String, fingerprint: String }, Paused { reason: String, until_ts: u64 }, Updating { reason: String } }
+enum HubAdmissionReadiness { Ready { worker_id: String, fingerprint: String }, Paused { reason: String, until_ts: u64 }, Updating { reason: String }, ResourceHeld { reason: String } }
 enum WorkerAdmission { Ready, Held { reason: String } }
 fn worker_connection_proof(reply: &serde_json::Value, backend_ready: bool) -> Result<WorkerAdmission, String> {
     if reply["lifecycle_protocol"] != 2 { return Err("serving hub has not adopted the fenced lifecycle protocol; no fresh connection proof".into()); }
@@ -399,6 +399,10 @@ fn worker_connection_proof(reply: &serde_json::Value, backend_ready: bool) -> Re
         Ok(HubAdmissionReadiness::Ready { worker_id, fingerprint }) if reply["ok"] == true && !worker_id.is_empty() && !fingerprint.is_empty() => Ok(WorkerAdmission::Ready),
         Ok(HubAdmissionReadiness::Paused { reason, until_ts }) if !reason.is_empty() && until_ts > now_ms() => Ok(WorkerAdmission::Held { reason }),
         Ok(HubAdmissionReadiness::Updating { reason }) if !reason.is_empty() => Ok(WorkerAdmission::Held { reason }),
+        // BR#6992 — the gateway's own resource fence (disk headroom) echoed
+        // back by the hub: a named hold, renewed while the volume is below
+        // its floor, self-clearing when the inventory advertises unmasked.
+        Ok(HubAdmissionReadiness::ResourceHeld { reason }) if !reason.is_empty() => Ok(WorkerAdmission::Held { reason }),
         _ => Err(format!("executor readiness held: {}",reply["readiness"])),
     }
 }
@@ -670,6 +674,39 @@ fn capability_inventory(cfg: &DispatchConfig, avail: &[opencode::Backend], worke
     inventory_with_runtime(cfg, capability_inventory_unheld(cfg, avail, worker, primary), update_request().as_ref())
 }
 
+/// BR#6992 — disk headroom is a loud fence, not a silent starvation: when the
+/// workspace volume's free bytes fall below the floor admission itself uses
+/// (`BRIDGE_WORKSPACE_MIN_FREE_GIB`, shared via workspace::Owner::disk_floor_bytes
+/// and workspace::available_bytes — one measurement, one threshold), the
+/// advertised inventory masks every model Unavailable with the disk reason and
+/// declares `resource_hold`. The hub then shows a named `resource_held` host
+/// instead of reading the gateway as starved with unexplained silence, and
+/// older hubs that do not know the field still fail closed on the masked
+/// availability. Backend health (probe readiness) uses the unmasked inventory,
+/// exactly like the update-handoff mask above.
+fn disk_headroom_hold(cfg: &DispatchConfig) -> Option<String> {
+    disk_headroom_hold_with_floor(cfg, workspace::Owner::disk_floor_bytes())
+}
+fn disk_headroom_hold_with_floor(cfg: &DispatchConfig, floor: u64) -> Option<String> {
+    let root = std::path::PathBuf::from(&cfg.workdir);
+    let available = workspace::available_bytes(&root).ok()?;
+    (available < floor).then(|| format!(
+        "disk headroom: {available} bytes free on {} below the {floor}-byte floor; workspace reclamation continues",
+        root.display()))
+}
+/// Same fail-closed masking as the update handoff: preserve `disabled` (a
+/// stronger statement), mask everything else Unavailable, never change model
+/// identity — a cleared fence resumes without a fingerprint-visible delta.
+fn inventory_resource_hold(mut facts: serde_json::Value, reason: &str) -> serde_json::Value {
+    let availability = json!(ModelAvailability::Unavailable { reason: reason.into() });
+    if facts["availability"]["kind"] != "disabled" { facts["availability"] = availability.clone(); }
+    if let Some(models) = facts.get_mut("alternatives").and_then(|v| v.as_array_mut()) {
+        for model in models { if model["availability"]["kind"] != "disabled" { model["availability"] = availability.clone(); } }
+    }
+    facts["resource_hold"] = json!({ "reason": reason });
+    facts
+}
+
 fn advertise_gateway_inventory(cfg: &DispatchConfig, raw: serde_json::Value) -> Result<serde_json::Value, String> {
     let request = update_request();
     let capabilities = inventory_with_runtime(cfg, raw, request.as_ref());
@@ -684,6 +721,10 @@ fn advertise_gateway_inventory(cfg: &DispatchConfig, raw: serde_json::Value) -> 
 
 fn inventory_with_runtime(cfg: &DispatchConfig, facts: serde_json::Value, request: Option<&UpdateRequest>) -> serde_json::Value {
     let mut facts = inventory_dispatch_hold(facts, request.is_some());
+    // BR#6992 — a full workspace volume fences the inventory loudly. Fail-open
+    // only when the volume cannot be measured: local admission (the workspace
+    // reconcile) remains the authoritative gate either way.
+    if let Some(reason) = disk_headroom_hold(cfg) { facts = inventory_resource_hold(facts, &reason); }
     let channel = cfg.auto_update.as_ref().filter(|update| update.enabled)
         .and_then(|update| match update.channel {
             UpdateChannel::Main => Some("main"),
@@ -2820,14 +2861,22 @@ fn run_with_output_limit(mut cmd: Command, secs: u64, max_bytes: u64) -> Result<
 /// host's own signing path stays exactly as it was.
 fn apply_identity(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), String> {
     for (key, value) in p.git_config() {
-        let ok = Command::new("git")
+        // BR#6992 — surface git's own failure text. Discarding stderr wrapped
+        // a full workspace volume as a bare "git config user.name failed",
+        // which the hub filed as a permanent identity prerequisite; the
+        // resource-failure recovery matcher needs the OS error evidence
+        // (e.g. "No space left on device") in the reason to heal it.
+        let output = Command::new("git")
             .current_dir(worktree)
             .args(["config", key, &value])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .output();
+        let ok = output.as_ref().map(|o| o.status.success()).unwrap_or(false);
         if !ok {
-            return Err(format!("git config {key} failed"));
+            let detail = match &output {
+                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                Err(error) => error.to_string(),
+            };
+            return Err(format!("git config {key} failed: {detail}"));
         }
     }
     Ok(())
@@ -4573,10 +4622,73 @@ mod tests {
         assert!(worker_connection_proof(&paused,false).is_err(),"a pause cannot hide an unavailable backend");
         let updating=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"updating","reason":"handoff"}});
         assert!(matches!(worker_connection_proof(&updating,true),Ok(WorkerAdmission::Held {..})));
-        for readiness in [json!({"kind":"cooldown","reason":"real failure","until_ts":now_ms()+60_000}),json!({"kind":"repair_required","reason":"identity"}),json!({"kind":"paused","reason":"expired","until_ts":1}),json!({"kind":"updating"}),json!({"kind":"ready"})] {
+        // BR#6992 — the hub echoes the gateway's own resource fence (disk
+        // headroom): a named typed hold, never a bare error.
+        let resource=json!({"ok":false,"lifecycle_protocol":2,"readiness":{"kind":"resource_held","reason":"disk headroom: 0 bytes free"}});
+        let held = worker_connection_proof(&resource,true).expect("resource hold is a typed hold");
+        assert!(matches!(held,WorkerAdmission::Held { ref reason } if reason.contains("disk headroom")));
+        for readiness in [json!({"kind":"cooldown","reason":"real failure","until_ts":now_ms()+60_000}),json!({"kind":"repair_required","reason":"identity"}),json!({"kind":"paused","reason":"expired","until_ts":1}),json!({"kind":"updating"}),json!({"kind":"resource_held"}),json!({"kind":"ready"})] {
             assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":2,"readiness":readiness}),true).is_err());
         }
         assert!(worker_connection_proof(&json!({"ok":true,"lifecycle_protocol":1,"readiness":{"kind":"ready","worker_id":"worker","fingerprint":"proof"}}),true).is_err());
+    }
+    #[test]
+    fn disk_headroom_hold_masks_models_and_declares_the_fence() {
+        let supply = json!({"tier":"large","model":"large-model","availability":{"kind":"usable"},
+            "alternatives":[{"tier":"small","model":"small-model","availability":{"kind":"usable"}},
+                {"tier":"medium","model":"medium-model","availability":{"kind":"disabled"}}]});
+        let held = inventory_resource_hold(supply.clone(), "disk headroom: 0 bytes free on /bridge-work below the 5368709120-byte floor");
+        assert_eq!(held["availability"]["kind"], "unavailable");
+        assert!(held["availability"]["reason"].as_str().unwrap().contains("disk headroom"));
+        assert!(held["availability"]["reason"].as_str().unwrap().contains("floor"));
+        assert_eq!(held["alternatives"].as_array().unwrap()[0]["availability"]["kind"], "unavailable");
+        assert_eq!(held["alternatives"].as_array().unwrap()[1]["availability"]["kind"], "disabled", "a disabled model is a stronger statement than a resource fence");
+        assert_eq!(held["model"], supply["model"], "model identity never changes across the fence");
+        assert_eq!(held["resource_hold"]["reason"], "disk headroom: 0 bytes free on /bridge-work below the 5368709120-byte floor");
+        assert!(inventory_has_usable_model(&supply));
+        assert!(!inventory_has_usable_model(&held), "masked inventory is not backend-health proof");
+    }
+    #[test]
+    fn disk_headroom_hold_resolves_the_shared_floor_against_the_workdir_volume() {
+        let cfg: DispatchConfig = serde_json::from_value(json!({
+            "url":"http://fixture","label":"disk-proof","token":"fixture",
+            "workdir": std::env::temp_dir().to_string_lossy().to_string()
+        })).unwrap();
+        // An unreachable floor holds on any real volume, and the reason names
+        // both numbers and the volume so the board is first-hand diagnosable.
+        let reason = disk_headroom_hold_with_floor(&cfg, u64::MAX - 1).expect("an unreachable floor must fence");
+        assert!(reason.contains("disk headroom"), "{reason}");
+        assert!(reason.contains(std::env::temp_dir().to_string_lossy().as_ref()), "{reason}");
+        // A zero floor never holds: available bytes cannot be negative.
+        assert!(disk_headroom_hold_with_floor(&cfg, 0).is_none());
+        // A nonexistent volume fails open here; local workspace admission
+        // remains the authoritative gate (its own reconcile errors loudly).
+        let missing: DispatchConfig = serde_json::from_value(json!({
+            "url":"http://fixture","label":"disk-proof-missing","token":"fixture",
+            "workdir": format!("{}/bridge-no-such-volume-6992", std::env::temp_dir().to_string_lossy())
+        })).unwrap();
+        assert!(disk_headroom_hold_with_floor(&missing, u64::MAX - 1).is_none());
+    }
+    #[test]
+    fn identity_gate_failures_carry_the_underlying_git_error() {
+        // BR#6992 — the start-barrier resource matcher needs the OS error
+        // evidence in the reason; a bare "git config user.name failed" fenced
+        // the gateway permanently when the real cause was a full volume.
+        // Outside a repository git fails deterministically with a stderr
+        // detail ("fatal: not in a git directory") that must now ride along.
+        let dir = std::env::temp_dir().join(format!("bridge-identity-stderr-{}-6992", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let profile = IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: "/keys/sv-agents-signing.pub".into(),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        };
+        let error = apply_identity(&dir, &profile).expect_err("git config cannot write outside a repository");
+        assert!(error.starts_with("git config user.name failed: "), "{error}");
+        assert!(error.contains("fatal"), "{error}: the stderr detail must surface, not a bare key name");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn managed_update_hold_cannot_advertise_usable_spare_models() {

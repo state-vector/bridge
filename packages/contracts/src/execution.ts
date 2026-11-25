@@ -32,6 +32,21 @@ export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
 export function isSigningScratchResourceFailure(reason: string): boolean {
   return reason.includes("sign-check scratch dir: No space left on device (os error 28)");
 }
+/** BR#6992 — same ENOSPC-wrapped-in-a-gate class, raised by repo-local
+ * identity provisioning (`git config user.name …`): the runner surfaces
+ * git's stderr, so the OS error text in the reason is the evidence that a
+ * full disk — not a broken identity — refused the gate. Without that
+ * evidence a genuine identity failure remains a prerequisite. */
+export function isIdentityProfileResourceFailure(reason: string): boolean {
+  return reason.includes("gate: identity profile failed:") && reason.includes("No space left on device");
+}
+/** The full evidence-bearing set a start barrier may recover from without a
+ * changed credential or configuration: transport/scratch resource failures
+ * and begin retries. Consumers that must NOT treat a failure as a task
+ * prerequisite use this predicate. */
+export function isResourceRecoverableStartFailure(reason: string): boolean {
+  return isSigningScratchResourceFailure(reason) || isBeginReadinessRetry(reason) || isIdentityProfileResourceFailure(reason);
+}
 export function isBeginReadinessRetry(reason: string): boolean {
   // Older hubs used this same rejection for a temporary readiness hold and
   // a credential mismatch. A bounded retry still requires fresh hub proof.
@@ -39,13 +54,13 @@ export function isBeginReadinessRetry(reason: string): boolean {
     || reason.includes("gate: gateway admission changed before begin; retry through the scheduler");
 }
 export function recoverResourceStartBarrier(barrier: ExecutorStartBarrier | null, now: number): ExecutorStartBarrier | null {
-  return barrier?.kind === "repair_required" && (isSigningScratchResourceFailure(barrier.reason) || isBeginReadinessRetry(barrier.reason))
+  return barrier?.kind === "repair_required" && isResourceRecoverableStartFailure(barrier.reason)
     ? nextExecutorStartBarrier(barrier, barrier.fingerprint, barrier.reason, now, "resource") : barrier;
 }
 export function nextExecutorStartBarrier(previous: ExecutorStartBarrier | null, fingerprint: string, reason: string, now: number, failureClass: "transport" | "prerequisite" | "resource" = "transport"): ExecutorStartBarrier {
   // Resource recovery changes neither credential nor configuration. Repeated
   // ENOSPC must back off, not permanently require a new identity fingerprint.
-  if (failureClass === "resource" || isSigningScratchResourceFailure(reason) || isBeginReadinessRetry(reason)) return ExecutorStartBarrierSchema.parse({
+  if (failureClass === "resource" || isResourceRecoverableStartFailure(reason)) return ExecutorStartBarrierSchema.parse({
     kind: "cooldown", fingerprint, failures: 1, until_ts: now + 60_000, reason,
   });
   const failures = previous?.fingerprint === fingerprint ? previous.failures + 1 : 1;
@@ -127,6 +142,12 @@ export const ExecutorCapabilitiesSchema = ModelCapabilitySchema.extend({ alterna
     target: z.string().regex(/^[0-9a-f]{40}$/).nullish(),
     deadline: z.number().int().nonnegative().nullish(),
   }).optional(),
+  /** BR#6992 — additive resource fence (old hubs strip the field and still
+   * fail closed on the masked model availability): the gateway cannot claim
+   * work because a local resource — disk headroom — is exhausted. The hub
+   * surfaces this as ExecutorReadiness `resource_held` with this reason
+   * instead of reading the host as silently starved. */
+  resource_hold: z.object({ reason: text }).optional(),
 });
 export type ExecutorCapabilities = z.infer<typeof ExecutorCapabilitiesSchema>;
 export function capabilityBlockers(required: ExecutionRequirements, actual: Pick<ExecutorCapabilities, "tier" | "tools" | "environment">, host: string): string[] {

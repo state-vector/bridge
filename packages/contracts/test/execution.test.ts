@@ -42,7 +42,30 @@ describe("durable execution failure boundaries", () => {
     let repeated = recovered;
     for (let i = 1; i <= 5; i++) repeated = nextExecutorStartBarrier(repeated, legacy.fingerprint, reason, i * 70_000, "prerequisite");
     expect(repeated).toMatchObject({ kind: "cooldown", failures: 1, until_ts: 410_000 });
-    for (const failure of ["gate: signing key not found", "gate: sign check failed (exit 255)", "gate: No space left on device in unrelated tool", "gate: sign-check scratch dir: Permission denied (os error 13)"]) {
+    for (const failure of ["gate: signing key not found", "gate: sign check failed (exit 255)", "gate: No space left on device in unrelated tool", "gate: sign-check scratch dir: Permission denied (os error 13)", "gate: identity profile failed: git config user.name failed"]) {
+      const barrier = nextExecutorStartBarrier(null, legacy.fingerprint, failure, 100, "prerequisite");
+      expect(barrier.kind).toBe("repair_required");
+      expect(recoverResourceStartBarrier(barrier, 200)).toBe(barrier);
+    }
+  });
+  it("recovers identity-profile ENOSPC as a bounded resource cooldown, never a permanent prerequisite", () => {
+    // BR#6992 live specimen: a full workspace volume refused `git config
+    // user.name` while provisioning a worktree identity; the bare error text
+    // fenced the gateway permanently. The runner now surfaces git's stderr,
+    // so the OS error evidence in the reason is what makes it recoverable —
+    // without it (the negative cases above) an identity defect stays a
+    // prerequisite.
+    const reason = "gate: identity profile failed: git config user.name failed: error: could not write '.git/config.lock': No space left on device (os error 28)";
+    const legacy = { kind: "repair_required", fingerprint: "same-worker/config", failures: 2, reason } as const;
+    const recovered = recoverResourceStartBarrier(legacy, 100);
+    expect(recovered).toMatchObject({ kind: "cooldown", fingerprint: legacy.fingerprint, failures: 1, until_ts: 60_100 });
+    let repeated = recovered;
+    for (let i = 1; i <= 5; i++) repeated = nextExecutorStartBarrier(repeated, legacy.fingerprint, reason, i * 70_000, "prerequisite");
+    expect(repeated).toMatchObject({ kind: "cooldown", failures: 1 });
+    // The evidence gate is AND-ed, not substring-lucky: an ENOSPC mention
+    // outside the identity-profile gate, or an identity gate whose git stderr
+    // named a different cause, both stay prerequisites.
+    for (const failure of ["gate: identity profile failed: git config user.email failed: error: unknown", "No space left on device while signing the receipt"]) {
       const barrier = nextExecutorStartBarrier(null, legacy.fingerprint, failure, 100, "prerequisite");
       expect(barrier.kind).toBe("repair_required");
       expect(recoverResourceStartBarrier(barrier, 200)).toBe(barrier);

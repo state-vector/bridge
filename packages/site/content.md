@@ -23,6 +23,12 @@ directories still require complete host visibility before adoption.
 
 The default budget is 100 GiB of owned disk with 5 GiB filesystem headroom;
 `BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` configure it.
+Dropping below the floor is a loud fence: the gateway's advertised inventory
+declares a named resource hold and masks its models unavailable with the disk
+reason, so the board shows `resource_held` with that reason — never a silently
+starved scheduler — and the fence lifts on the next clean advertise once the
+volume recovers. Older hubs that do not know the field still fail closed on
+the masked availability.
 New allocations pause when the budget is exceeded; reclamation continues, with one slot per pass for the largest eligible released workspace. The owner can reclaim the declared Bridge worker dry-run bundle from stopped workspaces when it contains only the expected generated files, and the nested CLI target when Cargo marks it as a cache and no files are tracked.
 While reclamation runs, a bounded sampling job on the same owner re-proofs
 disk admission every 15 seconds from the last measured inventory plus a fresh
@@ -358,7 +364,7 @@ That is the whole runner. It pairs with your hub using a device code, then claim
 
 **Unclaimed means no owner.** Board and orient owner lookups never match an empty owner to a token's empty principal, including revoked registrations. Retired machine names cannot appear as fabricated owners of pooled work.
 
-**Git identity is a first-class property of dispatched sessions** (BR#3185): the runner provisions each worktree's repo-local git config from an identity profile — an explicit `identity` block in the config wins, otherwise the built-in `worker` class applies (commits as `detached-cody`, signed with the sv-agents-signing key per the BR#3181 ruling). Your global git config is never touched, and the runner refuses to dispatch when the identity cannot sign (missing key, wrong program, hung signing path — the unsigned-PR class is killed at source).
+**Git identity is a first-class property of dispatched sessions** (BR#3185): the runner provisions each worktree's repo-local git config from an identity profile — an explicit `identity` block in the config wins, otherwise the built-in `worker` class applies (commits as `detached-cody`, signed with the sv-agents-signing key per the BR#3181 ruling). Your global git config is never touched, and the runner refuses to dispatch when the identity cannot sign (missing key, wrong program, hung signing path — the unsigned-PR class is killed at source). Provisioning failures carry git's own error text, so a full-volume refusal (`No space left on device`) is recognized as a resource failure and recovers as a bounded cooldown once headroom returns (BR#6992) — a genuinely broken identity still refuses dispatch.
 
 **Token rotation is graceful and self-healing** (BR#3787): tokens rotate in place against the device's principal — but a rotation never amputates. Identity is anchored by the **principal only** (a label held by another device's credential is refused or suffixed, never stolen — the 2026-10-27 fleet 401 ping-pong was label theft); the **previous hash keeps authenticating for 72 hours** (flagged stale) so in-flight dispatches finish; every response carries the token's **epoch**, and the runner re-vends its own row **proactively** (`/api/token/repair` on the agent plane — the principal is the credential, so headless gateways self-heal with no human session, rate-limited 6/hour). Every repair failure reason is logged, never swallowed.
 

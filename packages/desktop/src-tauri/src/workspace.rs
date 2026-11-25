@@ -711,8 +711,14 @@ impl Owner {
     /// disagree about what "held" means.
     fn budget_floor() -> (u64, u64) {
         let budget = std::env::var("BRIDGE_WORKSPACE_BUDGET_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(100).saturating_mul(GIB);
-        let floor = std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB);
-        (budget, floor)
+        (budget, Self::disk_floor_bytes())
+    }
+    /// BR#6992 — the workspace-volume floor half of budget_floor(), shared
+    /// with the advertised gateway inventory: local admission and the
+    /// hub-visible resource fence resolve the same knob, so a full volume can
+    /// never read as a silently starved scheduler while admission holds.
+    pub(super) fn disk_floor_bytes() -> u64 {
+        std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB)
     }
     fn measure_with_limits(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
         let records = self.records()?;
@@ -1070,7 +1076,10 @@ fn disk_bytes(path: &Path) -> Result<u64, String> {
     }
     String::from_utf8_lossy(&output.stdout).split_whitespace().next().and_then(|n| n.parse::<u64>().ok()).map(|n| n.saturating_mul(1024)).ok_or("workspace disk inventory malformed".into())
 }
-fn available_bytes(path: &Path) -> Result<u64, String> {
+/// Free bytes visible to unprivileged writers on the filesystem containing
+/// `path` (BR#6992: shared by workspace admission and the advertised
+/// inventory — one measurement, one floor, one truth).
+pub(super) fn available_bytes(path: &Path) -> Result<u64, String> {
     #[cfg(unix)] {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
         let path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;

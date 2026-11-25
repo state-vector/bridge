@@ -1239,6 +1239,8 @@ Deletion authority comes from the allocation's exact stopped execution and exclu
 
 The default owned-disk budget is **100 GiB**, including retained lifecycle evidence, with at least **5 GiB free** on the workspace filesystem. `BRIDGE_WORKSPACE_BUDGET_GIB` and `BRIDGE_WORKSPACE_MIN_FREE_GIB` override those limits. Reclamation continues when admission is held; the gateway stops granting new local allocations until measurement is fresh and the budget permits them. Source and unknown effects are never sacrificed to satisfy a quota.
 
+A volume that drops below the free floor is a **loud fence, not a silent starvation** (BR#6992): the gateway's advertised inventory masks every model `unavailable` with the named disk reason and declares a `resource_hold`, so the board shows the host as `resource_held` with that reason instead of reading a live-but-starved scheduler — hubs that predate the field still fail closed on the masked availability. The fence uses the same measurement and the same `BRIDGE_WORKSPACE_MIN_FREE_GIB` threshold as admission itself, reclamation keeps running underneath it, and it self-clears on the next unmasked advertise once the volume recovers; no operator action is required.
+
 Legacy adoption imports existing registered worktrees, runner-owned trees and session directories, `~/opencode-tmp` children, repository caches, and standalone build caches carrying a standard `CACHEDIR.TAG` into this same journal. `sweep_repos` (`BRIDGE_SWEEP_REPOS`) adds repository roots for registered-tree discovery. Adoption proves ownership/readers and preservation before removing anything; it does not apply an age-only deletion rule. Historical `isolate`/`worktree_exempt_repos` settings are accepted for configuration compatibility; dispatched executions always use owned isolation.
 
 ```bash
@@ -1531,6 +1533,14 @@ shared checkout keeps its own identity.
   missing key, wrong program, or hung signing program refuses the dispatch
   loudly (like the smoke gate) — the task is noted on the board and the
   runner retries next cycle; unsigned commits are never shipped.
+- **Full-disk windows** (BR#6992): identity provisioning failures carry
+  git's own error text, and when that evidence names a resource refusal
+  (`No space left on device`, e.g. writing `.git/config.lock` on a full
+  volume) the start barrier recovers as a bounded resource cooldown that
+  auto-decays once headroom returns — the same class as the sign-check
+  scratch ENOSPC. A genuinely broken identity (missing key, wrong program,
+  unknown git failure) stays a task prerequisite and keeps refusing
+  dispatch.
 - **Board surfacing**: Connect nests each gateway's provisioned worker
   agents under it with their identity class, and the pairing screen states
   the class the device declared plus what its runner's dispatches commit
