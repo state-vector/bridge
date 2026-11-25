@@ -62,7 +62,7 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
         let Some(_lock) = owner.lock(&id)? else { continue; };
         if owner.file(&id).exists() { continue; }
         owner.save(&Resource { version: 1, id, location: Location::Legacy { root: path, task },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None })?;
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None })?;
     }
     // Shared clones are explicit cache resources in the same ledger. Their
     // external worktrees/branches/readers must be clear before eviction.
@@ -74,7 +74,7 @@ pub(super) fn adopt(owner: &Owner) -> Result<(), String> {
             let Some(_lock) = owner.lock(&id)? else { continue; };
             if !owner.file(&id).exists() {
                 owner.save(&Resource { version: 1, id, location: Location::RepositoryCache { root: path, authority:CacheAuthority::LegacyDiscovery },
-                    phase: Phase::Cached { last_used_at: 0 }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None })?;
+                    phase: Phase::Cached { last_used_at: 0 }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None })?;
             }
         }
     }
@@ -94,7 +94,7 @@ fn adopt_cache(owner: &Owner, root: PathBuf, legacy_scope: Option<PathBuf>) -> R
     let Some(_lock) = owner.lock(&id)? else { return Ok(()); };
     if !owner.file(&id).exists() {
         owner.save(&Resource { version: 1, id, location: Location::GeneratedCache { root, legacy_scope },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None })?;
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None })?;
     }
     Ok(())
 }

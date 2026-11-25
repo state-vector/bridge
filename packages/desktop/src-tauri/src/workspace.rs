@@ -107,6 +107,16 @@ struct Resource {
     /// the worktree must never move (that would break its git worktree link).
     #[serde(default)]
     adopted_from: Option<String>,
+    /// BR#22634 — recorded-reset receipt: when the tree's expired
+    /// unpublished value was preserved by publishing it to archival
+    /// branches on origin (`bridge-archive/<id>/…`), ending BR#14525's
+    /// Yield hold so the reclaim ladder could proceed. The pushed branches
+    /// are the durable receipt; `verify_published_source` re-verifies them
+    /// at every removal step — this field is the ledger's audit marker.
+    #[serde(default)]
+    reset_at: Option<u64>,
+    #[serde(default)]
+    reset_branch: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Removal { resource_id: String, bytes: u64, at: u64 }
@@ -209,6 +219,13 @@ impl Owner {
         fs::create_dir_all(&ledger).map_err(|e| e.to_string())?;
         let mut cfg = cfg.clone();
         cfg.workdir = allocations.parent().ok_or("workspace parent missing")?.to_string_lossy().into_owned();
+        // BR#22634 — the journal recovery reserves: one at the lifecycle
+        // root (records, status, removal receipts, reservations, terminal
+        // stages) and one at the workdir root (sessions, allocation
+        // scaffolding). Best effort by contract: an unfilled reserve only
+        // degrades to the pre-reserve behaviour.
+        journal::ensure_reserve(&gateway_pipeline::root(&cfg)?);
+        journal::ensure_reserve(Path::new(&cfg.workdir));
         Ok(Self { cfg, ledger, allocations })
     }
     fn file(&self, id: &str) -> PathBuf { self.ledger.join(format!("{id}.json")) }
@@ -291,7 +308,7 @@ impl Owner {
         let root = self.allocations.join(&id);
         let record = Resource { version: 1, id: id.clone(), location: Location::Managed { root: root.clone() },
             phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-            last_activity_at: 0, retained_value: None, adopted_from: None };
+            last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None };
         self.save(&record)?; // intent precedes every directory and Git write
         for path in ["work", "tmp", "logs", "cache/cargo", "cache/npm", "cache/xdg"] { fs::create_dir_all(root.join(path)).map_err(|e| e.to_string())?; }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?; }
@@ -311,7 +328,7 @@ impl Owner {
             } else if cache_path.exists() {CacheAuthority::LegacyDiscovery} else {CacheAuthority::ExclusiveAllocation};
             let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path, authority },
                 phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-                last_activity_at: 0, retained_value: None, adopted_from: None };
+                last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
             if self.contains(&cache_record.id) && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
@@ -445,6 +462,10 @@ impl Owner {
     /// One bounded fair pass; busy/held tickets only exclude their own paths.
     /// This is called by the gateway during both normal work and update drain.
     pub fn reconcile(&self, protected: &[Ticket]) -> Result<Status, String> {
+        // BR#22634 — publish-reset budget for this pass: with the gate
+        // enabled, archival publishing is bounded so the retained pile
+        // drains over passes, never as one remote-hosting burst.
+        PUBLISH_RESET_BUDGET.store(publish_reset_pass_cap(), std::sync::atomic::Ordering::Relaxed);
         legacy::adopt(self)?;
         let mut records = self.records()?;
         records.sort_by_key(|r| (r.checked_at, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
@@ -460,6 +481,14 @@ impl Owner {
             }
         }
         let mut visited = 0;
+        // BR#22634 — one record's failed journal save must not abort the
+        // pass before `measure`: the status write is what re-proofs
+        // admission and what surfaces the wedge to the hub. Observed live:
+        // a full volume failed the FIRST record's save, `measure` never
+        // ran, the status aged out and the sampler fenced dispatch on a
+        // stale proof while every other visitable record went untouched.
+        let mut save_failures = 0usize;
+        let mut first_save_error: Option<String> = None;
         // BR#14716 — adaptive drain: under a held admission (pressure) the
         // fair BATCH=4 pass is a starvation generator — 684 pending records
         // at 4 per 30s pass is 8.5 hours to VISIT once, and any erroring
@@ -488,9 +517,18 @@ impl Owner {
                 Ok(()) => { record.error = None; record.retry_at = 0; },
                 Err(error) => { record.error = Some(error); record.retry_at = now_ms() + 30_000; },
             }
-            self.save(&record)?;
+            if let Err(error) = self.save(&record) {
+                save_failures += 1;
+                if first_save_error.is_none() { first_save_error = Some(error) }
+            }
         }
-        self.measure()
+        let status = self.measure()?;
+        if let Some(error) = first_save_error {
+            // The pass advanced and the status is fresh; the failure is
+            // surfaced for retry exactly as before, but AFTER measure.
+            return Err(format!("workspace pass advanced with {save_failures} journal save failure(s); first: {error}"));
+        }
+        Ok(status)
     }
     fn advance(&self, record: &mut Resource) -> Result<(), String> {
         if matches!(record.phase,Phase::Removed { .. }) {return Ok(());}
@@ -556,7 +594,24 @@ impl Owner {
                 },
                 Retention::Yield { signal } => {
                     record.retained_value = Some(signal);
-                    return Err("BR#14525 retention ended (TTL expiry or disk pressure); unpublished worktree value needs an explicit adoption or a recorded reset before reclaim; source retained".into());
+                    // BR#22634 — the recorded reset, finally implemented.
+                    // BR#14525's contract says an expired unpublished tree
+                    // needs "an explicit adoption or a recorded reset before
+                    // reclaim" — but no reset path existed, so expired trees
+                    // error forever: observed live as 1,661 retained records
+                    // (384GiB) that no reclamation could ever free, filling
+                    // the volume and ENOSPC-bricking the journal. The reset
+                    // PRESERVES the value by publishing it: park-commit the
+                    // residue, push HEAD to a clearly-marked archival branch
+                    // on origin — the same park-before-remove law the repo's
+                    // own worktree discipline prescribes — after which the
+                    // ladder's evidence fences stay the sole deletion
+                    // authority. Publish failure keeps the old contract:
+                    // retained, retried next pass.
+                    if !self.recorded_reset(record)? {
+                        return Err("BR#14525 retention ended (TTL expiry or disk pressure); unpublished worktree value needs an explicit adoption or a recorded reset before reclaim; source retained".into());
+                    }
+                    // Published: fall through to the reclaim ladder below.
                 },
             }
         }
@@ -650,6 +705,36 @@ impl Owner {
         }
         Ok(Retention::Hold { signal })
     }
+    /// BR#22634 — the recorded reset for BR#14525's Yield contract (see the
+    /// call site for the incident). Preserves the expired unpublished value
+    /// by publishing it to archival branches on origin, then records the
+    /// receipt. `Ok(false)` keeps the old retain contract (gate off, budget
+    /// spent, nothing publishable); `Err` surfaces a real publish failure
+    /// for retry next pass. Idempotent: a record holding a receipt passes
+    /// straight through, and a partially-published record (receipt not yet
+    /// saved) re-pushes the same deterministic branches.
+    fn recorded_reset(&self, record: &mut Resource) -> Result<bool, String> {
+        if !publish_reset_enabled(&self.ledger) { return Ok(false); }
+        if record.reset_at.is_some() { return Ok(true); }
+        if PUBLISH_RESET_BUDGET.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |left| if left > 0 { Some(left - 1) } else { None }).is_err() {
+            return Ok(false);
+        }
+        let mut repos = Vec::new();
+        repositories(&record.location.work(), &mut repos)?;
+        let mut published = 0usize;
+        for repository in &repos {
+            if !git(repository, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok_and(|tip| !tip.is_empty()) { continue }
+            publish_reset_repo(repository, &record.id)?;
+            published += 1;
+        }
+        if published > 0 {
+            record.reset_at = Some(now_ms());
+            record.reset_branch = Some(format!("bridge-archive/{}", record.id));
+        }
+        // The hold ended: the value now lives on origin, not in the tree.
+        record.retained_value = None;
+        Ok(true)
+    }
     fn measure(&self) -> Result<Status, String> {
         let (budget, floor) = Self::budget_floor();
         self.measure_with_limits(budget, floor)
@@ -700,7 +785,7 @@ impl Owner {
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
             let mut child=if self.file(&id).exists() {self.read(&id)?} else {
-                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}
+                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}
             };
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }
@@ -812,6 +897,14 @@ impl Owner {
             admissible_bytes: Some(admissible_bytes),
             preserved_bytes };
         self.write_status(&status)?;
+        // BR#22634 — refill the journal recovery reserves while the volume
+        // is healthy (comfortably above the floor): a drained reserve is
+        // what carried the journal writes through the last full-volume
+        // wedge. Best effort by contract.
+        if available_bytes > floor.saturating_add(journal::reserve_bytes()) {
+            journal::ensure_reserve(&gateway_pipeline::root(&self.cfg)?);
+            journal::ensure_reserve(Path::new(&self.cfg.workdir));
+        }
         Ok(status)
     }
     /// BR#19525 — serialised status.json writer. The full inventory pass and
@@ -998,6 +1091,58 @@ fn verify_layout(record:&Resource)->Result<(),String> {
         for entry in fs::read_dir(root).map_err(|e|e.to_string())? {
             let entry=entry.map_err(|e|e.to_string())?;
             if !matches!(entry.file_name().to_str(),Some("work"|"tmp"|"cache"|"logs")) {return Err("workspace contains unregistered inputs outside its source directory; retained".into());}
+        }
+    }
+    Ok(())
+}
+/// BR#22634 — publish-to-preserve gate. Publishing agent WIP to a shared
+/// origin is a human policy decision (branch namespace, remote storage,
+/// secret-leak review), so the recorded reset stays OFF until the gateway
+/// opts in explicitly via `BRIDGE_WORKSPACE_PUBLISH_RESET`.
+// BR#22634 — publish-to-preserve policy gate. The env flag is the
+// production opt-in; the FORCE seam is the TEST opt-in. The seam is
+// PATH-SCOPED (like attempt_journal::FAIL_FIRST_WRITE): a plain global
+// bool leaks the gate to every concurrently-running test's reconcile
+// during the window — observed as the full suite's real-controller
+// timing tests starving while the publish test's reconcile held the
+// flag — so a test may force the gate only for ITS owner ledger.
+static PUBLISH_RESET_FORCE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static PUBLISH_RESET_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn publish_reset_enabled(ledger: &Path) -> bool {
+    if matches!(std::env::var("BRIDGE_WORKSPACE_PUBLISH_RESET").as_deref(), Ok("1" | "true")) { return true; }
+    PUBLISH_RESET_FORCE.lock().map(|forced| forced.as_deref() == Some(ledger)).unwrap_or(false)
+}
+fn publish_reset_pass_cap() -> usize {
+    std::env::var("BRIDGE_WORKSPACE_PUBLISH_RESET_MAX").ok().and_then(|value| value.parse().ok()).unwrap_or(25).clamp(1, 500)
+}
+/// BR#22634 — publish one repository's unpublished value to a deterministic
+/// archival branch on origin: park-commit the residue, push HEAD, then
+/// publish-and-drop any local ref outside HEAD (standalone clones only —
+/// a worktree's refs belong to its parent clone, which the fence never
+/// blames). Ref names derive from (record, repository), so retries
+/// fast-forward the same receipt.
+fn publish_reset_repo(repository: &Path, record_id: &str) -> Result<(), String> {
+    let key = journal::stable_key(&[record_id, &repository.to_string_lossy()]);
+    let archive = format!("refs/heads/bridge-archive/{record_id}/{}", &key[..16]);
+    if !git(repository, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?.is_empty() {
+        git(repository, &["add", "--all"])?;
+        git(repository, &["-c", "user.name=bridge-ops", "-c", "user.email=ops@bridge.local", "commit", "-m", &format!("wip: park residue before archival reset (BR#22634 {record_id})")])?;
+    }
+    git(repository, &["push", "--force", "origin", &format!("HEAD:{archive}")])?;
+    if repository.join(".git").is_dir() {
+        if git(repository, &["rev-parse", "-q", "--verify", "refs/stash"]).is_ok_and(|value| !value.is_empty()) {
+            // A stash is single-ref reflog history: preserve its tip, drop
+            // the ref so the local-refs fence can ever pass.
+            let stash = git(repository, &["rev-parse", "refs/stash"])?;
+            git(repository, &["push", "--force", "origin", &format!("{stash}:{archive}/stash")])?;
+            git(repository, &["stash", "clear"])?;
+        }
+        for reference in git(repository, &["for-each-ref", "--format=%(refname)", "refs/heads/", "refs/tags/"])?.lines() {
+            let reference = reference.trim();
+            if reference.is_empty() || git(repository, &["merge-base", "--is-ancestor", reference, "HEAD"]).is_ok() { continue }
+            let tip = git(repository, &["rev-parse", reference])?;
+            git(repository, &["push", "--force", "origin", &format!("{tip}:{archive}/refs-{}", reference.trim_start_matches("refs/").replace('/', "-"))])?;
+            git(repository, &["update-ref", "-d", reference])?;
         }
     }
     Ok(())

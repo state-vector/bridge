@@ -55,7 +55,7 @@ fn inspection_uses_only_the_active_attempt_from_the_owner_ledger() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Managed { root: owner.allocations.join(id) },
-            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
+            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
         }).unwrap();
     }
     assert_eq!(owner.active_paths_for_task("BR#42").unwrap(), vec![owner.allocations.join("active/work")]);
@@ -199,7 +199,7 @@ fn budget_counts_aliased_nested_allocations_once() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Legacy { root, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
         }).unwrap();
     }
     let allocation_bytes = disk_bytes(&allocation).unwrap();
@@ -272,7 +272,7 @@ fn legacy_unknown_operations_are_retained_without_publishing_or_removing_source(
     let (cfg,ready,_)=fixture(&hub);let owner=Owner::open(&cfg).unwrap();
     let root=PathBuf::from(&cfg.workdir).join("legacy");fs::create_dir_all(&root).unwrap();fs::write(root.join("evidence"),"do not replay or delete").unwrap();
     let id=legacy::allocation_id("legacy",&root).unwrap();
-    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}).unwrap();
+    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);assert!(root.join("evidence").exists());
     assert!(owner.read(&id).unwrap().error.unwrap().contains("operation evidence"));
     drop(ready);let _=fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
@@ -325,7 +325,7 @@ fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
         fs::write(path.join("unpublished-input"), "keep this").unwrap();
         owner.save(&Resource {
             version: 1, id, location: Location::Legacy { root: path, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
         }).unwrap();
     }
     let t = ticket("released-under-pressure");
@@ -445,7 +445,7 @@ fn completed_resource_history_is_cold_and_cannot_resurrect_a_claim() {
     let before=fs::read(owner.archive_file(&id)).unwrap();
     for n in 0..256 {
         let name=format!("historical-{n}");
-        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None}).unwrap();
+        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}).unwrap();
     }
     assert!(owner.records().unwrap().is_empty(),"completed history must not be scanned/rewritten as active work");
     owner.reconcile(&[]).unwrap();assert_eq!(fs::read(owner.archive_file(&id)).unwrap(),before);
@@ -647,4 +647,61 @@ fn done_trees_reclaim_while_dirty_trees_stay_adoptable_until_taken() {
     assert_eq!(c.root,dirty_root);
     let adopted=owner.read(&c.id).unwrap();
     assert!(adopted.retained_value.is_none(),"adoption clears the value signal");
+}
+
+#[test]
+fn publish_to_preserve_records_the_reset_and_frees_expired_unpublished_trees() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22634-reset");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    let archive=sandbox.0.join("archive.git");
+    git(&sandbox.0,&["init","--bare","archive.git"]).unwrap();
+    git(&work,&["remote","set-url","origin",archive.to_str().unwrap()]).unwrap();
+    fs::write(work.join("tracked"),"unique unpublished value").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    // Gate OFF — the pre-BR#22634 contract: an expired unpublished tree is
+    // retained forever (the 1,661-record / 384 GiB pile on the gateway).
+    owner.reconcile(&[]).unwrap();
+    assert_source_not_removed(&owner,&id,&root);
+    assert!(owner.read(&id).unwrap().error.as_deref().unwrap_or("").contains("recorded reset"),"retention yield surfaces the missing reset");
+    // Gate ON — publish-to-preserve, then the ladder reclaims the tree.
+    // Reset the pass's retry backoff (a real recovery cadence would simply
+    // arrive 30s later; the publish path itself is what's under test).
+    // The force seam is path-scoped to THIS owner's ledger so concurrent
+    // tests' reconciles never observe the gate.
+    let mut record=owner.read(&id).unwrap();record.retry_at=0;owner.save(&record).unwrap();
+    *PUBLISH_RESET_FORCE.lock().unwrap()=Some(owner.ledger.clone());
+    let outcome=owner.reconcile(&[]);
+    *PUBLISH_RESET_FORCE.lock().unwrap()=None;
+    outcome.unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(matches!(record.phase,Phase::Removed { .. }),"published tree was reclaimed");
+    assert!(record.reset_at.is_some(),"recorded-reset receipt missing");
+    assert_eq!(record.reset_branch,Some(format!("bridge-archive/{id}")));
+    assert!(!root.exists(),"allocation root removed");
+    let key=super::super::attempt_journal::stable_key(&[&id,&work.to_string_lossy()]);
+    let branch=format!("bridge-archive/{id}/{}",&key[..16]);
+    let refs=git(&archive,&["for-each-ref","--format=%(refname)","refs/heads/"]).unwrap();
+    assert!(refs.contains(&branch),"archival receipt branch missing: {refs}");
+    assert!(git(&archive,&["show",&format!("{branch}:tracked")]).unwrap().contains("unique unpublished value"),"parked residue survives on the archive branch");
+}
+
+#[test]
+fn a_failed_record_save_still_leaves_a_fresh_status_proof() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22634-save-failure");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    git(&work,&["remote","set-url","origin",sandbox.0.join("unavailable.git").to_str().unwrap()]).unwrap();
+    fs::write(work.join("tracked"),"unpublished").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    let before=owner.status().unwrap().observed_at;
+    // BR#22634 incident shape: the record's journal save hits a full volume
+    // (no reserve to draw). The pass must still run `measure` so admission
+    // is re-proved and the sampler keeps dispatch unfenced.
+    *super::super::attempt_journal::FAIL_FIRST_WRITE.lock().unwrap()=Some(owner.ledger.join(format!("{id}.json")));
+    assert!(owner.reconcile(&[]).is_err(),"the failed journal save surfaces after measure");
+    assert!(owner.status().unwrap().observed_at>before,"measure re-proved admission after the failed save");
+    *super::super::attempt_journal::FAIL_FIRST_WRITE.lock().unwrap()=None;
 }

@@ -116,23 +116,123 @@ pub fn record_name(url: &str, host: &str, owner: &Ownership) -> String {
 pub fn save(root: &Path, record: &Record) -> Result<(), String> {
     write_file(&root.join(record.name()), &serde_json::to_vec(record).map_err(|e| e.to_string())?)
 }
+/// BR#22634 — the journal recovery reserve. Every workspace-owner mutation
+/// (record phase transitions, status proofs, removal receipts, terminal
+/// stages, attempt journals) funnels through `write_file`; on a full volume
+/// each of those writes fails with ENOSPC, so the journal that authorizes
+/// the reclamation which would refill the volume becomes unwritable —
+/// observed live on the gateway: 0 bytes free, every reconcile pass dying on
+/// its first `save`, "reclamation continues" while nothing could ever be
+/// reclaimed. The reserve breaks that deadlock by construction: the owner
+/// preallocates real blocks beside its ledger, and any journal write that
+/// hits ENOSPC draws from the nearest reserve and retries once. The reserve
+/// is refilled by the workspace owner while the volume is healthy.
+const RESERVE_NAME: &str = ".journal-reserve.bin";
+pub fn reserve_bytes() -> u64 {
+    // Test binaries take a token 64 KiB default: the reserve is real
+    // preallocated disk, and ~50 sandbox owners zero-filling 32 MiB each
+    // starves the suite's real-controller timing tests under full parallel
+    // load (observed: two 60s-deadline tests failing only in the whole-suite
+    // run, green in isolation and green on the pre-change base). The
+    // reserve MECHANISM is size-independent; the journal unit tests
+    // exercise real sizes via `ensure_reserve_sized`.
+    if cfg!(test) {
+        std::env::var("BRIDGE_JOURNAL_RESERVE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+            .saturating_mul(1024 * 1024).max(64 * 1024)
+    } else {
+        std::env::var("BRIDGE_JOURNAL_RESERVE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(16)
+            .saturating_mul(1024 * 1024)
+    }
+}
+fn is_storage_full(error: &str) -> bool {
+    // ENOSPC stringifies identically on the gateway's Linux and on macOS
+    // dev/test hosts: "No space left on device (os error 28)". A false
+    // positive costs one harmless (possibly empty) reserve draw.
+    error.contains("os error 28") || error.contains("No space left on device")
+}
+fn draw_from_reserve(path: &Path) -> bool {
+    // Walk up from the target journal to find the owning reserve (the
+    // workspace owner keeps one at its lifecycle root and one at its
+    // workdir root, so every journal family under either tree is covered).
+    // Draw is idempotent and lock-free: concurrent writers race to
+    // truncate the same file; a loser's retry simply fails again and the
+    // write errors exactly as before — never worse.
+    let Some(mut dir) = path.parent().map(Path::to_path_buf) else { return false };
+    for _ in 0..4 {
+        let reserve = dir.join(RESERVE_NAME);
+        if let Ok(file) = fs::File::options().read(true).write(true).open(&reserve) {
+            if file.set_len(0).is_ok() { let _ = file.sync_all(); return true; }
+        }
+        if !dir.pop() { break }
+    }
+    false
+}
+/// Best-effort (re)fill of the recovery reserve at `root`. Filling writes
+/// real zero blocks — a sparse hole reserves nothing — through a temp file,
+/// so a mid-fill failure (tight disk) never shrinks an existing reserve.
+/// Never fails its caller: an unfilled reserve only means the next ENOSPC
+/// draw finds nothing and the write errors exactly as before.
+pub fn ensure_reserve(root: &Path) { ensure_reserve_sized(root, reserve_bytes()) }
+/// Test-shaped variant with an explicit size (the env-tunable default is
+/// not safe to mutate from parallel tests). Compiled unconditionally:
+/// `ensure_reserve` itself calls it, so gating it behind cfg(test) breaks
+/// the production lib build (test builds activate cfg(test) and mask it).
+pub(crate) fn ensure_reserve_sized(root: &Path, want: u64) {
+    let path = root.join(RESERVE_NAME);
+    if want == 0 { return }
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= want { return }
+    let tmp = path.with_extension(format!("reserve-{}.tmp", std::process::id()));
+    let Ok(mut file) = fs::File::create(&tmp) else { return };
+    // 64 KiB stack chunks: a 4 MiB buffer would overflow small worker and
+    // test threads; 256 iterations is nothing.
+    let zero = [0u8; 64 * 1024];
+    let mut remaining = want;
+    while remaining > 0 {
+        let chunk = remaining.min(zero.len() as u64) as usize;
+        if file.write_all(&zero[..chunk]).is_err() { let _ = fs::remove_file(&tmp); return }
+        remaining -= chunk as u64;
+    }
+    if file.sync_all().is_ok() && fs::rename(&tmp, &path).is_ok() { return }
+    let _ = fs::remove_file(&tmp);
+}
+/// Test seam for the ENOSPC retry path: when armed with a path, the next
+/// `write_file` targeting exactly that path fails its first attempt with a
+/// real ENOSPC message. Path-scoped so parallel tests never cross-fire.
+#[cfg(test)]
+pub(crate) static FAIL_FIRST_WRITE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let root = path.parent().ok_or("journal parent missing")?;
-    fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let root = path.parent().ok_or("journal parent missing")?.to_path_buf();
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-    let mut options = fs::OpenOptions::new(); options.create_new(true).write(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-    let result = (|| -> Result<(), String> {
-        let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
+    let write_once = |tmp: &Path| -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut armed = FAIL_FIRST_WRITE.lock().unwrap();
+            if armed.as_deref() == Some(path) { *armed = None; return Err("No space left on device (os error 28)".into()) }
+        }
+        let mut options = fs::OpenOptions::new(); options.create_new(true).write(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let mut file = options.open(tmp).map_err(|e| e.to_string())?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-        #[cfg(unix)] fs::File::open(root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+        fs::rename(tmp, path).map_err(|e| e.to_string())?;
+        #[cfg(unix)] fs::File::open(&root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
         Ok(())
-    })();
-    if result.is_err() { let _ = fs::remove_file(tmp); }
+    };
+    let result = write_once(&tmp);
+    // BR#22634 — ENOSPC is recoverable through the reserve: remove the
+    // failed temp, draw the preallocated blocks, retry once.
+    let result = match result {
+        Err(error) if is_storage_full(&error) => {
+            let _ = fs::remove_file(&tmp);
+            if draw_from_reserve(path) { write_once(&tmp) } else { Err(error) }
+        }
+        other => other,
+    };
+    if result.is_err() { let _ = fs::remove_file(&tmp); }
     result
 }
 pub fn insert(root: &Path, record: Record) -> Result<Record, String> {
@@ -175,4 +275,39 @@ pub fn remove(root: &Path, record: &Record) -> Result<(), String> {
         .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound && archive.join(record.name()).exists() { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())?;
     #[cfg(unix)] { fs::File::open(root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?; fs::File::open(archive).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?; }
     Ok(())
+}
+
+#[cfg(test)]
+mod br22634_tests {
+    use super::*;
+    fn scratch() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("br22634-journal-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    #[test]
+    fn enospc_write_survives_through_the_reserve() {
+        let dir = scratch();
+        ensure_reserve_sized(&dir, 64 * 1024);
+        let reserve = dir.join(RESERVE_NAME);
+        assert!(fs::metadata(&reserve).unwrap().len() >= 64 * 1024, "reserve holds real preallocated blocks");
+        let target = dir.join("records/record.json");
+        *FAIL_FIRST_WRITE.lock().unwrap() = Some(target.clone());
+        write_file(&target, br#"{"ok":true}"#).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), br#"{"ok":true}"#);
+        assert_eq!(fs::metadata(&reserve).unwrap().len(), 0, "the full-volume write drew the reserve");
+        ensure_reserve_sized(&dir, 64 * 1024);
+        assert!(fs::metadata(&reserve).unwrap().len() >= 64 * 1024, "reserve refilled while healthy");
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn enospc_without_reserve_fails_exactly_as_before() {
+        let dir = scratch();
+        let target = dir.join("records/record.json");
+        *FAIL_FIRST_WRITE.lock().unwrap() = Some(target.clone());
+        assert!(write_file(&target, br#"{"ok":true}"#).is_err());
+        assert!(!target.exists(), "no torn file left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

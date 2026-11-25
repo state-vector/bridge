@@ -81,11 +81,25 @@ def extract_candidate(archive, destination):
         members = tar.getmembers()
         if len(members) != 1 or members[0].name != "bridge" or not members[0].isfile() or members[0].size > MAX_ARCHIVE:
             raise ValueError("archive must contain exactly one regular bridge executable")
-        with tar.extractfile(members[0]) as source, open(destination, "wb") as output:
+        # BR#22634 — stage then atomically rename: an interrupted extraction
+        # (full volume) must never leave a truncated candidate on the path
+        # the swap's digest gate reads — a torn file there wedges the whole
+        # update operation until the next full download.
+        staged = destination.with_name(destination.name + ".extracted")
+        with tar.extractfile(members[0]) as source, open(staged, "wb") as output:
             shutil.copyfileobj(source, output)
             output.flush()
             os.fsync(output.fileno())
+        if staged.stat().st_size != members[0].size:
+            staged.unlink()
+            raise ValueError("staged candidate size mismatch after extraction")
+        os.replace(staged, destination)
     os.chmod(destination, 0o755)
+    directory = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def digest(path):
@@ -363,6 +377,16 @@ class Supervisor:
     def candidate(self, operation):
         return self.root / "candidates" / operation.nonce / "bridge"
 
+    def stage_backup(self):
+        # BR#22634 — stage then atomically rename: a truncated backup left
+        # by a full-volume copy would wedge every later rollback on the
+        # "verified rollback binary missing" gate.
+        staged = self.backup.with_name(self.backup.name + ".staged")
+        shutil.copy2(self.binary, staged)
+        with staged.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(staged, self.backup)
+
     def own_request(self, op):
         value = read(self.request)
         if value is not None and value.get("nonce") != op.nonce:
@@ -516,7 +540,14 @@ class Supervisor:
                 data = source.read(MAX_ARCHIVE + 1)
             if len(data) > MAX_ARCHIVE or hashlib.sha256(data).hexdigest() != state.archive_digest:
                 raise ValueError("artifact checksum/size validation failed")
-            archive.write_bytes(data)
+            # BR#22634 — stage the download then rename, so a torn archive
+            # on a full volume never masquerades as a validated candidate.
+            staged_archive = archive.with_name(archive.name + ".downloaded")
+            staged_archive.write_bytes(data)
+            if staged_archive.stat().st_size != len(data):
+                staged_archive.unlink()
+                raise ValueError("staged archive size mismatch")
+            os.replace(staged_archive, archive)
             extract_candidate(archive, executable)
             if self.build(executable) != state.operation.target:
                 raise ValueError("candidate embedded commit differs from manifest")
@@ -553,9 +584,7 @@ class Supervisor:
                 # A same-build controller restart is a participant reconnect,
                 # not a failed update or a new retry budget.
                 op = replace(op, controller=current)
-                shutil.copy2(self.binary, self.backup)
-                with self.backup.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                self.stage_backup()
                 self.save(Installing(op, state.candidate_digest, InstallStep.STOP))
             elif op.worker_protocol == 1 and self.info(self.candidate(op)).get("recovery_protocol") == 1:
                 self.save(Reconciling(replace(op, controller=current), state.candidate_digest, ReconcileStep.FREEZE))
@@ -618,9 +647,7 @@ class Supervisor:
                 # Job-specific waits retain their original WAL/ownership. They
                 # are NOT controller writers and cannot require restarting the
                 # old code before installing the code that can reconcile them.
-                shutil.copy2(self.binary, self.backup)
-                with self.backup.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                self.stage_backup()
                 self.save(Installing(op, state.candidate_digest, InstallStep.SWAP))
         elif isinstance(state, Installing):
             op = state.operation

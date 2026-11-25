@@ -533,5 +533,43 @@ else:
                     if p and p.poll() is None:p.terminate();p.wait(timeout=2)
 
 
+class ExtractStagingTests(unittest.TestCase):
+    """BR#22634 — an interrupted extraction must never leave a torn binary."""
+
+    def _archive(self, root, payload):
+        archive = root / "bridge.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo("bridge")
+            info.size = len(payload)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(payload))
+        return archive
+
+    def test_stages_then_installs_atomically(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = os.urandom(8192)
+            archive = self._archive(root, payload)
+            destination = root / "candidates" / NONCE / "bridge"
+            destination.parent.mkdir(parents=True)
+            m.extract_candidate(archive, destination)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(list(destination.parent.glob("*.extracted")), [])
+            self.assertTrue(os.stat(destination).st_mode & 0o111)
+
+    def test_a_torn_staged_write_never_reaches_the_candidate_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = os.urandom(8192)
+            archive = self._archive(root, payload)
+            destination = root / "candidates" / NONCE / "bridge"
+            destination.parent.mkdir(parents=True)
+            with patch.object(m.shutil, "copyfileobj", side_effect=lambda source, output: output.write(source.read(16))):
+                with self.assertRaises(ValueError):
+                    m.extract_candidate(archive, destination)
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(destination.parent.glob("*.extracted")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
