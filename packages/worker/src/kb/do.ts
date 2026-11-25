@@ -12815,27 +12815,48 @@ export class KnowledgeHub {
               // authority (machine.ts qualify "via: human"); a machine
               // answerer keeps the system pen and the gate refuses loudly
               // (an agent answer can never author completion).
+              // The in_review disposition (the live BR#16533 re-seat shape)
+              // is gated on typed execution_result (machine
+              // execution-submission + review-needs-pr): composed from the
+              // close_card template's receipts — the ask carries the
+              // first-hand delivery evidence. A hand-authored close choice
+              // with no template receipts fails LOUDLY (fail-closed), never
+              // scavenges the answer text.
               const tt = AskTemplateSchema.safeParse(m.ask?.template);
-              const to = tt.success && tt.data.kind === "close_card" && tt.data.disposition === "in_review" ? "in_review" : "done";
-              const parkClaimed = ["todo", "blocked"].includes(String(subject.status));
-              const closePen = HUMAN_ACTOR_RX.test(actor) ? actor : asActor;
-              try {
-                if (parkClaimed) {
+              const tpl = tt.success && tt.data.kind === "close_card" ? tt.data : undefined;
+              const to = tpl?.disposition === "in_review" ? "in_review" : "done";
+              // idempotent: the subject already sits in the disposition
+              // state — the ask's authorisation was already executed; the
+              // answer records, no redundant edge is forced (in_review →
+              // in_review is not an edge and would gate-reject).
+              if (String(subject.status) === to) {
+                this.audit(actor, "answer_dispatch_close_already_applied", subject.id, { ask_id: id, to });
+                taskStatus = to;
+              } else {
+                const parkClaimed = ["todo", "blocked"].includes(String(subject.status));
+                const closePen = HUMAN_ACTOR_RX.test(actor) ? actor : asActor;
+                const execResult =
+                  to === "in_review" && tpl
+                    ? { outcome: `close per answered ask ${id}: ${tpl.subject}`.slice(0, 200), receipts: [String(tpl.receipts)] }
+                    : undefined;
+                try {
+                  if (parkClaimed) {
+                    await this.transition(
+                      { id: subject.id, to: "in_progress", human_verdict: true, note: `ask ${id} answered — close disposition: composed-edge claim through the only legal door from ${subject.status} (BR#22008)` },
+                      closePen,
+                    );
+                  }
                   await this.transition(
-                    { id: subject.id, to: "in_progress", human_verdict: true, note: `ask ${id} answered — close disposition: composed-edge claim through the only legal door from ${subject.status} (BR#22008)` },
+                    { id: subject.id, to, human_verdict: true, execution_result: execResult, note: `ask ${id} answered — closed ${to} per typed choice (BR#22008); gates validated server-side${tpl ? `; receipts: ${String(tpl.receipts).slice(0, 160)}` : ""}` },
                     closePen,
                   );
+                  taskStatus = to;
+                } catch (e) {
+                  const msg = String((e as Error).message ?? e).slice(0, 300);
+                  this.audit(actor, "answer_apply_failed", subject.id, { ask_id: id, action: "close", error: msg, composed_claim: parkClaimed });
+                  this.version(id, actor, "note", `close dispatch failed on ${subject.id} (${subject.status}): ${msg}`, { target: subject.id, error: msg });
+                  taskStatus = parkClaimed ? "in_progress" : undefined;
                 }
-                await this.transition(
-                  { id: subject.id, to, human_verdict: true, note: `ask ${id} answered — closed ${to} per typed choice (BR#22008); gates validated server-side` },
-                  closePen,
-                );
-                taskStatus = to;
-              } catch (e) {
-                const msg = String((e as Error).message ?? e).slice(0, 300);
-                this.audit(actor, "answer_apply_failed", subject.id, { ask_id: id, action: "close", error: msg, composed_claim: parkClaimed });
-                this.version(id, actor, "note", `close dispatch failed on ${subject.id} (${subject.status}): ${msg}`, { target: subject.id, error: msg });
-                taskStatus = parkClaimed ? "in_progress" : undefined;
               }
             } else if (decisionAction === "clear_hold") {
               // BR#22008 server-side hold clear: the typed choice names the

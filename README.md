@@ -2016,7 +2016,11 @@ lifecycle edges server-side: a `close` on a parked card claims it through
 review, admission, receipts) validates exactly as for a hand close, and a
 refusal surfaces as `answer_apply_failed` on the ask, never a raw 400 on the
 click (the BR#21657 op-first-button wedge class is dead: the UI button submits
-the typed choice only). Legacy options-only asks (no `decision` struct) keep
+the typed choice only). A `close` to `in_review` (the re-seat shape — an open
+PR delivery) composes the template's receipts as typed `execution_result` so
+the submission gates validate exactly as for a hand submission, and a close
+answered while the card already sits in the disposition state is an idempotent
+no-op — the authorisation records, no illegal edge is forced. Legacy options-only asks (no `decision` struct) keep
 their documented click semantics through the closed option-intent registry
 (`legacyOptionAction` in contracts — SUPERSEDE → drop, RELEASE → release,
 KEEP/RE-SCOPE → park), applied only to an answer that exactly equals one of

@@ -74,6 +74,48 @@ describe("typed answer dispatch (BR#22008)", () => {
     expect(String(askAfter.meta.ask.answer ?? "")).toContain(label);
   });
 
+  it("a close_card ask with disposition in_review composes typed execution_result receipts — the live BR#16533 re-seat shape (todo → claim → in_review in ONE click)", async () => {
+    // the live wedge Ray hit on BR#16533/ask BR#22077: a watchdog-demoted
+    // todo card + a close_card ask whose disposition is in_review (the PR is
+    // OPEN — the card must seat for a fresh verify, not go done). The
+    // in_review edge is gated on typed execution_result {outcome,receipts};
+    // the composed close carries the ask template's receipts so the gates
+    // validate exactly as for a hand submission.
+    const task = (await call("create", { type: "task", title: "Re-seat drill — BR#22008 in_review disposition", qualified: true })).body.id;
+    await call("transition", { id: task, to: "in_progress", actor: "owner", session: "holder-22008d" });
+    await call("transition", { id: task, to: "todo", actor: "owner", note: "watchdog demote drill" });
+
+    const ask = await call("ask.create", { template: { kind: "close_card", task_id: task, subject: "PR #3480 re-seat: production-wiring delivery", disposition: "in_review", receipts: "PR state-vector/superpositional#3480 OPEN MERGEABLE/CLEAN, head 08ddee92, checks 23 success; cure #3481 merged", why_now: "the human's GO authorized the re-seat" } });
+    expect(ask.status, JSON.stringify(ask.body)).toBe(200);
+    const node = (await call("get", { id: ask.body.id })).body;
+    expect(node.meta.ask.decision.choices[0]).toMatchObject({ executor: "human", action: "close" });
+
+    // the ONE typed click: todo → in_progress (claim) → in_review (typed
+    // execution_result from the template receipts) — no gate rejection
+    const label = String(node.meta.ask.decision.choices[0].label);
+    const answered = await call("ask.answer", { id: ask.body.id, answer: label, actor: "web:rayh" });
+    expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    expect(answered.body.task_status).toBe("in_review");
+    const seated = (await call("get", { id: task })).body;
+    expect(seated.status).toBe("in_review");
+    const askAfter = (await call("get", { id: ask.body.id })).body;
+    expect(askAfter.status).toBe("done");
+    expect(String(askAfter.meta.ask.answer ?? "")).toContain(label);
+
+    // idempotent: a second close ask answered while the card ALREADY sits in
+    // the disposition state is a no-op success — the authorisation was
+    // already executed; the answer records, no in_review → in_review edge is
+    // forced (that would gate-reject).
+    const ask2 = await call("ask.create", { template: { kind: "close_card", task_id: task, subject: "duplicate close drill", disposition: "in_review", receipts: "PR state-vector/superpositional#3480 unchanged", why_now: "duplicate authorisation drill" } });
+    expect(ask2.status, JSON.stringify(ask2.body)).toBe(200);
+    const node2 = (await call("get", { id: ask2.body.id })).body;
+    const label2 = String(node2.meta.ask.decision.choices[0].label);
+    const answered2 = await call("ask.answer", { id: ask2.body.id, answer: label2, actor: "web:rayh" });
+    expect(answered2.status, JSON.stringify(answered2.body)).toBe(200);
+    expect(answered2.body.task_status).toBe("in_review"); // no-op, no rejection
+    expect((await call("get", { id: task })).body.status).toBe("in_review");
+  });
+
   it("free text is commentary: a prose answer records on the ask and dispatches NOTHING", async () => {
     const task = (await call("create", { type: "task", title: "Prose answer drill — BR#22008", qualified: true })).body.id;
     await call("transition", { id: task, to: "in_progress", actor: "owner", session: "holder-22008b" });
