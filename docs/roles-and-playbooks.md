@@ -32,6 +32,10 @@ before the parent can be done. Publishers can stack extra bars with `await: ["ro
 ### `role:analysis` — decompose, don't build
 - Starts: orient, read the parent + related knowledge; coordinate via ask_agent instead of
   forking overlapping work.
+- Repo steering first (BR#21859): before decomposing work in a repo, read its agent
+  steering — `AGENTS.md` at the root and any `.kiro/steering/*.md` — and apply it to HOW
+  you scope (children whose acceptance criteria carry the steering's discipline — trace
+  end-to-end, docs ride with the change). Where a repo carries none, proceed.
 - Does: unqualified todo is gated to this lane on purpose; analyse, then decompose into
   child tasks (`child_of` the parent), one per coherent unit, each tagged with the role
   that should pick it up and carrying concrete checkable acceptance criteria in its body
@@ -71,6 +75,10 @@ before the parent can be done. Publishers can stack extra bars with `await: ["ro
 - Does: record a verdict against the existing receipts — decision artefact linked to the
   implementation, accepted or rejected with reasons; accepted verdict is what lets work
   complete.
+- Repo steering first (BR#21859): before verifying work in a repo, read its agent
+  steering — `AGENTS.md` at the root and any `.kiro/steering/*.md` — and judge the work
+  against that steering too: a diff that ignores the repo's own rules is a finding, not a
+  style nit. Where a repo carries none, proceed.
 - Critique the verdict (BR#21859): before accepting, attempt to DISPROVE the acceptance —
   re-run the strongest counter-check (the one result that would flip it) and cite what was
   actually run and read, never what was assumed.

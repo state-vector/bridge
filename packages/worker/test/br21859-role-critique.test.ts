@@ -44,6 +44,8 @@ describe("role critique discipline (BR#21859)", () => {
     expect(p).toContain("CRITIQUE AT FINISH (BR#21859)");
     expect(p).toContain("without asking you anything");
     expect(p).toContain("what you did NOT verify");
+    expect(p).toContain("REPO STEERING FIRST (BR#21859)");
+    expect(p).toMatch(/AGENTS\.md at the root and any \.kiro\/steering\/\*\.md/);
   });
 
   it("review: disprove-your-acceptance before filing the verdict", () => {
@@ -51,6 +53,19 @@ describe("role critique discipline (BR#21859)", () => {
     expect(p).toContain("CRITIQUE YOUR OWN VERDICT (BR#21859)");
     expect(p).toContain("attempt to DISPROVE your acceptance");
     expect(p).toContain("If you cannot name a counter-check you performed, you are not ready to accept");
+    expect(p).toContain("REPO STEERING FIRST (BR#21859)");
+    expect(p).toMatch(/AGENTS\.md at the root and any \.kiro\/steering\/\*\.md/);
+  });
+
+  it("the repo-steering directive is inherited by EVERY role — not just impl (verify bounce, BR#21859)", () => {
+    for (const role of ["analysis", "impl", "review"] as const) {
+      expect(DEFAULT_ROLE_PLAYBOOKS[role]).toContain("REPO STEERING FIRST (BR#21859)");
+    }
+    // The bounce mechanism: resolveRolePlaybook resolves strictly per-role, so a
+    // directive only in one role's playbook mechanically never reaches the others.
+    expect(resolveRolePlaybook(undefined, "analysis")).toContain("REPO STEERING FIRST");
+    expect(resolveRolePlaybook(undefined, "review")).toContain("REPO STEERING FIRST");
+    expect(resolveRolePlaybook(undefined, "impl")).toContain("REPO STEERING FIRST");
   });
 
   it("overrides keep winning; blank still resets to the (hardened) default", () => {

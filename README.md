@@ -1728,13 +1728,13 @@ not by client convention.
 
 Every lane also carries the **critique discipline** (BR#21859) — self- and system-critique
 early and often, not only at review time: each heartbeat names the one biggest thing that
-could be wrong right now; analysis traces the problem end-to-end before decomposing and
-self-reviews each child for fresh-session checkability before finishing; impl reads the
-repo's agent steering (`AGENTS.md`, `.kiro/steering/*.md` where present) before its first
-edit and self-critiques its own diff against the acceptance criteria and that steering
-before handover, declaring what it did NOT verify; review attempts to disprove its own
-acceptance before filing it, citing what it actually checked. Full contract:
-`docs/roles-and-playbooks.md`.
+could be wrong right now; every role reads the repo's agent steering (`AGENTS.md`,
+`.kiro/steering/*.md` where present) before its first action and applies it to HOW the
+work happens; analysis traces the problem end-to-end before decomposing and self-reviews
+each child for fresh-session checkability before finishing; impl self-critiques its own
+diff against the acceptance criteria and that steering before handover, declaring what it
+did NOT verify; review attempts to disprove its own acceptance before filing it, citing
+what it actually checked. Full contract: `docs/roles-and-playbooks.md`.
 
 **Verify is the merge authority; the merge train is the executor** (standing order BR#3033,
 re-divisioned by BR#3516). The verify round reviews substance and records an accepted or

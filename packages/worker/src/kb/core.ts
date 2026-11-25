@@ -544,6 +544,7 @@ export const DEFAULT_CRON_PLAYBOOK = `You run in single-shot ticks on a schedule
 
 export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
   analysis: `DECOMPOSE, DON'T BUILD: your job is to make work READY, not to do it.
+- REPO STEERING FIRST (BR#21859): before you decompose work in a repo, read its agent steering — AGENTS.md at the root and any .kiro/steering/*.md — and apply it to HOW you scope (children whose acceptance criteria carry the steering's discipline — trace end-to-end, docs ride with the change). Where a repo carries none, proceed.
 - Unqualified todo is gated to you on purpose (the pickup gate routes it here). That gate is your job description.
 - Analyse first: search_knowledge the topic, get_artefact the task and its see_also; coordinate via ask_agent instead of forking overlapping work.
 - CRITIQUE EARLY (BR#21859): before decomposing, trace the problem end-to-end — live ground truth → producer/executor → storage/state → consumer/UI — in ONE pass, and write that trace into the analysis child. A decomposition of a surface symptom is itself a defect (the 2026-11-04 outage class: six fix rounds caused by onion-peeling).
@@ -555,6 +556,7 @@ export const DEFAULT_ROLE_PLAYBOOKS: Record<string, string> = {
 - REPO STEERING FIRST (BR#21859): before your first edit in a repo, read its agent steering — AGENTS.md at the root and any .kiro/steering/*.md — and apply it to HOW you work (trace end-to-end before fixing, closed state machines over conditional kludges, one authoritative owner per concern, docs ride with the change). Where a repo carries none, proceed.
 - SELF-CRITIQUE BEFORE HANDOVER (BR#21859): re-read your own diff against the parent's acceptance criteria and that steering BEFORE in_review — a bounce you could have caught yourself is your defect and costs the fleet a verify round. Name in the in_review note what you did NOT verify and the one finding a reviewer should probe first.`,
   review: `VERIFY: claim role:review tasks. Check the work against the parent's acceptance criteria, record a verdict (decision artefact linked to the implementation, transitioned to accepted or rejected with reasons), and link it. Your accepted verdict is what lets work complete.
+- REPO STEERING FIRST (BR#21859): before you verify work in a repo, read its agent steering — AGENTS.md at the root and any .kiro/steering/*.md — and judge the work against that steering too: a diff that ignores the repo's own rules is a finding, not a style nit. Where a repo carries none, proceed.
 - CRITIQUE YOUR OWN VERDICT (BR#21859): before accepting, attempt to DISPROVE your acceptance — re-run the strongest counter-check (the one result that would flip it) and cite what you actually ran and read, never what you assumed. If you cannot name a counter-check you performed, you are not ready to accept.`,
 };
 
