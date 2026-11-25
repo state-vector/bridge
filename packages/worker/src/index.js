@@ -379,6 +379,24 @@ export default {
           method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body),
         }));
       }
+      if (sub === "train_pardon" && request.method === "POST") {
+        // GH#489: operator retroactive exoneration for a train_red episode
+        // adjudicated infra-caused after the line moved on (the bisect write
+        // path needs a live lease + burst-red stop, so it can never express
+        // this). Web/human-only, same trust class as release_claim — the DO
+        // re-verifies the admin-mint header server-side and agents exonerate
+        // nothing themselves: the op is deliberately absent from the MCP tool
+        // surface. The DO enforces the evidence bar (accepted decision naming
+        // the episode's class, done root-fix naming the stop, or exact-URL
+        // green-rerun receipt) and writes the score-side train_red_pardon
+        // stamp with the ding's exact sha:culprit.
+        if (auth.bearer) return kbCors(json({ error: "train.pardon is web/human-only (GH#489) — the exoneration override is never agent-reachable" }, 403));
+        const body = await request.json().catch(() => ({}));
+        body.actor = `web:${auth.login ?? "anon"}`;
+        return kbCors(await kbGuard("kb.train.pardon", env.KB.get(kbId).fetch("https://kb/train.pardon", {
+          method: "POST", headers: { "content-type": "application/json", "x-kb-admin": "1" }, body: JSON.stringify(body),
+        })));
+      }
         const op = ["create", "update", "transition", "link", "progress", "enrich", "boost", "ask_answer"].includes(sub) ? sub : null;
         if (!op) return kbCors(new Response("not found", { status: 404 }));
         const body = kbMutationIdentity(await request.json().catch(() => ({})), auth);
