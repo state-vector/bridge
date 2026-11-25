@@ -2917,6 +2917,19 @@ details rather than overprinted `×N` labels. Historical totals are separate fro
 an active same-kind bounce-budget escalation. Repairs held by an unconfirmed old
 writer name the gateway reconciliation required before another worker may start.
 
+**Resolved cars never hold the line (BR#22592).** A leg is RESOLVED for queue
+admission when it is landed, receipt-settled (`awaiting-ci` with a merge
+receipt older than the 15-minute settle window — the walk re-fires the
+`merged` event and the hub promotes the leg stamp), or dead (terminal
+`dead` leg stamp from the walk's CLOSED-unmerged bounce). Resolved legs
+admit no car: the derived queue reaps them so the line advances to the next
+live candidate even when no settle pass ever lands again (the 2026-11-26
+all-resolved-line wedge). The card-level close is untouched — landed closes,
+interactive holds and foreign typed waits keep their owners. `dead` is a leg
+state only. A starve-episode diagnostic duty left unclaimed past
+`train.starve_pickup_budget_min` (default 20m) is re-boosted and alarms the
+train sink once per episode naming it for dispatch.
+
 The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 records remaining lifecycle, completion, priority and recovery gaps at commit
 `4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
