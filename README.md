@@ -1726,6 +1726,16 @@ PR link, review verifies with receipts in a fresh session. Separation of duties,
 gates, and verify auto-spawn are enforced server-side in `packages/worker/src/kb/do.ts`,
 not by client convention.
 
+Every lane also carries the **critique discipline** (BR#21859) — self- and system-critique
+early and often, not only at review time: each heartbeat names the one biggest thing that
+could be wrong right now; analysis traces the problem end-to-end before decomposing and
+self-reviews each child for fresh-session checkability before finishing; impl reads the
+repo's agent steering (`AGENTS.md`, `.kiro/steering/*.md` where present) before its first
+edit and self-critiques its own diff against the acceptance criteria and that steering
+before handover, declaring what it did NOT verify; review attempts to disprove its own
+acceptance before filing it, citing what it actually checked. Full contract:
+`docs/roles-and-playbooks.md`.
+
 **Verify is the merge authority; the merge train is the executor** (standing order BR#3033,
 re-divisioned by BR#3516). The verify round reviews substance and records an accepted or
 rejected verdict — its accepted verdict is what licenses the merge; the mechanical merge

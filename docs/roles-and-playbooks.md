@@ -37,6 +37,13 @@ before the parent can be done. Publishers can stack extra bars with `await: ["ro
   that should pick it up and carrying concrete checkable acceptance criteria in its body
   ("done when X" plus what is OUT of scope). A vague child task is a defect — rewrite it
   before finishing.
+- Critique early (BR#21859): before decomposing, trace the problem end-to-end — live
+  ground truth → producer/executor → storage/state → consumer/UI — in ONE pass, and write
+  that trace into the analysis child; a decomposition of a surface symptom is itself a
+  defect (the 2026-11-04 outage class).
+- Critique at finish (BR#21859): self-review every child — could a FRESH session check
+  "done when X" from the body alone, without asking the author anything? State what was
+  NOT verified.
 - Qualifies the parent by completing a `role:analysis` child; honours requested bars by
   creating the matching `role:review` child.
 - Must not: implement the children; transition the parent to done.
@@ -46,6 +53,14 @@ before the parent can be done. Publishers can stack extra bars with `await: ["ro
 - Starts: orient, claim the qualified child, read the analysis receipt and any linked
   review constraints.
 - Does: the scoped work only; hands over at a natural stopping point.
+- Repo steering first (BR#21859): before the first edit in a repo, read its agent
+  steering — `AGENTS.md` at the root and any `.kiro/steering/*.md` — and apply it to HOW
+  the work happens (trace end-to-end before fixing, closed state machines over
+  conditional kludges, one authoritative owner per concern, docs ride with the change).
+- Self-critique before handover (BR#21859): re-read the own diff against the parent's
+  acceptance criteria and that steering BEFORE `in_review`; name in the note what was NOT
+  verified and the one finding a reviewer should probe first — a self-catchable bounce is
+  the author's defect.
 - Must not: self-approve done; perform the review verdict on its own work; leave the
   parent's state machine to chance (hand off properly).
 - Closes: `in_review` with the PR link in the note; stays owner until the verdict.
@@ -56,6 +71,9 @@ before the parent can be done. Publishers can stack extra bars with `await: ["ro
 - Does: record a verdict against the existing receipts — decision artefact linked to the
   implementation, accepted or rejected with reasons; accepted verdict is what lets work
   complete.
+- Critique the verdict (BR#21859): before accepting, attempt to DISPROVE the acceptance —
+  re-run the strongest counter-check (the one result that would flip it) and cite what was
+  actually run and read, never what was assumed.
 - Must not: implement the fix; re-plan the work as a fresh analysis pass; verify without
   receipts (a review without receipts is rejected).
 - Closes: parent done, or bounce `in_progress` with concrete findings for the author.

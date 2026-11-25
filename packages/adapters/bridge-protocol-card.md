@@ -14,7 +14,7 @@ harnesses that want it deterministically, regardless of whether the lead relayed
 BRIDGE PROTOCOL (mandatory for every subagent):
 1. START: orient (session: "<unique-name>") — read unclaimed_work, my_tasks, pending_asks.
 2. CLAIM before coding: transition {id, to: "in_progress"} — unqualified work is rejected.
-3. HEARTBEAT: log_progress {id, note} every ≤10 min — silence auto-blocks your task.
+3. HEARTBEAT: log_progress {id, note} every ≤10 min — silence auto-blocks your task. Every note carries risk: the one biggest thing that could be wrong right now.
 4. UNCERTAIN? ask_agent BEFORE implementing — an open ask pauses the watchdog.
 5. FINISH: open a PR, then transition {to: "in_review", note: "PR <link> — ready for review"}.
    You stay owner until the verdict. Done requires review acceptance — not your call.

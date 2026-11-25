@@ -191,7 +191,7 @@ export const TOOL_ARG_SCHEMAS = {
   }),
   log_progress: z.looseObject({
     id: z.string(),
-    note: z.string(),
+    note: z.string().describe("The heartbeat line: did + will. While in_progress, also carry risk — the single biggest thing that could be wrong right now, one line; \"none identified\" is a claim you must be able to defend (BR#21859)."),
     will: z.string().optional(),
     grace_minutes: z.number().int().max(60).optional(),
     sentiment: z
