@@ -137,6 +137,10 @@
    ]
   },
   {
+   "name": "score_explain",
+   "required": []
+  },
+  {
    "name": "search_knowledge",
    "required": [
     "q"

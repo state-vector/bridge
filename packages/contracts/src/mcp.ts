@@ -48,6 +48,7 @@ export const TOOL_NAMES = [
   "reconcile_schedule",
   "reconcile_status",
   "related_artefacts",
+  "score_explain",
   "search_knowledge",
   "session_alive",
   "stats",
@@ -91,6 +92,14 @@ export const TOOL_ARG_SCHEMAS = {
     q: z.string(),
     type: z.string().optional(),
     limit: z.number().int().max(100).optional(),
+  }),
+  // GH#492 — the EXPLAIN for the behaviour score: the raw, deduped event rows
+  // computeAgentScores counts for a label, the counters they produced and the
+  // derived hints. Read-only; exposes only what the score already reads.
+  score_explain: z.looseObject({
+    label: z.string().optional().describe("agent label to explain (defaults to the caller's own label)"),
+    since_ts: z.number().int().optional().describe("narrow to events at/after this epoch ms — clamped to the scoring windows (7d / 48h); explain never widens them"),
+    kinds: z.array(z.enum(["progress", "watchdog_transition", "reassign", "train_red_ding", "artefact_created", "ask_received", "ask_answered_on_time"])).optional().describe("restrict the returned event kinds (default: all)"),
   }),
   get_artefact: z.looseObject({ id: z.string(), view: z.enum(["full", "execution"]).optional().describe("Execution returns canonical task state without related-work discovery; full is the default agent view.") }),
   claim_takeover: z.looseObject({

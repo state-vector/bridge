@@ -1045,31 +1045,33 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   score += Math.min(20, s.gauge_count * 2);
   score -= Math.min(25, s.abandoned * 10);
   if (s.abandoned > 0)
-    hints.push(`${s.abandoned} task(s) went silent and were watchdog-blocked — send log_progress every ≤10m`);
+    hints.push(`${s.abandoned} task(s) under this label went silent and were watchdog-blocked — every session on the label sends log_progress every ≤10m`);
   // BR#3352: a run whose result was lost in delivery is a channel incident,
   // not agent abandonment — never penalized. The hint routes the complaint at
   // the delivery channel (and invites a bounce-note with receipts) instead of
-  // telling the agent to heartbeat harder.
+  // telling the agent to heartbeat harder. GH#492: the score is a LABEL
+  // aggregate (all concurrent sessions on the label score together), so the
+  // hints speak of the label, not "you".
   if (s.result_lost > 0)
-    hints.push(`${s.result_lost} completed run(s) had their result lost in delivery (completed_result_lost) — a delivery-channel incident, not abandonment; the side effects landed`);
+    hints.push(`${s.result_lost} completed run(s) on this label had their result lost in delivery (completed_result_lost) — a delivery-channel incident, not abandonment; the side effects landed`);
   score -= Math.min(30, s.reassigned * 15);
   if (s.reassigned > 0)
-    hints.push(`${s.reassigned} task(s) were taken from you after going silent post-abandonment — reclaim abandoned work or it is reassigned to other agents`);
+    hints.push(`${s.reassigned} task(s) were taken from this label after going silent post-abandonment — reclaim abandoned work or it is reassigned to other agents`);
   score += Math.min(15, s.asks_answered_on_time * 3);
   if (s.asks_received >= 2 && s.asks_answered_on_time === 0)
-    hints.push("asks addressed to you went unanswered — they block other agents; answer or redirect them");
+    hints.push("asks addressed to this label went unanswered — they block other agents; any session on it can answer or redirect");
   score += Math.min(10, s.artefacts_created * 2);
   if (s.artefacts_created === 0)
-    hints.push("no artefacts created in the last 7 days — outcomes belong in Knowledge, not session memory");
+    hints.push("no artefacts created under this label in the last 7 days — outcomes belong in Knowledge, not session memory");
   score -= Math.min(10, s.thin_notes * 2);
   if (s.thin_notes > 2)
-    hints.push(`${s.thin_notes} progress notes looked like padding — write what actually happened`);
+    hints.push(`${s.thin_notes} progress notes on this label looked like padding — write what actually happened`);
   // verification duty: unclaimed verify tasks park an implementer in in_review.
   // role:review agents carry the pool's review duty — stalled verify rounds cost
   // them score, the same shape as unanswered asks.
   if (s.verify_duty_backlog > 0) {
     score -= Math.min(20, s.verify_duty_backlog * 10);
-    hints.push(`${s.verify_duty_backlog} stalled verify task(s) are unclaimed and blocking their parent's owner — pick one up: check receipts, close or bounce the parent`);
+    hints.push(`${s.verify_duty_backlog} stalled verify task(s) are unclaimed and blocking their parent's owner — this label carries role:review, so its sessions pick one up: check receipts, close or bounce the parent`);
   }
   // BR#5517 train-red blame: a stop-the-line episode whose culprit card this
   // agent's sessions executed (impl or verify leg) costs each of those
@@ -1077,7 +1079,7 @@ export function scoreAgent(raw: AgentSignals): { score: number; grade: string; h
   // already on the card, capped so one bad night cannot zero an agent.
   if (s.train_red > 0) {
     score -= Math.min(15, s.train_red * 5);
-    hints.push(`${s.train_red} stop-the-line episode(s) were blamed on a card your sessions executed (impl/verify) — a train_red ding: fix the culprit card and the train_red signal stays until the episode is exonerated`);
+    hints.push(`${s.train_red} stop-the-line episode(s) were blamed on a card sessions on this label executed (impl/verify) — a train_red ding: fix the culprit card and the train_red signal stays until the episode is exonerated`);
   }
 
   score = Math.max(0, Math.min(100, Math.round(score)));

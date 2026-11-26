@@ -1817,4 +1817,153 @@ describe("GH#489 train.pardon — operator-only retroactive exoneration", () => 
     expect(String(body.error)).toMatch(/gate: no unpardoned train_red_ding/);
   });
 });
+
+// GH#492 — score explainability: the hub told agents THAT they were dinged
+// (orient score + hints) but never WHICH events fed it. score.explain is the
+// EXPLAIN: the exact deduped event rows computeAgentScores counts for a
+// label, the counters they produced and the derived score — mirrored query
+// for query, read-only, no new authority.
+describe("GH#492 score.explain — the raw events behind the score", () => {
+  it("returns the deduped event rows, the observed_by stamp rides the watchdog row, and its signals equal the board row's", async () => {
+    const label = "gh492-scorer";
+    const tok = await kbJson("/admin.mint", { label, tags: [] });
+    expect(tok.status).toBe(200);
+    const { body: card } = await kbJson("/create", { type: "task", title: "GH#492 score specimen" });
+    const claim = await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: label, token_id: tok.body.id, session: "gh492-sess" });
+    expect(claim.status).toBe(200);
+    const p1 = await kbJson("/progress.log", { id: card.id, note: "did the thing with full gauges", completion_pct: 40, confidence_pct: 70, risk_pct: 20, context_pct: 30, actor: label, token_id: tok.body.id, session: "gh492-sess" });
+    const p2 = await kbJson("/progress.log", { id: card.id, note: "ok", actor: label, token_id: tok.body.id, session: "gh492-sess" });
+    expect(p1.status).toBe(200);
+    expect(p2.status).toBe(200);
+    // a real artefact (≥200-char body) created by the label — create only
+    // carries `owner` through on tasks, so the specimen is a task
+    const art = await kbJson("/create", { type: "task", title: "GH#492 artefact specimen", body_md: "x".repeat(250), owner: label });
+    expect(art.status).toBe(200);
+    // an ask addressed to the label, answered on time by it
+    const ask = await kbJson("/ask.create", { to: label, question: "GH#492: can you take the follow-up?", options: ["GO", "NO-GO"], actor: "gh492-asker" });
+    expect(ask.status).toBe(200);
+    const ans = await kbJson("/ask.answer", { id: ask.body.id, answer: "GO", actor: label });
+    expect(ans.status).toBe(200);
+    // a watchdog release classed completed_result_lost on a card the label claimed
+    const { body: card2 } = await kbJson("/create", { type: "task", title: "GH#492 lost-report specimen" });
+    const claim2 = await kbJson("/transition", { id: card2.id, to: "in_progress", note: "claim", actor: label, token_id: tok.body.id, session: "gh492-sess-b" });
+    expect(claim2.status).toBe(200);
+    // outlive the 5s mutation dedupe: a paired audit folds into a same-key
+    // mutation row written <5s ago, and the folded row carries no
+    // result_class/released_owner — the release needs its own signal row
+    await new Promise((r) => setTimeout(r, 5_500));
+    const rel = await kbJson("/transition", {
+      id: card2.id, to: "todo", actor: "system:watchdog",
+      note: "stalled; completed_result_lost — receipt https://github.com/a/b/pull/1",
+      observed_by: "gh492-sess-b", result_class: "completed_result_lost",
+    });
+    expect(rel.status).toBe(200);
+    // the stamp (GH#494 half): the event detail names the observing session
+    const exWd = await kbJson("/score.explain", { label, kinds: ["watchdog_transition"] });
+    const wd = exWd.body.events.find((e: any) => e.artefact_id === card2.id);
+    expect(wd).toBeTruthy();
+    expect(wd.counts).toBe("result_lost");
+    expect(wd.observed_by).toBe("gh492-sess-b");
+
+    const ex = await kbJson("/score.explain", { label });
+    expect(ex.body.signals.progress_count).toBe(2);
+    expect(ex.body.signals.gauge_count).toBe(1);
+    expect(ex.body.signals.thin_notes).toBe(1);
+    expect(ex.body.signals.result_lost).toBe(1);
+    expect(ex.body.signals.abandoned).toBe(0);
+    expect(ex.body.signals.reassigned).toBe(0);
+    expect(ex.body.signals.asks_received).toBe(1);
+    expect(ex.body.signals.asks_answered_on_time).toBe(1);
+    expect(ex.body.signals.artefacts_created).toBe(1);
+    const kinds = new Set(ex.body.events.map((e: any) => e.kind));
+    for (const k of ["progress", "watchdog_transition", "artefact_created", "ask_received", "ask_answered_on_time"])
+      expect(kinds.has(k), `missing kind ${k}`).toBe(true);
+    // since_ts narrows (never widens); kinds filters
+    const narrow = await kbJson("/score.explain", { label, since_ts: Date.now() + 60_000 });
+    expect(narrow.body.events.length).toBe(0);
+    const only = await kbJson("/score.explain", { label, kinds: ["progress"] });
+    expect(only.body.events.length).toBe(2);
+    expect(only.body.events.every((e: any) => e.kind === "progress")).toBe(true);
+    // DRIFT-GUARD: explain's signals must equal computeAgentScores' — the
+    // board row (same isolate, same data). Poll GET /board (its payload has
+    // the agents score rows) until both sides read fresh.
+    const fields = Object.keys(ex.body.signals);
+    let matched = false, lastDiff = "";
+    for (let i = 0; i < 22 && !matched; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const [bResp, fresh] = await Promise.all([kb("/board"), kbJson("/score.explain", { label })]);
+      const board = await bResp.json() as any;
+      const row = (board.agents ?? []).find((a: any) => a.label === label);
+      if (!row) { lastDiff = "no board row"; continue; }
+      const diff = fields.filter((f) => row[f] !== fresh.body.signals[f]);
+      if (!diff.length && row.score === fresh.body.score.score && row.grade === fresh.body.score.grade) matched = true;
+      else lastDiff = `diff: ${diff.join(",")} row.score=${row.score} ex.score=${fresh.body.score.score}`;
+    }
+    expect(matched, lastDiff).toBe(true);
+  }, 75_000);
+});
+
+// GH#494 — the acked delivery contract: a result transition is recorded
+// BEFORE it applies, the response carries delivery_id, replaying the id is
+// an idempotent no-op (the loss class is the response, never a double-apply),
+// and the redelivery owner (gateway credential / admin web plane) re-drives
+// unacked deliveries instead of nobody owning the retry.
+describe("GH#494 acked delivery contract + redrive", () => {
+  const kbNoAdmin = async (path: string, body: unknown): Promise<{ status: number; body: any }> => {
+    const r = await kb(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(executorRequest(body)) });
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+
+  it("transition carries delivery_id; replay is idempotent; the gateway redrive verifies and acks", async () => {
+    const tok = await kbJson("/admin.mint", { label: "gh494-driver", tags: [] });
+    const { body: card } = await kbJson("/create", { type: "task", title: "GH#494 delivery specimen" });
+    const t1 = await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim", actor: "gh494-driver", token_id: tok.body.id, session: "gh494-sess" });
+    expect(t1.status).toBe(200);
+    expect(String(t1.body.delivery_id)).toMatch(/^[\da-f-]{36}$/);
+    // the receipt is queryable, session-scoped
+    const pend = await kbJson("/delivery.pending", { sessions: ["gh494-sess"] });
+    const mine = pend.body.deliveries.find((d: any) => d.delivery_id === t1.body.delivery_id);
+    expect(mine).toBeTruthy();
+    expect(mine.status).toBe("applied");
+    expect(mine.artefact_id).toBe(card.id);
+    // replaying the SAME id + session replays the recorded result — no re-apply
+    const t2 = await kbJson("/transition", { id: card.id, to: "in_progress", note: "claim-again", delivery_id: t1.body.delivery_id, actor: "gh494-driver", token_id: tok.body.id, session: "gh494-sess" });
+    expect(t2.status).toBe(200);
+    expect(t2.body.redelivered).toBe(true);
+    // another session's receipt is refused — never leaked across claims
+    const t3 = await kbJson("/transition", { id: card.id, to: "in_review", note: "steal receipt", delivery_id: t1.body.delivery_id, actor: "gh494-driver", token_id: tok.body.id, session: "gh494-sess-other" });
+    expect(t3.status).toBe(400);
+    // the redelivery owner verifies the applied row and acks it
+    const gw = await kbJson("/admin.mint", { label: "gh494-gw", tags: ["gateway"] });
+    const rv = await kbJson("/delivery.redrive", { delivery_id: t1.body.delivery_id, token_id: gw.body.id, actor: "gh494-gw" });
+    expect(rv.status).toBe(200);
+    expect(rv.body.state).toBe("verified");
+    const pend2 = await kbJson("/delivery.pending", {});
+    expect(pend2.body.deliveries.find((d: any) => d.delivery_id === t1.body.delivery_id)).toBeUndefined();
+    const rv2 = await kbJson("/delivery.redrive", { delivery_id: t1.body.delivery_id, token_id: gw.body.id, actor: "gh494-gw" });
+    expect(rv2.body.state).toBe("acked");
+  });
+
+  it("a gate-refused apply stays pending for redrive → superseded; bare agents cannot redrive", async () => {
+    const tok = await kbJson("/admin.mint", { label: "gh494-b", tags: [] });
+    const gw = await kbJson("/admin.mint", { label: "gh494-gw2", tags: ["gateway"] });
+    const { body: card } = await kbJson("/create", { type: "task", title: "GH#494 pending specimen" });
+    // recorded BEFORE apply → the illegal lifecycle edge (todo → in_review)
+    // leaves a pending delivery carrying the recorded intent
+    const refused = await kbJson("/transition", { id: card.id, to: "in_review", note: "illegal edge specimen", delivery_id: "gh494-manual-1", actor: "gh494-b", token_id: tok.body.id, session: "gh494-sess-b" });
+    expect(refused.status).toBe(400);
+    const pend = await kbJson("/delivery.pending", {});
+    expect(pend.body.deliveries.find((d: any) => d.delivery_id === "gh494-manual-1")?.status).toBe("pending");
+    // a bare agent token is NOT the redelivery owner
+    const bare = await kbNoAdmin("/delivery.redrive", { delivery_id: "gh494-manual-1", token_id: tok.body.id, actor: "gh494-b" });
+    expect(bare.status).toBe(400);
+    expect(String(bare.body.error)).toContain("gate: delivery.redrive");
+    // the gateway re-executes the recorded payload → the same gate refuses → superseded, acked
+    const rv = await kbJson("/delivery.redrive", { delivery_id: "gh494-manual-1", token_id: gw.body.id, actor: "gh494-gw2" });
+    expect(rv.status).toBe(200);
+    expect(rv.body.state).toBe("superseded");
+    const pend2 = await kbJson("/delivery.pending", {});
+    expect(pend2.body.deliveries.find((d: any) => d.delivery_id === "gh494-manual-1")).toBeUndefined();
+  });
+});
 import { completeExecutionReview } from "./completion-fixture";

@@ -238,7 +238,7 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
   transition: {
     description: `Move artefact status under its lifecycle. Per type: ${Object.entries(LIFECYCLES)
       .map(([t, m]) => `${t}: ${Object.entries(m as Record<string, string[]>).map(([f, tos]) => `${f}→${tos.join("|")}`).join(", ")}`)
-      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned. BR#6432 batch disposition: an agent cannot supersede directly (BR#2480), but when a human has ANSWERED a batch-authorization ask ("SUPERSEDE all N …", receipts in the ask body), you may apply it per target: transition {id: "<target>", to: "superseded", batch_auth: {ask: "BR#N"}} — the hub verifies the human answer server-side, checks the target is named in the ask's census and still an open park, executes the drop as system:question(<answered_by>), and stamps meta.batch_auth provenance. Recheck each target's live state FIRST — the old ruling only applies while its predicate still holds.`,
+      .join("; ")}. Moving to blocked REQUIRES note (reason) + a typed await_event from the closed grammar — pass await_event directly ({event:"ask",ask_id:"BR#N"} | {event:"time",until_ts:<epoch ms>} | {event:"pr_merged",repo,n} | {event:"br_done",id} | …), or an unblock_condition citing it as prose: "Machine proxy (typed await_event ask ask_id=BR#N): …" parses to the same typed event (BR#4062). No dead-end cards. For a long/handed-off op (re-index, deploy, background batch): transition {to: "blocked", class: "subprocess", note, unblock_condition, budget_minutes} — watchdog paused until the budget lapses; past it the block converts to abandoned. BR#6432 batch disposition: an agent cannot supersede directly (BR#2480), but when a human has ANSWERED a batch-authorization ask ("SUPERSEDE all N …", receipts in the ask body), you may apply it per target: transition {id: "<target>", to: "superseded", batch_auth: {ask: "BR#N"}} — the hub verifies the human answer server-side, checks the target is named in the ask's census and still an open park, executes the drop as system:question(<answered_by>), and stamps meta.batch_auth provenance. Recheck each target's live state FIRST — the old ruling only applies while its predicate still holds. GH#494 delivery law: deliver your result transition BEFORE composing your closing message — a dropped final call has no live caller left to retry it. The response carries delivery_id (the hub's delivery receipt): re-posting the SAME delivery_id is an idempotent replay of the recorded result, never a double-apply.`,
     schema: TOOL_ARG_SCHEMAS.transition,
     handler: async (args, ctx) => text(JSON.stringify({
       ...await ctx.call("transition", { ...args, session: args.session ?? ctx.sessionName, token_id: ctx.identity.token_id }),
@@ -340,6 +340,17 @@ export const TOOL_TABLE: ToolTable = defineToolTable({
     description: "Answer an ask from your inbox. The answer must be the EXACT label of one of the ask's options (trimmed equality) — typed choice dispatch, BR#22008: free text is recorded as commentary and never drives any workflow; a decision ask with no exact label match holds. Decision + exact match applies the choice's typed action (supersede/release/close/clear_hold/hold) through the legal lifecycle edges server-side.",
     schema: TOOL_ARG_SCHEMAS.answer_ask,
     handler: async (args, ctx) => text(JSON.stringify(await ctx.call("ask.answer", { id: args.id, answer: args.answer }))),
+  },
+  // GH#492 — score explainability: the hub tells you THAT you were dinged
+  // (orient score + hints); this tells you WHICH events fed it.
+  score_explain: {
+    description: "EXPLAIN for the behaviour score: the raw, deduped event rows computeAgentScores counts for a label — progress notes (7d), system:watchdog transitions (48h) with their result_class, reassigns (48h), train_red_dings (7d, pardons applied), real artefact creations (7d), asks received / answered on time (7d) — plus the exact counters they produced, the score, grade and hints derived from them. label defaults to your own; since_ts narrows within the scoring windows (it never widens them); kinds filters. Read-only: exposes only what the score already reads. When orient flags a deduction, run this before complaining — the rows are the evidence.",
+    schema: TOOL_ARG_SCHEMAS.score_explain,
+    handler: async (args, ctx) => text(JSON.stringify(await ctx.call("score.explain", {
+      label: args.label ?? ctx.identity.label,
+      since_ts: args.since_ts,
+      ...(args.kinds ? { kinds: args.kinds } : {}),
+    }), null, 1)),
   },
   // ---- merge train (BR#3516/BR#3517) — executor-facing: bridge train.
   // Division of labour: the EXECUTOR fetches GitHub facts and performs the

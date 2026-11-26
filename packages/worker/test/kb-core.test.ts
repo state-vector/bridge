@@ -276,6 +276,16 @@ describe("agent behaviour score", () => {
     expect(many.score).toBe(35); // min(15, 5×5) — capped, one bad night ≠ zero
     expect(many.hints.join(" ")).toMatch(/5 stop-the-line episode/);
   });
+
+  it("GH#492: hints address the LABEL, not 'you' — all of a label's sessions score together", () => {
+    const r = scoreAgent({ ...zero, abandoned: 1, reassigned: 1, thin_notes: 3, train_red: 1, asks_received: 3, asks_answered_on_time: 0 });
+    const joined = r.hints.join(" ");
+    expect(joined).toMatch(/watchdog-blocked/); // the canonical substrings survive the rewording
+    expect(joined).toMatch(/under this label/);
+    expect(joined).toMatch(/taken from this label/);
+    expect(joined).toMatch(/sessions on this label/);
+    expect(joined).not.toMatch(/your /); // the misleading second-person scope is gone
+  });
 });
 
 describe("BR#3352 completed_result_lost — session-trail classification", () => {

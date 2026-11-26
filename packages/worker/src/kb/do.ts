@@ -1856,9 +1856,15 @@ export class KnowledgeHub {
       // and flags the delivery channel instead of punishing the agent.
       let trail: ResultTrail | null = null;
       try {
+        // GH#494: trail receipts persist across claims — without a claim window
+        // this read classified a fresh claim's release from a PRIOR claim's
+        // progress notes (the "two completed_result_lost events on one card"
+        // ambiguity: both events citing the same old receipts). Only progress
+        // written under the CURRENT claim (since status_ts — the claim's own
+        // clock) may classify it.
         const notes = (this.state.storage.sql.exec(
-          `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' ORDER BY seq DESC LIMIT 20`,
-          r.id,
+          `SELECT summary FROM ledger WHERE artefact_id = ? AND kind = 'mutation' AND action = 'progress' AND ts >= ? ORDER BY seq DESC LIMIT 20`,
+          r.id, r.status_ts ?? 0,
         ).toArray() as any[]).map((x) => String(x.summary ?? ""));
         const sess = meta.session
           ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session))
@@ -1878,8 +1884,12 @@ export class KnowledgeHub {
       await this.transition({
         id: r.id, to: "todo",
         note: trail
-          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
+          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}${trail.session ? `; observed under session ${trail.session}` : ""}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
           : `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
+        // GH#494: the observing session rides the event detail — two
+        // completed_result_lost events on one card are disambiguated by WHICH
+        // session's claim-window trail each classification read.
+        ...(trail?.session ? { observed_by: trail.session } : {}),
         ...(trail ? { result_class: "completed_result_lost" } : {}),
       }, "system:watchdog");
       } catch (e) {
@@ -3956,14 +3966,19 @@ export class KnowledgeHub {
     // result_class "completed_result_lost" is a delivery-channel incident
     // (the run happened, the report was lost) — it must not count as
     // abandonment. Every other watchdog transition still does.
+    // GH#492: attribute from the EVENT, not the artefact's current owner —
+    // a release clears the owner in the same write, so the join alone
+    // attributed real releases to "unknown" (and, worse, a card re-claimed
+    // inside the window re-attributed the OLD release to the NEW claimant).
+    // The release stamps released_owner (the pre-release claim owner).
     for (const r of this.state.storage.sql.exec(
       `SELECT a.owner AS owner, e.detail AS detail FROM events e JOIN artefacts a ON a.id = e.artefact_id
        WHERE e.op = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ?`,
       recentTs,
     ).toArray() as any[]) {
-      const s = sig(r.owner || "unknown");
       let d: any = {};
       try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+      const s = sig(String(d?.released_owner || r.owner || "") || "unknown");
       if (d?.result_class === "completed_result_lost") s.result_lost++;
       else if (d?.result_class === PROXY_WAIT_HOLD_RESULT_CLASS) {
         // BR#4067: a hold-park preserves a machine wait (train queue slot /
@@ -4022,19 +4037,37 @@ export class KnowledgeHub {
        WHERE created_ts >= ? AND LENGTH(body_md) >= 200 AND owner != '' GROUP BY owner`,
       weekTs,
     ).toArray() as any[]) sig(r.owner).artefacts_created += r.n;
+    // GH#492: asks are question NODES now — askCreate no longer writes the
+    // legacy asks table, so counters that read it were permanently zero (no
+    // credit for on-time answers, no unanswered hint ever fired). The node
+    // store is the one source: an ask is yours iff it targets `any`, your
+    // label (or label@session), or one of your capability tags — the same
+    // BR#3578 grammar the inbox uses. Recipients resolve once per node.
+    const nodeAsks = (this.state.storage.sql.exec(
+      `SELECT id, title, created_ts, meta, status FROM artefacts
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked','done') AND created_ts >= ?
+       AND json_extract(meta, '$.ask.to') IS NOT NULL`,
+      weekTs,
+    ).toArray() as any[]).map((n) => {
+      const m = JSON.parse(n.meta ?? "{}");
+      return {
+        id: String(n.id), title: String(n.title ?? ""), created_ts: Number(n.created_ts), status: String(n.status),
+        to: this.askRecipient(m.ask), from: String(m.ask?.from ?? ""),
+        answered_by: m.ask?.answered_by == null ? null : String(m.ask.answered_by),
+        answered_ts: Number(m.ask?.answered_ts ?? 0),
+      };
+    });
     for (const t of tokens) {
       const s = sig(t.label);
       const tags: string[] = parseTags(t.tags);
       const targets = ["any", t.label, ...tags.map((x: string) => `tag:${x}`)];
-      const marks = targets.map(() => "?").join(",");
-      s.asks_received = this.one(
-        `SELECT COUNT(*) AS n FROM asks WHERE status IN ('open','answered') AND from_label != ?
-         AND created_ts >= ? AND to_target IN (${marks})`, t.label, weekTs, ...targets,
-      )?.n ?? 0;
-      s.asks_answered_on_time = this.one(
-        `SELECT COUNT(*) AS n FROM asks WHERE status = 'answered' AND answered_by = ? AND answered_ts IS NOT NULL
-         AND answered_ts - created_ts <= ${30 * 60_000} AND created_ts >= ?`, t.label, weekTs,
-      )?.n ?? 0;
+      for (const a of nodeAsks) {
+        const mine = a.to === "any" || a.to === t.label || String(a.to).startsWith(`${t.label}@`) || targets.includes(a.to);
+        if (!mine || a.from === t.label) continue;
+        s.asks_received++;
+        if (a.status === "done" && a.answered_by === t.label && a.answered_ts > 0
+          && a.answered_ts - a.created_ts <= 30 * 60_000) s.asks_answered_on_time++;
+      }
       // verification duty backlog: role:review agents carry the pool's stalled
       // verify rounds — each one is an implementer parked in in_review.
       if (tags.includes("role:review")) {
@@ -4049,6 +4082,181 @@ export class KnowledgeHub {
       .filter(([label]) => !/^(system:|web$)/.test(label))
       .map(([label, s]) => ({ label, ...s, ...scoreAgent(s) }))
       .sort((a, b) => b.score - a.score);
+  }
+
+  /** GH#492 — the EXPLAIN for the behaviour score. Returns the raw, deduped
+   *  event rows computeAgentScores counts for ONE label, the counters they
+   *  produced and the derived score/grade/hints. Read-only and deliberately
+   *  uncached: it exposes only what the score already reads, mirrored query
+  *  for query — same windows (progress/asks/dings/artefact creations: 7d;
+   *  watchdog transitions & reassigns: 48h), same predicates, same dedupe.
+   *  A drift between this and computeAgentScores is a test failure
+   *  (do.test.ts asserts signals equality against the board row), not a
+   *  silent divergence. since_ts only NARROWS within the scoring windows —
+   *  explaining a score can never widen them. */
+  private scoreExplain(body: any, actor: string) {
+    const label = String(body.label ?? actor ?? "").trim();
+    if (!label) throw new Error("score.explain needs label (or an authenticated actor label)");
+    const kinds = Array.isArray(body.kinds) ? body.kinds.map(String) : null;
+    const want = (k: string) => !kinds || kinds.includes(k);
+    const now = Date.now();
+    const weekTs = now - 7 * 24 * 60 * 60_000;
+    const recentTs = now - 48 * 60 * 60_000;
+    const sinceRaw = Number(body.since_ts);
+    const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
+    const weekFloor = Math.max(since, weekTs);
+    const recentFloor = Math.max(since, recentTs);
+    const events: any[] = [];
+    const push = (row: any) => events.push(row);
+    const signals = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
+
+    // progress ledger rows (RECENT_PROGRESS_SQL's row set, label-scoped)
+    if (want("progress")) {
+      for (const p of this.state.storage.sql.exec(
+        `SELECT artefact_id, ts, data FROM ledger WHERE kind = 'mutation' AND action = 'progress' AND actor = ? AND ts >= ?`,
+        label, weekFloor,
+      ).toArray() as any[]) {
+        const d = JSON.parse(p.data ?? "{}");
+        const gauge = d.completion_pct != null || d.confidence_pct != null || d.risk_pct != null;
+        const thin = String(d.note ?? "").trim().length < 10;
+        signals.progress_count++;
+        if (gauge) signals.gauge_count++;
+        if (thin) signals.thin_notes++;
+        push({ kind: "progress", ts: p.ts, artefact_id: p.artefact_id, note: String(d.note ?? "").slice(0, 160), gauges: gauge ? { completion_pct: d.completion_pct, confidence_pct: d.confidence_pct, risk_pct: d.risk_pct, context_pct: d.context_pct } : undefined, thin });
+      }
+    }
+    // watchdog transitions naming this label — attributed from the event's
+    // released_owner when present (the release clears the artefact owner),
+    // falling back to the current owner for pre-stamp events (GH#492)
+    if (want("watchdog_transition")) {
+      for (const r of this.state.storage.sql.exec(
+        `SELECT e.artefact_id AS artefact_id, e.ts AS ts, e.data AS detail, a.owner AS owner FROM ledger e
+         JOIN artefacts a ON a.id = e.artefact_id
+         WHERE e.kind = 'signal' AND e.action = 'transition' AND e.actor = 'system:watchdog' AND e.ts >= ?
+           AND (a.owner = ? OR json_extract(e.data, '$.released_owner') = ?)`,
+        recentFloor, label, label,
+      ).toArray() as any[]) {
+        let d: any = {};
+        try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+        if (String(d?.released_owner || r.owner || "") !== label) continue; // pre-stamp rows attributed by current owner only
+        const counts = d?.result_class === "completed_result_lost" ? "result_lost"
+          : d?.result_class ? "none" // proxy_wait_hold / bounce_reentry_demote / machine_wait_stall — no-counter classes (BR#4067/BR#4494/GH#491)
+          : "abandoned";
+        if (counts === "result_lost") signals.result_lost++;
+        else if (counts === "abandoned") signals.abandoned++;
+        push({ kind: "watchdog_transition", ts: r.ts, artefact_id: r.artefact_id, result_class: d?.result_class ?? null, counts, note: String(d?.note ?? "").slice(0, 160), observed_by: d?.observed_by ?? null, released_session: d?.released_session ?? null });
+      }
+    }
+    // reassigns away from this label
+    if (want("reassign")) {
+      for (const r of this.state.storage.sql.exec(
+        `SELECT artefact_id, ts, data AS detail FROM ledger WHERE kind = 'signal' AND action = 'reassign' AND ts >= ?`,
+        recentFloor,
+      ).toArray() as any[]) {
+        let d: any = {};
+        try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+        if (String(d?.prev_owner ?? "") !== label) continue;
+        signals.reassigned++;
+        push({ kind: "reassign", ts: r.ts, artefact_id: r.artefact_id, prev_owner: d?.prev_owner });
+      }
+    }
+    // train_red dings naming this label — with the pardon/culprit dedupe mirrored
+    if (want("train_red_ding")) {
+      const pardons = new Set<string>();
+      for (const r of this.state.storage.sql.exec(
+        `SELECT data AS detail FROM ledger WHERE kind = 'signal' AND action = 'train_red_pardon' AND ts >= ?`,
+        weekFloor,
+      ).toArray() as any[]) {
+        let d: any = {};
+        try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+        if (d?.sha && d?.culprit) pardons.add(`${d.sha}:${d.culprit}`);
+      }
+      for (const r of this.state.storage.sql.exec(
+        `SELECT artefact_id, ts, data AS detail FROM ledger WHERE kind = 'signal' AND action = 'train_red_ding' AND ts >= ?`,
+        weekFloor,
+      ).toArray() as any[]) {
+        let d: any = {};
+        try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
+        if (!d?.sha || !d?.culprit) continue;
+        const agents: string[] = Array.isArray(d.agents) ? d.agents.map(String) : [];
+        if (!agents.includes(label)) continue;
+        const pardoned = pardons.has(`${d.sha}:${d.culprit}`);
+        const mismatch = String(d.culprit) !== String(r.artefact_id ?? "");
+        if (!pardoned && !mismatch) signals.train_red++;
+        push({ kind: "train_red_ding", ts: r.ts, artefact_id: r.artefact_id, sha: d.sha, counted: !pardoned && !mismatch, ...(pardoned ? { why_not: "pardoned — episode exonerated" } : mismatch ? { why_not: "culprit mismatch — ding belongs to another card" } : {}) });
+      }
+    }
+    // real artefact creations (≥200-char body)
+    if (want("artefact_created")) {
+      for (const r of this.state.storage.sql.exec(
+        `SELECT id AS artefact_id, created_ts AS ts, type, title FROM artefacts
+         WHERE created_ts >= ? AND owner = ? AND LENGTH(body_md) >= 200`,
+        weekFloor, label,
+      ).toArray() as any[]) {
+        signals.artefacts_created++;
+        push({ kind: "artefact_created", ts: r.ts, artefact_id: r.artefact_id, type: r.type, title: String(r.title ?? "").slice(0, 100) });
+      }
+    }
+    // asks received / answered on time — GH#492: asks are question NODES
+    // (askCreate no longer writes the legacy asks table), so this section
+    // reads the same node store as computeAgentScores, with the same
+    // BR#3578 targets grammar. Recipients resolve once per node.
+    const tokenRows = this.state.storage.sql.exec(
+      `SELECT tags FROM auth_tokens WHERE label = ? AND revoked_ts IS NULL`,
+      label,
+    ).toArray() as any[];
+    const askTargets = (tags: string) => parseTags(tags);
+    const nodeAsks = (this.state.storage.sql.exec(
+      `SELECT id, title, created_ts, meta, status FROM artefacts
+       WHERE type = 'question' AND status IN ('todo','in_progress','blocked','done') AND created_ts >= ?
+       AND json_extract(meta, '$.ask.to') IS NOT NULL`,
+      weekFloor,
+    ).toArray() as any[]).map((n) => {
+      const m = JSON.parse(n.meta ?? "{}");
+      return {
+        id: String(n.id), title: String(n.title ?? ""), created_ts: Number(n.created_ts), status: String(n.status),
+        to: this.askRecipient(m.ask), from: String(m.ask?.from ?? ""),
+        answered_by: m.ask?.answered_by == null ? null : String(m.ask.answered_by),
+        answered_ts: Number(m.ask?.answered_ts ?? 0),
+      };
+    });
+    for (const t of tokenRows) {
+      const targets = ["any", label, ...askTargets(t.tags).map((x: string) => `tag:${x}`)];
+      for (const a of nodeAsks) {
+        const mine = a.to === "any" || a.to === label || String(a.to).startsWith(`${label}@`) || targets.includes(a.to);
+        if (!mine || a.from === label) continue;
+        if (want("ask_received")) {
+          signals.asks_received++;
+          push({ kind: "ask_received", ts: a.created_ts, ask_id: a.id, from_label: a.from, status: a.status, question: a.title.slice(0, 160) });
+        }
+        if (want("ask_answered_on_time") && a.status === "done" && a.answered_by === label && a.answered_ts > 0
+          && a.answered_ts - a.created_ts <= 30 * 60_000) {
+          signals.asks_answered_on_time++;
+          push({ kind: "ask_answered_on_time", ts: a.answered_ts, ask_id: a.id, created_ts: a.created_ts });
+        }
+      }
+      // verification duty backlog: live pool state, not an event — role:review only
+      const tags: string[] = parseTags(t.tags);
+      if (tags.includes("role:review")) {
+        signals.verify_duty_backlog = this.one(
+          `SELECT COUNT(*) AS n FROM relations r JOIN artefacts c ON c.id = r.src_id JOIN artefacts p ON p.id = r.dst_id
+           WHERE r.relation = 'child_of' AND c.type = 'task' AND c.status = 'todo' AND c.owner = ''
+           AND c.roles LIKE '%"review"%' AND p.status = 'in_review'`,
+        )?.n ?? 0;
+      }
+    }
+    events.sort((a, b) => b.ts - a.ts);
+    const truncated = events.length > 500;
+    return {
+      label,
+      now_ts: now,
+      window: { week_ts: weekTs, recent_ts: recentTs, note: "progress / asks / train_red dings / artefact creations: trailing 7d; watchdog transitions & reassigns: trailing 48h; since_ts narrows within these, never widens" },
+      signals,
+      verify_duty_backlog: signals.verify_duty_backlog,
+      score: scoreAgent(signals),
+      events: truncated ? events.slice(0, 500) : events,
+      ...(truncated ? { events_truncated: true } : {}),
+    };
   }
 
   /** BR#5517 blame resolution: the agent labels that executed a culprit
@@ -4472,6 +4680,29 @@ export class KnowledgeHub {
         created_ts INTEGER NOT NULL,
         answered_ts INTEGER
       );
+      -- GH#494 acked delivery contract: every result-bearing client transition
+      -- is recorded BEFORE it applies and stamped after — the receipt turns a
+      -- lost final report from "unrecoverable" into "re-drivable": the
+      -- gateway's reconciliation lists pending rows for the sessions it hosts
+      -- (delivery.pending) and re-drives them (delivery.redrive). Re-posting
+      -- the same delivery_id is an idempotent replay of the recorded result,
+      -- never a double-apply. status: pending (recorded, apply not confirmed)
+      -- | applied | superseded (redrive found the card moved past it).
+      CREATE TABLE IF NOT EXISTS deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        session TEXT NOT NULL DEFAULT '',
+        label TEXT NOT NULL DEFAULT '',
+        op TEXT NOT NULL,
+        artefact_id TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL DEFAULT '{}',
+        result TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_ts INTEGER NOT NULL,
+        applied_ts INTEGER,
+        redriven_ts INTEGER,
+        acked_ts INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_deliveries_session ON deliveries (session, created_ts);
     `);
     mark("baseline_ddl");
 
@@ -5306,7 +5537,7 @@ export class KnowledgeHub {
         // a shrinking update is rejected; DELETE + re-INSERT binds only small
         // values). See artefactSlim for the guard set.
         case "slim": return this.json(await this.artefactSlim(body, actor));
-        case "transition": return this.json(await this.transition(body, actor, "client"));
+        case "transition": return this.json(await this.recordedTransition(body, actor));
         case "claim.takeover": return this.json(await this.claimTakeover(body, actor));
         case "supersede.task": return this.json(await this.supersedeTask(body, actor));
         case "card.force_review": return this.json(await this.cardForceReview(body, actor));
@@ -5320,6 +5551,8 @@ export class KnowledgeHub {
         case "relations": return this.json(await this.relations(String(body.id)));
         case "stats": return this.json(await this.stats(body));
         case "get_history": return this.json(await this.getHistory(String(body.id ?? ""), Number(body.limit ?? 100)));
+        // GH#492 — the score's raw-events query (read-only, no new authority)
+        case "score.explain": return this.json(this.scoreExplain(body, actor));
         // ---- merge train (BR#3516/BR#3517): executor-fed facts, hub decides ----
         case "train.lease": return this.json(await this.trainLease(body, actor));
         case "train.event": return this.json(await this.trainEvent(body, actor));
@@ -5350,6 +5583,9 @@ export class KnowledgeHub {
         case "reconcile.report": return this.json(await this.reconcileReport(body, actor));
         case "reconcile.status": return this.json(await this.reconcileStatus(body));
         case "reconcile.ignore": return this.json(await this.reconcileIgnore(body, actor));
+        // ---- GH#494 delivery redelivery: the gateway's reconciliation feeds ----
+        case "delivery.pending": return this.json(this.deliveryPending(body));
+        case "delivery.redrive": return this.json(await this.deliveryRedrive(body, actor, isAdmin));
         // ---- proxy verification probes (BR#4658): the executor polls the
         // sweep-enqueued probes, runs gh first-hand, feeds verdicts back —
         // executor-fed facts, hub-decided ----
@@ -8605,6 +8841,147 @@ export class KnowledgeHub {
     return response;
   }
 
+  // ---- GH#494: the acked delivery contract for result-bearing client ops ----
+  // The interactive end-of-run loss class: a session's final transition is its
+  // last act — if the transport drops it, no process exists to re-post it, and
+  // the watchdog release + re-claim cycle is the only recovery. The contract:
+  // record the delivery BEFORE applying, stamp the recorded result after, hand
+  // back delivery_id. A client re-posting the SAME delivery_id gets the
+  // recorded result replayed (idempotent — the loss class is the response,
+  // never a double-apply), and the gateway's reconciliation re-drives unacked
+  // deliveries for the sessions it hosts (delivery.pending / delivery.redrive)
+  // instead of nothing owning the redelivery. progress.log is deliberately
+  // NOT ledgered here: its rows are already durable in the ledger before its
+  // response is written, so a lost progress response has no unrecoverable
+  // window worth a second write on the hottest op.
+
+  /** The ONE seam every client-plane result transition flows through. */
+  private async recordedTransition(body: any, actor: string) {
+    const session = String(body.session ?? "");
+    // Idempotent replay: an existing delivery_id owned by THIS session returns
+    // the recorded result without re-applying. Another session's delivery_id
+    // is refused — a receipt is never leaked across claims.
+    const clientId = String(body.delivery_id ?? "").trim();
+    if (clientId) {
+      const existing = this.one(`SELECT delivery_id, session, status, result FROM deliveries WHERE delivery_id = ?`, clientId);
+      if (existing) {
+        if (existing.session !== session)
+          throw new Error(`gate: delivery_id ${clientId} belongs to session ${existing.session || "(none)"} — present your own receipt, or omit delivery_id to deliver fresh`);
+        if (existing.status === "applied")
+          return { ...JSON.parse(String(existing.result ?? "{}")), delivery_id: existing.delivery_id, redelivered: true };
+        // pending: fall through and re-apply under the same id (the crash window)
+      }
+    }
+    const deliveryId = clientId || crypto.randomUUID();
+    this.state.storage.sql.exec(
+      `INSERT INTO deliveries (delivery_id, session, label, op, artefact_id, payload, status, created_ts)
+       VALUES (?, ?, ?, 'transition', ?, ?, 'pending', ?)`,
+      deliveryId, session, actor, String(body.id ?? ""), JSON.stringify(body).slice(0, 8192), Date.now(),
+    );
+    try {
+      const result = await this.transition(body, actor, "client");
+      this.state.storage.sql.exec(
+        `UPDATE deliveries SET status = 'applied', applied_ts = ?, result = ? WHERE delivery_id = ? AND status = 'pending'`,
+        Date.now(), JSON.stringify(result).slice(0, 2048), deliveryId,
+      );
+      return { ...result, delivery_id: deliveryId };
+    } catch (e) {
+      // the pending row stays as evidence and stays re-drivable — redrive
+      // classifies it (superseded once the card refuses the recorded intent).
+      // The caller still gets the real error.
+      throw e;
+    }
+  }
+
+  /** GH#494 — the redelivery owner's feed: unacked deliveries, optionally
+   *  scoped to the sessions the gateway hosts. The gateway reconciliation
+   *  polls this on its existing tick and re-drives what it finds. Piggybacks
+   *  the ledger's retention: acked rows die at 72h, unacked at 14d (a pending
+   *  row that old belongs to a session that is never coming back). */
+  private deliveryPending(body: any) {
+    const now = Date.now();
+    this.state.storage.sql.exec(`DELETE FROM deliveries WHERE acked_ts IS NOT NULL AND acked_ts < ?`, now - 72 * 3_600_000);
+    this.state.storage.sql.exec(`DELETE FROM deliveries WHERE acked_ts IS NULL AND created_ts < ?`, now - 14 * 24 * 3_600_000);
+    const since = Number.isFinite(Number(body.since_ts)) && Number(body.since_ts) > 0 ? Number(body.since_ts) : now - 48 * 3_600_000;
+    const sessions = Array.isArray(body.sessions) ? body.sessions.map(String).filter(Boolean) : null;
+    const rows = (sessions && sessions.length
+      ? this.state.storage.sql.exec(
+          `SELECT delivery_id, session, label, op, artefact_id, status, created_ts, applied_ts, payload FROM deliveries
+           WHERE acked_ts IS NULL AND created_ts >= ? AND session IN (${sessions.map(() => "?").join(",")}) ORDER BY created_ts ASC`,
+          since, ...sessions,
+        )
+      : this.state.storage.sql.exec(
+          `SELECT delivery_id, session, label, op, artefact_id, status, created_ts, applied_ts, payload FROM deliveries
+           WHERE acked_ts IS NULL AND created_ts >= ? ORDER BY created_ts ASC`,
+          since,
+        )
+    ).toArray() as any[];
+    return {
+      deliveries: rows.map((r) => {
+        let note = "";
+        try { note = String(JSON.parse(String(r.payload ?? "{}"))?.note ?? "").slice(0, 200); } catch { /* corrupt payload — empty excerpt */ }
+        return {
+          delivery_id: r.delivery_id, session: r.session, label: r.label, op: r.op, artefact_id: r.artefact_id,
+          status: r.status, created_ts: r.created_ts, applied_ts: r.applied_ts ?? null, note_excerpt: note,
+        };
+      }),
+    };
+  }
+
+  /** GH#494 — re-drive one delivery. The redelivery owner (gateway-tagged
+   *  credential or the admin web plane) is the only caller: the recorded
+   *  payload re-executes under its ORIGINAL identity, so re-driving is machine
+   *  authority, never agent authority.
+   *  - applied row: the write landed and its response was lost. Verify the
+   *    card still sits at the recorded status → ack verified; else ack
+   *    superseded (the card moved on — the state machine owns it now).
+   *  - pending row: the apply never confirmed (DO death between record and
+   *    apply, or a gate rejection). Re-execute the payload; a fresh gate
+   *    rejection classifies superseded.
+   *  Redrive acks at every terminal outcome — an acked delivery never
+   *  re-appears in delivery.pending. */
+  private async deliveryRedrive(body: any, actor: string, isAdmin: boolean) {
+    if (!isAdmin) {
+      const credential = body.token_id ? this.one(`SELECT tags FROM auth_tokens WHERE id = ?`, String(body.token_id)) : null;
+      if (!credential || !tagsSayGateway(parseTags(credential.tags)))
+        throw new Error("gate: delivery.redrive is the redelivery owner's op — gateway credential or admin web plane only (GH#494; a delivery's payload re-executes)");
+    }
+    const id = String(body.delivery_id ?? "").trim();
+    const row = this.one(`SELECT * FROM deliveries WHERE delivery_id = ?`, id);
+    if (!row) throw new Error(`no such delivery: ${id || "(none)"}`);
+    if (row.acked_ts) return { delivery_id: id, state: "acked" };
+    const now = Date.now();
+    if (row.status === "applied") {
+      let recorded: any = {};
+      try { recorded = JSON.parse(String(row.result ?? "{}")); } catch { recorded = {}; }
+      const cur = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(row.artefact_id ?? ""));
+      const verified = !!cur?.status && !!recorded?.status && String(cur.status) === String(recorded.status);
+      this.state.storage.sql.exec(`UPDATE deliveries SET acked_ts = ?, status = ? WHERE delivery_id = ?`, now, verified ? "applied" : "superseded", id);
+      this.audit(actor, "delivery_redrive", String(row.artefact_id || ""), { delivery_id: id, state: verified ? "verified" : "superseded" });
+      return { delivery_id: id, state: verified ? "verified" : "superseded", recorded_status: recorded?.status ?? null, current_status: cur?.status ?? null };
+    }
+    // pending: re-execute the recorded payload under its original identity.
+    // (No in-flight guard: one DO serializes requests — a redrive can never
+    // race a mid-apply write on this row.)
+    let payload: any;
+    try { payload = JSON.parse(String(row.payload ?? "{}")); } catch {
+      this.state.storage.sql.exec(`UPDATE deliveries SET status = 'superseded', acked_ts = ?, redriven_ts = ? WHERE delivery_id = ?`, now, now, id);
+      return { delivery_id: id, state: "superseded", note: "payload unparseable" };
+    }
+    this.state.storage.sql.exec(`UPDATE deliveries SET redriven_ts = ? WHERE delivery_id = ?`, now, id);
+    delete payload.delivery_id; // never recurse into the recorder
+    try {
+      const result = await this.transition(payload, String(payload.actor ?? actor), "client");
+      this.state.storage.sql.exec(`UPDATE deliveries SET status = 'applied', applied_ts = ?, acked_ts = ?, result = ? WHERE delivery_id = ?`, now, now, JSON.stringify(result).slice(0, 2048), id);
+      this.audit(actor, "delivery_redrive", String(row.artefact_id || ""), { delivery_id: id, state: "redelivered" });
+      return { delivery_id: id, state: "redelivered", result };
+    } catch (e) {
+      this.state.storage.sql.exec(`UPDATE deliveries SET status = 'superseded', acked_ts = ? WHERE delivery_id = ?`, now, id);
+      this.audit(actor, "delivery_redrive", String(row.artefact_id || ""), { delivery_id: id, state: "superseded", error: String((e as Error).message ?? e).slice(0, 300) });
+      return { delivery_id: id, state: "superseded", error: String((e as Error).message ?? e).slice(0, 200) };
+    }
+  }
+
   private async transition(body: any, actor: string, origin: "client" | "machine" = "machine", beforeWrite?: () => void, reviewTarget?: ReviewTarget) {
     if (body.to === "in_progress" || body.to === "todo") {
       const wait = this.startupWait(String(body.id ?? ""));
@@ -10133,6 +10510,9 @@ export class KnowledgeHub {
     // orient only). Releasing a task to `todo` clears meta.session alongside
     // owner_clear so a released card carries no stale executor lease; a fresh
     // claim (todo → in_progress) re-stamps from the claiming session.
+    // GH#492: captured BEFORE the todo leg clears it — the release event
+    // stamps the released claim's session (released_session).
+    const releasedSession = typeof meta.session === "string" ? meta.session : undefined;
     if (row.type === "task") {
       if (verdict.status === "todo") {
         delete meta.session;
@@ -10394,6 +10774,17 @@ export class KnowledgeHub {
       from: row.status, to: verdict.status, note: body.note ?? "", sentiment,
       ...(attributedAgent ? { agent: attributedAgent } : {}),
       ...(body.result_class ? { result_class: String(body.result_class).slice(0, 60) } : {}),
+      // GH#492/494: a release clears the card's owner in the same write — an
+      // event joined to the artefact's CURRENT owner attributes to nobody
+      // (or to whoever re-claims within the scoring window). The released
+      // claim's own identity rides the event, so the score attributes the
+      // incident to the claim it actually released.
+      ...(verdict.owner_clear && row.owner ? { released_owner: String(row.owner) } : {}),
+      ...(verdict.owner_clear && row.owner && releasedSession ? { released_session: releasedSession.slice(0, 120) } : {}),
+      // GH#494: a completed_result_lost event names the session whose
+      // claim-window trail fed the classification — re-releases can no longer
+      // blur two incidents into one unattributable pair.
+      ...(body.observed_by ? { observed_by: String(body.observed_by).slice(0, 80) } : {}),
     });
     this.version(id, actor, "transition", `${row.status} → ${verdict.status}${body.note ? ` — ${String(body.note).slice(0, 120)}` : ""}`, { from: row.status, to: verdict.status, note: body.note ?? "" });
     if (row.type === "task" && (verdict.status === "in_review" || verdict.status === "done")) {
@@ -13514,7 +13905,7 @@ export class KnowledgeHub {
     // score optimisation is an explicit standing directive: the agent sees its
     // number, its grade, and the concrete actions that raise it — every
     // check-in, not as trivia at the bottom of the payload.
-    const scoreDirective = `\n\nYOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it — it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") : "No deductions — keep heartbeats ≤10m, finish with receipts, answer asks fast."}`;
+    const scoreDirective = `\n\nYOUR SCORE: ${my_score.score}/100 (${my_score.grade}). Optimise for it — it gates which work you can claim and whether your tasks survive. ${my_score.hints.length ? "Actions that raise it now: " + my_score.hints.join(" ") + " Raw events behind every number: run score_explain." : "No deductions — keep heartbeats ≤10m, finish with receipts, answer asks fast."}`;
     return {
       project: projectName,
       instructions: composeBootstrap(projectName, settings.board ?? DEFAULT_BOARD)
