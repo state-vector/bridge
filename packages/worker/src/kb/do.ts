@@ -1414,10 +1414,23 @@ export class KnowledgeHub {
     // (F) unblock-proxy watch (BR#3361a): blocked cards with machine-checkable
     // unblock conditions re-evaluated periodically; the unblock duty
     // auto-spawns when the proxy flips TRUE. Isolated like its siblings.
+    let parkLiveness: Record<string, unknown> | undefined;
     try {
       await this.unblockProxySweep(now);
     } catch (e) {
       this.audit("hub:proxy-watch", "sweep_error", "unblock_proxy_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
+    }
+
+    // (F1) park liveness backstop (BR-park-hygiene): the proxy sweep's guard
+    // skips used to be silent — a card whose proxy_check went stale was
+    // never re-evaluated again (specimen: a merged PR noticed by nobody).
+    // This pass audits check AGE on every typed park, resumes satisfied
+    // waits and releases conclusively dead ones from LEDGER state only, and
+    // makes probe starvation a visible census instead of silence.
+    try {
+      parkLiveness = await this.parkLivenessSweep(now);
+    } catch (e) {
+      this.audit("system:proxy-watch", "sweep_error", "park_liveness_sweep", { error: String((e as Error).message ?? e).slice(0, 300) });
     }
 
     // (F2) BR#18328 — the durable external-CI wait evaluator: todo cards
@@ -1487,6 +1500,7 @@ export class KnowledgeHub {
           drained_this_tick: drained, owner_released_this_tick: ownerReleased,
           blocked_stale_hours: blockedStaleHours, owner_stale_hours: ownerStaleHours,
         },
+        park_liveness: parkLiveness ?? null,
       }),
     );
     // BR#4212: persist the channel counters once per tick so an isolate
@@ -2053,6 +2067,17 @@ export class KnowledgeHub {
         // a fact the hub OWNS, unlike a GitHub read it cannot make.
         const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, atom.repo, atom.number);
         if (pv) return { ok: true, receipt: `provenance: ${atom.repo}#${atom.number} merged (sha ${String(pv.merge_sha).slice(0, 9)}, signer ${pv.signer})` };
+        // Park liveness (BR-park-hygiene): the reconcile daemon's observations
+        // are a ledger the hub OWNS (delivery_pr_outcomes, fed by
+        // reconcile.report with zero hub GitHub calls). A MERGED row there is
+        // as native as a train-stamped provenance row — previously a merged
+        // PR with no provenance row needed an agent-run probe, so a starved
+        // probe pool starved the park forever.
+        const obs = this.one(
+          `SELECT merge_sha, observed_at FROM delivery_pr_outcomes WHERE repo = ? AND pr = ? AND state = 'MERGED'`,
+          atom.repo, Number(atom.number),
+        );
+        if (obs) return { ok: true, receipt: `reconcile observation (ledger-native): ${atom.repo}#${atom.number} MERGED (sha ${String(obs.merge_sha ?? "").slice(0, 9) || "n/a"}, observed ${new Date(Number(obs.observed_at ?? 0)).toISOString()})` };
         const closed = this.closedPrReceipt(atom.repo, Number(atom.number));
         if (closed) return { ok: false, receipt: `GitHub observed CLOSED without a merge: ${closed}`, probeState: "negative" };
         // BR#6384 Leg 3: probe-backed next (the BR#4658 grammar applied to
@@ -2484,7 +2509,21 @@ export class KnowledgeHub {
       try {
         const meta = JSON.parse(r.meta ?? "{}");
         const bmeta = meta.blocked ?? {};
-        if (this.startupWait(r.id) || this.protectedExecution(String(r.id), meta)) continue;
+        if (this.startupWait(r.id) || this.protectedExecution(String(r.id), meta)) {
+          // Park liveness (BR-park-hygiene): a guard skip used to be SILENT —
+          // the card's proxy_check kept its old timestamp forever while the
+          // world moved on (specimen: a pr_merged park whose PR merged the
+          // day after its last check; nothing ever re-evaluated it and no
+          // census counted the silence). Stamp the skip honestly: a stale
+          // "protected" verdict is now machine-readable, and the park
+          // liveness backstop re-evaluates these cards from ledger state.
+          const prevGuard = meta.proxy_check as { at?: number; verdict?: string } | undefined;
+          if (!prevGuard || prevGuard.verdict !== "protected" || now - Number(prevGuard.at ?? 0) > 6 * 3_600_000) {
+            const why = this.startupWait(r.id) ? "startup wait" : "execution wait/handoff";
+            this.stampProxyCheck(r.id, meta, now, "protected", `the sweep's ${why} guard owns this card's exit — the park liveness backstop re-evaluates it from ledger state`, prevGuard);
+          }
+          continue;
+        }
         if (this.closedDeliveryLegs(meta).length && this.continueBlockedWork(String(r.id), meta, { kind: "closed_delivery" })) continue;
         // BR#3578: the typed await (validated at the door) is trusted and
         // evaluated FIRST; the free text is annotation + legacy fallback.
@@ -2758,6 +2797,219 @@ export class KnowledgeHub {
       } catch { /* skip malformed */ }
     }
     return out;
+  }
+
+  // ---------- park liveness backstop (BR-park-hygiene) ----------
+
+  /** The watchdog's watchdog. The proxy sweep legitimately skips protected
+   *  cards (execution waits, handoffs, startup fences) — but a skip with a
+   *  stale stamp is SILENCE: the card's typed predicate goes unevaluated
+   *  forever while the world moves (specimen BR#14077: its PR merged the day
+   *  after its last proxy check; the merge was never noticed; the park sat).
+   *  This paced pass audits every typed park's proxy_check AGE and, for a
+   *  silenced card, evaluates the predicate from LEDGER/BOARD state only —
+   *  zero GitHub calls, zero agents — then takes only the machine's own
+   *  exits: satisfied → continueBlockedWork (the BR#14544 consumed-wait
+   *  resume); conclusively dead → continueBlockedWork dead_leg (release to
+   *  the pool); indeterminate → honest census so probe starvation is
+   *  VISIBLE instead of silent. It never flips a card the machine cannot
+   *  prove, and never touches lanes, anchors, human bounds, live executors,
+   *  verdict duties or train slots — those guards live inside
+   *  continueBlockedWork / consumedWaitResumeGuards and are re-checked on
+   *  every consumption. */
+  private async parkLivenessSweep(now: number): Promise<Record<string, unknown>> {
+    const periodMin = Math.max(0, Math.min(120, parseInt(this.settingValue("park_liveness_minutes", "30"), 10) || 30));
+    if (periodMin === 0) return { disabled: true };
+    const last = Number(this.settingValue("park_liveness_last_ts", "0")) || 0;
+    if (now - last < periodMin * 60_000) return { paced: true };
+    this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('park_liveness_last_ts', ?)`, String(now));
+    const staleMs = Math.max(15, Math.min(1440, parseInt(this.settingValue("park_proxy_stale_minutes", "60"), 10) || 60)) * 60_000;
+    const probeStaleMs = Math.max(1, Math.min(168, parseInt(this.settingValue("park_probe_stale_hours", "24"), 10) || 24)) * 3_600_000;
+    const rows = this.state.storage.sql.exec(
+      `SELECT id, title, meta, roles FROM artefacts WHERE type = 'task' AND status = 'blocked'`,
+    ).toArray() as any[];
+    const census = {
+      checked: 0, silenced: 0, resumed: 0, dead_released: 0, resume_refused: 0,
+      probe_pending: 0, probe_starved: 0, protected_infra: 0, protected_execution: 0, waiting: 0,
+      silenced_ids: [] as string[], starved_ids: [] as string[], refused_ids: [] as { id: string; why: string }[],
+    };
+    for (const r of rows) {
+      const id = String(r.id);
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const aw = validateAwaitEvent(meta.blocked?.await_event);
+        if (!aw) continue;
+        if (meta.lane || this.isUnclaimableAnchor(r, meta)) { census.protected_infra++; continue; }
+        const lastCheck = Number(meta.proxy_check?.at ?? 0) || Number(meta.blocked?.ts ?? 0) || 0;
+        if (lastCheck && now - lastCheck <= staleMs) {
+          // fresh stamp — but keep the two ownership classes separately visible
+          if (meta.proxy_check?.verdict === "protected") census.protected_execution++;
+          else census.checked++;
+          continue;
+        } // the main sweep is reaching this card
+        census.silenced++;
+        if (census.silenced_ids.length < 12) census.silenced_ids.push(id);
+        const v = await this.evalLedgerPredicate(id, aw, meta, now);
+        if (v.state === "waiting") {
+          // a live, honestly-waiting leg (open ask, future timer, hub not yet
+          // deployed at the wanted commit) — census only: the card's verdict
+          // vocabulary belongs to the sweep that owns it, and a re-stamp here
+          // would only reset the silence window and churn the audit log
+          census.waiting++;
+          continue;
+        }
+        if (v.state === "true" || v.state === "dead") {
+          const guards = this.consumedWaitResumeGuards(r, meta, v.receipts, null);
+          const resume = decideConsumedWaitResume(guards);
+          // the backstop's hub-side resume IS the BR#14544 auto-resume: pass
+          // the auto_resume shape (not satisfied) so the consumption mirrors
+          // the machine's blocked→in_progress effect, including the standing
+          // park-time round's supersession
+          const continuation = v.state === "true"
+            ? { kind: "auto_resume" as const, receipts: v.receipts }
+            : { kind: "dead_leg" as const, receipts: v.receipts };
+          if (resume.kind === "auto_resume" && this.continueBlockedWork(id, meta, continuation)) {
+            if (v.state === "true") { census.resumed++; this.audit("system:proxy-watch", "park_liveness_resume", id, { receipts: v.receipts }); }
+            else { census.dead_released++; this.audit("system:proxy-watch", "park_liveness_dead_release", id, { receipts: v.receipts }); }
+            continue;
+          }
+          // refused — the consumption's guard set named an owner (live
+          // executor, train state, human bound, verdict duty, or the CAS
+          // tripped). Census only: no stamp, the owning layer keeps the card.
+          const why = resume.kind === "duty_fallback" ? `${resume.reason}: ${resume.detail}` : "consumption refused";
+          census.resume_refused++;
+          if (census.refused_ids.length < 12) census.refused_ids.push({ id, why: why.slice(0, 160) });
+          continue;
+        }
+        // indeterminate: needs credentials the hub does not hold — make the
+        // starvation visible instead of silent
+        if (v.probeAgeMs !== undefined && v.probeAgeMs > probeStaleMs) {
+          census.probe_starved++;
+          if (census.starved_ids.length < 12) census.starved_ids.push(id);
+          this.stampProxyCheck(id, meta, now, "probe_starved",
+            `no executor has verified this gate for ${Math.round(v.probeAgeMs / 3_600_000)}h — the verification pool is empty (park liveness backstop)`, meta.proxy_check,
+            { receipts: v.receipts });
+        } else {
+          census.probe_pending++;
+        }
+      } catch (e) {
+        this.audit("system:proxy-watch", "sweep_error", id, { error: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('park_liveness_census', ?)`,
+      JSON.stringify({ ts: now, ...census }),
+    );
+    this.audit("system:proxy-watch", "park_liveness_sweep", "watchdog", { ...census });
+    // the population alarm: silenced parks with NO machine exit and a starving
+    // probe/resume leg = work the pool cannot see. One alarm per episode.
+    if (census.silenced > 0 && census.resumed + census.dead_released === 0 && census.resume_refused + census.probe_starved > 0) {
+      const alarmLast = Number(this.settingValue("park_liveness_alarm_ts", "0")) || 0;
+      if (now - alarmLast > 24 * 3_600_000) {
+        this.audit("system:proxy-watch", "park_liveness_alarm", "watchdog", {
+          silenced: census.silenced, resume_refused: census.resume_refused,
+          probe_starved: census.probe_starved, silenced_ids: census.silenced_ids, starved_ids: census.starved_ids,
+        });
+        this.state.storage.sql.exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('park_liveness_alarm_ts', ?)`, String(now));
+      }
+    }
+    return { ts: now, ...census };
+  }
+
+  /** Ledger/board-only verdict for one typed await — the liveness backstop's
+   *  evaluator. ZERO GitHub calls, ZERO agents: every TRUE/DEAD it returns is
+   *  a fact the hub owns (train provenance, reconcile observations, board
+   *  rows, its own probes). Anything needing live GitHub state is honest
+   *  indeterminate. */
+  private async evalLedgerPredicate(
+    id: string, aw: AwaitEvent, meta: any, now: number,
+  ): Promise<{ state: "true" | "dead" | "waiting" | "indeterminate"; receipts: string[]; probeAgeMs?: number }> {
+    switch (aw.event) {
+      case "br_done": {
+        if (isSelfAwait(id, aw)) return { state: "indeterminate", receipts: ["self-await — the main sweep owns the rebind"] };
+        const out = this.dependencyOutcome(String(aw.id), [id]);
+        if (out.ok) return { state: "true", receipts: [`${aw.id} done — ${out.receipt}`] };
+        if (out.probeState === "negative") return { state: "dead", receipts: [`${aw.id} cannot reach done — ${out.receipt}`] };
+        return { state: "indeterminate", receipts: [out.receipt] };
+      }
+      case "br_answered": {
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.id);
+        if (!row) return { state: "indeterminate", receipts: [`${aw.id} not found on this board`] };
+        if (row.status === "done" || row.status === "superseded") return { state: "true", receipts: [`${aw.id} ${row.status} (answered)`] };
+        return { state: "waiting", receipts: [`${aw.id} still ${row.status}`] };
+      }
+      case "ask": {
+        const row = this.one(`SELECT status FROM artefacts WHERE id = ?`, aw.ask_id);
+        if (!row) return { state: "dead", receipts: [`ask ${aw.ask_id} vanished — no board row`] };
+        if (row.status === "done" || row.status === "superseded") return { state: "true", receipts: [`ask ${aw.ask_id} ${row.status}`] };
+        return { state: "waiting", receipts: [`awaiting ask ${aw.ask_id}`] };
+      }
+      case "time": {
+        if (now >= aw.until_ts) return { state: "true", receipts: [`timer elapsed (until_ts ${aw.until_ts} = ${new Date(aw.until_ts).toISOString()})`] };
+        return { state: "waiting", receipts: [`timer until ${new Date(aw.until_ts).toISOString()}`] };
+      }
+      case "pr_merged": {
+        const pv = this.one(`SELECT merge_sha, signer FROM provenance WHERE repo = ? AND pr = ?`, aw.repo, aw.n);
+        if (pv) return { state: "true", receipts: [`provenance: ${aw.repo}#${aw.n} merged (sha ${String(pv.merge_sha).slice(0, 9)})`] };
+        const obs = this.one(`SELECT merge_sha FROM delivery_pr_outcomes WHERE repo = ? AND pr = ? AND state = 'MERGED'`, aw.repo, aw.n);
+        if (obs) return { state: "true", receipts: [`reconcile observation (ledger-native): ${aw.repo}#${aw.n} MERGED`] };
+        const closed = this.closedPrReceipt(aw.repo, aw.n);
+        if (closed) return { state: "dead", receipts: [`GitHub observed CLOSED without a merge: ${closed}`] };
+        const v = this.one(`SELECT ok, state, updated_ts FROM proxy_probes WHERE key = ?`, proxyProbeKey(awaitEventToAtom(aw)!)) as any;
+        if (v?.state === "verified" && v.ok === 1) return { state: "true", receipts: [`executor-verified: ${aw.repo}#${aw.n} MERGED`] };
+        if (v?.state === "verified" && v.ok === 0) return { state: "dead", receipts: [`executor-verified conclusive negative for ${aw.repo}#${aw.n}`] };
+        return {
+          state: "indeterminate",
+          receipts: [`merge state for ${aw.repo}#${aw.n} needs credentials the hub does not hold`],
+          probeAgeMs: v?.updated_ts ? now - Number(v.updated_ts) : now - (Number(meta.blocked?.ts ?? 0) || now),
+        };
+      }
+      case "br_pr_merged": {
+        // bare form resolves against the default repo, same as the atom
+        // evaluator (the AwaitEvent carries no repo field)
+        const repo = this.settingValue("unblock_proxy_default_repo", "state-vector/superpositional");
+        const pv = this.one(`SELECT pr, merge_sha FROM provenance WHERE task_id = ? AND repo = ? ORDER BY merged_at DESC LIMIT 1`, aw.id, repo);
+        if (pv) return { state: "true", receipts: [`provenance: ${aw.id}'s PR ${repo}#${pv.pr} merged`] };
+        return { state: "indeterminate", receipts: [`no provenance row for ${aw.id} — waiting for a train event`] };
+      }
+      case "run_success":
+      case "pr_checks_green": {
+        const v = this.one(`SELECT ok, state, updated_ts FROM proxy_probes WHERE key = ?`, proxyProbeKey(awaitEventToAtom(aw)!)) as any;
+        if (v?.state === "verified" && v.ok === 1) return { state: "true", receipts: ["executor-verified (ledger probe verdict)"] };
+        if (v?.state === "verified" && v.ok === 0) return { state: "dead", receipts: ["executor-verified conclusive negative"] };
+        return {
+          state: "indeterminate",
+          receipts: [`gate needs a worker-executor probe verdict the hub does not hold`],
+          probeAgeMs: v?.updated_ts ? now - Number(v.updated_ts) : now - (Number(meta.blocked?.ts ?? 0) || now),
+        };
+      }
+      case "deployed": {
+        if (!aw.commit) return { state: "indeterminate", receipts: ["no commit in the condition"] };
+        try {
+          const v = (await import("../__version.json")) as { commit?: string };
+          const ok = deployedSatisfied(String(v.commit ?? ""), aw.commit);
+          return ok
+            ? { state: "true", receipts: [`hub deployed commit=${v.commit}`] }
+            : { state: "waiting", receipts: [`hub deployed commit=${v.commit ?? "unknown"} — wanted ${aw.commit}`] };
+        } catch {
+          return { state: "indeterminate", receipts: ["hub has no version stamp"] };
+        }
+      }
+      case "lane_health": {
+        const row = this.one(`SELECT id,meta FROM lane_cards WHERE json_extract(meta,'$.lane.repo')=? AND json_extract(meta,'$.lane.base')=? LIMIT 1`, aw.repo, aw.base ?? "main");
+        const m = JSON.parse(String(row?.meta ?? "{}"));
+        if (!m.lane?.queue_facts?.base_state) return { state: "indeterminate", receipts: [`${aw.repo}@${aw.base ?? "main"} has no observed deployment health`] };
+        const observation = DeployObservationSchema.safeParse(m.lane?.deploy_observation);
+        const tip = m.lane?.queue_facts?.base_state?.tip_sha;
+        const effective = applyDeployObservation(m.lane?.queue_facts?.base_state, m.lane?.deploy_observation, laneOfMeta(m)?.required_workflows ?? [], now);
+        const ok = !!tip && (!aw.head || aw.head === tip) && observation.success && observation.data.tip_sha === tip && effective?.verdict === "green" && !m.stop;
+        return ok
+          ? { state: "true", receipts: [`${aw.repo}@${aw.base ?? "main"} lane green at ${String(tip).slice(0, 9)}`] }
+          : { state: "indeterminate", receipts: [`${aw.repo}@${aw.base ?? "main"} health=${effective?.verdict ?? "unknown"}`] };
+      }
+      default:
+        return { state: "indeterminate", receipts: [`${aw.event} is not ledger-evaluable`] };
+    }
   }
 
   /** BR#5916: do-not-claim infra anchors — the standing alarm sink (or any
@@ -3335,10 +3587,12 @@ export class KnowledgeHub {
     | { kind: "satisfied"; receipts: string[] }
     | { kind: "expired_coordination"; ask_id: string }
     | { kind: "auto_resume"; receipts: string[] }
+    | { kind: "dead_leg"; receipts: string[] }
     | { kind: "closed_delivery" }): boolean {
     const expiredAsk = continuation.kind === "expired_coordination" ? continuation.ask_id : undefined;
     const autoResume = continuation.kind === "auto_resume";
     const closedDelivery = continuation.kind === "closed_delivery";
+    const deadLeg = continuation.kind === "dead_leg";
     const expected = validateAwaitEvent(evaluated.blocked?.await_event);
     if ((!expected && !closedDelivery) || ("receipts" in continuation && !continuation.receipts.length)
       || (expiredAsk && (expected?.event !== "ask" || expected.ask_id !== expiredAsk))) return false;
@@ -3368,6 +3622,14 @@ export class KnowledgeHub {
     delete meta.blocked; delete meta.awaiting_ask; delete meta.last_unblock_spawn;
     delete meta.consumed_wait_fallback; // BR#14544: the fallback round is consumed with the wait
     if (continuation.kind === "satisfied" || autoResume) meta.proxy_check = { at: now, verdict: "true", receipts: continuation.receipts };
+    else if (deadLeg) {
+      // Park liveness (BR-park-hygiene): the typed wait is conclusively dead
+      // (conclusive-negative receipts — closed-unmerged PR, dependency
+      // retired without a successor). Release honestly: the annotation
+      // survives the transition-shaped consumption and tells the pool why.
+      meta.proxy_check = { at: now, verdict: "dead_leg", receipts: continuation.receipts };
+      meta.blocked_drained = { ts: now, klass: "dead-atom", why: continuation.receipts.join("; ").slice(0, 400) };
+    }
     else delete meta.proxy_check;
     if (autoResume) {
       // BR#14544: the provenance stamp RIDES the consumption write — one
@@ -3416,7 +3678,7 @@ export class KnowledgeHub {
       if (current.status !== row.status || current.meta !== row.meta || current.owner !== row.owner) throw new Error("wait continuation changed before commit");
       if (expiredAsk) this.cancelRequest(expiredAsk, "The recovery coordination request expired. Bridge will retry the same recovery duty.", "system:coordination");
       this.state.storage.sql.exec(`UPDATE artefacts SET status='todo',owner='',meta=?,status_ts=?,updated_ts=? WHERE id=?`, JSON.stringify(meta), now, now, id);
-      if (autoResume || closedDelivery) {
+      if (autoResume || closedDelivery || deadLeg) {
         // the machine's resume effect, mirrored for this direct-SQL edge
         // (machine.ts on blocked → in_progress): the stale park-time round
         // must not outlive the wait it was issued for. conserveDelivery
@@ -3433,10 +3695,10 @@ export class KnowledgeHub {
             continue;
           }
           const vm = JSON.parse(String(v.meta ?? "{}"));
-          vm.superseded_reason = `${id} resumed from blocked (${closedDelivery ? "delivery PR closed unmerged" : "BR#14544 consumed-wait auto-resume"}) — unblock round superseded`;
+          vm.superseded_reason = `${id} resumed from blocked (${deadLeg ? "typed wait conclusively dead — park liveness backstop" : closedDelivery ? "delivery PR closed unmerged" : "BR#14544 consumed-wait auto-resume"}) — unblock round superseded`;
           // The closed-PR repair cannot retire another live executor. Only
           // its obsolete unowned park-time round belongs to this edge.
-          if (closedDelivery && (v.owner || v.status !== "todo" || this.staleReviewHasExecutionHold(String(v.id), vm))) continue;
+          if ((closedDelivery || deadLeg) && (v.owner || v.status !== "todo" || this.staleReviewHasExecutionHold(String(v.id), vm))) continue;
           this.state.storage.sql.exec(`UPDATE artefacts SET status = 'superseded', meta = ?, status_ts = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(vm), now, now, String(v.id));
           this.audit("system:proxy-watch", "transition", String(v.id), { from: v.status, to: "superseded", note: vm.superseded_reason });
           this.version(String(v.id), "system:proxy-watch", "transition", vm.superseded_reason, { from: v.status, to: "superseded" });
@@ -3464,6 +3726,11 @@ export class KnowledgeHub {
         const note = `blocked → todo — ${closedLegs.map(leg => leg.receipt).join(", ")} closed unmerged; delivery still required. Restore the delivery path and submit for fresh independent review.`;
         this.version(id, "system:proxy-watch", "closed_delivery_released", note, { from: "blocked", to: "todo", legs: closedLegs });
         this.audit("system:proxy-watch", "closed_delivery_released", id, { legs: closedLegs });
+      } else if (deadLeg) {
+        const { receipts } = continuation;
+        const note = `blocked → todo — typed wait conclusively dead (park liveness backstop): ${receipts.join("; ").slice(0, 300)}. Released to the pool for re-delivery or repair; the dead-leg receipt is on the card.`;
+        this.version(id, "system:proxy-watch", "dead_leg_released", note, { from: "blocked", to: "todo", receipts });
+        this.audit("system:proxy-watch", "dead_leg_released", id, { await_event: expected, receipts });
       } else {
         const { receipts } = continuation;
         this.version(id, "system:proxy-watch", "transition", "blocked → todo — verified prerequisite consumed; actual work resumed, not completed", { from: "blocked", to: "todo" });
@@ -5681,6 +5948,7 @@ export class KnowledgeHub {
         case "admin.settings_get":
         case "admin.settings_set":
         case "admin.unblock_proxy_sweep":
+        case "admin.park_liveness_sweep":
         case "admin.stall_sweep":
         case "admin.startup_sweep":
         case "admin.awaiting_requeue_sweep":
@@ -5712,6 +5980,14 @@ export class KnowledgeHub {
             await this.unblockProxySweep(Number(body.now ?? Date.now()));
             const last = this.one(`SELECT value FROM settings WHERE key = 'unblock_proxy_last_ts'`);
             return this.json({ ok: true, last_sweep_ts: Number(last?.value ?? 0) });
+          }
+          if (op === "admin.park_liveness_sweep") {
+            // drill/liveness path for the park liveness backstop
+            // (BR-park-hygiene): pass now=<future epoch ms> to place stale
+            // proxy checks past the silence window; per-card guards still
+            // apply (lanes, anchors, human bounds, live executors).
+            const census = await this.parkLivenessSweep(Number(body.now ?? Date.now()));
+            return this.json({ ok: true, census });
           }
           if (op === "admin.stall_sweep") {
             // drill/liveness path for the in_progress stall sweep (BR#4282):

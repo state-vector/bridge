@@ -4258,6 +4258,25 @@ closes those leaks with four hub mechanisms:
   authority, never by relaxing the gate. A tripped guard falls back to today's duty spawn, with the
   fallback reason (live executor / verdict duty / human-bound / unverified predicate) annotated loud on
   the round so its escalation ask rides `time-sensitive` instead of aging silently.
+- **Park liveness backstop** (a3, the 2026-11-26 stale-park audit): the proxy sweep's guard skips
+  (startup fences, execution waits/handoffs) used to be SILENT — a card's `proxy_check` kept its old
+  timestamp forever while the world moved on, and no census counted the silence (the live specimen: a
+  `pr_merged` park whose PR merged the day after its last check; nothing ever re-evaluated it). Two
+  changes close that class. The guard skip now stamps the verdict `protected` honestly (paced to 6h,
+  one audit line when a card first enters protection), so a silence is named on the card. And
+  `parkLivenessSweep` (paced by `park_liveness_minutes`, default 30, `0` = off) audits every typed
+  park's check AGE (stale past `park_proxy_stale_minutes`, default 60): for a silenced card it
+  re-evaluates the predicate from LEDGER/BOARD state only — zero GitHub calls, zero agents (train
+  provenance, reconcile observations, board rows, its own probe verdicts; the reconcile-observed
+  `MERGED` row is now ledger truth for `pr_merged` atoms in the main sweep too) — then takes only the
+  machine's own exits: satisfied → the BR#14544 consumed-wait resume (guards re-checked inside the
+  consumption: live executors, train states, human bounds, verdict duties are census-refused, never
+  ripped from their owner); conclusively dead (closed-unmerged PR, dependency retired without a
+  successor) → a `dead_leg` release to the pool with the receipt on the card; indeterminate → a
+  visible census instead of silence, with probes starving past `park_probe_stale_hours` (default 24)
+  stamped `probe_starved` and one `park_liveness_alarm` per day naming the starved class. Lanes and
+  infra anchors are exempt (their expired timers re-arm by design, BR#5916/BR#15528). Drill:
+  `admin.park_liveness_sweep {now}`; the census rides the `watchdog.sweep` blob as `park_liveness`.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.
