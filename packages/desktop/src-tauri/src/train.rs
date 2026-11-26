@@ -6006,7 +6006,19 @@ fn reconcile_pass(ctx: &mut Ctx) -> Result<Vec<String>, String> {
                 "--json", "number,title,state,mergeCommit,headRefOid,headRefName,updatedAt",
             ])
             .unwrap_or(Value::Array(Vec::new()));
-        let payload = concat_pr_rows(&pr_payload(&rows), &merged_rows);
+        // BR#22592 (closed-observed reap): the closed-unmerged feed rides
+        // additively too — same best-effort contract. gh MIXES merged rows
+        // into --state closed; concat_pr_rows keeps CLOSED-state rows only.
+        // limit 100 (vs the merged feed's 50): the wedged cars can be days
+        // old and every merge since their creation crowds the closed list;
+        // the walk's dead-leg stamp remains the card-level backstop.
+        let closed_rows = ctx
+            .gh_json(&[
+                "pr", "list", "--repo", &repo, "--state", "closed", "--limit", "100",
+                "--json", "number,title,state,headRefOid,headRefName,updatedAt",
+            ])
+            .unwrap_or(Value::Array(Vec::new()));
+        let payload = concat_pr_rows(&pr_payload(&rows), &merged_rows, &closed_rows);
         // BR#5106: the PR status labels (bridge:merge-ready / bridge:wip) are
         // GitHub WRITES — identity-gated exactly like merge legs (BR#3181,
         // the BR#3516 split): a worker-class credential stamps them from the
@@ -6089,7 +6101,7 @@ fn classify_pr_merge_state(state: &str, merge_commit: &str, url: &str) -> ProbeV
 /// and gh's mergeCommit OBJECT shape flattens to the oid STRING the hub's
 /// row contract names. Pure; best-effort by construction — an upstream
 /// failure leaves the caller feeding the open feed alone.
-fn concat_pr_rows(open: &Value, merged: &Value) -> Value {
+fn concat_pr_rows(open: &Value, merged: &Value, closed: &Value) -> Value {
     let mut out: Vec<Value> = match open {
         Value::Array(a) => a.iter().filter(|r| r.is_object()).cloned().collect(),
         _ => Vec::new(),
@@ -6112,7 +6124,40 @@ fn concat_pr_rows(open: &Value, merged: &Value) -> Value {
             out.push(row);
         }
     }
+    // BR#22592 (closed-observed reap): the closed-unmerged feed rides
+    // ADDITIVELY beside the open+merged lists — the board's own
+    // CLOSED-unmerged observation, delivered by the lease-free reconcile
+    // pass so the hub's queue reap never waits for a lease-holding walk
+    // binary. `gh pr list --state closed` MIXES merged and closed rows
+    // (merged PRs are closed on GitHub); this arm keeps CLOSED-state rows
+    // only — the MERGED half rides the merged feed above. A CLOSED row
+    // carries no mergeCommit; the hub's normalizePr contract writes the
+    // gh receipt itself. Best-effort by construction like the merged arm:
+    // a gh failure shrinks the report to the open+merged feeds alone.
+    if let Value::Array(a) = closed {
+        for r in a {
+            let number = r.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+            let closed_row = r.is_object()
+                && number > 0
+                && vstr(r, "state").map(|s| s.eq_ignore_ascii_case("CLOSED")).unwrap_or(false);
+            if !closed_row {
+                continue;
+            }
+            out.push(row_clone_without_merge_commit(r));
+        }
+    }
     Value::Array(out)
+}
+
+/// Clone a feed row for the closed arm, guaranteeing no mergeCommit rides a
+/// CLOSED-unmerged observation (the MERGED receipt field is meaningless
+/// there and must not be laundered into the hub's outcome rows).
+fn row_clone_without_merge_commit(r: &Value) -> Value {
+    let mut row = r.clone();
+    if let Some(obj) = row.as_object_mut() {
+        obj.remove("mergeCommit");
+    }
+    row
 }
 
 // ===========================================================================
@@ -7236,11 +7281,12 @@ mod tests {
             { "number": 3, "title": "closed pr", "state": "CLOSED" },
             { "number": "seven", "title": "string number", "state": "MERGED" }
         ]);
-        let out = concat_pr_rows(&open, &merged);
+        let out = concat_pr_rows(&open, &merged, &json!([]));
         let rows = out.as_array().expect("array");
         // the daemon drops non-OBJECTS only (both sides) — number-level junk
         // is the hub's normalizePr contract; the merged side additionally
-        // keeps MERGED rows with a positive number
+        // keeps MERGED rows with a positive number (the CLOSED row rides
+        // the closed feed, not this one)
         assert_eq!(rows.len(), 3, "2 open objects + 1 valid merged row");
         assert_eq!(rows[0]["number"], 1);
         assert_eq!(rows[2]["number"], 2);
@@ -7248,8 +7294,34 @@ mod tests {
         // the gh object shape flattens to the string the hub contract reads
         assert_eq!(rows[2]["mergeCommit"], json!("f".repeat(40)));
         // a broken merged feed degrades to the open feed alone
-        let open_only = concat_pr_rows(&pr_payload(&json!([{ "number": 5 }])), &json!(null));
+        let open_only = concat_pr_rows(&pr_payload(&json!([{ "number": 5 }])), &json!(null), &json!(null));
         assert_eq!(open_only.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concat_pr_rows_appends_closed_rows_br22592() {
+        // gh's --state closed MIXES merged and closed-unmerged rows; only
+        // CLOSED-state rows ride this arm (the MERGED half is the merged
+        // feed's job — a merged PR must never be laundered in as a closed
+        // observation, and a closed row must never carry a mergeCommit).
+        let open = json!([{ "number": 1, "title": "open pr", "state": "OPEN" }]);
+        let closed = json!([
+            { "number": 4019, "title": "closed unmerged", "state": "CLOSED", "mergeCommit": { "oid": "f".repeat(40) } },
+            { "number": 4054, "title": "merged (rides the merged feed)", "state": "MERGED" },
+            { "number": 0, "title": "bad number", "state": "CLOSED" },
+            { "number": "x", "title": "string number", "state": "CLOSED" },
+            { "number": 9, "title": "no state" }
+        ]);
+        let out = concat_pr_rows(&open, &json!([]), &closed);
+        let rows = out.as_array().expect("array");
+        assert_eq!(rows.len(), 2, "1 open + 1 valid closed row");
+        assert_eq!(rows[1]["number"], 4019);
+        assert_eq!(rows[1]["state"], "CLOSED");
+        // the MERGED receipt field never rides a CLOSED-unmerged observation
+        assert!(rows[1].get("mergeCommit").is_none());
+        // a broken closed feed degrades to the open+merged feeds alone
+        let degraded = concat_pr_rows(&open, &json!([]), &json!(null));
+        assert_eq!(degraded.as_array().unwrap().len(), 1);
     }
 
     #[test]

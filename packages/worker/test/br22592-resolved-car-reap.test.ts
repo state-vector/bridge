@@ -239,6 +239,35 @@ describe("BR#22592 legs 1-3 — the reap (integration)", () => {
     expect(String(after.status)).toBe("blocked");
   });
 
+  it("the derived queue reaps a CLOSED-observed leg from the board's own reconcile feed — queue correctness never waits for an executor binary", async () => {
+    const REPO_F = "state-vector/reap-closed-observed";
+    await healthyLane(REPO_F, "fixture-gw");
+    // two queued cars: one whose PR the board observed CLOSED-unmerged (the
+    // 2026-11-26 live shape: 4019/3939 closed on GitHub, invisible to the
+    // open+merged feeds, no dead-leg stamp because the walk binary predates
+    // BR#22592), one whose PR is observed OPEN (the live control)
+    const deadCar = await queuedCar("BR#22592 closed-observed car", REPO_F, 610);
+    const liveCar = await queuedCar("BR#22592 open control car", REPO_F, 611);
+    expect((await laneQueueIds(REPO_F)).join(",")).toBe(`${deadCar},${liveCar}`);
+    // one daemon observation cycle carrying the CLOSED-unmerged receipt
+    // (reconcile.report validates CLOSED rows: no mergeCommit, gh receipts)
+    const rep = await post("/reconcile.report", {
+      repo: REPO_F, actor: "fixture-gw",
+      prs: [
+        { number: 610, state: "CLOSED", title: "closed unmerged", updatedAt: new Date().toISOString() },
+        { number: 611, state: "OPEN", title: "still live", updatedAt: new Date().toISOString() },
+      ],
+    });
+    expect(rep.status, `reconcile.report failed: ${JSON.stringify(await rep.json()).slice(0, 300)}`).toBe(200);
+    const queueIds = await laneQueueIds(REPO_F);
+    // the card's own disposition stays with the probe/walk paths — the QUEUE
+    // is what reaps: a closed leg cannot drive a merge. A CLOSED-observed
+    // unmerged leg must be reaped from the derived queue — the line must not
+    // wait for an executor binary to learn a PR the board itself observed
+    // closed.
+    expect(queueIds).toEqual([liveCar]);
+  });
+
   it("merged dedupe promotes the orphaned awaiting-ci leg to terminal landed — the receipt is FACT", async () => {
     const REPO_E = "state-vector/reap-promote";
     await healthyLane(REPO_E, "fixture-gw");

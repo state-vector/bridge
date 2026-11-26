@@ -2924,15 +2924,25 @@ writer name the gateway reconciliation required before another worker may start.
 **Resolved cars never hold the line (BR#22592).** A leg is RESOLVED for queue
 admission when it is landed, receipt-settled (`awaiting-ci` with a merge
 receipt older than the 15-minute settle window — the walk re-fires the
-`merged` event and the hub promotes the leg stamp), or dead (terminal
-`dead` leg stamp from the walk's CLOSED-unmerged bounce). Resolved legs
-admit no car: the derived queue reaps them so the line advances to the next
-live candidate even when no settle pass ever lands again (the 2026-11-26
-all-resolved-line wedge). The card-level close is untouched — landed closes,
-interactive holds and foreign typed waits keep their owners. `dead` is a leg
-state only. A starve-episode diagnostic duty left unclaimed past
-`train.starve_pickup_budget_min` (default 20m) is re-boosted and alarms the
-train sink once per episode naming it for dispatch.
+`merged` event and the hub promotes the leg stamp), dead (terminal
+`dead` leg stamp from the walk's CLOSED-unmerged bounce), or **closed by the
+board's own observation** — the hub's `delivery_pr_outcomes` row for the PR
+says CLOSED-unmerged (the reconcile feed's closed list and verified
+`pr_merged` probes write it; a MERGED outcome is terminal in the upsert and
+a reopen rewrites the row OPEN, so a closed row is never stale). The queue
+reads the observation and never mutates the card: the walk's dead-leg stamp
+and the conclusive-negative probe keep the card-level disposition. Resolved
+legs admit no car: the derived queue reaps them so the line advances to the
+next live candidate even when no settle pass ever lands again (the 2026-11-26
+all-resolved-line wedge) — and queue correctness never waits for an executor
+binary to learn what the board itself observed. The card-level close is
+untouched — landed closes, interactive holds and foreign typed waits keep
+their owners. `dead` is a leg state only. The reconcile pass ships the
+closed-unmerged list beside the open+merged feeds (lease-free observation —
+a gateway without the lane lease still feeds it). A starve-episode
+diagnostic duty left unclaimed past `train.starve_pickup_budget_min`
+(default 20m) is re-boosted and alarms the train sink once per episode naming
+it for dispatch.
 
 **Heal latency: one alarm tick, keyed to what the park actually awaits (BR#22657).**
 Prerequisite parks heal on the 60s alarm leg; cars heal on the settle verdict
@@ -3874,6 +3884,10 @@ Pinned in `packages/worker/test/br6348-conflicting-park.test.ts`.
 open feed. A merge with a citable commit is evidence for independent delivery
 verification; a current acceptance can settle through the normal exact-head
 and required-check rules. Standing lane cards do not participate.
+**Observed closures (BR#22592).** The same feed appends the closed-unmerged
+list — a CLOSED row is a terminal never-lands receipt for the queue's reap
+(the anti-wedge leg above), not a card judgement: the card's disposition
+stays with the dead-leg stamp and the conclusive-negative probe.
 
 **Stranded waits.** A train-only wait outside the queue can enter the
 disposition ladder once the lane has moved and the wait exceeds

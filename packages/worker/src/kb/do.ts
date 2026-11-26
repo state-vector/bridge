@@ -19164,6 +19164,21 @@ export class KnowledgeHub {
          AND conclusion='MERGED' AND length(head_sha)=40 AND head_sha NOT GLOB '*[^0-9a-f]*'
          AND receipt='https://github.com/' || repo || '/pull/' || pr`, repo, repo,
     ).toArray().map(row => Number(row.pr)));
+    // BR#22592 (closed-observed reap): the board's own CLOSED-unmerged
+    // observations (delivery_pr_outcomes — written by reconcile.report's
+    // CLOSED rows and by verified pr_merged probe verdicts; the MERGED
+    // upsert is terminal so a closed row can never overwrite a merged one).
+    // A closed-unmerged PR can NEVER land, and queue correctness must not
+    // wait for an executor binary to report it: the hub deploy (git
+    // integration) and the gateway binary update (runner channel) are
+    // independent cadences, and the 2026-11-26 line sat wedged on exactly
+    // that gap — the hub knew nothing while the walk predating the dead-leg
+    // report held the head. The car's own disposition (the walk's dead_leg
+    // bounce stamp / the BR#6384 conclusive-negative probe) keeps its owner;
+    // this reads the observation, never mutates the card.
+    const observedClosures = new Set(this.state.storage.sql.exec(
+      `SELECT pr FROM delivery_pr_outcomes WHERE repo=? AND state='CLOSED'`, repo,
+    ).toArray().map(row => Number(row.pr)));
     // BR#15528: the merge LEDGER the train writes (provenance rows + merged
     // train events). An observed merge is only a STALE TRAIN SLOT once the
     // ledger itself records it — the executor walk's already-merged arm is
@@ -19209,8 +19224,20 @@ export class KnowledgeHub {
       // observed (the delivery observations above) AND ledgered (the train's
       // own provenance/train_events row). Observed-but-unledgered stays
       // queued so the walk reaches it and stamps the row it exists to stamp.
+      // BR#22592 (closed-observed reap): a leg whose PR the board itself
+      // observed CLOSED-unmerged (delivery_pr_outcomes; MERGED is terminal
+      // in the upsert, a reopen rewrites the row OPEN with a newer
+      // observation) can NEVER land — the queue must not hold the line
+      // waiting for the executor's dead-leg stamp: the hub deploy and the
+      // gateway binary update are independent cadences, and the live
+      // 2026-11-26 line sat wedged on exactly that gap with two fresh cars
+      // starving behind closed-unmerged heads. The card's own disposition
+      // (the walk's dead_leg bounce stamp, the BR#6384 conclusive-negative
+      // probe close) keeps its owner — this reads the observation, never
+      // mutates the card.
       return (!recordedOwner || recordedOwner === c.id)
-        && legs.some(leg => !observedMerges.has(leg.number) || !ledgeredMerges.has(leg.number));
+        && legs.some(leg => !observedClosures.has(leg.number)
+          && (!observedMerges.has(leg.number) || !ledgeredMerges.has(leg.number)));
     }).map((c) => {
       // BR#5114: the entry names its PR — the panel's NEXT/QUEUE columns
       // read "card · #pr", not a bare card id (Ray: "wtf does that mean?")
