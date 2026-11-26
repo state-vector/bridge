@@ -40,10 +40,13 @@ writes draw from a preallocated recovery reserve beside the ledger when they
 hit ENOSPC and retry once, and a record whose save still fails no longer
 blocks the status proof from being refreshed — reclamation and admission keep
 running on a full volume. When retention ends, an expired unpublished tree's
-value is published to deterministic `bridge-archive/<record>/…` branches on
-origin (a recorded reset) instead of being held forever; publish-to-preserve
-is off by default and capped per pass (`BRIDGE_WORKSPACE_PUBLISH_RESET`,
-`BRIDGE_WORKSPACE_PUBLISH_RESET_MAX`).
+disposition is decided by task liveness (BR#22672): a task that is still open
+and routable back to this host keeps the tree adoptable (the affinity clock is
+refreshed, so a future claim here adopts the same worktree); a closed task or
+a foreign claim records a durable discard receipt (task, session, HEADs, refs,
+stash, dirty inventory, ignored evidence) to `discards/<record>.json` — the
+deletion authority BR#14525 demands — and the ladder reclaims the bytes.
+Nothing is published to git, and an unreachable hub retains the tree.
 `bridge status` includes disk accounting, and `bridge workspaces status` shows
 resource states, retention errors and checkpoint receipts. Offline
 `bridge workspaces reconcile` uses the same owner and controller lock.

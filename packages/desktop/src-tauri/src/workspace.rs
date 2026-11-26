@@ -45,10 +45,23 @@ enum Retention {
     /// Unpublished value inside the TTL, no pressure: stay Released as the
     /// adoptable value signal (no error, no ladder advance).
     Hold { signal: String },
-    /// Unpublished value whose retention window ended: stop protecting BY
-    /// POLICY (the tree re-enters the ladder, where the evidence fences and
-    /// `verify_published_source` still refuse to destroy unique source).
+    /// Unpublished value whose retention window ended (TTL or pressure):
+    /// the task-liveness rule (BR#22672) decides the exit — an adoptable
+    /// task converts this back to Hold (grace), a gone task receives the
+    /// recorded discard receipt and the tree re-enters the ladder.
     Yield { signal: String },
+}
+/// BR#22672 — task-liveness verdict for an expired unpublished worktree.
+enum TaskLiveness {
+    /// The task is open and routable back to this host (no other claimant,
+    /// or this record's own session): the tree stays adoptable value.
+    Adoptable { status: String },
+    /// The task closed, or another session's claim replaced this line: the
+    /// value is stale by policy — recorded discard.
+    Gone { reason: String },
+    /// The liveness query failed (hub unreachable, view drift): never a
+    /// licence to destroy — retain and retry next pass.
+    Unknown { error: String },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -107,19 +120,52 @@ struct Resource {
     /// the worktree must never move (that would break its git worktree link).
     #[serde(default)]
     adopted_from: Option<String>,
-    /// BR#22634 — recorded-reset receipt: when the tree's expired
-    /// unpublished value was preserved by publishing it to archival
-    /// branches on origin (`bridge-archive/<id>/…`), ending BR#14525's
-    /// Yield hold so the reclaim ladder could proceed. The pushed branches
-    /// are the durable receipt; `verify_published_source` re-verifies them
-    /// at every removal step — this field is the ledger's audit marker.
+    /// BR#22634/BR#22672 — recorded-reset receipt: when the tree's expired
+    /// unpublished value had its retention end (task closed or re-claimed
+    /// elsewhere), the owner recorded a durable DISCARD RECEIPT
+    /// (`discards/<id>.json`: task, session, HEADs, local refs, stash tip,
+    /// dirty inventory, ignored evidence, byte counts) and the tree
+    /// re-entered the reclaim ladder. Nothing is published anywhere (git
+    /// vetoed as the sink, BR#22656): the receipt is the reset BR#14525
+    /// demands before any removal — knowledge preserved, bytes reclaimed.
+    /// `reset_at`/`reset_reason` are the ledger's audit markers; the fences
+    /// re-verify the receipt FILE by content at every removal step.
     #[serde(default)]
     reset_at: Option<u64>,
     #[serde(default)]
-    reset_branch: Option<String>,
+    reset_reason: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Removal { resource_id: String, bytes: u64, at: u64 }
+/// BR#22672 — the durable discard receipt (see `Owner::discard_receipt`).
+/// Written to `discards/<id>.json` BEFORE the ladder touches the tree; the
+/// fences verify it by content (`reset_proof`). Bounded lists keep a
+/// pathological tree from wedging the journal with its own inventory.
+#[derive(Serialize)]
+struct DiscardReceipt {
+    resource_id: String,
+    adopted_from: Option<String>,
+    task: Option<String>,
+    session: Option<String>,
+    reason: String,
+    at: u64,
+    observed_bytes: u64,
+    repositories: Vec<RepositoryInventory>,
+}
+#[derive(Serialize)]
+struct RepositoryInventory {
+    path: String,
+    head: Option<String>,
+    head_subject: Option<String>,
+    dirty: usize,
+    dirty_paths: Vec<String>,
+    unpushed: Option<usize>,
+    local_refs: Vec<LocalRef>,
+    stash: Option<String>,
+    ignored_evidence: Vec<String>,
+}
+#[derive(Serialize)]
+struct LocalRef { reference: String, tip: String }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -308,7 +354,7 @@ impl Owner {
         let root = self.allocations.join(&id);
         let record = Resource { version: 1, id: id.clone(), location: Location::Managed { root: root.clone() },
             phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-            last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None };
+            last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None };
         self.save(&record)?; // intent precedes every directory and Git write
         for path in ["work", "tmp", "logs", "cache/cargo", "cache/npm", "cache/xdg"] { fs::create_dir_all(root.join(path)).map_err(|e| e.to_string())?; }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?; }
@@ -328,7 +374,7 @@ impl Owner {
             } else if cache_path.exists() {CacheAuthority::LegacyDiscovery} else {CacheAuthority::ExclusiveAllocation};
             let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path, authority },
                 phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-                last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None };
+                last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
             if self.contains(&cache_record.id) && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
@@ -462,10 +508,6 @@ impl Owner {
     /// One bounded fair pass; busy/held tickets only exclude their own paths.
     /// This is called by the gateway during both normal work and update drain.
     pub fn reconcile(&self, protected: &[Ticket]) -> Result<Status, String> {
-        // BR#22634 — publish-reset budget for this pass: with the gate
-        // enabled, archival publishing is bounded so the retained pile
-        // drains over passes, never as one remote-hosting burst.
-        PUBLISH_RESET_BUDGET.store(publish_reset_pass_cap(), std::sync::atomic::Ordering::Relaxed);
         legacy::adopt(self)?;
         let mut records = self.records()?;
         records.sort_by_key(|r| (r.checked_at, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
@@ -575,7 +617,29 @@ impl Owner {
         // authority; "reclaim on expiry" means the HOLD ends, never a silent
         // wipe of unique source.
         if let Phase::Released { .. } = &record.phase {
-            match self.retention(record)? {
+            // BR#22672 (human ruling on BR#22634): the end-state disposition
+            // of an expired unpublished worktree is TASK-LIVENESS. While the
+            // task is open and can still be routed back to this host — no
+            // other claimant holds it, or the claim is this record's own
+            // session — the tree stays the adoptable value signal (grace:
+            // the affinity clock is refreshed so `adopt` can still re-key
+            // it to a future claim here). Once the task closes, or another
+            // session holds it, the value is stale by policy: it receives
+            // the recorded reset (a durable discard receipt — BR#14525's
+            // exit) and the tree re-enters the ladder. The hub being
+            // unreachable is never a licence to destroy: retained, retried.
+            let decision = match self.retention(record)? {
+                Retention::Yield { signal } => match self.task_liveness(record) {
+                    TaskLiveness::Adoptable { status } => {
+                        record.last_activity_at = now_ms();
+                        Retention::Hold { signal: format!("{signal}; task-liveness grace (BR#22672): task open ({status}), still routable to this host") }
+                    },
+                    TaskLiveness::Gone { reason } => Retention::Yield { signal: format!("{signal}; task-liveness gone: {reason}") },
+                    TaskLiveness::Unknown { error } => return Err(format!("task liveness unavailable; worktree retained: {error}")),
+                },
+                decision => decision,
+            };
+            match decision {
                 Retention::Reclaim => { record.retained_value = None; },
                 Retention::Hold { signal } => {
                     // Holding the worktree's unpublished value never freezes
@@ -589,48 +653,53 @@ impl Owner {
                     let mut paths = Vec::new();
                     repositories(&record.location.work(), &mut paths)?;
                     self.retire_disposable_children(record, &paths)?;
-                    for path in &paths { unpreserved_ignored_inputs(path)?; }
+                    for path in &paths { unpreserved_ignored_inputs(path, false)?; }
                     return Ok(());
                 },
                 Retention::Yield { signal } => {
                     record.retained_value = Some(signal);
-                    // BR#22634 — the recorded reset, finally implemented.
-                    // BR#14525's contract says an expired unpublished tree
-                    // needs "an explicit adoption or a recorded reset before
-                    // reclaim" — but no reset path existed, so expired trees
-                    // error forever: observed live as 1,661 retained records
-                    // (384GiB) that no reclamation could ever free, filling
-                    // the volume and ENOSPC-bricking the journal. The reset
-                    // PRESERVES the value by publishing it: park-commit the
-                    // residue, push HEAD to a clearly-marked archival branch
-                    // on origin — the same park-before-remove law the repo's
-                    // own worktree discipline prescribes — after which the
-                    // ladder's evidence fences stay the sole deletion
-                    // authority. Publish failure keeps the old contract:
-                    // retained, retried next pass.
-                    if !self.recorded_reset(record)? {
-                        return Err("BR#14525 retention ended (TTL expiry or disk pressure); unpublished worktree value needs an explicit adoption or a recorded reset before reclaim; source retained".into());
-                    }
-                    // Published: fall through to the reclaim ladder below.
+                    // BR#22634/BR#22672 — the recorded reset BR#14525 always
+                    // demanded and never had (observed live as 1,670 retained
+                    // records / 384 GiB filling the volume and
+                    // ENOSPC-bricking the journal). With the task gone, the
+                    // reset is a DURABLE DISCARD RECEIPT, not a publication —
+                    // git is vetoed as the sink (BR#22656, human ruling). The
+                    // owner records WHAT the tree held (task, session, HEADs,
+                    // local refs, stash tip, dirty inventory, ignored
+                    // evidence, bytes) to `discards/<id>.json`; the ladder
+                    // then reclaims the bytes. The receipt file is the
+                    // deletion authority, re-verified by content; a failed
+                    // receipt write keeps the old contract: retained,
+                    // retried next pass.
+                    self.recorded_reset(record)?;
+                    // Receipt recorded: fall through to the reclaim ladder.
                 },
             }
         }
+        // BR#22672 — a recorded reset (durable discard receipt on disk,
+        // verified BY CONTENT, not by the ledger flag alone) is the explicit
+        // authority BR#14525 requires. The value fences below guard exactly
+        // what the receipt already captured — unpublished changes, refs
+        // outside HEAD, ignored evidence, scratch inputs — so they stand
+        // down for this tree. Live-writer and structural fences never
+        // stand down.
+        let discarded = self.reset_proof(record);
         if matches!(record.phase, Phase::Released { .. } | Phase::Preserving { .. }) {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
-            verify_layout(record)?;
+            verify_layout(record, discarded)?;
             let mut paths = Vec::new();
             repositories(&record.location.work(), &mut paths)?;
             self.retire_disposable_children(record,&paths)?;
-            for path in &paths { unpreserved_ignored_inputs(path)?; }
+            for path in &paths { unpreserved_ignored_inputs(path, discarded)?; }
             // Non-Git scratch inputs are never silently thrown away. Empty
             // scratch and explicitly owned cache/tmp are disposable.
-            if uncovered_inputs(&record.location.work(), &paths)? { return Err("scratch contains unpublished non-Git inputs; preserve them before retirement".into()); }
+            if !discarded && uncovered_inputs(&record.location.work(), &paths)? { return Err("scratch contains unpublished non-Git inputs; preserve them before retirement".into()); }
             let snapshots = paths.into_iter().map(|path| Snapshot { path }).collect();
             record.phase = Phase::Reclaimable { snapshots }; self.save(record)?;
         }
         if let Phase::Reclaimable { snapshots } = &record.phase {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
-            verify_inputs(record,snapshots)?;
+            verify_inputs(record,snapshots,discarded)?;
             for snapshot in snapshots {
                 legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
             }
@@ -647,10 +716,10 @@ impl Owner {
                 if let Location::GeneratedCache { legacy_scope: Some(scope), .. } = &record.location {
                     legacy::prove_cache_scope(self, scope)?;
                 }
-                verify_inputs(record,&snapshots)?;
+                verify_inputs(record,&snapshots,discarded)?;
                 for snapshot in snapshots {
                     legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
-                    verify_published_source(&snapshot.path)?;
+                    verify_published_source(&snapshot.path, discarded)?;
                 }
                 if record.location.root().exists() {
                     fs::rename(record.location.root(), &trash).map_err(|e| e.to_string())?;
@@ -705,35 +774,125 @@ impl Owner {
         }
         Ok(Retention::Hold { signal })
     }
-    /// BR#22634 — the recorded reset for BR#14525's Yield contract (see the
-    /// call site for the incident). Preserves the expired unpublished value
-    /// by publishing it to archival branches on origin, then records the
-    /// receipt. `Ok(false)` keeps the old retain contract (gate off, budget
-    /// spent, nothing publishable); `Err` surfaces a real publish failure
-    /// for retry next pass. Idempotent: a record holding a receipt passes
-    /// straight through, and a partially-published record (receipt not yet
-    /// saved) re-pushes the same deterministic branches.
-    fn recorded_reset(&self, record: &mut Resource) -> Result<bool, String> {
-        if !publish_reset_enabled(&self.ledger) { return Ok(false); }
-        if record.reset_at.is_some() { return Ok(true); }
-        if PUBLISH_RESET_BUDGET.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |left| if left > 0 { Some(left - 1) } else { None }).is_err() {
-            return Ok(false);
+    /// BR#22634/BR#22672 — the recorded reset for BR#14525's Yield contract
+    /// (see the call site for the incident). The receipt is written BEFORE
+    /// any ladder step touches the tree, on the deterministic path
+    /// `discards/<id>.json`: idempotent, so a crash between the receipt
+    /// write and the ledger save simply re-writes the same receipt next
+    /// pass. A record already carrying `reset_at` passes straight through.
+    /// `reset_proof` re-verifies the file by content for every fence that
+    /// stands down — a ledger flag alone is never deletion authority.
+    fn recorded_reset(&self, record: &mut Resource) -> Result<(), String> {
+        if record.reset_at.is_some() { return Ok(()); }
+        let receipt = self.discard_receipt(record)?;
+        let bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+        journal::write_file(&self.discard_file(&record.id), &bytes)?;
+        record.reset_at = Some(now_ms());
+        record.reset_reason = Some(receipt.reason);
+        // The hold ended: the knowledge now lives in the receipt, not the tree.
+        record.retained_value = None;
+        Ok(())
+    }
+    fn discard_file(&self, id: &str) -> PathBuf { self.ledger.join("discards").join(format!("{id}.json")) }
+    /// BR#22672 — the fences' receipt check, BY CONTENT: `reset_at` on the
+    /// record plus a receipt file on disk whose `resource_id` matches.
+    fn reset_proof(&self, record: &Resource) -> bool {
+        if record.reset_at.is_none() { return false; }
+        fs::read(self.discard_file(&record.id)).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|receipt| receipt["resource_id"] == record.id.as_str())
+    }
+    /// BR#22672 — task-liveness for a released worktree's value signal: can
+    /// the hub still route this task back to the tree? Open and unclaimed
+    /// (todo/blocked — this host can reserve it) or claimed by this record's
+    /// own session (resume, or in_review rework on a bounce) means the tree
+    /// is still the adoptable line. Closed (done/superseded) or claimed by
+    /// a different session means the tree is stale by policy — recorded
+    /// discard. The hub being unreachable (or the view drifting) is never
+    /// a licence to destroy: Unknown, retained, retried next pass.
+    fn task_liveness(&self, record: &Resource) -> TaskLiveness {
+        let Phase::Released { owner } = &record.phase else {
+            return TaskLiveness::Gone { reason: "record is not released; no task to route back".into() };
+        };
+        let ticket = owner.ticket();
+        let card = match mcp_call_session_with_timeout(&self.cfg, &mut 0, "get_artefact",
+            json!({"id":ticket.task_id,"view":"execution"}), None, Duration::from_secs(8)) {
+            Ok(card) => card,
+            Err(error) => return TaskLiveness::Unknown { error },
+        };
+        if card["id"] != ticket.task_id.as_str() || card["type"].as_str() != Some("task") {
+            return TaskLiveness::Unknown { error: format!("task view drift for {}: not a task card", ticket.task_id) };
         }
+        let status = card["status"].as_str().unwrap_or_default().to_string();
+        match status.as_str() {
+            "done" | "superseded" => TaskLiveness::Gone { reason: format!("task {} closed ({status})", ticket.task_id) },
+            "todo" | "blocked" | "in_progress" | "in_review" => {
+                let session = card["meta"]["session"].as_str().unwrap_or_default();
+                if session.is_empty() || session == ticket.session {
+                    TaskLiveness::Adoptable { status }
+                } else {
+                    TaskLiveness::Gone { reason: format!("task {} is {status} under session {session}; this worktree is not the live line", ticket.task_id) }
+                }
+            },
+            _ => TaskLiveness::Unknown { error: format!("task {} has unrecognised status '{status}'", ticket.task_id) },
+        }
+    }
+    /// BR#22672 — the discard receipt: the durable record of what an expired
+    /// unpublished worktree held when its task could no longer route back.
+    /// "Preserve the learnings, reclaim the bytes": enough inventory to know
+    /// what was there (task, session, HEADs and subjects, local refs, stash
+    /// tip, dirty file list, ignored evidence, sizes) without keeping the
+    /// bytes or pushing anything into git. Lists are bounded so a pathological
+    /// tree cannot wedge the journal with its own inventory.
+    fn discard_receipt(&self, record: &Resource) -> Result<DiscardReceipt, String> {
+        let (task, session) = match &record.phase {
+            Phase::Released { owner } => { let ticket = owner.ticket(); (Some(ticket.task_id.clone()), Some(ticket.session.clone())) },
+            _ => (None, None),
+        };
         let mut repos = Vec::new();
         repositories(&record.location.work(), &mut repos)?;
-        let mut published = 0usize;
+        let mut inventories = Vec::new();
         for repository in &repos {
-            if !git(repository, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok_and(|tip| !tip.is_empty()) { continue }
-            publish_reset_repo(repository, &record.id)?;
-            published += 1;
+            let head = git(repository, &["rev-parse", "HEAD"]).ok().filter(|tip| !tip.is_empty());
+            let head_subject = head.is_some().then(|| git(repository, &["log", "-1", "--format=%s"]).ok()).flatten();
+            let status = git(repository, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"]).unwrap_or_default();
+            let dirty = status.lines().count();
+            let dirty_paths = status.lines().take(200)
+                // Porcelain v1 is two status columns + one space + path, but
+                // the git() helper trims the whole output — the first line
+                // can lose its leading status space. Slice from column 2 and
+                // trim: correct for both shapes, best-effort for renames.
+                .map(|line| line.get(2..).unwrap_or(line).trim().to_string()).collect();
+            let unpushed = head.is_some().then(|| git(repository, &["rev-list", "--count", "HEAD", "--not", "--remotes"]).ok())
+                .flatten().and_then(|count| count.trim().parse::<usize>().ok());
+            let mut local_refs = Vec::new();
+            if repository.join(".git").is_dir() {
+                for reference in git(repository, &["for-each-ref", "--format=%(refname)", "refs/heads/", "refs/tags/"])?.lines() {
+                    let reference = reference.trim();
+                    if reference.is_empty() || git(repository, &["merge-base", "--is-ancestor", reference, "HEAD"]).is_ok() { continue }
+                    if let Ok(tip) = git(repository, &["rev-parse", reference]) {
+                        local_refs.push(LocalRef { reference: reference.to_string(), tip });
+                    }
+                }
+            }
+            let stash = git(repository, &["rev-parse", "-q", "--verify", "refs/stash"]).ok().filter(|tip| !tip.is_empty());
+            let ignored = git(repository, &["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]).unwrap_or_default();
+            let ignored_evidence = ignored.split('\0')
+                .filter(|path| !path.is_empty() && !disposable(path.trim_end_matches('/').rsplit('/').next().unwrap_or("")))
+                .take(50).map(|path| path.to_string()).collect();
+            inventories.push(RepositoryInventory {
+                path: repository.to_string_lossy().into_owned(), head, head_subject, dirty, dirty_paths, unpushed, local_refs, stash, ignored_evidence,
+            });
         }
-        if published > 0 {
-            record.reset_at = Some(now_ms());
-            record.reset_branch = Some(format!("bridge-archive/{}", record.id));
-        }
-        // The hold ended: the value now lives on origin, not in the tree.
-        record.retained_value = None;
-        Ok(true)
+        Ok(DiscardReceipt {
+            resource_id: record.id.clone(),
+            adopted_from: record.adopted_from.clone(),
+            task, session,
+            reason: record.retained_value.clone().unwrap_or_else(|| "retention ended".into()),
+            at: now_ms(),
+            observed_bytes: record.observed_bytes,
+            repositories: inventories,
+        })
     }
     fn measure(&self) -> Result<Status, String> {
         let (budget, floor) = Self::budget_floor();
@@ -785,7 +944,7 @@ impl Owner {
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
             let mut child=if self.file(&id).exists() {self.read(&id)?} else {
-                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}
+                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}
             };
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }
@@ -1066,7 +1225,11 @@ fn is_bridge_cli_target(repository: &Path, target: &Path) -> Result<bool, String
     Ok(legacy::cache_tag(target))
 }
 
-pub(super) fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
+pub(super) fn unpreserved_ignored_inputs(path: &Path, discarded: bool) -> Result<(), String> {
+    // BR#22672 — a recorded discard receipt already captured the ignored
+    // inventory (paths and evidence class) before the ladder ran; this
+    // value fence stands down for that tree.
+    if discarded { return Ok(()); }
     let ignored=git(path,&["ls-files","--others","--ignored","--exclude-standard","--directory","-z"])?;
     // BR#14740 — recreatable caches are disposable BY CLASS, not by per-allocation
     // declaration: node_modules/target (the exact names `disposable()` sanctions
@@ -1086,8 +1249,11 @@ pub(super) fn unpreserved_ignored_inputs(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn verify_layout(record:&Resource)->Result<(),String> {
+fn verify_layout(record:&Resource,discarded:bool)->Result<(),String> {
     if let Location::Managed {root}=&record.location {
+        // BR#22672 — layout drift fences WHAT the tree holds for the future;
+        // a discard-bound tree has no future — the receipt is the authority.
+        if discarded { return Ok(()); }
         for entry in fs::read_dir(root).map_err(|e|e.to_string())? {
             let entry=entry.map_err(|e|e.to_string())?;
             if !matches!(entry.file_name().to_str(),Some("work"|"tmp"|"cache"|"logs")) {return Err("workspace contains unregistered inputs outside its source directory; retained".into());}
@@ -1095,59 +1261,11 @@ fn verify_layout(record:&Resource)->Result<(),String> {
     }
     Ok(())
 }
-/// BR#22634 — publish-to-preserve gate. Publishing agent WIP to a shared
-/// origin is a human policy decision (branch namespace, remote storage,
-/// secret-leak review), so the recorded reset stays OFF until the gateway
-/// opts in explicitly via `BRIDGE_WORKSPACE_PUBLISH_RESET`.
-// BR#22634 — publish-to-preserve policy gate. The env flag is the
-// production opt-in; the FORCE seam is the TEST opt-in. The seam is
-// PATH-SCOPED (like attempt_journal::FAIL_FIRST_WRITE): a plain global
-// bool leaks the gate to every concurrently-running test's reconcile
-// during the window — observed as the full suite's real-controller
-// timing tests starving while the publish test's reconcile held the
-// flag — so a test may force the gate only for ITS owner ledger.
-static PUBLISH_RESET_FORCE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
-static PUBLISH_RESET_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn publish_reset_enabled(ledger: &Path) -> bool {
-    if matches!(std::env::var("BRIDGE_WORKSPACE_PUBLISH_RESET").as_deref(), Ok("1" | "true")) { return true; }
-    PUBLISH_RESET_FORCE.lock().map(|forced| forced.as_deref() == Some(ledger)).unwrap_or(false)
-}
-fn publish_reset_pass_cap() -> usize {
-    std::env::var("BRIDGE_WORKSPACE_PUBLISH_RESET_MAX").ok().and_then(|value| value.parse().ok()).unwrap_or(25).clamp(1, 500)
-}
-/// BR#22634 — publish one repository's unpublished value to a deterministic
-/// archival branch on origin: park-commit the residue, push HEAD, then
-/// publish-and-drop any local ref outside HEAD (standalone clones only —
-/// a worktree's refs belong to its parent clone, which the fence never
-/// blames). Ref names derive from (record, repository), so retries
-/// fast-forward the same receipt.
-fn publish_reset_repo(repository: &Path, record_id: &str) -> Result<(), String> {
-    let key = journal::stable_key(&[record_id, &repository.to_string_lossy()]);
-    let archive = format!("refs/heads/bridge-archive/{record_id}/{}", &key[..16]);
-    if !git(repository, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?.is_empty() {
-        git(repository, &["add", "--all"])?;
-        git(repository, &["-c", "user.name=bridge-ops", "-c", "user.email=ops@bridge.local", "commit", "-m", &format!("wip: park residue before archival reset (BR#22634 {record_id})")])?;
-    }
-    git(repository, &["push", "--force", "origin", &format!("HEAD:{archive}")])?;
-    if repository.join(".git").is_dir() {
-        if git(repository, &["rev-parse", "-q", "--verify", "refs/stash"]).is_ok_and(|value| !value.is_empty()) {
-            // A stash is single-ref reflog history: preserve its tip, drop
-            // the ref so the local-refs fence can ever pass.
-            let stash = git(repository, &["rev-parse", "refs/stash"])?;
-            git(repository, &["push", "--force", "origin", &format!("{stash}:{archive}/stash")])?;
-            git(repository, &["stash", "clear"])?;
-        }
-        for reference in git(repository, &["for-each-ref", "--format=%(refname)", "refs/heads/", "refs/tags/"])?.lines() {
-            let reference = reference.trim();
-            if reference.is_empty() || git(repository, &["merge-base", "--is-ancestor", reference, "HEAD"]).is_ok() { continue }
-            let tip = git(repository, &["rev-parse", reference])?;
-            git(repository, &["push", "--force", "origin", &format!("{tip}:{archive}/refs-{}", reference.trim_start_matches("refs/").replace('/', "-"))])?;
-            git(repository, &["update-ref", "-d", reference])?;
-        }
-    }
-    Ok(())
-}
-fn verify_published_source(path: &Path) -> Result<(), String> {
+fn verify_published_source(path: &Path, discarded: bool) -> Result<(), String> {
+    // BR#22672 — a recorded discard receipt already captured exactly what
+    // this fence guards (local changes, refs outside HEAD, an unpublished
+    // HEAD); the receipt is the explicit reset authority BR#14525 names.
+    if discarded { return Ok(()); }
     if !git(path, &["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"])?.is_empty() {
         return Err("workspace has local changes; source retained".into());
     }
@@ -1171,7 +1289,7 @@ fn verify_published_source(path: &Path) -> Result<(), String> {
     }
     Err("workspace HEAD is not reachable from a published branch; source retained".into())
 }
-fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
+fn verify_inputs(record:&Resource,snapshots:&[Snapshot],discarded:bool)->Result<(),String> {
     if let Location::OwnedDisposable { root, .. } = &record.location {
         if root.file_name().and_then(|name| name.to_str()) == Some(".kb-bundle")
             && !is_bridge_worker_bundle(root.parent().ok_or("worker bundle repository missing")?, root)? {
@@ -1192,10 +1310,13 @@ fn verify_inputs(record:&Resource,snapshots:&[Snapshot])->Result<(),String> {
         }
         return Ok(());
     }
-    verify_layout(record)?;
+    verify_layout(record,discarded)?;
+    // BR#22672 — the discard receipt covers the unpublished value the
+    // scratch/ignored fences guard; they stand down for this tree.
+    if discarded { return Ok(()); }
     let paths:Vec<_>=snapshots.iter().map(|s|s.path.clone()).collect();
     if uncovered_inputs(&record.location.work(),&paths)? {return Err("new unpublished scratch inputs arrived before retirement; retained".into());}
-    for snapshot in snapshots {unpreserved_ignored_inputs(&snapshot.path)?;}
+    for snapshot in snapshots {unpreserved_ignored_inputs(&snapshot.path,false)?;}
     Ok(())
 }
 fn remove_tree(path: &Path) -> Result<(), String> {

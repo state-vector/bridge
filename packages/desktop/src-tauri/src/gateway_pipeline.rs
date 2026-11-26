@@ -1417,7 +1417,7 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(terminal_root(&cfg).unwrap().join(record.name())).unwrap(),before);
         drop(controller);drop(ready);let _=std::fs::remove_dir_all(root(&cfg).unwrap());
     }
-    pub(crate) struct Hub { url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
+    pub(crate) struct Hub { pub(crate) url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
     impl Hub {
         pub(crate) fn new(mut answer: impl FnMut(serde_json::Value) -> Option<serde_json::Value> + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -9,7 +9,10 @@ impl Sandbox {
         fs::create_dir_all(&root).unwrap(); Self(root)
     }
     fn owner(&self) -> Owner {
-        let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://fixture.invalid","label":"workspace-tests","workdir":self.0.join("disk")})).unwrap();
+        // 127.0.0.1:1 refuses instantly — the liveness query must fail FAST
+        // in tests that exercise the hub-unreachable path (and never stall
+        // on DNS for .invalid-style hostnames).
+        let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://127.0.0.1:1","label":"workspace-tests","workdir":self.0.join("disk")})).unwrap();
         let ledger = self.0.join("journal"); let allocations = self.0.join("disk/workspaces");
         fs::create_dir_all(&ledger).unwrap(); fs::create_dir_all(&allocations).unwrap();
         Owner { cfg, ledger, allocations: allocations.canonicalize().unwrap() }
@@ -55,7 +58,7 @@ fn inspection_uses_only_the_active_attempt_from_the_owner_ledger() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Managed { root: owner.allocations.join(id) },
-            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
+            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
         }).unwrap();
     }
     assert_eq!(owner.active_paths_for_task("BR#42").unwrap(), vec![owner.allocations.join("active/work")]);
@@ -199,7 +202,7 @@ fn budget_counts_aliased_nested_allocations_once() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Legacy { root, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
         }).unwrap();
     }
     let allocation_bytes = disk_bytes(&allocation).unwrap();
@@ -272,7 +275,7 @@ fn legacy_unknown_operations_are_retained_without_publishing_or_removing_source(
     let (cfg,ready,_)=fixture(&hub);let owner=Owner::open(&cfg).unwrap();
     let root=PathBuf::from(&cfg.workdir).join("legacy");fs::create_dir_all(&root).unwrap();fs::write(root.join("evidence"),"do not replay or delete").unwrap();
     let id=legacy::allocation_id("legacy",&root).unwrap();
-    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}).unwrap();
+    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);assert!(root.join("evidence").exists());
     assert!(owner.read(&id).unwrap().error.unwrap().contains("operation evidence"));
     drop(ready);let _=fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
@@ -325,7 +328,7 @@ fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
         fs::write(path.join("unpublished-input"), "keep this").unwrap();
         owner.save(&Resource {
             version: 1, id, location: Location::Legacy { root: path, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_branch: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
         }).unwrap();
     }
     let t = ticket("released-under-pressure");
@@ -445,7 +448,7 @@ fn completed_resource_history_is_cold_and_cannot_resurrect_a_claim() {
     let before=fs::read(owner.archive_file(&id)).unwrap();
     for n in 0..256 {
         let name=format!("historical-{n}");
-        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_branch:None}).unwrap();
+        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}).unwrap();
     }
     assert!(owner.records().unwrap().is_empty(),"completed history must not be scanned/rewritten as active work");
     owner.reconcile(&[]).unwrap();assert_eq!(fs::read(owner.archive_file(&id)).unwrap(),before);
@@ -596,7 +599,12 @@ fn affinity_adopts_a_quiesced_prior_worktree_and_assesses_inherited_state() {
 // tree's hold ends (never a silent wipe — the fences still govern removal).
 #[test]
 fn expired_affinity_starts_fresh_and_ends_the_retention_hold() {
-    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"BR#42","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);
     let first=Ticket { task_id:"BR#42".into(), session:"gen-1".into() };
     let a=owner.allocate(&first,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
@@ -612,13 +620,17 @@ fn expired_affinity_starts_fresh_and_ends_the_retention_hold() {
     let b=owner.allocate(&second,Some(source.to_str().unwrap())).unwrap();
     assert_ne!(b.root,root,"expired affinity must fall back to a fresh worktree");
     assert!(b.adopted.is_none());
-    // The expired hold yields: the retention signal names the cure and the
-    // evidence fences still refuse to destroy the unpublished source.
+    // BR#22672: the expired hold ends through the recorded reset — the task
+    // is closed, so the stale tree is discarded WITH a receipt. The deletion
+    // authority is the receipt (age alone never was authority); what the
+    // receipt records is exactly the WIP the old fences used to retain.
     owner.reconcile(&[]).unwrap();
     let expired=owner.read(&old_id).unwrap();
-    assert!(expired.retained_value.as_deref().is_some_and(|s| s.contains("TTL expired")),"{:?}",expired.retained_value);
-    assert!(expired.error.as_deref().is_some_and(|e| e.contains("retention ended")));
-    assert!(fs::read_to_string(work.join("tracked")).unwrap().contains("stale WIP"),"age alone is never deletion authority");
+    assert!(matches!(expired.phase,Phase::Removed { .. }),"expired affinity with a closed task is discarded");
+    assert!(expired.retained_value.is_none(),"the retention signal ended");
+    assert!(expired.reset_at.is_some(),"the recorded reset is the hold's exit");
+    let receipt:serde_json::Value=serde_json::from_slice(&fs::read(owner.ledger.join("discards").join(format!("{old_id}.json"))).unwrap()).unwrap();
+    assert!(receipt["repositories"][0]["dirty_paths"].as_array().is_some_and(|paths| paths.iter().any(|p| p.as_str().is_some_and(|p| p.ends_with("tracked")))),"the discarded WIP is recorded in the receipt, not silently lost");
 }
 
 // BR#14525 — a clean, published done tree reclaims immediately (task done),
@@ -650,41 +662,109 @@ fn done_trees_reclaim_while_dirty_trees_stay_adoptable_until_taken() {
 }
 
 #[test]
-fn publish_to_preserve_records_the_reset_and_frees_expired_unpublished_trees() {
-    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+fn recorded_discard_frees_expired_unpublished_trees_when_the_task_closed() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22634-discard","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
     let source=crate::checkpoint::tests::init(&sandbox.0);
-    let t=ticket("br22634-reset");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    let t=ticket("br22634-discard");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
     a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
-    let archive=sandbox.0.join("archive.git");
-    git(&sandbox.0,&["init","--bare","archive.git"]).unwrap();
-    git(&work,&["remote","set-url","origin",archive.to_str().unwrap()]).unwrap();
     fs::write(work.join("tracked"),"unique unpublished value").unwrap();
     let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
-    // Gate OFF — the pre-BR#22634 contract: an expired unpublished tree is
-    // retained forever (the 1,661-record / 384 GiB pile on the gateway).
+    // Task closed on the hub (BR#22672: recorded discard): the durable
+    // receipt is BR#14525's reset — the ladder reclaims the bytes, nothing
+    // is published anywhere, and the receipt remembers what was lost.
     owner.reconcile(&[]).unwrap();
-    assert_source_not_removed(&owner,&id,&root);
-    assert!(owner.read(&id).unwrap().error.as_deref().unwrap_or("").contains("recorded reset"),"retention yield surfaces the missing reset");
-    // Gate ON — publish-to-preserve, then the ladder reclaims the tree.
-    // Reset the pass's retry backoff (a real recovery cadence would simply
-    // arrive 30s later; the publish path itself is what's under test).
-    // The force seam is path-scoped to THIS owner's ledger so concurrent
-    // tests' reconciles never observe the gate.
-    let mut record=owner.read(&id).unwrap();record.retry_at=0;owner.save(&record).unwrap();
-    *PUBLISH_RESET_FORCE.lock().unwrap()=Some(owner.ledger.clone());
-    let outcome=owner.reconcile(&[]);
-    *PUBLISH_RESET_FORCE.lock().unwrap()=None;
-    outcome.unwrap();
     let record=owner.read(&id).unwrap();
-    assert!(matches!(record.phase,Phase::Removed { .. }),"published tree was reclaimed");
-    assert!(record.reset_at.is_some(),"recorded-reset receipt missing");
-    assert_eq!(record.reset_branch,Some(format!("bridge-archive/{id}")));
+    assert!(matches!(record.phase,Phase::Removed { .. }),"expired tree with a closed task was reclaimed");
+    assert!(record.reset_at.is_some(),"recorded-reset marker missing");
+    assert!(record.reset_reason.as_deref().unwrap_or("").contains("closed"),"reset reason carries the liveness verdict");
     assert!(!root.exists(),"allocation root removed");
-    let key=super::super::attempt_journal::stable_key(&[&id,&work.to_string_lossy()]);
-    let branch=format!("bridge-archive/{id}/{}",&key[..16]);
-    let refs=git(&archive,&["for-each-ref","--format=%(refname)","refs/heads/"]).unwrap();
-    assert!(refs.contains(&branch),"archival receipt branch missing: {refs}");
-    assert!(git(&archive,&["show",&format!("{branch}:tracked")]).unwrap().contains("unique unpublished value"),"parked residue survives on the archive branch");
+    let receipt:serde_json::Value=serde_json::from_slice(&fs::read(owner.ledger.join("discards").join(format!("{id}.json"))).unwrap()).unwrap();
+    assert_eq!(receipt["resource_id"],id.as_str());
+    assert_eq!(receipt["task"],"br22634-discard");
+    assert_eq!(receipt["session"],format!("session-br22634-discard"));
+    let inventory=&receipt["repositories"][0];
+    assert!(inventory["dirty_paths"].as_array().is_some_and(|paths| paths.iter().any(|p| p.as_str().is_some_and(|p| p.ends_with("tracked")))),"receipt inventory lists the lost WIP file: {receipt}");
+    assert!(inventory["head"].as_str().is_some(),"receipt records the HEAD the tree died on");
+    // The value fences stood down BY CONTENT: the receipt exists, matches the
+    // record, and is the only reason the removal could proceed.
+    assert!(owner.reset_proof(&record),"reset proof verifies the receipt file");
+    let mut stale=record.clone();stale.id="other".into();
+    assert!(!owner.reset_proof(&stale),"a receipt for another resource is not deletion authority");
+}
+
+#[test]
+fn task_liveness_grace_retains_expired_trees_while_the_task_is_open_and_routable() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22634-grace","type":"task","status":"todo","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22634-grace");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join("tracked"),"adoptable WIP").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    // BR#22672 grace: the TTL expired, but the task is open and unclaimed —
+    // it can still be routed back to this host, so the tree stays the
+    // adoptable value signal (no error, no discard, clock refreshed).
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(root.exists(),"open task: the expired tree is retained by grace");
+    assert!(record.retained_value.as_deref().unwrap_or("").contains("task-liveness grace"),"grace signal recorded");
+    assert!(record.last_activity_at>1,"grace refreshes the affinity clock so adoption can still re-key the tree");
+    assert!(record.error.is_none(),"grace is a policy hold, not an error");
+    assert!(record.reset_at.is_none(),"no discard receipt while the task can route back");
+    // The routing proof: a NEW claim on this task adopts the SAME worktree.
+    let next=Ticket { task_id:"br22634-grace".into(), session:"gen-2".into() };
+    let c=owner.allocate(&next,Some(source.to_str().unwrap())).unwrap();
+    assert_eq!(c.root,root,"a new claim routes back to the retained worktree");
+}
+
+#[test]
+fn a_foreign_claim_discards_the_stale_worktree() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22634-foreign","type":"task","status":"in_progress","meta":{"session":"dispatch-elsewhere"}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22634-foreign");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join("tracked"),"stale WIP").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    // BR#22672: another machine picked the task up — this worktree is not
+    // the live line, so it is marked for deletion (with the receipt).
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(matches!(record.phase,Phase::Removed { .. }),"a foreign claim discards the stale tree");
+    assert!(record.reset_reason.as_deref().unwrap_or("").contains("not the live line"),"reset reason names the foreign claim");
+    assert!(!root.exists(),"allocation root removed");
+}
+
+#[test]
+fn hub_unreachability_never_discards_expired_wip() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner(); // 127.0.0.1:1: refused instantly
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22634-unreachable");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join("tracked"),"unpublished").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    // The liveness verdict is UNKNOWN when the hub cannot answer: the
+    // worktree is retained (the error surfaces for retry), never discarded
+    // on a failed probe.
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(record.error.as_deref().unwrap_or("").contains("task liveness unavailable"),"liveness failure surfaces on the record");
+    assert!(record.reset_at.is_none(),"no receipt without a liveness verdict");
+    assert_source_not_removed(&owner,&id,&root);
 }
 
 #[test]

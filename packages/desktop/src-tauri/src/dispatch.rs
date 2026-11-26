@@ -37,7 +37,7 @@ mod workspace;
 mod workspace_inspect;
 
 pub(crate) fn assert_no_unpreserved_checkpoint_inputs(path: &Path) -> Result<(), String> {
-    workspace::unpreserved_ignored_inputs(path)
+    workspace::unpreserved_ignored_inputs(path, false)
 }
 #[path = "recovery.rs"]
 mod recovery;
