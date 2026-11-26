@@ -895,6 +895,46 @@ fn a_mid_ladder_record_routes_through_its_lineage() {
     assert!(!root.exists(),"allocation root removed");
 }
 
+// BR#22634 — measured on the gateway: 1,179 never-visited records sat at
+// the head of the fair LRU (checked_at=0 sorted FIRST) while 1,632 aged
+// records waited behind them, so live dispatch's fresh turnover starved
+// the backlog and the pile could only drain at the ENOSPC brink. A record
+// with no visit history is NEWEST, not oldest: the aged, actionable
+// backlog gets the visit budget.
+#[test]
+fn the_fair_pass_visits_the_aged_backlog_before_never_visited_records() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        let id=request["params"]["arguments"]["id"].as_str().unwrap_or("").to_string();
+        Some(json!({"id":id,"type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let mut ids=Vec::new();
+    for n in 0..4 {
+        let t=ticket(&format!("br22634-fair-{n}"));let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+        a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+        fs::write(work.join("tracked"),"aged expired value").unwrap();
+        let mut record=owner.read(&id).unwrap();record.last_activity_at=1;record.checked_at=1;owner.save(&record).unwrap();
+        ids.push(id);
+    }
+    // The fresh record: released moments ago, never visited.
+    let fresh=ticket("br22634-fresh");let a=owner.allocate(&fresh,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&fresh)).unwrap();let fresh_id=a.id.clone();drop(a);owner.release(&released(&attempt(&fresh))).unwrap();
+    owner.reconcile(&[]).unwrap();
+    // The aged, expired, closed-task records drained this pass — the
+    // visit budget reached the backlog, not the turnover.
+    for id in &ids {
+        let record=owner.read(id).unwrap();
+        assert!(matches!(record.phase,Phase::Removed { .. }),"aged expired record {id} drained this pass");
+    }
+    // The fresh record was not visited while aged work waited.
+    let record=owner.read(&fresh_id).unwrap();
+    assert_eq!(record.checked_at,0,"never-visited records are newest, not oldest");
+    assert!(matches!(record.phase,Phase::Released { .. }),"the fresh record stays released and unassessed");
+}
+
 // Pre-lineage ladder records (the existing stuck pile) have no ticket to
 // consult: liveness is UNKNOWN at the gate and the refusal stands — the
 // conservative exit, never a blind discard.

@@ -522,7 +522,18 @@ impl Owner {
     pub fn reconcile(&self, protected: &[Ticket]) -> Result<Status, String> {
         legacy::adopt(self)?;
         let mut records = self.records()?;
-        records.sort_by_key(|r| (r.checked_at, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
+        // BR#22634 — the fair LRU keys on CHECKED age, and a never-visited
+        // record has no age: checked_at=0 sorted FIRST, so live dispatch's
+        // fresh turnover (measured on the gateway: ~22 new records/hour vs
+        // a ~4-record visit budget per pass) permanently occupied the queue
+        // head and the 1,600-record aged backlog was unreachable at fair
+        // pace — the pile could only ever drain at the ENOSPC brink. A
+        // record with no visit history is NEWEST, not oldest: its first
+        // visit assesses retention (a within-TTL hold is the default
+        // anyway — no visit is the safe state), while the aged, actionable
+        // backlog gets the visit budget. The pressure LRU and slot below
+        // are unchanged.
+        records.sort_by_key(|r| (if r.checked_at == 0 { u64::MAX } else { r.checked_at }, std::cmp::Reverse(r.observed_bytes), r.id.clone()));
         if self.status().is_ok_and(|status| matches!(status.admission, Admission::Held { .. })) {
             // Keep the normal fair pass, with one pressure slot for the
             // largest released allocation that can be checked now.

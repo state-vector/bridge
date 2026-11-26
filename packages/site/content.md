@@ -51,7 +51,9 @@ ladder value-fence refusal on an expired record — ignored evidence invisible
 to `git status`, non-Git scratch, local refs outside HEAD, an unpublished
 HEAD — routes through the same liveness gate, with the task lineage captured
 at release keeping mid-ladder records attributable; pre-lineage records keep
-their refusal (the conservative exit).
+their refusal (the conservative exit). The reconcile pass is LRU by
+last-visit age with never-visited records counting as newest, so fresh
+dispatch turnover cannot starve the aged backlog of its visit budget.
 `bridge status` includes disk accounting, and `bridge workspaces status` shows
 resource states, retention errors and checkpoint receipts. Offline
 `bridge workspaces reconcile` uses the same owner and controller lock.
