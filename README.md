@@ -2934,6 +2934,23 @@ state only. A starve-episode diagnostic duty left unclaimed past
 `train.starve_pickup_budget_min` (default 20m) is re-boosted and alarms the
 train sink once per episode naming it for dispatch.
 
+**Heal latency: one alarm tick, keyed to what the park actually awaits (BR#22657).**
+Prerequisite parks heal on the 60s alarm leg; cars heal on the settle verdict
+one tick after green or the fail-closed bound. A blocked card parked
+`pr_merged` is resumed as a prerequisite when its merge receipt exists — even
+when the card's completion contract is `delivery` — unless the card's OWN
+delivery legs (its stamped PR bindings) cover the awaited repo#pr; those
+parks belong to the merged-park close, not the prerequisite resume (the
+2026-11-25 BR#21252 epic: healed 4m15s late by the 15-min proxy sweep
+because the 60s leg skipped every merge-completing card). A provenance gap
+is never silent: eligible car rows with an empty provenance table emit a
+`merged_park_provenance_empty` audit row every pass (the BR#22622
+starvation shape). And a landed label never overstates certainty: a
+merged-provenance close landing while a lane it rides sits on a
+`checks_unconfirmed` stop (CI unknown past the fail-closed bound) stamps
+`ci_unproven: true` on the landed state — the merge is real, the CI
+settlement never was (the BR#22593 shape).
+
 The [delivery-mechanism architecture review and proposed structural repair plan](docs/analysis/BR-7542-delivery-mechanism-review-and-plan.md)
 records remaining lifecycle, completion, priority and recovery gaps at commit
 `4c1f82416`. Its acceptance criteria describe proposed work, not shipped guarantees.
