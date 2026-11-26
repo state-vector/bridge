@@ -4277,6 +4277,29 @@ closes those leaks with four hub mechanisms:
   stamped `probe_starved` and one `park_liveness_alarm` per day naming the starved class. Lanes and
   infra anchors are exempt (their expired timers re-arm by design, BR#5916/BR#15528). Drill:
   `admin.park_liveness_sweep {now}`; the census rides the `watchdog.sweep` blob as `park_liveness`.
+- **Claim liveness** (a4, the 2026-11-27 stale-claim audit — the in_progress twin): the stall sweep's
+  guard skips used to be SILENT on the claim side — a zombie claim (a board row of an ended session)
+  fenced by a bound-ask marker, a typed execution wait, a handoff or an open ask row was never
+  re-judged and nothing counted the silence (specimens: BR#9594, 19 days past its ask's own machine
+  cancellation, annotated "blocked 82h" against a resolved ask; BR#6992, an ended interactive claim
+  with no named fence). Three changes close the class. (1) The `awaiting_ask` skip HEALS the provably
+  dead shape: a marker whose ask is a cancelled/expired NON-human coordination request is stale
+  metadata (the BR#18868 admission-side law applied to the claim side) — the marker and its lying
+  park-prose fragment clear (`stale_ask_marker_cleared` audit + board note) and the card falls through
+  to the ordinary silence classification, so a plain silent card releases to the pool. Human decisions
+  and answered asks (BR#3578 keep-park) never qualify. (2) Every remaining silent skip STAMPS the
+  fence on the card (`meta.silence_hold {reason, since}` — startup_wait / execution_wait / handoff /
+  open_ask, cleared automatically once signals go fresh again) and lands in the stall census
+  (`watchdog.sweep.stale_claims` — reason → card count + oldest silence); the fence's own owner still
+  owns every exit. (3) The scheduler's dispatch holds gain a per-class AGE (`hold_oldest_ts` on
+  `schedule_status`, `held_oldest_hours` on `/stats.scheduler`) and one throttled all-class pile alarm
+  (`dispatch_hold_pile`, one per day): a class fires when its pile passes `dispatch_hold_pile_threshold`
+  (default 8) OR any card in it has been held past `dispatch_hold_stale_hours` (default 48) — a hold
+  with no age bound is silent starvation, and the eligible:1/full-pool incident (84 held across seven
+  reasons, scheduler reporting "ready", no alarm anywhere) is the class this closes. The diagnosis
+  sweep's guard skips stamp too (`silence_hold.reason = diagnosis:<guard>`), so a held card carries its
+  own why-not-diagnosed; a spawned duty clears the stamp. Drills: `admin.stall_sweep {now}` (the
+  census settings row is written on every run); `test/claim-liveness.test.ts` pins all four shapes.
 - **Terminal close-leg ownership** (b): a new gate rule `done-close-legs` reads the "## Done when"
   section + the done note; every terminal "close GH #N" intent (or receipt-shaped claim like
   "GH#N fully closed") must carry a **closure receipt** or be owned by a CLOSED close-duty child.

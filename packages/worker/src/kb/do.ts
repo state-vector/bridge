@@ -1501,6 +1501,9 @@ export class KnowledgeHub {
           blocked_stale_hours: blockedStaleHours, owner_stale_hours: ownerStaleHours,
         },
         park_liveness: parkLiveness ?? null,
+        // BR-flow-unblock — the stall census (written by stallSweep): in_progress
+        // cards held by a named fence, so silent claims are countable on /stats
+        ...(this.readStaleClaims(now) ?? {}),
       }),
     );
     // BR#4212: persist the channel counters once per tick so an isolate
@@ -1653,8 +1656,42 @@ export class KnowledgeHub {
     for await (const r of this.stallCandidates(trace)) {
       try {
       const meta = JSON.parse(r.meta ?? "{}");
-      if (this.protectedExecution(String(r.id), meta)) continue;
+      if (this.protectedExecution(String(r.id), meta)) {
+        // BR-flow-unblock — a protected skip used to be SILENT: an in_progress
+        // card fenced by a startup wait, a typed execution wait or a published
+        // handoff never re-entered this sweep's judgment and nothing counted
+        // the silence (the zombie-claim class: board rows of ended sessions).
+        // Name the fence on the card — the honest-stamp law the park-hygiene
+        // backstop applied to blocked parks — and count it. The fence's own
+        // owner (readiness reconciliation, the wake evaluator, the handoff
+        // claim) still owns the exit; this stamp is census, not release.
+        const reason = this.startupWait(String(r.id)) ? "startup_wait"
+          : isExecutionWait(meta) ? "execution_wait" : "handoff";
+        this.stampSilenceHold(String(r.id), meta, now, reason);
+        continue;
+      }
       if (meta.awaiting_ask) {
+        const askId = String(meta.awaiting_ask.ask_id ?? "");
+        if (this.cancelledCoordinationMarker(meta)) {
+          // BR#18868 stall-side twin — the marker names a cancelled or expired
+          // NON-human coordination ask: nobody will ever answer it, so the
+          // marker is stale metadata, not a live hold. The admission side
+          // (todoLifecycleHold) already ignores it for dispatch; the claim
+          // side kept holding — the BR#9594 specimen sat 19 days past its
+          // ask's own machine cancellation, annotated "blocked 82h" against a
+          // resolved ask. Clear the marker and its park-prose fragment, then
+          // FALL THROUGH to the ordinary silence classification: a plain
+          // silent card releases to the pool. Human decisions and answered
+          // asks never qualify for this heal (the marker check refuses them)
+          // — their exits stay human-owned below.
+          delete meta.awaiting_ask;
+          if (typeof meta.blocked?.reason === "string" && /awaiting .+ on ask /i.test(String(meta.blocked.reason))) delete meta.blocked;
+          delete meta.silence_hold;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+          this.audit("system:watchdog", "stale_ask_marker_cleared", r.id, { ask_id: askId });
+          this.version(r.id, "system:watchdog", "note",
+            `stale bound-ask marker cleared (watchdog, BR#18868 stall twin): ask ${askId} is cancelled/expired by its own receipt — nobody will answer it; the card re-enters the ordinary silence classification`, {});
+        } else {
         // aging escalation: a task parked on a human answer must show its
         // age, or the wait is invisible and unbounded. Annotate hourly;
         // the release stays human-owned (an answered ask un-blocks it).
@@ -1690,6 +1727,7 @@ export class KnowledgeHub {
           }
         } catch { /* annotation is best-effort */ }
         continue;
+        }
       }
       // (A) declared grace: the agent stated a silence window — honor it until it lapses
       if (typeof meta.grace_until === "number" && meta.grace_until > now) continue;
@@ -1711,7 +1749,14 @@ export class KnowledgeHub {
       const openAsk = this.one(
         `SELECT id FROM asks WHERE status = 'open' AND artefact_id = ?`, r.id,
       );
-      if (openAsk) continue;
+      if (openAsk) {
+        // BR-flow-unblock — an open ask row pauses the claim (rule 6) but the
+        // pause used to be SILENT: no annotation, no census. Name it (the
+        // 24h TTL expiry still owns the eventual release; this is visibility,
+        // not a second owner).
+        this.stampSilenceHold(String(r.id), meta, now, "open_ask", { ask_id: String(openAsk.id) });
+        continue;
+      }
       // Repair pre-BR#6839 phantom claims even when a train/board write just
       // refreshed updated_ts. Only the actual worker's signals prove liveness;
       // another duty's progress and a bounce itself do not start a writer.
@@ -1781,7 +1826,16 @@ export class KnowledgeHub {
         }, "system:watchdog");
         continue;
       }
-      if (now - lastTs <= staleMs) continue;
+      if (now - lastTs <= staleMs) {
+        // quiet but plausibly working (a fresh signal exists) — an older
+        // silence stamp is stale metadata here; clear it so the census
+        // counts only LIVE silences
+        if (meta.silence_hold) {
+          delete meta.silence_hold;
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), r.id);
+        }
+        continue;
+      }
       // BR#4067 — typed-proxy preservation: silence must not destroy a machine
       // wait. A card the train owns (queued/awaiting-ci/bounced on a live PR)
       // or one parked on a typed await / bound ask is PARKED blocked — the
@@ -1911,8 +1965,49 @@ export class KnowledgeHub {
         this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
       }
     }
+    // BR-flow-unblock — the stall census: every in_progress card silently held
+    // by a named fence (startup wait, typed execution wait, handoff, open
+    // ask), with its oldest silence. Written on every sweep run so the
+    // admin.stall_sweep drill and the alarm tick both produce it; /stats
+    // carries it inside the watchdog.sweep payload. A hold with no age and no
+    // name is silent starvation — this makes the silence countable.
+    const heldRows = this.state.storage.sql.exec(
+      `SELECT json_extract(meta,'$.silence_hold.reason') AS reason, COUNT(*) AS n,
+         MIN(CAST(json_extract(meta,'$.silence_hold.since') AS INTEGER)) AS oldest_since
+       FROM artefacts WHERE type='task' AND status='in_progress' AND json_extract(meta,'$.silence_hold.reason') IS NOT NULL
+       GROUP BY 1`).toArray() as any[];
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('watchdog.stale_claims', ?)`,
+      JSON.stringify({ ts: now, claims: heldRows.map(row => ({ reason: String(row.reason), cards: Number(row.n), oldest_since: Number(row.oldest_since ?? 0) })) }),
+    );
   }
 
+  /** BR-flow-unblock — name a silent in_progress hold on the card (the
+   * claim-side twin of the park sweep's proxy_check stamps). Idempotent: the
+   * first stamp for a reason carries `since`; re-stamps keep it (no write,
+   * no note churn) until the reason CHANGES or the freshness branch deletes
+   * the stamp. The fence's own owner still owns the exit — this is census. */
+  private stampSilenceHold(id: string, meta: Record<string, unknown>, now: number, reason: string, detail: Record<string, unknown> = {}): void {
+    const cur = meta.silence_hold as { reason?: string; since?: number } | undefined;
+    if (cur?.reason === reason) return;
+    meta.silence_hold = { reason, since: cur?.since ?? now, ...detail };
+    this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), id);
+    this.version(id, "system:watchdog", "note",
+      `silent claim hold named (watchdog): ${reason}${detail.ask_id ? ` (ask ${String(detail.ask_id)})` : ""} — the fence is counted in the stall census until its owner discharges it`, {});
+  }
+
+
+  /** BR-flow-unblock — the last stall census (tolerant reader: the sweep may
+   * not have run yet on a fresh isolate). Rides the watchdog.sweep payload. */
+  private readStaleClaims(now: number): { stale_claims?: { ts: number; age_min: number; claims: { reason: string; cards: number; oldest_since: number }[] } } | null {
+    try {
+      const row = this.one(`SELECT value FROM settings WHERE key = 'watchdog.stale_claims'`);
+      if (!row) return null;
+      const parsed = JSON.parse(String(row.value)) as { ts?: number; claims?: { reason: string; cards: number; oldest_since: number }[] };
+      if (!parsed?.ts || !Array.isArray(parsed.claims)) return null;
+      return { stale_claims: { ts: parsed.ts, age_min: Math.round(Math.max(0, now - parsed.ts) / 60_000), claims: parsed.claims } };
+    } catch { /* malformed — the next sweep rewrites it */ return null; }
+  }
 
   private settingValue(key: string, fallback: string): string {
     const row = this.one(`SELECT value FROM settings WHERE key = ?`, key);
@@ -7368,9 +7463,14 @@ export class KnowledgeHub {
     automaticScopes?: ReadonlySet<string>) {
     const reasons: Partial<Record<SchedulingReason, number>> = {};
     const held: Partial<Record<SchedulingReason, string[]>> = {};
+    // BR-flow-unblock — per-class hold AGE: the earliest status_ts among the
+    // cards each reason holds. A hold count without an age cannot answer
+    // "is this lawful pacing or silent starvation" — the eligible:1/full-pool
+    // incident was exactly that (84 held, no age anywhere).
+    const holdOldest: Partial<Record<SchedulingReason, number>> = {};
     const filter = taskIds ? " AND a.id IN (SELECT value FROM json_each(?))" : "";
     const rows = this.state.storage.sql.exec(
-      `SELECT a.id,a.title,a.body_md,a.project,a.meta,a.roles,a.tags,a.updated_ts,a.created_ts,
+      `SELECT a.id,a.title,a.body_md,a.project,a.meta,a.roles,a.tags,a.updated_ts,a.created_ts,a.status_ts,
         MAX(COALESCE(repair.created_ts, delivery.created_ts, a.created_ts), COALESCE(repair_turn.last_reserved_at, 0),
             COALESCE(q.last_reserved_at, 0)) AS queue_ts,
         COALESCE(repair.id, delivery.id, a.id) AS queue_id,
@@ -7550,7 +7650,16 @@ export class KnowledgeHub {
           routeCandidates.push({ id, created: Number(row.created_ts), proof });
         }
       }
-      if (reason) { if (taskIds) taskHolds.set(id, reason); reasons[reason] = (reasons[reason] ?? 0) + 1; const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id); return false; }
+      if (reason) {
+        if (taskIds) taskHolds.set(id, reason);
+        reasons[reason] = (reasons[reason] ?? 0) + 1;
+        const ids = held[reason] ??= []; if (ids.length < 100) ids.push(id);
+        // hold age: how long has THIS card been sitting in its current shape?
+        // status_ts is the board's own "entered this state at" clock.
+        const holdTs = Number(row.status_ts ?? row.updated_ts ?? row.created_ts ?? 0);
+        if (holdTs > 0 && (!holdOldest[reason] || holdTs < holdOldest[reason]!)) holdOldest[reason] = holdTs;
+        return false;
+      }
       return true;
     }));
     // BR#17649 — ONE selection law for both stages (recovery-capacity.ts):
@@ -7575,7 +7684,7 @@ export class KnowledgeHub {
       || Number(String(a.queue_id).slice(3)) - Number(String(b.queue_id).slice(3))
       || Number(String(a.id).slice(3)) - Number(String(b.id).slice(3)));
     routeCandidates.sort((a, b) => a.created - b.created || Number(a.id.slice(3)) - Number(b.id.slice(3)));
-    return { eligible, entries, reasons, held, taskHolds, automaticRouteCandidates, routeCandidates: routeCandidates.map(task => task.id),
+    return { eligible, entries, reasons, held, holdOldest, taskHolds, automaticRouteCandidates, routeCandidates: routeCandidates.map(task => task.id),
       managedRouteCandidates: routeCandidates.flatMap(({ id, proof }) => proof ? [{ id, proof }] : []) };
   }
 
@@ -7721,7 +7830,7 @@ export class KnowledgeHub {
           : { kind: "starved", since: Number(pending.since), reason: "eligible_work_not_reserved" };
         const observed = this.one(`SELECT outcome FROM dispatch_observations WHERE token_id=?`, tokenId);
         return { token_id: tokenId, host: label, ...gatewayOccupancy(this.state.storage.sql, tokenId, label), capacity: gatewayCapacity(capabilities), admission_cap: dispatchAdmissionCapacity(capabilities), eligible: selection.eligible.length,
-          reasons: selection.reasons, held: selection.held, routeCandidates: selection.routeCandidates, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
+          reasons: selection.reasons, held: selection.held, hold_oldest_ts: selection.holdOldest, routeCandidates: selection.routeCandidates, candidates: selection.eligible.slice(0, 10).map(t => String(t.id)), readiness, observed_at: Number(row.observed_ts),
           live: now - Number(row.observed_ts) < 120_000, health, last_dispatch: observed ? SchedulingOutcomeSchema.parse(JSON.parse(observed.outcome)) : null };
       });
   }
@@ -7880,6 +7989,48 @@ export class KnowledgeHub {
     if (startupPile > 5 && !this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='startup_interrupt_pile' AND ts>? LIMIT 1`, now - 1_800_000)) {
       const sample = [...new Set(statuses.flatMap(s => s.held?.startup_interrupt ?? []))].slice(0, 10);
       this.audit("system:scheduler", "startup_interrupt_pile", null, { pile: startupPile, threshold: 5, hosts: statuses.filter(s => Number(s.reasons?.startup_interrupt ?? 0) > 0).length, sample });
+    }
+    // BR-flow-unblock — the ALL-CLASS hold-pile alarm: the per-class pile
+    // signals above have thresholds (30 / 5) a lawful-shaped distribution
+    // never reaches, and only two classes are covered at all. The eligible:1
+    // incident ran 84 held cards across seven reasons — retry_budget 22,
+    // unknown_operations 17, independent_wait 28 — with the scheduler
+    // reporting "ready" and no alarm anywhere, because every class was under
+    // its threshold and NONE carried an age. Every dispatch hold class is now
+    // alarm-eligible: fire when a class's pile passes the size threshold OR
+    // any card in it has been held past the stale-age knob (a hold with no
+    // age bound is silent starvation). One alarm per day naming every firing
+    // class with its oldest age and specimen ids — the operator surface the
+    // per-class signals cannot provide.
+    {
+      const sizeThreshold = Math.max(1, Math.min(200, parseInt(this.settingValue("dispatch_hold_pile_threshold", "8"), 10) || 8));
+      const staleHours = Math.max(1, Math.min(720, parseInt(this.settingValue("dispatch_hold_stale_hours", "48"), 10) || 48));
+      const classes = new Map<SchedulingReason, { count: number; oldest_ts: number }>();
+      for (const s of statuses) {
+        for (const reason of Object.keys(s.reasons ?? {}) as SchedulingReason[]) {
+          const count = Number(s.reasons?.[reason] ?? 0);
+          if (!count) continue;
+          const ts = Number((s as { hold_oldest_ts?: Record<string, number> }).hold_oldest_ts?.[reason] ?? 0);
+          const prev = classes.get(reason);
+          const prevTs = prev?.oldest_ts ?? 0;
+          // earliest known hold start wins; 0 = unknown never masks a known one
+          const oldest = prevTs && ts ? Math.min(prevTs, ts) : (prevTs || ts);
+          classes.set(reason, { count: Math.max(prev?.count ?? 0, count), oldest_ts: oldest });
+        }
+      }
+      const firing = [...classes.entries()]
+        .filter(([reason, c]) => c.count >= sizeThreshold || (c.oldest_ts > 0 && now - c.oldest_ts >= staleHours * 3_600_000))
+        .map(([reason, c]) => ({
+          reason, count: c.count,
+          oldest_hours: c.oldest_ts ? Math.round((now - c.oldest_ts) / 3_600_000) : null,
+          sample: statuses.flatMap(s => s.held?.[reason] ?? []).slice(0, 6),
+        }));
+      if (firing.length && !this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='dispatch_hold_pile' AND ts>? LIMIT 1`, now - 24 * 3_600_000)) {
+        this.audit("system:scheduler", "dispatch_hold_pile", null, {
+          threshold: sizeThreshold, stale_hours: staleHours, classes: firing,
+          eligible: statuses.reduce((n, s) => n + (s.eligible ?? 0), 0),
+        });
+      }
     }
   }
 
@@ -11853,13 +12004,17 @@ export class KnowledgeHub {
     // by hand. Surface the per-host scheduler state (starved-since, held
     // counts by reason) here so the watchdog prose sweep and the operator
     // both see WHY nothing is dispatching from the stats route alone.
-    let scheduler: { host: string; live: boolean; ready: string; eligible: number; active: number; reserved: number; capacity: number; admission_cap: number; starved_since: number | null; held: Record<string, number> }[] | undefined;
+    let scheduler: { host: string; live: boolean; ready: string; eligible: number; active: number; reserved: number; capacity: number; admission_cap: number; starved_since: number | null; held: Record<string, number>; held_oldest_hours: Record<string, number> }[] | undefined;
     try {
       scheduler = this.schedulingStatus(undefined, Date.now()).map(s => ({
         host: s.host, live: s.live, ready: s.readiness?.kind ?? "unknown", eligible: s.eligible ?? 0,
         active: s.active ?? 0, reserved: s.reserved ?? 0, capacity: s.capacity ?? 0, admission_cap: s.admission_cap ?? 0,
         starved_since: s.health?.kind === "starved" ? Number(s.health.since) : null,
         held: Object.fromEntries(Object.entries(s.reasons ?? {}).map(([k, v]) => [k, Number(v)])),
+        // BR-flow-unblock — per-class hold age: a count without an age cannot
+        // distinguish lawful pacing from a silently starving pile
+        held_oldest_hours: Object.fromEntries(Object.entries((s as { hold_oldest_ts?: Record<string, number> }).hold_oldest_ts ?? {})
+          .map(([k, ts]) => [k, Math.max(0, Math.round((Date.now() - Number(ts)) / 3_600_000))])),
       }));
     } catch { /* scheduling shape varies — best-effort */ }
     return {
@@ -20955,11 +21110,21 @@ export class KnowledgeHub {
         const parked = String(row.subject_status) === "blocked";
         if (parked && (hold !== "unknown_operations"
           || !this.reconcilableBlockedWait(id, { status: "blocked", owner: String(row.subject_owner ?? "") }, meta, state, Date.now()))) continue;
-        if ((hold !== "retry_budget" && hold !== "unknown_operations")
-          || (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now()))
-          || this.isUnclaimableAnchor({ id }, meta) || meta.operator_gated || this.startupHasAsk(id)
-          || this.protectedExecution(id, meta)
-          || (parked ? this.parkDiagnosisHold(meta) : this.todoLifecycleHold(id, meta))) continue;
+        if (hold !== "retry_budget" && hold !== "unknown_operations") continue;
+        if (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now())) continue;
+        // BR-flow-unblock — the guard skips used to be SILENT: a budget- or
+        // operations-fenced card whose diagnosis was blocked by a guard just
+        // lingered held with no receipt naming WHY no diagnosis ever spawned
+        // (the held-but-undiagnosable half of the eligible:1 starvation).
+        // Name the guard on the card — the fence's owner still owns it — so
+        // a held card carries its own why-not-diagnosed.
+        const guardSkip = this.isUnclaimableAnchor({ id }, meta) ? "anchor"
+          : meta.operator_gated ? "operator_gate"
+          : this.startupHasAsk(id) ? "startup_ask"
+          : this.protectedExecution(id, meta) ? "protected_execution"
+          : (parked ? this.parkDiagnosisHold(meta) : this.todoLifecycleHold(id, meta)) ? "lifecycle_hold"
+          : null;
+        if (guardSkip) { this.stampSilenceHold(id, meta, Date.now(), `diagnosis:${guardSkip}`); continue; }
         const diagnosedSameAttempt = meta.execution_diagnosis?.generation === state.generation && meta.execution_diagnosis?.hold === hold;
         if (diagnosedSameAttempt && attemptDiagnosisCoversAttempt(state)) {
           // BR#18198 — the accepted duty's stamp already covers this stopped
@@ -21022,7 +21187,10 @@ export class KnowledgeHub {
             || !this.reconcilableBlockedWait(id, writeRow, writeMeta, this.executionState(id) ?? fresh, Date.now())) continue;
         }
         this.state.storage.transactionSync(() => {
-          this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?))
+          // BR-flow-unblock — a duty actually spawned: any earlier guard stamp
+          // ("why not diagnosed") is stale metadata now that diagnosis is in
+          // flight; the write's WHERE re-proves the shape.
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=json_set(meta, '$.execution_diagnosis', json(?), '$.silence_hold', null)
             WHERE id=? AND status=? AND owner=''`, JSON.stringify(diagnosis), id, parked ? "blocked" : "todo");
           this.version(id, "system:recovery", "execution_diagnosis_scheduled", "Assigned diagnosis of a stopped execution attempt",
             { ...diagnosis, attempt_id: state.attempt?.attempt_id });
