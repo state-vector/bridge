@@ -46,7 +46,12 @@ refreshed, so a future claim here adopts the same worktree); a closed task or
 a foreign claim records a durable discard receipt (task, session, HEADs, refs,
 stash, dirty inventory, ignored evidence) to `discards/<record>.json` — the
 deletion authority BR#14525 demands — and the ladder reclaims the bytes.
-Nothing is published to git, and an unreachable hub retains the tree.
+Nothing is published to git, and an unreachable hub retains the tree. Every
+ladder value-fence refusal on an expired record — ignored evidence invisible
+to `git status`, non-Git scratch, local refs outside HEAD, an unpublished
+HEAD — routes through the same liveness gate, with the task lineage captured
+at release keeping mid-ladder records attributable; pre-lineage records keep
+their refusal (the conservative exit).
 `bridge status` includes disk accounting, and `bridge workspaces status` shows
 resource states, retention errors and checkpoint receipts. Offline
 `bridge workspaces reconcile` uses the same owner and controller lock.

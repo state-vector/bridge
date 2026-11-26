@@ -58,7 +58,7 @@ fn inspection_uses_only_the_active_attempt_from_the_owner_ledger() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Managed { root: owner.allocations.join(id) },
-            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
+            phase, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None, task_lineage: None,
         }).unwrap();
     }
     assert_eq!(owner.active_paths_for_task("BR#42").unwrap(), vec![owner.allocations.join("active/work")]);
@@ -202,7 +202,7 @@ fn budget_counts_aliased_nested_allocations_once() {
     ] {
         owner.save(&Resource {
             version: 1, id: id.into(), location: Location::Legacy { root, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None, task_lineage: None,
         }).unwrap();
     }
     let allocation_bytes = disk_bytes(&allocation).unwrap();
@@ -275,7 +275,7 @@ fn legacy_unknown_operations_are_retained_without_publishing_or_removing_source(
     let (cfg,ready,_)=fixture(&hub);let owner=Owner::open(&cfg).unwrap();
     let root=PathBuf::from(&cfg.workdir).join("legacy");fs::create_dir_all(&root).unwrap();fs::write(root.join("evidence"),"do not replay or delete").unwrap();
     let id=legacy::allocation_id("legacy",&root).unwrap();
-    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}).unwrap();
+    owner.save(&Resource {version:1,id:id.clone(),location:Location::Legacy {root:root.clone(),task:Some("BR#123".into())},phase:Phase::LegacyUnproved,observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None,task_lineage:None}).unwrap();
     assert_eq!(owner.reconcile(&[]).unwrap().reclaimed_bytes,0);assert!(root.join("evidence").exists());
     assert!(owner.read(&id).unwrap().error.unwrap().contains("operation evidence"));
     drop(ready);let _=fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
@@ -328,7 +328,7 @@ fn disk_pressure_visits_one_released_allocation_before_the_legacy_backlog() {
         fs::write(path.join("unpublished-input"), "keep this").unwrap();
         owner.save(&Resource {
             version: 1, id, location: Location::Legacy { root: path, task: None },
-            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None,
+            phase: Phase::LegacyUnproved, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None, last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None, task_lineage: None,
         }).unwrap();
     }
     let t = ticket("released-under-pressure");
@@ -448,7 +448,7 @@ fn completed_resource_history_is_cold_and_cannot_resurrect_a_claim() {
     let before=fs::read(owner.archive_file(&id)).unwrap();
     for n in 0..256 {
         let name=format!("historical-{n}");
-        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}).unwrap();
+        owner.save(&Resource {version:1,id:name,location:Location::Legacy {root:sandbox.0.join("gone"),task:None},phase:Phase::Removed {reclaimed_bytes:0,at:1},observed_bytes:0,checked_at:0,retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None,task_lineage:None}).unwrap();
     }
     assert!(owner.records().unwrap().is_empty(),"completed history must not be scanned/rewritten as active work");
     owner.reconcile(&[]).unwrap();assert_eq!(fs::read(owner.archive_file(&id)).unwrap(),before);
@@ -764,6 +764,161 @@ fn hub_unreachability_never_discards_expired_wip() {
     let record=owner.read(&id).unwrap();
     assert!(record.error.as_deref().unwrap_or("").contains("task liveness unavailable"),"liveness failure surfaces on the record");
     assert!(record.reset_at.is_none(),"no receipt without a liveness verdict");
+    assert_source_not_removed(&owner,&id,&root);
+}
+
+// BR#22672 — the pile's measured mass was NOT git-dirty trees: retention is
+// porcelain-blind to ignored evidence, so clean+published trees carrying
+// unique ignored files route Reclaim → ladder → fence refusal forever. The
+// value-fence gate is their exit: refusal + expired + closed task → the
+// receipt (which inventories exactly that ignored evidence) waives the fence.
+#[test]
+fn ignored_evidence_records_a_discard_receipt_when_the_task_closed() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22672-ignored","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    // A committed ignore rule: the work tree reads CLEAN to porcelain while
+    // carrying unique ignored evidence — the host pile's exact shape (650
+    // records / 148 GiB porcelain-blind to their own evidence).
+    fs::write(source.join(".gitignore"),".env\n").unwrap();
+    git(&source,&["add",".gitignore"]).unwrap();
+    git(&source,&["commit","-m","Declare local env evidence ignored"]).unwrap();
+    let t=ticket("br22672-ignored");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    // Ignored evidence: invisible to porcelain, not disposable by class.
+    fs::write(work.join(".env"),"unique local secret evidence").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(matches!(record.phase,Phase::Removed { .. }),"ignored-evidence tree with a closed task is discarded, not wedged at the fence");
+    assert!(record.reset_at.is_some(),"the gate wrote the recorded reset");
+    assert!(!root.exists(),"allocation root removed");
+    let receipt:serde_json::Value=serde_json::from_slice(&fs::read(owner.ledger.join("discards").join(format!("{id}.json"))).unwrap()).unwrap();
+    assert_eq!(receipt["task"],"br22672-ignored","receipt attributes the discard to the task");
+    assert!(receipt["repositories"][0]["ignored_evidence"].as_array().is_some_and(|paths| paths.iter().any(|p| p.as_str().is_some_and(|p| p.ends_with(".env")))),"the ignored evidence is preserved in the receipt: {:?}",receipt);
+}
+
+#[test]
+fn the_value_fence_gate_graces_an_open_task_with_ignored_evidence() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22672-gate-grace","type":"task","status":"todo","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    // Committed ignore rule: porcelain-clean tree carrying ignored evidence
+    // (the fence refusal class the gate routes at arm 1).
+    fs::write(source.join(".gitignore"),".env\n").unwrap();
+    git(&source,&["add",".gitignore"]).unwrap();
+    git(&source,&["commit","-m","Declare local env evidence ignored"]).unwrap();
+    let t=ticket("br22672-gate-grace");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join(".env"),"adoptable ignored evidence").unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    // The fence refused an EXPIRED tree, but the task is open and routable:
+    // grace, not a receipt — the same BR#22672 ruling, applied at the gate.
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(root.exists(),"open task: the gate holds the refused tree by grace");
+    assert!(record.retained_value.as_deref().unwrap_or("").contains("task-liveness grace"),"gate grace signal recorded: {:?}",record.retained_value);
+    assert!(record.last_activity_at>1,"the gate refreshes the affinity clock");
+    assert!(record.error.is_none(),"grace is a policy hold, not an error: {:?}",record.error);
+    assert!(record.reset_at.is_none(),"no receipt while the task can route back");
+}
+
+// BR#22672 — retention must SEE local refs outside HEAD (the 570-record
+// Removing pile was exactly this class passing the shallow check).
+#[test]
+fn local_refs_outside_head_are_a_retention_signal() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22672-refs","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22672-refs");let a=owner.allocate(&t,None).unwrap();
+    let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);
+    owner.release(&released(&Ownership::Reservation {ticket:t})).unwrap();
+    // A standalone clone — the stuck pile's legacy shape: .git is a
+    // directory, so the tree's local refs die with it. Clean porcelain,
+    // published HEAD, but a side ref the ladder's fence refuses — and
+    // retention now sees it too.
+    fs::remove_dir_all(&work).unwrap();
+    git(&sandbox.0,&["clone",source.to_str().unwrap(),work.to_str().unwrap()]).unwrap();
+    configure(&work,&sandbox.0);
+    let tree=git(&work,&["rev-parse","HEAD^{tree}"]).unwrap();
+    let side=git(&work,&["commit-tree",&tree,"-m","side work"]).unwrap();
+    git(&work,&["update-ref","refs/heads/side",&side]).unwrap();
+    let mut record=owner.read(&id).unwrap();record.last_activity_at=1;owner.save(&record).unwrap();
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(matches!(record.phase,Phase::Removed { .. }),"local-refs tree with a closed task is discarded through the Yield path");
+    let receipt:serde_json::Value=serde_json::from_slice(&fs::read(owner.ledger.join("discards").join(format!("{id}.json"))).unwrap()).unwrap();
+    assert!(receipt["repositories"][0]["local_refs"].as_array().is_some_and(|refs| refs.iter().any(|r| r["reference"]=="refs/heads/side")),"the side ref is preserved in the receipt");
+    assert!(!root.exists(),"allocation root removed");
+}
+
+// BR#22672 — records already inside the ladder (the live Removing pile)
+// lost their owner with the Released phase. The lineage captured at release
+// keeps the gate's liveness query and the receipt's attribution working.
+#[test]
+fn a_mid_ladder_record_routes_through_its_lineage() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22672-lineage","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22672-lineage");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join("tracked"),"mid-ladder unpublished value").unwrap();
+    // Force the record into the ladder, past Released, as the stuck pile is.
+    let mut record=owner.read(&id).unwrap();
+    record.phase=Phase::Reclaimable { snapshots: vec![Snapshot { path: work.clone() }] };
+    record.last_activity_at=1;
+    assert!(record.task_lineage.is_some(),"release captured the task lineage");
+    owner.save(&record).unwrap();
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(matches!(record.phase,Phase::Removed { .. }),"the fence refusal routed through the gate to a receipt");
+    assert!(record.reset_reason.as_deref().unwrap_or("").contains("task-liveness gone"),"the gate's reset reason carries the verdict");
+    let receipt:serde_json::Value=serde_json::from_slice(&fs::read(owner.ledger.join("discards").join(format!("{id}.json"))).unwrap()).unwrap();
+    assert_eq!(receipt["task"],"br22672-lineage","the receipt attributes via the lineage, not the phase");
+    assert!(receipt["repositories"][0]["dirty_paths"].as_array().is_some_and(|paths| paths.iter().any(|p| p.as_str().is_some_and(|p| p.ends_with("tracked")))),"the dirty inventory is preserved");
+    assert!(!root.exists(),"allocation root removed");
+}
+
+// Pre-lineage ladder records (the existing stuck pile) have no ticket to
+// consult: liveness is UNKNOWN at the gate and the refusal stands — the
+// conservative exit, never a blind discard.
+#[test]
+fn pre_lineage_ladder_records_stay_retained() {
+    let sandbox=Sandbox::new();let mut owner=sandbox.owner();
+    let hub=Hub::new(|request| if request["params"]["name"]=="get_artefact" {
+        Some(json!({"id":"br22672-pre","type":"task","status":"done","meta":{}}))
+    } else { None });
+    owner.cfg.url=hub.url.clone();
+    ready(&owner);
+    let source=crate::checkpoint::tests::init(&sandbox.0);
+    let t=ticket("br22672-pre");let a=owner.allocate(&t,Some(source.to_str().unwrap())).unwrap();configure(&a.work,&sandbox.0);
+    a.bind(&attempt(&t)).unwrap();let id=a.id.clone();let root=a.root.clone();let work=a.work.clone();drop(a);owner.release(&released(&attempt(&t))).unwrap();
+    fs::write(work.join("tracked"),"pre-lineage unpublished value").unwrap();
+    let mut record=owner.read(&id).unwrap();
+    record.phase=Phase::Reclaimable { snapshots: vec![Snapshot { path: work.clone() }] };
+    record.last_activity_at=1;
+    record.task_lineage=None; // the pre-existing pile shape
+    owner.save(&record).unwrap();
+    owner.reconcile(&[]).unwrap();
+    let record=owner.read(&id).unwrap();
+    assert!(record.error.as_deref().unwrap_or("").contains("no task lineage"),"the conservative exit surfaces the missing lineage");
+    assert!(record.reset_at.is_none(),"no receipt without a routable task identity");
     assert_source_not_removed(&owner,&id,&root);
 }
 

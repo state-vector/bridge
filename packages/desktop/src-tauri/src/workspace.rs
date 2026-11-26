@@ -134,6 +134,14 @@ struct Resource {
     reset_at: Option<u64>,
     #[serde(default)]
     reset_reason: Option<String>,
+    /// BR#22672 — the task/session this resource was released for. The
+    /// ladder phases past `Released` drop the owner, but the value-fence
+    /// gate may still need to ask the hub what became of the task (and the
+    /// discard receipt must attribute what was lost). Records released
+    /// before this field existed carry None: their gate cannot consult
+    /// liveness and their refusal stands (the conservative exit).
+    #[serde(default)]
+    task_lineage: Option<Ticket>,
 }
 #[derive(Serialize, Deserialize)]
 struct Removal { resource_id: String, bytes: u64, at: u64 }
@@ -354,7 +362,7 @@ impl Owner {
         let root = self.allocations.join(&id);
         let record = Resource { version: 1, id: id.clone(), location: Location::Managed { root: root.clone() },
             phase: Phase::InUse { owner: Ownership::Reservation { ticket: ticket.clone() } }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-            last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None };
+            last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None, task_lineage: None };
         self.save(&record)?; // intent precedes every directory and Git write
         for path in ["work", "tmp", "logs", "cache/cargo", "cache/npm", "cache/xdg"] { fs::create_dir_all(root.join(path)).map_err(|e| e.to_string())?; }
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?; }
@@ -374,7 +382,7 @@ impl Owner {
             } else if cache_path.exists() {CacheAuthority::LegacyDiscovery} else {CacheAuthority::ExclusiveAllocation};
             let cache_record = Resource { version: 1, id: cache_id, location: Location::RepositoryCache { root: cache_path, authority },
                 phase: Phase::Cached { last_used_at: now_ms() }, observed_bytes: 0, checked_at: 0, retry_at: 0, error: None,
-                last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None };
+                last_activity_at: 0, retained_value: None, adopted_from: None, reset_at: None, reset_reason: None, task_lineage: None };
             // A partially retired cache must finish its old deletion before it
             // can be re-created. Never overwrite a removal intent.
             if self.contains(&cache_record.id) && !matches!(self.read(&cache_record.id)?.phase, Phase::Cached { .. } | Phase::Removed { .. }) {
@@ -467,6 +475,10 @@ impl Owner {
                 record.phase = Phase::Released { owner: owner.clone() }; record.retry_at = 0;
                 // BR#14525 — the affinity/retention TTL starts at release.
                 record.last_activity_at = now_ms();
+                // BR#22672 — remember whose work this was past the Released
+                // phase: the ladder's value-fence gate and the discard
+                // receipt both need the task lineage after the owner is gone.
+                record.task_lineage = Some(owner.ticket().clone());
                 self.save(&record)
             },
             Phase::InUse { .. } => Err("workspace release does not match its exact owner".into()),
@@ -603,7 +615,7 @@ impl Owner {
                 record.phase = Phase::LegacyUnproved; self.save(record)?;
                 legacy::prove(self, record)?;
             },
-            Phase::InUse { owner } => { self.recover_release(&owner)?; record.phase = Phase::Released { owner }; record.last_activity_at = now_ms(); record.retained_value = None; self.save(record)?; },
+            Phase::InUse { owner } => { self.recover_release(&owner)?; let ticket = owner.ticket().clone(); record.phase = Phase::Released { owner }; record.last_activity_at = now_ms(); record.retained_value = None; record.task_lineage = Some(ticket); self.save(record)?; },
             Phase::LegacyUnproved => { legacy::prove(self, record)?; },
             _ => {},
         }
@@ -683,24 +695,41 @@ impl Owner {
         // outside HEAD, ignored evidence, scratch inputs — so they stand
         // down for this tree. Live-writer and structural fences never
         // stand down.
-        let discarded = self.reset_proof(record);
+        let mut discarded = self.reset_proof(record);
         if matches!(record.phase, Phase::Released { .. } | Phase::Preserving { .. }) {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
-            verify_layout(record, discarded)?;
+            // BR#22672 — each value fence refusal routes through the gate:
+            // expired + closed/foreign task → the receipt re-runs the fence
+            // waived; expired + routable task → grace; anything else → the
+            // refusal stands. Live-writer and structural fences never gate.
+            if let Err(error) = verify_layout(record, discarded) {
+                match self.gate(record,&mut discarded,&error)? { true => verify_layout(record,discarded)?, false => return Ok(()) }
+            }
             let mut paths = Vec::new();
             repositories(&record.location.work(), &mut paths)?;
             self.retire_disposable_children(record,&paths)?;
-            for path in &paths { unpreserved_ignored_inputs(path, discarded)?; }
+            for path in &paths {
+                if let Err(error) = unpreserved_ignored_inputs(path, discarded) {
+                    match self.gate(record,&mut discarded,&error)? { true => unpreserved_ignored_inputs(path,discarded)?, false => return Ok(()) }
+                }
+            }
             // Non-Git scratch inputs are never silently thrown away. Empty
             // scratch and explicitly owned cache/tmp are disposable.
-            if !discarded && uncovered_inputs(&record.location.work(), &paths)? { return Err("scratch contains unpublished non-Git inputs; preserve them before retirement".into()); }
+            if !discarded && uncovered_inputs(&record.location.work(), &paths)? {
+                match self.gate(record,&mut discarded,"scratch contains unpublished non-Git inputs; preserve them before retirement")? {
+                    true => {},
+                    false => return Ok(()),
+                }
+            }
             let snapshots = paths.into_iter().map(|path| Snapshot { path }).collect();
             record.phase = Phase::Reclaimable { snapshots }; self.save(record)?;
         }
-        if let Phase::Reclaimable { snapshots } = &record.phase {
+        if let Phase::Reclaimable { snapshots } = record.phase.clone() {
             legacy::no_readers(record.location.root(),self.reader_authority(record)?)?;
-            verify_inputs(record,snapshots,discarded)?;
-            for snapshot in snapshots {
+            if let Err(error) = verify_inputs(record,&snapshots,discarded) {
+                match self.gate(record,&mut discarded,&error)? { true => verify_inputs(record,&snapshots,discarded)?, false => return Ok(()) }
+            }
+            for snapshot in &snapshots {
                 legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
             }
             let repositories = snapshots.iter().filter(|s| s.path.join(".git").is_file()).map(|s| PathBuf::from(worktree_owner(&s.path, &s.path.to_string_lossy()))).collect();
@@ -716,10 +745,14 @@ impl Owner {
                 if let Location::GeneratedCache { legacy_scope: Some(scope), .. } = &record.location {
                     legacy::prove_cache_scope(self, scope)?;
                 }
-                verify_inputs(record,&snapshots,discarded)?;
-                for snapshot in snapshots {
+                if let Err(error) = verify_inputs(record,&snapshots,discarded) {
+                    match self.gate(record,&mut discarded,&error)? { true => verify_inputs(record,&snapshots,discarded)?, false => return Ok(()) }
+                }
+                for snapshot in &snapshots {
                     legacy::no_external_worktrees(&snapshot.path, record.location.root())?;
-                    verify_published_source(&snapshot.path, discarded)?;
+                    if let Err(error) = verify_published_source(&snapshot.path, discarded) {
+                        match self.gate(record,&mut discarded,&error)? { true => verify_published_source(&snapshot.path,discarded)?, false => return Ok(()) }
+                    }
                 }
                 if record.location.root().exists() {
                     fs::rename(record.location.root(), &trash).map_err(|e| e.to_string())?;
@@ -750,6 +783,48 @@ impl Owner {
         }
         Ok(())
     }
+    /// BR#22672 — the affinity clock test shared by retention and the ladder
+    /// gate: past the worktree TTL (or never used), the record is expired.
+    fn affinity_expired(record: &Resource) -> bool {
+        record.last_activity_at == 0 || now_ms().saturating_sub(record.last_activity_at) > worktree_ttl().as_millis() as u64
+    }
+    /// BR#22672 — the ladder's value-fence gate. A value fence refused this
+    /// tree. If the record is EXPIRED and carries no receipt, the task-liveness
+    /// disposition is the exit — the same ruling the Yield arm applies:
+    /// Gone → the recorded reset (the receipt is the reset authority; the
+    /// caller re-runs the fence, now waived); Adoptable → grace (the affinity
+    /// clock is refreshed so a future claim here still adopts the tree; this
+    /// pass holds); otherwise the refusal stands exactly as before. Live-writer
+    /// and structural fences never route through here — only the value fences
+    /// do (the ones a receipt can answer for).
+    /// Ok(true) = proceed (receipt written, `discarded` now true),
+    /// Ok(false) = grace hold (return Ok from advance),
+    /// Err = the refusal (or the liveness failure) stands.
+    fn gate(&self, record: &mut Resource, discarded: &mut bool, refusal: &str) -> Result<bool, String> {
+        if !Self::affinity_expired(record) {
+            // A grace already granted holds silently, exactly like
+            // retention's Hold arm: the signal marks the policy hold and
+            // the refusal does not churn an error while the task can
+            // still route back. A fresh refusal on a live record errors
+            // exactly as before.
+            if record.retained_value.as_deref().is_some_and(|s| s.contains("task-liveness grace")) { return Ok(false); }
+            return Err(refusal.into());
+        }
+        match self.task_liveness(record) {
+            TaskLiveness::Gone { reason } => {
+                record.retained_value = Some(format!("value-fence refusal ({refusal}); task-liveness gone: {reason}"));
+                self.recorded_reset(record)?;
+                *discarded = true;
+                Ok(true)
+            },
+            TaskLiveness::Adoptable { status } => {
+                record.last_activity_at = now_ms();
+                record.retained_value = Some(format!("task-liveness grace (BR#22672): task open ({status}), still routable to this host; fence refusal ({refusal})"));
+                Ok(false)
+            },
+            TaskLiveness::Unknown { error } => Err(format!("task liveness unavailable; worktree retained: {refusal}; {error}")),
+        }
+    }
     /// BR#14525 — one retention decision per released worktree: what does the
     /// tree hold, and does the explicit policy still protect it?
     fn retention(&self, record: &Resource) -> Result<Retention, String> {
@@ -764,14 +839,34 @@ impl Owner {
         let published = if dirty > 0 { true } else {
             git(&work, &["for-each-ref", "--format=%(objectname)", "--contains", "HEAD", "refs/remotes/origin"])?.lines().count() > 0
         };
-        if dirty == 0 && published { return Ok(Retention::Reclaim); }
-        let signal = format!("unpublished worktree value (BR#14525 value signal): {dirty} uncommitted entries, local commits {}published", if published { "" } else { "UN" });
+        // BR#22672 — retention must SEE every value class the ladder's
+        // fences guard, or "clean" trees route into the ladder and wedge
+        // there (the 570-record Removing pile: this shallow check passed
+        // them, the deep fence refused them, and no exit existed). A
+        // standalone clone's local refs outside HEAD — including any stash —
+        // are unpublished value: the same conditions verify_published_source
+        // enforces, detected locally, no network. Ignored evidence and
+        // non-Git scratch stay ladder-detected: the value-fence gate routes
+        // them at their refusal point while the phase still carries the
+        // owner, so liveness and the receipt keep full task attribution.
+        let mut unpublished: Vec<String> = Vec::new();
+        if dirty > 0 { unpublished.push(format!("{dirty} uncommitted entries")); }
+        if !published { unpublished.push("local commits unpublished".into()); }
+        if work.join(".git").is_dir() {
+            for tip in git(&work, &["for-each-ref", "--format=%(objectname)", "refs/heads/", "refs/tags/", "refs/stash"])?.lines() {
+                let tip = tip.trim();
+                if tip.is_empty() { continue }
+                if git(&work, &["merge-base", "--is-ancestor", tip, "HEAD"]).is_err() {
+                    unpublished.push("local refs outside HEAD".into());
+                    break;
+                }
+            }
+        }
+        if unpublished.is_empty() { return Ok(Retention::Reclaim); }
+        let signal = format!("unpublished worktree value (BR#14525 value signal): {}", unpublished.join(", "));
         let pressure = self.status().is_ok_and(|s| matches!(s.admission, Admission::Held { .. }));
         if pressure { return Ok(Retention::Yield { signal: format!("{signal}; yielding to disk pressure") }); }
-        let ttl = worktree_ttl().as_millis() as u64;
-        if record.last_activity_at == 0 || now_ms().saturating_sub(record.last_activity_at) > ttl {
-            return Ok(Retention::Yield { signal: format!("{signal}; affinity/retention TTL expired") });
-        }
+        if Self::affinity_expired(record) { return Ok(Retention::Yield { signal: format!("{signal}; affinity/retention TTL expired") }); }
         Ok(Retention::Hold { signal })
     }
     /// BR#22634/BR#22672 — the recorded reset for BR#14525's Yield contract
@@ -811,10 +906,18 @@ impl Owner {
     /// discard. The hub being unreachable (or the view drifting) is never
     /// a licence to destroy: Unknown, retained, retried next pass.
     fn task_liveness(&self, record: &Resource) -> TaskLiveness {
-        let Phase::Released { owner } = &record.phase else {
-            return TaskLiveness::Gone { reason: "record is not released; no task to route back".into() };
+        // BR#22672 — the ticket comes from the Released owner while it is
+        // still present; records already inside the ladder (Reclaimable/
+        // Removing fence refusals) fall back to the task lineage captured
+        // at release. Pre-lineage records have neither: liveness cannot be
+        // consulted, so the refusal stands (the conservative exit).
+        let ticket = match &record.phase {
+            Phase::Released { owner } => owner.ticket().clone(),
+            _ => match &record.task_lineage {
+                Some(ticket) => ticket.clone(),
+                None => return TaskLiveness::Unknown { error: "record carries no task lineage; liveness cannot be consulted".into() },
+            },
         };
-        let ticket = owner.ticket();
         let card = match mcp_call_session_with_timeout(&self.cfg, &mut 0, "get_artefact",
             json!({"id":ticket.task_id,"view":"execution"}), None, Duration::from_secs(8)) {
             Ok(card) => card,
@@ -847,7 +950,9 @@ impl Owner {
     fn discard_receipt(&self, record: &Resource) -> Result<DiscardReceipt, String> {
         let (task, session) = match &record.phase {
             Phase::Released { owner } => { let ticket = owner.ticket(); (Some(ticket.task_id.clone()), Some(ticket.session.clone())) },
-            _ => (None, None),
+            // Mid-ladder receipts (value-fence gate): the lineage captured at
+            // release attributes what was lost.
+            _ => match &record.task_lineage { Some(ticket) => (Some(ticket.task_id.clone()), Some(ticket.session.clone())), None => (None, None) },
         };
         let mut repos = Vec::new();
         repositories(&record.location.work(), &mut repos)?;
@@ -944,7 +1049,7 @@ impl Owner {
             let id=legacy::allocation_id("generated",&path)?;
             let _lock=self.lock(&id)?.ok_or("disposable child is being reconciled")?;
             let mut child=if self.file(&id).exists() {self.read(&id)?} else {
-                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None}
+                Resource {version:1,id,location:Location::OwnedDisposable {root:path,parent_id:parent.id.clone()},phase:Phase::Reclaimable {snapshots:vec![]},observed_bytes:0,checked_at:now_ms(),retry_at:0,error:None,last_activity_at:0,retained_value:None,adopted_from:None,reset_at:None,reset_reason:None,task_lineage:None}
             };
             self.save(&child)?;self.advance(&mut child)?;self.save(&child)?;
         }
