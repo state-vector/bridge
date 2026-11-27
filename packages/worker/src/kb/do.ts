@@ -19490,14 +19490,24 @@ export class KnowledgeHub {
   }
 
   private recordSignoffDeferral(taskId: string, reviewId: string | undefined, actor: string): void {
+    this.recordCloseDeferral(taskId, reviewId, actor, "signoff_close_deferred",
+      `Accepted delivery retained${reviewId ? ` from verdict ${reviewId}` : ""}. A human must mark ${taskId} done in the webapp.`);
+  }
+
+  /** One visible marker per (review, action): the "accepted verdict retained,
+   *  waiting on a hold the machine cannot cure" receipt. Idempotent — sweep
+   *  passes must not stack copies. */
+  private hasCloseDeferral(taskId: string, reviewId: string | undefined, action: string): boolean {
     const review = reviewId ?? null;
-    const deferred = this.one(
-      `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action='signoff_close_deferred' AND json_extract(data,'$.review') IS ? LIMIT 1`,
-      taskId, review,
+    return !!this.one(
+      `SELECT 1 FROM artefact_versions WHERE artefact_id=? AND action=? AND json_extract(data,'$.review') IS ? LIMIT 1`,
+      taskId, action, review,
     );
-    if (!deferred) this.version(taskId, actor, "signoff_close_deferred",
-      `Accepted delivery retained${review ? ` from verdict ${review}` : ""}. A human must mark ${taskId} done in the webapp.`,
-      { review });
+  }
+
+  private recordCloseDeferral(taskId: string, reviewId: string | undefined, actor: string, action: string, message: string): void {
+    if (this.hasCloseDeferral(taskId, reviewId, action)) return;
+    this.version(taskId, actor, action, message, { review: reviewId ?? null });
   }
 
    /** Apply only the current typed, exact-revision acceptance. PR delivery uses
@@ -19530,6 +19540,30 @@ export class KnowledgeHub {
     const result = current.result;
     if (!mergeCompletesTask(meta)) {
       if (parent.status === "in_review" && result.kind === "accepted_execution" && result.task_id === parentId && ExecutionResultSchema.safeParse(meta.execution_result).success) {
+        // BR#17626 — the recovery-disposition close gate is a STRUCTURAL hold
+        // this emitter cannot cure: the subject's own continuation (a bound
+        // ask, a reachable repair dependency, a bound decision) owns the exit
+        // until it executes. A held close is deferred once, with a visible
+        // marker, and the emitter stands down — the BR#15659 law again.
+        // Re-attempting re-fires the gate's refusal on every review-reconcile
+        // pass (specimen: 3 refusals on BR#17432 2026-11-20 02:14–02:28Z,
+        // ~7 min apart, while BR#16941 starved unclaimed in todo — the
+        // acceptance stayed bound and the sweep kept re-manufacturing the
+        // refusal until the fold raised an "unclassified" breach card per
+        // window).
+        if (this.diagnosisContinuationHeld(parentId, meta.machine_duty, meta.execution_result)) {
+          if (this.hasCloseDeferral(parentId, current.id, "diagnosis_close_deferred")) return;
+          try {
+            await this.transition({ id: parentId, to: "done", session: "", execution_result: meta.execution_result, note: `Independent execution acceptance: ${result.receipts.join("; ")}` }, actor);
+            this.completeDeliveryClosure(parentId, result.receipts);
+            this.stampAcceptedRecoveryDiagnosis(parentId, meta, actor);
+          } catch (e) {
+            if (!String((e as Error).message ?? e).includes("still needs a continuation")) throw e;
+            this.recordCloseDeferral(parentId, current.id, actor, "diagnosis_close_deferred",
+              `Accepted execution verdict ${current.id} retained. The diagnosis still needs a continuation on ${String(meta.machine_duty?.subject ?? "the subject")} — Bridge closes this when that continuation executes.`);
+          }
+          return;
+        }
         await this.transition({ id: parentId, to: "done", session: "", execution_result: meta.execution_result, note: `Independent execution acceptance: ${result.receipts.join("; ")}` }, actor);
         this.completeDeliveryClosure(parentId, result.receipts);
         // BR#18198 — inside the accepted task-recovery duty's own done
@@ -21135,24 +21169,27 @@ export class KnowledgeHub {
     }
   }
 
-  /** A diagnostic result is evidence, not a new retry or a continuation by itself. */
-  private requireAttemptDiagnosisContinuation(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }, dutyResult?: unknown): void {
-    if (duty?.kind !== "task-recovery" || duty.reason !== "execution_environment" || !duty.subject) return;
+  /** Would the recovery-disposition close gate refuse this duty's close?
+   *  (BR#17626 — the predicate form of requireAttemptDiagnosisContinuation,
+   *  exact same precondition chain, so the acceptance emitter can WAIT OUT a
+   *  held close instead of re-manufacturing its refusal every sweep pass.) */
+  private diagnosisContinuationHeld(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }, dutyResult?: unknown): boolean {
+    if (duty?.kind !== "task-recovery" || duty.reason !== "execution_environment" || !duty.subject) return false;
     const parent = this.one(`SELECT status,owner,meta FROM artefacts WHERE id=?`, duty.subject);
-    if (!parent || !["todo", "blocked"].includes(String(parent.status))) return;
+    if (!parent || !["todo", "blocked"].includes(String(parent.status))) return false;
     const meta = JSON.parse(String(parent.meta ?? "{}"));
-    if (meta.execution_diagnosis?.duty !== dutyId) return;
+    if (meta.execution_diagnosis?.duty !== dutyId) return false;
     const state = this.executionState(duty.subject);
     const revision = String(meta.work_revision ?? "legacy");
     const hold = executionAdmissionHold(state ?? undefined, revision);
-    if (!state || state.generation !== meta.execution_diagnosis.generation || hold !== meta.execution_diagnosis.hold) return;
-    if (state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now())) return;
-    if (this.startupHasAsk(duty.subject)) return;
+    if (!state || state.generation !== meta.execution_diagnosis.generation || hold !== meta.execution_diagnosis.hold) return false;
+    if (state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now())) return false;
+    if (this.startupHasAsk(duty.subject)) return false;
     const wait = parent.status === "blocked" ? validateAwaitEvent(meta.blocked?.await_event) : null;
     if (wait && wait.event !== "time" && wait.event !== "recovery_required" && wait.event !== "ask" && wait.event !== "br_answered") {
-      if (wait.event !== "br_done") return;
+      if (wait.event !== "br_done") return false;
       const target = this.dependencyOutcome(wait.id, [duty.subject, dutyId]);
-      if (!target.ok && target.probeState !== "negative") return;
+      if (!target.ok && target.probeState !== "negative") return false;
     }
     // BR#17881 — a dispatched gateway-runner diagnostic can never author the
     // execution-side continuations this fence otherwise accepts: gateway
@@ -21167,15 +21204,21 @@ export class KnowledgeHub {
     // execution-environment recovery of BR#17785, with every typed
     // execution-side mechanism refused and the board-side binding already
     // in place).
-    if (this.diagnosisContinuationAuthored(duty.subject, dutyId, dutyResult)) return;
+    if (this.diagnosisContinuationAuthored(duty.subject, dutyId, dutyResult)) return false;
     // And when the subject's dispatch gate has demonstrably cleared while
     // the diagnosis stood — todo, unowned, past every claimability fence the
     // diagnosis sweep itself applies, no live dispatch blockers — the honest
     // receipt-backed close is itself the admissible continuation: the
     // scheduler's next reservation (a fresh diagnostic, or the subject's own
     // re-dispatch once its hold clears) owns the retry.
-    if (this.dispatchGateCleared(duty.subject, parent, meta, dutyId, dutyResult)) return;
-    throw new Error(`gate: diagnosis of ${duty.subject} still needs a continuation — reconcile the effect, record an admissible retry, or bind a real repair dependency or a decision to that task`);
+    if (this.dispatchGateCleared(duty.subject, parent, meta, dutyId, dutyResult)) return false;
+    return true;
+  }
+
+  /** A diagnostic result is evidence, not a new retry or a continuation by itself. */
+  private requireAttemptDiagnosisContinuation(dutyId: string, duty?: { kind?: string; reason?: string; subject?: string }, dutyResult?: unknown): void {
+    if (this.diagnosisContinuationHeld(dutyId, duty, dutyResult))
+      throw new Error(`gate: diagnosis of ${duty?.subject} still needs a continuation — reconcile the effect, record an admissible retry, or bind a real repair dependency or a decision to that task`);
   }
 
   /** BR#17881 — the board-side continuations this fence's message names: a
