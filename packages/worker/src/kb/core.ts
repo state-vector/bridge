@@ -685,6 +685,13 @@ export const LIMITS = {
   metaKeys: 20,
   relationsPerArtefact: 100,
   /**
+   * BR#17043 — child_of fan-out audit threshold on ONE parent. Audit-only
+   * (`child_of_fanout_high`), never a refusal: the BR#4728 specimen carried
+   * 189 membership edges from the rollup regression while legitimate large
+   * decompositions exist. The audit makes the fan-out visible per link.
+   */
+  childOfFanoutAudit: 50,
+  /**
    * BR#11554 — meta VALUE bytes (the serialized meta JSON). The old limits
    * capped body chars and meta KEY COUNT but never meta VALUE size, so
    * additive on-card receipt chains (refire_archive + per-duty receipt keys)
@@ -3330,6 +3337,96 @@ export function admissionLandedCloseNote(input: { gateway: string; reviewId: str
     `merge commits: ${legList.map((l) => `https://github.com/${l.repo}/commit/${l.mergeSha}`).join(", ")}`,
     `carried by ${input.gateway}; re-queueing a fully-merged delivery is the 33-admission respawn livelock — this admission is terminal, never a re-queue.`,
   ].join("\n");
+}
+
+// ---- the carry's terminal-admission close is BOUNDED (BR#17043, BR#4403 law) ----
+
+/**
+ * BR#17043 — the merged-provenance carry/sweep retries its terminal admission
+ * close on every sweep tick. When the close is gate-refused (done-open-
+ * children, specimen BR#16873: 7h+ of ~60s `merged_admission_close_refused`
+ * audited events on a cured root blocker), that is a SEMANTIC gate rejection
+ * under BR#4403 — the same precondition refuses every retry, so the ladder is
+ * bounded: ADMITTED_CLOSE_REFUSAL_BOUND audited refusals, then the admission
+ * PARKS as a typed wait on the blocking child's terminal event and further
+ * sweep ticks fold silently. Infra/5xx-shaped errors stay retryable-audited
+ * (BR#4403's retryable class) and never advance the bound.
+ */
+export const ADMITTED_CLOSE_REFUSAL_BOUND = 3;
+
+/** BR#17043 hygiene: a parent carrying more than this many child_of edges is
+ *  audited (`child_of_fanout_high`, LIMITS.childOfFanoutAudit). Audit-only —
+ *  the BR#4728 specimen carried 189 membership edges from the rollup
+ *  regression, and a refusal cap here would have blocked legitimate large
+ *  decompositions. */
+export const CHILD_OF_FANOUT_AUDIT = LIMITS.childOfFanoutAudit;
+
+/** Pull the named open children out of a done-open-children gate refusal.
+ *  The gate (machine.ts done-open-children, BR#5370 finding B) names every
+ *  blocking child as `Open child: BR#123 (blocked), BR#124 (in_progress).`
+ *  Tolerates pluralisation and bare ids; returns [] when the refusal names
+ *  none (different gate — no typed child wait is possible). */
+export function parseOpenChildrenFromRefusal(error: string): Array<{ id: string; status: string }> {
+  const text = String(error ?? "");
+  const m = text.match(/Open child(?:ren)?:\s*([^.]+)\.?/i);
+  if (!m) return [];
+  const out: Array<{ id: string; status: string }> = [];
+  for (const part of m[1].split(/\s*,\s*/)) {
+    const hit = part.match(/^(BR#\d+)(?:\s*\(([^)]*)\))?$/i);
+    if (!hit) continue;
+    out.push({ id: hit[1].toUpperCase(), status: String(hit[2] ?? "unknown") });
+  }
+  return out;
+}
+
+export type AdmittedCloseRefusalVerdict =
+  | { action: "audit"; refusal: number }
+  | { action: "park"; refusal: number; children: Array<{ id: string; status: string }> };
+
+/** The bounded ladder over one terminal-admission close refusal.
+ *  - non-semantic errors (infra/5xx — BR#4403 retryable): audited, bound untouched;
+ *  - semantic gate refusals 1..ADMITTED_CLOSE_REFUSAL_BOUND: audited, the next
+ *    replay/sweep pass retries (today's behavior);
+ *  - past the bound: PARK — the caller parks the admission as a typed wait on
+ *    the first named child's terminal event (or a bounded time re-arm when the
+ *    gate named no child) and stops minting per-tick events. */
+export function admittedCloseRefusalLadder(prevRefusals: number, error: string): AdmittedCloseRefusalVerdict {
+  const text = String(error ?? "");
+  const semantic = /gate:|open child|separation of duties|unreviewed|without receipts|must name EVERY/i.test(text);
+  if (!semantic) return { action: "audit", refusal: Math.max(0, Math.floor(prevRefusals)) };
+  const refusal = Math.max(0, Math.floor(prevRefusals)) + 1;
+  if (refusal <= ADMITTED_CLOSE_REFUSAL_BOUND) return { action: "audit", refusal };
+  return { action: "park", refusal, children: parseOpenChildrenFromRefusal(text) };
+}
+
+/** The single close-bounce / repair brief stamped ONCE when the ladder parks
+ *  the admission (BR#8071 pattern — one loud brief, never a per-tick stream;
+ *  BR#6073 feedback — name the exact child and owner as the next action). */
+export function admittedCloseParkBrief(input: {
+  parentId: string;
+  via: string;
+  legs: Array<{ repo: string; number: number; mergeSha?: string }>;
+  children: Array<{ id: string; status: string; owner?: string }>;
+  bound: number;
+}): string {
+  const legs = input.legs.filter((l) => l.number > 0);
+  const legText = legs.length
+    ? legs.map((l) => `${l.repo}#${l.number}${l.mergeSha ? ` merged as ${l.mergeSha.slice(0, 9)}` : ""}`).join(", ")
+    : "the landed legs stamp stands";
+  const first = input.children[0];
+  const named = input.children.length
+    ? input.children.map((c) => `${c.id} (${c.status}${c.owner ? `, owner ${c.owner}` : ", ownerless"})`).join(", ")
+    : "the gate named no specific child";
+  const next = first
+    ? `Next action: finish or close ${first.id}${first.owner && first.owner !== "" ? ` (owner ${first.owner})` : ""} — its terminal event releases the typed wait and the carry resumes with a fresh bounded ladder.`
+    : `Next action: clear the gate the refusal names, then the carry resumes with a fresh bounded ladder.`;
+  return [
+    `terminal admission close parked after ${input.bound} gate refusals (BR#17043 bounded carry ladder — BR#4403 law applied to the merged-provenance carry, ${input.via}).`,
+    `The landed legs stamp stands (${legText}) — already-landed receipts are preserved, nothing re-queues.`,
+    `Open children still fence done: ${named}.`,
+    next,
+    `Further sweep ticks fold silently into this park — no per-tick audited refusals. If a child is genuinely unclosable, force-close it with reasons (machine.ts done-open-children) or detach the exact edge (BR#15717 unlink).`,
+  ].join(" ");
 }
 
 // ---- awaiting-CI phase (BR#3516 §2) ----

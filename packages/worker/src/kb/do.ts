@@ -189,6 +189,10 @@ import {
   TRAIN_LANDED_CLOSE_MAX_RETRIES,
   admissionMergedTerminal,
   admissionLandedCloseNote,
+  admittedCloseRefusalLadder,
+  admittedCloseParkBrief,
+  ADMITTED_CLOSE_REFUSAL_BOUND,
+  CHILD_OF_FANOUT_AUDIT,
   type MergedLegReceipt,
   type AdmissionLegCoverage,
   releaseHold,
@@ -4368,7 +4372,9 @@ export class KnowledgeHub {
   /** Blocker rollup (BR#2645): cluster the blocked cards by machine root key
    *  (rollup.ts) and execute the plan — create ONE boosted ROOT BLOCKER task
    *  per qualifying cluster (≥3 members, no open root for the key), stamp the
-   *  queued cards (meta.root_blocker + child_of → board tree + boost cascade).
+   *  queued cards (meta.root_blocker + relates → board tree + boost cascade;
+   *  BR#17043: membership is never child_of — it must not fence the root's
+   *  done or regenerate after a ruling-ordered detach).
    *  Idempotent: the plan only stamps cards whose pointer changed, so a re-run
    *  creates no duplicates. Roots close only by agent/human with receipts;
    *  done roots are never reused — a later cluster opens a fresh root. */
@@ -4424,15 +4430,21 @@ export class KnowledgeHub {
             `UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`,
             JSON.stringify(meta), now, s.id,
           );
-          // child_of → board tree + boost cascade. Best-effort: the nesting
-          // cap and relation limits can reject; the stamp alone still counts.
+          // BR#17043 (BR#4894 spec b): membership is a board-tree pointer,
+          // NEVER a decomposition edge — 'relates', never child_of. The old
+          // child_of link is what REGENERATED BR#4728's children after the
+          // BR#5841 ruling-ordered detach: every rollup sweep re-inserted
+          // the edge onto the cured root, and each member fenced the root's
+          // done (breach BR#16873: 7h+ of ~60s close refusals). The
+          // meta.root_blocker stamp stays the membership pointer; the boost
+          // cascade (this.boost) still reaches members through it.
           const linked = this.one(
-            `SELECT 1 AS x FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`,
+            `SELECT 1 AS x FROM relations WHERE src_id = ? AND relation IN ('child_of','relates') AND dst_id = ?`,
             s.id, rootId,
           );
           if (!linked) {
             try {
-              await this.link({ src: s.id, relation: "child_of", dst: rootId }, "system:watchdog");
+              await this.link({ src: s.id, relation: "relates", dst: rootId }, "system:watchdog");
             } catch (e) {
               this.audit("system:watchdog", "rollup_link_rejected", s.id, { root: rootId, error: String((e as Error).message ?? e).slice(0, 200) });
             }
@@ -5722,6 +5734,49 @@ export class KnowledgeHub {
     }
 
     mark("duties_v1");
+    // ---------- root_edges_v1: rollup membership edges stop fencing their root's done (BR#17043, BR#4894 spec b) ----------
+    // One-time repair over state the new rollup can no longer produce. The
+    // blocker rollup (BR#2645) linked every queued card child_of its root
+    // blocker — decomposition semantics for what is a membership pointer.
+    // After BR#5841's ruling-ordered detach of BR#4728's children (2026-11-03,
+    // web:rayh: "detached all children; close BR#4728 done"), the next rollup
+    // sweep REGENERATED the edges (14+ cards created after the detach carried
+    // child_of onto the cured root) and the terminal admission close was
+    // gate-refused every ~60s for 7h+ (breach BR#16873; specimens BR#15597,
+    // BR#15638). meta.root_blocker == dst membership edges rewrite to
+    // 'relates': the pointer, the child card, its typed waits and every
+    // non-membership edge are untouched — only the fencing edge type changes.
+    // Review/unblock children keep their child_of edge: verify rounds and
+    // unblock duties are read by edge-type-sensitive readers (one-open-verify
+    // cap, openUnblockChild) and are census-exempt by their own markers.
+    try {
+      if (!this.one(`SELECT value FROM settings WHERE key = 'root_edges_v1'`)) {
+        const membership = this.state.storage.sql.exec(
+          `SELECT r.src_id AS src, r.dst_id AS dst, r.created_ts AS ts FROM relations r
+           JOIN artefacts s ON s.id = r.src_id
+           WHERE r.relation = 'child_of' AND r.src_id != r.dst_id
+             AND json_extract(s.meta, '$.root_blocker') = r.dst_id
+             AND s.roles NOT LIKE '%"review"%' AND s.roles NOT LIKE '%"unblock"%'`,
+        ).toArray() as any[];
+        for (const e of membership) {
+          this.state.storage.sql.exec(
+            `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
+            String(e.src), String(e.dst), Number(e.ts ?? Date.now()),
+          );
+          this.state.storage.sql.exec(`DELETE FROM relations WHERE src_id = ? AND relation = 'child_of' AND dst_id = ?`, String(e.src), String(e.dst));
+          this.audit("system:migration", "root_edge_relates", String(e.src), { was: "child_of", now: "relates", dst: String(e.dst), why: "BR#17043: rollup membership is relates-linked — a member must never fence its root blocker's done" });
+          this.version(String(e.src), "system:migration", "note", `BR#17043 migration: this card's rollup-membership edge to its root blocker (${String(e.dst)}) was child_of — rewritten to 'relates'; the meta.root_blocker pointer is unchanged and the card keeps its own waits`, {});
+        }
+        this.state.storage.sql.exec(
+          `INSERT OR REPLACE INTO settings (key, value) VALUES ('root_edges_v1', ?)`,
+          JSON.stringify({ rewritten: membership.length, ts: Date.now() }),
+        );
+        this.audit("system:migration", "root_edges_v1", null, { rewritten: membership.length });
+      }
+    } catch (e) {
+      console.log("root_edges_v1 migration:", String(e).slice(0, 200));
+    }
+
     this.state.storage.sql.exec(DUTY_LOOKUP_SCHEMA);
     this.state.waitUntil(this.prepareDutyLookup().catch(() => { /* a train read retries */ }));
 
@@ -6805,9 +6860,15 @@ export class KnowledgeHub {
       this.version(t.id, actor, "update", on ? `boosted (priority 0, via ${id})` : `boost removed (via ${id})`, {});
       boosted.push(t.id);
       for (const c of this.state.storage.sql.exec(
-        `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-         WHERE r.relation = 'child_of' AND r.dst_id = ?`, t.id,
+        `SELECT c.id AS id, r.relation AS relation, c.meta AS meta FROM relations r JOIN artefacts c ON c.id = r.src_id
+         WHERE r.relation IN ('child_of','relates') AND r.dst_id = ?`, t.id,
       ).toArray() as any[]) {
+        // BR#17043: rollup membership rides 'relates' (membership must never
+        // fence the root's done). Cascade boost only to members whose
+        // root_blocker pointer names THIS root — never every relates-linked
+        // card (reverse duties, episodes and cross-references also live on
+        // 'relates' and must not inherit the root's priority).
+        if (String(c.relation) === "relates" && JSON.parse(String(c.meta ?? "{}")).root_blocker !== t.id) continue;
         if (!seen.has(c.id)) { seen.add(c.id); queue.push(c.id); }
       }
     }
@@ -11933,6 +11994,17 @@ export class KnowledgeHub {
       `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, ?, ?, ?)`,
       srcId, rel, dstId, Date.now(),
     );
+    // BR#17043 hygiene: a child_of fan-out this deep on ONE parent is the
+    // rollup-membership regression class (BR#4728 carried 189). Audit-only —
+    // loud visibility per new link, never a refusal (large legitimate
+    // decompositions exist and MCP has no unlink to repair a refused link).
+    if (rel === "child_of") {
+      const fanout = this.one(
+        `SELECT COUNT(*) AS n FROM relations WHERE relation = 'child_of' AND dst_id = ?`, dstId,
+      ) as any;
+      if (Number(fanout?.n ?? 0) > LIMITS.childOfFanoutAudit)
+        this.audit(actor, "child_of_fanout_high", dstId, { fanout: Number(fanout?.n ?? 0), threshold: LIMITS.childOfFanoutAudit, src: srcId });
+    }
     this.audit(actor, "link", srcId, { relation: rel, dst: dstId });
     return { src: srcId, relation: rel, dst: dstId };
   }
@@ -16888,8 +16960,14 @@ export class KnowledgeHub {
       },
       a.actor,
     );
+    // BR#17043 (BR#4894 spec b): the root-fix card is ABOUT the lane, not a
+    // decomposition child of it — the meta.child_of_lane stamp stays the
+    // binding pointer (the only readers: the generatedBinding read and this
+    // stamp). The BR#5185 class: lane cards accumulated spawned children
+    // whose open statuses fenced the lane's own close. The edge rides
+    // 'relates': membership without fencing.
     this.state.storage.sql.exec(
-      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+      `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
       created.id, a.laneId, a.now,
     );
     this.audit(a.actor, "root_fix_spawned", created.id, { lane: laneKey(a.repo, a.base), sha: a.sha.slice(0, 9), failing: a.failing.map((f) => f.name), culprit: a.culpritId, pr: a.pr });
@@ -18392,6 +18470,7 @@ export class KnowledgeHub {
       `SELECT id, status, meta FROM artefacts
        WHERE type = 'task' AND (
          (status = 'blocked' AND json_extract(meta, '$.merge_train.state') IN ('queued', 'awaiting-ci'))
+         OR (status NOT IN ('done', 'superseded') AND json_extract(meta, '$.merge_train.close_parked') IS NOT NULL)
          OR (status = 'in_progress' AND json_extract(meta, '$.merge_train.state') = 'awaiting-ci')
          OR (status IN ('todo', 'in_progress') AND json_extract(meta, '$.merge_train.state') = 'bounced'
              AND json_extract(meta, '$.merge_train.close_bounce') = 1
@@ -19835,6 +19914,48 @@ export class KnowledgeHub {
     if (!row || ["done", "superseded"].includes(String(row.status))) return true;
     const now = Date.now();
     const meta = JSON.parse(row.meta ?? "{}");
+    // BR#17043: a live typed park owns this exit. While the parked children
+    // are still open the carry folds SILENTLY — no audited refusal, no
+    // version row (the bounded ladder already stamped the single park brief;
+    // a per-tick event stream here was the BR#16873 livelock). Once every
+    // parked child is terminal the park clears and the ladder re-arms fresh
+    // — whether the child released the typed wait or went terminal without
+    // it (e.g. superseded; br_done watches done only).
+    const parked = (meta.merge_train ?? {}).close_parked as
+      | { children?: Array<{ id: string; status?: string }>; since?: number; via?: string; wait?: { event?: string; until_ts?: number } }
+      | undefined;
+    if (parked) {
+      // Two park shapes, one silence law: while the park's own condition
+      // holds the carry folds SILENTLY (zero event rows — the anti-livelock
+      // property BR#16873 priced). Children parks release on every parked
+      // child terminal; gate-cleared parks re-arm on their bounded time
+      // window (an immediate retry here would re-ladder 3 refusals every
+      // tick — a livelock at 1/4 rate).
+      const parkedChildren = Array.isArray(parked.children) ? parked.children : [];
+      if (parkedChildren.length) {
+        const stillOpen = parkedChildren.filter((c) => {
+          const s = this.one(`SELECT status FROM artefacts WHERE id = ?`, String(c.id));
+          return s && !["done", "superseded"].includes(String(s.status));
+        });
+        if (stillOpen.length) return false;
+      } else if (parked.wait?.event === "time" && Number(parked.wait.until_ts ?? 0) > now) {
+        return false;
+      }
+      meta.merge_train = { ...(meta.merge_train ?? {}) };
+      delete meta.merge_train.close_parked;
+      meta.merge_train.close_refusals = 0;
+      // The wait is consumed — a re-refusal re-parks with a fresh one.
+      // Leaving the stale blocked marker would leave a typed wait pointing
+      // at an already-terminal child (or an expired timer) owning an exit
+      // the carry is this moment retaking.
+      delete meta.blocked;
+      this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(meta), parentId);
+      this.audit(actor, "merged_admission_park_cleared", parentId, {
+        via,
+        parked_children: parkedChildren.map((c) => String(c.id)),
+        parked_since: Number(parked.since ?? 0) || null,
+      });
+    }
     const parentRoles = parseTags(String(row.roles ?? ""));
     const humanSignoff = effectiveRole(parentRoles) === "human";
     const first = merged[0];
@@ -20014,15 +20135,119 @@ export class KnowledgeHub {
       }
       await this.transition(closeBody, actor);
     } catch (e) {
+      const errText = String((e as Error)?.message ?? e);
       // The landed stamp is honest (the legs ARE merged — hub receipts prove
       // it) and it is exactly what the acceptance-qualify gate reads, so the
-      // stamp STAYS; the refusal is a loud audit the next pass retries.
-      this.audit(actor, "merged_admission_close_refused", parentId, { error: String((e as Error)?.message ?? e).slice(0, 300), via, legs: merged.map((m) => `${m.repo}#${m.number}`) });
-      this.version(parentId, actor, "merged_admission_close_refused", `terminal admission close refused — ${String((e as Error)?.message ?? e).slice(0, 180)}; the landed legs stamp stands and the next replay/sweep retries the carry (BR#9510)`, {});
+      // stamp STAYS.
+      // BR#17043: the retry itself is BOUNDED. A semantic gate refusal here
+      // (done-open-children et al.) is BR#4403-terminal — the same refusal
+      // would greet every future pass — yet this catch re-drove the close on
+      // every replay/sweep tick forever (specimen BR#16873: 7h+ of ~60s
+      // `merged_admission_close_refused` events; siblings BR#15597,
+      // BR#15638, BR#6073). The ladder: ADMITTED_CLOSE_REFUSAL_BOUND audited
+      // refusals → ONE typed park on the first named child's terminal event
+      // with the single close-bounce brief (BR#8071 pattern) → further ticks
+      // fold silently at the entry check above. Infra/5xx-shaped errors stay
+      // retryable-audited and never advance the bound.
+      meta.merge_train = { ...(meta.merge_train ?? {}) };
+      const verdict = admittedCloseRefusalLadder(Number(meta.merge_train.close_refusals ?? 0), errText);
+      meta.merge_train.close_refusals = verdict.refusal;
+      if (verdict.action === "audit") {
+        // BR#17043: the refused close's in_progress pre-done leg (landed for
+        // blocked/todo rows just above) leaves a shape no sweep arm re-selects
+        // (in_progress + no merge_train.state) — the bounded ladder would
+        // strand after ONE refusal instead of retrying inside its bound.
+        // Re-read fresh (the refused legs mutated meta server-side), persist
+        // the refusal counter on the FRESH meta, then restore the queued-park
+        // shape so the next sweep tick re-drives the carry. An in_review-
+        // position card keeps its status — its own re-drive legs own it.
+        const fresh = this.one(`SELECT status, meta FROM artefacts WHERE id = ?`, parentId);
+        const freshMeta = JSON.parse(String(fresh?.meta ?? "{}"));
+        freshMeta.merge_train = { ...(freshMeta.merge_train ?? {}), close_refusals: verdict.refusal };
+        if (String(fresh?.status ?? "") === "in_progress" && !freshMeta.merge_train.state && trainLegs(freshMeta).length > 0) {
+          freshMeta.merge_train.state = "queued";
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta=?, status='blocked', updated_ts=? WHERE id=?`, JSON.stringify(freshMeta), now, parentId);
+          this.version(parentId, "system:train", "transition", `merge-train: queued — the bounded carry ladder re-armed after refusal ${verdict.refusal}/${ADMITTED_CLOSE_REFUSAL_BOUND}; the next sweep tick retries the carry (BR#17043)`, { from: "in_progress", to: "blocked" });
+        } else {
+          this.state.storage.sql.exec(`UPDATE artefacts SET meta = ? WHERE id = ?`, JSON.stringify(freshMeta), parentId);
+        }
+        this.audit(actor, "merged_admission_close_refused", parentId, { error: errText.slice(0, 300), via, legs: merged.map((m) => `${m.repo}#${m.number}`), refusal: verdict.refusal, bound: ADMITTED_CLOSE_REFUSAL_BOUND });
+        this.version(parentId, actor, "merged_admission_close_refused", `terminal admission close refused (${verdict.refusal}/${ADMITTED_CLOSE_REFUSAL_BOUND}) — ${errText.slice(0, 180)}; the landed legs stamp stands and the next replay/sweep retries the carry (BR#9510)`, {});
+        return false;
+      }
+      // bound exceeded — park ONCE: typed wait on the first named child's
+      // terminal event (children-terminal), or a bounded time re-arm when
+      // the gate named no child (gate-cleared). The brief is the single
+      // close-bounce: exact child + owner as the next action (BR#6073).
+      const children = verdict.children;
+      const owners = new Map(children.map((c) => {
+        const o = this.one(`SELECT owner FROM artefacts WHERE id = ?`, c.id);
+        return [c.id, String(o?.owner ?? "")];
+      }));
+      const brief = admittedCloseParkBrief({
+        parentId, via,
+        legs: merged.map((m) => ({ repo: m.repo, number: m.number, mergeSha: m.mergeSha })),
+        children: children.map((c) => ({ ...c, owner: owners.get(c.id) ?? "" })),
+        bound: ADMITTED_CLOSE_REFUSAL_BOUND,
+      });
+      const firstChild = children[0]?.id;
+      meta.merge_train.close_parked = {
+        reason: firstChild ? "open-children" : "gate-refused",
+        children,
+        bound: ADMITTED_CLOSE_REFUSAL_BOUND,
+        since: now,
+        via,
+        wait: firstChild ? { event: "br_done", id: firstChild } : { event: "time", until_ts: now + 30 * 60_000 },
+      };
+      meta.merge_train.close_refusals = 0; // fresh bounded ladder on resume
+      this.audit(actor, "merged_admission_close_parked", parentId, {
+        via, bound: ADMITTED_CLOSE_REFUSAL_BOUND,
+        children: children.map((c) => `${c.id} (${c.status})`),
+        wait: meta.merge_train.close_parked.wait,
+        error: errText.slice(0, 300),
+      });
+      this.version(parentId, actor, "merged_admission_close_parked", brief, {});
+      try {
+        // Machine park (the coordination-checkpoint park precedent): the
+        // carry is anonymous — no session, no owner, no live writer
+        // (protectedExecution already screened this exit). A blocked state
+        // with a grammar-valid typed wait pauses the watchdog and lets the
+        // proxy-watch release the card when the child goes terminal.
+        meta.blocked = {
+          reason: `terminal admission close parked — ${ADMITTED_CLOSE_REFUSAL_BOUND} gate refusals (BR#17043 bounded carry ladder): open children still fence done on the landed stamp`,
+          ts: now,
+          unblock_condition: firstChild
+            ? `Machine proxy (typed await_event br_done id=${firstChild}): when child ${firstChild} reaches a terminal status (done/superseded), the merged-provenance carry resumes the bounded close ladder on the landed legs stamp (BR#17043).`
+            : `Machine proxy (typed await_event time): the carry re-arms its bounded close ladder after the re-arm window; clear the gate the refusal names (BR#17043).`,
+          await_event: meta.merge_train.close_parked.wait,
+        };
+        delete meta.session; delete meta.session_alive_ts; delete meta.grace_until;
+        // BR#17043: the interactive marker is a live-writer screen, and no
+        // live writer exists here (protectedExecution screened this exit
+        // before the close attempt that parked). Leaving it set would make
+        // every resume pass retain ("an existing subsystem or executor owns
+        // this exit") and the park could never resume — the parked-forever
+        // twin of the refusal livelock this ladder replaces.
+        delete meta.interactive_execution;
+        const preParkStatus = String(this.one(`SELECT status FROM artefacts WHERE id = ?`, parentId)?.status ?? row.status);
+        this.state.storage.sql.exec(
+          `UPDATE artefacts SET status='blocked', owner='', status_ts=?, updated_ts=?, meta=? WHERE id=?`,
+          now, now, JSON.stringify(meta), parentId,
+        );
+        this.version(parentId, "system:train", "transition", `parked by the bounded carry ladder (BR#17043) — typed wait ${firstChild ? `br_done ${firstChild}` : "time re-arm"}`, { from: preParkStatus, to: "blocked" });
+      } catch {
+        // A refused park must never mask the refusal itself: the park marker
+        // + brief above are already stamped, so the entry fold still owns
+        // the exit and the next pass stays silent.
+      }
       return false;
     }
     const completed = JSON.parse(this.one(`SELECT meta FROM artefacts WHERE id = ?`, parentId).meta ?? "{}");
     completed.merge_train = { ...(meta.merge_train ?? {}), state: "landed", pr: first.number, repo: first.repo, merge_sha: first.mergeSha, landed_at: now, closed_via: via, ...(ciUnproven ? { ci_unproven: true } : {}) };
+    // BR#17043 hygiene: the ladder is per-admission state — a closed card
+    // carries no refusal counter or park marker forward.
+    delete completed.merge_train.close_refusals;
+    delete completed.merge_train.close_parked;
     this.state.storage.sql.exec(`UPDATE artefacts SET meta = ?, updated_ts = ? WHERE id = ?`, JSON.stringify(completed), now, parentId);
     if (ciUnproven) {
       this.audit(actor, "merged_park_close_ci_unproven", parentId, { via, legs: merged.map((m) => `${m.repo}#${m.number}`), note: "landed on merged provenance while a lane it rides sits on a checks_unconfirmed stop — CI never proven green (BR#22593)" });
@@ -20646,7 +20871,7 @@ export class KnowledgeHub {
       try {
         const openDuty = this.one(
           `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-           WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+           WHERE r.relation IN ('child_of','relates') AND r.dst_id = ? AND c.type = 'task'
              AND c.status NOT IN ('done', 'superseded') AND c.tags LIKE '%"diagnostic"%' LIMIT 1`,
           lane.id,
         ) as any;
@@ -20688,7 +20913,10 @@ export class KnowledgeHub {
             "system:train",
           );
           ep.duty_id = String(createdDuty.id);
-          this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`, ep.duty_id, lane.id, Date.now());
+          // BR#17043 (BR#4894 spec b): the episode duty is ABOUT the lane
+          // (machine_duty.subject binds it) — 'relates', never child_of: an
+          // open diagnostic must not fence the lane card's own retirement.
+          this.state.storage.sql.exec(`INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`, ep.duty_id, lane.id, Date.now());
           this.audit("system:train", "train:gate_blocked_duty_spawned", ep.duty_id, {
             lane: `${repo}@${base}`,
             lane_card: lane.id,
@@ -20933,7 +21161,7 @@ export class KnowledgeHub {
         try {
           const openDuty = this.one(
             `SELECT c.id AS id FROM relations r JOIN artefacts c ON c.id = r.src_id
-             WHERE r.relation = 'child_of' AND r.dst_id = ? AND c.type = 'task'
+             WHERE r.relation IN ('child_of','relates') AND r.dst_id = ? AND c.type = 'task'
                AND c.status NOT IN ('done', 'superseded') AND c.tags LIKE '%"diagnostic"%' LIMIT 1`,
             l.id,
           ) as any;
@@ -20959,8 +21187,10 @@ export class KnowledgeHub {
               "system:train",
             );
             dutyId = String(createdDuty.id);
+            // BR#17043 (BR#4894 spec b): episode duties are ABOUT the lane
+            // (machine_duty.subject binds them) — 'relates', never child_of.
             this.state.storage.sql.exec(
-              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'child_of', ?, ?)`,
+              `INSERT OR IGNORE INTO relations (src_id, relation, dst_id, created_ts) VALUES (?, 'relates', ?, ?)`,
               dutyId, l.id, now0,
             );
             this.audit("system:train", "train:starvation_duty_spawned", dutyId, {
