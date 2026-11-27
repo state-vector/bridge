@@ -1572,6 +1572,16 @@ shared checkout keeps its own identity.
   scratch ENOSPC. A genuinely broken identity (missing key, wrong program,
   unknown git failure) stays a task prerequisite and keeps refusing
   dispatch.
+- **Stale git lockfiles** (BR#6992): repo-scope config is the owning
+  clone's, shared by all its worktrees, so one writer killed mid-write can
+  orphan a `config.lock` that wedges **every** startup of **every** task of
+  that repo (`could not lock config file ... File exists`). Before writing
+  the profile the runner resolves the repo's common git dir
+  (`git rev-parse --git-common-dir`) and removes a `config.lock` older than
+  60 seconds — git holds config locks for milliseconds, so an older one can
+  only be debris from a killed writer — logging `removed stale git lockfile
+  <path> (age Ns)`. A fresh lock is treated as a live concurrent writer and
+  keeps the normal refusal.
 - **Board surfacing**: Connect nests each gateway's provisioned worker
   agents under it with their identity class, and the pairing screen states
   the class the device declared plus what its runner's dispatches commit

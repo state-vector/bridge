@@ -2854,12 +2854,64 @@ fn run_with_output_limit(mut cmd: Command, secs: u64, max_bytes: u64) -> Result<
     }
 }
 
+/// Staleness rule for orphaned git lockfiles (BR#6992): git holds a config
+/// lock for milliseconds, so a lock older than this has no live writer — it
+/// is debris from a killed one. Absent, unreadable, or future mtimes are
+/// never stale (a fresh lock is a live concurrent writer).
+const GIT_LOCK_STALE_SECS: u64 = 60;
+
+/// Some((lock, age_secs)) when the lockfile exists and its mtime is older
+/// than GIT_LOCK_STALE_SECS behind `now`.
+fn stale_lock_path(path: &std::path::Path, now: std::time::SystemTime) -> Option<(std::path::PathBuf, u64)> {
+    let age = now
+        .duration_since(std::fs::metadata(path).ok()?.modified().ok()?)
+        .ok()?
+        .as_secs();
+    (age > GIT_LOCK_STALE_SECS).then(|| (path.to_path_buf(), age))
+}
+
+/// The lockfile repo-scope `git config` serializes on: the common git dir's
+/// config.lock. For a linked worktree repo scope is the OWNING clone's
+/// config (BR#3185), shared by all that clone's worktrees — the lock lives
+/// in the clone's .git, not the worktree's own gitdir. None when git
+/// metadata is unavailable; callers keep their existing error path.
+fn repo_common_config_lock(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    let common_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = std::path::Path::new(&common_dir);
+    if dir.as_os_str().is_empty() { return None; }
+    let common = if dir.is_absolute() { dir.to_path_buf() } else { worktree.join(dir) };
+    Some(common.join("config.lock"))
+}
+
+/// Self-heal the stale-git-lockfile wedge (BR#6992): one killed writer
+/// orphaning a config.lock on a shared clone wedged every startup of every
+/// task of that repo ("could not lock config file ... File exists"). Best
+/// effort — a fresh lock is a live writer and is never touched; a failed
+/// removal keeps the existing error path.
+fn clear_stale_config_lock(worktree: &std::path::Path) {
+    let Some((lock, age)) = repo_common_config_lock(worktree)
+        .and_then(|lock| stale_lock_path(&lock, std::time::SystemTime::now()))
+    else { return };
+    match std::fs::remove_file(&lock) {
+        Ok(()) => dlog("", &format!("removed stale git lockfile {} (age {age}s)", lock.display())),
+        Err(e) => dlog("", &format!("stale git lockfile {} removal failed: {e}", lock.display())),
+    }
+}
+
 /// Write the identity profile into the repo-local git config (BR#3185).
 /// Idempotent; re-applied on resume. `git config` (no scope flag) writes at
 /// repo scope — for a linked worktree that is the owning clone's config,
 /// shared by that clone's worktrees; --global is never touched, so the
-/// host's own signing path stays exactly as it was.
+/// host's own signing path stays exactly as it was. A stale (>60s) config
+/// lock on the owning clone is removed first (BR#6992 self-heal).
 fn apply_identity(worktree: &std::path::Path, p: &IdentityProfile) -> Result<(), String> {
+    clear_stale_config_lock(worktree);
     for (key, value) in p.git_config() {
         // BR#6992 — surface git's own failure text. Discarding stderr wrapped
         // a full workspace volume as a bare "git config user.name failed",
@@ -5642,6 +5694,106 @@ mod tests {
         // idempotent: re-apply on resume neither errors nor corrupts
         apply_identity(&repo, &profile).expect("re-apply idempotent");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn backdate_mtime(path: &std::path::Path, t: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open lockfile for backdating");
+        f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+            .expect("backdate lockfile mtime");
+    }
+
+    /// The BR#6992 incident shape: a linked worktree of a shared clone.
+    /// Returns (owning clone, linked worktree).
+    fn clone_with_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let clone = temp_git_repo(tag);
+        std::fs::write(clone.join("seed.txt"), "seed").expect("seed file");
+        let ok = Command::new("git")
+            .current_dir(&clone)
+            .args(["add", "seed.txt"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "seed add must succeed for the lockfile test scratch clone");
+        let ok = Command::new("git")
+            .current_dir(&clone)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "seed"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "seed commit must succeed for the lockfile test scratch clone");
+        let wt = std::env::temp_dir().join(format!("bridge-identity-wt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        let ok = Command::new("git")
+            .current_dir(&clone)
+            .args(["worktree", "add", "-b", &format!("wt-{tag}")])
+            .arg(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "linked worktree must add for the lockfile test scratch clone");
+        (clone, wt)
+    }
+
+    fn lockfile_test_profile() -> IdentityProfile {
+        IdentityProfile {
+            name: "detached-cody".into(),
+            email: "297316395+detached-cody@users.noreply.github.com".into(),
+            signing_key_path: "/keys/sv-agents-signing.pub".into(),
+            signing_program: "/usr/bin/ssh-keygen".into(),
+        }
+    }
+
+    #[test]
+    fn stale_config_lock_on_the_owning_clone_is_self_healed() {
+        // BR#6992: a linked worktree's repo-scope `git config` resolves to
+        // the OWNING clone's config; one killed writer orphaned that clone's
+        // config.lock and every startup of every task wedged behind it.
+        let (clone, wt) = clone_with_worktree("stale-lock");
+        let lock = clone.join(".git").join("config.lock");
+        std::fs::write(&lock, "").expect("orphaned lockfile");
+        let now = std::time::SystemTime::now();
+        backdate_mtime(&lock, now - std::time::Duration::from_secs(120));
+        // the staleness rule itself: >60s is stale, absent files are not
+        let (stale, age) = stale_lock_path(&lock, now).expect("a 120s-old lock must be judged stale");
+        assert_eq!(stale, lock);
+        assert!(age >= 120, "{age}s");
+        assert!(stale_lock_path(&clone.join(".git").join("no-such.lock"), now).is_none());
+
+        apply_identity(&wt, &lockfile_test_profile()).expect("stale lock must self-heal and identity must apply");
+        assert!(!lock.exists(), "the stale lockfile must be removed, not left behind");
+        // repo scope wrote through to the owning clone's shared config
+        let email = Command::new("git")
+            .current_dir(&clone)
+            .args(["config", "--get", "user.email"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(email, "297316395+detached-cody@users.noreply.github.com");
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn fresh_config_lock_is_a_live_writer_and_keeps_the_error_path() {
+        let (clone, wt) = clone_with_worktree("fresh-lock");
+        let lock = clone.join(".git").join("config.lock");
+        std::fs::write(&lock, "").expect("live lockfile");
+        // the staleness rule itself: fresh and future mtimes are never stale
+        let now = std::time::SystemTime::now();
+        assert!(stale_lock_path(&lock, now).is_none(), "a fresh lock must not be judged stale");
+        backdate_mtime(&lock, now + std::time::Duration::from_secs(300));
+        assert!(stale_lock_path(&lock, now).is_none(), "a future mtime is never stale");
+
+        let error = apply_identity(&wt, &lockfile_test_profile())
+            .expect_err("a live config lock keeps git's refusal");
+        assert!(error.starts_with("git config user.name failed: "), "{error}");
+        assert!(error.contains("lock config file"), "{error}: git's own stderr must ride along");
+        assert!(lock.exists(), "a fresh lock belongs to a live writer — never unlink it");
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     fn throwaway_signing_key(tag: &str) -> std::path::PathBuf {
